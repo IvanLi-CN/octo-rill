@@ -1,0 +1,19 @@
+.DS_Store
+
+# Rust
+target/
+
+# Local data
+.data/
+.env
+
+# Node/Bun
+node_modules/
+web/node_modules/
+
+# Vite output
+web/dist/
+
+# Git
+.git/
+
