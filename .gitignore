@@ -1,0 +1,41 @@
+.DS_Store
+Thumbs.db
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local data
+/.data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Logs
+logs/
+*.log
+
+# Bun/Node
+node_modules/
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo
+*.tsbuildinfo
+*.local
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Codex / Serena
+.codex/
+.serena/
+.serena
