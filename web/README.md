@@ -11,6 +11,22 @@ Currently, two official plugins are available:
 
 The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
+## Storybook
+
+Start Storybook locally:
+
+```bash
+bun run storybook
+```
+
+Then open `http://127.0.0.1:6006`.
+
+Build Storybook for CI/static hosting:
+
+```bash
+bun run storybook:build
+```
+
 ## Expanding the ESLint configuration
 
 If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
