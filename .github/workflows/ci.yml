@@ -79,6 +79,17 @@ jobs:
             echo "No web/ package; skipping"
           fi
 
+      - name: Front-end Storybook build (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f web/package.json ]]; then
+            cd web
+            bun run storybook:build
+          else
+            echo "No web/ package; skipping"
+          fi
+
   unit-tests:
     name: Backend Tests
     runs-on: ubuntu-latest
