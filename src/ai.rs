@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::state::AppState;
 
@@ -10,14 +12,6 @@ struct ReleaseRow {
     tag_name: String,
     name: Option<String>,
     published_at: Option<String>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct NotificationRow {
-    repo_full_name: Option<String>,
-    subject_title: Option<String>,
-    reason: Option<String>,
-    updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,89 +76,98 @@ fn extract_error_message(body: &[u8]) -> Option<String> {
     None
 }
 
-pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<String> {
+pub fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{:02x}", b).expect("sha256 hex");
+    }
+    out
+}
+
+fn compute_daily_window_naive(
+    now_local: NaiveDateTime,
+    at: NaiveTime,
+) -> (NaiveDateTime, NaiveDateTime, NaiveDate) {
+    let today = now_local.date();
+    let mut end = NaiveDateTime::new(today, at);
+    // Use the latest boundary <= now.
+    if now_local < end {
+        end -= chrono::Duration::days(1);
+    }
+    let start = end - chrono::Duration::hours(24);
+    (start, end, end.date())
+}
+
+fn local_from_naive(naive: NaiveDateTime) -> chrono::DateTime<Local> {
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => dt,
+        // If DST makes the time ambiguous, prefer the earliest.
+        LocalResult::Ambiguous(dt, _) => dt,
+        // This shouldn't happen for typical daily times like 08:00. Fallback to a
+        // non-panicking conversion for robustness.
+        LocalResult::None => {
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+                .with_timezone(&Local)
+        }
+    }
+}
+
+pub struct DailyWindow {
+    pub key_date: NaiveDate,
+    pub start_local: chrono::DateTime<Local>,
+    pub end_local: chrono::DateTime<Local>,
+    pub start_utc: chrono::DateTime<chrono::Utc>,
+    pub end_utc: chrono::DateTime<chrono::Utc>,
+}
+
+pub fn compute_window_for_key_date(
+    key_date: NaiveDate,
+    at: NaiveTime,
+) -> (chrono::DateTime<Local>, chrono::DateTime<Local>) {
+    let end_naive = NaiveDateTime::new(key_date, at);
+    let start_naive = end_naive - chrono::Duration::hours(24);
+    (local_from_naive(start_naive), local_from_naive(end_naive))
+}
+
+pub fn compute_daily_window(at: Option<NaiveTime>, now: chrono::DateTime<Local>) -> DailyWindow {
+    let now_naive = now.naive_local();
+    if let Some(at) = at {
+        let (start_naive, end_naive, key_date) = compute_daily_window_naive(now_naive, at);
+        let start_local = local_from_naive(start_naive);
+        let end_local = local_from_naive(end_naive);
+        return DailyWindow {
+            key_date,
+            start_utc: start_local.with_timezone(&chrono::Utc),
+            end_utc: end_local.with_timezone(&chrono::Utc),
+            start_local,
+            end_local,
+        };
+    }
+
+    let end_local = now;
+    let start_local = end_local - chrono::Duration::hours(24);
+    DailyWindow {
+        key_date: end_local.date_naive(),
+        start_utc: start_local.with_timezone(&chrono::Utc),
+        end_utc: end_local.with_timezone(&chrono::Utc),
+        start_local,
+        end_local,
+    }
+}
+
+pub async fn chat_completion(
+    state: &AppState,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<String> {
     let Some(ai) = state.config.ai.clone() else {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     };
-
-    let today = chrono::Local::now().date_naive().to_string();
-    let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-
-    let releases = sqlx::query_as::<_, ReleaseRow>(
-        r#"
-        SELECT sr.full_name, r.tag_name, r.name, r.published_at
-        FROM releases r
-        JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = ?
-          AND r.published_at IS NOT NULL
-          AND r.published_at >= ?
-        ORDER BY r.published_at DESC
-        LIMIT 30
-        "#,
-    )
-    .bind(user_id)
-    .bind(&since)
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query releases for brief")?;
-
-    let notifications = sqlx::query_as::<_, NotificationRow>(
-        r#"
-        SELECT repo_full_name, subject_title, reason, updated_at
-        FROM notifications
-        WHERE user_id = ?
-          AND unread = 1
-        ORDER BY updated_at DESC
-        LIMIT 30
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query notifications for brief")?;
-
-    let releases_md = if releases.is_empty() {
-        "- (none in last 24h)".to_owned()
-    } else {
-        releases
-            .iter()
-            .map(|r| {
-                let title = r
-                    .name
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(&r.tag_name);
-                let published = r.published_at.as_deref().unwrap_or("");
-                format!("- {}: {} ({})", r.full_name, title, published)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let notifications_md = if notifications.is_empty() {
-        "- (none)".to_owned()
-    } else {
-        notifications
-            .iter()
-            .map(|n| {
-                let repo = n.repo_full_name.as_deref().unwrap_or("(unknown repo)");
-                let title = n.subject_title.as_deref().unwrap_or("(no title)");
-                let reason = n.reason.as_deref().unwrap_or("");
-                let updated = n.updated_at.as_deref().unwrap_or("");
-                if reason.trim().is_empty() {
-                    format!("- {}: {} ({})", repo, title, updated)
-                } else {
-                    format!("- {}: {} ({}, {})", repo, title, reason, updated)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let user_prompt = format!(
-        "Date: {today}\n\nNew releases (last 24h):\n{releases_md}\n\nUnread notifications:\n{notifications_md}\n\nWrite a concise daily brief in Markdown with sections: Releases, Notifications, Next actions. Keep it actionable."
-    );
 
     let url = ai
         .base_url
@@ -176,15 +179,15 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
         messages: vec![
             ChatMessage {
                 role: "system",
-                content: "You are an assistant that writes a short, actionable GitHub daily brief in Markdown. Do not include URLs.",
+                content: system,
             },
             ChatMessage {
                 role: "user",
-                content: &user_prompt,
+                content: user,
             },
         ],
         temperature: 0.2,
-        max_tokens: 800,
+        max_tokens,
     };
 
     let resp = state
@@ -216,6 +219,73 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("AI response missing content"))?;
 
+    Ok(content)
+}
+
+pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<String> {
+    if state.config.ai.is_none() {
+        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
+    };
+
+    let now_local = chrono::Local::now();
+    let window = compute_daily_window(state.config.ai_daily_at_local, now_local);
+    let key_date = window.key_date.to_string();
+    let start_utc = window.start_utc.to_rfc3339();
+    let end_utc = window.end_utc.to_rfc3339();
+
+    let releases = sqlx::query_as::<_, ReleaseRow>(
+        r#"
+        SELECT sr.full_name, r.tag_name, r.name, r.published_at
+        FROM releases r
+        JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        WHERE r.user_id = ?
+          AND r.published_at IS NOT NULL
+          AND r.published_at >= ?
+          AND r.published_at < ?
+        ORDER BY r.published_at DESC
+        LIMIT 40
+        "#,
+    )
+    .bind(user_id)
+    .bind(&start_utc)
+    .bind(&end_utc)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query releases for brief")?;
+
+    let releases_md = if releases.is_empty() {
+        "- (none in last 24h)".to_owned()
+    } else {
+        releases
+            .iter()
+            .map(|r| {
+                let title = r
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&r.tag_name);
+                let published = r.published_at.as_deref().unwrap_or("");
+                format!("- {}: {} ({})", r.full_name, title, published)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let user_prompt = format!(
+        "时间窗口（本地）：{start_local} → {end_local}\n\nReleases：\n{releases_md}\n\n请用中文输出一份简短、可执行的 Markdown 日报，包含两个部分：\n\n1) ## 昨日更新（Releases）\n2) ## 建议跟进（Next actions）\n\n要求：不包含任何 URL；优先输出可执行的行动项；列表不超过 10 条。",
+        start_local = window.start_local.to_rfc3339(),
+        end_local = window.end_local.to_rfc3339(),
+    );
+
+    let content = chat_completion(
+        state,
+        "你是一个助理，负责根据 GitHub Releases 列表写一份简短、可执行的中文日报（Markdown）。不要包含任何 URL。",
+        &user_prompt,
+        900,
+    )
+    .await?;
+
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
@@ -227,7 +297,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
         "#,
     )
     .bind(user_id)
-    .bind(&today)
+    .bind(&key_date)
     .bind(&content)
     .bind(&now)
     .execute(&state.pool)
@@ -235,4 +305,59 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
     .context("failed to store brief")?;
 
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_window_after_boundary() {
+        let at = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let now = NaiveDate::from_ymd_opt(2026, 2, 21)
+            .unwrap()
+            .and_hms_opt(9, 0, 0)
+            .unwrap();
+        let (start, end, key_date) = compute_daily_window_naive(now, at);
+        assert_eq!(
+            start,
+            NaiveDate::from_ymd_opt(2026, 2, 20)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            end,
+            NaiveDate::from_ymd_opt(2026, 2, 21)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap()
+        );
+        assert_eq!(key_date, NaiveDate::from_ymd_opt(2026, 2, 21).unwrap());
+    }
+
+    #[test]
+    fn daily_window_before_boundary() {
+        let at = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
+        let now = NaiveDate::from_ymd_opt(2026, 2, 21)
+            .unwrap()
+            .and_hms_opt(7, 0, 0)
+            .unwrap();
+        let (start, end, key_date) = compute_daily_window_naive(now, at);
+        assert_eq!(
+            start,
+            NaiveDate::from_ymd_opt(2026, 2, 19)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            end,
+            NaiveDate::from_ymd_opt(2026, 2, 20)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap()
+        );
+        assert_eq!(key_date, NaiveDate::from_ymd_opt(2026, 2, 20).unwrap());
+    }
 }
