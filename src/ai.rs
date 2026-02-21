@@ -136,10 +136,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
                     .filter(|s| !s.trim().is_empty())
                     .unwrap_or(&r.tag_name);
                 let published = r.published_at.as_deref().unwrap_or("");
-                format!(
-                    "- {}: {} ({})",
-                    r.full_name, title, published
-                )
+                format!("- {}: {} ({})", r.full_name, title, published)
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -179,8 +176,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
         messages: vec![
             ChatMessage {
                 role: "system",
-                content:
-                    "You are an assistant that writes a short, actionable GitHub daily brief in Markdown. Do not include URLs.",
+                content: "You are an assistant that writes a short, actionable GitHub daily brief in Markdown. Do not include URLs.",
             },
             ChatMessage {
                 role: "user",
