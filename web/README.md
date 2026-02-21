@@ -19,7 +19,7 @@ Start Storybook locally:
 bun run storybook
 ```
 
-Then open `http://127.0.0.1:6006`.
+Then open `http://127.0.0.1:55176`.
 
 Build Storybook for CI/static hosting:
 

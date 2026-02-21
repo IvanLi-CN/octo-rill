@@ -8,8 +8,8 @@
 		"build": "tsc -b && vite build",
 		"lint": "biome check .",
 		"format": "biome format . --write",
-		"preview": "vite preview",
-		"storybook": "storybook dev -p 6006 --host 127.0.0.1",
+		"preview": "vite preview --host 127.0.0.1 --port 55175 --strictPort",
+		"storybook": "storybook dev -p 55176 --host 127.0.0.1 --no-open",
 		"storybook:build": "storybook build"
 	},
 	"dependencies": {
