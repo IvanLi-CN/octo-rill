@@ -82,8 +82,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
         .route("/notifications", get(api::list_notifications))
+        .route("/feed", get(api::list_feed))
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
+        .route("/translate/release", post(api::translate_release))
+        .route("/translate/notification", post(api::translate_notification))
         .route("/sync/starred", post(api::sync_starred))
         .route("/sync/releases", post(api::sync_releases))
         .route("/sync/notifications", post(api::sync_notifications));
@@ -216,7 +219,8 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
                 .unwrap_or(Duration::from_secs(60));
             tokio::time::sleep(sleep_for).await;
 
-            let today = chrono::Local::now().date_naive().to_string();
+            let window = ai::compute_daily_window(Some(at), chrono::Local::now());
+            let key_date = window.key_date.to_string();
             let users = sqlx::query_scalar::<_, i64>(r#"SELECT id FROM users ORDER BY id"#)
                 .fetch_all(&state.pool)
                 .await;
@@ -234,7 +238,7 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
                     r#"SELECT 1 FROM briefs WHERE user_id = ? AND date = ? LIMIT 1"#,
                 )
                 .bind(user_id)
-                .bind(&today)
+                .bind(&key_date)
                 .fetch_optional(&state.pool)
                 .await;
 
