@@ -1,5 +1,6 @@
 import { ArrowUpRight, Languages, RefreshCcw } from "lucide-react";
 
+import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -17,30 +18,6 @@ function formatIsoShort(iso: string) {
 	const noZ = iso.replace("Z", "");
 	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
 	return noFrac.replace("T", " ");
-}
-
-function renderSummary(summary: string) {
-	const lines = summary
-		.split("\n")
-		.map((l) => l.trim())
-		.filter(Boolean);
-
-	const looksLikeBullets = lines.some((l) => l.startsWith("- "));
-	if (!looksLikeBullets) {
-		return (
-			<div className="text-muted-foreground text-sm whitespace-pre-wrap">
-				{summary}
-			</div>
-		);
-	}
-
-	return (
-		<ul className="text-muted-foreground list-disc space-y-1 pl-5 text-sm">
-			{lines.map((l) => (
-				<li key={l}>{l.replace(/^- /, "")}</li>
-			))}
-		</ul>
-	);
 }
 
 export function FeedItemCard(props: {
@@ -70,12 +47,18 @@ export function FeedItemCard(props: {
 		item.translated?.status === "ready" ? item.translated.summary : null;
 	const originalExcerpt = item.excerpt?.trim() ? item.excerpt : null;
 
-	// When AI is disabled/missing, fall back to original content rather than showing an empty card.
-	const bodyText = showOriginal
-		? originalExcerpt
-		: translatedSummary?.trim()
-			? translatedSummary
-			: originalExcerpt;
+	const showAiFallbackInOriginal =
+		showOriginal && !originalExcerpt && Boolean(translatedSummary?.trim());
+
+	// Prefer the active language, but never render an empty original view if we do have an AI
+	// summary available (some releases legitimately ship with an empty body).
+	const bodyText = showAiFallbackInOriginal
+		? translatedSummary
+		: showOriginal
+			? originalExcerpt
+			: translatedSummary?.trim()
+				? translatedSummary
+				: originalExcerpt;
 
 	const subtitleBits = [
 		item.reason || item.subtitle,
@@ -176,11 +159,18 @@ export function FeedItemCard(props: {
 			</CardHeader>
 
 			{bodyText ? (
-				<CardContent className="pt-0">{renderSummary(bodyText)}</CardContent>
+				<CardContent className="pt-0">
+					{showAiFallbackInOriginal ? (
+						<div className="text-muted-foreground mb-2 font-mono text-[11px]">
+							原文 Release notes 为空/无法提取，以下为 AI 中文翻译
+						</div>
+					) : null}
+					<Markdown content={bodyText} />
+				</CardContent>
 			) : (
 				<CardContent className="pt-0">
 					<p className="text-muted-foreground text-sm">
-						暂无摘要，点击 <span className="font-mono">GitHub</span> 查看详情。
+						暂无内容，点击 <span className="font-mono">GitHub</span> 查看详情。
 					</p>
 				</CardContent>
 			)}

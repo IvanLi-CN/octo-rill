@@ -272,7 +272,7 @@ export function Dashboard(props: { me: MeResponse }) {
 				) : null}
 			</div>
 
-			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
 				<section className="min-w-0">
 					{tab === "all" || tab === "releases" ? (
 						<>
@@ -332,11 +332,6 @@ export function Dashboard(props: { me: MeResponse }) {
 
 					{tab === "briefs" ? (
 						<div className="space-y-6">
-							<BriefListCard
-								briefs={briefs}
-								selectedDate={selectedBriefDate}
-								onSelectDate={(d) => setSelectedBriefDate(d)}
-							/>
 							<ReleaseDailyCard
 								briefs={briefs}
 								selectedDate={selectedBriefDate}
@@ -350,6 +345,23 @@ export function Dashboard(props: { me: MeResponse }) {
 				</section>
 
 				<aside className="space-y-6">
+					{tab === "all" || tab === "releases" || tab === "briefs" ? (
+						<>
+							<BriefListCard
+								briefs={briefs}
+								selectedDate={selectedBriefDate}
+								onSelectDate={(d) => setSelectedBriefDate(d)}
+							/>
+							{tab === "all" || tab === "releases" ? (
+								<ReleaseDailyCard
+									briefs={briefs}
+									selectedDate={selectedBriefDate}
+									busy={busy === "Generate brief"}
+									onGenerate={onGenerateBrief}
+								/>
+							) : null}
+						</>
+					) : null}
 					<InboxQuickList notifications={notifications} />
 				</aside>
 			</div>
