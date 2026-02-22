@@ -57,11 +57,19 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
 	>({});
+	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
+		null,
+	);
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
 
-	const latestBrief = useMemo(() => briefs[0] ?? null, [briefs]);
+	const selectedBrief = useMemo(() => {
+		if (!selectedBriefDate) return briefs[0] ?? null;
+		return (
+			briefs.find((b) => b.date === selectedBriefDate) ?? briefs[0] ?? null
+		);
+	}, [briefs, selectedBriefDate]);
 
 	const refreshSidebar = useCallback(async () => {
 		const [n, b] = await Promise.all([
@@ -70,6 +78,10 @@ export function Dashboard(props: { me: MeResponse }) {
 		]);
 		setNotifications(sortNotifications(n));
 		setBriefs(b);
+		setSelectedBriefDate((prev) => {
+			if (prev && b.some((x) => x.date === prev)) return prev;
+			return b[0]?.date ?? null;
+		});
 	}, []);
 
 	const refreshAll = useCallback(async () => {
@@ -242,6 +254,27 @@ export function Dashboard(props: { me: MeResponse }) {
 							>
 								Inbox
 							</Button>
+
+							<div className="flex items-center gap-2">
+								<span className="text-muted-foreground font-mono text-xs">
+									日报
+								</span>
+								<select
+									className="bg-background h-8 rounded-md border px-3 font-mono text-xs shadow-xs disabled:opacity-50"
+									value={selectedBrief?.date ?? ""}
+									disabled={briefs.length === 0}
+									onChange={(e) => setSelectedBriefDate(e.target.value)}
+								>
+									{briefs.length === 0 ? (
+										<option value="">(none)</option>
+									) : null}
+									{briefs.map((b) => (
+										<option key={b.date} value={b.date}>
+											#{b.date}
+										</option>
+									))}
+								</select>
+							</div>
 						</div>
 
 						{busy ? (
@@ -268,7 +301,7 @@ export function Dashboard(props: { me: MeResponse }) {
 
 				<aside className="space-y-6">
 					<ReleaseDailyCard
-						brief={latestBrief}
+						brief={selectedBrief}
 						busy={busy === "Generate brief"}
 						onGenerate={onGenerateBrief}
 					/>

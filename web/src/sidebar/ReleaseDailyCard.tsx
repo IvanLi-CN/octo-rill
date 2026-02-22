@@ -1,5 +1,6 @@
 import { Sparkles } from "lucide-react";
 
+import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -62,14 +63,20 @@ export function ReleaseDailyCard(props: {
 
 			<CardContent className="pt-0">
 				{brief ? (
-					<details className="group">
-						<summary className="text-muted-foreground cursor-pointer select-none font-mono text-xs">
-							展开查看（Markdown）
-						</summary>
-						<pre className="bg-muted/20 mt-3 max-h-96 overflow-auto rounded-lg border p-4 text-sm whitespace-pre-wrap">
-							{brief.content_markdown}
-						</pre>
-					</details>
+					<div className="space-y-3">
+						<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
+							<Markdown content={brief.content_markdown} />
+						</div>
+
+						<details className="group">
+							<summary className="text-muted-foreground cursor-pointer select-none font-mono text-xs">
+								查看原始 Markdown
+							</summary>
+							<pre className="bg-muted/20 mt-2 max-h-72 overflow-auto rounded-lg border p-4 text-sm whitespace-pre-wrap">
+								{brief.content_markdown}
+							</pre>
+						</details>
+					</div>
 				) : (
 					<p className="text-muted-foreground text-sm">
 						提示：日报基于 <code>AI_DAILY_AT_LOCAL</code>{" "}
