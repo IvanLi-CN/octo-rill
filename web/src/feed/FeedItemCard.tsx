@@ -58,7 +58,7 @@ export function FeedItemCard(props: {
 		onTranslateNow,
 	} = props;
 
-	const kindLabel = item.kind === "release" ? "RELEASE" : "INBOX";
+	const kindLabel = "RELEASE";
 	const originalTitle = item.title ?? "(no title)";
 	const translatedTitle =
 		item.translated?.status === "ready" ? item.translated.title : null;
@@ -89,9 +89,7 @@ export function FeedItemCard(props: {
 							<span
 								className={cn(
 									"font-mono inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] tracking-wide",
-									item.kind === "release"
-										? "bg-primary text-primary-foreground border-primary/20"
-										: "bg-background",
+									"bg-primary text-primary-foreground border-primary/20",
 								)}
 							>
 								{kindLabel}

@@ -7,7 +7,8 @@ export type TranslatedItem = {
 	summary: string | null;
 };
 
-export type FeedItemKind = "release" | "notification";
+// Feed is releases-only (Inbox has its own API + UI tab).
+export type FeedItemKind = "release";
 
 export type FeedItem = {
 	kind: FeedItemKind;

@@ -27,8 +27,8 @@ export function Landing({ bootError }: LandingProps) {
 						把 GitHub 的更新变成可读的信息流
 					</h1>
 					<p className="text-muted-foreground mt-3 text-pretty leading-relaxed">
-						Releases + Inbox 混合时间线，AI 自动翻译成中文；侧栏提供“昨日
-						Release 日报”和 Inbox 快捷入口。需要操作时，直接跳回 GitHub。
+						Releases 信息流（无限滚动），AI 自动翻译成中文；并提供“昨日 Release
+						日报”和 Inbox 快捷入口。需要操作时，直接跳回 GitHub。
 					</p>
 				</div>
 

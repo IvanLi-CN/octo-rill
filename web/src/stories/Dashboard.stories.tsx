@@ -33,24 +33,6 @@ function makeMockFeed(): FeedItem[] {
 			},
 		},
 		{
-			kind: "notification",
-			ts: "2026-02-21T07:40:00Z",
-			id: "90001",
-			repo_full_name: "acme/rocket",
-			title: "Build failed on main",
-			subtitle: "ci_activity",
-			reason: "ci_activity",
-			subject_type: "CheckSuite",
-			html_url: "https://github.com/notifications/thread/90001",
-			unread: 1,
-			translated: {
-				lang: "zh-CN",
-				status: "missing",
-				title: null,
-				summary: null,
-			},
-		},
-		{
 			kind: "release",
 			ts: "2026-02-21T06:20:00Z",
 			id: "10000",
@@ -115,7 +97,7 @@ const mockNotifs: NotificationItem[] = [
 
 function DashboardPreview() {
 	const items = makeMockFeed();
-	const inFlightKeys = new Set(["notification:90001"]);
+	const inFlightKeys = new Set(["release:10001"]);
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		mockBriefs[0]?.date ?? null,
 	);

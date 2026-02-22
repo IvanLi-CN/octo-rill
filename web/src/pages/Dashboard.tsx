@@ -6,6 +6,7 @@ import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
+import { InboxList } from "@/inbox/InboxList";
 import { AppShell } from "@/layout/AppShell";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -51,18 +52,10 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 
-	const [filter, setFilter] = useState<"all" | "release" | "notification">(
-		"all",
-	);
+	type Tab = "all" | "releases" | "briefs" | "inbox";
+	const [tab, setTab] = useState<Tab>("all");
 
-	const feed = useFeed({
-		types:
-			filter === "release"
-				? "releases"
-				: filter === "notification"
-					? "notifications"
-					: null,
-	});
+	const feed = useFeed();
 
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
@@ -236,50 +229,131 @@ export function Dashboard(props: { me: MeResponse }) {
 				<p className="text-destructive mb-4 text-sm">{bootError}</p>
 			) : null}
 
-			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-				<section className="min-w-0">
-					<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-						<div className="flex flex-wrap items-center gap-2">
-							<Button
-								variant={filter === "all" ? "default" : "outline"}
-								size="sm"
-								className="font-mono text-xs"
-								onClick={() => setFilter("all")}
-							>
-								全部
-							</Button>
-							<Button
-								variant={filter === "release" ? "default" : "outline"}
-								size="sm"
-								className="font-mono text-xs"
-								onClick={() => setFilter("release")}
-							>
-								Releases
-							</Button>
-							<Button
-								variant={filter === "notification" ? "default" : "outline"}
-								size="sm"
-								className="font-mono text-xs"
-								onClick={() => setFilter("notification")}
-							>
-								Inbox
-							</Button>
-						</div>
+			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+				<div className="flex flex-wrap items-center gap-2">
+					<Button
+						variant={tab === "all" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("all")}
+					>
+						全部
+					</Button>
+					<Button
+						variant={tab === "releases" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("releases")}
+					>
+						Releases
+					</Button>
+					<Button
+						variant={tab === "briefs" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("briefs")}
+					>
+						日报
+					</Button>
+					<Button
+						variant={tab === "inbox" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("inbox")}
+					>
+						Inbox
+					</Button>
+				</div>
 
-						{busy ? (
-							<span className="text-muted-foreground font-mono text-xs">
-								{busy}…
-							</span>
+				{busy ? (
+					<span className="text-muted-foreground font-mono text-xs">
+						{busy}…
+					</span>
+				) : null}
+			</div>
+
+			{tab === "all" ? (
+				<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+					<section className="min-w-0">
+						{!feed.loadingInitial && feed.items.length === 0 ? (
+							<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+								<h2 className="text-base font-semibold tracking-tight">
+									还没有内容
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm">
+									先同步 starred，再同步 releases；Inbox 在右侧作为快捷入口。
+									或者直接点 <span className="font-mono">Sync all</span>。
+								</p>
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+										Sync all
+									</Button>
+									<Button
+										variant="outline"
+										disabled={Boolean(busy)}
+										onClick={onSyncStarred}
+									>
+										Sync starred
+									</Button>
+									<Button
+										variant="outline"
+										disabled={Boolean(busy)}
+										onClick={onSyncReleases}
+									>
+										Sync releases
+									</Button>
+									<Button
+										variant="outline"
+										disabled={Boolean(busy)}
+										onClick={onSyncInbox}
+									>
+										Sync inbox
+									</Button>
+								</div>
+							</div>
 						) : null}
-					</div>
 
+						<FeedList
+							items={feed.items}
+							error={feed.error}
+							loadingInitial={feed.loadingInitial}
+							loadingMore={feed.loadingMore}
+							hasMore={feed.hasMore}
+							inFlightKeys={inFlightKeys}
+							registerItemRef={register}
+							onLoadMore={feed.loadMore}
+							showOriginalByKey={showOriginalByKey}
+							onToggleOriginal={onToggleOriginal}
+							onTranslateNow={onTranslateNow}
+						/>
+					</section>
+
+					<aside className="space-y-6">
+						<BriefListCard
+							briefs={briefs}
+							selectedDate={selectedBriefDate}
+							onSelectDate={(d) => setSelectedBriefDate(d)}
+						/>
+						<ReleaseDailyCard
+							briefs={briefs}
+							selectedDate={selectedBriefDate}
+							busy={busy === "Generate brief"}
+							onGenerate={onGenerateBrief}
+						/>
+						<InboxQuickList notifications={notifications} />
+					</aside>
+				</div>
+			) : null}
+
+			{tab === "releases" ? (
+				<section className="min-w-0">
 					{!feed.loadingInitial && feed.items.length === 0 ? (
 						<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 							<h2 className="text-base font-semibold tracking-tight">
 								还没有内容
 							</h2>
 							<p className="text-muted-foreground mt-1 text-sm">
-								先同步 starred，再同步 releases / inbox；或者直接点{" "}
+								先同步 starred，再同步 releases；或者直接点{" "}
 								<span className="font-mono">Sync all</span>。
 							</p>
 							<div className="mt-4 flex flex-wrap gap-2">
@@ -300,13 +374,6 @@ export function Dashboard(props: { me: MeResponse }) {
 								>
 									Sync releases
 								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncInbox}
-								>
-									Sync inbox
-								</Button>
 							</div>
 						</div>
 					) : null}
@@ -325,22 +392,33 @@ export function Dashboard(props: { me: MeResponse }) {
 						onTranslateNow={onTranslateNow}
 					/>
 				</section>
+			) : null}
 
-				<aside className="space-y-6">
-					<BriefListCard
-						briefs={briefs}
-						selectedDate={selectedBriefDate}
-						onSelectDate={(d) => setSelectedBriefDate(d)}
-					/>
-					<ReleaseDailyCard
-						briefs={briefs}
-						selectedDate={selectedBriefDate}
-						busy={busy === "Generate brief"}
-						onGenerate={onGenerateBrief}
-					/>
-					<InboxQuickList notifications={notifications} />
-				</aside>
-			</div>
+			{tab === "briefs" ? (
+				<div className="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
+					<section className="min-w-0">
+						<BriefListCard
+							briefs={briefs}
+							selectedDate={selectedBriefDate}
+							onSelectDate={(d) => setSelectedBriefDate(d)}
+						/>
+					</section>
+					<section className="min-w-0">
+						<ReleaseDailyCard
+							briefs={briefs}
+							selectedDate={selectedBriefDate}
+							busy={busy === "Generate brief"}
+							onGenerate={onGenerateBrief}
+						/>
+					</section>
+				</div>
+			) : null}
+
+			{tab === "inbox" ? (
+				<section className="min-w-0">
+					<InboxList notifications={notifications} />
+				</section>
+			) : null}
 		</AppShell>
 	);
 }
