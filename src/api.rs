@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use axum::extract::Query;
 use axum::{Json, extract::State, http::StatusCode};
@@ -453,6 +453,342 @@ fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str>
     }
 }
 
+#[derive(Debug, Clone)]
+struct StreamCursor {
+    sort_ts: String,
+    id_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct MixedCursor {
+    release: Option<StreamCursor>,
+    notification: Option<StreamCursor>,
+}
+
+fn parse_stream_cursor(raw: &str) -> Result<StreamCursor, ApiError> {
+    let mut it = raw.split('|');
+    let sort_ts = it
+        .next()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::bad_request("invalid mixed cursor"))?;
+    let id_key = it
+        .next()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::bad_request("invalid mixed cursor"))?;
+    if it.next().is_some() {
+        return Err(ApiError::bad_request("invalid mixed cursor"));
+    }
+    Ok(StreamCursor { sort_ts, id_key })
+}
+
+fn parse_mixed_cursor(cursor: &str) -> Result<MixedCursor, ApiError> {
+    let mut out = MixedCursor {
+        release: None,
+        notification: None,
+    };
+
+    let mut recognized = false;
+    for part in cursor
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(v) = part.strip_prefix("r=") {
+            out.release = Some(parse_stream_cursor(v)?);
+            recognized = true;
+            continue;
+        }
+        if let Some(v) = part.strip_prefix("release=") {
+            out.release = Some(parse_stream_cursor(v)?);
+            recognized = true;
+            continue;
+        }
+        if let Some(v) = part.strip_prefix("n=") {
+            out.notification = Some(parse_stream_cursor(v)?);
+            recognized = true;
+            continue;
+        }
+        if let Some(v) = part.strip_prefix("notification=") {
+            out.notification = Some(parse_stream_cursor(v)?);
+            recognized = true;
+            continue;
+        }
+    }
+
+    if recognized {
+        return Ok(out);
+    }
+
+    // Backward-compat: previous cursor format was "<sort_ts>|<kind>|<id_key>".
+    let (sort_ts, kind_rank, id_key) = parse_cursor(cursor)?;
+    match kind_rank {
+        1 => out.release = Some(StreamCursor { sort_ts, id_key }),
+        0 => out.notification = Some(StreamCursor { sort_ts, id_key }),
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn encode_mixed_cursor(
+    release: Option<&StreamCursor>,
+    notification: Option<&StreamCursor>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = release {
+        parts.push(format!("r={}|{}", r.sort_ts, r.id_key));
+    }
+    if let Some(n) = notification {
+        parts.push(format!("n={}|{}", n.sort_ts, n.id_key));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(";"))
+    }
+}
+
+async fn fetch_feed_releases(
+    state: &AppState,
+    user_id: i64,
+    cursor: Option<&StreamCursor>,
+    limit: i64,
+) -> Result<Vec<FeedRow>, ApiError> {
+    let base_sql = r#"
+        WITH items AS (
+          SELECT
+            'release' AS kind,
+            COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
+            COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
+            printf('%020d', r.release_id) AS id_key,
+            CAST(r.release_id AS TEXT) AS entity_id,
+            sr.full_name AS repo_full_name,
+            COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
+            NULL AS subtitle,
+            NULL AS reason,
+            NULL AS subject_type,
+            r.html_url AS html_url,
+            NULL AS unread,
+            r.body AS release_body
+          FROM releases r
+          JOIN starred_repos sr
+            ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+          WHERE r.user_id = ?
+        )
+        SELECT
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
+          i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
+          i.release_body,
+          t.source_hash AS trans_source_hash,
+          t.title AS trans_title,
+          t.summary AS trans_summary
+        FROM items i
+        LEFT JOIN ai_translations t
+          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
+    "#;
+
+    let (sql, has_cursor) = if cursor.is_some() {
+        (
+            format!(
+                r#"
+                {base_sql}
+                WHERE (
+                  i.sort_ts < ?
+                  OR (i.sort_ts = ? AND i.id_key < ?)
+                )
+                ORDER BY i.sort_ts DESC, i.id_key DESC
+                LIMIT ?
+                "#
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                r#"
+                {base_sql}
+                ORDER BY i.sort_ts DESC, i.id_key DESC
+                LIMIT ?
+                "#
+            ),
+            false,
+        )
+    };
+
+    let mut qy = sqlx::query_as::<_, FeedRow>(&sql)
+        .bind(user_id)
+        .bind(user_id);
+    if has_cursor {
+        let c = cursor.expect("cursor");
+        qy = qy.bind(&c.sort_ts).bind(&c.sort_ts).bind(&c.id_key);
+    }
+    qy = qy.bind(limit);
+
+    qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
+}
+
+async fn fetch_feed_notifications(
+    state: &AppState,
+    user_id: i64,
+    cursor: Option<&StreamCursor>,
+    limit: i64,
+) -> Result<Vec<FeedRow>, ApiError> {
+    let base_sql = r#"
+        WITH items AS (
+          SELECT
+            'notification' AS kind,
+            COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS sort_ts,
+            COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS ts,
+            n.thread_id AS id_key,
+            n.thread_id AS entity_id,
+            n.repo_full_name AS repo_full_name,
+            n.subject_title AS title,
+            n.reason AS subtitle,
+            n.reason AS reason,
+            n.subject_type AS subject_type,
+            ('https://github.com/notifications/thread/' || n.thread_id) AS html_url,
+            n.unread AS unread,
+            NULL AS release_body
+          FROM notifications n
+          WHERE n.user_id = ?
+        )
+        SELECT
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
+          i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
+          i.release_body,
+          t.source_hash AS trans_source_hash,
+          t.title AS trans_title,
+          t.summary AS trans_summary
+        FROM items i
+        LEFT JOIN ai_translations t
+          ON t.user_id = ? AND t.entity_type = 'notification' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
+    "#;
+
+    let (sql, has_cursor) = if cursor.is_some() {
+        (
+            format!(
+                r#"
+                {base_sql}
+                WHERE (
+                  i.sort_ts < ?
+                  OR (i.sort_ts = ? AND i.id_key < ?)
+                )
+                ORDER BY i.sort_ts DESC, i.id_key DESC
+                LIMIT ?
+                "#
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                r#"
+                {base_sql}
+                ORDER BY i.sort_ts DESC, i.id_key DESC
+                LIMIT ?
+                "#
+            ),
+            false,
+        )
+    };
+
+    let mut qy = sqlx::query_as::<_, FeedRow>(&sql)
+        .bind(user_id)
+        .bind(user_id);
+    if has_cursor {
+        let c = cursor.expect("cursor");
+        qy = qy.bind(&c.sort_ts).bind(&c.sort_ts).bind(&c.id_key);
+    }
+    qy = qy.bind(limit);
+
+    qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
+}
+
+fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
+    let source = match r.kind.as_str() {
+        "release" => format!(
+            "kind=release\nrepo={}\ntitle={}\nbody={}\n",
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            truncate_chars(r.release_body.as_deref().unwrap_or(""), 6000),
+        ),
+        "notification" => format!(
+            "kind=notification\nrepo={}\ntitle={}\nreason={}\nsubject_type={}\n",
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            r.reason.as_deref().unwrap_or(""),
+            r.subject_type.as_deref().unwrap_or(""),
+        ),
+        _ => String::new(),
+    };
+
+    let translated = if !ai_enabled {
+        Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        })
+    } else {
+        let current_hash = ai::sha256_hex(&source);
+        if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
+            let mut title = r.trans_title.clone().filter(|s| !s.trim().is_empty());
+            let mut summary = r.trans_summary.clone().filter(|s| !s.trim().is_empty());
+            let mut status = "ready".to_owned();
+
+            // Some early cached entries accidentally stored the entire JSON blob in `summary`.
+            // Try to recover it without forcing an AI call; if we can't, mark as missing so the
+            // client can re-translate.
+            if let Some(raw) = summary.as_deref() {
+                let t = raw.trim_start();
+                if t.starts_with('{') || t.starts_with("\"{") {
+                    if let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw) {
+                        if title.is_none() {
+                            title = t_title;
+                        }
+                        if t_summary.is_some() {
+                            summary = t_summary;
+                        }
+                    } else {
+                        status = "missing".to_owned();
+                        title = None;
+                        summary = None;
+                    }
+                }
+            }
+
+            Some(TranslatedItem {
+                lang: "zh-CN".to_owned(),
+                status,
+                title,
+                summary,
+            })
+        } else {
+            Some(TranslatedItem {
+                lang: "zh-CN".to_owned(),
+                status: "missing".to_owned(),
+                title: None,
+                summary: None,
+            })
+        }
+    };
+
+    FeedItem {
+        kind: r.kind,
+        ts: r.ts,
+        id: r.entity_id,
+        repo_full_name: r.repo_full_name,
+        title: r.title,
+        subtitle: r.subtitle,
+        reason: r.reason,
+        subject_type: r.subject_type,
+        html_url: r.html_url,
+        unread: r.unread,
+        translated,
+    }
+}
+
 pub async fn list_feed(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -464,10 +800,136 @@ pub async fn list_feed(
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
+    // For the mixed feed, ensure both kinds are visible near the top even if one stream is much
+    // "hotter" than the other. We do this by fetching each stream separately and interleaving.
+    if include_releases && include_notifications {
+        let ai_enabled = state.config.ai.is_some();
+        let mixed_cursor = match cursor {
+            Some(c) => parse_mixed_cursor(c)?,
+            None => MixedCursor {
+                release: None,
+                notification: None,
+            },
+        };
+
+        let notif_quota = (limit / 5).clamp(1, 10);
+
+        let releases = fetch_feed_releases(
+            state.as_ref(),
+            user_id,
+            mixed_cursor.release.as_ref(),
+            limit,
+        )
+        .await?;
+        let notifications = fetch_feed_notifications(
+            state.as_ref(),
+            user_id,
+            mixed_cursor.notification.as_ref(),
+            limit,
+        )
+        .await?;
+
+        let target_notifs = notif_quota.min(notifications.len() as i64);
+        let target_releases = limit - target_notifs;
+        let interval = if target_notifs > 0 {
+            (target_releases / target_notifs).max(1)
+        } else {
+            i64::MAX
+        };
+
+        let mut rel_q: VecDeque<FeedRow> = VecDeque::from(releases);
+        let mut notif_q: VecDeque<FeedRow> = VecDeque::from(notifications);
+
+        let mut items: Vec<FeedItem> = Vec::with_capacity(limit as usize);
+        let mut out_releases = 0i64;
+        let mut out_notifs = 0i64;
+        let mut since_notif = 0i64;
+
+        let mut next_release_cursor = mixed_cursor.release.clone();
+        let mut next_notif_cursor = mixed_cursor.notification.clone();
+
+        while items.len() < limit as usize && (!rel_q.is_empty() || !notif_q.is_empty()) {
+            let should_take_notif = out_notifs < target_notifs
+                && !notif_q.is_empty()
+                && (since_notif >= interval || rel_q.is_empty() || out_releases >= target_releases);
+
+            if should_take_notif {
+                let r = notif_q.pop_front().expect("notif row");
+                next_notif_cursor = Some(StreamCursor {
+                    sort_ts: r.sort_ts.clone(),
+                    id_key: r.id_key.clone(),
+                });
+                items.push(feed_item_from_row(r, ai_enabled));
+                out_notifs += 1;
+                since_notif = 0;
+                continue;
+            }
+
+            if out_releases < target_releases && !rel_q.is_empty() {
+                let r = rel_q.pop_front().expect("release row");
+                next_release_cursor = Some(StreamCursor {
+                    sort_ts: r.sort_ts.clone(),
+                    id_key: r.id_key.clone(),
+                });
+                items.push(feed_item_from_row(r, ai_enabled));
+                out_releases += 1;
+                since_notif += 1;
+                continue;
+            }
+
+            // If quotas are exhausted, fill from whichever stream still has items.
+            if let Some(r) = rel_q.pop_front() {
+                next_release_cursor = Some(StreamCursor {
+                    sort_ts: r.sort_ts.clone(),
+                    id_key: r.id_key.clone(),
+                });
+                items.push(feed_item_from_row(r, ai_enabled));
+                out_releases += 1;
+                since_notif += 1;
+                continue;
+            }
+            if let Some(r) = notif_q.pop_front() {
+                next_notif_cursor = Some(StreamCursor {
+                    sort_ts: r.sort_ts.clone(),
+                    id_key: r.id_key.clone(),
+                });
+                items.push(feed_item_from_row(r, ai_enabled));
+                out_notifs += 1;
+                since_notif = 0;
+                continue;
+            }
+        }
+
+        let next_cursor = if items.len() < limit as usize {
+            None
+        } else {
+            encode_mixed_cursor(next_release_cursor.as_ref(), next_notif_cursor.as_ref())
+        };
+
+        return Ok(Json(FeedResponse { items, next_cursor }));
+    }
+
     let (cursor_sort_ts, cursor_kind_rank, cursor_id_key) = match cursor {
         Some(c) => {
-            let (sort_ts, kind_rank, id_key) = parse_cursor(c)?;
-            (Some(sort_ts), Some(kind_rank), Some(id_key))
+            // Be liberal in what we accept: the mixed feed cursor can briefly leak into a
+            // single-stream request when switching filters. Parse it and extract the relevant
+            // stream cursor instead of returning 400.
+            let mixed = parse_mixed_cursor(c)?;
+            if include_releases {
+                if let Some(r) = mixed.release {
+                    (Some(r.sort_ts), Some(1), Some(r.id_key))
+                } else {
+                    (None, None, None)
+                }
+            } else if include_notifications {
+                if let Some(n) = mixed.notification {
+                    (Some(n.sort_ts), Some(0), Some(n.id_key))
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            }
         }
         None => (None, None, None),
     };
@@ -617,63 +1079,7 @@ pub async fn list_feed(
         if idx == limit.saturating_sub(1) as usize {
             next_cursor = Some(format!("{}|{}|{}", r.sort_ts, r.kind, r.id_key));
         }
-
-        let source = match r.kind.as_str() {
-            "release" => format!(
-                "kind=release\nrepo={}\ntitle={}\nbody={}\n",
-                r.repo_full_name.as_deref().unwrap_or(""),
-                r.title.as_deref().unwrap_or(""),
-                truncate_chars(r.release_body.as_deref().unwrap_or(""), 6000),
-            ),
-            "notification" => format!(
-                "kind=notification\nrepo={}\ntitle={}\nreason={}\nsubject_type={}\n",
-                r.repo_full_name.as_deref().unwrap_or(""),
-                r.title.as_deref().unwrap_or(""),
-                r.reason.as_deref().unwrap_or(""),
-                r.subject_type.as_deref().unwrap_or(""),
-            ),
-            _ => String::new(),
-        };
-
-        let translated = if !ai_enabled {
-            Some(TranslatedItem {
-                lang: "zh-CN".to_owned(),
-                status: "disabled".to_owned(),
-                title: None,
-                summary: None,
-            })
-        } else {
-            let current_hash = ai::sha256_hex(&source);
-            if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
-                Some(TranslatedItem {
-                    lang: "zh-CN".to_owned(),
-                    status: "ready".to_owned(),
-                    title: r.trans_title,
-                    summary: r.trans_summary,
-                })
-            } else {
-                Some(TranslatedItem {
-                    lang: "zh-CN".to_owned(),
-                    status: "missing".to_owned(),
-                    title: None,
-                    summary: None,
-                })
-            }
-        };
-
-        items.push(FeedItem {
-            kind: r.kind,
-            ts: r.ts,
-            id: r.entity_id,
-            repo_full_name: r.repo_full_name,
-            title: r.title,
-            subtitle: r.subtitle,
-            reason: r.reason,
-            subject_type: r.subject_type,
-            html_url: r.html_url,
-            unread: r.unread,
-            translated,
-        });
+        items.push(feed_item_from_row(r, ai_enabled));
     }
 
     // If we returned fewer than limit, there's no next page.
@@ -706,6 +1112,39 @@ pub struct TranslateResponse {
 struct TranslationJson {
     title_zh: Option<String>,
     summary_md: Option<String>,
+}
+
+fn parse_translation_json(raw: &str) -> Option<TranslationJson> {
+    // Model output is supposed to be a JSON object, but some models occasionally return a JSON
+    // *string* containing the object. Accept both.
+    serde_json::from_str::<TranslationJson>(raw)
+        .ok()
+        .or_else(|| {
+            let inner = serde_json::from_str::<String>(raw).ok()?;
+            serde_json::from_str::<TranslationJson>(&inner).ok()
+        })
+}
+
+fn extract_translation_from_json_blob(raw: &str) -> Option<(Option<String>, Option<String>)> {
+    let parsed = parse_translation_json(raw)?;
+    let title = parsed
+        .title_zh
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let summary = parsed
+        .summary_md
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+
+    if title.is_none() && summary.is_none() {
+        None
+    } else {
+        Some((title, summary))
+    }
 }
 
 struct TranslationUpsert<'a> {
@@ -848,12 +1287,56 @@ pub async fn translate_release(
     if let Some(c) = cached
         && c.source_hash == source_hash
     {
-        return Ok(Json(TranslateResponse {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: c.title,
-            summary: c.summary,
-        }));
+        if let Some(raw) = c.summary.as_deref() {
+            let t = raw.trim_start();
+            if (t.starts_with('{') || t.starts_with("\"{"))
+                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+            {
+                let out_title = t_title.or_else(|| c.title.clone());
+                let out_summary = t_summary.or_else(|| c.summary.clone());
+
+                // Normalize the cache so subsequent requests don't have to parse the blob.
+                upsert_translation(
+                    state.as_ref(),
+                    user_id,
+                    TranslationUpsert {
+                        entity_type: "release",
+                        entity_id: &entity_id,
+                        lang: "zh-CN",
+                        source_hash: &source_hash,
+                        title: out_title.as_deref(),
+                        summary: out_summary.as_deref(),
+                    },
+                )
+                .await?;
+
+                return Ok(Json(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: out_title,
+                    summary: out_summary,
+                }));
+            }
+        }
+
+        // If the cache looks normal, return it. If it looked like a JSON blob and we couldn't
+        // salvage it, fall through and regenerate.
+        let cache_is_json_blob = c
+            .summary
+            .as_deref()
+            .map(|raw| {
+                let t = raw.trim_start();
+                t.starts_with('{') || t.starts_with("\"{")
+            })
+            .unwrap_or(false);
+        if !cache_is_json_blob {
+            return Ok(Json(TranslateResponse {
+                lang: "zh-CN".to_owned(),
+                status: "ready".to_owned(),
+                title: c.title,
+                summary: c.summary,
+            }));
+        }
     }
 
     let prompt = format!(
@@ -872,7 +1355,7 @@ pub async fn translate_release(
     .await
     .map_err(ApiError::internal)?;
 
-    let parsed = serde_json::from_str::<TranslationJson>(&raw).ok();
+    let parsed = parse_translation_json(&raw);
     let out_title = parsed
         .as_ref()
         .and_then(|p| p.title_zh.as_deref())
@@ -998,12 +1481,53 @@ pub async fn translate_notification(
     if let Some(c) = cached
         && c.source_hash == source_hash
     {
-        return Ok(Json(TranslateResponse {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: c.title,
-            summary: c.summary,
-        }));
+        if let Some(raw) = c.summary.as_deref() {
+            let t = raw.trim_start();
+            if (t.starts_with('{') || t.starts_with("\"{"))
+                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+            {
+                let out_title = t_title.or_else(|| c.title.clone());
+                let out_summary = t_summary.or_else(|| c.summary.clone());
+
+                upsert_translation(
+                    state.as_ref(),
+                    user_id,
+                    TranslationUpsert {
+                        entity_type: "notification",
+                        entity_id: thread_id,
+                        lang: "zh-CN",
+                        source_hash: &source_hash,
+                        title: out_title.as_deref(),
+                        summary: out_summary.as_deref(),
+                    },
+                )
+                .await?;
+
+                return Ok(Json(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: out_title,
+                    summary: out_summary,
+                }));
+            }
+        }
+
+        let cache_is_json_blob = c
+            .summary
+            .as_deref()
+            .map(|raw| {
+                let t = raw.trim_start();
+                t.starts_with('{') || t.starts_with("\"{")
+            })
+            .unwrap_or(false);
+        if !cache_is_json_blob {
+            return Ok(Json(TranslateResponse {
+                lang: "zh-CN".to_owned(),
+                status: "ready".to_owned(),
+                title: c.title,
+                summary: c.summary,
+            }));
+        }
     }
 
     let prompt = format!(
@@ -1023,7 +1547,7 @@ pub async fn translate_notification(
     .await
     .map_err(ApiError::internal)?;
 
-    let parsed = serde_json::from_str::<TranslationJson>(&raw).ok();
+    let parsed = parse_translation_json(&raw);
     let out_title = parsed
         .as_ref()
         .and_then(|p| p.title_zh.as_deref())
