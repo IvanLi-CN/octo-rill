@@ -1,6 +1,6 @@
 # OctoRill 产品说明
 
-OctoRill 是一个 GitHub 信息聚合与阅读界面：把你关心的更新（主要是 Releases）和 Inbox（GitHub Notifications）整理成类似 GitHub dashboard 的信息流，并用 AI 自动翻译成用户语言（当前默认中文）。所有可操作入口最终都会跳转回 GitHub 完成操作。
+OctoRill 是一个 GitHub 信息聚合与阅读界面：提供一个 **Releases 信息流**（类似 GitHub dashboard 的阅读体验），并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 **Release 日报** 与 **Inbox（GitHub Notifications）** 的快捷入口。所有可操作入口最终都会跳转回 GitHub 完成操作。
 
 ## 核心体验
 
@@ -54,7 +54,7 @@ OctoRill 是一个 GitHub 信息聚合与阅读界面：把你关心的更新（
 - 同步数据：
   - Starred repos（用于确定关注范围）
   - Releases（用于信息流与日报）
-  - Notifications（用于信息流与侧栏快捷入口）
+  - Notifications（用于 Inbox 列表与侧栏快捷入口）
 
 ## 非目标（本项目不做什么）
 
