@@ -196,22 +196,12 @@ function DashboardPreview() {
 				</section>
 
 				<aside className="space-y-6">
-					{tab === "all" || tab === "releases" || tab === "briefs" ? (
-						<>
-							<BriefListCard
-								briefs={mockBriefs}
-								selectedDate={selectedDate}
-								onSelectDate={(d) => setSelectedDate(d)}
-							/>
-							{tab === "all" || tab === "releases" ? (
-								<ReleaseDailyCard
-									briefs={mockBriefs}
-									selectedDate={selectedDate}
-									busy={false}
-									onGenerate={() => {}}
-								/>
-							) : null}
-						</>
+					{tab === "briefs" ? (
+						<BriefListCard
+							briefs={mockBriefs}
+							selectedDate={selectedDate}
+							onSelectDate={(d) => setSelectedDate(d)}
+						/>
 					) : null}
 					<InboxQuickList notifications={mockNotifs} />
 				</aside>
