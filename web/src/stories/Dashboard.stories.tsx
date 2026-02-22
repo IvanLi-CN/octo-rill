@@ -1,8 +1,10 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 
+import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
+import { InboxList } from "@/inbox/InboxList";
 import { AppShell } from "@/layout/AppShell";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -98,6 +100,8 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview() {
 	const items = makeMockFeed();
 	const inFlightKeys = new Set(["release:10001"]);
+	type Tab = "all" | "releases" | "briefs" | "inbox";
+	const [tab, setTab] = useState<Tab>("all");
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		mockBriefs[0]?.date ?? null,
 	);
@@ -115,7 +119,78 @@ function DashboardPreview() {
 				</div>
 			}
 		>
-			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+				<div className="flex flex-wrap items-center gap-2">
+					<Button
+						variant={tab === "all" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("all")}
+					>
+						全部
+					</Button>
+					<Button
+						variant={tab === "releases" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("releases")}
+					>
+						Releases
+					</Button>
+					<Button
+						variant={tab === "briefs" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("briefs")}
+					>
+						日报
+					</Button>
+					<Button
+						variant={tab === "inbox" ? "default" : "outline"}
+						size="sm"
+						className="font-mono text-xs"
+						onClick={() => setTab("inbox")}
+					>
+						Inbox
+					</Button>
+				</div>
+			</div>
+
+			{tab === "all" ? (
+				<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+					<section className="min-w-0">
+						<FeedList
+							items={items}
+							error={null}
+							loadingInitial={false}
+							loadingMore={false}
+							hasMore={false}
+							inFlightKeys={inFlightKeys}
+							registerItemRef={() => () => {}}
+							onLoadMore={() => {}}
+							showOriginalByKey={{}}
+							onToggleOriginal={() => {}}
+							onTranslateNow={() => {}}
+						/>
+					</section>
+					<aside className="space-y-6">
+						<BriefListCard
+							briefs={mockBriefs}
+							selectedDate={selectedDate}
+							onSelectDate={(d) => setSelectedDate(d)}
+						/>
+						<ReleaseDailyCard
+							briefs={mockBriefs}
+							selectedDate={selectedDate}
+							busy={false}
+							onGenerate={() => {}}
+						/>
+						<InboxQuickList notifications={mockNotifs} />
+					</aside>
+				</div>
+			) : null}
+
+			{tab === "releases" ? (
 				<section className="min-w-0">
 					<FeedList
 						items={items}
@@ -131,21 +206,33 @@ function DashboardPreview() {
 						onTranslateNow={() => {}}
 					/>
 				</section>
-				<aside className="space-y-6">
-					<BriefListCard
-						briefs={mockBriefs}
-						selectedDate={selectedDate}
-						onSelectDate={(d) => setSelectedDate(d)}
-					/>
-					<ReleaseDailyCard
-						briefs={mockBriefs}
-						selectedDate={selectedDate}
-						busy={false}
-						onGenerate={() => {}}
-					/>
-					<InboxQuickList notifications={mockNotifs} />
-				</aside>
-			</div>
+			) : null}
+
+			{tab === "briefs" ? (
+				<div className="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
+					<section className="min-w-0">
+						<BriefListCard
+							briefs={mockBriefs}
+							selectedDate={selectedDate}
+							onSelectDate={(d) => setSelectedDate(d)}
+						/>
+					</section>
+					<section className="min-w-0">
+						<ReleaseDailyCard
+							briefs={mockBriefs}
+							selectedDate={selectedDate}
+							busy={false}
+							onGenerate={() => {}}
+						/>
+					</section>
+				</div>
+			) : null}
+
+			{tab === "inbox" ? (
+				<section className="min-w-0">
+					<InboxList notifications={mockNotifs} />
+				</section>
+			) : null}
 		</AppShell>
 	);
 }
