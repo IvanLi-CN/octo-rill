@@ -272,153 +272,87 @@ export function Dashboard(props: { me: MeResponse }) {
 				) : null}
 			</div>
 
-			{tab === "all" ? (
-				<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-					<section className="min-w-0">
-						{!feed.loadingInitial && feed.items.length === 0 ? (
-							<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-								<h2 className="text-base font-semibold tracking-tight">
-									还没有内容
-								</h2>
-								<p className="text-muted-foreground mt-1 text-sm">
-									先同步 starred，再同步 releases；Inbox 在右侧作为快捷入口。
-									或者直接点 <span className="font-mono">Sync all</span>。
-								</p>
-								<div className="mt-4 flex flex-wrap gap-2">
-									<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-										Sync all
-									</Button>
-									<Button
-										variant="outline"
-										disabled={Boolean(busy)}
-										onClick={onSyncStarred}
-									>
-										Sync starred
-									</Button>
-									<Button
-										variant="outline"
-										disabled={Boolean(busy)}
-										onClick={onSyncReleases}
-									>
-										Sync releases
-									</Button>
-									<Button
-										variant="outline"
-										disabled={Boolean(busy)}
-										onClick={onSyncInbox}
-									>
-										Sync inbox
-									</Button>
-								</div>
-							</div>
-						) : null}
-
-						<FeedList
-							items={feed.items}
-							error={feed.error}
-							loadingInitial={feed.loadingInitial}
-							loadingMore={feed.loadingMore}
-							hasMore={feed.hasMore}
-							inFlightKeys={inFlightKeys}
-							registerItemRef={register}
-							onLoadMore={feed.loadMore}
-							showOriginalByKey={showOriginalByKey}
-							onToggleOriginal={onToggleOriginal}
-							onTranslateNow={onTranslateNow}
-						/>
-					</section>
-
-					<aside className="space-y-6">
-						<BriefListCard
-							briefs={briefs}
-							selectedDate={selectedBriefDate}
-							onSelectDate={(d) => setSelectedBriefDate(d)}
-						/>
-						<ReleaseDailyCard
-							briefs={briefs}
-							selectedDate={selectedBriefDate}
-							busy={busy === "Generate brief"}
-							onGenerate={onGenerateBrief}
-						/>
-						<InboxQuickList notifications={notifications} />
-					</aside>
-				</div>
-			) : null}
-
-			{tab === "releases" ? (
+			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
 				<section className="min-w-0">
-					{!feed.loadingInitial && feed.items.length === 0 ? (
-						<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-							<h2 className="text-base font-semibold tracking-tight">
-								还没有内容
-							</h2>
-							<p className="text-muted-foreground mt-1 text-sm">
-								先同步 starred，再同步 releases；或者直接点{" "}
-								<span className="font-mono">Sync all</span>。
-							</p>
-							<div className="mt-4 flex flex-wrap gap-2">
-								<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-									Sync all
-								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncStarred}
-								>
-									Sync starred
-								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncReleases}
-								>
-									Sync releases
-								</Button>
-							</div>
+					{tab === "all" || tab === "releases" ? (
+						<>
+							{!feed.loadingInitial && feed.items.length === 0 ? (
+								<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+									<h2 className="text-base font-semibold tracking-tight">
+										还没有内容
+									</h2>
+									<p className="text-muted-foreground mt-1 text-sm">
+										先同步 starred，再同步 releases；右侧是 Inbox 快捷入口。
+										或者直接点 <span className="font-mono">Sync all</span>。
+									</p>
+									<div className="mt-4 flex flex-wrap gap-2">
+										<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+											Sync all
+										</Button>
+										<Button
+											variant="outline"
+											disabled={Boolean(busy)}
+											onClick={onSyncStarred}
+										>
+											Sync starred
+										</Button>
+										<Button
+											variant="outline"
+											disabled={Boolean(busy)}
+											onClick={onSyncReleases}
+										>
+											Sync releases
+										</Button>
+										<Button
+											variant="outline"
+											disabled={Boolean(busy)}
+											onClick={onSyncInbox}
+										>
+											Sync inbox
+										</Button>
+									</div>
+								</div>
+							) : null}
+
+							<FeedList
+								items={feed.items}
+								error={feed.error}
+								loadingInitial={feed.loadingInitial}
+								loadingMore={feed.loadingMore}
+								hasMore={feed.hasMore}
+								inFlightKeys={inFlightKeys}
+								registerItemRef={register}
+								onLoadMore={feed.loadMore}
+								showOriginalByKey={showOriginalByKey}
+								onToggleOriginal={onToggleOriginal}
+								onTranslateNow={onTranslateNow}
+							/>
+						</>
+					) : null}
+
+					{tab === "briefs" ? (
+						<div className="space-y-6">
+							<BriefListCard
+								briefs={briefs}
+								selectedDate={selectedBriefDate}
+								onSelectDate={(d) => setSelectedBriefDate(d)}
+							/>
+							<ReleaseDailyCard
+								briefs={briefs}
+								selectedDate={selectedBriefDate}
+								busy={busy === "Generate brief"}
+								onGenerate={onGenerateBrief}
+							/>
 						</div>
 					) : null}
 
-					<FeedList
-						items={feed.items}
-						error={feed.error}
-						loadingInitial={feed.loadingInitial}
-						loadingMore={feed.loadingMore}
-						hasMore={feed.hasMore}
-						inFlightKeys={inFlightKeys}
-						registerItemRef={register}
-						onLoadMore={feed.loadMore}
-						showOriginalByKey={showOriginalByKey}
-						onToggleOriginal={onToggleOriginal}
-						onTranslateNow={onTranslateNow}
-					/>
+					{tab === "inbox" ? <InboxList notifications={notifications} /> : null}
 				</section>
-			) : null}
 
-			{tab === "briefs" ? (
-				<div className="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
-					<section className="min-w-0">
-						<BriefListCard
-							briefs={briefs}
-							selectedDate={selectedBriefDate}
-							onSelectDate={(d) => setSelectedBriefDate(d)}
-						/>
-					</section>
-					<section className="min-w-0">
-						<ReleaseDailyCard
-							briefs={briefs}
-							selectedDate={selectedBriefDate}
-							busy={busy === "Generate brief"}
-							onGenerate={onGenerateBrief}
-						/>
-					</section>
-				</div>
-			) : null}
-
-			{tab === "inbox" ? (
-				<section className="min-w-0">
-					<InboxList notifications={notifications} />
-				</section>
-			) : null}
+				<aside className="space-y-6">
+					<InboxQuickList notifications={notifications} />
+				</aside>
+			</div>
 		</AppShell>
 	);
 }
