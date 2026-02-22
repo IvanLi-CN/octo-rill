@@ -21,6 +21,9 @@ Thumbs.db
 logs/
 *.log
 
+# Scratch
+/tmp/
+
 # Bun/Node
 node_modules/
 web/node_modules/
