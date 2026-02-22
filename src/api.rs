@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use axum::extract::Query;
 use axum::{Json, extract::State, http::StatusCode};
@@ -426,23 +426,23 @@ fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
     Ok((sort_ts, kind_rank, id_key))
 }
 
-fn parse_types(types: Option<String>) -> Result<(bool, bool), ApiError> {
+fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
+    // Feed is releases-only. Inbox belongs to its own API (`/api/notifications`) and UI tab.
     let Some(types) = types else {
-        return Ok((true, true));
+        return Ok(());
     };
-    let mut include_releases = false;
-    let mut include_notifications = false;
     for part in types.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         match part {
-            "releases" | "release" => include_releases = true,
-            "notifications" | "notification" | "inbox" => include_notifications = true,
+            "releases" | "release" => {}
+            "notifications" | "notification" | "inbox" => {
+                return Err(ApiError::bad_request(
+                    "feed only supports releases; use /api/notifications for inbox items",
+                ));
+            }
             _ => return Err(ApiError::bad_request(format!("invalid types: {part}"))),
         }
     }
-    if !include_releases && !include_notifications {
-        return Err(ApiError::bad_request("types is empty"));
-    }
-    Ok((include_releases, include_notifications))
+    Ok(())
 }
 
 fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str> {
@@ -460,11 +460,6 @@ struct StreamCursor {
 }
 
 #[derive(Debug, Clone)]
-struct MixedCursor {
-    release: Option<StreamCursor>,
-    notification: Option<StreamCursor>,
-}
-
 fn parse_stream_cursor(raw: &str) -> Result<StreamCursor, ApiError> {
     let mut it = raw.split('|');
     let sort_ts = it
@@ -483,69 +478,43 @@ fn parse_stream_cursor(raw: &str) -> Result<StreamCursor, ApiError> {
     Ok(StreamCursor { sort_ts, id_key })
 }
 
-fn parse_mixed_cursor(cursor: &str) -> Result<MixedCursor, ApiError> {
-    let mut out = MixedCursor {
-        release: None,
-        notification: None,
-    };
-
+fn parse_release_cursor(cursor: &str) -> Result<Option<StreamCursor>, ApiError> {
     let mut recognized = false;
+    let mut release: Option<StreamCursor> = None;
+
     for part in cursor
         .split(';')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
         if let Some(v) = part.strip_prefix("r=") {
-            out.release = Some(parse_stream_cursor(v)?);
+            release = Some(parse_stream_cursor(v)?);
             recognized = true;
             continue;
         }
         if let Some(v) = part.strip_prefix("release=") {
-            out.release = Some(parse_stream_cursor(v)?);
+            release = Some(parse_stream_cursor(v)?);
             recognized = true;
             continue;
         }
-        if let Some(v) = part.strip_prefix("n=") {
-            out.notification = Some(parse_stream_cursor(v)?);
-            recognized = true;
-            continue;
-        }
-        if let Some(v) = part.strip_prefix("notification=") {
-            out.notification = Some(parse_stream_cursor(v)?);
+
+        // Ignore notification parts from legacy mixed cursors; feed is releases-only.
+        if part.starts_with("n=") || part.starts_with("notification=") {
             recognized = true;
             continue;
         }
     }
 
     if recognized {
-        return Ok(out);
+        return Ok(release);
     }
 
     // Backward-compat: previous cursor format was "<sort_ts>|<kind>|<id_key>".
     let (sort_ts, kind_rank, id_key) = parse_cursor(cursor)?;
     match kind_rank {
-        1 => out.release = Some(StreamCursor { sort_ts, id_key }),
-        0 => out.notification = Some(StreamCursor { sort_ts, id_key }),
-        _ => {}
-    }
-    Ok(out)
-}
-
-fn encode_mixed_cursor(
-    release: Option<&StreamCursor>,
-    notification: Option<&StreamCursor>,
-) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(r) = release {
-        parts.push(format!("r={}|{}", r.sort_ts, r.id_key));
-    }
-    if let Some(n) = notification {
-        parts.push(format!("n={}|{}", n.sort_ts, n.id_key));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(";"))
+        1 => Ok(Some(StreamCursor { sort_ts, id_key })),
+        0 => Ok(None),
+        _ => Ok(None),
     }
 }
 
@@ -586,83 +555,6 @@ async fn fetch_feed_releases(
         FROM items i
         LEFT JOIN ai_translations t
           ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
-    "#;
-
-    let (sql, has_cursor) = if cursor.is_some() {
-        (
-            format!(
-                r#"
-                {base_sql}
-                WHERE (
-                  i.sort_ts < ?
-                  OR (i.sort_ts = ? AND i.id_key < ?)
-                )
-                ORDER BY i.sort_ts DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            true,
-        )
-    } else {
-        (
-            format!(
-                r#"
-                {base_sql}
-                ORDER BY i.sort_ts DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            false,
-        )
-    };
-
-    let mut qy = sqlx::query_as::<_, FeedRow>(&sql)
-        .bind(user_id)
-        .bind(user_id);
-    if has_cursor {
-        let c = cursor.expect("cursor");
-        qy = qy.bind(&c.sort_ts).bind(&c.sort_ts).bind(&c.id_key);
-    }
-    qy = qy.bind(limit);
-
-    qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
-}
-
-async fn fetch_feed_notifications(
-    state: &AppState,
-    user_id: i64,
-    cursor: Option<&StreamCursor>,
-    limit: i64,
-) -> Result<Vec<FeedRow>, ApiError> {
-    let base_sql = r#"
-        WITH items AS (
-          SELECT
-            'notification' AS kind,
-            COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS sort_ts,
-            COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS ts,
-            n.thread_id AS id_key,
-            n.thread_id AS entity_id,
-            n.repo_full_name AS repo_full_name,
-            n.subject_title AS title,
-            n.reason AS subtitle,
-            n.reason AS reason,
-            n.subject_type AS subject_type,
-            ('https://github.com/notifications/thread/' || n.thread_id) AS html_url,
-            n.unread AS unread,
-            NULL AS release_body
-          FROM notifications n
-          WHERE n.user_id = ?
-        )
-        SELECT
-          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
-          i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
-          i.release_body,
-          t.source_hash AS trans_source_hash,
-          t.title AS trans_title,
-          t.summary AS trans_summary
-        FROM items i
-        LEFT JOIN ai_translations t
-          ON t.user_id = ? AND t.entity_type = 'notification' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
     "#;
 
     let (sql, has_cursor) = if cursor.is_some() {
@@ -795,289 +687,27 @@ pub async fn list_feed(
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<FeedResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
-    let (include_releases, include_notifications) = parse_types(q.types)?;
+    validate_feed_types(q.types.as_deref())?;
 
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    // For the mixed feed, ensure both kinds are visible near the top even if one stream is much
-    // "hotter" than the other. We do this by fetching each stream separately and interleaving.
-    if include_releases && include_notifications {
-        let ai_enabled = state.config.ai.is_some();
-        let mixed_cursor = match cursor {
-            Some(c) => parse_mixed_cursor(c)?,
-            None => MixedCursor {
-                release: None,
-                notification: None,
-            },
-        };
-
-        let notif_quota = (limit / 5).clamp(1, 10);
-
-        let releases = fetch_feed_releases(
-            state.as_ref(),
-            user_id,
-            mixed_cursor.release.as_ref(),
-            limit,
-        )
-        .await?;
-        let notifications = fetch_feed_notifications(
-            state.as_ref(),
-            user_id,
-            mixed_cursor.notification.as_ref(),
-            limit,
-        )
-        .await?;
-
-        let target_notifs = notif_quota.min(notifications.len() as i64);
-        let target_releases = limit - target_notifs;
-        let interval = if target_notifs > 0 {
-            (target_releases / target_notifs).max(1)
-        } else {
-            i64::MAX
-        };
-
-        let mut rel_q: VecDeque<FeedRow> = VecDeque::from(releases);
-        let mut notif_q: VecDeque<FeedRow> = VecDeque::from(notifications);
-
-        let mut items: Vec<FeedItem> = Vec::with_capacity(limit as usize);
-        let mut out_releases = 0i64;
-        let mut out_notifs = 0i64;
-        let mut since_notif = 0i64;
-
-        let mut next_release_cursor = mixed_cursor.release.clone();
-        let mut next_notif_cursor = mixed_cursor.notification.clone();
-
-        while items.len() < limit as usize && (!rel_q.is_empty() || !notif_q.is_empty()) {
-            let should_take_notif = out_notifs < target_notifs
-                && !notif_q.is_empty()
-                && (since_notif >= interval || rel_q.is_empty() || out_releases >= target_releases);
-
-            if should_take_notif {
-                let r = notif_q.pop_front().expect("notif row");
-                next_notif_cursor = Some(StreamCursor {
-                    sort_ts: r.sort_ts.clone(),
-                    id_key: r.id_key.clone(),
-                });
-                items.push(feed_item_from_row(r, ai_enabled));
-                out_notifs += 1;
-                since_notif = 0;
-                continue;
-            }
-
-            if out_releases < target_releases && !rel_q.is_empty() {
-                let r = rel_q.pop_front().expect("release row");
-                next_release_cursor = Some(StreamCursor {
-                    sort_ts: r.sort_ts.clone(),
-                    id_key: r.id_key.clone(),
-                });
-                items.push(feed_item_from_row(r, ai_enabled));
-                out_releases += 1;
-                since_notif += 1;
-                continue;
-            }
-
-            // If quotas are exhausted, fill from whichever stream still has items.
-            if let Some(r) = rel_q.pop_front() {
-                next_release_cursor = Some(StreamCursor {
-                    sort_ts: r.sort_ts.clone(),
-                    id_key: r.id_key.clone(),
-                });
-                items.push(feed_item_from_row(r, ai_enabled));
-                out_releases += 1;
-                since_notif += 1;
-                continue;
-            }
-            if let Some(r) = notif_q.pop_front() {
-                next_notif_cursor = Some(StreamCursor {
-                    sort_ts: r.sort_ts.clone(),
-                    id_key: r.id_key.clone(),
-                });
-                items.push(feed_item_from_row(r, ai_enabled));
-                out_notifs += 1;
-                since_notif = 0;
-                continue;
-            }
-        }
-
-        let next_cursor = if items.len() < limit as usize {
-            None
-        } else {
-            encode_mixed_cursor(next_release_cursor.as_ref(), next_notif_cursor.as_ref())
-        };
-
-        return Ok(Json(FeedResponse { items, next_cursor }));
-    }
-
-    let (cursor_sort_ts, cursor_kind_rank, cursor_id_key) = match cursor {
-        Some(c) => {
-            // Be liberal in what we accept: the mixed feed cursor can briefly leak into a
-            // single-stream request when switching filters. Parse it and extract the relevant
-            // stream cursor instead of returning 400.
-            let mixed = parse_mixed_cursor(c)?;
-            if include_releases {
-                if let Some(r) = mixed.release {
-                    (Some(r.sort_ts), Some(1), Some(r.id_key))
-                } else {
-                    (None, None, None)
-                }
-            } else if include_notifications {
-                if let Some(n) = mixed.notification {
-                    (Some(n.sort_ts), Some(0), Some(n.id_key))
-                } else {
-                    (None, None, None)
-                }
-            } else {
-                (None, None, None)
-            }
-        }
-        None => (None, None, None),
+    // Accept legacy cursors from the previous "mixed feed" implementation, but only use the
+    // release stream cursor since feed is now releases-only.
+    let release_cursor = match cursor {
+        Some(c) => parse_release_cursor(c)?,
+        None => None,
     };
 
-    let release_sql = r#"
-        SELECT
-          'release' AS kind,
-          1 AS kind_rank,
-          COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
-          COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
-          printf('%020d', r.release_id) AS id_key,
-          CAST(r.release_id AS TEXT) AS entity_id,
-          sr.full_name AS repo_full_name,
-          COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
-          NULL AS subtitle,
-          NULL AS reason,
-          NULL AS subject_type,
-          r.html_url AS html_url,
-          NULL AS unread,
-          r.body AS release_body
-        FROM releases r
-        JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = ?
-    "#;
-
-    let notif_sql = r#"
-        SELECT
-          'notification' AS kind,
-          0 AS kind_rank,
-          -- Sort by GitHub update time when available, so inbox items interleave with releases
-          -- instead of being pinned by initial sync time.
-          COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS sort_ts,
-          COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS ts,
-          n.thread_id AS id_key,
-          n.thread_id AS entity_id,
-          n.repo_full_name AS repo_full_name,
-          n.subject_title AS title,
-          n.reason AS subtitle,
-          n.reason AS reason,
-          n.subject_type AS subject_type,
-          ('https://github.com/notifications/thread/' || n.thread_id) AS html_url,
-          n.unread AS unread,
-          NULL AS release_body
-        FROM notifications n
-        WHERE n.user_id = ?
-    "#;
-
-    let mut parts: Vec<&str> = Vec::new();
-    if include_releases {
-        parts.push(release_sql);
-    }
-    if include_notifications {
-        parts.push(notif_sql);
-    }
-
-    let inner = parts.join("\nUNION ALL\n");
-
-    let (sql, has_cursor) = if cursor_sort_ts.is_some() {
-        (
-            format!(
-                r#"
-                WITH items AS (
-                {inner}
-                )
-                SELECT
-                  i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
-                  i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
-                  i.release_body,
-                  t.source_hash AS trans_source_hash,
-                  t.title AS trans_title,
-                  t.summary AS trans_summary
-                FROM items i
-                LEFT JOIN ai_translations t
-                  ON t.user_id = ? AND t.entity_type = i.kind AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
-                WHERE (
-                  i.sort_ts < ?
-                  OR (i.sort_ts = ? AND i.kind_rank < ?)
-                  OR (i.sort_ts = ? AND i.kind_rank = ? AND i.id_key < ?)
-                )
-                ORDER BY i.sort_ts DESC, i.kind_rank DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            true,
-        )
-    } else {
-        (
-            format!(
-                r#"
-                WITH items AS (
-                {inner}
-                )
-                SELECT
-                  i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
-                  i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
-                  i.release_body,
-                  t.source_hash AS trans_source_hash,
-                  t.title AS trans_title,
-                  t.summary AS trans_summary
-                FROM items i
-                LEFT JOIN ai_translations t
-                  ON t.user_id = ? AND t.entity_type = i.kind AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
-                ORDER BY i.sort_ts DESC, i.kind_rank DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            false,
-        )
-    };
-
-    let mut qy = sqlx::query_as::<_, FeedRow>(&sql);
-    // binds for inner query
-    if include_releases {
-        qy = qy.bind(user_id);
-    }
-    if include_notifications {
-        qy = qy.bind(user_id);
-    }
-    // bind for translation join
-    qy = qy.bind(user_id);
-    // binds for cursor
-    if has_cursor {
-        let sort_ts = cursor_sort_ts.as_ref().expect("cursor sort_ts");
-        let kind_rank = cursor_kind_rank.expect("cursor kind_rank");
-        let id_key = cursor_id_key.as_ref().expect("cursor id_key");
-        qy = qy
-            .bind(sort_ts)
-            .bind(sort_ts)
-            .bind(kind_rank)
-            .bind(sort_ts)
-            .bind(kind_rank)
-            .bind(id_key);
-    }
-    qy = qy.bind(limit);
-
-    let rows = qy
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-
+    let rows = fetch_feed_releases(state.as_ref(), user_id, release_cursor.as_ref(), limit).await?;
     let ai_enabled = state.config.ai.is_some();
 
     let mut items = Vec::with_capacity(rows.len());
     let mut next_cursor: Option<String> = None;
     for (idx, r) in rows.into_iter().enumerate() {
         if idx == limit.saturating_sub(1) as usize {
-            next_cursor = Some(format!("{}|{}|{}", r.sort_ts, r.kind, r.id_key));
+            // Cursor format: "<sort_ts>|release|<id_key>" (backward compatible with parse_cursor).
+            next_cursor = Some(format!("{}|release|{}", r.sort_ts, r.id_key));
         }
         items.push(feed_item_from_row(r, ai_enabled));
     }
