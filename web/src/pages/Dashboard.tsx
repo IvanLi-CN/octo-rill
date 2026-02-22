@@ -7,6 +7,7 @@ import type { FeedItem } from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { AppShell } from "@/layout/AppShell";
+import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
 	type NotificationItem,
@@ -326,10 +327,14 @@ export function Dashboard(props: { me: MeResponse }) {
 				</section>
 
 				<aside className="space-y-6">
-					<ReleaseDailyCard
+					<BriefListCard
 						briefs={briefs}
 						selectedDate={selectedBriefDate}
 						onSelectDate={(d) => setSelectedBriefDate(d)}
+					/>
+					<ReleaseDailyCard
+						briefs={briefs}
+						selectedDate={selectedBriefDate}
 						busy={busy === "Generate brief"}
 						onGenerate={onGenerateBrief}
 					/>

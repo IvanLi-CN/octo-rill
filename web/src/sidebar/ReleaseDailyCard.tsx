@@ -9,7 +9,6 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
 
 export type BriefItem = {
 	date: string;
@@ -27,11 +26,10 @@ function formatWindow(brief: BriefItem) {
 export function ReleaseDailyCard(props: {
 	briefs: BriefItem[];
 	selectedDate: string | null;
-	onSelectDate: (date: string) => void;
 	busy: boolean;
 	onGenerate: () => void;
 }) {
-	const { briefs, selectedDate, onSelectDate, busy, onGenerate } = props;
+	const { briefs, selectedDate, busy, onGenerate } = props;
 
 	const selected = (() => {
 		if (selectedDate) {
@@ -42,7 +40,6 @@ export function ReleaseDailyCard(props: {
 	})();
 
 	const windowText = selected ? formatWindow(selected) : null;
-	const list = briefs.slice(0, 10);
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
@@ -75,47 +72,18 @@ export function ReleaseDailyCard(props: {
 			</CardHeader>
 
 			<CardContent className="pt-0">
-				{briefs.length > 0 ? (
-					<div className="space-y-3">
-						<div className="space-y-2">
-							<p className="text-muted-foreground font-mono text-[11px]">
-								日报列表（最近 {list.length} / 共 {briefs.length}）
-							</p>
-							<div className="max-h-28 space-y-1 overflow-auto rounded-lg border bg-background/30 p-2">
-								{list.map((b) => {
-									const active = selected?.date === b.date;
-									return (
-										<button
-											key={b.date}
-											type="button"
-											onClick={() => onSelectDate(b.date)}
-											className={cn(
-												"flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs transition-colors hover:bg-background",
-												active
-													? "border-primary/40 bg-background"
-													: "border-transparent bg-background/40",
-											)}
-										>
-											<span className={active ? "text-foreground" : ""}>
-												#{b.date}
-											</span>
-											<span className="text-muted-foreground truncate text-[11px]">
-												{b.created_at.replace("T", " ").replace("Z", "")}
-											</span>
-										</button>
-									);
-								})}
-							</div>
-						</div>
-
-						<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
-							<Markdown content={selected?.content_markdown ?? ""} />
-						</div>
-					</div>
-				) : (
+				{briefs.length === 0 ? (
 					<p className="text-muted-foreground text-sm">
 						提示：日报基于 <code>AI_DAILY_AT_LOCAL</code>{" "}
 						的时间边界统计“昨日更新”。
+					</p>
+				) : selected ? (
+					<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
+						<Markdown content={selected.content_markdown} />
+					</div>
+				) : (
+					<p className="text-muted-foreground text-sm">
+						请选择一条日报查看内容。
 					</p>
 				)}
 			</CardContent>

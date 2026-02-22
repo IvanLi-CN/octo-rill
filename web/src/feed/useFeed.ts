@@ -74,7 +74,15 @@ export function useFeed(params?: { types: string | null }) {
 	}, [typesParam]);
 
 	const loadMore = useCallback(async () => {
-		if (!nextCursor || loadingMore) return;
+		if (!nextCursor || loadingMore || loadingInitial) return;
+
+		// When switching filters, IntersectionObserver can fire before `loadInitial` resets the
+		// cursor. Avoid sending a mixed cursor to a single-stream endpoint (or vice versa).
+		const looksLikeMixedCursor =
+			nextCursor.includes("r=") ||
+			nextCursor.includes("n=") ||
+			nextCursor.includes(";");
+		if (types && looksLikeMixedCursor) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
 		setError(null);
@@ -91,7 +99,7 @@ export function useFeed(params?: { types: string | null }) {
 		} finally {
 			setLoadingMore(false);
 		}
-	}, [nextCursor, loadingMore, typesParam]);
+	}, [nextCursor, loadingMore, loadingInitial, types, typesParam]);
 
 	const refresh = useCallback(async () => {
 		await loadInitial();

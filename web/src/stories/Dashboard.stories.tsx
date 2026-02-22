@@ -4,6 +4,7 @@ import { useState } from "react";
 import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
 import { AppShell } from "@/layout/AppShell";
+import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
 	type NotificationItem,
@@ -149,10 +150,14 @@ function DashboardPreview() {
 					/>
 				</section>
 				<aside className="space-y-6">
-					<ReleaseDailyCard
+					<BriefListCard
 						briefs={mockBriefs}
 						selectedDate={selectedDate}
 						onSelectDate={(d) => setSelectedDate(d)}
+					/>
+					<ReleaseDailyCard
+						briefs={mockBriefs}
+						selectedDate={selectedDate}
 						busy={false}
 						onGenerate={() => {}}
 					/>
