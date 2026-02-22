@@ -37,7 +37,7 @@ export function FeedList(props: {
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
 
 	useEffect(() => {
-		if (!hasMore) return;
+		if (!hasMore || loadingInitial || loadingMore) return;
 		const el = sentinelRef.current;
 		if (!el) return;
 
@@ -50,7 +50,7 @@ export function FeedList(props: {
 
 		obs.observe(el);
 		return () => obs.disconnect();
-	}, [hasMore, onLoadMore]);
+	}, [hasMore, loadingInitial, loadingMore, onLoadMore]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
 
