@@ -360,6 +360,7 @@ pub struct FeedItem {
     id: String,
     repo_full_name: Option<String>,
     title: Option<String>,
+    excerpt: Option<String>,
     subtitle: Option<String>,
     reason: Option<String>,
     subject_type: Option<String>,
@@ -451,6 +452,85 @@ fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str>
     } else {
         std::borrow::Cow::Borrowed(s)
     }
+}
+
+fn release_excerpt(body: Option<&str>) -> Option<String> {
+    let body = body?;
+    let normalized = body.replace("\r\n", "\n");
+
+    // Prefer a short bullet list if present; it reads well in a feed item.
+    let mut bullets: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for raw in normalized.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        let item = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(item) = item {
+            bullets.push(truncate_chars(item, 220).into_owned());
+            if bullets.len() >= 6 {
+                break;
+            }
+        }
+    }
+
+    if !bullets.is_empty() {
+        let mut out = String::new();
+        for (idx, b) in bullets.into_iter().enumerate() {
+            if idx > 0 {
+                out.push('\n');
+            }
+            out.push_str("- ");
+            out.push_str(b.trim());
+        }
+        return Some(truncate_chars(&out, 900).into_owned());
+    }
+
+    // Fallback: first paragraph-like snippet, excluding code fences.
+    let mut parts: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for raw in normalized.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            if !parts.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        // Skip headings; they usually duplicate the title and are noisy in the feed body.
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        parts.push(trimmed.to_owned());
+        if parts.len() >= 4 {
+            break;
+        }
+    }
+
+    let joined = parts.join(" ").trim().to_owned();
+    if joined.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&joined, 900).into_owned())
 }
 
 #[derive(Debug, Clone)]
@@ -597,6 +677,11 @@ async fn fetch_feed_releases(
 }
 
 fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
+    let excerpt = match r.kind.as_str() {
+        "release" => release_excerpt(r.release_body.as_deref()),
+        _ => None,
+    };
+
     let source = match r.kind.as_str() {
         "release" => format!(
             "kind=release\nrepo={}\ntitle={}\nbody={}\n",
@@ -671,6 +756,7 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         id: r.entity_id,
         repo_full_name: r.repo_full_name,
         title: r.title,
+        excerpt,
         subtitle: r.subtitle,
         reason: r.reason,
         subject_type: r.subject_type,
