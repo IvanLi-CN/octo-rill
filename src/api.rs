@@ -379,6 +379,7 @@ pub struct TranslatedItem {
 #[derive(Debug, sqlx::FromRow)]
 struct FeedRow {
     kind: String,
+    sort_ts: String,
     ts: String,
     id_key: String,
     entity_id: String,
@@ -397,7 +398,7 @@ struct FeedRow {
 
 fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
     let mut it = cursor.split('|');
-    let ts = it
+    let sort_ts = it
         .next()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
@@ -422,7 +423,7 @@ fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
         _ => return Err(ApiError::bad_request("invalid cursor kind")),
     };
 
-    Ok((ts, kind_rank, id_key))
+    Ok((sort_ts, kind_rank, id_key))
 }
 
 fn parse_types(types: Option<String>) -> Result<(bool, bool), ApiError> {
@@ -463,10 +464,10 @@ pub async fn list_feed(
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    let (cursor_ts, cursor_kind_rank, cursor_id_key) = match cursor {
+    let (cursor_sort_ts, cursor_kind_rank, cursor_id_key) = match cursor {
         Some(c) => {
-            let (ts, kind_rank, id_key) = parse_cursor(c)?;
-            (Some(ts), Some(kind_rank), Some(id_key))
+            let (sort_ts, kind_rank, id_key) = parse_cursor(c)?;
+            (Some(sort_ts), Some(kind_rank), Some(id_key))
         }
         None => (None, None, None),
     };
@@ -475,6 +476,7 @@ pub async fn list_feed(
         SELECT
           'release' AS kind,
           1 AS kind_rank,
+          COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
           COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
           printf('%020d', r.release_id) AS id_key,
           CAST(r.release_id AS TEXT) AS entity_id,
@@ -496,7 +498,8 @@ pub async fn list_feed(
         SELECT
           'notification' AS kind,
           0 AS kind_rank,
-          COALESCE(n.updated_at, n.last_seen_at) AS ts,
+          COALESCE(n.last_seen_at, n.updated_at, '1970-01-01T00:00:00Z') AS sort_ts,
+          COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS ts,
           n.thread_id AS id_key,
           n.thread_id AS entity_id,
           n.repo_full_name AS repo_full_name,
@@ -521,7 +524,7 @@ pub async fn list_feed(
 
     let inner = parts.join("\nUNION ALL\n");
 
-    let (sql, has_cursor) = if cursor_ts.is_some() {
+    let (sql, has_cursor) = if cursor_sort_ts.is_some() {
         (
             format!(
                 r#"
@@ -529,7 +532,7 @@ pub async fn list_feed(
                 {inner}
                 )
                 SELECT
-                  i.kind, i.ts, i.id_key, i.entity_id,
+                  i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
                   i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
                   i.release_body,
                   t.source_hash AS trans_source_hash,
@@ -539,11 +542,11 @@ pub async fn list_feed(
                 LEFT JOIN ai_translations t
                   ON t.user_id = ? AND t.entity_type = i.kind AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
                 WHERE (
-                  i.ts < ?
-                  OR (i.ts = ? AND i.kind_rank < ?)
-                  OR (i.ts = ? AND i.kind_rank = ? AND i.id_key < ?)
+                  i.sort_ts < ?
+                  OR (i.sort_ts = ? AND i.kind_rank < ?)
+                  OR (i.sort_ts = ? AND i.kind_rank = ? AND i.id_key < ?)
                 )
-                ORDER BY i.ts DESC, i.kind_rank DESC, i.id_key DESC
+                ORDER BY i.sort_ts DESC, i.kind_rank DESC, i.id_key DESC
                 LIMIT ?
                 "#
             ),
@@ -557,7 +560,7 @@ pub async fn list_feed(
                 {inner}
                 )
                 SELECT
-                  i.kind, i.ts, i.id_key, i.entity_id,
+                  i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
                   i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
                   i.release_body,
                   t.source_hash AS trans_source_hash,
@@ -566,7 +569,7 @@ pub async fn list_feed(
                 FROM items i
                 LEFT JOIN ai_translations t
                   ON t.user_id = ? AND t.entity_type = i.kind AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
-                ORDER BY i.ts DESC, i.kind_rank DESC, i.id_key DESC
+                ORDER BY i.sort_ts DESC, i.kind_rank DESC, i.id_key DESC
                 LIMIT ?
                 "#
             ),
@@ -586,14 +589,14 @@ pub async fn list_feed(
     qy = qy.bind(user_id);
     // binds for cursor
     if has_cursor {
-        let ts = cursor_ts.as_ref().expect("cursor ts");
+        let sort_ts = cursor_sort_ts.as_ref().expect("cursor sort_ts");
         let kind_rank = cursor_kind_rank.expect("cursor kind_rank");
         let id_key = cursor_id_key.as_ref().expect("cursor id_key");
         qy = qy
-            .bind(ts)
-            .bind(ts)
+            .bind(sort_ts)
+            .bind(sort_ts)
             .bind(kind_rank)
-            .bind(ts)
+            .bind(sort_ts)
             .bind(kind_rank)
             .bind(id_key);
     }
@@ -610,7 +613,7 @@ pub async fn list_feed(
     let mut next_cursor: Option<String> = None;
     for (idx, r) in rows.into_iter().enumerate() {
         if idx == limit.saturating_sub(1) as usize {
-            next_cursor = Some(format!("{}|{}|{}", r.ts, r.kind, r.id_key));
+            next_cursor = Some(format!("{}|{}|{}", r.sort_ts, r.kind, r.id_key));
         }
 
         let source = match r.kind.as_str() {
