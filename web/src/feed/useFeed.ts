@@ -27,10 +27,7 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 	return out;
 }
 
-export function useFeed(params?: { types: string | null }) {
-	const types = params?.types ?? null;
-	const typesParam = types ? `&types=${encodeURIComponent(types)}` : "";
-
+export function useFeed() {
 	const [items, setItems] = useState<FeedItem[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(false);
@@ -38,7 +35,6 @@ export function useFeed(params?: { types: string | null }) {
 	const [error, setError] = useState<string | null>(null);
 
 	const reqIdRef = useRef(0);
-	const lastTypesParamRef = useRef<string>("");
 
 	const hasMore = Boolean(nextCursor);
 
@@ -49,17 +45,10 @@ export function useFeed(params?: { types: string | null }) {
 		// Cancel any in-flight "load more" state; we are replacing the list.
 		setLoadingMore(false);
 
-		// Avoid flashing wrong results when switching filters (types).
-		if (lastTypesParamRef.current !== typesParam) {
-			lastTypesParamRef.current = typesParam;
-			setItems([]);
-			setNextCursor(null);
-		}
-
 		setLoadingInitial(true);
 		setError(null);
 		try {
-			const res = await apiGet<FeedResponse>(`/api/feed?limit=30${typesParam}`);
+			const res = await apiGet<FeedResponse>("/api/feed?limit=30");
 			if (reqId !== reqIdRef.current) return;
 			setItems(res.items);
 			setNextCursor(res.next_cursor);
@@ -71,24 +60,16 @@ export function useFeed(params?: { types: string | null }) {
 				setLoadingInitial(false);
 			}
 		}
-	}, [typesParam]);
+	}, []);
 
 	const loadMore = useCallback(async () => {
 		if (!nextCursor || loadingMore || loadingInitial) return;
-
-		// When switching filters, IntersectionObserver can fire before `loadInitial` resets the
-		// cursor. Avoid sending a mixed cursor to a single-stream endpoint (or vice versa).
-		const looksLikeMixedCursor =
-			nextCursor.includes("r=") ||
-			nextCursor.includes("n=") ||
-			nextCursor.includes(";");
-		if (types && looksLikeMixedCursor) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
 		setError(null);
 		try {
 			const res = await apiGet<FeedResponse>(
-				`/api/feed?limit=30${typesParam}&cursor=${encodeURIComponent(nextCursor)}`,
+				`/api/feed?limit=30&cursor=${encodeURIComponent(nextCursor)}`,
 			);
 			if (reqId !== reqIdRef.current) return;
 			setItems((prev) => mergeByKey(prev, res.items));
@@ -99,7 +80,7 @@ export function useFeed(params?: { types: string | null }) {
 		} finally {
 			setLoadingMore(false);
 		}
-	}, [nextCursor, loadingMore, loadingInitial, types, typesParam]);
+	}, [nextCursor, loadingMore, loadingInitial]);
 
 	const refresh = useCallback(async () => {
 		await loadInitial();
@@ -127,13 +108,9 @@ export function useFeed(params?: { types: string | null }) {
 	);
 
 	const stats = useMemo(() => {
-		let releases = 0;
-		let notifications = 0;
-		for (const it of items) {
-			if (it.kind === "release") releases += 1;
-			if (it.kind === "notification") notifications += 1;
-		}
-		return { releases, notifications, total: items.length };
+		// Feed is releases-only; keep stats for header/debug UI.
+		const releases = items.length;
+		return { releases, total: items.length };
 	}, [items]);
 
 	return {

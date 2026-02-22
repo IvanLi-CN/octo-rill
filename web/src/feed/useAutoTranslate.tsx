@@ -40,13 +40,8 @@ export function useAutoTranslate(params: {
 	);
 
 	const translate = useCallback(async (item: FeedItem) => {
-		if (item.kind === "release") {
-			return apiPostJson<TranslateResponse>("/api/translate/release", {
-				release_id: item.id,
-			});
-		}
-		return apiPostJson<TranslateResponse>("/api/translate/notification", {
-			thread_id: item.id,
+		return apiPostJson<TranslateResponse>("/api/translate/release", {
+			release_id: item.id,
 		});
 	}, []);
 
