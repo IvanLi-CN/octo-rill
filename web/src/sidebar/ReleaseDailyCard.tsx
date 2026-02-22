@@ -111,15 +111,6 @@ export function ReleaseDailyCard(props: {
 						<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
 							<Markdown content={selected?.content_markdown ?? ""} />
 						</div>
-
-						<details className="group">
-							<summary className="text-muted-foreground cursor-pointer select-none font-mono text-xs">
-								查看原始 Markdown
-							</summary>
-							<pre className="bg-muted/20 mt-2 max-h-72 overflow-auto rounded-lg border p-4 text-sm whitespace-pre-wrap">
-								{selected?.content_markdown ?? ""}
-							</pre>
-						</details>
 					</div>
 				) : (
 					<p className="text-muted-foreground text-sm">

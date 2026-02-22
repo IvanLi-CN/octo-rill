@@ -47,13 +47,22 @@ function sortNotifications(items: NotificationItem[]) {
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 
-	const feed = useFeed();
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 
 	const [filter, setFilter] = useState<"all" | "release" | "notification">(
 		"all",
 	);
+
+	const feed = useFeed({
+		types:
+			filter === "release"
+				? "releases"
+				: filter === "notification"
+					? "notifications"
+					: null,
+	});
+
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
 	>({});
@@ -106,11 +115,6 @@ export function Dashboard(props: { me: MeResponse }) {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [feed.loadInitial, refreshSidebar]);
-
-	const filteredItems = useMemo(() => {
-		if (filter === "all") return feed.items;
-		return feed.items.filter((it) => it.kind === filter);
-	}, [feed.items, filter]);
 
 	const onToggleOriginal = useCallback((key: string) => {
 		setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -175,8 +179,8 @@ export function Dashboard(props: { me: MeResponse }) {
 						<div className="flex flex-wrap items-center gap-2">
 							<h1 className="text-xl font-semibold tracking-tight">OctoRill</h1>
 							<span className="text-muted-foreground font-mono text-xs">
-								{feed.stats.total} items · {feed.stats.releases} releases ·{" "}
-								{feed.stats.notifications} inbox
+								Loaded {feed.items.length} · {notifications.length} inbox ·{" "}
+								{briefs.length} briefs
 							</span>
 						</div>
 						<p className="text-muted-foreground mt-1 text-sm">
@@ -234,7 +238,7 @@ export function Dashboard(props: { me: MeResponse }) {
 			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
 				<section className="min-w-0">
 					<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-						<div className="flex flex-wrap gap-2">
+						<div className="flex flex-wrap items-center gap-2">
 							<Button
 								variant={filter === "all" ? "default" : "outline"}
 								size="sm"
@@ -307,7 +311,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					) : null}
 
 					<FeedList
-						items={filteredItems}
+						items={feed.items}
 						error={feed.error}
 						loadingInitial={feed.loadingInitial}
 						loadingMore={feed.loadingMore}

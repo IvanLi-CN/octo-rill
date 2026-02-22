@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import { apiGet } from "@/api";
 import type { FeedItem, FeedResponse, TranslateResponse } from "@/feed/types";
@@ -27,45 +27,71 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 	return out;
 }
 
-export function useFeed() {
+export function useFeed(params?: { types: string | null }) {
+	const types = params?.types ?? null;
+	const typesParam = types ? `&types=${encodeURIComponent(types)}` : "";
+
 	const [items, setItems] = useState<FeedItem[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(false);
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 
+	const reqIdRef = useRef(0);
+	const lastTypesParamRef = useRef<string>("");
+
 	const hasMore = Boolean(nextCursor);
 
 	const loadInitial = useCallback(async () => {
+		reqIdRef.current += 1;
+		const reqId = reqIdRef.current;
+
+		// Cancel any in-flight "load more" state; we are replacing the list.
+		setLoadingMore(false);
+
+		// Avoid flashing wrong results when switching filters (types).
+		if (lastTypesParamRef.current !== typesParam) {
+			lastTypesParamRef.current = typesParam;
+			setItems([]);
+			setNextCursor(null);
+		}
+
 		setLoadingInitial(true);
 		setError(null);
 		try {
-			const res = await apiGet<FeedResponse>("/api/feed?limit=30");
+			const res = await apiGet<FeedResponse>(`/api/feed?limit=30${typesParam}`);
+			if (reqId !== reqIdRef.current) return;
 			setItems(res.items);
 			setNextCursor(res.next_cursor);
 		} catch (err) {
+			if (reqId !== reqIdRef.current) return;
 			setError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoadingInitial(false);
+			if (reqId === reqIdRef.current) {
+				setLoadingInitial(false);
+			}
 		}
-	}, []);
+	}, [typesParam]);
 
 	const loadMore = useCallback(async () => {
 		if (!nextCursor || loadingMore) return;
+		const reqId = reqIdRef.current;
 		setLoadingMore(true);
 		setError(null);
 		try {
 			const res = await apiGet<FeedResponse>(
-				`/api/feed?limit=30&cursor=${encodeURIComponent(nextCursor)}`,
+				`/api/feed?limit=30${typesParam}&cursor=${encodeURIComponent(nextCursor)}`,
 			);
+			if (reqId !== reqIdRef.current) return;
 			setItems((prev) => mergeByKey(prev, res.items));
 			setNextCursor(res.next_cursor);
 		} catch (err) {
+			if (reqId !== reqIdRef.current) return;
 			setError(err instanceof Error ? err.message : String(err));
 		} finally {
 			setLoadingMore(false);
 		}
-	}, [nextCursor, loadingMore]);
+	}, [nextCursor, loadingMore, typesParam]);
 
 	const refresh = useCallback(async () => {
 		await loadInitial();
