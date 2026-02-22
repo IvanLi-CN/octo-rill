@@ -527,10 +527,42 @@ fn release_excerpt(body: Option<&str>) -> Option<String> {
     }
 
     let joined = parts.join(" ").trim().to_owned();
-    if joined.is_empty() {
-        return None;
+    if !joined.is_empty() {
+        return Some(truncate_chars(&joined, 900).into_owned());
     }
-    Some(truncate_chars(&joined, 900).into_owned())
+
+    // Last resort: fall back to the first non-empty, non-code lines. Many releases have
+    // mostly headings/links; returning *something* is better than rendering an empty original
+    // excerpt while a translated summary exists.
+    let mut fallback: Vec<String> = Vec::new();
+    let mut in_code = false;
+    for raw in normalized.lines() {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        if in_code {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if !fallback.is_empty() {
+                break;
+            }
+            continue;
+        }
+        fallback.push(trimmed.to_owned());
+        if fallback.len() >= 10 {
+            break;
+        }
+    }
+
+    let fallback = fallback.join(" ").trim().to_owned();
+    if fallback.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&fallback, 900).into_owned())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -684,10 +716,12 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
 
     let source = match r.kind.as_str() {
         "release" => format!(
-            "kind=release\nrepo={}\ntitle={}\nbody={}\n",
+            // v=2: translation input is the excerpt shown in the UI (not a free-form summary of
+            // the entire body) so "中文/原文" toggles show comparable content.
+            "v=2\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
-            truncate_chars(r.release_body.as_deref().unwrap_or(""), 6000),
+            truncate_chars(excerpt.as_deref().unwrap_or(""), 2000),
         ),
         "notification" => format!(
             "kind=notification\nrepo={}\ntitle={}\nreason={}\nsubject_type={}\n",
@@ -966,15 +1000,17 @@ pub async fn translate_release(
         .to_owned();
 
     let body = row.body.unwrap_or_default();
-    let body = if body.chars().count() > 6000 {
-        body.chars().take(6000).collect::<String>()
+    let excerpt = release_excerpt(Some(&body));
+    let excerpt = excerpt.unwrap_or_default();
+    let excerpt = if excerpt.chars().count() > 2000 {
+        excerpt.chars().take(2000).collect::<String>()
     } else {
-        body
+        excerpt
     };
 
     let source = format!(
-        "kind=release\nrepo={}\ntitle={}\nbody={}\n",
-        row.full_name, title, body
+        "v=2\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+        row.full_name, title, excerpt
     );
     let source_hash = ai::sha256_hex(&source);
     let entity_id = release_id.to_string();
@@ -1055,17 +1091,17 @@ pub async fn translate_release(
     }
 
     let prompt = format!(
-        "Repo: {repo}\nOriginal title: {title}\n\nRelease body (truncated):\n{body}\n\n请把这条 Release 翻译并总结为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"- ...\\n- ...\"}}\n\n要求：保留版本号/专有名词；summary_md 2-5 条；不包含任何 URL。",
+        "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n要求：不要新增信息；不要总结/扩写；尽量保留原有段落/列表结构；不包含任何 URL。",
         repo = row.full_name,
         title = title,
-        body = body,
+        excerpt = excerpt,
     );
 
     let raw = ai::chat_completion(
         state.as_ref(),
-        "你是一个助理，负责把 GitHub Release 标题与正文转写为中文标题与简短要点摘要（Markdown）。不要包含任何 URL。",
+        "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（保留结构，不新增信息）。不要包含任何 URL。",
         &prompt,
-        700,
+        900,
     )
     .await
     .map_err(ApiError::internal)?;
