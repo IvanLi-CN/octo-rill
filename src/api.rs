@@ -498,7 +498,9 @@ pub async fn list_feed(
         SELECT
           'notification' AS kind,
           0 AS kind_rank,
-          COALESCE(n.last_seen_at, n.updated_at, '1970-01-01T00:00:00Z') AS sort_ts,
+          -- Sort by GitHub update time when available, so inbox items interleave with releases
+          -- instead of being pinned by initial sync time.
+          COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS sort_ts,
           COALESCE(n.updated_at, n.last_seen_at, '1970-01-01T00:00:00Z') AS ts,
           n.thread_id AS id_key,
           n.thread_id AS entity_id,
