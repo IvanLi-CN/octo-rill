@@ -16,6 +16,7 @@ export type FeedItem = {
 	id: string;
 	repo_full_name: string | null;
 	title: string | null;
+	excerpt: string | null;
 	subtitle: string | null;
 	reason: string | null;
 	subject_type: string | null;
