@@ -68,6 +68,14 @@ export function FeedItemCard(props: {
 
 	const translatedSummary =
 		item.translated?.status === "ready" ? item.translated.summary : null;
+	const originalExcerpt = item.excerpt?.trim() ? item.excerpt : null;
+
+	// When AI is disabled/missing, fall back to original content rather than showing an empty card.
+	const bodyText = showOriginal
+		? originalExcerpt
+		: translatedSummary?.trim()
+			? translatedSummary
+			: originalExcerpt;
 
 	const subtitleBits = [
 		item.reason || item.subtitle,
@@ -167,11 +175,15 @@ export function FeedItemCard(props: {
 				</div>
 			</CardHeader>
 
-			{!showOriginal && translatedSummary ? (
+			{bodyText ? (
+				<CardContent className="pt-0">{renderSummary(bodyText)}</CardContent>
+			) : (
 				<CardContent className="pt-0">
-					{renderSummary(translatedSummary)}
+					<p className="text-muted-foreground text-sm">
+						暂无摘要，点击 <span className="font-mono">GitHub</span> 查看详情。
+					</p>
 				</CardContent>
-			) : null}
+			)}
 		</Card>
 	);
 }

@@ -21,6 +21,8 @@ function makeMockFeed(): FeedItem[] {
 			id: "10001",
 			repo_full_name: "acme/rocket",
 			title: "v1.8.0",
+			excerpt:
+				"- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
 			subtitle: null,
 			reason: null,
 			subject_type: null,
@@ -40,6 +42,7 @@ function makeMockFeed(): FeedItem[] {
 			id: "10000",
 			repo_full_name: "acme/rocket",
 			title: "v1.7.3",
+			excerpt: "- Patch release\n- Fixes a regression in auth flow",
 			subtitle: null,
 			reason: null,
 			subject_type: null,
