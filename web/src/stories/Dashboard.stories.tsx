@@ -156,9 +156,9 @@ function DashboardPreview() {
 				</div>
 			</div>
 
-			{tab === "all" ? (
-				<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-					<section className="min-w-0">
+			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+				<section className="min-w-0">
+					{tab === "all" || tab === "releases" ? (
 						<FeedList
 							items={items}
 							error={null}
@@ -172,67 +172,31 @@ function DashboardPreview() {
 							onToggleOriginal={() => {}}
 							onTranslateNow={() => {}}
 						/>
-					</section>
-					<aside className="space-y-6">
-						<BriefListCard
-							briefs={mockBriefs}
-							selectedDate={selectedDate}
-							onSelectDate={(d) => setSelectedDate(d)}
-						/>
-						<ReleaseDailyCard
-							briefs={mockBriefs}
-							selectedDate={selectedDate}
-							busy={false}
-							onGenerate={() => {}}
-						/>
-						<InboxQuickList notifications={mockNotifs} />
-					</aside>
-				</div>
-			) : null}
+					) : null}
 
-			{tab === "releases" ? (
-				<section className="min-w-0">
-					<FeedList
-						items={items}
-						error={null}
-						loadingInitial={false}
-						loadingMore={false}
-						hasMore={false}
-						inFlightKeys={inFlightKeys}
-						registerItemRef={() => () => {}}
-						onLoadMore={() => {}}
-						showOriginalByKey={{}}
-						onToggleOriginal={() => {}}
-						onTranslateNow={() => {}}
-					/>
+					{tab === "briefs" ? (
+						<div className="space-y-6">
+							<BriefListCard
+								briefs={mockBriefs}
+								selectedDate={selectedDate}
+								onSelectDate={(d) => setSelectedDate(d)}
+							/>
+							<ReleaseDailyCard
+								briefs={mockBriefs}
+								selectedDate={selectedDate}
+								busy={false}
+								onGenerate={() => {}}
+							/>
+						</div>
+					) : null}
+
+					{tab === "inbox" ? <InboxList notifications={mockNotifs} /> : null}
 				</section>
-			) : null}
 
-			{tab === "briefs" ? (
-				<div className="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
-					<section className="min-w-0">
-						<BriefListCard
-							briefs={mockBriefs}
-							selectedDate={selectedDate}
-							onSelectDate={(d) => setSelectedDate(d)}
-						/>
-					</section>
-					<section className="min-w-0">
-						<ReleaseDailyCard
-							briefs={mockBriefs}
-							selectedDate={selectedDate}
-							busy={false}
-							onGenerate={() => {}}
-						/>
-					</section>
-				</div>
-			) : null}
-
-			{tab === "inbox" ? (
-				<section className="min-w-0">
-					<InboxList notifications={mockNotifs} />
-				</section>
-			) : null}
+				<aside className="space-y-6">
+					<InboxQuickList notifications={mockNotifs} />
+				</aside>
+			</div>
 		</AppShell>
 	);
 }
