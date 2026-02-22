@@ -64,13 +64,6 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
 
-	const selectedBrief = useMemo(() => {
-		if (!selectedBriefDate) return briefs[0] ?? null;
-		return (
-			briefs.find((b) => b.date === selectedBriefDate) ?? briefs[0] ?? null
-		);
-	}, [briefs, selectedBriefDate]);
-
 	const refreshSidebar = useCallback(async () => {
 		const [n, b] = await Promise.all([
 			apiGet<NotificationItem[]>("/api/notifications"),
@@ -160,6 +153,15 @@ export function Dashboard(props: { me: MeResponse }) {
 		});
 	}, [refreshAll, run]);
 
+	const onSyncAll = useCallback(() => {
+		void run("Sync all", async () => {
+			await apiPost<SyncStarredResult>("/api/sync/starred");
+			await apiPost<SyncReleasesResult>("/api/sync/releases");
+			await apiPost<SyncNotificationsResult>("/api/sync/notifications");
+			await refreshAll();
+		});
+	}, [refreshAll, run]);
+
 	const aiDisabledHint = useMemo(() => {
 		const any = feed.items.find((it) => it.translated?.status === "disabled");
 		return Boolean(any);
@@ -193,6 +195,9 @@ export function Dashboard(props: { me: MeResponse }) {
 							onClick={() => void refreshAll()}
 						>
 							Refresh
+						</Button>
+						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+							Sync all
 						</Button>
 						<Button
 							variant="outline"
@@ -254,27 +259,6 @@ export function Dashboard(props: { me: MeResponse }) {
 							>
 								Inbox
 							</Button>
-
-							<div className="flex items-center gap-2">
-								<span className="text-muted-foreground font-mono text-xs">
-									日报
-								</span>
-								<select
-									className="bg-background h-8 rounded-md border px-3 font-mono text-xs shadow-xs disabled:opacity-50"
-									value={selectedBrief?.date ?? ""}
-									disabled={briefs.length === 0}
-									onChange={(e) => setSelectedBriefDate(e.target.value)}
-								>
-									{briefs.length === 0 ? (
-										<option value="">(none)</option>
-									) : null}
-									{briefs.map((b) => (
-										<option key={b.date} value={b.date}>
-											#{b.date}
-										</option>
-									))}
-								</select>
-							</div>
 						</div>
 
 						{busy ? (
@@ -283,6 +267,44 @@ export function Dashboard(props: { me: MeResponse }) {
 							</span>
 						) : null}
 					</div>
+
+					{!feed.loadingInitial && feed.items.length === 0 ? (
+						<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+							<h2 className="text-base font-semibold tracking-tight">
+								还没有内容
+							</h2>
+							<p className="text-muted-foreground mt-1 text-sm">
+								先同步 starred，再同步 releases / inbox；或者直接点{" "}
+								<span className="font-mono">Sync all</span>。
+							</p>
+							<div className="mt-4 flex flex-wrap gap-2">
+								<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+									Sync all
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncStarred}
+								>
+									Sync starred
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncReleases}
+								>
+									Sync releases
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncInbox}
+								>
+									Sync inbox
+								</Button>
+							</div>
+						</div>
+					) : null}
 
 					<FeedList
 						items={filteredItems}
@@ -301,7 +323,9 @@ export function Dashboard(props: { me: MeResponse }) {
 
 				<aside className="space-y-6">
 					<ReleaseDailyCard
-						brief={selectedBrief}
+						briefs={briefs}
+						selectedDate={selectedBriefDate}
+						onSelectDate={(d) => setSelectedBriefDate(d)}
 						busy={busy === "Generate brief"}
 						onGenerate={onGenerateBrief}
 					/>

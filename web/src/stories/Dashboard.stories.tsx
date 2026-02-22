@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useState } from "react";
 
 import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
@@ -69,14 +70,24 @@ function makeMockFeed(): FeedItem[] {
 	];
 }
 
-const mockBrief: BriefItem = {
-	date: "2026-02-21",
-	window_start: "2026-02-20T08:00:00+08:00",
-	window_end: "2026-02-21T08:00:00+08:00",
-	content_markdown:
-		"## 昨日更新（Releases）\n\n- acme/rocket: v1.8.0\n\n## 建议跟进（Next actions）\n\n- 升级并验证 CI\n",
-	created_at: "2026-02-21T08:00:03Z",
-};
+const mockBriefs: BriefItem[] = [
+	{
+		date: "2026-02-21",
+		window_start: "2026-02-20T08:00:00+08:00",
+		window_end: "2026-02-21T08:00:00+08:00",
+		content_markdown:
+			"## 昨日更新（Releases）\n\n- acme/rocket: v1.8.0\n\n## 建议跟进（Next actions）\n\n- 升级并验证 CI\n",
+		created_at: "2026-02-21T08:00:03Z",
+	},
+	{
+		date: "2026-02-20",
+		window_start: "2026-02-19T08:00:00+08:00",
+		window_end: "2026-02-20T08:00:00+08:00",
+		content_markdown:
+			"## 昨日更新（Releases）\n\n- acme/rocket: v1.7.3\n\n## 建议跟进（Next actions）\n\n- 观察回归问题\n",
+		created_at: "2026-02-20T08:00:04Z",
+	},
+];
 
 const mockNotifs: NotificationItem[] = [
 	{
@@ -104,6 +115,9 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview() {
 	const items = makeMockFeed();
 	const inFlightKeys = new Set(["notification:90001"]);
+	const [selectedDate, setSelectedDate] = useState<string | null>(
+		mockBriefs[0]?.date ?? null,
+	);
 
 	return (
 		<AppShell
@@ -136,7 +150,9 @@ function DashboardPreview() {
 				</section>
 				<aside className="space-y-6">
 					<ReleaseDailyCard
-						brief={mockBrief}
+						briefs={mockBriefs}
+						selectedDate={selectedDate}
+						onSelectDate={(d) => setSelectedDate(d)}
 						busy={false}
 						onGenerate={() => {}}
 					/>
