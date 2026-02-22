@@ -345,22 +345,12 @@ export function Dashboard(props: { me: MeResponse }) {
 				</section>
 
 				<aside className="space-y-6">
-					{tab === "all" || tab === "releases" || tab === "briefs" ? (
-						<>
-							<BriefListCard
-								briefs={briefs}
-								selectedDate={selectedBriefDate}
-								onSelectDate={(d) => setSelectedBriefDate(d)}
-							/>
-							{tab === "all" || tab === "releases" ? (
-								<ReleaseDailyCard
-									briefs={briefs}
-									selectedDate={selectedBriefDate}
-									busy={busy === "Generate brief"}
-									onGenerate={onGenerateBrief}
-								/>
-							) : null}
-						</>
+					{tab === "briefs" ? (
+						<BriefListCard
+							briefs={briefs}
+							selectedDate={selectedBriefDate}
+							onSelectDate={(d) => setSelectedBriefDate(d)}
+						/>
 					) : null}
 					<InboxQuickList notifications={notifications} />
 				</aside>
