@@ -459,7 +459,6 @@ struct StreamCursor {
     id_key: String,
 }
 
-#[derive(Debug, Clone)]
 fn parse_stream_cursor(raw: &str) -> Result<StreamCursor, ApiError> {
     let mut it = raw.split('|');
     let sort_ts = it
