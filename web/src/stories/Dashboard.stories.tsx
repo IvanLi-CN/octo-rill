@@ -32,8 +32,7 @@ function makeMockFeed(): FeedItem[] {
 				lang: "zh-CN",
 				status: "ready",
 				title: "v1.8.0（稳定版）",
-				summary:
-					"- 修复发布流程中的签名问题\n- 提升启动速度\n- 建议升级并重新构建镜像",
+				summary: "- 这是一个稳定版本\n- 包含性能改进\n- 建议升级并重新构建镜像",
 			},
 		},
 		{
@@ -102,9 +101,12 @@ const mockNotifs: NotificationItem[] = [
 
 function DashboardPreview() {
 	const items = makeMockFeed();
-	const inFlightKeys = new Set(["release:10001"]);
+	const inFlightKeys = new Set<string>();
 	type Tab = "all" | "releases" | "briefs" | "inbox";
 	const [tab, setTab] = useState<Tab>("all");
+	const [showOriginalByKey, setShowOriginalByKey] = useState<
+		Record<string, boolean>
+	>({});
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		mockBriefs[0]?.date ?? null,
 	);
@@ -159,7 +161,7 @@ function DashboardPreview() {
 				</div>
 			</div>
 
-			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
 				<section className="min-w-0">
 					{tab === "all" || tab === "releases" ? (
 						<FeedList
@@ -171,19 +173,16 @@ function DashboardPreview() {
 							inFlightKeys={inFlightKeys}
 							registerItemRef={() => () => {}}
 							onLoadMore={() => {}}
-							showOriginalByKey={{}}
-							onToggleOriginal={() => {}}
+							showOriginalByKey={showOriginalByKey}
+							onToggleOriginal={(key) =>
+								setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
+							}
 							onTranslateNow={() => {}}
 						/>
 					) : null}
 
 					{tab === "briefs" ? (
 						<div className="space-y-6">
-							<BriefListCard
-								briefs={mockBriefs}
-								selectedDate={selectedDate}
-								onSelectDate={(d) => setSelectedDate(d)}
-							/>
 							<ReleaseDailyCard
 								briefs={mockBriefs}
 								selectedDate={selectedDate}
@@ -197,6 +196,23 @@ function DashboardPreview() {
 				</section>
 
 				<aside className="space-y-6">
+					{tab === "all" || tab === "releases" || tab === "briefs" ? (
+						<>
+							<BriefListCard
+								briefs={mockBriefs}
+								selectedDate={selectedDate}
+								onSelectDate={(d) => setSelectedDate(d)}
+							/>
+							{tab === "all" || tab === "releases" ? (
+								<ReleaseDailyCard
+									briefs={mockBriefs}
+									selectedDate={selectedDate}
+									busy={false}
+									onGenerate={() => {}}
+								/>
+							) : null}
+						</>
+					) : null}
 					<InboxQuickList notifications={mockNotifs} />
 				</aside>
 			</div>
