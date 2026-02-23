@@ -21,6 +21,10 @@ impl ApiError {
         }
     }
 
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
     }

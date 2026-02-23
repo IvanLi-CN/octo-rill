@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     http::{HeaderValue, Method},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -72,7 +72,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     spawn_daily_brief_scheduler(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
+    let session_cookie_name = build_session_cookie_name(&config);
     let session_layer = SessionManagerLayer::new(session_store)
+        .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
         .with_same_site(SameSite::Lax);
 
@@ -87,6 +89,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
+        .route("/reaction-token/status", get(api::reaction_token_status))
+        .route("/reaction-token/check", post(api::check_reaction_token))
+        .route("/reaction-token", put(api::upsert_reaction_token))
+        .route(
+            "/release/reactions/toggle",
+            post(api::toggle_release_reaction),
+        )
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
         .route("/translate/release", post(api::translate_release))
@@ -122,7 +131,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(cors_origin)
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     let app = app.layer(cors).layer(TraceLayer::new_for_http());
@@ -265,6 +274,24 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
             }
         }
     });
+}
+
+fn build_session_cookie_name(config: &AppConfig) -> String {
+    let host = config.public_base_url.host_str().unwrap_or("localhost");
+    let port = config
+        .public_base_url
+        .port_or_known_default()
+        .unwrap_or(config.bind_addr.port());
+    let raw = format!("octo_rill_sid_{host}_{port}");
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
 }
 
 async fn run_startup_brief_backfill(state: &AppState, at: chrono::NaiveTime) {

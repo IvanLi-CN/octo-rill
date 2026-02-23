@@ -33,6 +33,7 @@ Tab 语义：
 
 1) **Release 条目**
 - 展示：仓库名、发布版本（tag 或 release name）、发布时间、（可选）中文翻译标题与发布说明译文（摘录）
+- 反馈：展示 GitHub 同款反馈表情（👍 😄 ❤️ 🎉 🚀 👀），支持查看计数；站内点按切换需要用户提供 PAT
 - 操作：点击“在 GitHub 打开”跳转到对应 Release 页面（新标签页）
 
 ### 日报（独立 Tab）
@@ -73,6 +74,11 @@ Tab 语义：
 ## 数据来源与同步
 
 - 登录方式：GitHub OAuth。
+- OAuth 职责：用于登录、读取和同步（Feed / Notifications / Starred / Releases）。
+- OAuth scope：采用最小授权策略（不包含用于站内反馈写操作的额外 scope）。
+- Release 反馈写操作：使用用户提供的 GitHub PAT（Personal Access Token），与 OAuth 通道分离。
+  - Fine-grained PAT：按 GitHub Reactions 接口可不额外申请 repository permissions，但 token 必须覆盖目标仓库。
+  - Classic PAT：公共仓库建议 `public_repo`，私有仓库需 `repo`。
 - 本地存储：SQLite（默认 `./.data/octo-rill.db`）。
 - Release 数据语义：按“共享事实”处理，release 以稳定 `release_id` 引用；用户 Star 仅用于决定个人列表与同步范围。
 - 同步数据：
@@ -84,6 +90,17 @@ Tab 语义：
 - 可见性规则：
   - 取消 Star 后，该仓库可从当前用户的列表中消失；
   - 但历史日报中的 release 详情链接（`/?tab=briefs&release=<release_id>`）仍应可访问。
+
+## Release 反馈授权策略
+
+- 默认可用：所有 Release 卡片都展示反馈计数。
+- 站内点按前置条件：当前用户已配置 PAT，且 PAT 对目标仓库可访问。
+- 未配置或无权限时：反馈保持只读并显示引导信息；不影响 Feed 阅读与同步流程。
+- 交互约束（当前任务补充）：
+  - 点击反馈按钮且未配置 PAT：必须弹出 PAT 配置对话框（不能只在卡片底部报错）。
+  - 对话框必须给出配置路径与最小权限说明（classic PAT：公共仓库 `public_repo`、私有仓库 `repo`）。
+  - 输入 PAT 后自动可用性检查，防抖窗口为 `800ms`，且仅最后一次输入结果生效。
+  - 检查状态必须可见（`idle/checking/valid/invalid`）；仅 `valid` 状态允许保存并继续。
 
 ## 非目标（本项目不做什么）
 

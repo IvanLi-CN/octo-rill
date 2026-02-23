@@ -1,0 +1,12 @@
+-- Release reactions support (SQLite)
+
+PRAGMA foreign_keys = ON;
+
+ALTER TABLE releases ADD COLUMN node_id TEXT;
+
+ALTER TABLE releases ADD COLUMN react_plus1 INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases ADD COLUMN react_laugh INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases ADD COLUMN react_heart INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases ADD COLUMN react_hooray INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases ADD COLUMN react_rocket INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE releases ADD COLUMN react_eyes INTEGER NOT NULL DEFAULT 0;

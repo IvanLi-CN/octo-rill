@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiGet, apiPost } from "@/api";
+import { ApiError, apiGet, apiPost, apiPostJson, apiPutJson } from "@/api";
 import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
-import type { FeedItem } from "@/feed/types";
+import type {
+	FeedItem,
+	ReactionContent,
+	ReleaseReactions,
+	ToggleReleaseReactionResponse,
+} from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
@@ -42,6 +47,30 @@ type BriefGenerateResponse = {
 	content_markdown: string;
 };
 
+type ReactionTokenStatusResponse = {
+	configured: boolean;
+	masked_token: string | null;
+	check: {
+		state: "idle" | "valid" | "invalid" | "error";
+		message: string | null;
+		checked_at: string | null;
+	};
+};
+
+type ReactionTokenCheckResponse = {
+	state: "valid" | "invalid";
+	message: string;
+};
+
+const REACTION_CONTENTS: ReactionContent[] = [
+	"plus1",
+	"laugh",
+	"heart",
+	"hooray",
+	"rocket",
+	"eyes",
+];
+
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
 		if (a.unread !== b.unread) return b.unread - a.unread;
@@ -63,6 +92,47 @@ function parseDashboardQuery() {
 	return { tab, releaseId };
 }
 
+function itemKey(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
+}
+
+function sessionExpiredHint() {
+	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
+}
+
+function buildOptimisticReactions(
+	current: ReleaseReactions,
+	content: ReactionContent,
+): ReleaseReactions {
+	const viewer = { ...current.viewer };
+	const counts = { ...current.counts };
+	const hasReacted = viewer[content];
+	viewer[content] = !hasReacted;
+	counts[content] = Math.max(0, counts[content] + (hasReacted ? -1 : 1));
+	return {
+		...current,
+		viewer,
+		counts,
+	};
+}
+
+function itemFromKey(key: string): Pick<FeedItem, "kind" | "id"> | null {
+	const [kind, id] = key.split(":", 2);
+	if (kind !== "release" || !id) return null;
+	return { kind: "release", id };
+}
+
+function firstPendingReactionContent(
+	server: ReleaseReactions,
+	desired: ReleaseReactions,
+): ReactionContent | null {
+	return (
+		REACTION_CONTENTS.find(
+			(content) => server.viewer[content] !== desired.viewer[content],
+		) ?? null
+	);
+}
+
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 
@@ -82,9 +152,54 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
 		null,
 	);
+	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
+		() => new Set<string>(),
+	);
+	const reactionBusyKeysRef = useRef<Set<string>>(new Set<string>());
+	const reactionDesiredByKeyRef = useRef<Map<string, ReleaseReactions>>(
+		new Map<string, ReleaseReactions>(),
+	);
+	const reactionServerByKeyRef = useRef<Map<string, ReleaseReactions>>(
+		new Map<string, ReleaseReactions>(),
+	);
+	const reactionFlushTimerByKeyRef = useRef<Map<string, number>>(
+		new Map<string, number>(),
+	);
+	const [reactionErrorByKey, setReactionErrorByKey] = useState<
+		Record<string, string>
+	>({});
+	const [reactionTokenConfigured, setReactionTokenConfigured] =
+		useState<boolean>(false);
+	const [reactionTokenMasked, setReactionTokenMasked] = useState<string | null>(
+		null,
+	);
+	const [patDialogOpen, setPatDialogOpen] = useState<boolean>(false);
+	const [patInput, setPatInput] = useState<string>("");
+	const [patCheckState, setPatCheckState] = useState<
+		"idle" | "checking" | "valid" | "invalid"
+	>("idle");
+	const [patCheckMessage, setPatCheckMessage] = useState<string | null>(null);
+	const [patSaving, setPatSaving] = useState<boolean>(false);
+	const [pendingReaction, setPendingReaction] = useState<{
+		item: FeedItem;
+		content: ReactionContent;
+	} | null>(null);
+	const patCheckSeqRef = useRef(0);
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
+
+	const loadReactionTokenStatus = useCallback(async () => {
+		const res = await apiGet<ReactionTokenStatusResponse>(
+			"/api/reaction-token/status",
+		);
+		setReactionTokenConfigured(res.configured && res.check.state === "valid");
+		setReactionTokenMasked(res.masked_token);
+		if (!res.configured) {
+			setPatCheckState("idle");
+			setPatCheckMessage(null);
+		}
+	}, []);
 
 	const refreshSidebar = useCallback(async () => {
 		const [n, b] = await Promise.all([
@@ -127,7 +242,10 @@ export function Dashboard(props: { me: MeResponse }) {
 		void refreshSidebar().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [feed.loadInitial, refreshSidebar]);
+		void loadReactionTokenStatus().catch((err) => {
+			setBootError(err instanceof Error ? err.message : String(err));
+		});
+	}, [feed.loadInitial, loadReactionTokenStatus, refreshSidebar]);
 
 	const onToggleOriginal = useCallback((key: string) => {
 		setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -141,6 +259,265 @@ export function Dashboard(props: { me: MeResponse }) {
 		},
 		[translateNow],
 	);
+
+	const flushPendingReactions = useCallback(
+		(key: string) => {
+			if (reactionBusyKeysRef.current.has(key)) return;
+			const server = reactionServerByKeyRef.current.get(key);
+			const desired = reactionDesiredByKeyRef.current.get(key);
+			if (!server || !desired) return;
+
+			const content = firstPendingReactionContent(server, desired);
+			if (!content) {
+				reactionDesiredByKeyRef.current.delete(key);
+				return;
+			}
+
+			const item = itemFromKey(key);
+			if (!item) return;
+
+			const nextBusy = new Set(reactionBusyKeysRef.current);
+			nextBusy.add(key);
+			reactionBusyKeysRef.current = nextBusy;
+			setReactionBusyKeys(nextBusy);
+
+			void apiPostJson<ToggleReleaseReactionResponse>(
+				"/api/release/reactions/toggle",
+				{
+					release_id: item.id,
+					content,
+				},
+			)
+				.then((res) => {
+					reactionServerByKeyRef.current.set(key, res.reactions);
+					setReactionTokenConfigured(true);
+					setPatCheckState("valid");
+					setPatCheckMessage("PAT 可用");
+					setReactionErrorByKey((prev) => {
+						if (!(key in prev)) return prev;
+						const next = { ...prev };
+						delete next[key];
+						return next;
+					});
+
+					const latestDesired = reactionDesiredByKeyRef.current.get(key);
+					if (
+						!latestDesired ||
+						!firstPendingReactionContent(res.reactions, latestDesired)
+					) {
+						feed.applyReactions(item, res.reactions);
+						reactionDesiredByKeyRef.current.delete(key);
+					}
+				})
+				.catch((err) => {
+					const stable = reactionServerByKeyRef.current.get(key);
+					if (stable) {
+						reactionDesiredByKeyRef.current.set(key, stable);
+						feed.applyReactions(item, stable);
+					} else {
+						reactionDesiredByKeyRef.current.delete(key);
+					}
+
+					if (err instanceof ApiError) {
+						if (err.status === 401) {
+							setReactionErrorByKey((prev) => ({
+								...prev,
+								[key]: sessionExpiredHint(),
+							}));
+							return;
+						}
+						if (err.code === "pat_required" || err.code === "pat_invalid") {
+							setReactionTokenConfigured(false);
+							const retryItem = feed.items.find((it) => itemKey(it) === key);
+							if (retryItem) {
+								setPendingReaction({ item: retryItem, content });
+							}
+							setPatDialogOpen(true);
+							setPatCheckState(err.code === "pat_invalid" ? "invalid" : "idle");
+							setPatCheckMessage(
+								err.code === "pat_invalid"
+									? "PAT 无效或已过期，请重新填写并校验。"
+									: "需要先配置 PAT 才能使用站内反馈。",
+							);
+							return;
+						}
+					}
+
+					const raw = err instanceof Error ? err.message : String(err);
+					let message = raw;
+					if (
+						raw.includes("OAuth app restrictions") ||
+						raw.includes(
+							"organization has enabled OAuth App access restrictions",
+						)
+					) {
+						message = "该仓库限制了站内反馈，请在 GitHub 页面操作。";
+					}
+					setReactionErrorByKey((prev) => ({ ...prev, [key]: message }));
+				})
+				.finally(() => {
+					const nextBusy = new Set(reactionBusyKeysRef.current);
+					nextBusy.delete(key);
+					reactionBusyKeysRef.current = nextBusy;
+					setReactionBusyKeys(nextBusy);
+
+					const latestServer = reactionServerByKeyRef.current.get(key);
+					const latestDesired = reactionDesiredByKeyRef.current.get(key);
+					if (
+						latestServer &&
+						latestDesired &&
+						firstPendingReactionContent(latestServer, latestDesired)
+					) {
+						void flushPendingReactions(key);
+					}
+				});
+		},
+		[feed],
+	);
+
+	const scheduleReactionFlush = useCallback(
+		(key: string) => {
+			const timers = reactionFlushTimerByKeyRef.current;
+			const prev = timers.get(key);
+			if (prev !== undefined) {
+				window.clearTimeout(prev);
+			}
+			const timer = window.setTimeout(() => {
+				timers.delete(key);
+				flushPendingReactions(key);
+			}, 350);
+			timers.set(key, timer);
+		},
+		[flushPendingReactions],
+	);
+
+	const performReactionToggle = useCallback(
+		(item: FeedItem, content: ReactionContent) => {
+			const key = itemKey(item);
+			const current =
+				reactionDesiredByKeyRef.current.get(key) ??
+				(item.reactions?.status === "ready" ? item.reactions : null);
+			if (!current) return;
+
+			if (!reactionServerByKeyRef.current.has(key)) {
+				reactionServerByKeyRef.current.set(key, current);
+			}
+			const optimistic = buildOptimisticReactions(current, content);
+			reactionDesiredByKeyRef.current.set(key, optimistic);
+			feed.applyReactions(item, optimistic);
+
+			setReactionErrorByKey((prev) => {
+				if (!(key in prev)) return prev;
+				const next = { ...prev };
+				delete next[key];
+				return next;
+			});
+			scheduleReactionFlush(key);
+		},
+		[feed, scheduleReactionFlush],
+	);
+
+	const onToggleReaction = useCallback(
+		(item: FeedItem, content: ReactionContent) => {
+			if (!reactionTokenConfigured) {
+				setPendingReaction({ item, content });
+				setPatDialogOpen(true);
+				setPatCheckState("idle");
+				setPatCheckMessage("需要先配置 PAT 才能使用站内反馈。");
+				return;
+			}
+			performReactionToggle(item, content);
+		},
+		[performReactionToggle, reactionTokenConfigured],
+	);
+
+	useEffect(() => {
+		if (!patDialogOpen) return;
+		const token = patInput.trim();
+		patCheckSeqRef.current += 1;
+		const seq = patCheckSeqRef.current;
+		if (!token) {
+			setPatCheckState("idle");
+			setPatCheckMessage(null);
+			return;
+		}
+
+		setPatCheckState("checking");
+		setPatCheckMessage("正在检查 PAT 可用性…");
+		const timer = window.setTimeout(() => {
+			void apiPostJson<ReactionTokenCheckResponse>(
+				"/api/reaction-token/check",
+				{
+					token,
+				},
+			)
+				.then((res) => {
+					if (seq !== patCheckSeqRef.current) return;
+					setPatCheckState(res.state);
+					setPatCheckMessage(res.message);
+				})
+				.catch((err) => {
+					if (seq !== patCheckSeqRef.current) return;
+					if (err instanceof ApiError && err.status === 401) {
+						setPatCheckState("invalid");
+						setPatCheckMessage(sessionExpiredHint());
+						return;
+					}
+					const message = err instanceof Error ? err.message : String(err);
+					setPatCheckState("invalid");
+					setPatCheckMessage(message);
+				});
+		}, 800);
+
+		return () => window.clearTimeout(timer);
+	}, [patDialogOpen, patInput]);
+
+	useEffect(
+		() => () => {
+			for (const timer of reactionFlushTimerByKeyRef.current.values()) {
+				window.clearTimeout(timer);
+			}
+			reactionFlushTimerByKeyRef.current.clear();
+		},
+		[],
+	);
+
+	const onSavePat = useCallback(() => {
+		if (patCheckState !== "valid") return;
+		const token = patInput.trim();
+		if (!token) return;
+
+		setPatSaving(true);
+		void apiPutJson<ReactionTokenStatusResponse>("/api/reaction-token", {
+			token,
+		})
+			.then((res) => {
+				setReactionTokenConfigured(res.configured);
+				setReactionTokenMasked(res.masked_token);
+				setPatDialogOpen(false);
+				setPatInput("");
+				setPatCheckState("idle");
+				setPatCheckMessage(null);
+				if (pendingReaction) {
+					const next = pendingReaction;
+					setPendingReaction(null);
+					performReactionToggle(next.item, next.content);
+				}
+			})
+			.catch((err) => {
+				if (err instanceof ApiError && err.status === 401) {
+					setPatCheckState("invalid");
+					setPatCheckMessage(sessionExpiredHint());
+					return;
+				}
+				const message = err instanceof Error ? err.message : String(err);
+				setPatCheckState("invalid");
+				setPatCheckMessage(message);
+			})
+			.finally(() => {
+				setPatSaving(false);
+			});
+	}, [patCheckState, patInput, pendingReaction, performReactionToggle]);
 
 	const onGenerateBrief = useCallback(() => {
 		void run("Generate brief", async () => {
@@ -339,6 +716,10 @@ export function Dashboard(props: { me: MeResponse }) {
 								showOriginalByKey={showOriginalByKey}
 								onToggleOriginal={onToggleOriginal}
 								onTranslateNow={onTranslateNow}
+								reactionBusyKeys={reactionBusyKeys}
+								reactionErrorByKey={reactionErrorByKey}
+								onToggleReaction={onToggleReaction}
+								onSyncReleases={onSyncReleases}
 							/>
 						</>
 					) : null}
@@ -374,6 +755,85 @@ export function Dashboard(props: { me: MeResponse }) {
 				releaseId={activeReleaseId}
 				onClose={onCloseReleaseDetail}
 			/>
+			{patDialogOpen ? (
+				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+					<div className="bg-card w-full max-w-2xl rounded-xl border p-5 shadow-2xl">
+						<h2 className="text-lg font-semibold tracking-tight">
+							配置 GitHub PAT 以启用反馈表情
+						</h2>
+						<p className="text-muted-foreground mt-1 text-sm">
+							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+						</p>
+
+						<div className="bg-muted/40 mt-4 rounded-lg border p-3">
+							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+							<p className="text-muted-foreground mt-1 font-mono text-xs">
+								Settings → Developer settings → Personal access tokens → Tokens
+								(classic)
+							</p>
+							<p className="text-muted-foreground mt-2 text-xs">
+								最小权限：公共仓库用{" "}
+								<span className="font-mono">public_repo</span>
+								；私有仓库用 <span className="font-mono">repo</span>。
+							</p>
+							{reactionTokenMasked ? (
+								<p className="text-muted-foreground mt-2 text-xs">
+									当前已保存：
+									<span className="font-mono">{reactionTokenMasked}</span>
+								</p>
+							) : null}
+						</div>
+
+						<label
+							htmlFor="reaction-pat"
+							className="mt-4 block font-medium text-sm"
+						>
+							GitHub PAT
+						</label>
+						<input
+							id="reaction-pat"
+							type="password"
+							value={patInput}
+							onChange={(e) => setPatInput(e.target.value)}
+							placeholder="粘贴 PAT 后将自动校验（800ms 防抖）"
+							className="bg-background mt-1 w-full rounded-md border px-3 py-2 font-mono text-sm outline-none"
+						/>
+
+						<p
+							className={
+								patCheckState === "valid"
+									? "mt-2 text-xs text-emerald-600"
+									: patCheckState === "invalid"
+										? "mt-2 text-xs text-red-600"
+										: "text-muted-foreground mt-2 text-xs"
+							}
+						>
+							{patCheckMessage ??
+								"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
+						</p>
+
+						<div className="mt-5 flex items-center justify-end gap-2">
+							<Button
+								variant="outline"
+								onClick={() => {
+									setPatDialogOpen(false);
+									setPatInput("");
+									setPatCheckState("idle");
+									setPatCheckMessage(null);
+								}}
+							>
+								稍后再说
+							</Button>
+							<Button
+								onClick={onSavePat}
+								disabled={patSaving || patCheckState !== "valid"}
+							>
+								{patSaving ? "保存中…" : "保存并继续"}
+							</Button>
+						</div>
+					</div>
+				</div>
+			) : null}
 		</AppShell>
 	);
 }
