@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
+import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
@@ -133,6 +134,7 @@ function DashboardPreview() {
 					logoutHref="#"
 				/>
 			}
+			footer={<AppMetaFooter />}
 		>
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
 				<div className="flex flex-wrap items-center gap-2">

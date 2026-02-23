@@ -6,6 +6,8 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { AppMetaFooter } from "@/layout/AppMetaFooter";
+import { AppShell } from "@/layout/AppShell";
 
 type LandingProps = {
 	bootError?: string | null;
@@ -13,8 +15,8 @@ type LandingProps = {
 
 export function Landing({ bootError }: LandingProps) {
 	return (
-		<div className="min-h-screen">
-			<div className="mx-auto max-w-3xl px-6 py-12">
+		<AppShell footer={<AppMetaFooter />}>
+			<div className="mx-auto max-w-3xl py-4 sm:py-8">
 				<div className="mb-8">
 					<div className="inline-flex items-center gap-2 rounded-full border bg-card px-3 py-1 text-xs font-medium">
 						<span className="font-mono text-muted-foreground">OctoRill</span>
@@ -55,6 +57,6 @@ export function Landing({ bootError }: LandingProps) {
 					</CardContent>
 				</Card>
 			</div>
-		</div>
+		</AppShell>
 	);
 }
