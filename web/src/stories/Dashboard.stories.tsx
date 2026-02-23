@@ -6,6 +6,7 @@ import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppShell } from "@/layout/AppShell";
+import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -102,6 +103,9 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview() {
 	const items = makeMockFeed();
 	const inFlightKeys = new Set<string>();
+	const aiDisabledHint = items.some(
+		(it) => it.translated?.status === "disabled",
+	);
 	type Tab = "all" | "releases" | "briefs" | "inbox";
 	const [tab, setTab] = useState<Tab>("all");
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
@@ -114,14 +118,20 @@ function DashboardPreview() {
 	return (
 		<AppShell
 			header={
-				<div className="flex items-center justify-between">
-					<div>
-						<h1 className="text-xl font-semibold tracking-tight">OctoRill</h1>
-						<p className="text-muted-foreground font-mono text-xs">
-							Mock dashboard preview (Storybook)
-						</p>
-					</div>
-				</div>
+				<DashboardHeader
+					feedCount={items.length}
+					inboxCount={mockNotifs.length}
+					briefCount={mockBriefs.length}
+					login="storybook-user"
+					aiDisabledHint={aiDisabledHint}
+					busy={false}
+					onRefresh={() => {}}
+					onSyncAll={() => {}}
+					onSyncStarred={() => {}}
+					onSyncReleases={() => {}}
+					onSyncInbox={() => {}}
+					logoutHref="#"
+				/>
 			}
 		>
 			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">

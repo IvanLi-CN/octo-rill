@@ -8,6 +8,7 @@ import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppShell } from "@/layout/AppShell";
+import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -168,61 +169,19 @@ export function Dashboard(props: { me: MeResponse }) {
 	return (
 		<AppShell
 			header={
-				<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-					<div className="min-w-0">
-						<div className="flex flex-wrap items-center gap-2">
-							<h1 className="text-xl font-semibold tracking-tight">OctoRill</h1>
-							<span className="text-muted-foreground font-mono text-xs">
-								Loaded {feed.items.length} · {notifications.length} inbox ·{" "}
-								{briefs.length} briefs
-							</span>
-						</div>
-						<p className="text-muted-foreground mt-1 text-sm">
-							Logged in as{" "}
-							<span className="text-foreground font-medium">
-								{me.user.login}
-							</span>
-							{aiDisabledHint ? " · AI 未配置，将只显示原文" : ""}
-						</p>
-					</div>
-
-					<div className="flex flex-wrap gap-2">
-						<Button
-							variant="secondary"
-							disabled={Boolean(busy)}
-							onClick={() => void refreshAll()}
-						>
-							Refresh
-						</Button>
-						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-							Sync all
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncStarred}
-						>
-							Sync starred
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncReleases}
-						>
-							Sync releases
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncInbox}
-						>
-							Sync inbox
-						</Button>
-						<Button asChild variant="ghost">
-							<a href="/auth/logout">Logout</a>
-						</Button>
-					</div>
-				</div>
+				<DashboardHeader
+					feedCount={feed.items.length}
+					inboxCount={notifications.length}
+					briefCount={briefs.length}
+					login={me.user.login}
+					aiDisabledHint={aiDisabledHint}
+					busy={Boolean(busy)}
+					onRefresh={() => void refreshAll()}
+					onSyncAll={onSyncAll}
+					onSyncStarred={onSyncStarred}
+					onSyncReleases={onSyncReleases}
+					onSyncInbox={onSyncInbox}
+				/>
 			}
 		>
 			{bootError ? (
