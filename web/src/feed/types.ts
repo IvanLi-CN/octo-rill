@@ -10,6 +10,38 @@ export type TranslatedItem = {
 // Feed is releases-only (Inbox has its own API + UI tab).
 export type FeedItemKind = "release";
 
+export type ReactionContent =
+	| "plus1"
+	| "laugh"
+	| "heart"
+	| "hooray"
+	| "rocket"
+	| "eyes";
+
+export type ReactionCounts = {
+	plus1: number;
+	laugh: number;
+	heart: number;
+	hooray: number;
+	rocket: number;
+	eyes: number;
+};
+
+export type ReactionViewerState = {
+	plus1: boolean;
+	laugh: boolean;
+	heart: boolean;
+	hooray: boolean;
+	rocket: boolean;
+	eyes: boolean;
+};
+
+export type ReleaseReactions = {
+	counts: ReactionCounts;
+	viewer: ReactionViewerState;
+	status: "ready" | "reauth_required" | "sync_required";
+};
+
 export type FeedItem = {
 	kind: FeedItemKind;
 	ts: string;
@@ -23,6 +55,7 @@ export type FeedItem = {
 	html_url: string | null;
 	unread: number | null;
 	translated: TranslatedItem | null;
+	reactions: ReleaseReactions | null;
 };
 
 export type FeedResponse = {
@@ -35,4 +68,9 @@ export type TranslateResponse = {
 	status: "ready" | "disabled";
 	title: string | null;
 	summary: string | null;
+};
+
+export type ToggleReleaseReactionResponse = {
+	release_id: string;
+	reactions: ReleaseReactions;
 };

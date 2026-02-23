@@ -87,6 +87,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
+        .route(
+            "/release/reactions/toggle",
+            post(api::toggle_release_reaction),
+        )
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
         .route("/translate/release", post(api::translate_release))

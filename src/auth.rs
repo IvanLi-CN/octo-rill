@@ -25,6 +25,7 @@ pub async fn github_login(
         .add_scope(Scope::new("read:user".to_owned()))
         .add_scope(Scope::new("user:email".to_owned()))
         .add_scope(Scope::new("notifications".to_owned()))
+        .add_scope(Scope::new("repo".to_owned()))
         .url();
 
     session
