@@ -52,7 +52,9 @@ export function ReleaseDetailDrawer(props: {
 		setTranslateError(null);
 		setLanguage("zh");
 
-		void apiGet<ReleaseDetail>(`/api/releases/${encodeURIComponent(releaseId)}/detail`)
+		void apiGet<ReleaseDetail>(
+			`/api/releases/${encodeURIComponent(releaseId)}/detail`,
+		)
 			.then((res) => {
 				setDetail(res);
 			})
@@ -157,7 +159,11 @@ export function ReleaseDetailDrawer(props: {
 								className="font-mono text-xs"
 								disabled={!detail}
 							>
-								<a href={detail?.html_url ?? "#"} target="_blank" rel="noreferrer">
+								<a
+									href={detail?.html_url ?? "#"}
+									target="_blank"
+									rel="noreferrer"
+								>
 									<ArrowUpRight className="size-4" />
 									GitHub
 								</a>
