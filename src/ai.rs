@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -30,21 +30,6 @@ struct ChatCompletionsRequest<'a> {
 struct ChatMessage<'a> {
     role: &'a str,
     content: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionsResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChoiceMessage {
-    content: Option<String>,
 }
 
 fn truncate_chars_lossy(bytes: &[u8], max_chars: usize) -> String {
@@ -76,6 +61,73 @@ fn extract_error_message(body: &[u8]) -> Option<String> {
         .filter(|s| !s.is_empty())
     {
         return Some(msg.to_owned());
+    }
+    None
+}
+
+fn extract_chat_content(value: &Value) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    for choice in choices {
+        if let Some(text) = choice
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(text.to_owned());
+        }
+
+        if let Some(parts) = choice
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        {
+            let mut joined = Vec::new();
+            for part in parts {
+                let kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
+                if kind != "text" && kind != "output_text" && !kind.is_empty() {
+                    continue;
+                }
+                if let Some(seg) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.get("content").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    joined.push(seg);
+                }
+            }
+            if !joined.is_empty() {
+                return Some(joined.join("\n"));
+            }
+        }
+
+        if let Some(text) = choice
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(text.to_owned());
+        }
+    }
+    None
+}
+
+fn extract_refusal_message(value: &Value) -> Option<String> {
+    let choices = value.get("choices")?.as_array()?;
+    for choice in choices {
+        if let Some(refusal) = choice
+            .get("message")
+            .and_then(|m| m.get("refusal"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(refusal.to_owned());
+        }
     }
     None
 }
@@ -272,36 +324,51 @@ pub async fn chat_completion(
         max_tokens,
     };
 
-    let resp = state
-        .http
-        .post(url)
-        .bearer_auth(ai.api_key)
-        .json(&req)
-        .send()
-        .await
-        .context("AI request failed")?;
+    let mut last_missing: Option<String> = None;
+    for attempt in 0..2 {
+        let resp = state
+            .http
+            .post(url.clone())
+            .bearer_auth(&ai.api_key)
+            .json(&req)
+            .send()
+            .await
+            .context("AI request failed")?;
 
-    let status = resp.status();
-    let body = resp.bytes().await.context("AI read response failed")?;
+        let status = resp.status();
+        let body = resp.bytes().await.context("AI read response failed")?;
 
-    if !status.is_success() {
-        let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
-        return Err(anyhow!("AI returned {status}: {msg}"));
+        if !status.is_success() {
+            let msg =
+                extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
+            return Err(anyhow!("AI returned {status}: {msg}"));
+        }
+
+        let value: Value =
+            serde_json::from_slice(&body).context("AI response json decode failed")?;
+        if let Some(content) = extract_chat_content(&value) {
+            return Ok(content);
+        }
+
+        let msg = if let Some(refusal) = extract_refusal_message(&value) {
+            format!("AI refusal: {refusal}")
+        } else {
+            format!(
+                "AI response missing content: {}",
+                truncate_chars_lossy(&body, 400)
+            )
+        };
+        last_missing = Some(msg);
+        if attempt == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
     }
 
-    let resp: ChatCompletionsResponse =
-        serde_json::from_slice(&body).context("AI response json decode failed")?;
-
-    let content = resp
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.message.content)
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("AI response missing content"))?;
-
-    Ok(content)
+    Err(anyhow!(
+        "{}",
+        last_missing.unwrap_or_else(|| "AI response missing content".to_owned())
+    ))
 }
 
 pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<String> {
@@ -483,5 +550,45 @@ mod tests {
         let out = reconcile_brief_release_links(markdown, &targets);
         assert!(out.contains("release=12"));
         assert!(out.contains("release=123"));
+    }
+
+    #[test]
+    fn extract_chat_content_supports_string_message_content() {
+        let v = serde_json::json!({
+            "choices": [
+                { "message": { "content": "  hello world  " } }
+            ]
+        });
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn extract_chat_content_supports_array_message_content() {
+        let v = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            { "type": "text", "text": "line1" },
+                            { "type": "output_text", "text": "line2" }
+                        ]
+                    }
+                }
+            ]
+        });
+        assert_eq!(extract_chat_content(&v).as_deref(), Some("line1\nline2"));
+    }
+
+    #[test]
+    fn extract_refusal_message_reads_refusal_text() {
+        let v = serde_json::json!({
+            "choices": [
+                { "message": { "refusal": "policy blocked" } }
+            ]
+        });
+        assert_eq!(
+            extract_refusal_message(&v).as_deref(),
+            Some("policy blocked")
+        );
     }
 }
