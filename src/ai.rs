@@ -12,7 +12,7 @@ use crate::state::AppState;
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReleaseRow {
     release_id: i64,
-    full_name: String,
+    repo_id: i64,
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
@@ -353,6 +353,26 @@ fn compact_link_label(raw: &str) -> String {
     truncate_chars(raw, 64)
 }
 
+fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
+    let parsed = Url::parse(html_url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?.trim();
+    let repo = segments.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
+    parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
+}
+
 fn is_allowed_github_url(raw: &str) -> bool {
     if raw.contains('…') {
         return false;
@@ -574,7 +594,7 @@ fn to_release_digest(rows: Vec<ReleaseRow>) -> Vec<ReleaseDigest> {
     rows.into_iter()
         .map(|r| ReleaseDigest {
             release_id: r.release_id,
-            full_name: r.full_name,
+            full_name: resolve_release_full_name(&r.html_url, r.repo_id),
             title: r
                 .name
                 .as_deref()
@@ -882,7 +902,7 @@ async fn build_brief_content(
         r#"
         SELECT
           r.release_id,
-          sr.full_name,
+          r.repo_id,
           r.tag_name,
           r.name,
           r.body,
@@ -890,12 +910,12 @@ async fn build_brief_content(
           COALESCE(r.published_at, r.created_at, r.updated_at) AS published_at,
           r.is_prerelease
         FROM releases r
-        JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
         WHERE r.user_id = ?
           AND COALESCE(r.published_at, r.created_at, r.updated_at) >= ?
           AND COALESCE(r.published_at, r.created_at, r.updated_at) < ?
-        ORDER BY sr.full_name ASC, COALESCE(r.published_at, r.created_at, r.updated_at) DESC
+        ORDER BY
+          COALESCE(r.published_at, r.created_at, r.updated_at) DESC,
+          r.release_id DESC
         LIMIT 300
         "#,
     )
