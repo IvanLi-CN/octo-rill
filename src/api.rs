@@ -1115,6 +1115,9 @@ fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+const RELEASE_DETAIL_CHUNK_MAX_CHARS: usize = 2200;
+const RELEASE_DETAIL_CHUNK_MAX_TOKENS: u32 = 2200;
+
 fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
     let parsed = parse_translation_json(raw);
     let out_title = parsed
@@ -1413,6 +1416,62 @@ pub async fn translate_release(
     }))
 }
 
+async fn translate_release_detail_chunk(
+    state: &AppState,
+    repo_full_name: &str,
+    original_title: &str,
+    chunk: &str,
+    current: usize,
+    total: usize,
+) -> Result<String, ApiError> {
+    let prompt = format!(
+        "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
+        repo = repo_full_name,
+        title = original_title,
+        current = current,
+        total = total,
+        chunk = chunk,
+    );
+
+    let translated = ai::chat_completion(
+        state,
+        "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
+        &prompt,
+        RELEASE_DETAIL_CHUNK_MAX_TOKENS,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let translated = translated.trim().to_owned();
+    if markdown_structure_preserved(chunk, &translated) {
+        return Ok(translated);
+    }
+
+    let retry_prompt = format!(
+        "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n上一次译文（结构不一致，需重译）：\n{translated}\n\n请重新翻译，并严格满足：\n1) 译文非空行数必须与原文完全一致；\n2) 每行保留相同 Markdown 前缀（#, -, 1., >）；\n3) 保留链接 URL 与代码；\n4) 不新增、不删减信息；\n5) 只输出翻译后的 Markdown，不要解释。",
+        repo = repo_full_name,
+        title = original_title,
+        current = current,
+        total = total,
+        chunk = chunk,
+        translated = translated,
+    );
+    let retry = ai::chat_completion(
+        state,
+        "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
+        &retry_prompt,
+        RELEASE_DETAIL_CHUNK_MAX_TOKENS,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let retry = retry.trim().to_owned();
+    if !markdown_structure_preserved(chunk, &retry) {
+        return Err(ApiError::internal(
+            "release detail translation failed to preserve markdown structure",
+        ));
+    }
+    Ok(retry)
+}
+
 pub async fn translate_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1538,29 +1597,20 @@ pub async fn translate_release_detail(
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
     } else {
-        let chunks = split_markdown_chunks(&original_body, 5500);
+        let chunks = split_markdown_chunks(&original_body, RELEASE_DETAIL_CHUNK_MAX_CHARS);
         let total_chunks = chunks.len();
         let mut translated_chunks = Vec::with_capacity(total_chunks);
         for (idx, chunk) in chunks.iter().enumerate() {
-            let prompt = format!(
-                "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
-                repo = repo_full_name,
-                title = original_title,
-                current = idx + 1,
-                total = total_chunks,
-                chunk = chunk,
-            );
-
-            let translated = ai::chat_completion(
+            let translated = translate_release_detail_chunk(
                 state.as_ref(),
-                "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
-                &prompt,
-                1600,
+                &repo_full_name,
+                &original_title,
+                chunk,
+                idx + 1,
+                total_chunks,
             )
-            .await
-            .map_err(ApiError::internal)?;
-
-            translated_chunks.push(translated.trim().to_owned());
+            .await?;
+            translated_chunks.push(translated);
         }
 
         translated_chunks.join("\n\n")
