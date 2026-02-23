@@ -769,10 +769,63 @@ fn build_brief_markdown(window: &DailyWindow, repos: &[RepoRendered]) -> String 
     out
 }
 
+fn parse_internal_release_id(target: &str) -> Option<i64> {
+    let base = Url::parse("https://octorill.local/").expect("valid local base url");
+    let joined = base.join(target.trim()).ok()?;
+
+    if joined.host_str() != Some("octorill.local") {
+        return None;
+    }
+    if let Some(tab) = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))
+        && tab != "briefs"
+    {
+        return None;
+    }
+
+    let raw_release = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "release").then_some(v.into_owned()))?;
+    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    raw_release.parse::<i64>().ok()
+}
+
+fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    let mut i = 0usize;
+
+    while i < markdown.len() {
+        let rest = &markdown[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+            let target = &markdown[url_start..url_end];
+            if let Some(release_id) = parse_internal_release_id(target) {
+                ids.insert(release_id);
+            }
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        i += ch.len_utf8();
+    }
+
+    ids
+}
+
 fn contains_all_release_links(markdown: &str, release_ids: &[i64]) -> bool {
-    release_ids
-        .iter()
-        .all(|id| markdown.contains(&format!("release={id}")))
+    let present = extract_internal_release_ids(markdown);
+    release_ids.iter().all(|id| present.contains(id))
 }
 
 async fn polish_brief_markdown(
@@ -1003,5 +1056,18 @@ mod tests {
     fn fallback_bullets_never_empty() {
         let bullets = extract_fallback_bullets("", 3);
         assert_eq!(bullets.len(), 1);
+    }
+
+    #[test]
+    fn contains_all_release_links_matches_exact_release_id() {
+        let markdown = "- [v1.2.3](/?tab=briefs&release=123)";
+        assert!(contains_all_release_links(markdown, &[123]));
+        assert!(!contains_all_release_links(markdown, &[12, 123]));
+    }
+
+    #[test]
+    fn contains_all_release_links_accepts_query_order_variants() {
+        let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
+        assert!(contains_all_release_links(markdown, &[123]));
     }
 }
