@@ -1,113 +1,79 @@
 import { cn } from "@/lib/utils";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-type Block =
-	| { kind: "h"; level: 1 | 2 | 3; text: string }
-	| { kind: "p"; text: string }
-	| { kind: "ul"; items: string[] };
-
-function parseMarkdown(md: string): Block[] {
-	const lines = md.replaceAll("\r\n", "\n").split("\n");
-
-	const out: Block[] = [];
-	let para: string[] = [];
-	let list: string[] = [];
-
-	const flushPara = () => {
-		const text = para.join(" ").trim();
-		if (text) out.push({ kind: "p", text });
-		para = [];
-	};
-
-	const flushList = () => {
-		if (list.length > 0) out.push({ kind: "ul", items: list });
-		list = [];
-	};
-
-	for (const raw of lines) {
-		const line = raw.trimEnd();
-		const trimmed = line.trim();
-
-		if (!trimmed) {
-			flushList();
-			flushPara();
-			continue;
-		}
-
-		const heading = /^(#{1,3})\s+(.*)$/.exec(trimmed);
-		if (heading) {
-			flushList();
-			flushPara();
-			const level = heading[1].length as 1 | 2 | 3;
-			const text = heading[2].trim();
-			out.push({ kind: "h", level, text });
-			continue;
-		}
-
-		const bullet = /^[-*]\s+(.*)$/.exec(trimmed);
-		if (bullet) {
-			flushPara();
-			list.push(bullet[1].trim());
-			continue;
-		}
-
-		flushList();
-		para.push(trimmed);
-	}
-
-	flushList();
-	flushPara();
-	return out;
-}
-
-function blockKey(b: Block, i: number) {
-	if (b.kind === "ul") return `ul:${b.items.join("|")}:${i}`;
-	if (b.kind === "h") return `h${b.level}:${b.text}:${i}`;
-	return `p:${b.text}:${i}`;
-}
+const markdownComponents: Components = {
+	h1: ({ children }) => (
+		<h2 className="text-base font-semibold tracking-tight">{children}</h2>
+	),
+	h2: ({ children }) => (
+		<h3 className="text-sm font-semibold tracking-tight">{children}</h3>
+	),
+	h3: ({ children }) => (
+		<h4 className="text-xs font-semibold tracking-tight text-muted-foreground">
+			{children}
+		</h4>
+	),
+	p: ({ children }) => (
+		<p className="text-muted-foreground whitespace-pre-wrap">{children}</p>
+	),
+	ul: ({ children }) => (
+		<ul className="list-disc space-y-1 pl-5">{children}</ul>
+	),
+	ol: ({ children }) => (
+		<ol className="list-decimal space-y-1 pl-5">{children}</ol>
+	),
+	li: ({ children }) => <li className="text-muted-foreground">{children}</li>,
+	a: ({ children, href }) => (
+		<a
+			href={href}
+			target="_blank"
+			rel="noreferrer noopener"
+			className="text-foreground underline underline-offset-4"
+		>
+			{children}
+		</a>
+	),
+	code: ({ children }) => (
+		<code className="bg-muted/60 rounded px-1 py-0.5 font-mono text-[12px]">
+			{children}
+		</code>
+	),
+	pre: ({ children }) => (
+		<pre className="bg-muted/40 overflow-x-auto rounded-md border p-3 font-mono text-xs">
+			{children}
+		</pre>
+	),
+	blockquote: ({ children }) => (
+		<blockquote className="border-l-2 pl-3 text-muted-foreground italic">
+			{children}
+		</blockquote>
+	),
+	table: ({ children }) => (
+		<div className="overflow-x-auto">
+			<table className="w-full border-collapse text-left text-sm">
+				{children}
+			</table>
+		</div>
+	),
+	th: ({ children }) => (
+		<th className="border-b px-2 py-1 font-semibold">{children}</th>
+	),
+	td: ({ children }) => <td className="border-b px-2 py-1">{children}</td>,
+};
 
 export function Markdown(props: { content: string; className?: string }) {
 	const { content, className } = props;
-	const blocks = parseMarkdown(content);
 
 	return (
 		<div className={cn("space-y-3 text-sm leading-relaxed", className)}>
-			{blocks.map((b, i) => {
-				if (b.kind === "h") {
-					const classes =
-						b.level === 1
-							? "text-base font-semibold tracking-tight"
-							: b.level === 2
-								? "text-sm font-semibold tracking-tight"
-								: "text-xs font-semibold tracking-tight text-muted-foreground";
-					const Tag = b.level === 1 ? "h2" : b.level === 2 ? "h3" : "h4";
-					return (
-						<Tag key={blockKey(b, i)} className={classes}>
-							{b.text}
-						</Tag>
-					);
-				}
-
-				if (b.kind === "ul") {
-					return (
-						<ul key={blockKey(b, i)} className="list-disc space-y-1 pl-5">
-							{b.items.map((it) => (
-								<li key={it} className="text-muted-foreground">
-									{it}
-								</li>
-							))}
-						</ul>
-					);
-				}
-
-				return (
-					<p
-						key={blockKey(b, i)}
-						className="text-muted-foreground whitespace-pre-wrap"
-					>
-						{b.text}
-					</p>
-				);
-			})}
+			<ReactMarkdown
+				remarkPlugins={[remarkGfm]}
+				skipHtml
+				components={markdownComponents}
+			>
+				{content}
+			</ReactMarkdown>
 		</div>
 	);
 }
