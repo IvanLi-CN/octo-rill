@@ -1892,10 +1892,260 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+
     use super::{
         markdown_structure_preserved, parse_release_id_param, parse_translation_json,
         release_detail_translation_ready, release_excerpt,
     };
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (1, 30215105, 'IvanLi-CN', ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed user");
+
+        pool
+    }
+
+    async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO releases (
+              user_id, repo_id, release_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind(release_id)
+        .bind("v1.2.3")
+        .bind("Release v1.2.3")
+        .bind("- item")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release");
+    }
+
+    async fn seed_star(pool: &SqlitePool, repo_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind("openai/codex")
+        .bind("openai")
+        .bind("codex")
+        .bind("octo rill test")
+        .bind("https://github.com/openai/codex")
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed starred");
+    }
+
+    #[tokio::test]
+    async fn release_detail_query_is_readable_without_star() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            release_id: i64,
+            repo_full_name: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT r.release_id, sr.full_name AS repo_full_name
+            FROM releases r
+            LEFT JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ? AND r.release_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(1_i64)
+        .bind(120_i64)
+        .fetch_optional(&pool)
+        .await
+        .expect("query detail");
+
+        let row = row.expect("detail row");
+        assert_eq!(row.release_id, 120);
+        assert!(row.repo_full_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_releases_query_keeps_star_visibility_filter() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        let count_without_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases without star");
+        assert_eq!(count_without_star, 0);
+
+        seed_star(&pool, 42).await;
+        let count_with_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases with star");
+        assert_eq!(count_with_star, 1);
+    }
+
+    #[tokio::test]
+    async fn translate_detail_source_query_is_readable_without_star() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            repo_full_name: Option<String>,
+            tag_name: String,
+            name: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT sr.full_name AS repo_full_name, r.tag_name, r.name
+            FROM releases r
+            LEFT JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ? AND r.release_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(1_i64)
+        .bind(120_i64)
+        .fetch_optional(&pool)
+        .await
+        .expect("query translate detail source");
+
+        let row = row.expect("source row");
+        assert!(row.repo_full_name.is_none());
+        assert_eq!(row.tag_name, "v1.2.3");
+        assert_eq!(row.name.as_deref(), Some("Release v1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn detail_query_reads_release_detail_cache_namespace() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+            )
+            VALUES (?, 'release', ?, 'zh-CN', 'hash-release', 'Wrong namespace', 'release-summary', ?, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind("120")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed release translation");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+            )
+            VALUES (?, 'release_detail', ?, 'zh-CN', 'hash-detail', 'Detail namespace', 'detail-summary', ?, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind("120")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed release detail translation");
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            trans_title: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT t.title AS trans_title
+            FROM releases r
+            LEFT JOIN ai_translations t
+              ON t.user_id = r.user_id
+              AND t.entity_type = 'release_detail'
+              AND t.entity_id = CAST(r.release_id AS TEXT)
+              AND t.lang = 'zh-CN'
+            WHERE r.user_id = ? AND r.release_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(1_i64)
+        .bind(120_i64)
+        .fetch_optional(&pool)
+        .await
+        .expect("query release detail translation");
+
+        let row = row.expect("translation row");
+        assert_eq!(row.trans_title.as_deref(), Some("Detail namespace"));
+    }
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {

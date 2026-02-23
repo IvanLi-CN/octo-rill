@@ -553,6 +553,22 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_brief_release_links_avoids_prefix_false_positive() {
+        let markdown = "- [repo/b · v2.0.0](/?tab=briefs&release=123)\n";
+        let targets = vec![ReleaseRow {
+            release_id: 12,
+            full_name: "repo/a".to_owned(),
+            tag_name: "v1.2.0".to_owned(),
+            name: None,
+            published_at: None,
+        }];
+
+        let out = reconcile_brief_release_links(markdown, &targets);
+        assert!(out.contains("release=123"));
+        assert!(out.contains("release=12"));
+    }
+
+    #[test]
     fn extract_chat_content_supports_string_message_content() {
         let v = serde_json::json!({
             "choices": [
