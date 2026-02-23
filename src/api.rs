@@ -736,14 +736,13 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
                     }
                 }
             }
-            if status == "ready" {
-                if let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref()) {
-                    if !markdown_structure_preserved(src, s) {
-                        status = "missing".to_owned();
-                        title = None;
-                        summary = None;
-                    }
-                }
+            if status == "ready"
+                && let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref())
+                && !markdown_structure_preserved(src, s)
+            {
+                status = "missing".to_owned();
+                title = None;
+                summary = None;
             }
 
             Some(TranslatedItem {
@@ -914,10 +913,12 @@ fn line_prefix_kind(line: &str) -> &'static str {
     if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
         return "ul";
     }
-    if let Some((head, tail)) = t.split_once('.') {
-        if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) && tail.starts_with(' ') {
-            return "ol";
-        }
+    if let Some((head, tail)) = t.split_once('.')
+        && !head.is_empty()
+        && head.chars().all(|c| c.is_ascii_digit())
+        && tail.starts_with(' ')
+    {
+        return "ol";
     }
     "plain"
 }
@@ -1216,26 +1217,26 @@ pub async fn translate_release(
     .map_err(ApiError::internal)?;
 
     let (mut out_title, mut out_summary) = extract_translation_fields(&raw);
-    if let Some(summary) = out_summary.as_deref() {
-        if !markdown_structure_preserved(&excerpt, summary) {
-            let retry_prompt =
-                release_translation_prompt(&row.full_name, &title, &excerpt, Some(summary));
-            if let Ok(retry_raw) = ai::chat_completion(
-                state.as_ref(),
-                "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
-                &retry_prompt,
-                900,
-            )
-            .await
+    if let Some(summary) = out_summary.as_deref()
+        && !markdown_structure_preserved(&excerpt, summary)
+    {
+        let retry_prompt =
+            release_translation_prompt(&row.full_name, &title, &excerpt, Some(summary));
+        if let Ok(retry_raw) = ai::chat_completion(
+            state.as_ref(),
+            "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
+            &retry_prompt,
+            900,
+        )
+        .await
+        {
+            let (retry_title, retry_summary) = extract_translation_fields(&retry_raw);
+            if retry_summary
+                .as_deref()
+                .is_some_and(|s| markdown_structure_preserved(&excerpt, s))
             {
-                let (retry_title, retry_summary) = extract_translation_fields(&retry_raw);
-                if retry_summary
-                    .as_deref()
-                    .is_some_and(|s| markdown_structure_preserved(&excerpt, s))
-                {
-                    out_title = retry_title.or(out_title);
-                    out_summary = retry_summary;
-                }
+                out_title = retry_title.or(out_title);
+                out_summary = retry_summary;
             }
         }
     }
