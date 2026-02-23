@@ -6,6 +6,7 @@ import {
 	Card,
 	CardContent,
 	CardDescription,
+	CardFooter,
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
@@ -177,68 +178,6 @@ export function FeedItemCard(props: {
 						</Button>
 					</div>
 				</div>
-
-				{reactions ? (
-					<div className="mt-3 flex flex-wrap items-center gap-2">
-						{reactions.status === "ready"
-							? REACTION_ITEMS.map((reaction) => {
-									const active = reactions.viewer[reaction.content];
-									const count = reactions.counts[reaction.content];
-									return (
-										<button
-											key={reaction.content}
-											type="button"
-											disabled={isReactionBusy}
-											onClick={() => onToggleReaction(reaction.content)}
-											className={cn(
-												"inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs transition-colors",
-												active
-													? "border-primary bg-primary/10 text-primary"
-													: "text-muted-foreground hover:text-foreground border-border",
-												isReactionBusy && "cursor-not-allowed opacity-70",
-											)}
-											title={reaction.label}
-										>
-											<span>{reaction.emoji}</span>
-											<span>{count}</span>
-										</button>
-									);
-								})
-							: null}
-
-						{reactions.status === "reauth_required" ? (
-							<>
-								<span className="text-muted-foreground font-mono text-[11px]">
-									反馈表情需要重新登录（repo 权限）
-								</span>
-								<Button
-									asChild
-									variant="outline"
-									size="sm"
-									className="font-mono text-xs"
-								>
-									<a href="/auth/github/login">重新登录</a>
-								</Button>
-							</>
-						) : null}
-
-						{reactions.status === "sync_required" ? (
-							<>
-								<span className="text-muted-foreground font-mono text-[11px]">
-									反馈表情尚未就绪，请先同步 releases
-								</span>
-								<Button
-									variant="outline"
-									size="sm"
-									className="font-mono text-xs"
-									onClick={onSyncReleases}
-								>
-									Sync releases
-								</Button>
-							</>
-						) : null}
-					</div>
-				) : null}
 			</CardHeader>
 
 			{bodyText ? (
@@ -257,6 +196,68 @@ export function FeedItemCard(props: {
 					</p>
 				</CardContent>
 			)}
+
+			{reactions ? (
+				<CardFooter className="border-border/70 flex flex-wrap items-center gap-2 border-t px-6 py-4">
+					{reactions.status === "ready"
+						? REACTION_ITEMS.map((reaction) => {
+								const active = reactions.viewer[reaction.content];
+								const count = reactions.counts[reaction.content];
+								return (
+									<button
+										key={reaction.content}
+										type="button"
+										disabled={isReactionBusy}
+										onClick={() => onToggleReaction(reaction.content)}
+										className={cn(
+											"inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs transition-colors",
+											active
+												? "border-primary bg-primary/10 text-primary"
+												: "text-muted-foreground hover:text-foreground border-border",
+											isReactionBusy && "cursor-not-allowed opacity-70",
+										)}
+										title={reaction.label}
+									>
+										<span>{reaction.emoji}</span>
+										<span>{count}</span>
+									</button>
+								);
+							})
+						: null}
+
+					{reactions.status === "reauth_required" ? (
+						<>
+							<span className="text-muted-foreground font-mono text-[11px]">
+								反馈表情需要重新登录（repo 权限）
+							</span>
+							<Button
+								asChild
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+							>
+								<a href="/auth/github/login">重新登录</a>
+							</Button>
+						</>
+					) : null}
+
+					{reactions.status === "sync_required" ? (
+						<>
+							<span className="text-muted-foreground font-mono text-[11px]">
+								反馈表情尚未就绪，请先同步 releases
+							</span>
+							<Button
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+								onClick={onSyncReleases}
+							>
+								Sync releases
+							</Button>
+						</>
+					) : null}
+				</CardFooter>
+			) : null}
 		</Card>
 	);
 }
