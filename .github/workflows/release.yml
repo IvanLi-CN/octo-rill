@@ -24,7 +24,7 @@ jobs:
     name: Prepare release metadata
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
     outputs:
       should_release: ${{ steps.intent.outputs.should_release }}
       bump_level: ${{ steps.intent.outputs.bump_level }}
