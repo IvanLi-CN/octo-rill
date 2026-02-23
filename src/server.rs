@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::{ai, api, auth, state};
+use crate::{ai, api, auth, state, sync};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -81,11 +81,19 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/me", get(api::me))
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
+        .route(
+            "/releases/{release_id}/detail",
+            get(api::get_release_detail),
+        )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
         .route("/translate/release", post(api::translate_release))
+        .route(
+            "/translate/release/detail",
+            post(api::translate_release_detail),
+        )
         .route("/translate/notification", post(api::translate_notification))
         .route("/sync/starred", post(api::sync_starred))
         .route("/sync/releases", post(api::sync_releases))
@@ -205,6 +213,8 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
     }
 
     tokio::spawn(async move {
+        run_startup_brief_backfill(state.as_ref(), at).await;
+
         loop {
             let now = chrono::Local::now().naive_local();
             let today = chrono::Local::now().date_naive();
@@ -252,4 +262,55 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
             }
         }
     });
+}
+
+async fn run_startup_brief_backfill(state: &AppState, at: chrono::NaiveTime) {
+    let users = sqlx::query_scalar::<_, i64>(r#"SELECT id FROM users ORDER BY id"#)
+        .fetch_all(&state.pool)
+        .await;
+    let users = match users {
+        Ok(users) => users,
+        Err(err) => {
+            tracing::warn!(?err, "startup brief backfill: failed to query users");
+            return;
+        }
+    };
+
+    let key_dates = ai::recent_key_dates(at, chrono::Local::now(), 7);
+
+    for user_id in users {
+        if let Err(err) = sync::sync_releases(state, user_id).await {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "startup brief backfill: sync releases failed; continue with local data"
+            );
+        }
+
+        // Backfill oldest to newest so the latest day is generated last.
+        for key_date in key_dates.iter().rev() {
+            let key_date_str = key_date.to_string();
+            let exists = sqlx::query_scalar::<_, i64>(
+                r#"SELECT 1 FROM briefs WHERE user_id = ? AND date = ? LIMIT 1"#,
+            )
+            .bind(user_id)
+            .bind(&key_date_str)
+            .fetch_optional(&state.pool)
+            .await;
+
+            if matches!(exists, Ok(Some(_))) {
+                continue;
+            }
+
+            if let Err(err) = ai::generate_daily_brief_for_key_date(state, user_id, *key_date).await
+            {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    key_date = %key_date_str,
+                    "startup brief backfill: generate failed"
+                );
+            }
+        }
+    }
 }

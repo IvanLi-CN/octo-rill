@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
@@ -149,6 +149,95 @@ pub async fn list_releases(
     .map_err(ApiError::internal)?;
 
     Ok(Json(items))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ReleaseDetailResponse {
+    release_id: String,
+    full_name: String,
+    tag_name: String,
+    name: Option<String>,
+    title: String,
+    body: String,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+}
+
+pub async fn get_release_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(release_id_raw): Path<String>,
+) -> Result<Json<ReleaseDetailResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id_raw = release_id_raw.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    let release_id: i64 = release_id_raw
+        .parse()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ReleaseDetailRow {
+        release_id: i64,
+        full_name: String,
+        tag_name: String,
+        name: Option<String>,
+        body: Option<String>,
+        html_url: String,
+        published_at: Option<String>,
+        is_prerelease: i64,
+        is_draft: i64,
+    }
+
+    let row = sqlx::query_as::<_, ReleaseDetailRow>(
+        r#"
+        SELECT
+          r.release_id, sr.full_name, r.tag_name, r.name, r.body, r.html_url, r.published_at,
+          r.is_prerelease, r.is_draft
+        FROM releases r
+        JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        WHERE r.user_id = ? AND r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+
+    Ok(Json(ReleaseDetailResponse {
+        release_id: row.release_id.to_string(),
+        full_name: row.full_name,
+        tag_name: row.tag_name,
+        name: row.name,
+        title,
+        body: row.body.unwrap_or_default(),
+        html_url: row.html_url,
+        published_at: row.published_at,
+        is_prerelease: row.is_prerelease,
+        is_draft: row.is_draft,
+    }))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -822,6 +911,11 @@ pub struct TranslateReleaseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TranslateReleaseDetailRequest {
+    release_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct TranslateNotificationRequest {
     thread_id: String,
 }
@@ -834,10 +928,19 @@ pub struct TranslateResponse {
     summary: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TranslateReleaseDetailResponse {
+    lang: String,
+    status: String, // ready | disabled
+    title: Option<String>,
+    body_markdown: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TranslationJson {
     title_zh: Option<String>,
     summary_md: Option<String>,
+    body_md: Option<String>,
 }
 
 fn strip_markdown_code_fence(raw: &str) -> &str {
@@ -965,6 +1068,34 @@ fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
     })
 }
 
+fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
+    if input.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for line in input.replace("\r\n", "\n").lines() {
+        let candidate_len = current.chars().count() + line.chars().count() + 1;
+        if !current.is_empty() && candidate_len > max_chars {
+            chunks.push(current);
+            current = String::new();
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
 fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
     let parsed = parse_translation_json(raw);
     let out_title = parsed
@@ -975,7 +1106,7 @@ fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
         .map(|s| s.to_owned());
     let out_summary = parsed
         .as_ref()
-        .and_then(|p| p.summary_md.as_deref())
+        .and_then(|p| p.summary_md.as_deref().or(p.body_md.as_deref()))
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned())
@@ -1263,6 +1394,177 @@ pub async fn translate_release(
     }))
 }
 
+pub async fn translate_release_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<TranslateReleaseDetailRequest>,
+) -> Result<Json<TranslateReleaseDetailResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id_raw = req.release_id.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    let release_id: i64 = release_id_raw
+        .parse()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+
+    if state.config.ai.is_none() {
+        return Ok(Json(TranslateReleaseDetailResponse {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            body_markdown: None,
+        }));
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ReleaseDetailSourceRow {
+        full_name: String,
+        tag_name: String,
+        name: Option<String>,
+        body: Option<String>,
+    }
+
+    let row = sqlx::query_as::<_, ReleaseDetailSourceRow>(
+        r#"
+        SELECT sr.full_name, r.tag_name, r.name, r.body
+        FROM releases r
+        JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        WHERE r.user_id = ? AND r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let original_title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let original_body = row.body.unwrap_or_default();
+
+    let source = format!(
+        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
+        row.full_name, original_title, original_body
+    );
+    let source_hash = ai::sha256_hex(&source);
+    let entity_id = release_id.to_string();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct TranslationRow {
+        source_hash: String,
+        title: Option<String>,
+        summary: Option<String>,
+    }
+    let cached = sqlx::query_as::<_, TranslationRow>(
+        r#"
+        SELECT source_hash, title, summary
+        FROM ai_translations
+        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(&entity_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(cached) = cached
+        && cached.source_hash == source_hash
+    {
+        return Ok(Json(TranslateReleaseDetailResponse {
+            lang: "zh-CN".to_owned(),
+            status: "ready".to_owned(),
+            title: cached.title,
+            body_markdown: cached.summary,
+        }));
+    }
+
+    let translated_title = ai::chat_completion(
+        state.as_ref(),
+        "你是一个翻译助手，只把 GitHub Release 标题翻译成自然中文。输出纯文本，不要解释。",
+        &format!(
+            "Repo: {}\nOriginal title: {}\n\n输出中文标题：",
+            row.full_name, original_title
+        ),
+        120,
+    )
+    .await
+    .ok()
+    .and_then(|s| {
+        let title = s.trim();
+        if title.is_empty() {
+            None
+        } else {
+            Some(title.to_owned())
+        }
+    });
+
+    let chunks = split_markdown_chunks(&original_body, 5500);
+    let total_chunks = chunks.len();
+    let mut translated_chunks = Vec::with_capacity(total_chunks);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let prompt = format!(
+            "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
+            repo = row.full_name,
+            title = original_title,
+            current = idx + 1,
+            total = total_chunks,
+            chunk = chunk,
+        );
+
+        let translated = ai::chat_completion(
+            state.as_ref(),
+            "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
+            &prompt,
+            1600,
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+        translated_chunks.push(translated.trim().to_owned());
+    }
+
+    let body_markdown = translated_chunks.join("\n\n");
+
+    upsert_translation(
+        state.as_ref(),
+        user_id,
+        TranslationUpsert {
+            entity_type: "release_detail",
+            entity_id: &entity_id,
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: translated_title.as_deref(),
+            summary: Some(body_markdown.as_str()),
+        },
+    )
+    .await?;
+
+    Ok(Json(TranslateReleaseDetailResponse {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title: translated_title,
+        body_markdown: Some(body_markdown),
+    }))
+}
+
 pub async fn translate_notification(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1472,7 +1774,10 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_structure_preserved, parse_translation_json, release_excerpt};
+    use super::{
+        markdown_structure_preserved, parse_translation_json, release_excerpt,
+        split_markdown_chunks,
+    };
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {
@@ -1519,5 +1824,15 @@ echo should_not_be_in_excerpt
         let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
         assert!(!markdown_structure_preserved(source, translated_missing));
         assert!(markdown_structure_preserved(source, translated_ok));
+    }
+
+    #[test]
+    fn split_markdown_chunks_preserves_order() {
+        let md = "line1\nline2\nline3\nline4";
+        let chunks = split_markdown_chunks(md, 12);
+        assert!(chunks.len() >= 2);
+        let rebuilt = chunks.join("\n");
+        assert!(rebuilt.contains("line1"));
+        assert!(rebuilt.contains("line4"));
     }
 }
