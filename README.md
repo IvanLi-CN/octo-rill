@@ -25,7 +25,7 @@ Copy `.env.example` to `.env` and fill values.
   - `AI_API_KEY`
   - `AI_BASE_URL`
   - `AI_MODEL`
-  - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界）
+  - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界；不配置时默认 `08:00`）
 
 ### 2) 启动后端
 
