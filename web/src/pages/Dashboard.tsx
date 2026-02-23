@@ -6,6 +6,7 @@ import { FeedList } from "@/feed/FeedList";
 import type {
 	FeedItem,
 	ReactionContent,
+	ReleaseReactions,
 	ToggleReleaseReactionResponse,
 } from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
@@ -88,6 +89,22 @@ function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 
 function sessionExpiredHint() {
 	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
+}
+
+function buildOptimisticReactions(
+	current: ReleaseReactions,
+	content: ReactionContent,
+): ReleaseReactions {
+	const viewer = { ...current.viewer };
+	const counts = { ...current.counts };
+	const hasReacted = viewer[content];
+	viewer[content] = !hasReacted;
+	counts[content] = Math.max(0, counts[content] + (hasReacted ? -1 : 1));
+	return {
+		...current,
+		viewer,
+		counts,
+	};
 }
 
 export function Dashboard(props: { me: MeResponse }) {
@@ -212,6 +229,14 @@ export function Dashboard(props: { me: MeResponse }) {
 		(item: FeedItem, content: ReactionContent) => {
 			const key = itemKey(item);
 			if (reactionBusyKeysRef.current.has(key)) return;
+			const previousReactions =
+				item.reactions?.status === "ready" ? item.reactions : null;
+			if (previousReactions) {
+				feed.applyReactions(
+					item,
+					buildOptimisticReactions(previousReactions, content),
+				);
+			}
 
 			setReactionErrorByKey((prev) => {
 				if (!(key in prev)) return prev;
@@ -244,6 +269,9 @@ export function Dashboard(props: { me: MeResponse }) {
 					setPatCheckMessage("PAT 可用");
 				})
 				.catch((err) => {
+					if (previousReactions) {
+						feed.applyReactions(item, previousReactions);
+					}
 					if (err instanceof ApiError) {
 						if (err.status === 401) {
 							setReactionErrorByKey((prev) => ({
