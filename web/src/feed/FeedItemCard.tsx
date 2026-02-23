@@ -211,7 +211,7 @@ export function FeedItemCard(props: {
 										type="button"
 										onClick={() => onToggleReaction(reaction.content)}
 										className={cn(
-											"inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-xs transition-colors",
+											"group inline-flex cursor-pointer items-center rounded-full border px-2 py-0.5 font-mono text-xs transition-all duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
 											count > 0 && "gap-1",
 											active
 												? "border-primary bg-primary/10 text-primary"
@@ -220,7 +220,9 @@ export function FeedItemCard(props: {
 										)}
 										title={reaction.label}
 									>
-										<span>{reaction.emoji}</span>
+										<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
+											{reaction.emoji}
+										</span>
 										{count > 0 ? <span>{count}</span> : null}
 									</button>
 								);
