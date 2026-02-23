@@ -90,12 +90,7 @@ export function ReleaseDetailDrawer(props: {
 
 		if (!open || !releaseId) {
 			detailRequestSeqRef.current += 1;
-			if (!open && rendered) return;
-			setDetail(null);
-			setTranslated(null);
-			setError(null);
-			setTranslateError(null);
-			setLanguage("zh");
+			setLoadingDetail(false);
 			return;
 		}
 
@@ -124,7 +119,17 @@ export function ReleaseDetailDrawer(props: {
 				if (detailRequestSeqRef.current !== requestSeq) return;
 				setLoadingDetail(false);
 			});
-	}, [open, releaseId, rendered]);
+	}, [open, releaseId]);
+
+	useEffect(() => {
+		// Keep the previous content visible during close animation, then reset state.
+		if (open || rendered) return;
+		setDetail(null);
+		setTranslated(null);
+		setError(null);
+		setTranslateError(null);
+		setLanguage("zh");
+	}, [open, rendered]);
 
 	useEffect(() => {
 		if (!open || !releaseId || !detail || language !== "zh") return;
