@@ -28,8 +28,9 @@ export function ReleaseDailyCard(props: {
 	selectedDate: string | null;
 	busy: boolean;
 	onGenerate: () => void;
+	onOpenRelease?: (releaseId: string) => void;
 }) {
-	const { briefs, selectedDate, busy, onGenerate } = props;
+	const { briefs, selectedDate, busy, onGenerate, onOpenRelease } = props;
 
 	const selected = (() => {
 		if (selectedDate) {
@@ -79,7 +80,10 @@ export function ReleaseDailyCard(props: {
 					</p>
 				) : selected ? (
 					<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
-						<Markdown content={selected.content_markdown} />
+						<Markdown
+							content={selected.content_markdown}
+							onInternalReleaseClick={onOpenRelease}
+						/>
 					</div>
 				) : (
 					<p className="text-muted-foreground text-sm">
