@@ -39,6 +39,7 @@ export function FeedItemCard(props: {
 	showOriginal: boolean;
 	isTranslating: boolean;
 	isReactionBusy: boolean;
+	reactionError: string | null;
 	onToggleOriginal: () => void;
 	onTranslateNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
@@ -49,6 +50,7 @@ export function FeedItemCard(props: {
 		showOriginal,
 		isTranslating,
 		isReactionBusy,
+		reactionError,
 		onToggleOriginal,
 		onTranslateNow,
 		onToggleReaction,
@@ -256,6 +258,12 @@ export function FeedItemCard(props: {
 								Sync releases
 							</Button>
 						</>
+					) : null}
+
+					{reactionError ? (
+						<span className="text-destructive w-full font-mono text-[11px]">
+							{reactionError}
+						</span>
 					) : null}
 				</CardFooter>
 			) : null}

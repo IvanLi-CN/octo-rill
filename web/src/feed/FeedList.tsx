@@ -20,6 +20,7 @@ export function FeedList(props: {
 	onToggleOriginal: (key: string) => void;
 	onTranslateNow: (item: FeedItem) => void;
 	reactionBusyKeys: Set<string>;
+	reactionErrorByKey: Record<string, string>;
 	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
 	onSyncReleases: () => void;
 }) {
@@ -36,6 +37,7 @@ export function FeedList(props: {
 		onToggleOriginal,
 		onTranslateNow,
 		reactionBusyKeys,
+		reactionErrorByKey,
 		onToggleReaction,
 		onSyncReleases,
 	} = props;
@@ -84,6 +86,7 @@ export function FeedList(props: {
 				const showOriginal = Boolean(showOriginalByKey[key]);
 				const isTranslating = inFlightKeys.has(key);
 				const isReactionBusy = reactionBusyKeys.has(key);
+				const reactionError = reactionErrorByKey[key] ?? null;
 				return (
 					<div key={key} ref={registerItemRef(item)}>
 						<FeedItemCard
@@ -91,6 +94,7 @@ export function FeedList(props: {
 							showOriginal={showOriginal}
 							isTranslating={isTranslating}
 							isReactionBusy={isReactionBusy}
+							reactionError={reactionError}
 							onToggleOriginal={() => onToggleOriginal(key)}
 							onTranslateNow={() => onTranslateNow(item)}
 							onToggleReaction={(content) => onToggleReaction(item, content)}
