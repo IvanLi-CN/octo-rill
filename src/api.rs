@@ -632,6 +632,81 @@ fn has_repo_scope(scopes: &str) -> bool {
         .any(|scope| scope == "repo")
 }
 
+fn github_reauth_required_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "reauth_required",
+        "repo scope required; re-login via GitHub OAuth",
+    )
+}
+
+fn github_rate_limited_error() -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "github rate limit exceeded; retry later",
+    )
+}
+
+fn is_rate_limit_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("rate limit")
+}
+
+fn is_auth_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("bad credentials")
+        || lower.contains("requires authentication")
+        || lower.contains("resource not accessible by integration")
+        || lower.contains("saml")
+        || lower.contains("oauth app access restrictions")
+}
+
+fn github_graphql_http_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Option<ApiError> {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Some(github_reauth_required_error());
+    }
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    if remaining == Some("0") || is_rate_limit_message(body) {
+        return Some(github_rate_limited_error());
+    }
+
+    let accepted_scopes = headers
+        .get("x-accepted-oauth-scopes")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let oauth_scopes = headers
+        .get("x-oauth-scopes")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if (has_repo_scope(accepted_scopes) && !has_repo_scope(oauth_scopes)) || is_auth_message(body) {
+        return Some(github_reauth_required_error());
+    }
+
+    None
+}
+
+fn github_graphql_errors_to_api_error(errors: &[GraphQlError]) -> Option<ApiError> {
+    if errors.iter().any(|e| is_rate_limit_message(&e.message)) {
+        return Some(github_rate_limited_error());
+    }
+    if errors.iter().any(|e| is_auth_message(&e.message)) {
+        return Some(github_reauth_required_error());
+    }
+    None
+}
+
 async fn load_user_scopes(state: &AppState, user_id: i64) -> Result<String, ApiError> {
     let scopes = sqlx::query_scalar::<_, String>(
         r#"
@@ -1073,11 +1148,14 @@ async fn fetch_live_release_reactions(
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "reauth_required",
-            "repo scope required; re-login via GitHub OAuth",
-        ));
+        let headers = resp.headers().clone();
+        let body = resp.text().await.map_err(ApiError::internal)?;
+        if let Some(err) = github_graphql_http_error(status, &headers, &body) {
+            return Err(err);
+        }
+        return Err(ApiError::internal(format!(
+            "github graphql returned {status}: {body}"
+        )));
     }
 
     let resp = resp
@@ -1090,6 +1168,9 @@ async fn fetch_live_release_reactions(
     if let Some(errors) = resp.errors
         && !errors.is_empty()
     {
+        if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+            return Err(err);
+        }
         let msg = errors
             .into_iter()
             .map(|e| e.message)
@@ -1480,9 +1561,21 @@ async fn mutate_release_reaction(
         .json(&payload)
         .send()
         .await
-        .map_err(ApiError::internal)?
-        .error_for_status()
         .map_err(ApiError::internal)?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let headers = resp.headers().clone();
+        let body = resp.text().await.map_err(ApiError::internal)?;
+        if let Some(err) = github_graphql_http_error(status, &headers, &body) {
+            return Err(err);
+        }
+        return Err(ApiError::internal(format!(
+            "github graphql returned {status}: {body}"
+        )));
+    }
+
+    let resp = resp.error_for_status().map_err(ApiError::internal)?;
 
     let body = resp.text().await.map_err(ApiError::internal)?;
     if key == "removeReaction" {
@@ -1491,6 +1584,9 @@ async fn mutate_release_reaction(
         if let Some(errors) = parsed.errors
             && !errors.is_empty()
         {
+            if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+                return Err(err);
+            }
             let msg = errors
                 .into_iter()
                 .map(|e| e.message)
@@ -1516,6 +1612,9 @@ async fn mutate_release_reaction(
     if let Some(errors) = parsed.errors
         && !errors.is_empty()
     {
+        if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+            return Err(err);
+        }
         let msg = errors
             .into_iter()
             .map(|e| e.message)
@@ -2583,11 +2682,12 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_repo_scope,
-        markdown_structure_preserved, parse_repo_full_name_from_release_url,
-        parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
-        resolve_release_full_name, split_markdown_chunks,
+        github_graphql_http_error, has_repo_scope, markdown_structure_preserved,
+        parse_repo_full_name_from_release_url, parse_translation_json,
+        preserve_chunk_trailing_newline, release_excerpt, resolve_release_full_name,
+        split_markdown_chunks,
     };
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
     fn has_repo_scope_accepts_comma_delimited_scopes() {
@@ -2602,6 +2702,28 @@ mod tests {
     #[test]
     fn has_repo_scope_rejects_missing_repo_scope() {
         assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_rate_limit_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let err = github_graphql_http_error(reqwest::StatusCode::FORBIDDEN, &headers, "")
+            .expect("expected mapped error");
+        assert_eq!(err.code(), "rate_limited");
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_auth_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-accepted-oauth-scopes",
+            HeaderValue::from_static("repo, read:user"),
+        );
+        headers.insert("x-oauth-scopes", HeaderValue::from_static("read:user"));
+        let err = github_graphql_http_error(reqwest::StatusCode::FORBIDDEN, &headers, "")
+            .expect("expected mapped error");
+        assert_eq!(err.code(), "reauth_required");
     }
 
     #[test]
@@ -2628,35 +2750,27 @@ echo should_not_be_in_excerpt
 
     #[test]
     fn release_excerpt_fallback_keeps_newlines() {
-        let body = "First line
-Second line
-
-Third line";
+        let body = "First line\nSecond line\n\nThird line";
         let excerpt = release_excerpt(Some(body)).expect("excerpt");
-        assert!(excerpt.contains("First line
-Second line"));
-        assert!(excerpt.contains("
-
-Third line"));
+        assert!(excerpt.contains("First line\nSecond line"));
+        assert!(excerpt.contains("\n\nThird line"));
     }
 
     #[test]
     fn parse_translation_json_accepts_fenced_json() {
-        let raw = "```json\n{"title_zh":"标题","summary_md":"- **加粗**\\n- `code`"}\n```";
+        let raw = r#"```json
+{"title_zh":"标题","summary_md":"- **加粗**\\n- `code`"}
+```"#;
         let parsed = parse_translation_json(raw).expect("parse translation json");
         assert_eq!(parsed.title_zh.as_deref(), Some("标题"));
-        assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**
-- `code`"));
+        assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**\n- `code`"));
     }
 
     #[test]
     fn markdown_structure_requires_inline_markers() {
-        let source = "- **Nightly** build from `main`
-- Keep **bold** marker";
-        let translated_missing = "- 夜间构建来自 main
-- 请保留强调";
-        let translated_ok = "- **夜间**构建来自 `main`
-- 请保留 **强调** 标记";
+        let source = "- **Nightly** build from `main`\n- Keep **bold** marker";
+        let translated_missing = "- 夜间构建来自 main\n- 请保留强调";
+        let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
         assert!(!markdown_structure_preserved(source, translated_missing));
         assert!(markdown_structure_preserved(source, translated_ok));
     }
