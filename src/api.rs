@@ -648,16 +648,27 @@ fn github_rate_limited_error() -> ApiError {
     )
 }
 
+fn github_access_restricted_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "github denied reaction access for this repository (OAuth app restrictions or org policy)",
+    )
+}
+
 fn is_rate_limit_message(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     lower.contains("rate limit")
 }
 
-fn is_auth_message(msg: &str) -> bool {
+fn is_reauth_message(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("bad credentials")
-        || lower.contains("requires authentication")
-        || lower.contains("resource not accessible by integration")
+    lower.contains("bad credentials") || lower.contains("requires authentication")
+}
+
+fn is_access_restricted_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("resource not accessible by integration")
         || lower.contains("saml")
         || lower.contains("oauth app access restrictions")
 }
@@ -690,8 +701,12 @@ fn github_graphql_http_error(
         .get("x-oauth-scopes")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if (has_repo_scope(accepted_scopes) && !has_repo_scope(oauth_scopes)) || is_auth_message(body) {
+    if (has_repo_scope(accepted_scopes) && !has_repo_scope(oauth_scopes)) || is_reauth_message(body)
+    {
         return Some(github_reauth_required_error());
+    }
+    if is_access_restricted_message(body) {
+        return Some(github_access_restricted_error());
     }
 
     None
@@ -701,8 +716,14 @@ fn github_graphql_errors_to_api_error(errors: &[GraphQlError]) -> Option<ApiErro
     if errors.iter().any(|e| is_rate_limit_message(&e.message)) {
         return Some(github_rate_limited_error());
     }
-    if errors.iter().any(|e| is_auth_message(&e.message)) {
+    if errors.iter().any(|e| is_reauth_message(&e.message)) {
         return Some(github_reauth_required_error());
+    }
+    if errors
+        .iter()
+        .any(|e| is_access_restricted_message(&e.message))
+    {
+        return Some(github_access_restricted_error());
     }
     None
 }
@@ -974,12 +995,14 @@ fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
     }
 }
 
-fn release_reactions_status(r: &FeedRow, can_react: bool, live_ready: bool) -> &'static str {
+fn release_reactions_status(
+    r: &FeedRow,
+    can_react: bool,
+    live_fetch_ready: bool,
+    live_reactions: Option<&LiveReleaseReactions>,
+) -> &'static str {
     if !can_react {
         "reauth_required"
-    } else if !live_ready {
-        // Avoid exposing toggles when viewer reaction state is stale/unknown.
-        "sync_required"
     } else if r
         .release_node_id
         .as_deref()
@@ -987,6 +1010,12 @@ fn release_reactions_status(r: &FeedRow, can_react: bool, live_ready: bool) -> &
         .filter(|s| !s.is_empty())
         .is_none()
     {
+        "sync_required"
+    } else if !live_fetch_ready {
+        // Avoid exposing toggles when viewer reaction state is stale/unknown.
+        "sync_required"
+    } else if live_reactions.is_none() {
+        // GraphQL may return partial nodes; require per-release live data before enabling toggles.
         "sync_required"
     } else {
         "ready"
@@ -1169,12 +1198,13 @@ async fn fetch_live_release_reactions(
     if let Some(errors) = errors
         && !errors.is_empty()
     {
-        if let Some(err) = github_graphql_errors_to_api_error(&errors) {
-            return Err(err);
-        }
-        // `nodes(ids: ...)` may return partial data with per-node errors. As long as we got
-        // usable `data`, return the available nodes instead of failing the whole request.
+        // `nodes(ids: ...)` can legitimately return partial data with per-node auth errors
+        // (e.g. some private releases are inaccessible). Keep usable nodes instead of
+        // downgrading the whole page to reauth-required.
         if data.is_none() {
+            if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+                return Err(err);
+            }
             let msg = errors
                 .into_iter()
                 .map(|e| e.message)
@@ -1236,7 +1266,7 @@ fn feed_item_from_row(
     r: FeedRow,
     ai_enabled: bool,
     can_react: bool,
-    live_ready: bool,
+    live_fetch_ready: bool,
     live_reactions: Option<&LiveReleaseReactions>,
 ) -> FeedItem {
     let excerpt = match r.kind.as_str() {
@@ -1322,7 +1352,7 @@ fn feed_item_from_row(
         }
     };
 
-    let status = release_reactions_status(&r, can_react, live_ready);
+    let status = release_reactions_status(&r, can_react, live_fetch_ready, live_reactions);
     let mut counts = release_counts_from_row(&r);
     let mut viewer = ReleaseReactionViewer::default();
     if let Some(live) = live_reactions {
@@ -1471,13 +1501,13 @@ struct ReleaseReactionRow {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddReactionData {
-    add_reaction: GraphQlMutationPayload,
+    add_reaction: Option<GraphQlMutationPayload>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoveReactionData {
-    remove_reaction: GraphQlMutationPayload,
+    remove_reaction: Option<GraphQlMutationPayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1602,7 +1632,10 @@ async fn mutate_release_reaction(
         let Some(data) = parsed.data else {
             return Err(ApiError::internal("missing graphql data"));
         };
-        let Some(subject) = data.remove_reaction.subject else {
+        let Some(payload) = data.remove_reaction else {
+            return Err(ApiError::internal("missing removeReaction payload"));
+        };
+        let Some(subject) = payload.subject else {
             return Err(ApiError::internal("missing mutation subject"));
         };
         let _subject_id = subject.id;
@@ -1630,7 +1663,10 @@ async fn mutate_release_reaction(
     let Some(data) = parsed.data else {
         return Err(ApiError::internal("missing graphql data"));
     };
-    let Some(subject) = data.add_reaction.subject else {
+    let Some(payload) = data.add_reaction else {
+        return Err(ApiError::internal("missing addReaction payload"));
+    };
+    let Some(subject) = payload.subject else {
         return Err(ApiError::internal("missing mutation subject"));
     };
     let _subject_id = subject.id;
@@ -2691,12 +2727,42 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        github_graphql_http_error, has_repo_scope, markdown_structure_preserved,
-        parse_repo_full_name_from_release_url, parse_translation_json,
-        preserve_chunk_trailing_newline, release_excerpt, resolve_release_full_name,
-        split_markdown_chunks,
+        FeedRow, GraphQlError, LiveReleaseReactions, ReleaseReactionCounts, ReleaseReactionViewer,
+        github_graphql_errors_to_api_error, github_graphql_http_error, has_repo_scope,
+        markdown_structure_preserved, parse_repo_full_name_from_release_url,
+        parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
+        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn test_feed_row(node_id: Option<&str>) -> FeedRow {
+        FeedRow {
+            kind: "release".to_owned(),
+            sort_ts: "2026-01-01T00:00:00Z".to_owned(),
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+            id_key: "1".to_owned(),
+            entity_id: "1".to_owned(),
+            release_id: Some(1),
+            release_node_id: node_id.map(str::to_owned),
+            repo_full_name: None,
+            title: None,
+            subtitle: None,
+            reason: None,
+            subject_type: None,
+            html_url: None,
+            unread: None,
+            release_body: None,
+            react_plus1: None,
+            react_laugh: None,
+            react_heart: None,
+            react_hooray: None,
+            react_rocket: None,
+            react_eyes: None,
+            trans_source_hash: None,
+            trans_title: None,
+            trans_summary: None,
+        }
+    }
 
     #[test]
     fn has_repo_scope_accepts_comma_delimited_scopes() {
@@ -2733,6 +2799,49 @@ mod tests {
         let err = github_graphql_http_error(reqwest::StatusCode::FORBIDDEN, &headers, "")
             .expect("expected mapped error");
         assert_eq!(err.code(), "reauth_required");
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_org_restriction_403() {
+        let headers = HeaderMap::new();
+        let err = github_graphql_http_error(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            "OAuth App access restrictions are enabled",
+        )
+        .expect("expected mapped error");
+        assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn github_graphql_errors_to_api_error_marks_org_restriction() {
+        let errors = vec![GraphQlError {
+            message: "OAuth App access restrictions are enabled".to_owned(),
+        }];
+        let err = github_graphql_errors_to_api_error(&errors).expect("expected mapped error");
+        assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn release_reactions_status_requires_per_item_live_data() {
+        let row = test_feed_row(Some("R_node"));
+        assert_eq!(
+            release_reactions_status(&row, true, true, None),
+            "sync_required"
+        );
+    }
+
+    #[test]
+    fn release_reactions_status_ready_with_live_data() {
+        let row = test_feed_row(Some("R_node"));
+        let live = LiveReleaseReactions {
+            counts: ReleaseReactionCounts::default(),
+            viewer: ReleaseReactionViewer::default(),
+        };
+        assert_eq!(
+            release_reactions_status(&row, true, true, Some(&live)),
+            "ready"
+        );
     }
 
     #[test]
