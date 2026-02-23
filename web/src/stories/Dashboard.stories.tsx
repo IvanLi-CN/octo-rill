@@ -36,6 +36,25 @@ function makeMockFeed(): FeedItem[] {
 				title: "v1.8.0（稳定版）",
 				summary: "- 这是一个稳定版本\n- 包含性能改进\n- 建议升级并重新构建镜像",
 			},
+			reactions: {
+				counts: {
+					plus1: 12,
+					laugh: 2,
+					heart: 6,
+					hooray: 4,
+					rocket: 9,
+					eyes: 3,
+				},
+				viewer: {
+					plus1: true,
+					laugh: false,
+					heart: false,
+					hooray: true,
+					rocket: false,
+					eyes: false,
+				},
+				status: "ready",
+			},
 		},
 		{
 			kind: "release",
@@ -54,6 +73,25 @@ function makeMockFeed(): FeedItem[] {
 				status: "disabled",
 				title: null,
 				summary: null,
+			},
+			reactions: {
+				counts: {
+					plus1: 0,
+					laugh: 0,
+					heart: 0,
+					hooray: 0,
+					rocket: 0,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: false,
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: false,
+					eyes: false,
+				},
+				status: "reauth_required",
 			},
 		},
 	];
@@ -104,6 +142,7 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview() {
 	const items = makeMockFeed();
 	const inFlightKeys = new Set<string>();
+	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) => it.translated?.status === "disabled",
 	);
@@ -190,6 +229,9 @@ function DashboardPreview() {
 								setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
 							}
 							onTranslateNow={() => {}}
+							reactionBusyKeys={reactionBusyKeys}
+							onToggleReaction={() => {}}
+							onSyncReleases={() => {}}
 						/>
 					) : null}
 

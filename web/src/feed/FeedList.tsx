@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import { FeedItemCard } from "@/feed/FeedItemCard";
-import type { FeedItem } from "@/feed/types";
+import type { FeedItem, ReactionContent } from "@/feed/types";
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -19,6 +19,9 @@ export function FeedList(props: {
 	showOriginalByKey: Record<string, boolean>;
 	onToggleOriginal: (key: string) => void;
 	onTranslateNow: (item: FeedItem) => void;
+	reactionBusyKeys: Set<string>;
+	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
+	onSyncReleases: () => void;
 }) {
 	const {
 		items,
@@ -32,6 +35,9 @@ export function FeedList(props: {
 		showOriginalByKey,
 		onToggleOriginal,
 		onTranslateNow,
+		reactionBusyKeys,
+		onToggleReaction,
+		onSyncReleases,
 	} = props;
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -77,14 +83,18 @@ export function FeedList(props: {
 				const key = keyOf(item);
 				const showOriginal = Boolean(showOriginalByKey[key]);
 				const isTranslating = inFlightKeys.has(key);
+				const isReactionBusy = reactionBusyKeys.has(key);
 				return (
 					<div key={key} ref={registerItemRef(item)}>
 						<FeedItemCard
 							item={item}
 							showOriginal={showOriginal}
 							isTranslating={isTranslating}
+							isReactionBusy={isReactionBusy}
 							onToggleOriginal={() => onToggleOriginal(key)}
 							onTranslateNow={() => onTranslateNow(item)}
+							onToggleReaction={(content) => onToggleReaction(item, content)}
+							onSyncReleases={onSyncReleases}
 						/>
 					</div>
 				);

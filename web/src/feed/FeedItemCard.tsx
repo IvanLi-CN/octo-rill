@@ -9,8 +9,21 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
-import type { FeedItem } from "@/feed/types";
+import type { FeedItem, ReactionContent } from "@/feed/types";
 import { cn } from "@/lib/utils";
+
+const REACTION_ITEMS: Array<{
+	content: ReactionContent;
+	emoji: string;
+	label: string;
+}> = [
+	{ content: "plus1", emoji: "👍", label: "赞" },
+	{ content: "laugh", emoji: "😄", label: "笑" },
+	{ content: "heart", emoji: "❤️", label: "爱心" },
+	{ content: "hooray", emoji: "🎉", label: "庆祝" },
+	{ content: "rocket", emoji: "🚀", label: "火箭" },
+	{ content: "eyes", emoji: "👀", label: "关注" },
+];
 
 function formatIsoShort(iso: string) {
 	// "2026-02-21T08:00:00Z" -> "2026-02-21 08:00:00"
@@ -24,15 +37,21 @@ export function FeedItemCard(props: {
 	item: FeedItem;
 	showOriginal: boolean;
 	isTranslating: boolean;
+	isReactionBusy: boolean;
 	onToggleOriginal: () => void;
 	onTranslateNow: () => void;
+	onToggleReaction: (content: ReactionContent) => void;
+	onSyncReleases: () => void;
 }) {
 	const {
 		item,
 		showOriginal,
 		isTranslating,
+		isReactionBusy,
 		onToggleOriginal,
 		onTranslateNow,
+		onToggleReaction,
+		onSyncReleases,
 	} = props;
 
 	const kindLabel = "RELEASE";
@@ -70,6 +89,8 @@ export function FeedItemCard(props: {
 	const aiDisabled = item.translated?.status === "disabled";
 	const canTranslate =
 		!aiDisabled && item.translated?.status === "missing" && !isTranslating;
+
+	const reactions = item.reactions;
 
 	return (
 		<Card className="group bg-card/80 shadow-sm transition-shadow hover:shadow-md">
@@ -156,6 +177,68 @@ export function FeedItemCard(props: {
 						</Button>
 					</div>
 				</div>
+
+				{reactions ? (
+					<div className="mt-3 flex flex-wrap items-center gap-2">
+						{reactions.status === "ready"
+							? REACTION_ITEMS.map((reaction) => {
+									const active = reactions.viewer[reaction.content];
+									const count = reactions.counts[reaction.content];
+									return (
+										<button
+											key={reaction.content}
+											type="button"
+											disabled={isReactionBusy}
+											onClick={() => onToggleReaction(reaction.content)}
+											className={cn(
+												"inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs transition-colors",
+												active
+													? "border-primary bg-primary/10 text-primary"
+													: "text-muted-foreground hover:text-foreground border-border",
+												isReactionBusy && "cursor-not-allowed opacity-70",
+											)}
+											title={reaction.label}
+										>
+											<span>{reaction.emoji}</span>
+											<span>{count}</span>
+										</button>
+									);
+								})
+							: null}
+
+						{reactions.status === "reauth_required" ? (
+							<>
+								<span className="text-muted-foreground font-mono text-[11px]">
+									反馈表情需要重新登录（repo 权限）
+								</span>
+								<Button
+									asChild
+									variant="outline"
+									size="sm"
+									className="font-mono text-xs"
+								>
+									<a href="/auth/github/login">重新登录</a>
+								</Button>
+							</>
+						) : null}
+
+						{reactions.status === "sync_required" ? (
+							<>
+								<span className="text-muted-foreground font-mono text-[11px]">
+									反馈表情尚未就绪，请先同步 releases
+								</span>
+								<Button
+									variant="outline"
+									size="sm"
+									className="font-mono text-xs"
+									onClick={onSyncReleases}
+								>
+									Sync releases
+								</Button>
+							</>
+						) : null}
+					</div>
+				) : null}
 			</CardHeader>
 
 			{bodyText ? (

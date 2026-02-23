@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { apiGet, apiPost } from "@/api";
+import { apiGet, apiPost, apiPostJson } from "@/api";
 import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
-import type { FeedItem } from "@/feed/types";
+import type {
+	FeedItem,
+	ReactionContent,
+	ToggleReleaseReactionResponse,
+} from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
@@ -61,6 +65,8 @@ function parseDashboardQuery() {
 	const rawRelease = params.get("release");
 	const releaseId = rawRelease && /^\d+$/.test(rawRelease) ? rawRelease : null;
 	return { tab, releaseId };
+function itemKey(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
 }
 
 export function Dashboard(props: { me: MeResponse }) {
@@ -81,6 +87,9 @@ export function Dashboard(props: { me: MeResponse }) {
 	>({});
 	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
 		null,
+	);
+	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
+		() => new Set<string>(),
 	);
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -140,6 +149,43 @@ export function Dashboard(props: { me: MeResponse }) {
 			});
 		},
 		[translateNow],
+	);
+
+	const onToggleReaction = useCallback(
+		(item: FeedItem, content: ReactionContent) => {
+			const key = itemKey(item);
+			let shouldRun = false;
+			setReactionBusyKeys((prev) => {
+				if (prev.has(key)) return prev;
+				shouldRun = true;
+				const next = new Set(prev);
+				next.add(key);
+				return next;
+			});
+			if (!shouldRun) return;
+
+			void apiPostJson<ToggleReleaseReactionResponse>(
+				"/api/release/reactions/toggle",
+				{
+					release_id: item.id,
+					content,
+				},
+			)
+				.then((res) => {
+					feed.applyReactions(item, res.reactions);
+				})
+				.catch((err) => {
+					setBootError(err instanceof Error ? err.message : String(err));
+				})
+				.finally(() => {
+					setReactionBusyKeys((prev) => {
+						const next = new Set(prev);
+						next.delete(key);
+						return next;
+					});
+				});
+		},
+		[feed],
 	);
 
 	const onGenerateBrief = useCallback(() => {
@@ -339,6 +385,9 @@ export function Dashboard(props: { me: MeResponse }) {
 								showOriginalByKey={showOriginalByKey}
 								onToggleOriginal={onToggleOriginal}
 								onTranslateNow={onTranslateNow}
+								reactionBusyKeys={reactionBusyKeys}
+								onToggleReaction={onToggleReaction}
+								onSyncReleases={onSyncReleases}
 							/>
 						</>
 					) : null}

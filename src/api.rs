@@ -475,6 +475,7 @@ pub struct FeedItem {
     html_url: Option<String>,
     unread: Option<i64>,
     translated: Option<TranslatedItem>,
+    reactions: Option<ReleaseReactions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -485,6 +486,33 @@ pub struct TranslatedItem {
     summary: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct ReleaseReactions {
+    counts: ReleaseReactionCounts,
+    viewer: ReleaseReactionViewer,
+    status: String, // ready | reauth_required | sync_required
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ReleaseReactionCounts {
+    plus1: i64,
+    laugh: i64,
+    heart: i64,
+    hooray: i64,
+    rocket: i64,
+    eyes: i64,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ReleaseReactionViewer {
+    plus1: bool,
+    laugh: bool,
+    heart: bool,
+    hooray: bool,
+    rocket: bool,
+    eyes: bool,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct FeedRow {
     kind: String,
@@ -492,6 +520,8 @@ struct FeedRow {
     ts: String,
     id_key: String,
     entity_id: String,
+    release_id: Option<i64>,
+    release_node_id: Option<String>,
     repo_full_name: Option<String>,
     title: Option<String>,
     subtitle: Option<String>,
@@ -500,9 +530,50 @@ struct FeedRow {
     html_url: Option<String>,
     unread: Option<i64>,
     release_body: Option<String>,
+    react_plus1: Option<i64>,
+    react_laugh: Option<i64>,
+    react_heart: Option<i64>,
+    react_hooray: Option<i64>,
+    react_rocket: Option<i64>,
+    react_eyes: Option<i64>,
     trans_source_hash: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReactionContent {
+    Plus1,
+    Laugh,
+    Heart,
+    Hooray,
+    Rocket,
+    Eyes,
+}
+
+impl ReleaseReactionContent {
+    fn from_client_str(raw: &str) -> Option<Self> {
+        match raw {
+            "plus1" => Some(Self::Plus1),
+            "laugh" => Some(Self::Laugh),
+            "heart" => Some(Self::Heart),
+            "hooray" => Some(Self::Hooray),
+            "rocket" => Some(Self::Rocket),
+            "eyes" => Some(Self::Eyes),
+            _ => None,
+        }
+    }
+
+    fn as_graphql_enum(self) -> &'static str {
+        match self {
+            Self::Plus1 => "THUMBS_UP",
+            Self::Laugh => "LAUGH",
+            Self::Heart => "HEART",
+            Self::Hooray => "HOORAY",
+            Self::Rocket => "ROCKET",
+            Self::Eyes => "EYES",
+        }
+    }
 }
 
 fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
@@ -552,6 +623,27 @@ fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+fn has_repo_scope(scopes: &str) -> bool {
+    scopes.split_whitespace().any(|scope| scope == "repo")
+}
+
+async fn load_user_scopes(state: &AppState, user_id: i64) -> Result<String, ApiError> {
+    let scopes = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT scopes
+        FROM user_tokens
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .unwrap_or_default();
+
+    Ok(scopes)
 }
 
 fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str> {
@@ -720,6 +812,8 @@ async fn fetch_feed_releases(
             COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
             printf('%020d', r.release_id) AS id_key,
             CAST(r.release_id AS TEXT) AS entity_id,
+            r.release_id AS release_id,
+            r.node_id AS release_node_id,
             sr.full_name AS repo_full_name,
             COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
             NULL AS subtitle,
@@ -727,16 +821,22 @@ async fn fetch_feed_releases(
             NULL AS subject_type,
             r.html_url AS html_url,
             NULL AS unread,
-            r.body AS release_body
+            r.body AS release_body,
+            r.react_plus1 AS react_plus1,
+            r.react_laugh AS react_laugh,
+            r.react_heart AS react_heart,
+            r.react_hooray AS react_hooray,
+            r.react_rocket AS react_rocket,
+            r.react_eyes AS react_eyes
           FROM releases r
           JOIN starred_repos sr
             ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
           WHERE r.user_id = ?
         )
         SELECT
-          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
           i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
-          i.release_body,
+          i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
           t.title AS trans_title,
           t.summary AS trans_summary
@@ -785,7 +885,256 @@ async fn fetch_feed_releases(
     qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
 }
 
-fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
+fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
+    ReleaseReactionCounts {
+        plus1: r.react_plus1.unwrap_or(0),
+        laugh: r.react_laugh.unwrap_or(0),
+        heart: r.react_heart.unwrap_or(0),
+        hooray: r.react_hooray.unwrap_or(0),
+        rocket: r.react_rocket.unwrap_or(0),
+        eyes: r.react_eyes.unwrap_or(0),
+    }
+}
+
+fn release_reactions_status(r: &FeedRow, can_react: bool) -> &'static str {
+    if !can_react {
+        "reauth_required"
+    } else if r
+        .release_node_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        "sync_required"
+    } else {
+        "ready"
+    }
+}
+
+fn apply_group_to_reactions(
+    counts: &mut ReleaseReactionCounts,
+    viewer: &mut ReleaseReactionViewer,
+    content: &str,
+    total_count: i64,
+    viewer_has_reacted: bool,
+) {
+    match content {
+        "THUMBS_UP" => {
+            counts.plus1 = total_count;
+            viewer.plus1 = viewer_has_reacted;
+        }
+        "LAUGH" => {
+            counts.laugh = total_count;
+            viewer.laugh = viewer_has_reacted;
+        }
+        "HEART" => {
+            counts.heart = total_count;
+            viewer.heart = viewer_has_reacted;
+        }
+        "HOORAY" => {
+            counts.hooray = total_count;
+            viewer.hooray = viewer_has_reacted;
+        }
+        "ROCKET" => {
+            counts.rocket = total_count;
+            viewer.rocket = viewer_has_reacted;
+        }
+        "EYES" => {
+            counts.eyes = total_count;
+            viewer.eyes = viewer_has_reacted;
+        }
+        _ => {}
+    }
+}
+
+fn counts_from_groups(groups: &[GraphQlReactionGroup]) -> ReleaseReactionCounts {
+    let mut counts = ReleaseReactionCounts::default();
+    let mut viewer = ReleaseReactionViewer::default();
+    for group in groups {
+        apply_group_to_reactions(
+            &mut counts,
+            &mut viewer,
+            group.content.as_str(),
+            group.reactors.total_count,
+            group.viewer_has_reacted,
+        );
+    }
+    counts
+}
+
+fn viewer_from_groups(groups: &[GraphQlReactionGroup]) -> ReleaseReactionViewer {
+    let mut counts = ReleaseReactionCounts::default();
+    let mut viewer = ReleaseReactionViewer::default();
+    for group in groups {
+        apply_group_to_reactions(
+            &mut counts,
+            &mut viewer,
+            group.content.as_str(),
+            group.reactors.total_count,
+            group.viewer_has_reacted,
+        );
+    }
+    viewer
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphQlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseReactionsData {
+    nodes: Vec<Option<GraphQlReleaseNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseNode {
+    id: String,
+    reaction_groups: Vec<GraphQlReactionGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReactionGroup {
+    content: String,
+    viewer_has_reacted: bool,
+    reactors: GraphQlReactors,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReactors {
+    total_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct LiveReleaseReactions {
+    counts: ReleaseReactionCounts,
+    viewer: ReleaseReactionViewer,
+}
+
+async fn fetch_live_release_reactions(
+    state: &AppState,
+    access_token: &str,
+    node_ids: &[String],
+) -> Result<std::collections::HashMap<String, LiveReleaseReactions>, ApiError> {
+    if node_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let query = r#"
+      query($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Release {
+            id
+            reactionGroups {
+              content
+              viewerHasReacted
+              reactors(first: 0) {
+                totalCount
+              }
+            }
+          }
+        }
+      }
+    "#;
+
+    let payload = serde_json::json!({
+        "query": query,
+        "variables": { "ids": node_ids },
+    });
+
+    let resp = state
+        .http
+        .post("https://api.github.com/graphql")
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(ApiError::internal)?
+        .error_for_status()
+        .map_err(ApiError::internal)?
+        .json::<GraphQlResponse<GraphQlReleaseReactionsData>>()
+        .await
+        .map_err(ApiError::internal)?;
+
+    if let Some(errors) = resp.errors
+        && !errors.is_empty()
+    {
+        let msg = errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::internal(format!("github graphql error: {msg}")));
+    }
+
+    let mut out = std::collections::HashMap::new();
+    let nodes = resp.data.map(|d| d.nodes).unwrap_or_default();
+    for node in nodes.into_iter().flatten() {
+        out.insert(
+            node.id,
+            LiveReleaseReactions {
+                counts: counts_from_groups(&node.reaction_groups),
+                viewer: viewer_from_groups(&node.reaction_groups),
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn persist_release_reaction_counts(
+    state: &AppState,
+    user_id: i64,
+    release_id: i64,
+    counts: &ReleaseReactionCounts,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE releases
+        SET react_plus1 = ?,
+            react_laugh = ?,
+            react_heart = ?,
+            react_hooray = ?,
+            react_rocket = ?,
+            react_eyes = ?,
+            updated_at = ?
+        WHERE user_id = ? AND release_id = ?
+        "#,
+    )
+    .bind(counts.plus1)
+    .bind(counts.laugh)
+    .bind(counts.heart)
+    .bind(counts.hooray)
+    .bind(counts.rocket)
+    .bind(counts.eyes)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(user_id)
+    .bind(release_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+fn feed_item_from_row(
+    r: FeedRow,
+    ai_enabled: bool,
+    can_react: bool,
+    live_reactions: Option<&LiveReleaseReactions>,
+) -> FeedItem {
     let excerpt = match r.kind.as_str() {
         "release" => release_excerpt(r.release_body.as_deref()),
         _ => None,
@@ -869,6 +1218,14 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         }
     };
 
+    let status = release_reactions_status(&r, can_react);
+    let mut counts = release_counts_from_row(&r);
+    let mut viewer = ReleaseReactionViewer::default();
+    if let Some(live) = live_reactions {
+        counts = live.counts.clone();
+        viewer = live.viewer.clone();
+    }
+
     FeedItem {
         kind: r.kind,
         ts: r.ts,
@@ -882,6 +1239,11 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         html_url: r.html_url,
         unread: r.unread,
         translated,
+        reactions: Some(ReleaseReactions {
+            counts,
+            viewer,
+            status: status.to_owned(),
+        }),
     }
 }
 
@@ -905,6 +1267,48 @@ pub async fn list_feed(
 
     let rows = fetch_feed_releases(state.as_ref(), user_id, release_cursor.as_ref(), limit).await?;
     let ai_enabled = state.config.ai.is_some();
+    let scopes = load_user_scopes(state.as_ref(), user_id).await?;
+    let can_react = has_repo_scope(&scopes);
+
+    let mut node_ids: Vec<String> = Vec::new();
+    let mut release_by_node = std::collections::HashMap::<String, i64>::new();
+    for row in &rows {
+        if let (Some(release_id), Some(node_id)) = (row.release_id, row.release_node_id.as_deref())
+        {
+            let node_id = node_id.trim();
+            if !node_id.is_empty() {
+                node_ids.push(node_id.to_owned());
+                release_by_node.insert(node_id.to_owned(), release_id);
+            }
+        }
+    }
+    node_ids.sort();
+    node_ids.dedup();
+
+    let mut live_reactions_by_node =
+        std::collections::HashMap::<String, LiveReleaseReactions>::new();
+    if can_react && !node_ids.is_empty() {
+        let access_token = state
+            .load_access_token(user_id)
+            .await
+            .map_err(ApiError::internal)?;
+        if let Ok(live) =
+            fetch_live_release_reactions(state.as_ref(), &access_token, &node_ids).await
+        {
+            for (node_id, reaction) in &live {
+                if let Some(release_id) = release_by_node.get(node_id) {
+                    let _ = persist_release_reaction_counts(
+                        state.as_ref(),
+                        user_id,
+                        *release_id,
+                        &reaction.counts,
+                    )
+                    .await;
+                }
+            }
+            live_reactions_by_node = live;
+        }
+    }
 
     let mut items = Vec::with_capacity(rows.len());
     let mut next_cursor: Option<String> = None;
@@ -913,7 +1317,11 @@ pub async fn list_feed(
             // Cursor format: "<sort_ts>|release|<id_key>" (backward compatible with parse_cursor).
             next_cursor = Some(format!("{}|release|{}", r.sort_ts, r.id_key));
         }
-        items.push(feed_item_from_row(r, ai_enabled));
+        let live = r
+            .release_node_id
+            .as_deref()
+            .and_then(|id| live_reactions_by_node.get(id));
+        items.push(feed_item_from_row(r, ai_enabled, can_react, live));
     }
 
     // If we returned fewer than limit, there's no next page.
@@ -922,6 +1330,273 @@ pub async fn list_feed(
     }
 
     Ok(Json(FeedResponse { items, next_cursor }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleReleaseReactionRequest {
+    release_id: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToggleReleaseReactionResponse {
+    release_id: String,
+    reactions: ReleaseReactions,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseReactionRow {
+    release_id: i64,
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReactionData {
+    add_reaction: GraphQlMutationPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveReactionData {
+    remove_reaction: GraphQlMutationPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlMutationPayload {
+    subject: Option<GraphQlReleaseSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseSubject {
+    id: String,
+    reaction_groups: Vec<GraphQlReactionGroup>,
+}
+
+async fn mutate_release_reaction(
+    state: &AppState,
+    access_token: &str,
+    node_id: &str,
+    content: ReleaseReactionContent,
+    currently_reacted: bool,
+) -> Result<LiveReleaseReactions, ApiError> {
+    let (query, key) = if currently_reacted {
+        (
+            r#"
+            mutation($input: RemoveReactionInput!) {
+              removeReaction(input: $input) {
+                subject {
+                  ... on Release {
+                    id
+                    reactionGroups {
+                      content
+                      viewerHasReacted
+                      reactors(first: 0) {
+                        totalCount
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            "#,
+            "removeReaction",
+        )
+    } else {
+        (
+            r#"
+            mutation($input: AddReactionInput!) {
+              addReaction(input: $input) {
+                subject {
+                  ... on Release {
+                    id
+                    reactionGroups {
+                      content
+                      viewerHasReacted
+                      reactors(first: 0) {
+                        totalCount
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            "#,
+            "addReaction",
+        )
+    };
+
+    let payload = serde_json::json!({
+        "query": query,
+        "variables": {
+            "input": {
+                "subjectId": node_id,
+                "content": content.as_graphql_enum(),
+            }
+        }
+    });
+
+    let resp = state
+        .http
+        .post("https://api.github.com/graphql")
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(ApiError::internal)?
+        .error_for_status()
+        .map_err(ApiError::internal)?;
+
+    let body = resp.text().await.map_err(ApiError::internal)?;
+    if key == "removeReaction" {
+        let parsed = serde_json::from_str::<GraphQlResponse<RemoveReactionData>>(&body)
+            .map_err(ApiError::internal)?;
+        if let Some(errors) = parsed.errors
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::internal(format!("github graphql error: {msg}")));
+        }
+        let Some(data) = parsed.data else {
+            return Err(ApiError::internal("missing graphql data"));
+        };
+        let Some(subject) = data.remove_reaction.subject else {
+            return Err(ApiError::internal("missing mutation subject"));
+        };
+        let _subject_id = subject.id;
+        return Ok(LiveReleaseReactions {
+            counts: counts_from_groups(&subject.reaction_groups),
+            viewer: viewer_from_groups(&subject.reaction_groups),
+        });
+    }
+
+    let parsed = serde_json::from_str::<GraphQlResponse<AddReactionData>>(&body)
+        .map_err(ApiError::internal)?;
+    if let Some(errors) = parsed.errors
+        && !errors.is_empty()
+    {
+        let msg = errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::internal(format!("github graphql error: {msg}")));
+    }
+    let Some(data) = parsed.data else {
+        return Err(ApiError::internal("missing graphql data"));
+    };
+    let Some(subject) = data.add_reaction.subject else {
+        return Err(ApiError::internal("missing mutation subject"));
+    };
+    let _subject_id = subject.id;
+    Ok(LiveReleaseReactions {
+        counts: counts_from_groups(&subject.reaction_groups),
+        viewer: viewer_from_groups(&subject.reaction_groups),
+    })
+}
+
+pub async fn toggle_release_reaction(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<ToggleReleaseReactionRequest>,
+) -> Result<Json<ToggleReleaseReactionResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id_raw = req.release_id.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    let release_id = release_id_raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+
+    let Some(content) = ReleaseReactionContent::from_client_str(req.content.trim()) else {
+        return Err(ApiError::bad_request("invalid reaction content"));
+    };
+
+    let scopes = load_user_scopes(state.as_ref(), user_id).await?;
+    if !has_repo_scope(&scopes) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "repo scope required; re-login via GitHub OAuth",
+        ));
+    }
+
+    let row = sqlx::query_as::<_, ReleaseReactionRow>(
+        r#"
+        SELECT release_id, node_id
+        FROM releases
+        WHERE user_id = ? AND release_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let Some(node_id) = row
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "sync_required",
+            "release reaction data is not ready; sync releases first",
+        ));
+    };
+
+    let token = state
+        .load_access_token(user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let current =
+        fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await?;
+    let currently_reacted = current
+        .get(node_id)
+        .map(|r| match content {
+            ReleaseReactionContent::Plus1 => r.viewer.plus1,
+            ReleaseReactionContent::Laugh => r.viewer.laugh,
+            ReleaseReactionContent::Heart => r.viewer.heart,
+            ReleaseReactionContent::Hooray => r.viewer.hooray,
+            ReleaseReactionContent::Rocket => r.viewer.rocket,
+            ReleaseReactionContent::Eyes => r.viewer.eyes,
+        })
+        .unwrap_or(false);
+
+    let updated =
+        mutate_release_reaction(state.as_ref(), &token, node_id, content, currently_reacted)
+            .await?;
+    persist_release_reaction_counts(state.as_ref(), user_id, row.release_id, &updated.counts)
+        .await?;
+
+    Ok(Json(ToggleReleaseReactionResponse {
+        release_id: row.release_id.to_string(),
+        reactions: ReleaseReactions {
+            counts: updated.counts,
+            viewer: updated.viewer,
+            status: "ready".to_owned(),
+        },
+    }))
 }
 
 #[derive(Debug, Deserialize)]

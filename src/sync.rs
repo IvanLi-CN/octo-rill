@@ -96,6 +96,7 @@ struct RepoOwner {
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     id: i64,
+    node_id: Option<String>,
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
@@ -104,6 +105,18 @@ struct GitHubRelease {
     created_at: Option<String>,
     prerelease: bool,
     draft: bool,
+    reactions: Option<GitHubReleaseReactions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseReactions {
+    #[serde(rename = "+1")]
+    plus1: i64,
+    laugh: i64,
+    heart: i64,
+    hooray: i64,
+    rocket: i64,
+    eyes: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,10 +329,12 @@ pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncRelease
                 sqlx::query(
                     r#"
                     INSERT INTO releases (
-                      user_id, repo_id, release_id, tag_name, name, body, html_url,
-                      published_at, created_at, is_prerelease, is_draft, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+                      published_at, created_at, is_prerelease, is_draft, updated_at,
+                      react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, release_id) DO UPDATE SET
+                      node_id = excluded.node_id,
                       tag_name = excluded.tag_name,
                       name = excluded.name,
                       body = excluded.body,
@@ -328,12 +343,19 @@ pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncRelease
                       created_at = excluded.created_at,
                       is_prerelease = excluded.is_prerelease,
                       is_draft = excluded.is_draft,
+                      react_plus1 = excluded.react_plus1,
+                      react_laugh = excluded.react_laugh,
+                      react_heart = excluded.react_heart,
+                      react_hooray = excluded.react_hooray,
+                      react_rocket = excluded.react_rocket,
+                      react_eyes = excluded.react_eyes,
                       updated_at = excluded.updated_at
                     "#,
                 )
                 .bind(user_id)
                 .bind(repo.repo_id)
                 .bind(r.id)
+                .bind(r.node_id.as_deref())
                 .bind(&r.tag_name)
                 .bind(r.name.as_deref())
                 .bind(r.body.as_deref())
@@ -343,6 +365,12 @@ pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncRelease
                 .bind(r.prerelease as i64)
                 .bind(r.draft as i64)
                 .bind(&now)
+                .bind(r.reactions.as_ref().map(|v| v.plus1).unwrap_or(0))
+                .bind(r.reactions.as_ref().map(|v| v.laugh).unwrap_or(0))
+                .bind(r.reactions.as_ref().map(|v| v.heart).unwrap_or(0))
+                .bind(r.reactions.as_ref().map(|v| v.hooray).unwrap_or(0))
+                .bind(r.reactions.as_ref().map(|v| v.rocket).unwrap_or(0))
+                .bind(r.reactions.as_ref().map(|v| v.eyes).unwrap_or(0))
                 .execute(&state.pool)
                 .await
                 .with_context(|| {

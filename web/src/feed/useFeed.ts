@@ -1,7 +1,12 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 
 import { apiGet } from "@/api";
-import type { FeedItem, FeedResponse, TranslateResponse } from "@/feed/types";
+import type {
+	FeedItem,
+	FeedResponse,
+	ReleaseReactions,
+	TranslateResponse,
+} from "@/feed/types";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -107,6 +112,22 @@ export function useFeed() {
 		[],
 	);
 
+	const applyReactions = useCallback(
+		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
+			const key = itemKey(item);
+			setItems((prev) =>
+				prev.map((it) => {
+					if (itemKey(it) !== key) return it;
+					return {
+						...it,
+						reactions,
+					};
+				}),
+			);
+		},
+		[],
+	);
+
 	const stats = useMemo(() => {
 		// Feed is releases-only; keep stats for header/debug UI.
 		const releases = items.length;
@@ -125,5 +146,6 @@ export function useFeed() {
 		loadMore,
 		refresh,
 		applyTranslation,
+		applyReactions,
 	};
 }
