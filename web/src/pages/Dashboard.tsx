@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiGet, apiPost, apiPostJson } from "@/api";
+import { ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
 import type {
@@ -92,6 +92,9 @@ export function Dashboard(props: { me: MeResponse }) {
 		() => new Set<string>(),
 	);
 	const reactionBusyKeysRef = useRef<Set<string>>(new Set<string>());
+	const [reactionErrorByKey, setReactionErrorByKey] = useState<
+		Record<string, string>
+	>({});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
@@ -156,6 +159,13 @@ export function Dashboard(props: { me: MeResponse }) {
 		(item: FeedItem, content: ReactionContent) => {
 			const key = itemKey(item);
 			if (reactionBusyKeysRef.current.has(key)) return;
+
+			setReactionErrorByKey((prev) => {
+				if (!(key in prev)) return prev;
+				const next = { ...prev };
+				delete next[key];
+				return next;
+			});
 			const nextBusy = new Set(reactionBusyKeysRef.current);
 			nextBusy.add(key);
 			reactionBusyKeysRef.current = nextBusy;
@@ -170,9 +180,30 @@ export function Dashboard(props: { me: MeResponse }) {
 			)
 				.then((res) => {
 					feed.applyReactions(item, res.reactions);
+					setReactionErrorByKey((prev) => {
+						if (!(key in prev)) return prev;
+						const next = { ...prev };
+						delete next[key];
+						return next;
+					});
 				})
 				.catch((err) => {
-					setBootError(err instanceof Error ? err.message : String(err));
+					const raw = err instanceof Error ? err.message : String(err);
+					let message = raw;
+					if (err instanceof ApiError) {
+						if (
+							raw.includes("OAuth app restrictions") ||
+							raw.includes(
+								"organization has enabled OAuth App access restrictions",
+							)
+						) {
+							message =
+								"该仓库所在组织限制了 OAuth 应用反馈，当前无法在站内点按。";
+						} else if (raw.includes("repo scope required")) {
+							message = "反馈表情需要重新登录（repo 权限）。";
+						}
+					}
+					setReactionErrorByKey((prev) => ({ ...prev, [key]: message }));
 				})
 				.finally(() => {
 					const nextBusy = new Set(reactionBusyKeysRef.current);
@@ -382,6 +413,7 @@ export function Dashboard(props: { me: MeResponse }) {
 								onToggleOriginal={onToggleOriginal}
 								onTranslateNow={onTranslateNow}
 								reactionBusyKeys={reactionBusyKeys}
+								reactionErrorByKey={reactionErrorByKey}
 								onToggleReaction={onToggleReaction}
 								onSyncReleases={onSyncReleases}
 							/>
