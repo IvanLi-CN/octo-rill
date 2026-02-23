@@ -613,7 +613,13 @@ async fn load_reaction_pat_token(
         state
             .encryption_key
             .decrypt_str(&r.token_ciphertext, &r.token_nonce)
-            .map_err(ApiError::internal)
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "pat_invalid",
+                    "PAT is invalid or expired",
+                )
+            })
     })
     .transpose()
 }
@@ -1685,7 +1691,10 @@ pub async fn list_feed(
 
     let mut live_reactions_by_node =
         std::collections::HashMap::<String, LiveReleaseReactions>::new();
-    let reaction_pat = load_reaction_pat_token(state.as_ref(), user_id).await.ok().flatten();
+    let reaction_pat = load_reaction_pat_token(state.as_ref(), user_id)
+        .await
+        .ok()
+        .flatten();
     if !node_ids.is_empty()
         && let Some(pat) = reaction_pat
         && let Ok(live) = fetch_live_release_reactions(state.as_ref(), &pat, &node_ids).await
@@ -1940,12 +1949,26 @@ pub async fn toggle_release_reaction(
         return Err(ApiError::bad_request("invalid reaction content"));
     };
 
-    let Some(token) = load_reaction_pat_token(state.as_ref(), user_id).await? else {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "pat_required",
-            "release reactions require a GitHub PAT",
-        ));
+    let token = match load_reaction_pat_token(state.as_ref(), user_id).await {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "pat_required",
+                "release reactions require a GitHub PAT",
+            ));
+        }
+        Err(err) if err.code() == "pat_invalid" => {
+            let _ = persist_reaction_pat_check_result(
+                state.as_ref(),
+                user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await;
+            return Err(err);
+        }
+        Err(err) => return Err(err),
     };
 
     let row = sqlx::query_as::<_, ReleaseReactionRow>(
