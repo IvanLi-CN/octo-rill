@@ -1165,22 +1165,27 @@ async fn fetch_live_release_reactions(
         .await
         .map_err(ApiError::internal)?;
 
-    if let Some(errors) = resp.errors
+    let GraphQlResponse { data, errors } = resp;
+    if let Some(errors) = errors
         && !errors.is_empty()
     {
         if let Some(err) = github_graphql_errors_to_api_error(&errors) {
             return Err(err);
         }
-        let msg = errors
-            .into_iter()
-            .map(|e| e.message)
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApiError::internal(format!("github graphql error: {msg}")));
+        // `nodes(ids: ...)` may return partial data with per-node errors. As long as we got
+        // usable `data`, return the available nodes instead of failing the whole request.
+        if data.is_none() {
+            let msg = errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::internal(format!("github graphql error: {msg}")));
+        }
     }
 
     let mut out = std::collections::HashMap::new();
-    let nodes = resp.data.map(|d| d.nodes).unwrap_or_default();
+    let nodes = data.map(|d| d.nodes).unwrap_or_default();
     for node in nodes.into_iter().flatten() {
         out.insert(
             node.id,
@@ -1702,17 +1707,21 @@ pub async fn toggle_release_reaction(
         .map_err(ApiError::internal)?;
     let current =
         fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await?;
-    let currently_reacted = current
-        .get(node_id)
-        .map(|r| match content {
-            ReleaseReactionContent::Plus1 => r.viewer.plus1,
-            ReleaseReactionContent::Laugh => r.viewer.laugh,
-            ReleaseReactionContent::Heart => r.viewer.heart,
-            ReleaseReactionContent::Hooray => r.viewer.hooray,
-            ReleaseReactionContent::Rocket => r.viewer.rocket,
-            ReleaseReactionContent::Eyes => r.viewer.eyes,
-        })
-        .unwrap_or(false);
+    let Some(current_reactions) = current.get(node_id) else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "sync_required",
+            "release reaction data is stale; sync releases first",
+        ));
+    };
+    let currently_reacted = match content {
+        ReleaseReactionContent::Plus1 => current_reactions.viewer.plus1,
+        ReleaseReactionContent::Laugh => current_reactions.viewer.laugh,
+        ReleaseReactionContent::Heart => current_reactions.viewer.heart,
+        ReleaseReactionContent::Hooray => current_reactions.viewer.hooray,
+        ReleaseReactionContent::Rocket => current_reactions.viewer.rocket,
+        ReleaseReactionContent::Eyes => current_reactions.viewer.eyes,
+    };
 
     let updated =
         mutate_release_reaction(state.as_ref(), &token, node_id, content, currently_reacted)
