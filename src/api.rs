@@ -626,7 +626,10 @@ fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
 }
 
 fn has_repo_scope(scopes: &str) -> bool {
-    scopes.split_whitespace().any(|scope| scope == "repo")
+    scopes
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .any(|scope| scope == "repo")
 }
 
 async fn load_user_scopes(state: &AppState, user_id: i64) -> Result<String, ApiError> {
@@ -2551,10 +2554,26 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
+        has_repo_scope,
         markdown_structure_preserved, parse_repo_full_name_from_release_url,
         parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
         resolve_release_full_name, split_markdown_chunks,
     };
+
+    #[test]
+    fn has_repo_scope_accepts_comma_delimited_scopes() {
+        assert!(has_repo_scope("read:user,user:email,repo,notifications"));
+    }
+
+    #[test]
+    fn has_repo_scope_accepts_space_delimited_scopes() {
+        assert!(has_repo_scope("read:user user:email repo notifications"));
+    }
+
+    #[test]
+    fn has_repo_scope_rejects_missing_repo_scope() {
+        assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {
@@ -2580,25 +2599,35 @@ echo should_not_be_in_excerpt
 
     #[test]
     fn release_excerpt_fallback_keeps_newlines() {
-        let body = "First line\nSecond line\n\nThird line";
+        let body = "First line
+Second line
+
+Third line";
         let excerpt = release_excerpt(Some(body)).expect("excerpt");
-        assert!(excerpt.contains("First line\nSecond line"));
-        assert!(excerpt.contains("\n\nThird line"));
+        assert!(excerpt.contains("First line
+Second line"));
+        assert!(excerpt.contains("
+
+Third line"));
     }
 
     #[test]
     fn parse_translation_json_accepts_fenced_json() {
-        let raw = "```json\n{\"title_zh\":\"标题\",\"summary_md\":\"- **加粗**\\n- `code`\"}\n```";
+        let raw = "```json\n{"title_zh":"标题","summary_md":"- **加粗**\\n- `code`"}\n```";
         let parsed = parse_translation_json(raw).expect("parse translation json");
         assert_eq!(parsed.title_zh.as_deref(), Some("标题"));
-        assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**\n- `code`"));
+        assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**
+- `code`"));
     }
 
     #[test]
     fn markdown_structure_requires_inline_markers() {
-        let source = "- **Nightly** build from `main`\n- Keep **bold** marker";
-        let translated_missing = "- 夜间构建来自 main\n- 请保留强调";
-        let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
+        let source = "- **Nightly** build from `main`
+- Keep **bold** marker";
+        let translated_missing = "- 夜间构建来自 main
+- 请保留强调";
+        let translated_ok = "- **夜间**构建来自 `main`
+- 请保留 **强调** 标记";
         assert!(!markdown_structure_preserved(source, translated_missing));
         assert!(markdown_structure_preserved(source, translated_ok));
     }
