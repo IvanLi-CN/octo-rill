@@ -209,7 +209,6 @@ export function FeedItemCard(props: {
 									<button
 										key={reaction.content}
 										type="button"
-										disabled={isReactionBusy}
 										onClick={() => onToggleReaction(reaction.content)}
 										className={cn(
 											"inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-xs transition-colors",
@@ -217,7 +216,7 @@ export function FeedItemCard(props: {
 											active
 												? "border-primary bg-primary/10 text-primary"
 												: "text-muted-foreground hover:text-foreground border-border",
-											isReactionBusy && "cursor-not-allowed opacity-70",
+											isReactionBusy && "opacity-80",
 										)}
 										title={reaction.label}
 									>

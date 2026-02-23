@@ -62,6 +62,15 @@ type ReactionTokenCheckResponse = {
 	message: string;
 };
 
+const REACTION_CONTENTS: ReactionContent[] = [
+	"plus1",
+	"laugh",
+	"heart",
+	"hooray",
+	"rocket",
+	"eyes",
+];
+
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
 		if (a.unread !== b.unread) return b.unread - a.unread;
@@ -107,6 +116,23 @@ function buildOptimisticReactions(
 	};
 }
 
+function itemFromKey(key: string): Pick<FeedItem, "kind" | "id"> | null {
+	const [kind, id] = key.split(":", 2);
+	if (kind !== "release" || !id) return null;
+	return { kind: "release", id };
+}
+
+function firstPendingReactionContent(
+	server: ReleaseReactions,
+	desired: ReleaseReactions,
+): ReactionContent | null {
+	return (
+		REACTION_CONTENTS.find(
+			(content) => server.viewer[content] !== desired.viewer[content],
+		) ?? null
+	);
+}
+
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 
@@ -130,6 +156,15 @@ export function Dashboard(props: { me: MeResponse }) {
 		() => new Set<string>(),
 	);
 	const reactionBusyKeysRef = useRef<Set<string>>(new Set<string>());
+	const reactionDesiredByKeyRef = useRef<Map<string, ReleaseReactions>>(
+		new Map<string, ReleaseReactions>(),
+	);
+	const reactionServerByKeyRef = useRef<Map<string, ReleaseReactions>>(
+		new Map<string, ReleaseReactions>(),
+	);
+	const reactionFlushTimerByKeyRef = useRef<Map<string, number>>(
+		new Map<string, number>(),
+	);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
@@ -225,25 +260,22 @@ export function Dashboard(props: { me: MeResponse }) {
 		[translateNow],
 	);
 
-	const performReactionToggle = useCallback(
-		(item: FeedItem, content: ReactionContent) => {
-			const key = itemKey(item);
+	const flushPendingReactions = useCallback(
+		(key: string) => {
 			if (reactionBusyKeysRef.current.has(key)) return;
-			const previousReactions =
-				item.reactions?.status === "ready" ? item.reactions : null;
-			if (previousReactions) {
-				feed.applyReactions(
-					item,
-					buildOptimisticReactions(previousReactions, content),
-				);
+			const server = reactionServerByKeyRef.current.get(key);
+			const desired = reactionDesiredByKeyRef.current.get(key);
+			if (!server || !desired) return;
+
+			const content = firstPendingReactionContent(server, desired);
+			if (!content) {
+				reactionDesiredByKeyRef.current.delete(key);
+				return;
 			}
 
-			setReactionErrorByKey((prev) => {
-				if (!(key in prev)) return prev;
-				const next = { ...prev };
-				delete next[key];
-				return next;
-			});
+			const item = itemFromKey(key);
+			if (!item) return;
+
 			const nextBusy = new Set(reactionBusyKeysRef.current);
 			nextBusy.add(key);
 			reactionBusyKeysRef.current = nextBusy;
@@ -257,21 +289,35 @@ export function Dashboard(props: { me: MeResponse }) {
 				},
 			)
 				.then((res) => {
-					feed.applyReactions(item, res.reactions);
+					reactionServerByKeyRef.current.set(key, res.reactions);
+					setReactionTokenConfigured(true);
+					setPatCheckState("valid");
+					setPatCheckMessage("PAT 可用");
 					setReactionErrorByKey((prev) => {
 						if (!(key in prev)) return prev;
 						const next = { ...prev };
 						delete next[key];
 						return next;
 					});
-					setReactionTokenConfigured(true);
-					setPatCheckState("valid");
-					setPatCheckMessage("PAT 可用");
+
+					const latestDesired = reactionDesiredByKeyRef.current.get(key);
+					if (
+						!latestDesired ||
+						!firstPendingReactionContent(res.reactions, latestDesired)
+					) {
+						feed.applyReactions(item, res.reactions);
+						reactionDesiredByKeyRef.current.delete(key);
+					}
 				})
 				.catch((err) => {
-					if (previousReactions) {
-						feed.applyReactions(item, previousReactions);
+					const stable = reactionServerByKeyRef.current.get(key);
+					if (stable) {
+						reactionDesiredByKeyRef.current.set(key, stable);
+						feed.applyReactions(item, stable);
+					} else {
+						reactionDesiredByKeyRef.current.delete(key);
 					}
+
 					if (err instanceof ApiError) {
 						if (err.status === 401) {
 							setReactionErrorByKey((prev) => ({
@@ -282,7 +328,10 @@ export function Dashboard(props: { me: MeResponse }) {
 						}
 						if (err.code === "pat_required" || err.code === "pat_invalid") {
 							setReactionTokenConfigured(false);
-							setPendingReaction({ item, content });
+							const retryItem = feed.items.find((it) => itemKey(it) === key);
+							if (retryItem) {
+								setPendingReaction({ item: retryItem, content });
+							}
 							setPatDialogOpen(true);
 							setPatCheckState(err.code === "pat_invalid" ? "invalid" : "idle");
 							setPatCheckMessage(
@@ -311,9 +360,61 @@ export function Dashboard(props: { me: MeResponse }) {
 					nextBusy.delete(key);
 					reactionBusyKeysRef.current = nextBusy;
 					setReactionBusyKeys(nextBusy);
+
+					const latestServer = reactionServerByKeyRef.current.get(key);
+					const latestDesired = reactionDesiredByKeyRef.current.get(key);
+					if (
+						latestServer &&
+						latestDesired &&
+						firstPendingReactionContent(latestServer, latestDesired)
+					) {
+						void flushPendingReactions(key);
+					}
 				});
 		},
 		[feed],
+	);
+
+	const scheduleReactionFlush = useCallback(
+		(key: string) => {
+			const timers = reactionFlushTimerByKeyRef.current;
+			const prev = timers.get(key);
+			if (prev !== undefined) {
+				window.clearTimeout(prev);
+			}
+			const timer = window.setTimeout(() => {
+				timers.delete(key);
+				flushPendingReactions(key);
+			}, 350);
+			timers.set(key, timer);
+		},
+		[flushPendingReactions],
+	);
+
+	const performReactionToggle = useCallback(
+		(item: FeedItem, content: ReactionContent) => {
+			const key = itemKey(item);
+			const current =
+				reactionDesiredByKeyRef.current.get(key) ??
+				(item.reactions?.status === "ready" ? item.reactions : null);
+			if (!current) return;
+
+			if (!reactionServerByKeyRef.current.has(key)) {
+				reactionServerByKeyRef.current.set(key, current);
+			}
+			const optimistic = buildOptimisticReactions(current, content);
+			reactionDesiredByKeyRef.current.set(key, optimistic);
+			feed.applyReactions(item, optimistic);
+
+			setReactionErrorByKey((prev) => {
+				if (!(key in prev)) return prev;
+				const next = { ...prev };
+				delete next[key];
+				return next;
+			});
+			scheduleReactionFlush(key);
+		},
+		[feed, scheduleReactionFlush],
 	);
 
 	const onToggleReaction = useCallback(
@@ -370,6 +471,16 @@ export function Dashboard(props: { me: MeResponse }) {
 
 		return () => window.clearTimeout(timer);
 	}, [patDialogOpen, patInput]);
+
+	useEffect(
+		() => () => {
+			for (const timer of reactionFlushTimerByKeyRef.current.values()) {
+				window.clearTimeout(timer);
+			}
+			reactionFlushTimerByKeyRef.current.clear();
+		},
+		[],
+	);
 
 	const onSavePat = useCallback(() => {
 		if (patCheckState !== "valid") return;
