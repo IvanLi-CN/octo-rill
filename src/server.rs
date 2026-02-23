@@ -213,7 +213,10 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
     }
 
     tokio::spawn(async move {
-        run_startup_brief_backfill(state.as_ref(), at).await;
+        let backfill_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            run_startup_brief_backfill(backfill_state.as_ref(), at).await;
+        });
 
         loop {
             let now = chrono::Local::now().naive_local();
