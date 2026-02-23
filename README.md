@@ -48,3 +48,38 @@ Then open `http://127.0.0.1:55174`.
 - OAuth callback is handled by the backend (`/auth/github/callback`).
 - Local data (SQLite) lives under `./.data/`.
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
+
+## Release automation (PR label driven)
+
+Releases are decided by PR labels and executed only after `CI Pipeline` succeeds on `main`.
+
+### Required PR labels
+
+Every PR must contain exactly one `type:*` label and one `channel:*` label:
+
+- `type:*`: `type:docs`, `type:skip`, `type:patch`, `type:minor`, `type:major`
+- `channel:*`: `channel:stable`, `channel:rc`
+
+### Decision matrix
+
+| Type label | Channel label | Release result |
+| --- | --- | --- |
+| `type:docs` / `type:skip` | `channel:stable` / `channel:rc` | No release |
+| `type:patch` / `type:minor` / `type:major` | `channel:stable` | Stable release (`vX.Y.Z`) |
+| `type:patch` / `type:minor` / `type:major` | `channel:rc` | Prerelease (`vX.Y.Z-rc.<sha7>`) |
+
+### Image tags
+
+- Stable release: publish `${image}:vX.Y.Z` and `${image}:latest`
+- RC release: publish `${image}:vX.Y.Z-rc.<sha7>` only (no `latest`)
+
+### Troubleshooting
+
+- `PR Label Gate` fails:
+  - Missing or conflicting `type:*` / `channel:*` labels
+  - Unknown labels under `type:*` or `channel:*`
+- `Release` workflow skips:
+  - Commit cannot be mapped to exactly one PR
+  - GitHub API lookup failure for PR mapping/labels
+- `Release` workflow fails:
+  - Invalid label combination detected by `.github/scripts/release-intent.sh`

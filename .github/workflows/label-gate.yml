@@ -1,0 +1,72 @@
+name: PR Label Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+
+concurrency:
+  group: label-gate-${{ github.event.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  label-gate:
+    name: Release intent label gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release intent labels
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const typeAllowed = new Set([
+              "type:docs",
+              "type:skip",
+              "type:patch",
+              "type:minor",
+              "type:major",
+            ]);
+            const channelAllowed = new Set([
+              "channel:stable",
+              "channel:rc",
+            ]);
+
+            const labels = (context.payload.pull_request?.labels ?? [])
+              .map((label) => label?.name)
+              .filter((name) => typeof name === "string" && name.length > 0);
+
+            const typeLabels = labels.filter((name) => name.startsWith("type:"));
+            const channelLabels = labels.filter((name) => name.startsWith("channel:"));
+
+            const unknownType = typeLabels.filter((name) => !typeAllowed.has(name));
+            const unknownChannel = channelLabels.filter((name) => !channelAllowed.has(name));
+
+            const selectedType = typeLabels.filter((name) => typeAllowed.has(name));
+            const selectedChannel = channelLabels.filter((name) => channelAllowed.has(name));
+
+            if (unknownType.length > 0) {
+              core.setFailed(`Unknown type label(s): ${Array.from(new Set(unknownType)).sort().join(", ")}`);
+              return;
+            }
+
+            if (unknownChannel.length > 0) {
+              core.setFailed(`Unknown channel label(s): ${Array.from(new Set(unknownChannel)).sort().join(", ")}`);
+              return;
+            }
+
+            if (selectedType.length !== 1) {
+              core.setFailed(`PR must have exactly one type:* label; found ${selectedType.length}`);
+              return;
+            }
+
+            if (selectedChannel.length !== 1) {
+              core.setFailed(`PR must have exactly one channel:* label; found ${selectedChannel.length}`);
+              return;
+            }
+
+            core.notice(`Labels OK: ${selectedType[0]} + ${selectedChannel[0]}`);
