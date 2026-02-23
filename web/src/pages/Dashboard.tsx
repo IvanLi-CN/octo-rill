@@ -9,12 +9,15 @@ import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppShell } from "@/layout/AppShell";
 import { DashboardHeader } from "@/pages/DashboardHeader";
+import { ReleaseDetailDrawer } from "@/releases/ReleaseDetailDrawer";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
 	type NotificationItem,
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
+
+type Tab = "all" | "releases" | "briefs" | "inbox";
 
 type MeResponse = {
 	user: {
@@ -47,14 +50,28 @@ function sortNotifications(items: NotificationItem[]) {
 	});
 }
 
+function parseDashboardQuery() {
+	const params = new URLSearchParams(window.location.search);
+	const rawTab = params.get("tab");
+	const tab: Tab =
+		rawTab === "releases" || rawTab === "briefs" || rawTab === "inbox"
+			? rawTab
+			: "all";
+	const rawRelease = params.get("release");
+	const releaseId = rawRelease && /^\d+$/.test(rawRelease) ? rawRelease : null;
+	return { tab, releaseId };
+}
+
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 
-	type Tab = "all" | "releases" | "briefs" | "inbox";
-	const [tab, setTab] = useState<Tab>("all");
+	const [tab, setTab] = useState<Tab>(() => parseDashboardQuery().tab);
+	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
+		() => parseDashboardQuery().releaseId,
+	);
 
 	const feed = useFeed();
 
@@ -166,6 +183,41 @@ export function Dashboard(props: { me: MeResponse }) {
 		return Boolean(any);
 	}, [feed.items]);
 
+	const onSelectTab = useCallback((nextTab: Tab) => {
+		setTab(nextTab);
+		if (nextTab !== "briefs") {
+			setActiveReleaseId(null);
+		}
+	}, []);
+
+	const onOpenReleaseDetail = useCallback((releaseId: string) => {
+		setTab("briefs");
+		setActiveReleaseId(releaseId);
+	}, []);
+
+	const onCloseReleaseDetail = useCallback(() => {
+		setActiveReleaseId(null);
+	}, []);
+
+	useEffect(() => {
+		const params = new URLSearchParams(window.location.search);
+		if (tab === "all") {
+			params.delete("tab");
+		} else {
+			params.set("tab", tab);
+		}
+		if (activeReleaseId) {
+			params.set("release", activeReleaseId);
+		} else {
+			params.delete("release");
+		}
+		const query = params.toString();
+		const nextUrl = `${window.location.pathname}${query ? `?${query}` : ""}`;
+		if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+			window.history.replaceState({}, "", nextUrl);
+		}
+	}, [tab, activeReleaseId]);
+
 	return (
 		<AppShell
 			header={
@@ -194,7 +246,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						variant={tab === "all" ? "default" : "outline"}
 						size="sm"
 						className="font-mono text-xs"
-						onClick={() => setTab("all")}
+						onClick={() => onSelectTab("all")}
 					>
 						全部
 					</Button>
@@ -202,7 +254,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						variant={tab === "releases" ? "default" : "outline"}
 						size="sm"
 						className="font-mono text-xs"
-						onClick={() => setTab("releases")}
+						onClick={() => onSelectTab("releases")}
 					>
 						Releases
 					</Button>
@@ -210,7 +262,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						variant={tab === "briefs" ? "default" : "outline"}
 						size="sm"
 						className="font-mono text-xs"
-						onClick={() => setTab("briefs")}
+						onClick={() => onSelectTab("briefs")}
 					>
 						日报
 					</Button>
@@ -218,7 +270,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						variant={tab === "inbox" ? "default" : "outline"}
 						size="sm"
 						className="font-mono text-xs"
-						onClick={() => setTab("inbox")}
+						onClick={() => onSelectTab("inbox")}
 					>
 						Inbox
 					</Button>
@@ -296,6 +348,7 @@ export function Dashboard(props: { me: MeResponse }) {
 								selectedDate={selectedBriefDate}
 								busy={busy === "Generate brief"}
 								onGenerate={onGenerateBrief}
+								onOpenRelease={onOpenReleaseDetail}
 							/>
 						</div>
 					) : null}
@@ -314,6 +367,11 @@ export function Dashboard(props: { me: MeResponse }) {
 					<InboxQuickList notifications={notifications} />
 				</aside>
 			</div>
+
+			<ReleaseDetailDrawer
+				releaseId={activeReleaseId}
+				onClose={onCloseReleaseDetail}
+			/>
 		</AppShell>
 	);
 }

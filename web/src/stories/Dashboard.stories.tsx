@@ -64,7 +64,7 @@ const mockBriefs: BriefItem[] = [
 		window_start: "2026-02-20T08:00:00+08:00",
 		window_end: "2026-02-21T08:00:00+08:00",
 		content_markdown:
-			"## 昨日更新（Releases）\n\n- acme/rocket: v1.8.0\n\n## 建议跟进（Next actions）\n\n- 升级并验证 CI\n",
+			"## 概览\n\n- 时间窗口（本地）：2026-02-20T08:00:00+08:00 → 2026-02-21T08:00:00+08:00\n- 更新项目：1 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.8.0](/?tab=briefs&release=10001) · 2026-02-21T08:05:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.8.0)\n  - 稳定版发布，包含性能优化。\n  - 建议升级后重新构建镜像。\n",
 		created_at: "2026-02-21T08:00:03Z",
 	},
 	{
@@ -72,7 +72,7 @@ const mockBriefs: BriefItem[] = [
 		window_start: "2026-02-19T08:00:00+08:00",
 		window_end: "2026-02-20T08:00:00+08:00",
 		content_markdown:
-			"## 昨日更新（Releases）\n\n- acme/rocket: v1.7.3\n\n## 建议跟进（Next actions）\n\n- 观察回归问题\n",
+			"## 概览\n\n- 时间窗口（本地）：2026-02-19T08:00:00+08:00 → 2026-02-20T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.7.3](/?tab=briefs&release=10000) · 2026-02-20T06:20:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.7.3)\n  - 修复认证回归问题。\n",
 		created_at: "2026-02-20T08:00:04Z",
 	},
 ];
@@ -198,6 +198,7 @@ function DashboardPreview() {
 								selectedDate={selectedDate}
 								busy={false}
 								onGenerate={() => {}}
+								onOpenRelease={() => {}}
 							/>
 						</div>
 					) : null}
