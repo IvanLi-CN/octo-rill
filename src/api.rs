@@ -1136,6 +1136,13 @@ fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+fn preserve_chunk_trailing_newline(source_chunk: &str, translated_chunk: String) -> String {
+    if source_chunk.ends_with('\n') && !translated_chunk.ends_with('\n') {
+        return format!("{translated_chunk}\n");
+    }
+    translated_chunk
+}
+
 const RELEASE_DETAIL_CHUNK_MAX_CHARS: usize = 2200;
 const RELEASE_DETAIL_CHUNK_MAX_TOKENS: u32 = 2200;
 
@@ -1462,7 +1469,7 @@ async fn translate_release_detail_chunk(
     )
     .await
     .map_err(ApiError::internal)?;
-    let translated = translated.trim().to_owned();
+    let translated = preserve_chunk_trailing_newline(chunk, translated);
     if markdown_structure_preserved(chunk, &translated) {
         return Ok(translated);
     }
@@ -1484,7 +1491,7 @@ async fn translate_release_detail_chunk(
     )
     .await
     .map_err(ApiError::internal)?;
-    let retry = retry.trim().to_owned();
+    let retry = preserve_chunk_trailing_newline(chunk, retry);
     if !markdown_structure_preserved(chunk, &retry) {
         return Err(ApiError::internal(
             "release detail translation failed to preserve markdown structure",
@@ -1870,7 +1877,8 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 mod tests {
     use super::{
         markdown_structure_preserved, parse_repo_full_name_from_release_url,
-        parse_translation_json, release_excerpt, resolve_release_full_name, split_markdown_chunks,
+        parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
+        resolve_release_full_name, split_markdown_chunks,
     };
 
     #[test]
@@ -1950,5 +1958,21 @@ echo should_not_be_in_excerpt
     fn resolve_release_full_name_falls_back_when_url_invalid() {
         let full_name = resolve_release_full_name("https://example.com/not-github", 42);
         assert_eq!(full_name, "unknown/42");
+    }
+
+    #[test]
+    fn preserve_chunk_trailing_newline_keeps_chunk_boundaries() {
+        assert_eq!(
+            preserve_chunk_trailing_newline("line\n", "译文".to_owned()),
+            "译文\n"
+        );
+        assert_eq!(
+            preserve_chunk_trailing_newline("line", "译文".to_owned()),
+            "译文"
+        );
+        assert_eq!(
+            preserve_chunk_trailing_newline("line\n", "译文\n".to_owned()),
+            "译文\n"
+        );
     }
 }
