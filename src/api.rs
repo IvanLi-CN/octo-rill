@@ -1039,7 +1039,7 @@ async fn fetch_live_release_reactions(
             reactionGroups {
               content
               viewerHasReacted
-              reactors(first: 0) {
+              reactors(first: 1) {
                 totalCount
               }
             }
@@ -1393,7 +1393,7 @@ async fn mutate_release_reaction(
                     reactionGroups {
                       content
                       viewerHasReacted
-                      reactors(first: 0) {
+                      reactors(first: 1) {
                         totalCount
                       }
                     }
@@ -1415,7 +1415,7 @@ async fn mutate_release_reaction(
                     reactionGroups {
                       content
                       viewerHasReacted
-                      reactors(first: 0) {
+                      reactors(first: 1) {
                         totalCount
                       }
                     }
