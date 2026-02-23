@@ -53,3 +53,39 @@ export async function apiPostJson<T>(path: string, body?: unknown): Promise<T> {
 	}
 	return (await res.json()) as T;
 }
+
+export type ReleaseDetailTranslated = {
+	lang: string;
+	status: "ready" | "missing" | "disabled";
+	title: string | null;
+	summary: string | null;
+};
+
+export type ReleaseDetailResponse = {
+	release_id: string;
+	repo_full_name: string | null;
+	tag_name: string;
+	name: string | null;
+	body: string | null;
+	html_url: string;
+	published_at: string | null;
+	is_prerelease: number;
+	is_draft: number;
+	translated: ReleaseDetailTranslated | null;
+};
+
+export async function apiGetReleaseDetail(
+	releaseId: string,
+): Promise<ReleaseDetailResponse> {
+	return apiGet<ReleaseDetailResponse>(
+		`/api/releases/${encodeURIComponent(releaseId)}/detail`,
+	);
+}
+
+export async function apiTranslateReleaseDetail(
+	releaseId: string,
+): Promise<ReleaseDetailTranslated> {
+	return apiPostJson<ReleaseDetailTranslated>("/api/translate/release/detail", {
+		release_id: releaseId,
+	});
+}

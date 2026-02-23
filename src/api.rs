@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
@@ -446,6 +446,16 @@ fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn parse_release_id_param(raw: &str) -> Result<i64, ApiError> {
+    let release_id_raw = raw.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    release_id_raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))
+}
+
 fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str> {
     if s.chars().count() > max_chars {
         std::borrow::Cow::Owned(s.chars().take(max_chars).collect())
@@ -834,6 +844,20 @@ pub struct TranslateResponse {
     summary: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReleaseDetailResponse {
+    release_id: String,
+    repo_full_name: Option<String>,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    translated: Option<TranslatedItem>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TranslationJson {
     title_zh: Option<String>,
@@ -990,6 +1014,33 @@ fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
     (out_title, out_summary)
 }
 
+fn release_detail_translation_source(repo: Option<&str>, title: &str, body: &str) -> String {
+    format!(
+        "v=detail-1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
+        repo.unwrap_or(""),
+        title,
+        truncate_chars(body, 20_000),
+    )
+}
+
+fn release_detail_translation_prompt(
+    repo: Option<&str>,
+    title: &str,
+    body: &str,
+    previous_summary: Option<&str>,
+) -> String {
+    match previous_summary {
+        Some(previous_summary) => format!(
+            "Repo: {repo}\nOriginal title: {title}\n\nRelease details markdown:\n{body}\n\n上一次翻译（不合格，Markdown 结构丢失）：\n{previous_summary}\n\n请重新翻译并输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与原文完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。",
+            repo = repo.unwrap_or("(unknown repo)"),
+        ),
+        None => format!(
+            "Repo: {repo}\nOriginal title: {title}\n\nRelease details markdown:\n{body}\n\n请把这条 Release 详情翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与原文完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。",
+            repo = repo.unwrap_or("(unknown repo)"),
+        ),
+    }
+}
+
 fn release_translation_prompt(
     repo: &str,
     title: &str,
@@ -1047,19 +1098,361 @@ async fn upsert_translation(
     Ok(())
 }
 
+pub async fn get_release_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(release_id_raw): Path<String>,
+) -> Result<Json<ReleaseDetailResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id = parse_release_id_param(&release_id_raw)?;
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ReleaseDetailRow {
+        release_id: i64,
+        repo_full_name: Option<String>,
+        tag_name: String,
+        name: Option<String>,
+        body: Option<String>,
+        html_url: String,
+        published_at: Option<String>,
+        is_prerelease: i64,
+        is_draft: i64,
+        trans_source_hash: Option<String>,
+        trans_title: Option<String>,
+        trans_summary: Option<String>,
+    }
+
+    let row = sqlx::query_as::<_, ReleaseDetailRow>(
+        r#"
+        SELECT
+          r.release_id,
+          sr.full_name AS repo_full_name,
+          r.tag_name,
+          r.name,
+          r.body,
+          r.html_url,
+          r.published_at,
+          r.is_prerelease,
+          r.is_draft,
+          t.source_hash AS trans_source_hash,
+          t.title AS trans_title,
+          t.summary AS trans_summary
+        FROM releases r
+        LEFT JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        LEFT JOIN ai_translations t
+          ON t.user_id = r.user_id
+          AND t.entity_type = 'release_detail'
+          AND t.entity_id = CAST(r.release_id AS TEXT)
+          AND t.lang = 'zh-CN'
+        WHERE r.user_id = ? AND r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let title = row
+        .name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let body = row.body.clone().unwrap_or_default();
+    let source = release_detail_translation_source(row.repo_full_name.as_deref(), &title, &body);
+
+    let translated = if state.config.ai.is_none() {
+        Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        })
+    } else {
+        let current_hash = ai::sha256_hex(&source);
+        if row.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
+            let mut trans_title = row.trans_title.clone().filter(|s| !s.trim().is_empty());
+            let mut trans_summary = row.trans_summary.clone().filter(|s| !s.trim().is_empty());
+            let mut status = "ready".to_owned();
+
+            if let Some(raw) = trans_summary.as_deref() {
+                let t = raw.trim_start();
+                if t.starts_with('{') || t.starts_with("\"{") {
+                    if let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw) {
+                        if trans_title.is_none() {
+                            trans_title = t_title;
+                        }
+                        if t_summary.is_some() {
+                            trans_summary = t_summary;
+                        }
+                    } else {
+                        status = "missing".to_owned();
+                        trans_title = None;
+                        trans_summary = None;
+                    }
+                }
+            }
+
+            if status == "ready"
+                && let Some(summary) = trans_summary.as_deref()
+                && !markdown_structure_preserved(&body, summary)
+            {
+                status = "missing".to_owned();
+                trans_title = None;
+                trans_summary = None;
+            }
+
+            Some(TranslatedItem {
+                lang: "zh-CN".to_owned(),
+                status,
+                title: trans_title,
+                summary: trans_summary,
+            })
+        } else {
+            Some(TranslatedItem {
+                lang: "zh-CN".to_owned(),
+                status: "missing".to_owned(),
+                title: None,
+                summary: None,
+            })
+        }
+    };
+
+    Ok(Json(ReleaseDetailResponse {
+        release_id: row.release_id.to_string(),
+        repo_full_name: row.repo_full_name,
+        tag_name: row.tag_name,
+        name: row.name,
+        body: row.body,
+        html_url: row.html_url,
+        published_at: row.published_at,
+        is_prerelease: row.is_prerelease,
+        is_draft: row.is_draft,
+        translated,
+    }))
+}
+
+pub async fn translate_release_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<TranslateReleaseRequest>,
+) -> Result<Json<TranslateResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id = parse_release_id_param(&req.release_id)?;
+
+    if state.config.ai.is_none() {
+        return Ok(Json(TranslateResponse {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        }));
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ReleaseSourceRow {
+        repo_full_name: Option<String>,
+        tag_name: String,
+        name: Option<String>,
+        body: Option<String>,
+    }
+
+    let row = sqlx::query_as::<_, ReleaseSourceRow>(
+        r#"
+        SELECT
+          sr.full_name AS repo_full_name,
+          r.tag_name,
+          r.name,
+          r.body
+        FROM releases r
+        LEFT JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        WHERE r.user_id = ? AND r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let title = row
+        .name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let body = row.body.unwrap_or_default();
+    let source = release_detail_translation_source(row.repo_full_name.as_deref(), &title, &body);
+    let source_hash = ai::sha256_hex(&source);
+    let entity_id = release_id.to_string();
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct TranslationRow {
+        source_hash: String,
+        title: Option<String>,
+        summary: Option<String>,
+    }
+    let cached = sqlx::query_as::<_, TranslationRow>(
+        r#"
+        SELECT source_hash, title, summary
+        FROM ai_translations
+        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(&entity_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(c) = cached
+        && c.source_hash == source_hash
+    {
+        if let Some(raw) = c.summary.as_deref() {
+            let t = raw.trim_start();
+            if (t.starts_with('{') || t.starts_with("\"{"))
+                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+            {
+                let out_title = t_title.or_else(|| c.title.clone());
+                let out_summary = t_summary.or_else(|| c.summary.clone());
+
+                upsert_translation(
+                    state.as_ref(),
+                    user_id,
+                    TranslationUpsert {
+                        entity_type: "release_detail",
+                        entity_id: &entity_id,
+                        lang: "zh-CN",
+                        source_hash: &source_hash,
+                        title: out_title.as_deref(),
+                        summary: out_summary.as_deref(),
+                    },
+                )
+                .await?;
+
+                return Ok(Json(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: out_title,
+                    summary: out_summary,
+                }));
+            }
+        }
+
+        let cache_is_json_blob = c
+            .summary
+            .as_deref()
+            .map(|raw| {
+                let t = raw.trim_start();
+                t.starts_with('{') || t.starts_with("\"{")
+            })
+            .unwrap_or(false);
+        let cache_preserves_structure = c
+            .summary
+            .as_deref()
+            .map(|s| markdown_structure_preserved(&body, s))
+            .unwrap_or(true);
+        if !cache_is_json_blob && cache_preserves_structure {
+            return Ok(Json(TranslateResponse {
+                lang: "zh-CN".to_owned(),
+                status: "ready".to_owned(),
+                title: c.title,
+                summary: c.summary,
+            }));
+        }
+    }
+
+    let prompt =
+        release_detail_translation_prompt(row.repo_full_name.as_deref(), &title, &body, None);
+    let raw = ai::chat_completion(
+        state.as_ref(),
+        "你是一个助理，负责把 GitHub Release 详情翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
+        &prompt,
+        1_800,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    let (mut out_title, mut out_summary) = extract_translation_fields(&raw);
+    if let Some(summary) = out_summary.as_deref()
+        && !markdown_structure_preserved(&body, summary)
+    {
+        let retry_prompt = release_detail_translation_prompt(
+            row.repo_full_name.as_deref(),
+            &title,
+            &body,
+            Some(summary),
+        );
+        if let Ok(retry_raw) = ai::chat_completion(
+            state.as_ref(),
+            "你是一个助理，负责把 GitHub Release 详情翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
+            &retry_prompt,
+            1_800,
+        )
+        .await
+        {
+            let (retry_title, retry_summary) = extract_translation_fields(&retry_raw);
+            if retry_summary
+                .as_deref()
+                .is_some_and(|s| markdown_structure_preserved(&body, s))
+            {
+                out_title = retry_title.or(out_title);
+                out_summary = retry_summary;
+            }
+        }
+    }
+
+    upsert_translation(
+        state.as_ref(),
+        user_id,
+        TranslationUpsert {
+            entity_type: "release_detail",
+            entity_id: &entity_id,
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: out_title.as_deref(),
+            summary: out_summary.as_deref(),
+        },
+    )
+    .await?;
+
+    Ok(Json(TranslateResponse {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title: out_title,
+        summary: out_summary,
+    }))
+}
+
 pub async fn translate_release(
     State(state): State<Arc<AppState>>,
     session: Session,
     Json(req): Json<TranslateReleaseRequest>,
 ) -> Result<Json<TranslateResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
-    let release_id_raw = req.release_id.trim();
-    if release_id_raw.is_empty() {
-        return Err(ApiError::bad_request("release_id is required"));
-    }
-    let release_id: i64 = release_id_raw
-        .parse()
-        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+    let release_id = parse_release_id_param(&req.release_id)?;
 
     if state.config.ai.is_none() {
         return Ok(Json(TranslateResponse {
@@ -1472,7 +1865,10 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_structure_preserved, parse_translation_json, release_excerpt};
+    use super::{
+        markdown_structure_preserved, parse_release_id_param, parse_translation_json,
+        release_excerpt,
+    };
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {
@@ -1519,5 +1915,12 @@ echo should_not_be_in_excerpt
         let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
         assert!(!markdown_structure_preserved(source, translated_missing));
         assert!(markdown_structure_preserved(source, translated_ok));
+    }
+
+    #[test]
+    fn parse_release_id_param_requires_integer_string() {
+        assert_eq!(parse_release_id_param("123").expect("release id"), 123);
+        assert!(parse_release_id_param("12a").is_err());
+        assert!(parse_release_id_param("   ").is_err());
     }
 }
