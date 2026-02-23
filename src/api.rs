@@ -458,45 +458,10 @@ fn release_excerpt(body: Option<&str>) -> Option<String> {
     let body = body?;
     let normalized = body.replace("\r\n", "\n");
 
-    // Prefer a short bullet list if present; it reads well in a feed item.
-    let mut bullets: Vec<String> = Vec::new();
-    let mut in_code = false;
-    for raw in normalized.lines() {
-        let trimmed = raw.trim();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code {
-            continue;
-        }
-        let item = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(item) = item {
-            bullets.push(truncate_chars(item, 220).into_owned());
-            if bullets.len() >= 6 {
-                break;
-            }
-        }
-    }
-
-    if !bullets.is_empty() {
-        let mut out = String::new();
-        for (idx, b) in bullets.into_iter().enumerate() {
-            if idx > 0 {
-                out.push('\n');
-            }
-            out.push_str("- ");
-            out.push_str(b.trim());
-        }
-        return Some(truncate_chars(&out, 900).into_owned());
-    }
-
-    // Fallback: first paragraph-like snippet, excluding code fences.
-    let mut parts: Vec<String> = Vec::new();
+    // Preserve the markdown layout (headings/lists/line breaks) so original/translated views
+    // keep a similar reading structure.
+    let mut lines: Vec<String> = Vec::new();
+    let mut content_lines = 0usize;
     let mut in_code = false;
     for raw in normalized.lines() {
         let trimmed = raw.trim();
@@ -509,31 +474,29 @@ fn release_excerpt(body: Option<&str>) -> Option<String> {
         }
 
         if trimmed.is_empty() {
-            if !parts.is_empty() {
-                break;
+            if !lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+                lines.push(String::new());
             }
             continue;
         }
 
-        // Skip headings; they usually duplicate the title and are noisy in the feed body.
-        if trimmed.starts_with('#') {
-            continue;
-        }
-
-        parts.push(trimmed.to_owned());
-        if parts.len() >= 4 {
+        lines.push(trimmed.to_owned());
+        content_lines += 1;
+        if content_lines >= 18 {
             break;
         }
     }
 
-    let joined = parts.join(" ").trim().to_owned();
-    if !joined.is_empty() {
-        return Some(truncate_chars(&joined, 900).into_owned());
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
     }
 
-    // Last resort: fall back to the first non-empty, non-code lines. Many releases have
-    // mostly headings/links; returning *something* is better than rendering an empty original
-    // excerpt while a translated summary exists.
+    if !lines.is_empty() {
+        let out = lines.join("\n");
+        return Some(truncate_chars(&out, 900).into_owned());
+    }
+
+    // Fallback: preserve the first non-empty lines even when formatting is irregular.
     let mut fallback: Vec<String> = Vec::new();
     let mut in_code = false;
     for raw in normalized.lines() {
@@ -545,22 +508,28 @@ fn release_excerpt(body: Option<&str>) -> Option<String> {
         if in_code {
             continue;
         }
+
         if trimmed.is_empty() {
-            if !fallback.is_empty() {
-                break;
+            if !fallback.is_empty() && fallback.last().is_some_and(|line| !line.is_empty()) {
+                fallback.push(String::new());
             }
             continue;
         }
+
         fallback.push(trimmed.to_owned());
-        if fallback.len() >= 10 {
+        if fallback.len() >= 12 {
             break;
         }
     }
 
-    let fallback = fallback.join(" ").trim().to_owned();
+    while fallback.last().is_some_and(|line| line.is_empty()) {
+        fallback.pop();
+    }
+
     if fallback.is_empty() {
         None
     } else {
+        let fallback = fallback.join("\n");
         Some(truncate_chars(&fallback, 900).into_owned())
     }
 }
@@ -716,9 +685,9 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
 
     let source = match r.kind.as_str() {
         "release" => format!(
-            // v=2: translation input is the excerpt shown in the UI (not a free-form summary of
+            // v=3: translation input is the excerpt shown in the UI (not a free-form summary of
             // the entire body) so "中文/原文" toggles show comparable content.
-            "v=2\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            "v=3\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
             truncate_chars(excerpt.as_deref().unwrap_or(""), 2000),
@@ -1009,7 +978,7 @@ pub async fn translate_release(
     };
 
     let source = format!(
-        "v=2\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+        "v=3\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
         row.full_name, title, excerpt
     );
     let source_hash = ai::sha256_hex(&source);
@@ -1091,7 +1060,7 @@ pub async fn translate_release(
     }
 
     let prompt = format!(
-        "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n要求：不要新增信息；不要总结/扩写；尽量保留原有段落/列表结构；不包含任何 URL。",
+        "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n要求：不要新增信息；不要总结/扩写；逐段翻译并严格保留 Markdown 标记与层级（如 #、-、1.、**、`）；不包含任何 URL。",
         repo = row.full_name,
         title = title,
         excerpt = excerpt,
@@ -1099,7 +1068,7 @@ pub async fn translate_release(
 
     let raw = ai::chat_completion(
         state.as_ref(),
-        "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（保留结构，不新增信息）。不要包含任何 URL。",
+        "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
         &prompt,
         900,
     )
@@ -1355,4 +1324,39 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
         ));
     };
     Ok(user_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_excerpt;
+
+    #[test]
+    fn release_excerpt_keeps_markdown_structure() {
+        let body = r#"
+# Changelog
+
+- Added **markdown** rendering
+- Keep `inline code` markers
+1. Ordered item
+
+```bash
+echo should_not_be_in_excerpt
+```
+"#;
+
+        let excerpt = release_excerpt(Some(body)).expect("excerpt");
+        assert!(excerpt.contains("# Changelog"));
+        assert!(excerpt.contains("- Added **markdown** rendering"));
+        assert!(excerpt.contains("- Keep `inline code` markers"));
+        assert!(excerpt.contains("1. Ordered item"));
+        assert!(!excerpt.contains("should_not_be_in_excerpt"));
+    }
+
+    #[test]
+    fn release_excerpt_fallback_keeps_newlines() {
+        let body = "First line\nSecond line\n\nThird line";
+        let excerpt = release_excerpt(Some(body)).expect("excerpt");
+        assert!(excerpt.contains("First line\nSecond line"));
+        assert!(excerpt.contains("\n\nThird line"));
+    }
 }
