@@ -74,12 +74,16 @@ Tab 语义：
 
 - 登录方式：GitHub OAuth。
 - 本地存储：SQLite（默认 `./.data/octo-rill.db`）。
+- Release 数据语义：按“共享事实”处理，release 以稳定 `release_id` 引用；用户 Star 仅用于决定个人列表与同步范围。
 - 同步数据：
   - Starred repos（用于确定关注范围）
   - Releases（用于信息流与日报）
   - Notifications（用于 Inbox 列表与侧栏快捷入口）
 - 日报回填：
   - 服务启动时会为每个用户先同步一次 releases，再补齐最近 7 天日报（已存在日期会跳过）
+- 可见性规则：
+  - 取消 Star 后，该仓库可从当前用户的列表中消失；
+  - 但历史日报中的 release 详情链接（`/?tab=briefs&release=<release_id>`）仍应可访问。
 
 ## 非目标（本项目不做什么）
 

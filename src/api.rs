@@ -4,9 +4,29 @@ use axum::extract::{Path, Query};
 use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
+use url::Url;
 
 use crate::{ai, sync};
 use crate::{error::ApiError, state::AppState};
+
+fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
+    let parsed = Url::parse(html_url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "github.com" && host != "www.github.com" {
+        return None;
+    }
+    let mut segments = parsed.path_segments()?;
+    let owner = segments.next()?.trim();
+    let repo = segments.next()?.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
+    parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
+}
 
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
@@ -181,8 +201,8 @@ pub async fn get_release_detail(
 
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailRow {
+        repo_id: i64,
         release_id: i64,
-        full_name: String,
         tag_name: String,
         name: Option<String>,
         body: Option<String>,
@@ -195,11 +215,9 @@ pub async fn get_release_detail(
     let row = sqlx::query_as::<_, ReleaseDetailRow>(
         r#"
         SELECT
-          r.release_id, sr.full_name, r.tag_name, r.name, r.body, r.html_url, r.published_at,
+          r.repo_id, r.release_id, r.tag_name, r.name, r.body, r.html_url, r.published_at,
           r.is_prerelease, r.is_draft
         FROM releases r
-        JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
         WHERE r.user_id = ? AND r.release_id = ?
         LIMIT 1
         "#,
@@ -225,10 +243,11 @@ pub async fn get_release_detail(
         .filter(|s| !s.is_empty())
         .unwrap_or(&row.tag_name)
         .to_owned();
+    let full_name = resolve_release_full_name(&row.html_url, row.repo_id);
 
     Ok(Json(ReleaseDetailResponse {
         release_id: row.release_id.to_string(),
-        full_name: row.full_name,
+        full_name,
         tag_name: row.tag_name,
         name: row.name,
         title,
@@ -1419,7 +1438,8 @@ pub async fn translate_release_detail(
 
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailSourceRow {
-        full_name: String,
+        repo_id: i64,
+        html_url: String,
         tag_name: String,
         name: Option<String>,
         body: Option<String>,
@@ -1427,10 +1447,8 @@ pub async fn translate_release_detail(
 
     let row = sqlx::query_as::<_, ReleaseDetailSourceRow>(
         r#"
-        SELECT sr.full_name, r.tag_name, r.name, r.body
+        SELECT r.repo_id, r.html_url, r.tag_name, r.name, r.body
         FROM releases r
-        JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
         WHERE r.user_id = ? AND r.release_id = ?
         LIMIT 1
         "#,
@@ -1457,10 +1475,11 @@ pub async fn translate_release_detail(
         .unwrap_or(&row.tag_name)
         .to_owned();
     let original_body = row.body.unwrap_or_default();
+    let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
 
     let source = format!(
         "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
-        row.full_name, original_title, original_body
+        repo_full_name, original_title, original_body
     );
     let source_hash = ai::sha256_hex(&source);
     let entity_id = release_id.to_string();
@@ -1501,7 +1520,7 @@ pub async fn translate_release_detail(
         "你是一个翻译助手，只把 GitHub Release 标题翻译成自然中文。输出纯文本，不要解释。",
         &format!(
             "Repo: {}\nOriginal title: {}\n\n输出中文标题：",
-            row.full_name, original_title
+            repo_full_name, original_title
         ),
         120,
     )
@@ -1522,7 +1541,7 @@ pub async fn translate_release_detail(
     for (idx, chunk) in chunks.iter().enumerate() {
         let prompt = format!(
             "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
-            repo = row.full_name,
+            repo = repo_full_name,
             title = original_title,
             current = idx + 1,
             total = total_chunks,
@@ -1775,8 +1794,8 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        markdown_structure_preserved, parse_translation_json, release_excerpt,
-        split_markdown_chunks,
+        markdown_structure_preserved, parse_repo_full_name_from_release_url,
+        parse_translation_json, release_excerpt, resolve_release_full_name, split_markdown_chunks,
     };
 
     #[test]
@@ -1834,5 +1853,19 @@ echo should_not_be_in_excerpt
         let rebuilt = chunks.join("\n");
         assert!(rebuilt.contains("line1"));
         assert!(rebuilt.contains("line4"));
+    }
+
+    #[test]
+    fn parse_repo_full_name_from_release_url_extracts_owner_repo() {
+        let full_name = parse_repo_full_name_from_release_url(
+            "https://github.com/acme/rocket/releases/tag/v1.8.0",
+        );
+        assert_eq!(full_name.as_deref(), Some("acme/rocket"));
+    }
+
+    #[test]
+    fn resolve_release_full_name_falls_back_when_url_invalid() {
+        let full_name = resolve_release_full_name("https://example.com/not-github", 42);
+        assert_eq!(full_name, "unknown/42");
     }
 }
