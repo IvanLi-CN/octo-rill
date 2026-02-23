@@ -39,7 +39,7 @@ export type ReactionViewerState = {
 export type ReleaseReactions = {
 	counts: ReactionCounts;
 	viewer: ReactionViewerState;
-	status: "ready" | "reauth_required" | "sync_required";
+	status: "ready" | "sync_required";
 };
 
 export type FeedItem = {
