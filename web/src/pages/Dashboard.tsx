@@ -16,6 +16,7 @@ import {
 	type NotificationItem,
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
+import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type MeResponse = {
 	user: {
@@ -39,6 +40,35 @@ type BriefGenerateResponse = {
 	content_markdown: string;
 };
 
+type Tab = "all" | "releases" | "briefs" | "inbox";
+
+function parseTab(raw: string | null): Tab | null {
+	switch (raw) {
+		case "all":
+		case "releases":
+		case "briefs":
+		case "inbox":
+			return raw;
+		default:
+			return null;
+	}
+}
+
+function parseInitialReleaseId(): string | null {
+	if (typeof window === "undefined") return null;
+	const params = new URLSearchParams(window.location.search);
+	const raw = params.get("release")?.trim() ?? "";
+	return /^\d+$/.test(raw) ? raw : null;
+}
+
+function parseInitialTab(): Tab {
+	if (typeof window === "undefined") return "all";
+	const params = new URLSearchParams(window.location.search);
+	const releaseId = parseInitialReleaseId();
+	if (releaseId) return "briefs";
+	return parseTab(params.get("tab")) ?? "all";
+}
+
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
 		if (a.unread !== b.unread) return b.unread - a.unread;
@@ -54,8 +84,10 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 
-	type Tab = "all" | "releases" | "briefs" | "inbox";
-	const [tab, setTab] = useState<Tab>("all");
+	const [tab, setTab] = useState<Tab>(() => parseInitialTab());
+	const [selectedReleaseId] = useState<string | null>(() =>
+		parseInitialReleaseId(),
+	);
 
 	const feed = useFeed();
 
@@ -111,6 +143,24 @@ export function Dashboard(props: { me: MeResponse }) {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [feed.loadInitial, refreshSidebar]);
+
+	useEffect(() => {
+		if (typeof window === "undefined") return;
+		const params = new URLSearchParams(window.location.search);
+		params.set("tab", tab);
+		if (tab === "briefs" && selectedReleaseId) {
+			params.set("release", selectedReleaseId);
+		} else {
+			params.delete("release");
+		}
+
+		const nextSearch = params.toString();
+		const next = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ""}${window.location.hash}`;
+		const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+		if (next !== current) {
+			window.history.replaceState(null, "", next);
+		}
+	}, [tab, selectedReleaseId]);
 
 	const onToggleOriginal = useCallback((key: string) => {
 		setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -299,6 +349,7 @@ export function Dashboard(props: { me: MeResponse }) {
 								busy={busy === "Generate brief"}
 								onGenerate={onGenerateBrief}
 							/>
+							<ReleaseDetailCard releaseId={selectedReleaseId} />
 						</div>
 					) : null}
 

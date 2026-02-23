@@ -1,13 +1,17 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::state::AppState;
 
 #[derive(Debug, sqlx::FromRow)]
 struct ReleaseRow {
+    release_id: i64,
     full_name: String,
     tag_name: String,
     name: Option<String>,
@@ -84,6 +88,84 @@ pub fn sha256_hex(input: &str) -> String {
     for b in digest {
         use std::fmt::Write as _;
         write!(&mut out, "{:02x}", b).expect("sha256 hex");
+    }
+    out
+}
+
+fn parse_release_id_from_link_href(href: &str) -> Option<i64> {
+    let href = href.trim().trim_start_matches('<').trim_end_matches('>');
+    if href.is_empty() {
+        return None;
+    }
+
+    let parsed = if href.starts_with("http://") || href.starts_with("https://") {
+        Url::parse(href).ok()?
+    } else if href.starts_with('/') || href.starts_with('?') {
+        let base = Url::parse("https://octo-rill.local/").ok()?;
+        base.join(href).ok()?
+    } else {
+        return None;
+    };
+
+    for (k, v) in parsed.query_pairs() {
+        if k == "release" {
+            return v.parse::<i64>().ok();
+        }
+    }
+    None
+}
+
+fn escape_markdown_link_text(text: &str) -> String {
+    text.replace('[', "\\[").replace(']', "\\]")
+}
+
+fn extract_brief_release_ids(markdown: &str) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = markdown[cursor..].find("](") {
+        let href_start = cursor + rel + 2;
+        let Some(end_rel) = markdown[href_start..].find(')') else {
+            break;
+        };
+        let href_end = href_start + end_rel;
+        if let Some(id) = parse_release_id_from_link_href(&markdown[href_start..href_end]) {
+            ids.insert(id);
+        }
+        cursor = href_end + 1;
+    }
+    ids
+}
+
+fn reconcile_brief_release_links(markdown: &str, targets: &[ReleaseRow]) -> String {
+    let existing = extract_brief_release_ids(markdown);
+    let mut missing = targets
+        .iter()
+        .filter(|r| !existing.contains(&r.release_id))
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return markdown.to_owned();
+    }
+
+    // Keep generated links stable and deterministic.
+    missing.sort_by_key(|r| r.release_id);
+
+    let mut out = markdown.trim_end_matches('\n').to_owned();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str("## Release links\n");
+    for r in missing {
+        let title = r
+            .name
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&r.tag_name);
+        let label = escape_markdown_link_text(&format!("{} · {}", r.full_name, title));
+        out.push_str(&format!(
+            "- [{label}](/?tab=briefs&release={})\n",
+            r.release_id
+        ));
     }
     out
 }
@@ -235,7 +317,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
 
     let releases = sqlx::query_as::<_, ReleaseRow>(
         r#"
-        SELECT sr.full_name, r.tag_name, r.name, r.published_at
+        SELECT r.release_id, sr.full_name, r.tag_name, r.name, r.published_at
         FROM releases r
         JOIN starred_repos sr
           ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
@@ -285,6 +367,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
         900,
     )
     .await?;
+    let content = reconcile_brief_release_links(&content, &releases);
 
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -359,5 +442,46 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(key_date, NaiveDate::from_ymd_opt(2026, 2, 20).unwrap());
+    }
+
+    #[test]
+    fn extract_brief_release_ids_matches_exact_release_id() {
+        let markdown = r#"
+- [one](/?tab=briefs&release=12)
+- [two](/?tab=briefs&release=123)
+- [three](https://example.com/?release=456&foo=bar)
+- [bad](/?tab=briefs&release=abc)
+"#;
+
+        let ids = extract_brief_release_ids(markdown);
+        assert!(ids.contains(&12));
+        assert!(ids.contains(&123));
+        assert!(ids.contains(&456));
+        assert!(!ids.contains(&1));
+    }
+
+    #[test]
+    fn reconcile_brief_release_links_adds_missing_ids() {
+        let markdown = "- [repo/a · v1.2.0](/?tab=briefs&release=12)\n";
+        let targets = vec![
+            ReleaseRow {
+                release_id: 12,
+                full_name: "repo/a".to_owned(),
+                tag_name: "v1.2.0".to_owned(),
+                name: None,
+                published_at: None,
+            },
+            ReleaseRow {
+                release_id: 123,
+                full_name: "repo/b".to_owned(),
+                tag_name: "v2.0.0".to_owned(),
+                name: None,
+                published_at: None,
+            },
+        ];
+
+        let out = reconcile_brief_release_links(markdown, &targets);
+        assert!(out.contains("release=12"));
+        assert!(out.contains("release=123"));
     }
 }

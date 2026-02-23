@@ -48,6 +48,9 @@ Then open `http://127.0.0.1:55174`.
 - OAuth callback is handled by the backend (`/auth/github/callback`).
 - Local data (SQLite) lives under `./.data/`.
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
+- Release data is treated as durable factual records; Star only controls current list visibility.
+- Brief deep links (`/?tab=briefs&release=<id>`) open release details even after a repo is unstarred.
+- Release detail reading/translation does not depend on current Star state.
 
 ## Release automation (PR label driven)
 

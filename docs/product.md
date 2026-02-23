@@ -41,8 +41,10 @@ Tab 语义：
 
 - 时间窗口：以 `AI_DAILY_AT_LOCAL` 设定的本地时间（例如 `08:00`）为边界，
   窗口为「昨日 08:00（本地）→ 今日 08:00（本地）」。
-- 内容：由 AI 生成 Markdown（聚焦 Releases，不包含链接）。
+- 内容：由 AI 生成 Markdown（聚焦 Releases，不包含外部链接）；系统会补齐内部详情链接。
 - 用途：快速扫一眼昨天有哪些更新、哪些需要跟进。
+- 链接完整性：系统会对日报中的 `release_id` 内部链接做精确匹配校验与自动补齐，
+  防止 `12/123` 前缀冲突导致误判。
 
 ### 右侧侧栏：Inbox 快捷入口
 
@@ -63,9 +65,14 @@ Tab 语义：
 - 登录方式：GitHub OAuth。
 - 本地存储：SQLite（默认 `./.data/octo-rill.db`）。
 - 同步数据：
-  - Starred repos（用于确定关注范围）
-  - Releases（用于信息流与日报）
+  - Starred repos（用于个性化可见范围）
+  - Releases（共享事实数据；用于信息流、日报与详情）
   - Notifications（用于 Inbox 列表与侧栏快捷入口）
+
+语义边界：
+
+- **Star 只影响当前列表展示范围**（Feed / Releases / 日报候选）。
+- **Release 详情与详情翻译按 `release_id` 可读**，不依赖当前是否仍在 Star 列表中。
 
 ## 非目标（本项目不做什么）
 

@@ -27,8 +27,18 @@ const markdownComponents: Components = {
 	a: ({ children, href }) => (
 		<a
 			href={href}
-			target="_blank"
-			rel="noreferrer noopener"
+			target={
+				href?.startsWith("/?tab=briefs&release=") ||
+				href?.startsWith("?tab=briefs&release=")
+					? undefined
+					: "_blank"
+			}
+			rel={
+				href?.startsWith("/?tab=briefs&release=") ||
+				href?.startsWith("?tab=briefs&release=")
+					? undefined
+					: "noreferrer noopener"
+			}
 			className="text-foreground underline underline-offset-4"
 		>
 			{children}
