@@ -106,6 +106,17 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn escape_markdown_link_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if matches!(ch, '\\' | '[' | ']' | '(' | ')') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn extract_error_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     // OpenAI-style: { "error": { "message": "..." } }
@@ -738,10 +749,11 @@ fn build_brief_markdown(window: &DailyWindow, repos: &[RepoRendered]) -> String 
             } else {
                 ""
             };
+            let title = escape_markdown_link_text(&release.title);
 
             out.push_str(&format!(
                 "- [{}]({}) · {}{} · [GitHub Release]({})\n",
-                release.title,
+                title,
                 internal_link,
                 release.published_at,
                 prerelease_mark,
@@ -1069,5 +1081,43 @@ mod tests {
     fn contains_all_release_links_accepts_query_order_variants() {
         let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
         assert!(contains_all_release_links(markdown, &[123]));
+    }
+
+    #[test]
+    fn build_brief_markdown_escapes_release_title_link_text() {
+        let start_local = local_from_naive(
+            NaiveDate::from_ymd_opt(2026, 2, 20)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let end_local = local_from_naive(
+            NaiveDate::from_ymd_opt(2026, 2, 21)
+                .unwrap()
+                .and_hms_opt(8, 0, 0)
+                .unwrap(),
+        );
+        let window = DailyWindow {
+            key_date: NaiveDate::from_ymd_opt(2026, 2, 21).unwrap(),
+            start_utc: start_local.with_timezone(&chrono::Utc),
+            end_utc: end_local.with_timezone(&chrono::Utc),
+            start_local,
+            end_local,
+        };
+        let repo = RepoRendered {
+            full_name: "acme/rocket".to_owned(),
+            releases: vec![ReleaseRendered {
+                release_id: 42,
+                title: "v1.0 [beta](rc)".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.0".to_owned(),
+                published_at: "2026-02-20T09:00:00Z".to_owned(),
+                is_prerelease: false,
+                bullets: vec!["修复若干问题".to_owned()],
+                related_links: Vec::new(),
+            }],
+        };
+
+        let markdown = build_brief_markdown(&window, &[repo]);
+        assert!(markdown.contains("- [v1.0 \\[beta\\]\\(rc\\)](/?tab=briefs&release=42)"));
     }
 }
