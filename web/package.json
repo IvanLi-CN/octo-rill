@@ -8,6 +8,7 @@
 		"build": "tsc -b && vite build",
 		"lint": "biome check .",
 		"format": "biome format . --write",
+		"e2e": "playwright test",
 		"preview": "vite preview --host 127.0.0.1 --port 55175 --strictPort",
 		"storybook": "storybook dev -p 55176 --host 127.0.0.1 --no-open",
 		"storybook:build": "storybook build"
@@ -27,6 +28,7 @@
 		"tw-animate-css": "^1.2.9"
 	},
 	"devDependencies": {
+		"@playwright/test": "^1.57.0",
 		"@biomejs/biome": "^1.9.4",
 		"@storybook/addon-docs": "10.2.10",
 		"@storybook/react-vite": "10.2.10",
