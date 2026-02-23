@@ -394,6 +394,76 @@ fn is_allowed_markdown_link_target(raw: &str) -> bool {
     is_allowed_github_url(target)
 }
 
+fn trim_url_suffix(raw: &str) -> (&str, &str) {
+    let mut end = raw.len();
+    while end > 0 {
+        let Some(ch) = raw[..end].chars().next_back() else {
+            break;
+        };
+        if matches!(
+            ch,
+            ')' | ']' | '}' | ',' | ';' | '.' | ':' | '!' | '?' | '"' | '\''
+        ) {
+            end -= ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    (&raw[..end], &raw[end..])
+}
+
+fn sanitize_url_literals(markdown: &str) -> String {
+    fn sanitize_candidate(raw: &str) -> String {
+        let (url, suffix) = trim_url_suffix(raw);
+        if url.is_empty() || is_allowed_markdown_link_target(url) {
+            return raw.to_owned();
+        }
+
+        let mut out = compact_link_label(url);
+        out.push_str(suffix);
+        out
+    }
+
+    let mut out = String::with_capacity(markdown.len());
+    let mut i = 0usize;
+
+    while i < markdown.len() {
+        let rest = &markdown[i..];
+
+        if rest.starts_with('<')
+            && let Some(end_rel) = rest.find('>')
+        {
+            let inner = &rest[1..end_rel];
+            if inner.starts_with("https://") || inner.starts_with("http://") {
+                out.push_str(&sanitize_candidate(inner));
+                i += end_rel + 1;
+                continue;
+            }
+        }
+
+        if rest.starts_with("https://") || rest.starts_with("http://") {
+            let end_rel = rest
+                .char_indices()
+                .find_map(|(idx, ch)| {
+                    (idx > 0 && matches!(ch, ' ' | '\t' | '\n' | '\r' | '<' | '>' | '`'))
+                        .then_some(idx)
+                })
+                .unwrap_or(rest.len());
+            let raw = &rest[..end_rel];
+            out.push_str(&sanitize_candidate(raw));
+            i += end_rel;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
 fn sanitize_markdown_links(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len());
     let mut i = 0usize;
@@ -428,7 +498,7 @@ fn sanitize_markdown_links(markdown: &str) -> String {
         i += ch.len_utf8();
     }
 
-    out
+    sanitize_url_literals(&out)
 }
 
 fn strip_markdown_links_to_text(input: &str) -> String {
@@ -1122,6 +1192,29 @@ mod tests {
         );
         assert_eq!(links.len(), 1);
         assert_eq!(links[0], "https://github.com/acme/app/pull/12");
+    }
+
+    #[test]
+    fn sanitize_markdown_links_strips_disallowed_bare_urls() {
+        let markdown = "- details: https://example.com/acme/releases?foo=bar";
+        let sanitized = sanitize_markdown_links(markdown);
+        assert!(!sanitized.contains("https://example.com"));
+        assert!(sanitized.contains("example.com/acme/releases?foo=bar"));
+    }
+
+    #[test]
+    fn sanitize_markdown_links_strips_disallowed_angle_autolinks() {
+        let markdown = "- mirror: <https://example.com/acme/releases>";
+        let sanitized = sanitize_markdown_links(markdown);
+        assert!(!sanitized.contains("https://example.com"));
+        assert!(sanitized.contains("example.com/acme/releases"));
+    }
+
+    #[test]
+    fn sanitize_markdown_links_keeps_allowed_bare_github_urls() {
+        let markdown = "- ref: https://github.com/acme/app/releases/tag/v1.2.3";
+        let sanitized = sanitize_markdown_links(markdown);
+        assert_eq!(sanitized, markdown);
     }
 
     #[test]
