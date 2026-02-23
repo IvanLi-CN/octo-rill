@@ -1014,13 +1014,20 @@ fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
     (out_title, out_summary)
 }
 
-fn release_detail_translation_source(repo: Option<&str>, title: &str, body: &str) -> String {
+fn release_detail_translation_source(release_id: i64, title: &str, body: &str) -> String {
     format!(
-        "v=detail-1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
-        repo.unwrap_or(""),
+        "v=detail-2\nkind=release_detail\nrelease_id={}\ntitle={}\nbody={}\n",
+        release_id,
         title,
         truncate_chars(body, 20_000),
     )
+}
+
+fn release_detail_translation_ready(body: &str, summary: Option<&str>) -> bool {
+    if body.trim().is_empty() {
+        return true;
+    }
+    summary.is_some_and(|s| markdown_structure_preserved(body, s))
 }
 
 fn release_detail_translation_prompt(
@@ -1170,7 +1177,7 @@ pub async fn get_release_detail(
         .unwrap_or(&row.tag_name)
         .to_owned();
     let body = row.body.clone().unwrap_or_default();
-    let source = release_detail_translation_source(row.repo_full_name.as_deref(), &title, &body);
+    let source = release_detail_translation_source(row.release_id, &title, &body);
 
     let translated = if state.config.ai.is_none() {
         Some(TranslatedItem {
@@ -1205,8 +1212,7 @@ pub async fn get_release_detail(
             }
 
             if status == "ready"
-                && let Some(summary) = trans_summary.as_deref()
-                && !markdown_structure_preserved(&body, summary)
+                && !release_detail_translation_ready(&body, trans_summary.as_deref())
             {
                 status = "missing".to_owned();
                 trans_title = None;
@@ -1303,7 +1309,7 @@ pub async fn translate_release_detail(
         .unwrap_or(&row.tag_name)
         .to_owned();
     let body = row.body.unwrap_or_default();
-    let source = release_detail_translation_source(row.repo_full_name.as_deref(), &title, &body);
+    let source = release_detail_translation_source(release_id, &title, &body);
     let source_hash = ai::sha256_hex(&source);
     let entity_id = release_id.to_string();
 
@@ -1338,26 +1344,28 @@ pub async fn translate_release_detail(
                 let out_title = t_title.or_else(|| c.title.clone());
                 let out_summary = t_summary.or_else(|| c.summary.clone());
 
-                upsert_translation(
-                    state.as_ref(),
-                    user_id,
-                    TranslationUpsert {
-                        entity_type: "release_detail",
-                        entity_id: &entity_id,
-                        lang: "zh-CN",
-                        source_hash: &source_hash,
-                        title: out_title.as_deref(),
-                        summary: out_summary.as_deref(),
-                    },
-                )
-                .await?;
+                if release_detail_translation_ready(&body, out_summary.as_deref()) {
+                    upsert_translation(
+                        state.as_ref(),
+                        user_id,
+                        TranslationUpsert {
+                            entity_type: "release_detail",
+                            entity_id: &entity_id,
+                            lang: "zh-CN",
+                            source_hash: &source_hash,
+                            title: out_title.as_deref(),
+                            summary: out_summary.as_deref(),
+                        },
+                    )
+                    .await?;
 
-                return Ok(Json(TranslateResponse {
-                    lang: "zh-CN".to_owned(),
-                    status: "ready".to_owned(),
-                    title: out_title,
-                    summary: out_summary,
-                }));
+                    return Ok(Json(TranslateResponse {
+                        lang: "zh-CN".to_owned(),
+                        status: "ready".to_owned(),
+                        title: out_title,
+                        summary: out_summary,
+                    }));
+                }
             }
         }
 
@@ -1369,12 +1377,7 @@ pub async fn translate_release_detail(
                 t.starts_with('{') || t.starts_with("\"{")
             })
             .unwrap_or(false);
-        let cache_preserves_structure = c
-            .summary
-            .as_deref()
-            .map(|s| markdown_structure_preserved(&body, s))
-            .unwrap_or(true);
-        if !cache_is_json_blob && cache_preserves_structure {
+        if !cache_is_json_blob && release_detail_translation_ready(&body, c.summary.as_deref()) {
             return Ok(Json(TranslateResponse {
                 lang: "zh-CN".to_owned(),
                 status: "ready".to_owned(),
@@ -1422,6 +1425,30 @@ pub async fn translate_release_detail(
                 out_summary = retry_summary;
             }
         }
+    }
+
+    if !release_detail_translation_ready(&body, out_summary.as_deref()) {
+        // Clear malformed cache payloads so detail readers don't pick them up as fresh content.
+        upsert_translation(
+            state.as_ref(),
+            user_id,
+            TranslationUpsert {
+                entity_type: "release_detail",
+                entity_id: &entity_id,
+                lang: "zh-CN",
+                source_hash: &source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
+
+        return Ok(Json(TranslateResponse {
+            lang: "zh-CN".to_owned(),
+            status: "missing".to_owned(),
+            title: None,
+            summary: None,
+        }));
     }
 
     upsert_translation(
@@ -1867,7 +1894,7 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 mod tests {
     use super::{
         markdown_structure_preserved, parse_release_id_param, parse_translation_json,
-        release_excerpt,
+        release_detail_translation_ready, release_excerpt,
     };
 
     #[test]
@@ -1922,5 +1949,18 @@ echo should_not_be_in_excerpt
         assert_eq!(parse_release_id_param("123").expect("release id"), 123);
         assert!(parse_release_id_param("12a").is_err());
         assert!(parse_release_id_param("   ").is_err());
+    }
+
+    #[test]
+    fn release_detail_translation_ready_requires_summary_for_non_empty_body() {
+        let body = "- item";
+        assert!(!release_detail_translation_ready(body, None));
+        assert!(release_detail_translation_ready(body, Some("- 条目")));
+    }
+
+    #[test]
+    fn release_detail_translation_ready_allows_empty_body_without_summary() {
+        assert!(release_detail_translation_ready("", None));
+        assert!(release_detail_translation_ready("   \n", None));
     }
 }
