@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiGet, apiPost, apiPostJson } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -91,6 +91,7 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
+	const reactionBusyKeysRef = useRef<Set<string>>(new Set<string>());
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
@@ -154,15 +155,11 @@ export function Dashboard(props: { me: MeResponse }) {
 	const onToggleReaction = useCallback(
 		(item: FeedItem, content: ReactionContent) => {
 			const key = itemKey(item);
-			let shouldRun = false;
-			setReactionBusyKeys((prev) => {
-				if (prev.has(key)) return prev;
-				shouldRun = true;
-				const next = new Set(prev);
-				next.add(key);
-				return next;
-			});
-			if (!shouldRun) return;
+			if (reactionBusyKeysRef.current.has(key)) return;
+			const nextBusy = new Set(reactionBusyKeysRef.current);
+			nextBusy.add(key);
+			reactionBusyKeysRef.current = nextBusy;
+			setReactionBusyKeys(nextBusy);
 
 			void apiPostJson<ToggleReleaseReactionResponse>(
 				"/api/release/reactions/toggle",
@@ -178,11 +175,10 @@ export function Dashboard(props: { me: MeResponse }) {
 					setBootError(err instanceof Error ? err.message : String(err));
 				})
 				.finally(() => {
-					setReactionBusyKeys((prev) => {
-						const next = new Set(prev);
-						next.delete(key);
-						return next;
-					});
+					const nextBusy = new Set(reactionBusyKeysRef.current);
+					nextBusy.delete(key);
+					reactionBusyKeysRef.current = nextBusy;
+					setReactionBusyKeys(nextBusy);
 				});
 		},
 		[feed],
