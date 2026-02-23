@@ -342,6 +342,132 @@ fn compact_link_label(raw: &str) -> String {
     truncate_chars(raw, 64)
 }
 
+fn is_allowed_github_url(raw: &str) -> bool {
+    if raw.contains('…') {
+        return false;
+    }
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "github.com" || host == "www.github.com" || host == "raw.githubusercontent.com"
+}
+
+fn is_allowed_markdown_link_target(raw: &str) -> bool {
+    let target = raw.trim();
+    if target.starts_with("/?tab=briefs&release=") {
+        return true;
+    }
+    is_allowed_github_url(target)
+}
+
+fn sanitize_markdown_links(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut i = 0usize;
+
+    while i < markdown.len() {
+        let rest = &markdown[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let text_start = i + 1;
+            let text_end = i + text_end_rel;
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+
+            let text = &markdown[text_start..text_end];
+            let target = &markdown[url_start..url_end];
+
+            if is_allowed_markdown_link_target(target) {
+                out.push_str(&markdown[i..=url_end]);
+            } else {
+                out.push_str(text);
+            }
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn strip_markdown_links_to_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < input.len() {
+        let rest = &input[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let text_start = i + 1;
+            let text_end = i + text_end_rel;
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+            let text = &input[text_start..text_end];
+            out.push_str(text);
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn sanitize_bullet_text(raw: &str) -> String {
+    let normalized = raw.replace(['\r', '\n'], " ");
+    let normalized = strip_markdown_links_to_text(&normalized);
+    let normalized = strip_html_tags(&normalized);
+
+    let mut out = Vec::new();
+    for token in normalized.split_whitespace() {
+        let candidate = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                ')' | '(' | '[' | ']' | '<' | '>' | ',' | ';' | '"' | '\'' | '.'
+            )
+        });
+
+        if candidate.starts_with("https://") || candidate.starts_with("http://") {
+            continue;
+        }
+
+        out.push(token.to_owned());
+    }
+
+    out.join(" ").trim().to_owned()
+}
+
 fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -355,19 +481,13 @@ fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
         if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
             continue;
         }
-        let Ok(url) = Url::parse(candidate) else {
-            continue;
-        };
-        let Some(host) = url.host_str() else {
-            continue;
-        };
-        if !(host == "github.com"
-            || host == "www.github.com"
-            || host == "raw.githubusercontent.com")
-        {
+        if !is_allowed_github_url(candidate) {
             continue;
         }
 
+        let Ok(url) = Url::parse(candidate) else {
+            continue;
+        };
         let normalized = url.to_string();
         if seen.insert(normalized.clone()) {
             out.push(normalized);
@@ -412,7 +532,11 @@ fn extract_fallback_bullets(body: &str, max_bullets: usize) -> Vec<String> {
             continue;
         }
 
-        bullets.push(truncate_chars(content, 180));
+        let cleaned = sanitize_bullet_text(content);
+        if cleaned.is_empty() {
+            continue;
+        }
+        bullets.push(truncate_chars(&cleaned, 180));
         if bullets.len() >= max_bullets {
             break;
         }
@@ -422,7 +546,9 @@ fn extract_fallback_bullets(body: &str, max_bullets: usize) -> Vec<String> {
         let mut fallback = non_empty_lines(body)
             .filter(|line| !line.starts_with('#'))
             .take(max_bullets)
-            .map(|line| truncate_chars(line, 180))
+            .map(sanitize_bullet_text)
+            .filter(|line| !line.is_empty())
+            .map(|line| truncate_chars(&line, 180))
             .collect::<Vec<_>>();
         if fallback.is_empty() {
             fallback.push("本次发布未提供可提取的变更说明。".to_owned());
@@ -519,7 +645,7 @@ async fn summarize_project_with_ai(
         let bullets = item
             .summary_bullets
             .into_iter()
-            .map(|s| s.trim().to_owned())
+            .map(|s| sanitize_bullet_text(s.trim()))
             .filter(|s| !s.is_empty())
             .take(4)
             .collect::<Vec<_>>();
@@ -667,14 +793,16 @@ async fn polish_brief_markdown(
     .await
     .ok()?;
 
-    if !polished.contains("## 概览") || !polished.contains("## 项目更新") {
+    let sanitized = sanitize_markdown_links(&polished);
+
+    if !sanitized.contains("## 概览") || !sanitized.contains("## 项目更新") {
         return None;
     }
-    if !contains_all_release_links(&polished, release_ids) {
+    if !contains_all_release_links(&sanitized, release_ids) {
         return None;
     }
 
-    Some(polished)
+    Some(sanitized)
 }
 
 async fn build_brief_content(
@@ -728,7 +856,7 @@ async fn build_brief_content(
         ));
     }
 
-    let deterministic = build_brief_markdown(window, &repos);
+    let deterministic = sanitize_markdown_links(&build_brief_markdown(window, &repos));
 
     if state.config.ai.is_none() || releases.is_empty() {
         return Ok(deterministic);
