@@ -500,8 +500,52 @@ fn sanitize_bullet_text(raw: &str) -> String {
 }
 
 fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
+    fn push_link(
+        candidate: &str,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<String>,
+        max_links: usize,
+    ) -> bool {
+        if !is_allowed_github_url(candidate) {
+            return false;
+        }
+        let Ok(url) = Url::parse(candidate) else {
+            return false;
+        };
+        let normalized = url.to_string();
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+        out.len() >= max_links
+    }
+
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+
+    // Prefer explicit Markdown links first, e.g. [PR](https://github.com/...)
+    let mut i = 0usize;
+    while i < body.len() && out.len() < max_links {
+        let rest = &body[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+            let target = body[url_start..url_end].trim();
+            if push_link(target, &mut seen, &mut out, max_links) {
+                return out;
+            }
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        i += ch.len_utf8();
+    }
+
     for token in body.split_whitespace() {
         let candidate = token.trim_matches(|c: char| {
             matches!(
@@ -512,19 +556,8 @@ fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
         if !(candidate.starts_with("https://") || candidate.starts_with("http://")) {
             continue;
         }
-        if !is_allowed_github_url(candidate) {
-            continue;
-        }
-
-        let Ok(url) = Url::parse(candidate) else {
-            continue;
-        };
-        let normalized = url.to_string();
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-            if out.len() >= max_links {
-                break;
-            }
+        if push_link(candidate, &mut seen, &mut out, max_links) {
+            break;
         }
     }
     out
@@ -773,11 +806,7 @@ fn build_brief_markdown(window: &DailyWindow, repos: &[RepoRendered]) -> String 
 
             out.push_str(&format!(
                 "- [{}]({}) · {}{} · [GitHub Release]({})\n",
-                title,
-                internal_link,
-                release.published_at,
-                prerelease_mark,
-                release.html_url
+                title, internal_link, release.published_at, prerelease_mark, release.html_url
             ));
 
             for bullet in &release.bullets {
@@ -911,6 +940,7 @@ async fn build_brief_content(
           r.is_prerelease
         FROM releases r
         WHERE r.user_id = ?
+          AND r.is_draft = 0
           AND COALESCE(r.published_at, r.created_at, r.updated_at) >= ?
           AND COALESCE(r.published_at, r.created_at, r.updated_at) < ?
         ORDER BY
@@ -1082,6 +1112,16 @@ mod tests {
         );
         assert_eq!(links.len(), 1);
         assert!(links[0].contains("github.com/acme/app"));
+    }
+
+    #[test]
+    fn extract_github_links_parses_markdown_links() {
+        let links = extract_github_links(
+            "- [PR #12](https://github.com/acme/app/pull/12)\n- [Doc](https://example.com/ignore)",
+            5,
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], "https://github.com/acme/app/pull/12");
     }
 
     #[test]
