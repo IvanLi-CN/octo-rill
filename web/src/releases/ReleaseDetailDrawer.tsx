@@ -1,5 +1,5 @@
 import { ArrowUpRight, Languages, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiGet, apiPostJson } from "@/api";
 import { Markdown } from "@/components/Markdown";
@@ -32,11 +32,17 @@ export function ReleaseDetailDrawer(props: {
 	const [translating, setTranslating] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [translateError, setTranslateError] = useState<string | null>(null);
+	const detailRequestSeqRef = useRef(0);
+	const translateRequestSeqRef = useRef(0);
 
 	const open = Boolean(releaseId);
 
 	useEffect(() => {
+		translateRequestSeqRef.current += 1;
+		setTranslating(false);
+
 		if (!open || !releaseId) {
+			detailRequestSeqRef.current += 1;
 			setDetail(null);
 			setTranslated(null);
 			setError(null);
@@ -44,6 +50,9 @@ export function ReleaseDetailDrawer(props: {
 			setLanguage("zh");
 			return;
 		}
+
+		const requestSeq = detailRequestSeqRef.current + 1;
+		detailRequestSeqRef.current = requestSeq;
 
 		setLoadingDetail(true);
 		setDetail(null);
@@ -56,12 +65,15 @@ export function ReleaseDetailDrawer(props: {
 			`/api/releases/${encodeURIComponent(releaseId)}/detail`,
 		)
 			.then((res) => {
+				if (detailRequestSeqRef.current !== requestSeq) return;
 				setDetail(res);
 			})
 			.catch((err) => {
+				if (detailRequestSeqRef.current !== requestSeq) return;
 				setError(err instanceof Error ? err.message : String(err));
 			})
 			.finally(() => {
+				if (detailRequestSeqRef.current !== requestSeq) return;
 				setLoadingDetail(false);
 			});
 	}, [open, releaseId]);
@@ -70,6 +82,8 @@ export function ReleaseDetailDrawer(props: {
 		if (!open || !releaseId || !detail || language !== "zh") return;
 		if (translated || translating) return;
 
+		const requestSeq = translateRequestSeqRef.current + 1;
+		translateRequestSeqRef.current = requestSeq;
 		setTranslating(true);
 		setTranslateError(null);
 		void apiPostJson<ReleaseDetailTranslateResponse>(
@@ -79,16 +93,19 @@ export function ReleaseDetailDrawer(props: {
 			},
 		)
 			.then((res) => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslated(res);
 				if (res.status === "disabled") {
 					setLanguage("original");
 				}
 			})
 			.catch((err) => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslateError(err instanceof Error ? err.message : String(err));
 				setLanguage("original");
 			})
 			.finally(() => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslating(false);
 			});
 	}, [open, releaseId, detail, translated, translating, language]);
