@@ -685,9 +685,9 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
 
     let source = match r.kind.as_str() {
         "release" => format!(
-            // v=3: translation input is the excerpt shown in the UI (not a free-form summary of
+            // v=4: translation input is the excerpt shown in the UI (not a free-form summary of
             // the entire body) so "中文/原文" toggles show comparable content.
-            "v=3\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
             truncate_chars(excerpt.as_deref().unwrap_or(""), 2000),
@@ -730,6 +730,15 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
                             summary = t_summary;
                         }
                     } else {
+                        status = "missing".to_owned();
+                        title = None;
+                        summary = None;
+                    }
+                }
+            }
+            if status == "ready" {
+                if let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref()) {
+                    if !markdown_structure_preserved(src, s) {
                         status = "missing".to_owned();
                         title = None;
                         summary = None;
@@ -832,15 +841,41 @@ struct TranslationJson {
     summary_md: Option<String>,
 }
 
+fn strip_markdown_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((_, rest)) = rest.split_once('\n') else {
+        return trimmed;
+    };
+    let rest = rest.trim();
+    rest.strip_suffix("```").map(str::trim).unwrap_or(trimmed)
+}
+
+fn extract_json_object_span(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end < start {
+        return None;
+    }
+    Some(raw[start..=end].trim())
+}
+
 fn parse_translation_json(raw: &str) -> Option<TranslationJson> {
-    // Model output is supposed to be a JSON object, but some models occasionally return a JSON
-    // *string* containing the object. Accept both.
-    serde_json::from_str::<TranslationJson>(raw)
-        .ok()
-        .or_else(|| {
-            let inner = serde_json::from_str::<String>(raw).ok()?;
-            serde_json::from_str::<TranslationJson>(&inner).ok()
-        })
+    fn parse_direct(raw: &str) -> Option<TranslationJson> {
+        serde_json::from_str::<TranslationJson>(raw)
+            .ok()
+            .or_else(|| {
+                let inner = serde_json::from_str::<String>(raw).ok()?;
+                serde_json::from_str::<TranslationJson>(&inner).ok()
+            })
+    }
+
+    let trimmed = raw.trim();
+    parse_direct(trimmed)
+        .or_else(|| parse_direct(strip_markdown_code_fence(trimmed)))
+        .or_else(|| extract_json_object_span(trimmed).and_then(parse_direct))
 }
 
 fn extract_translation_from_json_blob(raw: &str) -> Option<(Option<String>, Option<String>)> {
@@ -862,6 +897,111 @@ fn extract_translation_from_json_blob(raw: &str) -> Option<(Option<String>, Opti
         None
     } else {
         Some((title, summary))
+    }
+}
+
+fn line_prefix_kind(line: &str) -> &'static str {
+    let t = line.trim();
+    if t.is_empty() {
+        return "blank";
+    }
+    if t.starts_with('#') {
+        return "heading";
+    }
+    if t.starts_with("> ") || t == ">" {
+        return "blockquote";
+    }
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+        return "ul";
+    }
+    if let Some((head, tail)) = t.split_once('.') {
+        if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) && tail.starts_with(' ') {
+            return "ol";
+        }
+    }
+    "plain"
+}
+
+fn markdown_structure_preserved(source: &str, translated: &str) -> bool {
+    let normalized_source = source.replace("\r\n", "\n");
+    let src_lines: Vec<&str> = normalized_source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let normalized_translated = translated.replace("\r\n", "\n");
+    let dst_lines: Vec<&str> = normalized_translated
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if src_lines.is_empty() {
+        return true;
+    }
+    if dst_lines.is_empty() || src_lines.len() != dst_lines.len() {
+        return false;
+    }
+
+    src_lines.iter().zip(dst_lines.iter()).all(|(s, d)| {
+        if line_prefix_kind(s) != line_prefix_kind(d) {
+            return false;
+        }
+
+        let src_bold_pairs = s.matches("**").count() / 2;
+        let dst_bold_pairs = d.matches("**").count() / 2;
+        if src_bold_pairs > 0 && dst_bold_pairs == 0 {
+            return false;
+        }
+
+        let src_code_pairs = s.matches('`').count() / 2;
+        let dst_code_pairs = d.matches('`').count() / 2;
+        if src_code_pairs > 0 && dst_code_pairs == 0 {
+            return false;
+        }
+        true
+    })
+}
+
+fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
+    let parsed = parse_translation_json(raw);
+    let out_title = parsed
+        .as_ref()
+        .and_then(|p| p.title_zh.as_deref())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let out_summary = parsed
+        .as_ref()
+        .and_then(|p| p.summary_md.as_deref())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| {
+            let s = raw.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_owned())
+            }
+        });
+    (out_title, out_summary)
+}
+
+fn release_translation_prompt(
+    repo: &str,
+    title: &str,
+    excerpt: &str,
+    previous_summary: Option<&str>,
+) -> String {
+    match previous_summary {
+        Some(previous_summary) => format!(
+            "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n上一次翻译（不合格，Markdown 结构丢失）：\n{previous_summary}\n\n请重新翻译并输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与 excerpt 完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。"
+        ),
+        None => format!(
+            "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与 excerpt 完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。"
+        ),
     }
 }
 
@@ -978,7 +1118,7 @@ pub async fn translate_release(
     };
 
     let source = format!(
-        "v=3\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+        "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
         row.full_name, title, excerpt
     );
     let source_hash = ai::sha256_hex(&source);
@@ -1049,7 +1189,12 @@ pub async fn translate_release(
                 t.starts_with('{') || t.starts_with("\"{")
             })
             .unwrap_or(false);
-        if !cache_is_json_blob {
+        let cache_preserves_structure = c
+            .summary
+            .as_deref()
+            .map(|s| markdown_structure_preserved(&excerpt, s))
+            .unwrap_or(true);
+        if !cache_is_json_blob && cache_preserves_structure {
             return Ok(Json(TranslateResponse {
                 lang: "zh-CN".to_owned(),
                 status: "ready".to_owned(),
@@ -1059,12 +1204,7 @@ pub async fn translate_release(
         }
     }
 
-    let prompt = format!(
-        "Repo: {repo}\nOriginal title: {title}\n\nRelease notes excerpt:\n{excerpt}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n要求：不要新增信息；不要总结/扩写；逐段翻译并严格保留 Markdown 标记与层级（如 #、-、1.、**、`）；不包含任何 URL。",
-        repo = row.full_name,
-        title = title,
-        excerpt = excerpt,
-    );
+    let prompt = release_translation_prompt(&row.full_name, &title, &excerpt, None);
 
     let raw = ai::chat_completion(
         state.as_ref(),
@@ -1075,27 +1215,30 @@ pub async fn translate_release(
     .await
     .map_err(ApiError::internal)?;
 
-    let parsed = parse_translation_json(&raw);
-    let out_title = parsed
-        .as_ref()
-        .and_then(|p| p.title_zh.as_deref())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_owned());
-    let out_summary = parsed
-        .as_ref()
-        .and_then(|p| p.summary_md.as_deref())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_owned())
-        .or_else(|| {
-            let s = raw.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s.to_owned())
+    let (mut out_title, mut out_summary) = extract_translation_fields(&raw);
+    if let Some(summary) = out_summary.as_deref() {
+        if !markdown_structure_preserved(&excerpt, summary) {
+            let retry_prompt =
+                release_translation_prompt(&row.full_name, &title, &excerpt, Some(summary));
+            if let Ok(retry_raw) = ai::chat_completion(
+                state.as_ref(),
+                "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
+                &retry_prompt,
+                900,
+            )
+            .await
+            {
+                let (retry_title, retry_summary) = extract_translation_fields(&retry_raw);
+                if retry_summary
+                    .as_deref()
+                    .is_some_and(|s| markdown_structure_preserved(&excerpt, s))
+                {
+                    out_title = retry_title.or(out_title);
+                    out_summary = retry_summary;
+                }
             }
-        });
+        }
+    }
 
     upsert_translation(
         state.as_ref(),
@@ -1328,7 +1471,7 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 
 #[cfg(test)]
 mod tests {
-    use super::release_excerpt;
+    use super::{markdown_structure_preserved, parse_translation_json, release_excerpt};
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {
@@ -1358,5 +1501,22 @@ echo should_not_be_in_excerpt
         let excerpt = release_excerpt(Some(body)).expect("excerpt");
         assert!(excerpt.contains("First line\nSecond line"));
         assert!(excerpt.contains("\n\nThird line"));
+    }
+
+    #[test]
+    fn parse_translation_json_accepts_fenced_json() {
+        let raw = "```json\n{\"title_zh\":\"标题\",\"summary_md\":\"- **加粗**\\n- `code`\"}\n```";
+        let parsed = parse_translation_json(raw).expect("parse translation json");
+        assert_eq!(parsed.title_zh.as_deref(), Some("标题"));
+        assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**\n- `code`"));
+    }
+
+    #[test]
+    fn markdown_structure_requires_inline_markers() {
+        let source = "- **Nightly** build from `main`\n- Keep **bold** marker";
+        let translated_missing = "- 夜间构建来自 main\n- 请保留强调";
+        let translated_ok = "- **夜间**构建来自 `main`\n- 请保留 **强调** 标记";
+        assert!(!markdown_structure_preserved(source, translated_missing));
+        assert!(markdown_structure_preserved(source, translated_ok));
     }
 }
