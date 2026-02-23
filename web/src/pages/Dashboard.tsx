@@ -86,6 +86,10 @@ function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+function sessionExpiredHint() {
+	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
+}
+
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 
@@ -241,6 +245,13 @@ export function Dashboard(props: { me: MeResponse }) {
 				})
 				.catch((err) => {
 					if (err instanceof ApiError) {
+						if (err.status === 401) {
+							setReactionErrorByKey((prev) => ({
+								...prev,
+								[key]: sessionExpiredHint(),
+							}));
+							return;
+						}
 						if (err.code === "pat_required" || err.code === "pat_invalid") {
 							setReactionTokenConfigured(false);
 							setPendingReaction({ item, content });
@@ -318,6 +329,11 @@ export function Dashboard(props: { me: MeResponse }) {
 				})
 				.catch((err) => {
 					if (seq !== patCheckSeqRef.current) return;
+					if (err instanceof ApiError && err.status === 401) {
+						setPatCheckState("invalid");
+						setPatCheckMessage(sessionExpiredHint());
+						return;
+					}
 					const message = err instanceof Error ? err.message : String(err);
 					setPatCheckState("invalid");
 					setPatCheckMessage(message);
@@ -350,6 +366,11 @@ export function Dashboard(props: { me: MeResponse }) {
 				}
 			})
 			.catch((err) => {
+				if (err instanceof ApiError && err.status === 401) {
+					setPatCheckState("invalid");
+					setPatCheckMessage(sessionExpiredHint());
+					return;
+				}
 				const message = err instanceof Error ? err.message : String(err);
 				setPatCheckState("invalid");
 				setPatCheckMessage(message);
