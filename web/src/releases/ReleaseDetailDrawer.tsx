@@ -1,4 +1,4 @@
-import { ArrowUpRight, Languages, X } from "lucide-react";
+import { ArrowUpRight, Languages, LoaderCircle, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiGet, apiPostJson } from "@/api";
@@ -18,6 +18,17 @@ function formatIsoShort(iso: string | null) {
 	const noZ = iso.replace("Z", "");
 	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
 	return noFrac.replace("T", " ");
+}
+
+function LoadingSkeleton(props: { className: string }) {
+	return (
+		<div
+			className={cn(
+				"bg-muted/70 h-3 animate-pulse rounded-md",
+				props.className,
+			)}
+		/>
+	);
 }
 
 export function ReleaseDetailDrawer(props: {
@@ -158,7 +169,7 @@ export function ReleaseDetailDrawer(props: {
 
 	const displayTitle = useMemo(() => {
 		if (language === "zh" && translated?.title?.trim()) return translated.title;
-		return detail?.title ?? "(no title)";
+		return detail?.title?.trim() || "未命名 release";
 	}, [detail, translated, language]);
 
 	const bodyContent = useMemo(() => {
@@ -168,6 +179,7 @@ export function ReleaseDetailDrawer(props: {
 		}
 		return detail.body;
 	}, [detail, translated, language]);
+	const loadingInitialDetail = loadingDetail && !detail && !error;
 
 	if (!rendered) return null;
 
@@ -199,44 +211,62 @@ export function ReleaseDetailDrawer(props: {
 				<header className="border-b p-4">
 					<div className="flex items-start justify-between gap-3">
 						<div className="min-w-0">
-							<p className="text-muted-foreground font-mono text-xs">
-								{detail?.full_name ?? "Loading…"} ·{" "}
-								{detail ? formatIsoShort(detail.published_at) : ""}
-								{detail?.is_prerelease ? " · 预发布" : ""}
-							</p>
-							<h2 className="mt-1 text-base font-semibold tracking-tight">
-								{displayTitle}
-							</h2>
+							{loadingInitialDetail ? (
+								<div className="space-y-2 py-1">
+									<LoadingSkeleton className="w-52" />
+									<LoadingSkeleton className="h-5 w-80 max-w-[70vw]" />
+								</div>
+							) : (
+								<>
+									<p className="text-muted-foreground font-mono text-xs">
+										{detail?.full_name ?? "加载失败"} ·{" "}
+										{detail ? formatIsoShort(detail.published_at) : ""}
+										{detail?.is_prerelease ? " · 预发布" : ""}
+									</p>
+									<h2 className="mt-1 text-base font-semibold tracking-tight">
+										{displayTitle}
+									</h2>
+								</>
+							)}
 						</div>
 						<div className="flex shrink-0 items-center gap-2">
-							<Button
-								variant="ghost"
-								size="sm"
-								className="font-mono text-xs"
-								disabled={!detail || translated?.status === "disabled"}
-								onClick={() =>
-									setLanguage((prev) => (prev === "zh" ? "original" : "zh"))
-								}
-							>
-								<Languages className="size-4" />
-								{language === "zh" ? "原文" : "中文"}
-							</Button>
-							<Button
-								asChild
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-								disabled={!detail}
-							>
-								<a
-									href={detail?.html_url ?? "#"}
-									target="_blank"
-									rel="noreferrer"
-								>
-									<ArrowUpRight className="size-4" />
-									GitHub
-								</a>
-							</Button>
+							{loadingInitialDetail ? (
+								<div className="text-muted-foreground bg-muted/60 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 font-mono text-xs">
+									<LoaderCircle className="size-3.5 animate-spin" />
+									正在加载
+								</div>
+							) : (
+								<>
+									<Button
+										variant="ghost"
+										size="sm"
+										className="font-mono text-xs"
+										disabled={!detail || translated?.status === "disabled"}
+										onClick={() =>
+											setLanguage((prev) => (prev === "zh" ? "original" : "zh"))
+										}
+									>
+										<Languages className="size-4" />
+										{language === "zh" ? "原文" : "中文"}
+									</Button>
+									<Button
+										asChild
+										variant="outline"
+										size="sm"
+										className="font-mono text-xs"
+										disabled={!detail}
+									>
+										<a
+											href={detail?.html_url ?? "#"}
+											target="_blank"
+											rel="noreferrer"
+										>
+											<ArrowUpRight className="size-4" />
+											GitHub
+										</a>
+									</Button>
+								</>
+							)}
 							<Button
 								variant="ghost"
 								size="icon"
@@ -250,8 +280,18 @@ export function ReleaseDetailDrawer(props: {
 				</header>
 
 				<div className="min-h-0 flex-1 overflow-auto p-4">
-					{loadingDetail ? (
-						<p className="text-muted-foreground text-sm">加载中…</p>
+					{loadingInitialDetail ? (
+						<div className="bg-muted/10 space-y-3 rounded-lg border p-4">
+							<div className="text-muted-foreground mb-2 inline-flex items-center gap-2 text-xs">
+								<LoaderCircle className="size-4 animate-spin" />
+								正在拉取 Release 详情
+							</div>
+							<LoadingSkeleton className="w-44" />
+							<LoadingSkeleton className="w-full" />
+							<LoadingSkeleton className="w-11/12" />
+							<LoadingSkeleton className="w-10/12" />
+							<LoadingSkeleton className="w-1/2" />
+						</div>
 					) : null}
 
 					{error ? <p className="text-destructive text-sm">{error}</p> : null}
@@ -266,11 +306,14 @@ export function ReleaseDetailDrawer(props: {
 						<p className="text-destructive mb-3 text-xs">{translateError}</p>
 					) : null}
 
-					{translating && language === "zh" ? (
-						<p className="text-muted-foreground mb-3 text-xs">翻译中…</p>
+					{translating && language === "zh" && detail ? (
+						<div className="text-muted-foreground bg-muted/60 mb-3 inline-flex items-center gap-2 rounded-md border px-3 py-2 text-xs">
+							<LoaderCircle className="size-3.5 animate-spin" />
+							正在生成中文完整翻译，暂时显示当前可用内容。
+						</div>
 					) : null}
 
-					{detail ? (
+					{detail && !loadingInitialDetail ? (
 						<div className="bg-muted/10 rounded-lg border p-4">
 							<Markdown content={bodyContent} />
 						</div>
