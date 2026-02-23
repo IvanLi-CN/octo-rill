@@ -91,7 +91,7 @@ function makeMockFeed(): FeedItem[] {
 					rocket: false,
 					eyes: false,
 				},
-				status: "reauth_required",
+				status: "ready",
 			},
 		},
 	];
@@ -230,6 +230,7 @@ function DashboardPreview() {
 							}
 							onTranslateNow={() => {}}
 							reactionBusyKeys={reactionBusyKeys}
+							reactionErrorByKey={{}}
 							onToggleReaction={() => {}}
 							onSyncReleases={() => {}}
 						/>

@@ -228,22 +228,6 @@ export function FeedItemCard(props: {
 							})
 						: null}
 
-					{reactions.status === "reauth_required" ? (
-						<>
-							<span className="text-muted-foreground font-mono text-[11px]">
-								反馈表情需要重新登录（repo 权限）
-							</span>
-							<Button
-								asChild
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-							>
-								<a href="/auth/github/login">重新登录</a>
-							</Button>
-						</>
-					) : null}
-
 					{reactions.status === "sync_required" ? (
 						<>
 							<span className="text-muted-foreground font-mono text-[11px]">
