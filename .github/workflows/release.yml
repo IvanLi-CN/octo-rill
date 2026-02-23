@@ -1,0 +1,192 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+  issues: read
+  pull-requests: read
+
+env:
+  REGISTRY: ghcr.io
+  PLATFORMS: linux/amd64
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_branch }}
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event.workflow_run.conclusion == 'success'
+    outputs:
+      should_release: ${{ steps.intent.outputs.should_release }}
+      bump_level: ${{ steps.intent.outputs.bump_level }}
+      channel: ${{ steps.intent.outputs.channel }}
+      prerelease: ${{ steps.intent.outputs.prerelease }}
+      release_intent_label: ${{ steps.intent.outputs.release_intent_label }}
+      pr_number: ${{ steps.intent.outputs.pr_number }}
+      pr_url: ${{ steps.intent.outputs.pr_url }}
+      reason: ${{ steps.intent.outputs.reason }}
+      app_effective_version: ${{ steps.export.outputs.app_effective_version }}
+      app_release_tag: ${{ steps.export.outputs.app_release_tag }}
+      app_is_prerelease: ${{ steps.export.outputs.app_is_prerelease }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Determine release intent
+        id: intent
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: bash ./.github/scripts/release-intent.sh
+
+      - name: Compute effective version
+        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        shell: bash
+        env:
+          BUMP_LEVEL: ${{ steps.intent.outputs.bump_level }}
+          RELEASE_CHANNEL: ${{ steps.intent.outputs.channel }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: bash ./.github/scripts/compute-version.sh
+
+      - name: Export release metadata
+        id: export
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "app_effective_version=${APP_EFFECTIVE_VERSION:-}" >> "$GITHUB_OUTPUT"
+          echo "app_release_tag=${APP_RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
+          echo "app_is_prerelease=${APP_IS_PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Git user
+        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push tag (if missing)
+        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${APP_RELEASE_TAG}"
+          echo "target tag: ${tag}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists. Skipping push."
+          else
+            git tag -a "${tag}" -m "${tag}"
+            git push origin "${tag}"
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.export.outputs.app_release_tag }}
+          name: ${{ steps.export.outputs.app_release_tag }}
+          prerelease: ${{ steps.intent.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          pr_url="${{ steps.intent.outputs.pr_url }}"
+          if [[ -z "${pr_url}" ]]; then
+            pr_url="n/a"
+          fi
+          {
+            echo "### Release decision"
+            echo "- should_release: ${{ steps.intent.outputs.should_release }}"
+            echo "- reason: ${{ steps.intent.outputs.reason }}"
+            echo "- release_intent_label: ${{ steps.intent.outputs.release_intent_label }}"
+            echo "- channel: ${{ steps.intent.outputs.channel }}"
+            echo "- prerelease: ${{ steps.intent.outputs.prerelease }}"
+            echo "- app_release_tag: ${APP_RELEASE_TAG:-<none>}"
+            echo "- pr: ${pr_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  docker-release:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [prepare]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
+      APP_RELEASE_TAG: ${{ needs.prepare.outputs.app_release_tag }}
+      APP_IS_PRERELEASE: ${{ needs.prepare.outputs.app_is_prerelease }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute lowercase image name
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          lower="${GITHUB_REPOSITORY,,}"
+          image="${{ env.REGISTRY }}/${lower}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute Docker tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${{ steps.image.outputs.image }}"
+          if [[ "${APP_IS_PRERELEASE}" == "true" ]]; then
+            tags="${image}:${APP_RELEASE_TAG}"
+          else
+            tags="${image}:${APP_RELEASE_TAG}\n${image}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            printf "%b\n" "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            APP_EFFECTIVE_VERSION=${{ env.APP_EFFECTIVE_VERSION }}
+          cache-from: type=registry,ref=${{ steps.image.outputs.image }}:buildcache
+          cache-to: type=registry,ref=${{ steps.image.outputs.image }}:buildcache,mode=max
