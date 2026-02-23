@@ -7,6 +7,7 @@ import type { FeedItem } from "@/feed/types";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
+import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
@@ -183,6 +184,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					onSyncInbox={onSyncInbox}
 				/>
 			}
+			footer={<AppMetaFooter />}
 		>
 			{bootError ? (
 				<p className="text-destructive mb-4 text-sm">{bootError}</p>
