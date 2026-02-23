@@ -72,7 +72,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     spawn_daily_brief_scheduler(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
+    let session_cookie_name = build_session_cookie_name(&config);
     let session_layer = SessionManagerLayer::new(session_store)
+        .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
         .with_same_site(SameSite::Lax);
 
@@ -272,6 +274,24 @@ fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
             }
         }
     });
+}
+
+fn build_session_cookie_name(config: &AppConfig) -> String {
+    let host = config.public_base_url.host_str().unwrap_or("localhost");
+    let port = config
+        .public_base_url
+        .port_or_known_default()
+        .unwrap_or(config.bind_addr.port());
+    let raw = format!("octo_rill_sid_{host}_{port}");
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
 }
 
 async fn run_startup_brief_backfill(state: &AppState, at: chrono::NaiveTime) {
