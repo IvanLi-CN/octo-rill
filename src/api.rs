@@ -1091,19 +1091,40 @@ fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
     if input.is_empty() {
         return vec![String::new()];
     }
+    if max_chars == 0 {
+        return vec![input.replace("\r\n", "\n")];
+    }
 
+    let normalized = input.replace("\r\n", "\n");
     let mut chunks = Vec::new();
     let mut current = String::new();
-    for line in input.replace("\r\n", "\n").lines() {
-        let candidate_len = current.chars().count() + line.chars().count() + 1;
-        if !current.is_empty() && candidate_len > max_chars {
+    let mut current_len = 0usize;
+
+    for segment in normalized.split_inclusive('\n') {
+        let seg_len = segment.chars().count();
+
+        if seg_len > max_chars {
+            if !current.is_empty() {
+                chunks.push(current);
+                current = String::new();
+                current_len = 0;
+            }
+
+            let chars: Vec<char> = segment.chars().collect();
+            for part in chars.chunks(max_chars) {
+                chunks.push(part.iter().collect());
+            }
+            continue;
+        }
+
+        if !current.is_empty() && current_len + seg_len > max_chars {
             chunks.push(current);
             current = String::new();
+            current_len = 0;
         }
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
+
+        current.push_str(segment);
+        current_len += seg_len;
     }
 
     if !current.is_empty() {
@@ -1613,7 +1634,7 @@ pub async fn translate_release_detail(
             translated_chunks.push(translated);
         }
 
-        translated_chunks.join("\n\n")
+        translated_chunks.join("")
     };
 
     upsert_translation(
@@ -1904,9 +1925,17 @@ echo should_not_be_in_excerpt
         let md = "line1\nline2\nline3\nline4";
         let chunks = split_markdown_chunks(md, 12);
         assert!(chunks.len() >= 2);
-        let rebuilt = chunks.join("\n");
-        assert!(rebuilt.contains("line1"));
-        assert!(rebuilt.contains("line4"));
+        let rebuilt = chunks.join("");
+        assert_eq!(rebuilt, md);
+    }
+
+    #[test]
+    fn split_markdown_chunks_splits_overlong_single_line() {
+        let md = "a".repeat(25);
+        let chunks = split_markdown_chunks(&md, 8);
+        assert!(chunks.len() >= 4);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 8));
+        assert_eq!(chunks.join(""), md);
     }
 
     #[test]
