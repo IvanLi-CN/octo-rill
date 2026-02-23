@@ -1535,32 +1535,36 @@ pub async fn translate_release_detail(
         }
     });
 
-    let chunks = split_markdown_chunks(&original_body, 5500);
-    let total_chunks = chunks.len();
-    let mut translated_chunks = Vec::with_capacity(total_chunks);
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let prompt = format!(
-            "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
-            repo = repo_full_name,
-            title = original_title,
-            current = idx + 1,
-            total = total_chunks,
-            chunk = chunk,
-        );
+    let body_markdown = if original_body.trim().is_empty() {
+        String::new()
+    } else {
+        let chunks = split_markdown_chunks(&original_body, 5500);
+        let total_chunks = chunks.len();
+        let mut translated_chunks = Vec::with_capacity(total_chunks);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let prompt = format!(
+                "Repo: {repo}\nTitle: {title}\nChunk: {current}/{total}\n\nRelease notes chunk (Markdown):\n{chunk}\n\n请把这段 GitHub Release notes 翻译成中文 Markdown，要求：\n1) 保留原有 Markdown 结构（标题/列表/表格/引用/代码块）；\n2) 保留链接 URL 与代码；\n3) 不新增、不删减信息；\n4) 只输出翻译后的 Markdown，不要解释。",
+                repo = repo_full_name,
+                title = original_title,
+                current = idx + 1,
+                total = total_chunks,
+                chunk = chunk,
+            );
 
-        let translated = ai::chat_completion(
-            state.as_ref(),
-            "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
-            &prompt,
-            1600,
-        )
-        .await
-        .map_err(ApiError::internal)?;
+            let translated = ai::chat_completion(
+                state.as_ref(),
+                "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
+                &prompt,
+                1600,
+            )
+            .await
+            .map_err(ApiError::internal)?;
 
-        translated_chunks.push(translated.trim().to_owned());
-    }
+            translated_chunks.push(translated.trim().to_owned());
+        }
 
-    let body_markdown = translated_chunks.join("\n\n");
+        translated_chunks.join("\n\n")
+    };
 
     upsert_translation(
         state.as_ref(),
