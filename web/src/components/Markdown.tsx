@@ -6,10 +6,12 @@ function parseInternalReleaseLink(href: string | undefined): string | null {
 	if (!href) return null;
 	try {
 		const url = new URL(href, window.location.origin);
+		if (url.origin !== window.location.origin) return null;
+		if (url.pathname !== "/") return null;
 		const release = url.searchParams.get("release");
 		const tab = url.searchParams.get("tab");
 		if (!release || !/^\d+$/.test(release)) return null;
-		if (tab && tab !== "briefs") return null;
+		if (tab !== "briefs") return null;
 		return release;
 	} catch {
 		return null;
