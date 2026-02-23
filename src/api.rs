@@ -2124,6 +2124,7 @@ fn parse_translation_json(raw: &str) -> Option<TranslationJson> {
         Some(TranslationJson {
             title_zh: parsed.title_zh,
             summary_md: parsed.summary_md.map(|s| s.replace("\\n", "\n")),
+            body_md: parsed.body_md.map(|s| s.replace("\\n", "\n")),
         })
     }
 
@@ -3010,9 +3011,8 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedRow, GraphQlError, LiveReleaseReactions, ReleaseReactionCounts, ReleaseReactionViewer,
-        github_graphql_errors_to_api_error, github_graphql_http_error, has_repo_scope,
-        markdown_structure_preserved, parse_repo_full_name_from_release_url,
+        FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
+        has_repo_scope, markdown_structure_preserved, parse_repo_full_name_from_release_url,
         parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
         release_reactions_status, resolve_release_full_name, split_markdown_chunks,
     };
