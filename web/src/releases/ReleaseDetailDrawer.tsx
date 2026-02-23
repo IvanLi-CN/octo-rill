@@ -4,12 +4,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, apiPostJson } from "@/api";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type {
 	ReleaseDetail,
 	ReleaseDetailTranslateResponse,
 } from "@/releases/types";
 
 type LanguageMode = "zh" | "original";
+const DRAWER_ANIMATION_MS = 220;
 
 function formatIsoShort(iso: string | null) {
 	if (!iso) return "unknown time";
@@ -34,8 +36,42 @@ export function ReleaseDetailDrawer(props: {
 	const [translateError, setTranslateError] = useState<string | null>(null);
 	const detailRequestSeqRef = useRef(0);
 	const translateRequestSeqRef = useRef(0);
+	const closeTimerRef = useRef<number | null>(null);
 
 	const open = Boolean(releaseId);
+	const [rendered, setRendered] = useState(open);
+	const [visible, setVisible] = useState(open);
+
+	useEffect(() => {
+		if (open) {
+			if (closeTimerRef.current !== null) {
+				window.clearTimeout(closeTimerRef.current);
+				closeTimerRef.current = null;
+			}
+			setRendered(true);
+			const rafId = window.requestAnimationFrame(() => setVisible(true));
+			return () => window.cancelAnimationFrame(rafId);
+		}
+
+		setVisible(false);
+		if (!rendered) return;
+		if (closeTimerRef.current !== null) {
+			window.clearTimeout(closeTimerRef.current);
+		}
+		closeTimerRef.current = window.setTimeout(() => {
+			setRendered(false);
+			closeTimerRef.current = null;
+		}, DRAWER_ANIMATION_MS);
+	}, [open, rendered]);
+
+	useEffect(
+		() => () => {
+			if (closeTimerRef.current !== null) {
+				window.clearTimeout(closeTimerRef.current);
+			}
+		},
+		[],
+	);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
@@ -43,6 +79,7 @@ export function ReleaseDetailDrawer(props: {
 
 		if (!open || !releaseId) {
 			detailRequestSeqRef.current += 1;
+			if (!open && rendered) return;
 			setDetail(null);
 			setTranslated(null);
 			setError(null);
@@ -76,7 +113,7 @@ export function ReleaseDetailDrawer(props: {
 				if (detailRequestSeqRef.current !== requestSeq) return;
 				setLoadingDetail(false);
 			});
-	}, [open, releaseId]);
+	}, [open, releaseId, rendered]);
 
 	useEffect(() => {
 		if (!open || !releaseId || !detail || language !== "zh") return;
@@ -132,18 +169,33 @@ export function ReleaseDetailDrawer(props: {
 		return detail.body;
 	}, [detail, translated, language]);
 
-	if (!open) return null;
+	if (!rendered) return null;
 
 	return (
-		<div className="fixed inset-0 z-50 flex justify-end">
+		<div
+			className={cn(
+				"fixed inset-0 z-50 flex justify-end",
+				open ? "pointer-events-auto" : "pointer-events-none",
+			)}
+		>
 			<button
 				type="button"
-				className="bg-background/40 absolute inset-0 backdrop-blur-[1px]"
+				className={cn(
+					"bg-background/40 absolute inset-0 backdrop-blur-[1px] transition-opacity duration-200",
+					visible ? "opacity-100" : "opacity-0",
+				)}
 				onClick={onClose}
+				disabled={!open}
 				aria-label="Close release detail"
 			/>
 
-			<section className="bg-card relative z-10 flex h-full w-full max-w-3xl flex-col border-l shadow-2xl">
+			<section
+				className={cn(
+					"bg-card relative z-10 flex h-full w-full max-w-3xl flex-col border-l shadow-2xl transition-all duration-200 ease-out",
+					visible ? "translate-x-0 opacity-100" : "translate-x-8 opacity-0",
+				)}
+				style={{ transitionDuration: `${DRAWER_ANIMATION_MS}ms` }}
+			>
 				<header className="border-b p-4">
 					<div className="flex items-start justify-between gap-3">
 						<div className="min-w-0">
