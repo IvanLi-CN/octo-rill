@@ -899,9 +899,12 @@ fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
     }
 }
 
-fn release_reactions_status(r: &FeedRow, can_react: bool) -> &'static str {
+fn release_reactions_status(r: &FeedRow, can_react: bool, live_ready: bool) -> &'static str {
     if !can_react {
         "reauth_required"
+    } else if !live_ready {
+        // Avoid exposing toggles when viewer reaction state is stale/unknown.
+        "sync_required"
     } else if r
         .release_node_id
         .as_deref()
@@ -1147,6 +1150,7 @@ fn feed_item_from_row(
     r: FeedRow,
     ai_enabled: bool,
     can_react: bool,
+    live_ready: bool,
     live_reactions: Option<&LiveReleaseReactions>,
 ) -> FeedItem {
     let excerpt = match r.kind.as_str() {
@@ -1232,7 +1236,7 @@ fn feed_item_from_row(
         }
     };
 
-    let status = release_reactions_status(&r, can_react);
+    let status = release_reactions_status(&r, can_react, live_ready);
     let mut counts = release_counts_from_row(&r);
     let mut viewer = ReleaseReactionViewer::default();
     if let Some(live) = live_reactions {
@@ -1302,6 +1306,7 @@ pub async fn list_feed(
     let mut live_reactions_by_node =
         std::collections::HashMap::<String, LiveReleaseReactions>::new();
     let mut effective_can_react = can_react;
+    let mut live_reactions_ready = true;
     if can_react && !node_ids.is_empty() {
         let access_token = state
             .load_access_token(user_id)
@@ -1323,6 +1328,7 @@ pub async fn list_feed(
                 live_reactions_by_node = live;
             }
             Err(err) => {
+                live_reactions_ready = false;
                 if err.code() == "reauth_required" {
                     effective_can_react = false;
                 }
@@ -1341,7 +1347,13 @@ pub async fn list_feed(
             .release_node_id
             .as_deref()
             .and_then(|id| live_reactions_by_node.get(id));
-        items.push(feed_item_from_row(r, ai_enabled, effective_can_react, live));
+        items.push(feed_item_from_row(
+            r,
+            ai_enabled,
+            effective_can_react,
+            live_reactions_ready,
+            live,
+        ));
     }
 
     // If we returned fewer than limit, there's no next page.
