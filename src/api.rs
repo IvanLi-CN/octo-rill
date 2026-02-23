@@ -1685,8 +1685,9 @@ pub async fn list_feed(
 
     let mut live_reactions_by_node =
         std::collections::HashMap::<String, LiveReleaseReactions>::new();
+    let reaction_pat = load_reaction_pat_token(state.as_ref(), user_id).await.ok().flatten();
     if !node_ids.is_empty()
-        && let Some(pat) = load_reaction_pat_token(state.as_ref(), user_id).await?
+        && let Some(pat) = reaction_pat
         && let Ok(live) = fetch_live_release_reactions(state.as_ref(), &pat, &node_ids).await
     {
         for (node_id, reaction) in &live {
@@ -2002,9 +2003,9 @@ pub async fn toggle_release_reaction(
         };
     let Some(current_reactions) = current.get(node_id) else {
         return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "sync_required",
-            "release reaction data is stale; sync releases first",
+            StatusCode::FORBIDDEN,
+            "pat_forbidden",
+            "PAT cannot access this release repository; check token repository access",
         ));
     };
     let currently_reacted = match content {
