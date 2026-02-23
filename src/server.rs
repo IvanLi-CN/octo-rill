@@ -282,12 +282,22 @@ async fn run_startup_brief_backfill(state: &AppState, at: chrono::NaiveTime) {
     let key_dates = ai::recent_key_dates(at, chrono::Local::now(), 7);
 
     for user_id in users {
+        if let Err(err) = sync::sync_starred(state, user_id).await {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "startup brief backfill: sync starred failed; skip user"
+            );
+            continue;
+        }
+
         if let Err(err) = sync::sync_releases(state, user_id).await {
             tracing::warn!(
                 ?err,
                 user_id,
-                "startup brief backfill: sync releases failed; continue with local data"
+                "startup brief backfill: sync releases failed; skip user"
             );
+            continue;
         }
 
         // Backfill oldest to newest so the latest day is generated last.
