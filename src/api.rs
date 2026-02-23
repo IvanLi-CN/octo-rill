@@ -1066,7 +1066,18 @@ async fn fetch_live_release_reactions(
         .json(&payload)
         .send()
         .await
-        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "reauth_required",
+            "repo scope required; re-login via GitHub OAuth",
+        ));
+    }
+
+    let resp = resp
         .error_for_status()
         .map_err(ApiError::internal)?
         .json::<GraphQlResponse<GraphQlReleaseReactionsData>>()
@@ -1290,26 +1301,32 @@ pub async fn list_feed(
 
     let mut live_reactions_by_node =
         std::collections::HashMap::<String, LiveReleaseReactions>::new();
+    let mut effective_can_react = can_react;
     if can_react && !node_ids.is_empty() {
         let access_token = state
             .load_access_token(user_id)
             .await
             .map_err(ApiError::internal)?;
-        if let Ok(live) =
-            fetch_live_release_reactions(state.as_ref(), &access_token, &node_ids).await
-        {
-            for (node_id, reaction) in &live {
-                if let Some(release_id) = release_by_node.get(node_id) {
-                    let _ = persist_release_reaction_counts(
-                        state.as_ref(),
-                        user_id,
-                        *release_id,
-                        &reaction.counts,
-                    )
-                    .await;
+        match fetch_live_release_reactions(state.as_ref(), &access_token, &node_ids).await {
+            Ok(live) => {
+                for (node_id, reaction) in &live {
+                    if let Some(release_id) = release_by_node.get(node_id) {
+                        let _ = persist_release_reaction_counts(
+                            state.as_ref(),
+                            user_id,
+                            *release_id,
+                            &reaction.counts,
+                        )
+                        .await;
+                    }
+                }
+                live_reactions_by_node = live;
+            }
+            Err(err) => {
+                if err.code() == "reauth_required" {
+                    effective_can_react = false;
                 }
             }
-            live_reactions_by_node = live;
         }
     }
 
@@ -1324,7 +1341,7 @@ pub async fn list_feed(
             .release_node_id
             .as_deref()
             .and_then(|id| live_reactions_by_node.get(id));
-        items.push(feed_item_from_row(r, ai_enabled, can_react, live));
+        items.push(feed_item_from_row(r, ai_enabled, effective_can_react, live));
     }
 
     // If we returned fewer than limit, there's no next page.
