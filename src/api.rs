@@ -448,6 +448,320 @@ pub async fn generate_brief(
     }))
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReactionTokenCheckSummary {
+    state: String, // idle | valid | invalid | error
+    message: Option<String>,
+    checked_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReactionTokenStatusResponse {
+    configured: bool,
+    masked_token: Option<String>,
+    check: ReactionTokenCheckSummary,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReactionTokenRequest {
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReactionTokenCheckResponse {
+    state: String, // valid | invalid
+    message: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReactionTokenStatusRow {
+    masked_token: String,
+    last_check_state: String,
+    last_check_message: Option<String>,
+    last_checked_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReactionTokenSecretRow {
+    token_ciphertext: Vec<u8>,
+    token_nonce: Vec<u8>,
+}
+
+fn mask_pat_token(token: &str) -> String {
+    let trimmed = token.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= 8 {
+        return "********".to_owned();
+    }
+    let head = chars[..4].iter().collect::<String>();
+    let tail = chars[chars.len().saturating_sub(4)..]
+        .iter()
+        .collect::<String>();
+    format!("{head}...{tail}")
+}
+
+fn has_public_repo_scope(scopes: &str) -> bool {
+    scopes
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .any(|scope| scope == "public_repo")
+}
+
+async fn check_reaction_pat_with_github(
+    state: &AppState,
+    token: &str,
+) -> Result<ReactionTokenCheckResponse, ApiError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token is required"));
+    }
+
+    let resp = state
+        .http
+        .get("https://api.github.com/user")
+        .bearer_auth(token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = resp.text().await.map_err(ApiError::internal)?;
+
+    if status == reqwest::StatusCode::OK {
+        let scopes = headers
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !scopes.is_empty() && !has_repo_scope(scopes) && !has_public_repo_scope(scopes) {
+            return Ok(ReactionTokenCheckResponse {
+                state: "invalid".to_owned(),
+                message: "classic PAT needs public_repo (public) or repo (private)".to_owned(),
+            });
+        }
+        return Ok(ReactionTokenCheckResponse {
+            state: "valid".to_owned(),
+            message: "token is valid".to_owned(),
+        });
+    }
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(ReactionTokenCheckResponse {
+            state: "invalid".to_owned(),
+            message: "token is invalid or expired".to_owned(),
+        });
+    }
+
+    if status == reqwest::StatusCode::FORBIDDEN {
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        if remaining == Some("0") || is_rate_limit_message(&body) {
+            return Err(github_rate_limited_error());
+        }
+        return Ok(ReactionTokenCheckResponse {
+            state: "invalid".to_owned(),
+            message: "token cannot access GitHub user API; check PAT permissions".to_owned(),
+        });
+    }
+
+    Err(ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "github_unavailable",
+        format!("github check failed with status {status}"),
+    ))
+}
+
+async fn load_reaction_pat_status_row(
+    state: &AppState,
+    user_id: i64,
+) -> Result<Option<ReactionTokenStatusRow>, ApiError> {
+    sqlx::query_as::<_, ReactionTokenStatusRow>(
+        r#"
+        SELECT masked_token, last_check_state, last_check_message, last_checked_at
+        FROM reaction_pat_tokens
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_reaction_pat_token(
+    state: &AppState,
+    user_id: i64,
+) -> Result<Option<String>, ApiError> {
+    let row = sqlx::query_as::<_, ReactionTokenSecretRow>(
+        r#"
+        SELECT token_ciphertext, token_nonce
+        FROM reaction_pat_tokens
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    row.map(|r| {
+        state
+            .encryption_key
+            .decrypt_str(&r.token_ciphertext, &r.token_nonce)
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "pat_invalid",
+                    "PAT is invalid or expired",
+                )
+            })
+    })
+    .transpose()
+}
+
+async fn persist_reaction_pat_check_result(
+    state: &AppState,
+    user_id: i64,
+    check_state: &str,
+    check_message: Option<&str>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE reaction_pat_tokens
+        SET last_check_state = ?,
+            last_check_message = ?,
+            last_checked_at = ?,
+            updated_at = ?
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(check_state)
+    .bind(check_message)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+pub async fn reaction_token_status(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<ReactionTokenStatusResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let row = load_reaction_pat_status_row(state.as_ref(), user_id).await?;
+    let Some(row) = row else {
+        return Ok(Json(ReactionTokenStatusResponse {
+            configured: false,
+            masked_token: None,
+            check: ReactionTokenCheckSummary {
+                state: "idle".to_owned(),
+                message: None,
+                checked_at: None,
+            },
+        }));
+    };
+
+    Ok(Json(ReactionTokenStatusResponse {
+        configured: true,
+        masked_token: Some(row.masked_token),
+        check: ReactionTokenCheckSummary {
+            state: match row.last_check_state.as_str() {
+                "valid" => "valid".to_owned(),
+                "invalid" => "invalid".to_owned(),
+                "error" => "error".to_owned(),
+                _ => "idle".to_owned(),
+            },
+            message: row.last_check_message,
+            checked_at: row.last_checked_at,
+        },
+    }))
+}
+
+pub async fn check_reaction_token(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<ReactionTokenRequest>,
+) -> Result<Json<ReactionTokenCheckResponse>, ApiError> {
+    let _ = require_user_id(&session).await?;
+    let checked = check_reaction_pat_with_github(state.as_ref(), req.token.as_str()).await?;
+    Ok(Json(checked))
+}
+
+pub async fn upsert_reaction_token(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<ReactionTokenRequest>,
+) -> Result<Json<ReactionTokenStatusResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let token = req.token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request("token is required"));
+    }
+
+    let checked = check_reaction_pat_with_github(state.as_ref(), token).await?;
+    if checked.state != "valid" {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_invalid",
+            checked.message,
+        ));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let encrypted = state
+        .encryption_key
+        .encrypt_str(token)
+        .map_err(ApiError::internal)?;
+    let masked = mask_pat_token(token);
+
+    sqlx::query(
+        r#"
+        INSERT INTO reaction_pat_tokens (
+          user_id, token_ciphertext, token_nonce, masked_token,
+          last_check_state, last_check_message, last_checked_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          token_ciphertext = excluded.token_ciphertext,
+          token_nonce = excluded.token_nonce,
+          masked_token = excluded.masked_token,
+          last_check_state = excluded.last_check_state,
+          last_check_message = excluded.last_check_message,
+          last_checked_at = excluded.last_checked_at,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(encrypted.ciphertext)
+    .bind(encrypted.nonce)
+    .bind(&masked)
+    .bind("valid")
+    .bind("token is valid")
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(ReactionTokenStatusResponse {
+        configured: true,
+        masked_token: Some(masked),
+        check: ReactionTokenCheckSummary {
+            state: "valid".to_owned(),
+            message: Some("token is valid".to_owned()),
+            checked_at: Some(now),
+        },
+    }))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FeedQuery {
     cursor: Option<String>,
@@ -475,6 +789,7 @@ pub struct FeedItem {
     html_url: Option<String>,
     unread: Option<i64>,
     translated: Option<TranslatedItem>,
+    reactions: Option<ReleaseReactions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -485,6 +800,33 @@ pub struct TranslatedItem {
     summary: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct ReleaseReactions {
+    counts: ReleaseReactionCounts,
+    viewer: ReleaseReactionViewer,
+    status: String, // ready | sync_required
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ReleaseReactionCounts {
+    plus1: i64,
+    laugh: i64,
+    heart: i64,
+    hooray: i64,
+    rocket: i64,
+    eyes: i64,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ReleaseReactionViewer {
+    plus1: bool,
+    laugh: bool,
+    heart: bool,
+    hooray: bool,
+    rocket: bool,
+    eyes: bool,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct FeedRow {
     kind: String,
@@ -492,6 +834,8 @@ struct FeedRow {
     ts: String,
     id_key: String,
     entity_id: String,
+    release_id: Option<i64>,
+    release_node_id: Option<String>,
     repo_full_name: Option<String>,
     title: Option<String>,
     subtitle: Option<String>,
@@ -500,9 +844,50 @@ struct FeedRow {
     html_url: Option<String>,
     unread: Option<i64>,
     release_body: Option<String>,
+    react_plus1: Option<i64>,
+    react_laugh: Option<i64>,
+    react_heart: Option<i64>,
+    react_hooray: Option<i64>,
+    react_rocket: Option<i64>,
+    react_eyes: Option<i64>,
     trans_source_hash: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReactionContent {
+    Plus1,
+    Laugh,
+    Heart,
+    Hooray,
+    Rocket,
+    Eyes,
+}
+
+impl ReleaseReactionContent {
+    fn from_client_str(raw: &str) -> Option<Self> {
+        match raw {
+            "plus1" => Some(Self::Plus1),
+            "laugh" => Some(Self::Laugh),
+            "heart" => Some(Self::Heart),
+            "hooray" => Some(Self::Hooray),
+            "rocket" => Some(Self::Rocket),
+            "eyes" => Some(Self::Eyes),
+            _ => None,
+        }
+    }
+
+    fn as_graphql_enum(self) -> &'static str {
+        match self {
+            Self::Plus1 => "THUMBS_UP",
+            Self::Laugh => "LAUGH",
+            Self::Heart => "HEART",
+            Self::Hooray => "HOORAY",
+            Self::Rocket => "ROCKET",
+            Self::Eyes => "EYES",
+        }
+    }
 }
 
 fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
@@ -552,6 +937,100 @@ fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+fn has_repo_scope(scopes: &str) -> bool {
+    scopes
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .any(|scope| scope == "repo")
+}
+
+fn github_reauth_required_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "reauth_required",
+        "repo scope required; re-login via GitHub OAuth",
+    )
+}
+
+fn github_rate_limited_error() -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "github rate limit exceeded; retry later",
+    )
+}
+
+fn github_access_restricted_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        "github denied reaction access for this repository (OAuth app restrictions or org policy)",
+    )
+}
+
+fn is_rate_limit_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("rate limit")
+}
+
+fn is_reauth_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("bad credentials") || lower.contains("requires authentication")
+}
+
+fn is_access_restricted_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("resource not accessible by integration")
+        || lower.contains("saml")
+        || lower.contains("oauth app access restrictions")
+}
+
+fn github_graphql_http_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Option<ApiError> {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Some(github_reauth_required_error());
+    }
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim);
+    if remaining == Some("0") || is_rate_limit_message(body) {
+        return Some(github_rate_limited_error());
+    }
+
+    if is_reauth_message(body) {
+        return Some(github_reauth_required_error());
+    }
+    if is_access_restricted_message(body) {
+        return Some(github_access_restricted_error());
+    }
+
+    None
+}
+
+fn github_graphql_errors_to_api_error(errors: &[GraphQlError]) -> Option<ApiError> {
+    if errors.iter().any(|e| is_rate_limit_message(&e.message)) {
+        return Some(github_rate_limited_error());
+    }
+    if errors.iter().any(|e| is_reauth_message(&e.message)) {
+        return Some(github_reauth_required_error());
+    }
+    if errors
+        .iter()
+        .any(|e| is_access_restricted_message(&e.message))
+    {
+        return Some(github_access_restricted_error());
+    }
+    None
 }
 
 fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str> {
@@ -720,6 +1199,8 @@ async fn fetch_feed_releases(
             COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
             printf('%020d', r.release_id) AS id_key,
             CAST(r.release_id AS TEXT) AS entity_id,
+            r.release_id AS release_id,
+            r.node_id AS release_node_id,
             sr.full_name AS repo_full_name,
             COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
             NULL AS subtitle,
@@ -727,16 +1208,22 @@ async fn fetch_feed_releases(
             NULL AS subject_type,
             r.html_url AS html_url,
             NULL AS unread,
-            r.body AS release_body
+            r.body AS release_body,
+            r.react_plus1 AS react_plus1,
+            r.react_laugh AS react_laugh,
+            r.react_heart AS react_heart,
+            r.react_hooray AS react_hooray,
+            r.react_rocket AS react_rocket,
+            r.react_eyes AS react_eyes
           FROM releases r
           JOIN starred_repos sr
             ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
           WHERE r.user_id = ?
         )
         SELECT
-          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id,
+          i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
           i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
-          i.release_body,
+          i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
           t.title AS trans_title,
           t.summary AS trans_summary
@@ -785,7 +1272,275 @@ async fn fetch_feed_releases(
     qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
 }
 
-fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
+fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
+    ReleaseReactionCounts {
+        plus1: r.react_plus1.unwrap_or(0),
+        laugh: r.react_laugh.unwrap_or(0),
+        heart: r.react_heart.unwrap_or(0),
+        hooray: r.react_hooray.unwrap_or(0),
+        rocket: r.react_rocket.unwrap_or(0),
+        eyes: r.react_eyes.unwrap_or(0),
+    }
+}
+
+fn release_reactions_status(r: &FeedRow) -> &'static str {
+    if r.release_node_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        "sync_required"
+    } else {
+        "ready"
+    }
+}
+
+fn apply_group_to_reactions(
+    counts: &mut ReleaseReactionCounts,
+    viewer: &mut ReleaseReactionViewer,
+    content: &str,
+    total_count: i64,
+    viewer_has_reacted: bool,
+) {
+    match content {
+        "THUMBS_UP" => {
+            counts.plus1 = total_count;
+            viewer.plus1 = viewer_has_reacted;
+        }
+        "LAUGH" => {
+            counts.laugh = total_count;
+            viewer.laugh = viewer_has_reacted;
+        }
+        "HEART" => {
+            counts.heart = total_count;
+            viewer.heart = viewer_has_reacted;
+        }
+        "HOORAY" => {
+            counts.hooray = total_count;
+            viewer.hooray = viewer_has_reacted;
+        }
+        "ROCKET" => {
+            counts.rocket = total_count;
+            viewer.rocket = viewer_has_reacted;
+        }
+        "EYES" => {
+            counts.eyes = total_count;
+            viewer.eyes = viewer_has_reacted;
+        }
+        _ => {}
+    }
+}
+
+fn counts_from_groups(groups: &[GraphQlReactionGroup]) -> ReleaseReactionCounts {
+    let mut counts = ReleaseReactionCounts::default();
+    let mut viewer = ReleaseReactionViewer::default();
+    for group in groups {
+        apply_group_to_reactions(
+            &mut counts,
+            &mut viewer,
+            group.content.as_str(),
+            group.reactors.total_count,
+            group.viewer_has_reacted,
+        );
+    }
+    counts
+}
+
+fn viewer_from_groups(groups: &[GraphQlReactionGroup]) -> ReleaseReactionViewer {
+    let mut counts = ReleaseReactionCounts::default();
+    let mut viewer = ReleaseReactionViewer::default();
+    for group in groups {
+        apply_group_to_reactions(
+            &mut counts,
+            &mut viewer,
+            group.content.as_str(),
+            group.reactors.total_count,
+            group.viewer_has_reacted,
+        );
+    }
+    viewer
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlResponse<T> {
+    data: Option<T>,
+    errors: Option<Vec<GraphQlError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseReactionsData {
+    nodes: Vec<Option<GraphQlReleaseNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseNode {
+    id: String,
+    reaction_groups: Vec<GraphQlReactionGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReactionGroup {
+    content: String,
+    viewer_has_reacted: bool,
+    reactors: GraphQlReactors,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReactors {
+    total_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct LiveReleaseReactions {
+    counts: ReleaseReactionCounts,
+    viewer: ReleaseReactionViewer,
+}
+
+async fn fetch_live_release_reactions(
+    state: &AppState,
+    access_token: &str,
+    node_ids: &[String],
+) -> Result<std::collections::HashMap<String, LiveReleaseReactions>, ApiError> {
+    if node_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let query = r#"
+      query($ids: [ID!]!) {
+        nodes(ids: $ids) {
+          ... on Release {
+            id
+            reactionGroups {
+              content
+              viewerHasReacted
+              reactors(first: 1) {
+                totalCount
+              }
+            }
+          }
+        }
+      }
+    "#;
+
+    let payload = serde_json::json!({
+        "query": query,
+        "variables": { "ids": node_ids },
+    });
+
+    let resp = state
+        .http
+        .post("https://api.github.com/graphql")
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let headers = resp.headers().clone();
+        let body = resp.text().await.map_err(ApiError::internal)?;
+        if let Some(err) = github_graphql_http_error(status, &headers, &body) {
+            return Err(err);
+        }
+        return Err(ApiError::internal(format!(
+            "github graphql returned {status}: {body}"
+        )));
+    }
+
+    let resp = resp
+        .error_for_status()
+        .map_err(ApiError::internal)?
+        .json::<GraphQlResponse<GraphQlReleaseReactionsData>>()
+        .await
+        .map_err(ApiError::internal)?;
+
+    let GraphQlResponse { data, errors } = resp;
+    if let Some(errors) = errors
+        && !errors.is_empty()
+    {
+        // `nodes(ids: ...)` can legitimately return partial data with per-node auth errors
+        // (e.g. some private releases are inaccessible). Keep usable nodes instead of
+        // downgrading the whole page to reauth-required.
+        if data.is_none() {
+            if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+                return Err(err);
+            }
+            let msg = errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::internal(format!("github graphql error: {msg}")));
+        }
+    }
+
+    let mut out = std::collections::HashMap::new();
+    let nodes = data.map(|d| d.nodes).unwrap_or_default();
+    for node in nodes.into_iter().flatten() {
+        out.insert(
+            node.id,
+            LiveReleaseReactions {
+                counts: counts_from_groups(&node.reaction_groups),
+                viewer: viewer_from_groups(&node.reaction_groups),
+            },
+        );
+    }
+    Ok(out)
+}
+
+async fn persist_release_reaction_counts(
+    state: &AppState,
+    user_id: i64,
+    release_id: i64,
+    counts: &ReleaseReactionCounts,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE releases
+        SET react_plus1 = ?,
+            react_laugh = ?,
+            react_heart = ?,
+            react_hooray = ?,
+            react_rocket = ?,
+            react_eyes = ?,
+            updated_at = ?
+        WHERE user_id = ? AND release_id = ?
+        "#,
+    )
+    .bind(counts.plus1)
+    .bind(counts.laugh)
+    .bind(counts.heart)
+    .bind(counts.hooray)
+    .bind(counts.rocket)
+    .bind(counts.eyes)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(user_id)
+    .bind(release_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+fn feed_item_from_row(
+    r: FeedRow,
+    ai_enabled: bool,
+    live_reactions: Option<&LiveReleaseReactions>,
+) -> FeedItem {
     let excerpt = match r.kind.as_str() {
         "release" => release_excerpt(r.release_body.as_deref()),
         _ => None,
@@ -869,6 +1624,14 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         }
     };
 
+    let status = release_reactions_status(&r);
+    let mut counts = release_counts_from_row(&r);
+    let mut viewer = ReleaseReactionViewer::default();
+    if let Some(live) = live_reactions {
+        counts = live.counts.clone();
+        viewer = live.viewer.clone();
+    }
+
     FeedItem {
         kind: r.kind,
         ts: r.ts,
@@ -882,6 +1645,11 @@ fn feed_item_from_row(r: FeedRow, ai_enabled: bool) -> FeedItem {
         html_url: r.html_url,
         unread: r.unread,
         translated,
+        reactions: Some(ReleaseReactions {
+            counts,
+            viewer,
+            status: status.to_owned(),
+        }),
     }
 }
 
@@ -906,6 +1674,45 @@ pub async fn list_feed(
     let rows = fetch_feed_releases(state.as_ref(), user_id, release_cursor.as_ref(), limit).await?;
     let ai_enabled = state.config.ai.is_some();
 
+    let mut node_ids: Vec<String> = Vec::new();
+    let mut release_by_node = std::collections::HashMap::<String, i64>::new();
+    for row in &rows {
+        if let (Some(release_id), Some(node_id)) = (row.release_id, row.release_node_id.as_deref())
+        {
+            let node_id = node_id.trim();
+            if !node_id.is_empty() {
+                node_ids.push(node_id.to_owned());
+                release_by_node.insert(node_id.to_owned(), release_id);
+            }
+        }
+    }
+    node_ids.sort();
+    node_ids.dedup();
+
+    let mut live_reactions_by_node =
+        std::collections::HashMap::<String, LiveReleaseReactions>::new();
+    let reaction_pat = load_reaction_pat_token(state.as_ref(), user_id)
+        .await
+        .ok()
+        .flatten();
+    if !node_ids.is_empty()
+        && let Some(pat) = reaction_pat
+        && let Ok(live) = fetch_live_release_reactions(state.as_ref(), &pat, &node_ids).await
+    {
+        for (node_id, reaction) in &live {
+            if let Some(release_id) = release_by_node.get(node_id) {
+                let _ = persist_release_reaction_counts(
+                    state.as_ref(),
+                    user_id,
+                    *release_id,
+                    &reaction.counts,
+                )
+                .await;
+            }
+        }
+        live_reactions_by_node = live;
+    }
+
     let mut items = Vec::with_capacity(rows.len());
     let mut next_cursor: Option<String> = None;
     for (idx, r) in rows.into_iter().enumerate() {
@@ -913,7 +1720,11 @@ pub async fn list_feed(
             // Cursor format: "<sort_ts>|release|<id_key>" (backward compatible with parse_cursor).
             next_cursor = Some(format!("{}|release|{}", r.sort_ts, r.id_key));
         }
-        items.push(feed_item_from_row(r, ai_enabled));
+        let live = r
+            .release_node_id
+            .as_deref()
+            .and_then(|id| live_reactions_by_node.get(id));
+        items.push(feed_item_from_row(r, ai_enabled, live));
     }
 
     // If we returned fewer than limit, there's no next page.
@@ -922,6 +1733,348 @@ pub async fn list_feed(
     }
 
     Ok(Json(FeedResponse { items, next_cursor }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ToggleReleaseReactionRequest {
+    release_id: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToggleReleaseReactionResponse {
+    release_id: String,
+    reactions: ReleaseReactions,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseReactionRow {
+    release_id: i64,
+    node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddReactionData {
+    add_reaction: Option<GraphQlMutationPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveReactionData {
+    remove_reaction: Option<GraphQlMutationPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlMutationPayload {
+    subject: Option<GraphQlReleaseSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphQlReleaseSubject {
+    id: String,
+    reaction_groups: Vec<GraphQlReactionGroup>,
+}
+
+async fn mutate_release_reaction(
+    state: &AppState,
+    access_token: &str,
+    node_id: &str,
+    content: ReleaseReactionContent,
+    currently_reacted: bool,
+) -> Result<LiveReleaseReactions, ApiError> {
+    let (query, key) = if currently_reacted {
+        (
+            r#"
+            mutation($input: RemoveReactionInput!) {
+              removeReaction(input: $input) {
+                subject {
+                  ... on Release {
+                    id
+                    reactionGroups {
+                      content
+                      viewerHasReacted
+                      reactors(first: 1) {
+                        totalCount
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            "#,
+            "removeReaction",
+        )
+    } else {
+        (
+            r#"
+            mutation($input: AddReactionInput!) {
+              addReaction(input: $input) {
+                subject {
+                  ... on Release {
+                    id
+                    reactionGroups {
+                      content
+                      viewerHasReacted
+                      reactors(first: 1) {
+                        totalCount
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            "#,
+            "addReaction",
+        )
+    };
+
+    let payload = serde_json::json!({
+        "query": query,
+        "variables": {
+            "input": {
+                "subjectId": node_id,
+                "content": content.as_graphql_enum(),
+            }
+        }
+    });
+
+    let resp = state
+        .http
+        .post("https://api.github.com/graphql")
+        .bearer_auth(access_token)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(ApiError::internal)?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let headers = resp.headers().clone();
+        let body = resp.text().await.map_err(ApiError::internal)?;
+        if let Some(err) = github_graphql_http_error(status, &headers, &body) {
+            return Err(err);
+        }
+        return Err(ApiError::internal(format!(
+            "github graphql returned {status}: {body}"
+        )));
+    }
+
+    let resp = resp.error_for_status().map_err(ApiError::internal)?;
+
+    let body = resp.text().await.map_err(ApiError::internal)?;
+    if key == "removeReaction" {
+        let parsed = serde_json::from_str::<GraphQlResponse<RemoveReactionData>>(&body)
+            .map_err(ApiError::internal)?;
+        if let Some(errors) = parsed.errors
+            && !errors.is_empty()
+        {
+            if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+                return Err(err);
+            }
+            let msg = errors
+                .into_iter()
+                .map(|e| e.message)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::internal(format!("github graphql error: {msg}")));
+        }
+        let Some(data) = parsed.data else {
+            return Err(ApiError::internal("missing graphql data"));
+        };
+        let Some(payload) = data.remove_reaction else {
+            return Err(ApiError::internal("missing removeReaction payload"));
+        };
+        let Some(subject) = payload.subject else {
+            return Err(ApiError::internal("missing mutation subject"));
+        };
+        let _subject_id = subject.id;
+        return Ok(LiveReleaseReactions {
+            counts: counts_from_groups(&subject.reaction_groups),
+            viewer: viewer_from_groups(&subject.reaction_groups),
+        });
+    }
+
+    let parsed = serde_json::from_str::<GraphQlResponse<AddReactionData>>(&body)
+        .map_err(ApiError::internal)?;
+    if let Some(errors) = parsed.errors
+        && !errors.is_empty()
+    {
+        if let Some(err) = github_graphql_errors_to_api_error(&errors) {
+            return Err(err);
+        }
+        let msg = errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::internal(format!("github graphql error: {msg}")));
+    }
+    let Some(data) = parsed.data else {
+        return Err(ApiError::internal("missing graphql data"));
+    };
+    let Some(payload) = data.add_reaction else {
+        return Err(ApiError::internal("missing addReaction payload"));
+    };
+    let Some(subject) = payload.subject else {
+        return Err(ApiError::internal("missing mutation subject"));
+    };
+    let _subject_id = subject.id;
+    Ok(LiveReleaseReactions {
+        counts: counts_from_groups(&subject.reaction_groups),
+        viewer: viewer_from_groups(&subject.reaction_groups),
+    })
+}
+
+pub async fn toggle_release_reaction(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<ToggleReleaseReactionRequest>,
+) -> Result<Json<ToggleReleaseReactionResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_id_raw = req.release_id.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    let release_id = release_id_raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+
+    let Some(content) = ReleaseReactionContent::from_client_str(req.content.trim()) else {
+        return Err(ApiError::bad_request("invalid reaction content"));
+    };
+
+    let token = match load_reaction_pat_token(state.as_ref(), user_id).await {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "pat_required",
+                "release reactions require a GitHub PAT",
+            ));
+        }
+        Err(err) if err.code() == "pat_invalid" => {
+            let _ = persist_reaction_pat_check_result(
+                state.as_ref(),
+                user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await;
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let row = sqlx::query_as::<_, ReleaseReactionRow>(
+        r#"
+        SELECT release_id, node_id
+        FROM releases
+        WHERE user_id = ? AND release_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    };
+
+    let Some(node_id) = row
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "sync_required",
+            "release reaction data is not ready; sync releases first",
+        ));
+    };
+
+    let current =
+        match fetch_live_release_reactions(state.as_ref(), &token, &[node_id.to_owned()]).await {
+            Ok(v) => v,
+            Err(err) if err.code() == "reauth_required" => {
+                let _ = persist_reaction_pat_check_result(
+                    state.as_ref(),
+                    user_id,
+                    "invalid",
+                    Some("PAT is invalid or expired"),
+                )
+                .await;
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "pat_invalid",
+                    "PAT is invalid or expired",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+    let Some(current_reactions) = current.get(node_id) else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "pat_forbidden",
+            "PAT cannot access this release repository; check token repository access",
+        ));
+    };
+    let currently_reacted = match content {
+        ReleaseReactionContent::Plus1 => current_reactions.viewer.plus1,
+        ReleaseReactionContent::Laugh => current_reactions.viewer.laugh,
+        ReleaseReactionContent::Heart => current_reactions.viewer.heart,
+        ReleaseReactionContent::Hooray => current_reactions.viewer.hooray,
+        ReleaseReactionContent::Rocket => current_reactions.viewer.rocket,
+        ReleaseReactionContent::Eyes => current_reactions.viewer.eyes,
+    };
+
+    let updated =
+        match mutate_release_reaction(state.as_ref(), &token, node_id, content, currently_reacted)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) if err.code() == "reauth_required" => {
+                let _ = persist_reaction_pat_check_result(
+                    state.as_ref(),
+                    user_id,
+                    "invalid",
+                    Some("PAT is invalid or expired"),
+                )
+                .await;
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "pat_invalid",
+                    "PAT is invalid or expired",
+                ));
+            }
+            Err(err) => return Err(err),
+        };
+    let _ =
+        persist_reaction_pat_check_result(state.as_ref(), user_id, "valid", Some("PAT is valid"))
+            .await;
+    persist_release_reaction_counts(state.as_ref(), user_id, row.release_id, &updated.counts)
+        .await?;
+
+    Ok(Json(ToggleReleaseReactionResponse {
+        release_id: row.release_id.to_string(),
+        reactions: ReleaseReactions {
+            counts: updated.counts,
+            viewer: updated.viewer,
+            status: "ready".to_owned(),
+        },
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -985,12 +2138,18 @@ fn extract_json_object_span(raw: &str) -> Option<&str> {
 
 fn parse_translation_json(raw: &str) -> Option<TranslationJson> {
     fn parse_direct(raw: &str) -> Option<TranslationJson> {
-        serde_json::from_str::<TranslationJson>(raw)
+        let parsed = serde_json::from_str::<TranslationJson>(raw)
             .ok()
             .or_else(|| {
                 let inner = serde_json::from_str::<String>(raw).ok()?;
                 serde_json::from_str::<TranslationJson>(&inner).ok()
-            })
+            })?;
+
+        Some(TranslationJson {
+            title_zh: parsed.title_zh,
+            summary_md: parsed.summary_md.map(|s| s.replace("\\n", "\n")),
+            body_md: parsed.body_md.map(|s| s.replace("\\n", "\n")),
+        })
     }
 
     let trimmed = raw.trim();
@@ -1876,10 +3035,116 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        markdown_structure_preserved, parse_repo_full_name_from_release_url,
+        FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
+        has_repo_scope, markdown_structure_preserved, parse_repo_full_name_from_release_url,
         parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
-        resolve_release_full_name, split_markdown_chunks,
+        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
     };
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    fn test_feed_row(node_id: Option<&str>) -> FeedRow {
+        FeedRow {
+            kind: "release".to_owned(),
+            sort_ts: "2026-01-01T00:00:00Z".to_owned(),
+            ts: "2026-01-01T00:00:00Z".to_owned(),
+            id_key: "1".to_owned(),
+            entity_id: "1".to_owned(),
+            release_id: Some(1),
+            release_node_id: node_id.map(str::to_owned),
+            repo_full_name: None,
+            title: None,
+            subtitle: None,
+            reason: None,
+            subject_type: None,
+            html_url: None,
+            unread: None,
+            release_body: None,
+            react_plus1: None,
+            react_laugh: None,
+            react_heart: None,
+            react_hooray: None,
+            react_rocket: None,
+            react_eyes: None,
+            trans_source_hash: None,
+            trans_title: None,
+            trans_summary: None,
+        }
+    }
+
+    #[test]
+    fn has_repo_scope_accepts_comma_delimited_scopes() {
+        assert!(has_repo_scope("read:user,user:email,repo,notifications"));
+    }
+
+    #[test]
+    fn has_repo_scope_accepts_space_delimited_scopes() {
+        assert!(has_repo_scope("read:user user:email repo notifications"));
+    }
+
+    #[test]
+    fn has_repo_scope_rejects_missing_repo_scope() {
+        assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_rate_limit_403() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let err = github_graphql_http_error(reqwest::StatusCode::FORBIDDEN, &headers, "")
+            .expect("expected mapped error");
+        assert_eq!(err.code(), "rate_limited");
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_auth_403() {
+        let headers = HeaderMap::new();
+        let err = github_graphql_http_error(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            "Requires authentication",
+        )
+        .expect("expected mapped error");
+        assert_eq!(err.code(), "reauth_required");
+    }
+
+    #[test]
+    fn github_graphql_http_error_marks_org_restriction_403() {
+        let headers = HeaderMap::new();
+        let err = github_graphql_http_error(
+            reqwest::StatusCode::FORBIDDEN,
+            &headers,
+            "OAuth App access restrictions are enabled",
+        )
+        .expect("expected mapped error");
+        assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn github_graphql_errors_to_api_error_marks_org_restriction() {
+        let errors = vec![GraphQlError {
+            message: "OAuth App access restrictions are enabled".to_owned(),
+        }];
+        let err = github_graphql_errors_to_api_error(&errors).expect("expected mapped error");
+        assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn release_reactions_status_requires_per_item_live_data() {
+        let row = test_feed_row(Some("R_node"));
+        assert_eq!(release_reactions_status(&row), "ready");
+    }
+
+    #[test]
+    fn release_reactions_status_ready_with_live_data() {
+        let row = test_feed_row(Some("R_node"));
+        assert_eq!(release_reactions_status(&row), "ready");
+    }
+
+    #[test]
+    fn release_reactions_status_sync_required_without_node_id() {
+        let row = test_feed_row(None);
+        assert_eq!(release_reactions_status(&row), "sync_required");
+    }
 
     #[test]
     fn release_excerpt_keeps_markdown_structure() {
@@ -1913,7 +3178,9 @@ echo should_not_be_in_excerpt
 
     #[test]
     fn parse_translation_json_accepts_fenced_json() {
-        let raw = "```json\n{\"title_zh\":\"标题\",\"summary_md\":\"- **加粗**\\n- `code`\"}\n```";
+        let raw = r#"```json
+{"title_zh":"标题","summary_md":"- **加粗**\\n- `code`"}
+```"#;
         let parsed = parse_translation_json(raw).expect("parse translation json");
         assert_eq!(parsed.title_zh.as_deref(), Some("标题"));
         assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**\n- `code`"));
