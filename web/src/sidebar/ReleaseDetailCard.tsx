@@ -27,7 +27,8 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 	const { releaseId } = props;
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
-	const [error, setError] = useState<string | null>(null);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const [translateError, setTranslateError] = useState<string | null>(null);
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const translateRequestSeqRef = useRef(0);
@@ -37,12 +38,14 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 		setTranslating(false);
 		if (!releaseId) {
 			setDetail(null);
-			setError(null);
+			setLoadError(null);
+			setTranslateError(null);
 			return;
 		}
 		let active = true;
 		setLoading(true);
-		setError(null);
+		setLoadError(null);
+		setTranslateError(null);
 		setShowOriginal(false);
 		void apiGetReleaseDetail(releaseId)
 			.then((res) => {
@@ -51,7 +54,7 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 			})
 			.catch((err) => {
 				if (!active) return;
-				setError(err instanceof Error ? err.message : String(err));
+				setLoadError(err instanceof Error ? err.message : String(err));
 				setDetail(null);
 			})
 			.finally(() => {
@@ -70,7 +73,7 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 		translateRequestSeqRef.current = requestSeq;
 		const requestReleaseId = detail.release_id;
 		setTranslating(true);
-		setError(null);
+		setTranslateError(null);
 		void apiTranslateReleaseDetail(requestReleaseId)
 			.then((translated) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
@@ -82,7 +85,7 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 			})
 			.catch((err) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
-				setError(err instanceof Error ? err.message : String(err));
+				setTranslateError(err instanceof Error ? err.message : String(err));
 			})
 			.finally(() => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
@@ -189,14 +192,17 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 			</CardHeader>
 
 			<CardContent className="pt-0">
-				{error ? (
-					<p className="text-destructive text-sm">{error}</p>
+				{loadError ? (
+					<p className="text-destructive text-sm">{loadError}</p>
 				) : loading ? (
 					<p className="text-muted-foreground text-sm">
 						正在加载 release 详情…
 					</p>
 				) : display ? (
 					<div className="space-y-3">
+						{translateError ? (
+							<p className="text-destructive text-xs">{translateError}</p>
+						) : null}
 						<h3 className="text-sm font-semibold tracking-tight">
 							{display.title}
 						</h3>
