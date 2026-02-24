@@ -46,6 +46,7 @@ export function ReleaseDetailCard(props: {
 			return;
 		}
 		let active = true;
+		setDetail(null);
 		setLoading(true);
 		setLoadError(null);
 		setTranslateError(null);
@@ -70,11 +71,16 @@ export function ReleaseDetailCard(props: {
 		};
 	}, [releaseId]);
 
+	const activeDetail = useMemo(() => {
+		if (!releaseId || !detail) return null;
+		return detail.release_id === releaseId ? detail : null;
+	}, [detail, releaseId]);
+
 	const onTranslate = useCallback(() => {
-		if (!detail || translating) return;
+		if (!activeDetail || translating) return;
 		const requestSeq = translateRequestSeqRef.current + 1;
 		translateRequestSeqRef.current = requestSeq;
-		const requestReleaseId = detail.release_id;
+		const requestReleaseId = activeDetail.release_id;
 		setTranslating(true);
 		setTranslateError(null);
 		void apiTranslateReleaseDetail(requestReleaseId)
@@ -94,23 +100,27 @@ export function ReleaseDetailCard(props: {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslating(false);
 			});
-	}, [detail, translating]);
+	}, [activeDetail, translating]);
 
 	const display = useMemo(() => {
-		if (!detail) return null;
+		if (!activeDetail) return null;
 		const originalTitle =
-			detail.name?.trim() && detail.name.trim().length > 0
-				? detail.name
-				: detail.tag_name;
+			activeDetail.name?.trim() && activeDetail.name.trim().length > 0
+				? activeDetail.name
+				: activeDetail.tag_name;
 		const translatedTitle =
-			detail.translated?.status === "ready" ? detail.translated.title : null;
+			activeDetail.translated?.status === "ready"
+				? activeDetail.translated.title
+				: null;
 		const title = showOriginal
 			? originalTitle
 			: translatedTitle?.trim() || originalTitle;
 
 		const translatedBody =
-			detail.translated?.status === "ready" ? detail.translated.summary : null;
-		const originalBody = detail.body?.trim() ? detail.body : null;
+			activeDetail.translated?.status === "ready"
+				? activeDetail.translated.summary
+				: null;
+		const originalBody = activeDetail.body?.trim() ? activeDetail.body : null;
 		const body = showOriginal
 			? originalBody
 			: translatedBody?.trim()
@@ -118,14 +128,15 @@ export function ReleaseDetailCard(props: {
 				: originalBody;
 
 		return { title, body };
-	}, [detail, showOriginal]);
+	}, [activeDetail, showOriginal]);
 
 	const hasReadyTranslation = useMemo(() => {
-		if (!detail || detail.translated?.status !== "ready") return false;
-		const titleReady = Boolean(detail.translated.title?.trim());
-		const summaryReady = Boolean(detail.translated.summary?.trim());
+		if (!activeDetail || activeDetail.translated?.status !== "ready")
+			return false;
+		const titleReady = Boolean(activeDetail.translated.title?.trim());
+		const summaryReady = Boolean(activeDetail.translated.summary?.trim());
 		return titleReady || summaryReady;
-	}, [detail]);
+	}, [activeDetail]);
 
 	if (!releaseId) {
 		return null;
@@ -139,14 +150,14 @@ export function ReleaseDetailCard(props: {
 						<CardTitle className="text-base">Release 详情</CardTitle>
 						<CardDescription className="font-mono text-xs">
 							{loading ? "加载中…" : `#${releaseId}`}
-							{detail?.published_at
-								? ` · ${formatIsoShort(detail.published_at)}`
+							{activeDetail?.published_at
+								? ` · ${formatIsoShort(activeDetail.published_at)}`
 								: ""}
 						</CardDescription>
 					</div>
 
 					<div className="flex shrink-0 items-center gap-2">
-						{detail?.translated?.status === "disabled" ? (
+						{activeDetail?.translated?.status === "disabled" ? (
 							<span className="text-muted-foreground font-mono text-[11px]">
 								AI 未配置
 							</span>
@@ -158,7 +169,7 @@ export function ReleaseDetailCard(props: {
 										size="sm"
 										className="font-mono text-xs"
 										onClick={() => setShowOriginal((v) => !v)}
-										disabled={loading || !detail}
+										disabled={loading || !activeDetail}
 									>
 										<Languages className="size-4" />
 										{showOriginal ? "中文" : "原文"}
@@ -169,7 +180,7 @@ export function ReleaseDetailCard(props: {
 									size="sm"
 									className="font-mono text-xs"
 									onClick={onTranslate}
-									disabled={loading || !detail || translating}
+									disabled={loading || !activeDetail || translating}
 								>
 									<RefreshCcw className="size-4" />
 									{translating ? "翻译中…" : "翻译"}
@@ -177,14 +188,18 @@ export function ReleaseDetailCard(props: {
 							</>
 						)}
 
-						{detail?.html_url ? (
+						{activeDetail?.html_url ? (
 							<Button
 								asChild
 								variant="outline"
 								size="sm"
 								className="font-mono text-xs"
 							>
-								<a href={detail.html_url} target="_blank" rel="noreferrer">
+								<a
+									href={activeDetail.html_url}
+									target="_blank"
+									rel="noreferrer"
+								>
 									<ArrowUpRight className="size-4" />
 									GitHub
 								</a>
@@ -218,9 +233,9 @@ export function ReleaseDetailCard(props: {
 						<h3 className="text-sm font-semibold tracking-tight">
 							{display.title}
 						</h3>
-						{detail?.repo_full_name ? (
+						{activeDetail?.repo_full_name ? (
 							<p className="text-muted-foreground font-mono text-xs">
-								{detail.repo_full_name}
+								{activeDetail.repo_full_name}
 							</p>
 						) : null}
 						{display.body ? (
