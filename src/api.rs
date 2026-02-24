@@ -288,8 +288,8 @@ pub async fn get_release_detail(
         Some(TranslatedItem {
             lang: "zh-CN".to_owned(),
             status: "missing".to_owned(),
-            title: row.trans_title.clone(),
-            summary: row.trans_summary.clone(),
+            title: None,
+            summary: None,
         })
     };
 
