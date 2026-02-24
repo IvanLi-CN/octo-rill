@@ -907,11 +907,10 @@ fn parse_internal_release_id(target: &str) -> Option<i64> {
     if joined.host_str() != Some("octorill.local") {
         return None;
     }
-    if let Some(tab) = joined
+    let tab = joined
         .query_pairs()
-        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))
-        && tab != "briefs"
-    {
+        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))?;
+    if tab != "briefs" {
         return None;
     }
 
@@ -1267,6 +1266,12 @@ mod tests {
     }
 
     #[test]
+    fn contains_all_release_links_requires_tab_briefs() {
+        let markdown = "- [v1.2.3](/?release=123)";
+        assert!(!contains_all_release_links(markdown, &[123]));
+    }
+
+    #[test]
     fn reconcile_brief_release_links_adds_missing_release_ids() {
         let markdown = "- [v1.2.3](/?tab=briefs&release=12)\n";
         let releases = vec![
@@ -1307,6 +1312,22 @@ mod tests {
         }];
         let out = reconcile_brief_release_links(markdown, &releases);
         assert!(contains_all_release_links(&out, &[12, 123]));
+    }
+
+    #[test]
+    fn reconcile_brief_release_links_replaces_links_missing_tab() {
+        let markdown = "- [v1.2.3](/?release=123)\n";
+        let releases = vec![ReleaseDigest {
+            release_id: 123,
+            full_name: "acme/rocket".to_owned(),
+            title: "v1.2.3".to_owned(),
+            body: String::new(),
+            html_url: "https://github.com/acme/rocket/releases/tag/v1.2.3".to_owned(),
+            published_at: "2026-02-20T09:00:00Z".to_owned(),
+            is_prerelease: false,
+        }];
+        let out = reconcile_brief_release_links(markdown, &releases);
+        assert!(out.contains("/?tab=briefs&release=123"));
     }
 
     #[test]
