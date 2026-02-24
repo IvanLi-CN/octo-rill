@@ -1,5 +1,5 @@
 import { ArrowUpRight, Languages, RefreshCcw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	type ReleaseDetailResponse,
@@ -30,8 +30,11 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 	const [error, setError] = useState<string | null>(null);
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
+	const translateRequestSeqRef = useRef(0);
 
 	useEffect(() => {
+		translateRequestSeqRef.current += 1;
+		setTranslating(false);
 		if (!releaseId) {
 			setDetail(null);
 			setError(null);
@@ -63,19 +66,26 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 
 	const onTranslate = useCallback(() => {
 		if (!detail || translating) return;
+		const requestSeq = translateRequestSeqRef.current + 1;
+		translateRequestSeqRef.current = requestSeq;
+		const requestReleaseId = detail.release_id;
 		setTranslating(true);
 		setError(null);
-		void apiTranslateReleaseDetail(detail.release_id)
+		void apiTranslateReleaseDetail(requestReleaseId)
 			.then((translated) => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setDetail((prev) => {
 					if (!prev) return prev;
+					if (prev.release_id !== requestReleaseId) return prev;
 					return { ...prev, translated };
 				});
 			})
 			.catch((err) => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setError(err instanceof Error ? err.message : String(err));
 			})
 			.finally(() => {
+				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslating(false);
 			});
 	}, [detail, translating]);

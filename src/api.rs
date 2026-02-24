@@ -195,6 +195,7 @@ pub async fn get_release_detail(
 
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailRow {
+        repo_id: i64,
         release_id: i64,
         repo_full_name: Option<String>,
         tag_name: String,
@@ -204,6 +205,7 @@ pub async fn get_release_detail(
         published_at: Option<String>,
         is_prerelease: i64,
         is_draft: i64,
+        trans_source_hash: Option<String>,
         trans_title: Option<String>,
         trans_summary: Option<String>,
     }
@@ -211,6 +213,7 @@ pub async fn get_release_detail(
     let row = sqlx::query_as::<_, ReleaseDetailRow>(
         r#"
         SELECT
+          r.repo_id,
           r.release_id,
           sr.full_name AS repo_full_name,
           r.tag_name,
@@ -220,6 +223,7 @@ pub async fn get_release_detail(
           r.published_at,
           r.is_prerelease,
           r.is_draft,
+          t.source_hash AS trans_source_hash,
           t.title AS trans_title,
           t.summary AS trans_summary
         FROM releases r
@@ -248,6 +252,21 @@ pub async fn get_release_detail(
         ));
     };
 
+    let original_title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let original_body = row.body.clone().unwrap_or_default();
+    let source_hash = release_detail_source_hash(
+        &resolve_release_full_name(&row.html_url, row.repo_id),
+        &original_title,
+        &original_body,
+    );
+    let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
+
     let translated = if state.config.ai.is_none() {
         Some(TranslatedItem {
             lang: "zh-CN".to_owned(),
@@ -255,7 +274,12 @@ pub async fn get_release_detail(
             title: None,
             summary: None,
         })
-    } else if release_detail_translation_ready(row.body.as_deref(), row.trans_summary.as_deref()) {
+    } else if translation_fresh
+        && release_detail_translation_ready(
+            Some(original_body.as_str()),
+            row.trans_summary.as_deref(),
+        )
+    {
         Some(TranslatedItem {
             lang: "zh-CN".to_owned(),
             status: "ready".to_owned(),
@@ -973,6 +997,18 @@ fn parse_release_id_param(raw: &str) -> Result<i64, ApiError> {
     release_id_raw
         .parse::<i64>()
         .map_err(|_| ApiError::bad_request("release_id must be an integer string"))
+}
+
+fn release_detail_source_hash(
+    repo_full_name: &str,
+    original_title: &str,
+    original_body: &str,
+) -> String {
+    let source = format!(
+        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
+        repo_full_name, original_title, original_body
+    );
+    ai::sha256_hex(&source)
 }
 
 fn release_detail_translation_ready(body: Option<&str>, summary: Option<&str>) -> bool {
@@ -2753,11 +2789,7 @@ pub async fn translate_release_detail(
     let original_body = row.body.unwrap_or_default();
     let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
 
-    let source = format!(
-        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
-        repo_full_name, original_title, original_body
-    );
-    let source_hash = ai::sha256_hex(&source);
+    let source_hash = release_detail_source_hash(&repo_full_name, &original_title, &original_body);
     let entity_id = release_id.to_string();
 
     #[derive(Debug, sqlx::FromRow)]
