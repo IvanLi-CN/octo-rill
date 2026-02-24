@@ -146,6 +146,13 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	await expect(
 		page.getByRole("heading", { name: "Release 289513858" }),
 	).toBeVisible();
+
+	await page.getByRole("button", { name: "关闭" }).click();
+	await expect(page).toHaveURL(/tab=briefs/);
+	await expect(page).not.toHaveURL(/release=289513858/);
+	await expect(page.getByRole("heading", { name: "Release 详情" })).toHaveCount(
+		0,
+	);
 });
 
 test("detail translate button updates card content", async ({ page }) => {
