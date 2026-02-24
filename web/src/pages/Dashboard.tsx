@@ -14,14 +14,15 @@ import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { normalizeReleaseId } from "@/lib/releaseId";
 import { DashboardHeader } from "@/pages/DashboardHeader";
-import { ReleaseDetailDrawer } from "@/releases/ReleaseDetailDrawer";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
 	type NotificationItem,
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
+import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
 
@@ -82,13 +83,16 @@ function sortNotifications(items: NotificationItem[]) {
 
 function parseDashboardQuery() {
 	const params = new URLSearchParams(window.location.search);
+	const releaseId = normalizeReleaseId(params.get("release"));
+	if (releaseId) {
+		return { tab: "briefs" as Tab, releaseId };
+	}
+
 	const rawTab = params.get("tab");
 	const tab: Tab =
 		rawTab === "releases" || rawTab === "briefs" || rawTab === "inbox"
 			? rawTab
 			: "all";
-	const rawRelease = params.get("release");
-	const releaseId = rawRelease && /^\d+$/.test(rawRelease) ? rawRelease : null;
 	return { tab, releaseId };
 }
 
@@ -733,6 +737,10 @@ export function Dashboard(props: { me: MeResponse }) {
 								onGenerate={onGenerateBrief}
 								onOpenRelease={onOpenReleaseDetail}
 							/>
+							<ReleaseDetailCard
+								releaseId={activeReleaseId}
+								onClose={onCloseReleaseDetail}
+							/>
 						</div>
 					) : null}
 
@@ -751,10 +759,6 @@ export function Dashboard(props: { me: MeResponse }) {
 				</aside>
 			</div>
 
-			<ReleaseDetailDrawer
-				releaseId={activeReleaseId}
-				onClose={onCloseReleaseDetail}
-			/>
 			{patDialogOpen ? (
 				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
 					<div className="bg-card w-full max-w-2xl rounded-xl border p-5 shadow-2xl">

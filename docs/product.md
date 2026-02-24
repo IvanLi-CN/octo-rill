@@ -1,6 +1,6 @@
 # OctoRill 产品说明
 
-OctoRill 是一个 GitHub 信息聚合与阅读界面：提供一个 **Releases 信息流**（类似 GitHub dashboard 的阅读体验），并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 **Release 日报** 与 **Inbox（GitHub Notifications）** 的快捷入口。日报中的 release 主入口先在站内打开详情抽屉，其余外链统一跳转 GitHub。
+OctoRill 是一个 GitHub 信息聚合与阅读界面：提供一个 **Releases 信息流**（类似 GitHub dashboard 的阅读体验），并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 **Release 日报** 与 **Inbox（GitHub Notifications）** 的快捷入口。日报中的 release 主入口先在站内打开详情卡，其余外链统一跳转 GitHub。
 
 ## 核心体验
 
@@ -45,11 +45,12 @@ Tab 语义：
   - `## 概览`：时间窗口、项目数、release 数、预发布数
   - `## 项目更新`：按项目分组逐条列出 release 与变更要点
 - 链接策略：
-  - release 主链接：站内链接 `/?tab=briefs&release=<release_id>`，点击后打开详情抽屉
+  - release 主链接：站内链接 `/?tab=briefs&release=<release_id>`，点击后在 briefs 页展示详情卡
   - 其他链接：跳转 GitHub（仓库页、release 原文页、相关 GitHub 链接）
+- 链接完整性保障：日报润色后会按 `release` 查询参数做精确 `release_id` 校验，缺失时自动补链（避免 `12/123` 前缀误判）。
 - 用途：让用户快速了解这段时间发生了什么，并能一跳查看完整上下文。
 
-### Release 详情抽屉
+### Release 详情卡（briefs 内联）
 
 - 入口：日报中的 release 主链接（站内链接）触发打开。
 - 内容：
@@ -83,13 +84,16 @@ Tab 语义：
 - Release 数据语义：按“共享事实”处理，release 以稳定 `release_id` 引用；用户 Star 仅用于决定个人列表与同步范围。
 - 同步数据：
   - Starred repos（用于确定关注范围）
-  - Releases（用于信息流与日报）
+  - Releases（共享事实数据；用于信息流、日报与详情）
   - Notifications（用于 Inbox 列表与侧栏快捷入口）
 - 日报回填：
   - 服务启动时会为每个用户先同步一次 releases，再补齐最近 7 天日报（已存在日期会跳过）
 - 可见性规则：
   - 取消 Star 后，该仓库可从当前用户的列表中消失；
   - 但历史日报中的 release 详情链接（`/?tab=briefs&release=<release_id>`）仍应可访问。
+- 语义边界：
+  - 列表与日报候选按 Star 过滤（个性化可见范围）。
+  - 详情读取与详情翻译按 `release_id` 读取（共享事实读取），不依赖当前 Star 状态。
 
 ## Release 反馈授权策略
 
