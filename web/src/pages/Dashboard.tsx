@@ -577,6 +577,10 @@ export function Dashboard(props: { me: MeResponse }) {
 		setActiveReleaseId(releaseId);
 	}, []);
 
+	const onCloseReleaseDetail = useCallback(() => {
+		setActiveReleaseId(null);
+	}, []);
+
 	useEffect(() => {
 		const params = new URLSearchParams(window.location.search);
 		if (tab === "all") {
@@ -733,7 +737,10 @@ export function Dashboard(props: { me: MeResponse }) {
 								onGenerate={onGenerateBrief}
 								onOpenRelease={onOpenReleaseDetail}
 							/>
-							<ReleaseDetailCard releaseId={activeReleaseId} />
+							<ReleaseDetailCard
+								releaseId={activeReleaseId}
+								onClose={onCloseReleaseDetail}
+							/>
 						</div>
 					) : null}
 

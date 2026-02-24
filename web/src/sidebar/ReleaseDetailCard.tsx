@@ -1,4 +1,4 @@
-import { ArrowUpRight, Languages, RefreshCcw } from "lucide-react";
+import { ArrowUpRight, Languages, RefreshCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -23,8 +23,11 @@ function formatIsoShort(iso: string | null) {
 	return noFrac.replace("T", " ");
 }
 
-export function ReleaseDetailCard(props: { releaseId: string | null }) {
-	const { releaseId } = props;
+export function ReleaseDetailCard(props: {
+	releaseId: string | null;
+	onClose: () => void;
+}) {
+	const { releaseId, onClose } = props;
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
@@ -187,6 +190,15 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 								</a>
 							</Button>
 						) : null}
+						<Button
+							variant="ghost"
+							size="sm"
+							className="font-mono text-xs"
+							onClick={onClose}
+						>
+							<X className="size-4" />
+							关闭
+						</Button>
 					</div>
 				</div>
 			</CardHeader>
