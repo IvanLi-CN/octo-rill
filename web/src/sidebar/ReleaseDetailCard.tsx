@@ -92,7 +92,10 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 
 	const display = useMemo(() => {
 		if (!detail) return null;
-		const originalTitle = detail.name ?? detail.tag_name;
+		const originalTitle =
+			detail.name?.trim() && detail.name.trim().length > 0
+				? detail.name
+				: detail.tag_name;
 		const translatedTitle =
 			detail.translated?.status === "ready" ? detail.translated.title : null;
 		const title = showOriginal
