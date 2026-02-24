@@ -2812,10 +2812,7 @@ pub async fn translate_release_detail(
 
     if let Some(cached) = cached
         && cached.source_hash == source_hash
-        && release_detail_translation_ready(
-            Some(original_body.as_str()),
-            cached.summary.as_deref(),
-        )
+        && release_detail_translation_ready(Some(original_body.as_str()), cached.summary.as_deref())
     {
         return Ok(Json(TranslateResponse {
             lang: "zh-CN".to_owned(),
@@ -3109,11 +3106,14 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 mod tests {
     use super::{
         FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
-        has_repo_scope, markdown_structure_preserved, parse_repo_full_name_from_release_url,
-        parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
-        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
+        has_repo_scope, markdown_structure_preserved, parse_release_id_param,
+        parse_repo_full_name_from_release_url, parse_translation_json,
+        preserve_chunk_trailing_newline, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_reactions_status,
+        resolve_release_full_name, split_markdown_chunks,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
     fn test_feed_row(node_id: Option<&str>) -> FeedRow {
         FeedRow {
@@ -3144,6 +3144,84 @@ mod tests {
         }
     }
 
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (1, 30215105, 'IvanLi-CN', ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed user");
+
+        pool
+    }
+
+    async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO releases (
+              user_id, repo_id, release_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind(release_id)
+        .bind("v1.2.3")
+        .bind("Release v1.2.3")
+        .bind("- item")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release");
+    }
+
+    async fn seed_star(pool: &SqlitePool, repo_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind("openai/codex")
+        .bind("openai")
+        .bind("codex")
+        .bind("octo rill test")
+        .bind("https://github.com/openai/codex")
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed starred");
+    }
+
     #[test]
     fn has_repo_scope_accepts_comma_delimited_scopes() {
         assert!(has_repo_scope("read:user,user:email,repo,notifications"));
@@ -3157,6 +3235,103 @@ mod tests {
     #[test]
     fn has_repo_scope_rejects_missing_repo_scope() {
         assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
+
+    #[test]
+    fn parse_release_id_param_requires_integer_string() {
+        assert_eq!(parse_release_id_param("123").expect("release id"), 123);
+        assert!(parse_release_id_param("12a").is_err());
+        assert!(parse_release_id_param("   ").is_err());
+    }
+
+    #[test]
+    fn release_detail_translation_ready_requires_summary_for_non_empty_body() {
+        let body = "- item";
+        assert!(!release_detail_translation_ready(Some(body), None));
+        assert!(release_detail_translation_ready(Some(body), Some("- 条目")));
+    }
+
+    #[test]
+    fn release_detail_translation_ready_allows_empty_body_without_summary() {
+        assert!(release_detail_translation_ready(Some(""), None));
+        assert!(release_detail_translation_ready(Some("   \n"), None));
+        assert!(release_detail_translation_ready(None, None));
+    }
+
+    #[test]
+    fn release_detail_source_hash_changes_with_content() {
+        let hash1 = release_detail_source_hash("acme/repo", "v1.0.0", "line one");
+        let hash2 = release_detail_source_hash("acme/repo", "v1.0.0", "line two");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn release_detail_query_is_readable_without_star() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            release_id: i64,
+            repo_full_name: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT r.release_id, sr.full_name AS repo_full_name
+            FROM releases r
+            LEFT JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ? AND r.release_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(1_i64)
+        .bind(120_i64)
+        .fetch_optional(&pool)
+        .await
+        .expect("query detail");
+
+        let row = row.expect("detail row");
+        assert_eq!(row.release_id, 120);
+        assert!(row.repo_full_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_releases_query_keeps_star_visibility_filter() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        let count_without_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases without star");
+        assert_eq!(count_without_star, 0);
+
+        seed_star(&pool, 42).await;
+        let count_with_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases with star");
+        assert_eq!(count_with_star, 1);
     }
 
     #[test]
