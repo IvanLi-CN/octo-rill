@@ -2812,6 +2812,10 @@ pub async fn translate_release_detail(
 
     if let Some(cached) = cached
         && cached.source_hash == source_hash
+        && release_detail_translation_ready(
+            Some(original_body.as_str()),
+            cached.summary.as_deref(),
+        )
     {
         return Ok(Json(TranslateResponse {
             lang: "zh-CN".to_owned(),
