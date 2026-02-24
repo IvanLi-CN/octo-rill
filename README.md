@@ -56,7 +56,8 @@ Then open `http://127.0.0.1:55174`.
 - OAuth callback is handled by the backend (`/auth/github/callback`).
 - Local data (SQLite) lives under `./.data/`.
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
-- Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不应影响历史日报里的 release 详情访问。
+- Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
+- 日报落库前会做 `release_id` 内链完整性校验与补齐，按查询参数做精确匹配（避免 `12/123` 前缀误判）。
 
 ## Release automation (PR label driven)
 

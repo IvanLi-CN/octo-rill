@@ -113,10 +113,61 @@ jobs:
       - name: Run cargo test
         run: cargo test --locked --all-features
 
+  frontend-e2e:
+    name: Frontend E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: ${{ runner.os }}-playwright-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install web dependencies
+        run: |
+          set -euo pipefail
+          cd web
+          bun install --frozen-lockfile
+
+      - name: Install Playwright browser
+        run: |
+          set -euo pipefail
+          cd web
+          bunx playwright install --with-deps chromium
+
+      - name: Run Playwright tests
+        run: |
+          set -euo pipefail
+          cd web
+          bun run e2e
+
   build:
     name: Build (Release)
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests]
+    needs: [lint, unit-tests, frontend-e2e]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     timeout-minutes: 25
     steps:

@@ -174,15 +174,15 @@ pub async fn list_releases(
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct ReleaseDetailResponse {
     release_id: String,
-    full_name: String,
+    repo_full_name: Option<String>,
     tag_name: String,
     name: Option<String>,
-    title: String,
-    body: String,
+    body: Option<String>,
     html_url: String,
     published_at: Option<String>,
     is_prerelease: i64,
     is_draft: i64,
+    translated: Option<TranslatedItem>,
 }
 
 pub async fn get_release_detail(
@@ -191,18 +191,13 @@ pub async fn get_release_detail(
     Path(release_id_raw): Path<String>,
 ) -> Result<Json<ReleaseDetailResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
-    let release_id_raw = release_id_raw.trim();
-    if release_id_raw.is_empty() {
-        return Err(ApiError::bad_request("release_id is required"));
-    }
-    let release_id: i64 = release_id_raw
-        .parse()
-        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+    let release_id = parse_release_id_param(&release_id_raw)?;
 
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailRow {
         repo_id: i64,
         release_id: i64,
+        repo_full_name: Option<String>,
         tag_name: String,
         name: Option<String>,
         body: Option<String>,
@@ -210,14 +205,35 @@ pub async fn get_release_detail(
         published_at: Option<String>,
         is_prerelease: i64,
         is_draft: i64,
+        trans_source_hash: Option<String>,
+        trans_title: Option<String>,
+        trans_summary: Option<String>,
     }
 
     let row = sqlx::query_as::<_, ReleaseDetailRow>(
         r#"
         SELECT
-          r.repo_id, r.release_id, r.tag_name, r.name, r.body, r.html_url, r.published_at,
-          r.is_prerelease, r.is_draft
+          r.repo_id,
+          r.release_id,
+          sr.full_name AS repo_full_name,
+          r.tag_name,
+          r.name,
+          r.body,
+          r.html_url,
+          r.published_at,
+          r.is_prerelease,
+          r.is_draft,
+          t.source_hash AS trans_source_hash,
+          t.title AS trans_title,
+          t.summary AS trans_summary
         FROM releases r
+        LEFT JOIN starred_repos sr
+          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        LEFT JOIN ai_translations t
+          ON t.user_id = r.user_id
+          AND t.entity_type = 'release_detail'
+          AND t.entity_id = CAST(r.release_id AS TEXT)
+          AND t.lang = 'zh-CN'
         WHERE r.user_id = ? AND r.release_id = ?
         LIMIT 1
         "#,
@@ -236,26 +252,58 @@ pub async fn get_release_detail(
         ));
     };
 
-    let title = row
+    let original_title = row
         .name
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&row.tag_name)
         .to_owned();
-    let full_name = resolve_release_full_name(&row.html_url, row.repo_id);
+    let original_body = row.body.clone().unwrap_or_default();
+    let resolved_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
+    let source_hash =
+        release_detail_source_hash(&resolved_full_name, &original_title, &original_body);
+    let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
+
+    let translated = if state.config.ai.is_none() {
+        Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+        })
+    } else if translation_fresh
+        && release_detail_translation_ready(
+            Some(original_body.as_str()),
+            row.trans_summary.as_deref(),
+        )
+    {
+        Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "ready".to_owned(),
+            title: row.trans_title.clone(),
+            summary: row.trans_summary.clone(),
+        })
+    } else {
+        Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "missing".to_owned(),
+            title: None,
+            summary: None,
+        })
+    };
 
     Ok(Json(ReleaseDetailResponse {
         release_id: row.release_id.to_string(),
-        full_name,
+        repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
         tag_name: row.tag_name,
         name: row.name,
-        title,
-        body: row.body.unwrap_or_default(),
+        body: row.body,
         html_url: row.html_url,
         published_at: row.published_at,
         is_prerelease: row.is_prerelease,
         is_draft: row.is_draft,
+        translated,
     }))
 }
 
@@ -937,6 +985,36 @@ fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
         }
     }
     Ok(())
+}
+
+fn parse_release_id_param(raw: &str) -> Result<i64, ApiError> {
+    let release_id_raw = raw.trim();
+    if release_id_raw.is_empty() {
+        return Err(ApiError::bad_request("release_id is required"));
+    }
+    release_id_raw
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))
+}
+
+fn release_detail_source_hash(
+    repo_full_name: &str,
+    original_title: &str,
+    original_body: &str,
+) -> String {
+    let source = format!(
+        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
+        repo_full_name, original_title, original_body
+    );
+    ai::sha256_hex(&source)
+}
+
+fn release_detail_translation_ready(body: Option<&str>, summary: Option<&str>) -> bool {
+    let body_has_content = body.map(str::trim).is_some_and(|s| !s.is_empty());
+    if !body_has_content {
+        return true;
+    }
+    summary.map(str::trim).is_some_and(|s| !s.is_empty())
 }
 
 fn has_repo_scope(scopes: &str) -> bool {
@@ -2100,14 +2178,6 @@ pub struct TranslateResponse {
     summary: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TranslateReleaseDetailResponse {
-    lang: String,
-    status: String, // ready | disabled
-    title: Option<String>,
-    body_markdown: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct TranslationJson {
     title_zh: Option<String>,
@@ -2663,22 +2733,16 @@ pub async fn translate_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
     Json(req): Json<TranslateReleaseDetailRequest>,
-) -> Result<Json<TranslateReleaseDetailResponse>, ApiError> {
+) -> Result<Json<TranslateResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
-    let release_id_raw = req.release_id.trim();
-    if release_id_raw.is_empty() {
-        return Err(ApiError::bad_request("release_id is required"));
-    }
-    let release_id: i64 = release_id_raw
-        .parse()
-        .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
+    let release_id = parse_release_id_param(&req.release_id)?;
 
     if state.config.ai.is_none() {
-        return Ok(Json(TranslateReleaseDetailResponse {
+        return Ok(Json(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "disabled".to_owned(),
             title: None,
-            body_markdown: None,
+            summary: None,
         }));
     }
 
@@ -2723,11 +2787,7 @@ pub async fn translate_release_detail(
     let original_body = row.body.unwrap_or_default();
     let repo_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
 
-    let source = format!(
-        "v=1\nkind=release_detail\nrepo={}\ntitle={}\nbody={}\n",
-        repo_full_name, original_title, original_body
-    );
-    let source_hash = ai::sha256_hex(&source);
+    let source_hash = release_detail_source_hash(&repo_full_name, &original_title, &original_body);
     let entity_id = release_id.to_string();
 
     #[derive(Debug, sqlx::FromRow)]
@@ -2752,12 +2812,13 @@ pub async fn translate_release_detail(
 
     if let Some(cached) = cached
         && cached.source_hash == source_hash
+        && release_detail_translation_ready(Some(original_body.as_str()), cached.summary.as_deref())
     {
-        return Ok(Json(TranslateReleaseDetailResponse {
+        return Ok(Json(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "ready".to_owned(),
             title: cached.title,
-            body_markdown: cached.summary,
+            summary: cached.summary,
         }));
     }
 
@@ -2802,6 +2863,15 @@ pub async fn translate_release_detail(
 
         translated_chunks.join("")
     };
+    let translated_summary = (!body_markdown.trim().is_empty()).then_some(body_markdown);
+    if !release_detail_translation_ready(
+        Some(original_body.as_str()),
+        translated_summary.as_deref(),
+    ) {
+        return Err(ApiError::internal(
+            "release detail translation produced empty summary",
+        ));
+    }
 
     upsert_translation(
         state.as_ref(),
@@ -2812,16 +2882,16 @@ pub async fn translate_release_detail(
             lang: "zh-CN",
             source_hash: &source_hash,
             title: translated_title.as_deref(),
-            summary: Some(body_markdown.as_str()),
+            summary: translated_summary.as_deref(),
         },
     )
     .await?;
 
-    Ok(Json(TranslateReleaseDetailResponse {
+    Ok(Json(TranslateResponse {
         lang: "zh-CN".to_owned(),
         status: "ready".to_owned(),
         title: translated_title,
-        body_markdown: Some(body_markdown),
+        summary: translated_summary,
     }))
 }
 
@@ -3036,11 +3106,14 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 mod tests {
     use super::{
         FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
-        has_repo_scope, markdown_structure_preserved, parse_repo_full_name_from_release_url,
-        parse_translation_json, preserve_chunk_trailing_newline, release_excerpt,
-        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
+        has_repo_scope, markdown_structure_preserved, parse_release_id_param,
+        parse_repo_full_name_from_release_url, parse_translation_json,
+        preserve_chunk_trailing_newline, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_reactions_status,
+        resolve_release_full_name, split_markdown_chunks,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
     fn test_feed_row(node_id: Option<&str>) -> FeedRow {
         FeedRow {
@@ -3071,6 +3144,84 @@ mod tests {
         }
     }
 
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (1, 30215105, 'IvanLi-CN', ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed user");
+
+        pool
+    }
+
+    async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO releases (
+              user_id, repo_id, release_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind(release_id)
+        .bind("v1.2.3")
+        .bind("Release v1.2.3")
+        .bind("- item")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release");
+    }
+
+    async fn seed_star(pool: &SqlitePool, repo_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(1_i64)
+        .bind(repo_id)
+        .bind("openai/codex")
+        .bind("openai")
+        .bind("codex")
+        .bind("octo rill test")
+        .bind("https://github.com/openai/codex")
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed starred");
+    }
+
     #[test]
     fn has_repo_scope_accepts_comma_delimited_scopes() {
         assert!(has_repo_scope("read:user,user:email,repo,notifications"));
@@ -3084,6 +3235,103 @@ mod tests {
     #[test]
     fn has_repo_scope_rejects_missing_repo_scope() {
         assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
+
+    #[test]
+    fn parse_release_id_param_requires_integer_string() {
+        assert_eq!(parse_release_id_param("123").expect("release id"), 123);
+        assert!(parse_release_id_param("12a").is_err());
+        assert!(parse_release_id_param("   ").is_err());
+    }
+
+    #[test]
+    fn release_detail_translation_ready_requires_summary_for_non_empty_body() {
+        let body = "- item";
+        assert!(!release_detail_translation_ready(Some(body), None));
+        assert!(release_detail_translation_ready(Some(body), Some("- 条目")));
+    }
+
+    #[test]
+    fn release_detail_translation_ready_allows_empty_body_without_summary() {
+        assert!(release_detail_translation_ready(Some(""), None));
+        assert!(release_detail_translation_ready(Some("   \n"), None));
+        assert!(release_detail_translation_ready(None, None));
+    }
+
+    #[test]
+    fn release_detail_source_hash_changes_with_content() {
+        let hash1 = release_detail_source_hash("acme/repo", "v1.0.0", "line one");
+        let hash2 = release_detail_source_hash("acme/repo", "v1.0.0", "line two");
+        assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn release_detail_query_is_readable_without_star() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            release_id: i64,
+            repo_full_name: Option<String>,
+        }
+
+        let row = sqlx::query_as::<_, Row>(
+            r#"
+            SELECT r.release_id, sr.full_name AS repo_full_name
+            FROM releases r
+            LEFT JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ? AND r.release_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(1_i64)
+        .bind(120_i64)
+        .fetch_optional(&pool)
+        .await
+        .expect("query detail");
+
+        let row = row.expect("detail row");
+        assert_eq!(row.release_id, 120);
+        assert!(row.repo_full_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_releases_query_keeps_star_visibility_filter() {
+        let pool = setup_pool().await;
+        seed_release(&pool, 42, 120).await;
+
+        let count_without_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases without star");
+        assert_eq!(count_without_star, 0);
+
+        seed_star(&pool, 42).await;
+        let count_with_star: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM releases r
+            JOIN starred_repos sr
+              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+            WHERE r.user_id = ?
+            "#,
+        )
+        .bind(1_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("count releases with star");
+        assert_eq!(count_with_star, 1);
     }
 
     #[test]
