@@ -1,3 +1,4 @@
+import { normalizeReleaseId } from "@/lib/releaseId";
 import { cn } from "@/lib/utils";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -8,9 +9,9 @@ function parseInternalReleaseLink(href: string | undefined): string | null {
 		const url = new URL(href, window.location.origin);
 		if (url.origin !== window.location.origin) return null;
 		if (url.pathname !== "/") return null;
-		const release = url.searchParams.get("release");
+		const release = normalizeReleaseId(url.searchParams.get("release"));
 		const tab = url.searchParams.get("tab");
-		if (!release || !/^\d+$/.test(release)) return null;
+		if (!release) return null;
 		if (tab !== "briefs") return null;
 		return release;
 	} catch {
