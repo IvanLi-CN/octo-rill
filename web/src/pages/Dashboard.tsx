@@ -14,6 +14,7 @@ import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { normalizeReleaseId } from "@/lib/releaseId";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -82,8 +83,7 @@ function sortNotifications(items: NotificationItem[]) {
 
 function parseDashboardQuery() {
 	const params = new URLSearchParams(window.location.search);
-	const rawRelease = params.get("release");
-	const releaseId = rawRelease && /^\d+$/.test(rawRelease) ? rawRelease : null;
+	const releaseId = normalizeReleaseId(params.get("release"));
 	if (releaseId) {
 		return { tab: "briefs" as Tab, releaseId };
 	}

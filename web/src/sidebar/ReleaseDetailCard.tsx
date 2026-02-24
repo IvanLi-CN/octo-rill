@@ -15,6 +15,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { normalizeReleaseId } from "@/lib/releaseId";
 
 function formatIsoShort(iso: string | null) {
 	if (!iso) return null;
@@ -28,6 +29,10 @@ export function ReleaseDetailCard(props: {
 	onClose: () => void;
 }) {
 	const { releaseId, onClose } = props;
+	const normalizedReleaseId = useMemo(
+		() => normalizeReleaseId(releaseId),
+		[releaseId],
+	);
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
 	const [loadError, setLoadError] = useState<string | null>(null);
@@ -39,7 +44,7 @@ export function ReleaseDetailCard(props: {
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
 		setTranslating(false);
-		if (!releaseId) {
+		if (!normalizedReleaseId) {
 			setDetail(null);
 			setLoadError(null);
 			setTranslateError(null);
@@ -51,7 +56,7 @@ export function ReleaseDetailCard(props: {
 		setLoadError(null);
 		setTranslateError(null);
 		setShowOriginal(false);
-		void apiGetReleaseDetail(releaseId)
+		void apiGetReleaseDetail(normalizedReleaseId)
 			.then((res) => {
 				if (!active) return;
 				setDetail(res);
@@ -69,12 +74,12 @@ export function ReleaseDetailCard(props: {
 		return () => {
 			active = false;
 		};
-	}, [releaseId]);
+	}, [normalizedReleaseId]);
 
 	const activeDetail = useMemo(() => {
-		if (!releaseId || !detail) return null;
-		return detail.release_id === releaseId ? detail : null;
-	}, [detail, releaseId]);
+		if (!normalizedReleaseId || !detail) return null;
+		return detail.release_id === normalizedReleaseId ? detail : null;
+	}, [detail, normalizedReleaseId]);
 
 	const onTranslate = useCallback(() => {
 		if (!activeDetail || translating) return;
@@ -138,7 +143,7 @@ export function ReleaseDetailCard(props: {
 		return titleReady || summaryReady;
 	}, [activeDetail]);
 
-	if (!releaseId) {
+	if (!normalizedReleaseId) {
 		return null;
 	}
 
@@ -149,7 +154,7 @@ export function ReleaseDetailCard(props: {
 					<div className="min-w-0">
 						<CardTitle className="text-base">Release 详情</CardTitle>
 						<CardDescription className="font-mono text-xs">
-							{loading ? "加载中…" : `#${releaseId}`}
+							{loading ? "加载中…" : `#${normalizedReleaseId}`}
 							{activeDetail?.published_at
 								? ` · ${formatIsoShort(activeDetail.published_at)}`
 								: ""}

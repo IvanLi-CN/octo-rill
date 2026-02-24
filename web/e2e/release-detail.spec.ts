@@ -177,3 +177,22 @@ test("detail translate button updates card content", async ({ page }) => {
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
 });
+
+test("deep link with zero-padded release id still resolves detail", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseId: "123",
+		detailTitle: "Release 123",
+	});
+
+	await page.goto("/?tab=briefs&release=00123");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+
+	await expect(page).toHaveURL(/tab=briefs/);
+	await expect(page).toHaveURL(/release=123/);
+	await expect(
+		page.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
+	await expect(page.getByText("#123")).toBeVisible();
+});
