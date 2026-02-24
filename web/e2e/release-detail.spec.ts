@@ -64,9 +64,13 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
 			return json(route, {
-				provider: "openai",
 				configured: false,
-				has_token: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
 			});
 		}
 
@@ -130,6 +134,7 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	});
 
 	await page.goto("/?release=289513858");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
 	await expect(page).toHaveURL(/tab=briefs/);
 	await expect(page).toHaveURL(/release=289513858/);
@@ -147,6 +152,7 @@ test("detail translate button updates card content", async ({ page }) => {
 	await installApiMocks(page);
 
 	await page.goto("/?tab=briefs&release=123");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),

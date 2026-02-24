@@ -260,11 +260,9 @@ pub async fn get_release_detail(
         .unwrap_or(&row.tag_name)
         .to_owned();
     let original_body = row.body.clone().unwrap_or_default();
-    let source_hash = release_detail_source_hash(
-        &resolve_release_full_name(&row.html_url, row.repo_id),
-        &original_title,
-        &original_body,
-    );
+    let resolved_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
+    let source_hash =
+        release_detail_source_hash(&resolved_full_name, &original_title, &original_body);
     let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
 
     let translated = if state.config.ai.is_none() {
@@ -297,7 +295,7 @@ pub async fn get_release_detail(
 
     Ok(Json(ReleaseDetailResponse {
         release_id: row.release_id.to_string(),
-        repo_full_name: row.repo_full_name,
+        repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
         tag_name: row.tag_name,
         name: row.name,
         body: row.body,
