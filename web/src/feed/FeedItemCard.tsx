@@ -6,11 +6,25 @@ import {
 	Card,
 	CardContent,
 	CardDescription,
+	CardFooter,
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
-import type { FeedItem } from "@/feed/types";
+import type { FeedItem, ReactionContent } from "@/feed/types";
 import { cn } from "@/lib/utils";
+
+const REACTION_ITEMS: Array<{
+	content: ReactionContent;
+	emoji: string;
+	label: string;
+}> = [
+	{ content: "plus1", emoji: "👍", label: "赞" },
+	{ content: "laugh", emoji: "😄", label: "笑" },
+	{ content: "heart", emoji: "❤️", label: "爱心" },
+	{ content: "hooray", emoji: "🎉", label: "庆祝" },
+	{ content: "rocket", emoji: "🚀", label: "火箭" },
+	{ content: "eyes", emoji: "👀", label: "关注" },
+];
 
 function formatIsoShort(iso: string) {
 	// "2026-02-21T08:00:00Z" -> "2026-02-21 08:00:00"
@@ -24,15 +38,23 @@ export function FeedItemCard(props: {
 	item: FeedItem;
 	showOriginal: boolean;
 	isTranslating: boolean;
+	isReactionBusy: boolean;
+	reactionError: string | null;
 	onToggleOriginal: () => void;
 	onTranslateNow: () => void;
+	onToggleReaction: (content: ReactionContent) => void;
+	onSyncReleases: () => void;
 }) {
 	const {
 		item,
 		showOriginal,
 		isTranslating,
+		isReactionBusy,
+		reactionError,
 		onToggleOriginal,
 		onTranslateNow,
+		onToggleReaction,
+		onSyncReleases,
 	} = props;
 
 	const kindLabel = "RELEASE";
@@ -70,6 +92,8 @@ export function FeedItemCard(props: {
 	const aiDisabled = item.translated?.status === "disabled";
 	const canTranslate =
 		!aiDisabled && item.translated?.status === "missing" && !isTranslating;
+
+	const reactions = item.reactions;
 
 	return (
 		<Card className="group bg-card/80 shadow-sm transition-shadow hover:shadow-md">
@@ -174,6 +198,60 @@ export function FeedItemCard(props: {
 					</p>
 				</CardContent>
 			)}
+
+			{reactions ? (
+				<CardFooter className="border-border/70 flex flex-wrap items-center gap-2 border-t px-6 py-4">
+					{reactions.status === "ready"
+						? REACTION_ITEMS.map((reaction) => {
+								const active = reactions.viewer[reaction.content];
+								const count = reactions.counts[reaction.content];
+								return (
+									<button
+										key={reaction.content}
+										type="button"
+										onClick={() => onToggleReaction(reaction.content)}
+										className={cn(
+											"group inline-flex cursor-pointer items-center rounded-full border px-2 py-0.5 font-mono text-xs transition-all duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
+											count > 0 && "gap-1",
+											active
+												? "border-primary bg-primary/10 text-primary"
+												: "text-muted-foreground hover:text-foreground border-border",
+											isReactionBusy && "opacity-80",
+										)}
+										title={reaction.label}
+									>
+										<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
+											{reaction.emoji}
+										</span>
+										{count > 0 ? <span>{count}</span> : null}
+									</button>
+								);
+							})
+						: null}
+
+					{reactions.status === "sync_required" ? (
+						<>
+							<span className="text-muted-foreground font-mono text-[11px]">
+								反馈表情尚未就绪，请先同步 releases
+							</span>
+							<Button
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+								onClick={onSyncReleases}
+							>
+								Sync releases
+							</Button>
+						</>
+					) : null}
+
+					{reactionError ? (
+						<span className="text-destructive w-full font-mono text-[11px]">
+							{reactionError}
+						</span>
+					) : null}
+				</CardFooter>
+			) : null}
 		</Card>
 	);
 }
