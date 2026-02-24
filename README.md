@@ -1,6 +1,6 @@
 # OctoRill
 
-OctoRill 是一个 GitHub 信息聚合与阅读界面：把 Releases 整理成类似 GitHub dashboard 的信息流，并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 Release 日报与 Inbox 快捷入口。所有可操作入口最终都会跳转回 GitHub 完成操作。
+OctoRill 是一个 GitHub 信息聚合与阅读界面：把 Releases 整理成类似 GitHub dashboard 的信息流，并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 Release 日报与 Inbox 快捷入口。
 
 更多产品与交互说明见：`docs/product.md`。
 
@@ -25,7 +25,7 @@ Copy `.env.example` to `.env` and fill values.
   - `AI_API_KEY`
   - `AI_BASE_URL`
   - `AI_MODEL`
-  - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界）
+  - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界；不配置时默认 `08:00`）
 
 ### 2) 启动后端
 
@@ -43,14 +43,21 @@ bun run dev
 
 Then open `http://127.0.0.1:55174`.
 
+## Auth model
+
+- OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases）。
+- OAuth scope 策略：采用最小授权，默认不为站内反馈申请额外写权限。
+- Release 反馈（👍 😄 ❤️ 🎉 🚀 👀）写操作：要求用户额外提供 GitHub PAT（Personal Access Token）。
+  - Fine-grained PAT：按 GitHub Reactions 文档可不额外申请 repository permissions，但 token 仍需覆盖目标仓库。
+  - Classic PAT：公共仓库建议 `public_repo`，私有仓库需 `repo`。
+
 ## Notes
 
 - OAuth callback is handled by the backend (`/auth/github/callback`).
 - Local data (SQLite) lives under `./.data/`.
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
-- Release data is treated as durable factual records; Star only controls current list visibility.
-- Brief deep links (`/?tab=briefs&release=<id>`) open release details even after a repo is unstarred.
-- Release detail reading/translation does not depend on current Star state.
+- Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
+- 日报落库前会做 `release_id` 内链完整性校验与补齐，按查询参数做精确匹配（避免 `12/123` 前缀误判）。
 
 ## Release automation (PR label driven)
 
