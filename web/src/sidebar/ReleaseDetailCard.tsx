@@ -114,6 +114,13 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 		return { title, body };
 	}, [detail, showOriginal]);
 
+	const hasReadyTranslation = useMemo(() => {
+		if (!detail || detail.translated?.status !== "ready") return false;
+		const titleReady = Boolean(detail.translated.title?.trim());
+		const summaryReady = Boolean(detail.translated.summary?.trim());
+		return titleReady || summaryReady;
+	}, [detail]);
+
 	if (!releaseId) {
 		return null;
 	}
@@ -139,16 +146,18 @@ export function ReleaseDetailCard(props: { releaseId: string | null }) {
 							</span>
 						) : (
 							<>
-								<Button
-									variant="ghost"
-									size="sm"
-									className="font-mono text-xs"
-									onClick={() => setShowOriginal((v) => !v)}
-									disabled={loading || !detail}
-								>
-									<Languages className="size-4" />
-									{showOriginal ? "中文" : "原文"}
-								</Button>
+								{hasReadyTranslation ? (
+									<Button
+										variant="ghost"
+										size="sm"
+										className="font-mono text-xs"
+										onClick={() => setShowOriginal((v) => !v)}
+										disabled={loading || !detail}
+									>
+										<Languages className="size-4" />
+										{showOriginal ? "中文" : "原文"}
+									</Button>
+								) : null}
 								<Button
 									variant="ghost"
 									size="sm"
