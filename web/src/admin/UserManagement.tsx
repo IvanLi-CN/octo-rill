@@ -268,6 +268,7 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 									: !user.is_disabled && isLastActiveAdmin
 										? "最后一名启用管理员，不能禁用"
 										: null;
+							const guardHint = adminActionHint ?? disableActionHint;
 							return (
 								<div
 									key={user.id}
@@ -304,6 +305,11 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 												{user.is_disabled ? "已禁用" : "已启用"}
 											</span>
 										</div>
+										{guardHint ? (
+											<p className="text-muted-foreground mt-1 text-xs">
+												{guardHint}
+											</p>
+										) : null}
 									</div>
 									<div className="flex flex-wrap gap-2">
 										<Button
@@ -321,11 +327,6 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 											{user.is_disabled ? "启用" : "禁用"}
 										</Button>
 									</div>
-									{adminActionHint || disableActionHint ? (
-										<p className="text-muted-foreground w-full text-xs">
-											{adminActionHint ?? disableActionHint}
-										</p>
-									) : null}
 								</div>
 							);
 						})
