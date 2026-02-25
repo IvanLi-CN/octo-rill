@@ -3791,9 +3791,12 @@ pub async fn translate_notification(
     if thread_id.is_empty() {
         return Err(ApiError::bad_request("thread_id is required"));
     }
-    let mut items =
-        translate_notifications_batch_internal(state.as_ref(), user_id, &[thread_id.clone()])
-            .await?;
+    let mut items = translate_notifications_batch_internal(
+        state.as_ref(),
+        user_id,
+        std::slice::from_ref(&thread_id),
+    )
+    .await?;
     let Some(item) = items.pop() else {
         return Err(ApiError::internal("missing translation result"));
     };
