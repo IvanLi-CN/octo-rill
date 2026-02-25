@@ -2209,7 +2209,7 @@ pub struct TranslateBatchResponse {
 pub struct TranslateBatchItem {
     id: String,
     lang: String,
-    status: String, // ready | disabled | missing | error
+    status: String, // ready | disabled | missing | error | processing(stream)
     title: Option<String>,
     summary: Option<String>,
     error: Option<String>,
@@ -3284,64 +3284,6 @@ async fn prepare_release_batch(
         pending.push(item.clone());
     }
 
-    let translated_pending = translate_release_candidates_with_ai(state, &pending).await;
-    for (release_id, values) in translated_pending {
-        translated.insert(release_id, values);
-    }
-
-    for item in &candidates {
-        if let Some((title, summary)) = translated.get(&item.release_id) {
-            upsert_translation(
-                state,
-                user_id,
-                TranslationUpsert {
-                    entity_type: "release",
-                    entity_id: &item.entity_id,
-                    lang: "zh-CN",
-                    source_hash: &item.source_hash,
-                    title: title.as_deref(),
-                    summary: summary.as_deref(),
-                },
-            )
-            .await?;
-        }
-    }
-
-    let mut out = Vec::new();
-    for release_id in release_ids {
-        if missing.contains(release_id) {
-            out.push(TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "missing".to_owned(),
-                title: None,
-                summary: None,
-                error: Some("release not found".to_owned()),
-            });
-            continue;
-        }
-
-        if let Some((title, summary)) = translated.get(release_id) {
-            out.push(TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "ready".to_owned(),
-                title: title.clone(),
-                summary: summary.clone(),
-                error: None,
-            });
-        } else {
-            out.push(TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "error".to_owned(),
-                title: None,
-                summary: None,
-                error: Some("translation failed".to_owned()),
-            });
-        }
-    }
-
     Ok(PreparedReleaseBatch {
         candidates,
         pending,
@@ -3519,6 +3461,30 @@ async fn translate_releases_batch_stream_worker(
         }
 
         if !prepared.pending.is_empty() {
+            // Emit immediate in-progress items so the frontend receives stream bytes early
+            // instead of waiting for the first upstream translation response.
+            for item in &prepared.pending {
+                if !send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "item",
+                        item: Some(TranslateBatchItem {
+                            id: item.release_id.to_string(),
+                            lang: "zh-CN".to_owned(),
+                            status: "processing".to_owned(),
+                            title: None,
+                            summary: None,
+                            error: None,
+                        }),
+                        error: None,
+                    },
+                )
+                .await
+                {
+                    return Ok(());
+                }
+            }
+
             let groups = plan_release_translation_groups(state.as_ref(), &prepared.pending).await;
             let mut abort_remaining_batches = false;
             for batch_indices in groups {
