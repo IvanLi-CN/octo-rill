@@ -3,12 +3,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiPostJson } from "@/api";
 import type {
 	FeedItem,
+	TranslateBatchItem,
 	TranslateBatchResponse,
+	TranslateBatchStreamEvent,
 	TranslateResponse,
 } from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
 const BATCH_SIZE = 8;
+const BATCH_FLUSH_DELAY_MS = 300;
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -32,6 +35,7 @@ export function useAutoTranslate(params: {
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
 	const runningRef = useRef(0);
+	const flushTimerRef = useRef<number | null>(null);
 
 	// Force re-renders when in-flight state changes (refs don't trigger renders).
 	const [, forceRender] = useState(0);
@@ -52,6 +56,89 @@ export function useAutoTranslate(params: {
 			},
 		);
 	}, []);
+
+	const translateBatchStream = useCallback(
+		async (
+			items: FeedItem[],
+			onItem: (item: TranslateBatchItem) => void,
+		): Promise<void> => {
+			const res = await fetch("/api/translate/releases/batch/stream", {
+				method: "POST",
+				credentials: "include",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					release_ids: items.map((item) => item.id),
+				}),
+			});
+
+			if (!res.ok) {
+				let msg = `translate stream failed (${res.status})`;
+				try {
+					const body = (await res.json()) as {
+						error?: { message?: string };
+					};
+					if (body?.error?.message) msg = body.error.message;
+				} catch {
+					// Keep fallback message.
+				}
+				throw new Error(msg);
+			}
+
+			if (!res.body) {
+				throw new Error("translate stream missing response body");
+			}
+
+			const reader = res.body.getReader();
+			const decoder = new TextDecoder();
+			let buffer = "";
+			let doneEventSeen = false;
+
+			const handleLine = (rawLine: string) => {
+				const line = rawLine.trim();
+				if (!line) return;
+				let evt: TranslateBatchStreamEvent;
+				try {
+					evt = JSON.parse(line) as TranslateBatchStreamEvent;
+				} catch {
+					// Ignore malformed lines to keep stream resilient.
+					return;
+				}
+				if (evt.event === "item" && evt.item) {
+					onItem(evt.item);
+				}
+				if (evt.event === "error") {
+					throw new Error(evt.error ?? "translate stream failed");
+				}
+				if (evt.event === "done") {
+					doneEventSeen = true;
+				}
+			};
+
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				buffer += decoder.decode(value, { stream: true });
+
+				let newlineIdx = buffer.indexOf("\n");
+				while (newlineIdx >= 0) {
+					const line = buffer.slice(0, newlineIdx);
+					buffer = buffer.slice(newlineIdx + 1);
+					handleLine(line);
+					newlineIdx = buffer.indexOf("\n");
+				}
+			}
+
+			buffer += decoder.decode();
+			if (buffer.trim()) {
+				handleLine(buffer);
+			}
+
+			if (!doneEventSeen) {
+				throw new Error("translate stream ended before done event");
+			}
+		},
+		[],
+	);
 
 	const pump = useCallback(() => {
 		if (!enabled) return;
@@ -81,46 +168,66 @@ export function useAutoTranslate(params: {
 			runningRef.current += 1;
 			forceRender((x) => x + 1);
 
-			void translateBatch(batchItems)
-				.then((res) => {
-					const byId = new Map(res.items.map((item) => [item.id, item]));
+			const byId = new Map(batchItems.map((item) => [item.id, item]));
+			const handled = new Set<string>();
+
+			void translateBatchStream(batchItems, (translated) => {
+				const item = byId.get(translated.id);
+				if (!item) return;
+				const key = keyOf(item);
+				if (handled.has(key)) return;
+				handled.add(key);
+
+				inFlightRef.current.delete(key);
+				if (
+					translated.status === "ready" ||
+					translated.status === "disabled"
+				) {
+					onTranslated(item, {
+						lang: translated.lang,
+						status: translated.status === "disabled" ? "disabled" : "ready",
+						title: translated.title,
+						summary: translated.summary,
+					});
+					if (translated.status === "disabled") {
+						failedRef.current.add(key);
+					}
+				} else {
+					failedRef.current.add(key);
+				}
+				forceRender((x) => x + 1);
+			})
+				.catch(() => {
 					for (const item of batchItems) {
 						const key = keyOf(item);
-						const translated = byId.get(item.id);
-						if (
-							translated &&
-							(translated.status === "ready" ||
-								translated.status === "disabled")
-						) {
-							onTranslated(item, {
-								lang: translated.lang,
-								status: translated.status === "disabled" ? "disabled" : "ready",
-								title: translated.title,
-								summary: translated.summary,
-							});
-							if (translated.status === "disabled") {
-								failedRef.current.add(key);
-							}
-						} else {
+						if (!handled.has(key)) {
 							failedRef.current.add(key);
 						}
 					}
 				})
-				.catch(() => {
-					for (const item of batchItems) {
-						failedRef.current.add(keyOf(item));
-					}
-				})
 				.finally(() => {
 					for (const item of batchItems) {
-						inFlightRef.current.delete(keyOf(item));
+						const key = keyOf(item);
+						if (!handled.has(key)) {
+							failedRef.current.add(key);
+						}
+						inFlightRef.current.delete(key);
 					}
 					runningRef.current -= 1;
 					forceRender((x) => x + 1);
 					pump();
 				});
 		}
-	}, [enabled, onTranslated, shouldAutoTranslate, translateBatch]);
+	}, [enabled, onTranslated, shouldAutoTranslate, translateBatchStream]);
+
+	const schedulePump = useCallback(() => {
+		if (!enabled) return;
+		if (flushTimerRef.current !== null) return;
+		flushTimerRef.current = window.setTimeout(() => {
+			flushTimerRef.current = null;
+			pump();
+		}, BATCH_FLUSH_DELAY_MS);
+	}, [enabled, pump]);
 
 	const enqueue = useCallback(
 		(key: string) => {
@@ -128,9 +235,9 @@ export function useAutoTranslate(params: {
 			if (inFlightRef.current.has(key) || failedRef.current.has(key)) return;
 			if (queuedRef.current.includes(key)) return;
 			queuedRef.current.push(key);
-			pump();
+			schedulePump();
 		},
-		[enabled, pump],
+		[enabled, schedulePump],
 	);
 
 	const register = useCallback(
@@ -190,6 +297,10 @@ export function useAutoTranslate(params: {
 
 	useEffect(() => {
 		if (!enabled) {
+			if (flushTimerRef.current !== null) {
+				window.clearTimeout(flushTimerRef.current);
+				flushTimerRef.current = null;
+			}
 			observerRef.current?.disconnect();
 			observerRef.current = null;
 			return;
@@ -213,6 +324,10 @@ export function useAutoTranslate(params: {
 		}
 
 		return () => {
+			if (flushTimerRef.current !== null) {
+				window.clearTimeout(flushTimerRef.current);
+				flushTimerRef.current = null;
+			}
 			observerRef.current?.disconnect();
 			observerRef.current = null;
 		};
