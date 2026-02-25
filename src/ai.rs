@@ -236,6 +236,7 @@ pub fn compute_daily_window(at: Option<NaiveTime>, now: chrono::DateTime<Local>)
     }
 }
 
+#[cfg(test)]
 pub fn recent_key_dates(
     at: NaiveTime,
     now: chrono::DateTime<Local>,
@@ -1094,11 +1095,20 @@ pub async fn generate_daily_brief_for_key_date(
     user_id: i64,
     key_date: NaiveDate,
 ) -> Result<String> {
+    let at = resolve_daily_boundary(state.config.ai_daily_at_local);
+    generate_daily_brief_for_key_date_at(state, user_id, key_date, at).await
+}
+
+pub async fn generate_daily_brief_for_key_date_at(
+    state: &AppState,
+    user_id: i64,
+    key_date: NaiveDate,
+    at: NaiveTime,
+) -> Result<String> {
     if state.config.ai.is_none() {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     }
 
-    let at = resolve_daily_boundary(state.config.ai_daily_at_local);
     let window = daily_window_for_key_date(key_date, at);
     let content = build_brief_content(state, &window, user_id).await?;
 

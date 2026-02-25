@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { ApiError, apiGet } from "@/api";
+import { AdminJobs } from "@/pages/AdminJobs";
 import { AdminPanel } from "@/pages/AdminPanel";
 import { Dashboard } from "@/pages/Dashboard";
 import { Landing } from "@/pages/Landing";
@@ -24,7 +25,9 @@ function App() {
 	const isLoggedIn = Boolean(me?.user?.id);
 	const normalizedPathname =
 		window.location.pathname.replace(/\/+$/, "") || "/";
-	const isAdminRoute = normalizedPathname === "/admin";
+	const isAdminUsersRoute = normalizedPathname === "/admin";
+	const isAdminJobsRoute = normalizedPathname === "/admin/jobs";
+	const isAdminRoute = isAdminUsersRoute || isAdminJobsRoute;
 
 	useEffect(() => {
 		(async () => {
@@ -51,8 +54,11 @@ function App() {
 		return <Landing bootError={bootError} />;
 	}
 
-	if (isAdminRoute && me.user.is_admin) {
+	if (isAdminUsersRoute && me.user.is_admin) {
 		return <AdminPanel me={me} />;
+	}
+	if (isAdminJobsRoute && me.user.is_admin) {
+		return <AdminJobs me={me} />;
 	}
 
 	return <Dashboard me={me} />;

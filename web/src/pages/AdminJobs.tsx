@@ -1,4 +1,4 @@
-import { UserManagement } from "@/admin/UserManagement";
+import { JobManagement } from "@/admin/JobManagement";
 import { Button } from "@/components/ui/button";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -15,7 +15,7 @@ type MeResponse = {
 	};
 };
 
-export function AdminPanel(props: { me: MeResponse }) {
+export function AdminJobs(props: { me: MeResponse }) {
 	const { me } = props;
 
 	return (
@@ -24,9 +24,7 @@ export function AdminPanel(props: { me: MeResponse }) {
 				<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 					<div className="min-w-0">
 						<div className="flex flex-wrap items-center gap-2">
-							<h1 className="text-xl font-semibold tracking-tight">
-								管理员面板
-							</h1>
+							<h1 className="text-xl font-semibold tracking-tight">任务中心</h1>
 							<span className="text-muted-foreground font-mono text-xs">
 								OctoRill
 							</span>
@@ -42,7 +40,7 @@ export function AdminPanel(props: { me: MeResponse }) {
 
 					<div className="flex flex-wrap gap-2">
 						<Button asChild variant="outline">
-							<a href="/admin/jobs">任务中心</a>
+							<a href="/admin">用户管理</a>
 						</Button>
 						<Button asChild variant="secondary">
 							<a href="/">返回仪表盘</a>
@@ -55,12 +53,7 @@ export function AdminPanel(props: { me: MeResponse }) {
 			}
 			footer={<AppMetaFooter />}
 		>
-			<div className="space-y-4">
-				<p className="text-muted-foreground text-sm">
-					这是独立的管理员界面，当前包含用户管理与任务中心两个模块。
-				</p>
-				<UserManagement currentUserId={me.user.id} />
-			</div>
+			<JobManagement currentUserId={me.user.id} />
 		</AppShell>
 	);
 }
