@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { UserManagement } from "@/admin/UserManagement";
 import { ApiError, apiGet, apiPost, apiPostJson, apiPutJson } from "@/api";
 import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
@@ -24,7 +25,7 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
-type Tab = "all" | "releases" | "briefs" | "inbox";
+type Tab = "all" | "releases" | "briefs" | "inbox" | "admin";
 
 type MeResponse = {
 	user: {
@@ -34,6 +35,7 @@ type MeResponse = {
 		name: string | null;
 		avatar_url: string | null;
 		email: string | null;
+		is_admin: boolean;
 	};
 };
 
@@ -90,7 +92,10 @@ function parseDashboardQuery() {
 
 	const rawTab = params.get("tab");
 	const tab: Tab =
-		rawTab === "releases" || rawTab === "briefs" || rawTab === "inbox"
+		rawTab === "releases" ||
+		rawTab === "briefs" ||
+		rawTab === "inbox" ||
+		rawTab === "admin"
 			? rawTab
 			: "all";
 	return { tab, releaseId };
@@ -139,6 +144,7 @@ function firstPendingReactionContent(
 
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
+	const isAdmin = me.user.is_admin;
 
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
@@ -582,6 +588,12 @@ export function Dashboard(props: { me: MeResponse }) {
 	}, []);
 
 	useEffect(() => {
+		if (!isAdmin && tab === "admin") {
+			setTab("all");
+		}
+	}, [isAdmin, tab]);
+
+	useEffect(() => {
 		const params = new URLSearchParams(window.location.search);
 		if (tab === "all") {
 			params.delete("tab");
@@ -608,6 +620,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					inboxCount={notifications.length}
 					briefCount={briefs.length}
 					login={me.user.login}
+					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					onRefresh={() => void refreshAll()}
@@ -657,6 +670,16 @@ export function Dashboard(props: { me: MeResponse }) {
 					>
 						Inbox
 					</Button>
+					{isAdmin ? (
+						<Button
+							variant={tab === "admin" ? "default" : "outline"}
+							size="sm"
+							className="font-mono text-xs"
+							onClick={() => onSelectTab("admin")}
+						>
+							管理员
+						</Button>
+					) : null}
 				</div>
 
 				{busy ? (
@@ -745,6 +768,9 @@ export function Dashboard(props: { me: MeResponse }) {
 					) : null}
 
 					{tab === "inbox" ? <InboxList notifications={notifications} /> : null}
+					{tab === "admin" && isAdmin ? (
+						<UserManagement currentUserId={me.user.id} />
+					) : null}
 				</section>
 
 				<aside className="space-y-6">

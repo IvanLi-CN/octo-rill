@@ -163,6 +163,7 @@ function DashboardPreview() {
 					inboxCount={mockNotifs.length}
 					briefCount={mockBriefs.length}
 					login="storybook-user"
+					isAdmin
 					aiDisabledHint={aiDisabledHint}
 					busy={false}
 					onRefresh={() => {}}

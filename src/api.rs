@@ -41,6 +41,7 @@ pub struct UserSummary {
     name: Option<String>,
     avatar_url: Option<String>,
     email: Option<String>,
+    is_admin: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -51,27 +52,18 @@ struct UserRow {
     name: Option<String>,
     avatar_url: Option<String>,
     email: Option<String>,
+    is_admin: i64,
 }
 
 pub async fn me(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<MeResponse>, ApiError> {
-    let Some(user_id) = session
-        .get::<i64>("user_id")
-        .await
-        .map_err(ApiError::internal)?
-    else {
-        return Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "not logged in",
-        ));
-    };
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     let row = sqlx::query_as::<_, UserRow>(
         r#"
-        SELECT id, github_user_id, login, name, avatar_url, email
+        SELECT id, github_user_id, login, name, avatar_url, email, is_admin
         FROM users
         WHERE id = ?
         "#,
@@ -98,8 +90,307 @@ pub async fn me(
             name: row.name,
             avatar_url: row.avatar_url,
             email: row.email,
+            is_admin: row.is_admin != 0,
         },
     }))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminUserItem {
+    id: i64,
+    github_user_id: i64,
+    login: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    email: Option<String>,
+    is_admin: bool,
+    is_disabled: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUsersListResponse {
+    items: Vec<AdminUserItem>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminUsersQuery {
+    query: Option<String>,
+    role: Option<String>,
+    status: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminUserPatchRequest {
+    is_admin: Option<bool>,
+    is_disabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AdminUserUpdateGuard {
+    acting_user_id: i64,
+    target_user_id: i64,
+    target_is_admin: bool,
+    target_is_disabled: bool,
+    next_is_admin: bool,
+    next_is_disabled: bool,
+    admin_count: i64,
+    active_admin_count: i64,
+}
+
+fn guard_admin_user_update(guard: AdminUserUpdateGuard) -> Result<(), ApiError> {
+    if guard.target_user_id == guard.acting_user_id && guard.next_is_disabled {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "cannot_disable_self",
+            "admin cannot disable self",
+        ));
+    }
+
+    if guard.target_is_admin && !guard.next_is_admin && guard.admin_count <= 1 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_admin_guard",
+            "at least one admin is required",
+        ));
+    }
+
+    let target_is_active_admin = guard.target_is_admin && !guard.target_is_disabled;
+    let next_is_active_admin = guard.next_is_admin && !guard.next_is_disabled;
+    if target_is_active_admin && !next_is_active_admin && guard.active_admin_count <= 1 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_admin_guard",
+            "at least one active admin is required",
+        ));
+    }
+
+    Ok(())
+}
+
+pub async fn admin_list_users(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminUsersQuery>,
+) -> Result<Json<AdminUsersListResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let role = query.role.unwrap_or_else(|| "all".to_owned());
+    if role != "all" && role != "admin" && role != "user" {
+        return Err(ApiError::bad_request("invalid role filter"));
+    }
+    let status = query.status.unwrap_or_else(|| "all".to_owned());
+    if status != "all" && status != "enabled" && status != "disabled" {
+        return Err(ApiError::bad_request("invalid status filter"));
+    }
+
+    let page = query.page.unwrap_or(1);
+    if page < 1 {
+        return Err(ApiError::bad_request("page must be >= 1"));
+    }
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let query_text = query.query.unwrap_or_default().trim().to_lowercase();
+    let query_like = format!("%{query_text}%");
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM users
+        WHERE
+          (? = '' OR lower(login) LIKE ? OR lower(COALESCE(name, '')) LIKE ? OR lower(COALESCE(email, '')) LIKE ?)
+          AND (? = 'all' OR (? = 'admin' AND is_admin = 1) OR (? = 'user' AND is_admin = 0))
+          AND (? = 'all' OR (? = 'enabled' AND is_disabled = 0) OR (? = 'disabled' AND is_disabled = 1))
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .bind(query_like.as_str())
+    .bind(query_like.as_str())
+    .bind(role.as_str())
+    .bind(role.as_str())
+    .bind(role.as_str())
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminUserItem>(
+        r#"
+        SELECT
+          id,
+          github_user_id,
+          login,
+          name,
+          avatar_url,
+          email,
+          is_admin,
+          is_disabled,
+          created_at,
+          updated_at
+        FROM users
+        WHERE
+          (? = '' OR lower(login) LIKE ? OR lower(COALESCE(name, '')) LIKE ? OR lower(COALESCE(email, '')) LIKE ?)
+          AND (? = 'all' OR (? = 'admin' AND is_admin = 1) OR (? = 'user' AND is_admin = 0))
+          AND (? = 'all' OR (? = 'enabled' AND is_disabled = 0) OR (? = 'disabled' AND is_disabled = 1))
+        ORDER BY created_at ASC, id ASC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .bind(query_like.as_str())
+    .bind(query_like.as_str())
+    .bind(role.as_str())
+    .bind(role.as_str())
+    .bind(role.as_str())
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminUsersListResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
+}
+
+pub async fn admin_patch_user(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(target_user_id): Path<i64>,
+    Json(req): Json<AdminUserPatchRequest>,
+) -> Result<Json<AdminUserItem>, ApiError> {
+    let acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    if req.is_admin.is_none() && req.is_disabled.is_none() {
+        return Err(ApiError::bad_request(
+            "at least one field (is_admin/is_disabled) is required",
+        ));
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct AdminPatchTargetRow {
+        id: i64,
+        is_admin: i64,
+        is_disabled: i64,
+    }
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let target = sqlx::query_as::<_, AdminPatchTargetRow>(
+        r#"
+        SELECT id, is_admin, is_disabled
+        FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(target_user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(target) = target else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "user not found",
+        ));
+    };
+
+    let next_is_admin = req.is_admin.unwrap_or(target.is_admin != 0);
+    let next_is_disabled = req.is_disabled.unwrap_or(target.is_disabled != 0);
+
+    let target_is_admin = target.is_admin != 0;
+    let target_is_disabled = target.is_disabled != 0;
+    let target_is_active_admin = target_is_admin && !target_is_disabled;
+    let next_is_active_admin = next_is_admin && !next_is_disabled;
+
+    let admin_count = if target_is_admin && !next_is_admin {
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM users WHERE is_admin = 1"#)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?
+    } else {
+        0
+    };
+
+    let active_admin_count = if target_is_active_admin && !next_is_active_admin {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0"#,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        0
+    };
+
+    guard_admin_user_update(AdminUserUpdateGuard {
+        acting_user_id,
+        target_user_id: target.id,
+        target_is_admin,
+        target_is_disabled,
+        next_is_admin,
+        next_is_disabled,
+        admin_count,
+        active_admin_count,
+    })?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET is_admin = ?, is_disabled = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(if next_is_admin { 1_i64 } else { 0_i64 })
+    .bind(if next_is_disabled { 1_i64 } else { 0_i64 })
+    .bind(now.as_str())
+    .bind(target_user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let updated = sqlx::query_as::<_, AdminUserItem>(
+        r#"
+        SELECT
+          id,
+          github_user_id,
+          login,
+          name,
+          avatar_url,
+          email,
+          is_admin,
+          is_disabled,
+          created_at,
+          updated_at
+        FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(target_user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(updated))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -116,7 +407,7 @@ pub async fn list_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<Vec<StarredRepoItem>>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     let repos = sqlx::query_as::<_, StarredRepoItem>(
         r#"
@@ -150,7 +441,7 @@ pub async fn list_releases(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<Vec<ReleaseItem>>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     let items = sqlx::query_as::<_, ReleaseItem>(
         r#"
@@ -190,7 +481,7 @@ pub async fn get_release_detail(
     session: Session,
     Path(release_id_raw): Path<String>,
 ) -> Result<Json<ReleaseDetailResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let release_id = parse_release_id_param(&release_id_raw)?;
 
     #[derive(Debug, sqlx::FromRow)]
@@ -323,7 +614,7 @@ pub async fn list_notifications(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<Vec<NotificationItem>>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     let items = sqlx::query_as::<_, NotificationItem>(
         r#"
@@ -355,7 +646,7 @@ pub async fn list_briefs(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<Vec<BriefItem>>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
@@ -411,7 +702,7 @@ pub async fn sync_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<sync::SyncStarredResult>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let res = sync::sync_starred(state.as_ref(), user_id)
         .await
         .map_err(ApiError::internal)?;
@@ -422,7 +713,7 @@ pub async fn sync_releases(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<sync::SyncReleasesResult>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let res = sync::sync_releases(state.as_ref(), user_id)
         .await
         .map_err(ApiError::internal)?;
@@ -433,7 +724,7 @@ pub async fn sync_notifications(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<sync::SyncNotificationsResult>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let res = sync::sync_notifications(state.as_ref(), user_id)
         .await
         .map_err(ApiError::internal)?;
@@ -452,7 +743,7 @@ pub async fn generate_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<BriefGenerateResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let content = ai::generate_daily_brief(state.as_ref(), user_id)
         .await
         .map_err(ApiError::internal)?;
@@ -703,7 +994,7 @@ pub async fn reaction_token_status(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<ReactionTokenStatusResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let row = load_reaction_pat_status_row(state.as_ref(), user_id).await?;
     let Some(row) = row else {
         return Ok(Json(ReactionTokenStatusResponse {
@@ -738,7 +1029,7 @@ pub async fn check_reaction_token(
     session: Session,
     Json(req): Json<ReactionTokenRequest>,
 ) -> Result<Json<ReactionTokenCheckResponse>, ApiError> {
-    let _ = require_user_id(&session).await?;
+    let _ = require_active_user_id(state.as_ref(), &session).await?;
     let checked = check_reaction_pat_with_github(state.as_ref(), req.token.as_str()).await?;
     Ok(Json(checked))
 }
@@ -748,7 +1039,7 @@ pub async fn upsert_reaction_token(
     session: Session,
     Json(req): Json<ReactionTokenRequest>,
 ) -> Result<Json<ReactionTokenStatusResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let token = req.token.trim();
     if token.is_empty() {
         return Err(ApiError::bad_request("token is required"));
@@ -1736,7 +2027,7 @@ pub async fn list_feed(
     session: Session,
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<FeedResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     validate_feed_types(q.types.as_deref())?;
 
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
@@ -2014,7 +2305,7 @@ pub async fn toggle_release_reaction(
     session: Session,
     Json(req): Json<ToggleReleaseReactionRequest>,
 ) -> Result<Json<ToggleReleaseReactionResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let release_id_raw = req.release_id.trim();
     if release_id_raw.is_empty() {
         return Err(ApiError::bad_request("release_id is required"));
@@ -2462,7 +2753,7 @@ pub async fn translate_release(
     session: Session,
     Json(req): Json<TranslateReleaseRequest>,
 ) -> Result<Json<TranslateResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let release_id_raw = req.release_id.trim();
     if release_id_raw.is_empty() {
         return Err(ApiError::bad_request("release_id is required"));
@@ -2734,7 +3025,7 @@ pub async fn translate_release_detail(
     session: Session,
     Json(req): Json<TranslateReleaseDetailRequest>,
 ) -> Result<Json<TranslateResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let release_id = parse_release_id_param(&req.release_id)?;
 
     if state.config.ai.is_none() {
@@ -2900,7 +3191,7 @@ pub async fn translate_notification(
     session: Session,
     Json(req): Json<TranslateNotificationRequest>,
 ) -> Result<Json<TranslateResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let thread_id = req.thread_id.trim();
     if thread_id.is_empty() {
         return Err(ApiError::bad_request("thread_id is required"));
@@ -3102,10 +3393,76 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
     Ok(user_id)
 }
 
+fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
+    if is_disabled {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "account is disabled",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SessionAccessRow {
+    is_disabled: i64,
+}
+
+async fn require_active_user_id(state: &AppState, session: &Session) -> Result<i64, ApiError> {
+    let user_id = require_user_id(session).await?;
+    let row = sqlx::query_as::<_, SessionAccessRow>(
+        r#"
+        SELECT is_disabled
+        FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        session.clear().await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "session user not found",
+        ));
+    };
+
+    if let Err(err) = ensure_account_enabled(row.is_disabled != 0) {
+        session.clear().await;
+        return Err(err);
+    }
+
+    Ok(user_id)
+}
+
+async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i64, ApiError> {
+    let user_id = require_active_user_id(state, session).await?;
+    let is_admin =
+        sqlx::query_scalar::<_, i64>(r#"SELECT is_admin FROM users WHERE id = ? LIMIT 1"#)
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    if is_admin == 0 {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden_admin_only",
+            "admin permission required",
+        ));
+    }
+    Ok(user_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
+        AdminUserUpdateGuard, FeedRow, GraphQlError, ensure_account_enabled,
+        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, markdown_structure_preserved, parse_release_id_param,
         parse_repo_full_name_from_release_url, parse_translation_json,
         preserve_chunk_trailing_newline, release_detail_source_hash,
@@ -3235,6 +3592,130 @@ mod tests {
     #[test]
     fn has_repo_scope_rejects_missing_repo_scope() {
         assert!(!has_repo_scope("read:user,user:email,notifications"));
+    }
+
+    #[test]
+    fn ensure_account_enabled_rejects_disabled_user() {
+        let err = ensure_account_enabled(true).expect_err("disabled user should fail");
+        assert_eq!(err.code(), "account_disabled");
+    }
+
+    #[test]
+    fn guard_admin_user_update_rejects_disabling_self() {
+        let err = guard_admin_user_update(AdminUserUpdateGuard {
+            acting_user_id: 7,
+            target_user_id: 7,
+            target_is_admin: true,
+            target_is_disabled: false,
+            next_is_admin: true,
+            next_is_disabled: true,
+            admin_count: 2,
+            active_admin_count: 2,
+        })
+        .expect_err("disabling self must fail");
+        assert_eq!(err.code(), "cannot_disable_self");
+    }
+
+    #[test]
+    fn guard_admin_user_update_rejects_demoting_last_admin() {
+        let err = guard_admin_user_update(AdminUserUpdateGuard {
+            acting_user_id: 1,
+            target_user_id: 2,
+            target_is_admin: true,
+            target_is_disabled: false,
+            next_is_admin: false,
+            next_is_disabled: false,
+            admin_count: 1,
+            active_admin_count: 1,
+        })
+        .expect_err("last admin demotion must fail");
+        assert_eq!(err.code(), "last_admin_guard");
+    }
+
+    #[test]
+    fn guard_admin_user_update_rejects_disabling_last_active_admin() {
+        let err = guard_admin_user_update(AdminUserUpdateGuard {
+            acting_user_id: 1,
+            target_user_id: 2,
+            target_is_admin: true,
+            target_is_disabled: false,
+            next_is_admin: true,
+            next_is_disabled: true,
+            admin_count: 2,
+            active_admin_count: 1,
+        })
+        .expect_err("last active admin disable must fail");
+        assert_eq!(err.code(), "last_admin_guard");
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_earliest_user_as_admin() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              github_user_id INTEGER NOT NULL UNIQUE,
+              login TEXT NOT NULL,
+              name TEXT,
+              avatar_url TEXT,
+              email TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create legacy users table");
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (2, 200, 'later', '2026-02-25T09:00:00Z', '2026-02-25T09:00:00Z'),
+                   (1, 100, 'earlier', '2026-02-25T08:00:00Z', '2026-02-25T08:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert legacy users");
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0006_user_admin_and_disable.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("apply admin migration");
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct UserAdminState {
+            id: i64,
+            is_admin: i64,
+            is_disabled: i64,
+        }
+
+        let rows = sqlx::query_as::<_, UserAdminState>(
+            r#"
+            SELECT id, is_admin, is_disabled
+            FROM users
+            ORDER BY id ASC
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query migrated users");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, 1);
+        assert_eq!(rows[0].is_admin, 1);
+        assert_eq!(rows[0].is_disabled, 0);
+        assert_eq!(rows[1].id, 2);
+        assert_eq!(rows[1].is_admin, 0);
     }
 
     #[test]

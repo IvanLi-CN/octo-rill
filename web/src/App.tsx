@@ -12,6 +12,7 @@ type MeResponse = {
 		name: string | null;
 		avatar_url: string | null;
 		email: string | null;
+		is_admin: boolean;
 	};
 };
 
