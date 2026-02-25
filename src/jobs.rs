@@ -759,6 +759,13 @@ async fn execute_daily_slot_task(
         }));
     }
 
+    if failed > 0 && succeeded == 0 {
+        return Err(anyhow!(
+            "daily slot {hour_utc:02} failed for all users (failed={failed}, total={})",
+            users.len()
+        ));
+    }
+
     Ok(json!({
         "hour_utc": hour_utc,
         "total": users.len(),

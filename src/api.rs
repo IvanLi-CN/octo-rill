@@ -505,7 +505,7 @@ pub async fn admin_jobs_overview(
         SELECT COUNT(*)
         FROM job_tasks
         WHERE status = 'failed'
-          AND finished_at >= datetime('now', '-1 day')
+          AND datetime(finished_at) >= datetime('now', '-1 day')
         "#,
     )
     .fetch_one(&state.pool)
@@ -516,7 +516,7 @@ pub async fn admin_jobs_overview(
         SELECT COUNT(*)
         FROM job_tasks
         WHERE status = 'succeeded'
-          AND finished_at >= datetime('now', '-1 day')
+          AND datetime(finished_at) >= datetime('now', '-1 day')
         "#,
     )
     .fetch_one(&state.pool)
@@ -716,6 +716,18 @@ pub struct AdminTaskActionResponse {
     status: String,
 }
 
+fn map_job_action_error(err: anyhow::Error) -> ApiError {
+    match err.to_string().as_str() {
+        "task not found" => ApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found"),
+        "only finished tasks can be retried" => ApiError::new(
+            StatusCode::CONFLICT,
+            "invalid_task_state",
+            "only finished tasks can be retried",
+        ),
+        _ => ApiError::internal(err),
+    }
+}
+
 pub async fn admin_retry_realtime_task(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -724,7 +736,7 @@ pub async fn admin_retry_realtime_task(
     let acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let task = jobs::retry_task(state.as_ref(), task_id.as_str(), acting_user_id)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(map_job_action_error)?;
 
     Ok(Json(AdminTaskActionResponse {
         task_id: task.task_id,
@@ -740,7 +752,7 @@ pub async fn admin_cancel_realtime_task(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let status = jobs::cancel_task(state.as_ref(), task_id.as_str())
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(map_job_action_error)?;
 
     Ok(Json(AdminTaskActionResponse { task_id, status }))
 }
@@ -4137,7 +4149,7 @@ mod tests {
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
         admin_list_users, admin_patch_user, admin_users_offset, ensure_account_enabled,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, markdown_structure_preserved, parse_release_id_param,
+        has_repo_scope, map_job_action_error, markdown_structure_preserved, parse_release_id_param,
         parse_repo_full_name_from_release_url, parse_translation_json,
         preserve_chunk_trailing_newline, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_reactions_status,
@@ -4405,6 +4417,18 @@ mod tests {
     fn admin_users_offset_rejects_overflow_page() {
         let err = admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
         assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn map_job_action_error_maps_not_found() {
+        let err = map_job_action_error(anyhow::anyhow!("task not found"));
+        assert_eq!(err.code(), "not_found");
+    }
+
+    #[test]
+    fn map_job_action_error_maps_invalid_state() {
+        let err = map_job_action_error(anyhow::anyhow!("only finished tasks can be retried"));
+        assert_eq!(err.code(), "invalid_task_state");
     }
 
     #[tokio::test]
