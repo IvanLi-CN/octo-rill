@@ -3680,16 +3680,12 @@ mod tests {
 
     #[test]
     fn admin_users_offset_supports_first_page() {
-        assert_eq!(
-            admin_users_offset(1, 20).expect("first page offset"),
-            0
-        );
+        assert_eq!(admin_users_offset(1, 20).expect("first page offset"), 0);
     }
 
     #[test]
     fn admin_users_offset_rejects_overflow_page() {
-        let err =
-            admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
+        let err = admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
         assert_eq!(err.code(), "bad_request");
     }
 
