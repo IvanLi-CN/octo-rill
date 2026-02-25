@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
@@ -8,6 +10,375 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::state::AppState;
+
+const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
+const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MODEL_LIMIT_SAFETY_MIN_TOKENS: u32 = 512;
+const MODEL_LIMIT_SAFETY_RATIO: f64 = 0.05;
+const MODEL_LIMIT_DEFAULT_OUTPUT_TOKENS: u32 = 1_024;
+const MODEL_LIMIT_SOURCE_OPENROUTER: &str = "https://openrouter.ai/api/v1/models";
+const MODEL_LIMIT_SOURCE_LITELLM: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+#[derive(Debug, Default)]
+struct ModelLimitCatalog {
+    synced_limits: HashMap<String, u32>,
+    synced_at: Option<Instant>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModelsResponse {
+    data: Vec<OpenRouterModelItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModelItem {
+    id: String,
+    context_length: Option<u32>,
+}
+
+static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
+static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+
+fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
+    MODEL_LIMIT_CATALOG.get_or_init(|| tokio::sync::RwLock::new(ModelLimitCatalog::default()))
+}
+
+fn normalize_model_name(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase()
+}
+
+fn is_date_suffix(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 11 {
+        return false;
+    }
+    if bytes[0] != b'-' || bytes[5] != b'-' || bytes[8] != b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .enumerate()
+        .all(|(idx, b)| matches!(idx, 0 | 5 | 8) || b.is_ascii_digit())
+}
+
+fn strip_model_suffix(raw: &str) -> String {
+    let mut out = raw.to_owned();
+    if let Some(stripped) = out.strip_suffix("-latest") {
+        out = stripped.to_owned();
+    }
+    if let Some(stripped) = out.strip_suffix("-preview") {
+        out = stripped.to_owned();
+    }
+    if out.len() > 11 {
+        let suffix = &out[out.len() - 11..];
+        if is_date_suffix(suffix) {
+            out.truncate(out.len() - 11);
+        }
+    }
+    out
+}
+
+fn model_aliases(raw: &str) -> Vec<String> {
+    let normalized = normalize_model_name(raw);
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut aliases = Vec::new();
+    aliases.push(normalized.clone());
+
+    if let Some(tail) = normalized.rsplit('/').next() {
+        aliases.push(tail.to_owned());
+    }
+    if let Some(tail) = normalized.rsplit('.').next() {
+        aliases.push(tail.to_owned());
+    }
+
+    let mut expanded = Vec::new();
+    for alias in aliases {
+        let stripped = strip_model_suffix(&alias);
+        expanded.push(alias);
+        if !stripped.is_empty() {
+            expanded.push(stripped);
+        }
+    }
+
+    let mut uniq = HashSet::new();
+    expanded
+        .into_iter()
+        .filter(|alias| !alias.is_empty())
+        .filter(|alias| uniq.insert(alias.clone()))
+        .collect()
+}
+
+fn insert_model_limit(map: &mut HashMap<String, u32>, raw_model: &str, limit: u32) {
+    if limit == 0 {
+        return;
+    }
+    for alias in model_aliases(raw_model) {
+        let entry = map.entry(alias).or_insert(limit);
+        if limit < *entry {
+            *entry = limit;
+        }
+    }
+}
+
+fn builtin_model_limits() -> &'static HashMap<String, u32> {
+    BUILTIN_MODEL_LIMITS.get_or_init(|| {
+        let mut out = HashMap::new();
+        for (model, limit) in [
+            ("openai/gpt-5", 272_000u32),
+            ("openai/gpt-5-mini", 272_000),
+            ("openai/gpt-5-nano", 272_000),
+            ("openai/gpt-4o", 128_000),
+            ("openai/gpt-4o-mini", 128_000),
+            ("openai/gpt-4.1", 1_047_576),
+            ("openai/gpt-4.1-mini", 1_047_576),
+            ("anthropic/claude-3.5-haiku", 200_000),
+            ("anthropic/claude-3.7-sonnet", 200_000),
+            ("anthropic/claude-sonnet-4", 200_000),
+            ("google/gemini-2.5-flash-lite", 1_048_576),
+            ("google/gemini-2.5-flash", 1_048_576),
+            ("google/gemini-2.5-pro", 1_048_576),
+            ("deepseek/deepseek-chat-v3.1", 32_768),
+            ("deepseek/deepseek-r1-0528", 128_000),
+            ("qwen/qwen3-coder", 262_144),
+        ] {
+            insert_model_limit(&mut out, model, limit);
+        }
+        out
+    })
+}
+
+fn json_value_u32(value: &Value, key: &str) -> Option<u32> {
+    let raw = value.get(key)?;
+    if let Some(v) = raw.as_u64() {
+        return u32::try_from(v).ok();
+    }
+    raw.as_str()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+}
+
+async fn fetch_openrouter_model_limits(state: &AppState) -> Result<HashMap<String, u32>> {
+    let body = state
+        .http
+        .get(MODEL_LIMIT_SOURCE_OPENROUTER)
+        .send()
+        .await
+        .context("openrouter model catalog request failed")?
+        .error_for_status()
+        .context("openrouter model catalog returned error")?
+        .json::<OpenRouterModelsResponse>()
+        .await
+        .context("openrouter model catalog json decode failed")?;
+
+    let mut out = HashMap::new();
+    for item in body.data {
+        if let Some(limit) = item.context_length {
+            insert_model_limit(&mut out, &item.id, limit);
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_litellm_model_limits(state: &AppState) -> Result<HashMap<String, u32>> {
+    let body = state
+        .http
+        .get(MODEL_LIMIT_SOURCE_LITELLM)
+        .send()
+        .await
+        .context("litellm model catalog request failed")?
+        .error_for_status()
+        .context("litellm model catalog returned error")?
+        .json::<Value>()
+        .await
+        .context("litellm model catalog json decode failed")?;
+
+    let Some(map) = body.as_object() else {
+        return Err(anyhow!("litellm model catalog root is not an object"));
+    };
+
+    let mut out = HashMap::new();
+    for (raw_model, payload) in map {
+        if let Some(limit) = json_value_u32(payload, "max_input_tokens") {
+            insert_model_limit(&mut out, raw_model, limit);
+        }
+    }
+    Ok(out)
+}
+
+async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
+    let now = Instant::now();
+    if !force {
+        let guard = model_limit_catalog().read().await;
+        if let Some(at) = guard.synced_at
+            && now.duration_since(at) < MODEL_LIMIT_SYNC_INTERVAL
+        {
+            return Ok(());
+        }
+    }
+
+    let mut merged = HashMap::new();
+    let mut errors = Vec::new();
+
+    match fetch_openrouter_model_limits(state).await {
+        Ok(values) => {
+            for (key, value) in values {
+                insert_model_limit(&mut merged, &key, value);
+            }
+        }
+        Err(err) => errors.push(format!("openrouter: {err}")),
+    }
+
+    match fetch_litellm_model_limits(state).await {
+        Ok(values) => {
+            for (key, value) in values {
+                insert_model_limit(&mut merged, &key, value);
+            }
+        }
+        Err(err) => errors.push(format!("litellm: {err}")),
+    }
+
+    if merged.is_empty() && !errors.is_empty() {
+        return Err(anyhow!(
+            "model catalog refresh failed: {}",
+            errors.join("; ")
+        ));
+    }
+
+    if !errors.is_empty() {
+        tracing::warn!(
+            errors = %errors.join("; "),
+            "model catalog refresh completed with partial failures"
+        );
+    }
+
+    let mut guard = model_limit_catalog().write().await;
+    guard.synced_limits = merged;
+    guard.synced_at = Some(Instant::now());
+    Ok(())
+}
+
+fn lookup_model_limit_in_map(map: &HashMap<String, u32>, model: &str) -> Option<u32> {
+    for alias in model_aliases(model) {
+        if let Some(limit) = map.get(&alias) {
+            return Some(*limit);
+        }
+    }
+    None
+}
+
+pub async fn resolve_model_input_limit(state: &AppState) -> u32 {
+    if let Some(limit) = state.config.ai_model_context_limit {
+        return limit.max(1);
+    }
+
+    let model = state
+        .config
+        .ai
+        .as_ref()
+        .map(|cfg| cfg.model.as_str())
+        .unwrap_or_default();
+    if model.is_empty() {
+        return MODEL_LIMIT_UNKNOWN_FALLBACK;
+    }
+
+    if let Err(err) = refresh_model_limits(state, false).await {
+        tracing::warn!(?err, "model catalog lazy refresh failed");
+    }
+
+    {
+        let guard = model_limit_catalog().read().await;
+        if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model) {
+            return limit.max(1);
+        }
+    }
+
+    if let Some(limit) = lookup_model_limit_in_map(builtin_model_limits(), model) {
+        return limit.max(1);
+    }
+
+    MODEL_LIMIT_UNKNOWN_FALLBACK
+}
+
+pub async fn compute_input_budget(state: &AppState, max_tokens: u32) -> u32 {
+    let model_limit = resolve_model_input_limit(state).await;
+    let output_reserve = max_tokens.max(MODEL_LIMIT_DEFAULT_OUTPUT_TOKENS);
+    let ratio_margin = (f64::from(model_limit) * MODEL_LIMIT_SAFETY_RATIO).ceil() as u32;
+    let margin = ratio_margin.max(MODEL_LIMIT_SAFETY_MIN_TOKENS);
+    model_limit
+        .saturating_sub(output_reserve)
+        .saturating_sub(margin)
+}
+
+pub fn estimate_text_tokens(raw: &str) -> u32 {
+    let chars = raw.chars().count();
+    if chars == 0 {
+        return 1;
+    }
+    let estimated = (chars as f64 / 4.0).ceil() as u32;
+    estimated.max(1)
+}
+
+pub fn pack_batch_indices(
+    estimated_tokens: &[u32],
+    budget: u32,
+    fixed_overhead: u32,
+) -> Vec<Vec<usize>> {
+    if estimated_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = fixed_overhead;
+    let hard_budget = budget.max(fixed_overhead + 1);
+
+    for (idx, token_count) in estimated_tokens.iter().enumerate() {
+        let token_count = *token_count;
+        if current.is_empty() {
+            current.push(idx);
+            current_tokens = fixed_overhead.saturating_add(token_count);
+            continue;
+        }
+
+        if current_tokens.saturating_add(token_count) > hard_budget {
+            out.push(current);
+            current = vec![idx];
+            current_tokens = fixed_overhead.saturating_add(token_count);
+            continue;
+        }
+
+        current.push(idx);
+        current_tokens = current_tokens.saturating_add(token_count);
+    }
+
+    if !current.is_empty() {
+        out.push(current);
+    }
+
+    out
+}
+
+pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        if let Err(err) = refresh_model_limits(state.as_ref(), true).await {
+            tracing::warn!(?err, "model catalog initial refresh failed");
+        }
+
+        let mut interval = tokio::time::interval(MODEL_LIMIT_SYNC_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(err) = refresh_model_limits(state.as_ref(), true).await {
+                tracing::warn!(?err, "model catalog scheduled refresh failed");
+            }
+        }
+    });
+    handle.abort_handle()
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReleaseRow {
@@ -752,6 +1123,37 @@ fn build_project_prompt(full_name: &str, releases: &[ReleaseDigest]) -> String {
     body
 }
 
+fn build_projects_batch_prompt(projects: &[(String, Vec<ReleaseDigest>)]) -> String {
+    let mut body = String::new();
+    body.push_str("你会收到多个仓库在一个时间窗口内的 GitHub Release。请为每个 release 提取 1-4 条变更要点。\n");
+    body.push_str("输出严格 JSON（不要 markdown code block）：\n");
+    body.push_str("{\"items\":[{\"release_id\":123,\"summary_bullets\":[\"...\",\"...\"]}]}\n\n");
+    body.push_str("硬性要求：\n");
+    body.push_str("1) 必须覆盖输入中的每个 release_id；\n");
+    body.push_str("2) 不得新增输入里不存在的事实；\n");
+    body.push_str("3) 不输出任何 URL；\n");
+    body.push_str("4) 可标注 breaking/security/perf/docs/fix 等类型，但条目要简洁。\n\n");
+
+    for (full_name, releases) in projects {
+        body.push_str("====\n");
+        body.push_str("仓库：");
+        body.push_str(full_name);
+        body.push_str("\n");
+        for rel in releases {
+            body.push_str("\n---\n");
+            body.push_str(&format!("release_id: {}\n", rel.release_id));
+            body.push_str(&format!("title: {}\n", rel.title));
+            body.push_str(&format!("published_at: {}\n", rel.published_at));
+            body.push_str(&format!("is_prerelease: {}\n", rel.is_prerelease));
+            body.push_str("notes:\n");
+            body.push_str(&truncate_chars(&rel.body, 4_800));
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body
+}
+
 async fn summarize_project_with_ai(
     state: &AppState,
     full_name: &str,
@@ -789,6 +1191,79 @@ async fn summarize_project_with_ai(
     }
 
     Ok(out)
+}
+
+async fn summarize_projects_with_ai(
+    state: &AppState,
+    projects: &[(String, Vec<ReleaseDigest>)],
+) -> HashMap<i64, Vec<String>> {
+    if projects.is_empty() {
+        return HashMap::new();
+    }
+
+    let estimated = projects
+        .iter()
+        .map(|(_, releases)| {
+            releases
+                .iter()
+                .map(|rel| estimate_text_tokens(&rel.title) + estimate_text_tokens(&rel.body) + 48)
+                .sum::<u32>()
+                .max(1)
+        })
+        .collect::<Vec<_>>();
+    let budget = compute_input_budget(state, 1_400).await;
+    let groups = pack_batch_indices(&estimated, budget, 320);
+
+    let mut merged = HashMap::<i64, Vec<String>>::new();
+    for group in groups {
+        let batch_projects = group
+            .iter()
+            .map(|idx| projects[*idx].clone())
+            .collect::<Vec<_>>();
+        let prompt = build_projects_batch_prompt(&batch_projects);
+
+        let raw = chat_completion(
+            state,
+            "你是一个严谨的发布说明整理助手，擅长在不遗漏关键信息的前提下提炼 GitHub Release 变更。",
+            &prompt,
+            1_400,
+        )
+        .await;
+
+        let mut parsed_ok = false;
+        if let Ok(raw) = raw
+            && let Some(payload) = parse_project_summary_payload(&raw)
+        {
+            parsed_ok = true;
+            for item in payload.items {
+                let bullets = item
+                    .summary_bullets
+                    .into_iter()
+                    .map(|s| sanitize_bullet_text(s.trim()))
+                    .filter(|s| !s.is_empty())
+                    .take(4)
+                    .collect::<Vec<_>>();
+                if !bullets.is_empty() {
+                    merged.insert(item.release_id, bullets);
+                }
+            }
+        }
+        if !parsed_ok {
+            tracing::warn!(
+                "project batch summary parse failed; fallback to per-repo summarization"
+            );
+        }
+
+        for (full_name, releases) in &batch_projects {
+            if let Ok(map) = summarize_project_with_ai(state, full_name, releases).await {
+                for (release_id, bullets) in map {
+                    merged.entry(release_id).or_insert(bullets);
+                }
+            }
+        }
+    }
+
+    merged
 }
 
 fn build_repo_rendered(
@@ -1056,17 +1531,18 @@ async fn build_brief_content(
     .context("failed to query releases for brief")?;
 
     let releases = to_release_digest(rows);
-    let grouped = group_by_repo(&releases);
+    let grouped = group_by_repo(&releases)
+        .into_iter()
+        .collect::<Vec<(String, Vec<ReleaseDigest>)>>();
+
+    let ai_bullets = summarize_projects_with_ai(state, &grouped).await;
 
     let mut repos = Vec::with_capacity(grouped.len());
     for (full_name, project_releases) in grouped {
-        let ai_bullets = summarize_project_with_ai(state, &full_name, &project_releases)
-            .await
-            .ok();
         repos.push(build_repo_rendered(
             &full_name,
             &project_releases,
-            ai_bullets.as_ref(),
+            Some(&ai_bullets),
         ));
     }
 
