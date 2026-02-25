@@ -29,6 +29,7 @@ async function installBaseMocks(
 		patchMode?: "ok" | "conflict_last_admin";
 	},
 ) {
+	let currentUserIsAdmin = options.isAdmin;
 	const users: MockUser[] = [
 		{
 			id: 1,
@@ -70,7 +71,7 @@ async function installBaseMocks(
 					name: "Octo Admin",
 					avatar_url: null,
 					email: "admin@example.com",
-					is_admin: options.isAdmin,
+					is_admin: currentUserIsAdmin,
 				},
 			});
 		}
@@ -100,7 +101,7 @@ async function installBaseMocks(
 		}
 
 		if (pathname === "/api/admin/users") {
-			if (options.adminApiForbidden) {
+			if (options.adminApiForbidden || !currentUserIsAdmin) {
 				return json(
 					route,
 					{
@@ -174,6 +175,9 @@ async function installBaseMocks(
 			}
 			if (typeof body.is_admin === "boolean") {
 				target.is_admin = body.is_admin;
+				if (target.id === 1) {
+					currentUserIsAdmin = body.is_admin;
+				}
 			}
 			if (typeof body.is_disabled === "boolean") {
 				target.is_disabled = body.is_disabled;
@@ -242,6 +246,35 @@ test("admin action error remains visible after list refresh", async ({
 	await expect(
 		page.getByText("至少保留一名启用管理员，当前操作已被拦截。"),
 	).toBeVisible();
+});
+
+test("self-demoted admin is redirected out of admin panel", async ({
+	page,
+}) => {
+	await installBaseMocks(page, { isAdmin: true });
+	await page.goto("/");
+
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page).toHaveURL(/\/admin$/);
+	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+
+	const userRow = page
+		.getByText("octo-user", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	await page.getByRole("button", { name: "确认更改" }).click();
+	await expect(userRow).toContainText("管理员");
+
+	const selfRow = page
+		.getByText("octo-admin（你）", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await selfRow.getByRole("button", { name: "撤销管理员" }).click();
+	await page.getByRole("button", { name: "确认更改" }).click();
+
+	await expect(page).toHaveURL("/");
+	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
 });
 
 test("non-admin user cannot stay on admin route", async ({ page }) => {

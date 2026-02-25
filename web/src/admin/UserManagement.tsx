@@ -123,10 +123,9 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 				);
 			} catch (err) {
 				if (err instanceof ApiError && err.code === "forbidden_admin_only") {
-					setError(toAdminUserErrorMessage(err));
-					setItems([]);
-					setTotal(0);
-					setGuardSummary(DEFAULT_GUARD);
+					// Permission can change within the same session (e.g. self demotion),
+					// so force a full reload to refresh /api/me and exit admin view.
+					window.location.replace("/");
 					return;
 				}
 				setError(toAdminUserErrorMessage(err));
