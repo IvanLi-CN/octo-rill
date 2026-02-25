@@ -2209,6 +2209,34 @@ pub struct TranslateBatchItem {
     error: Option<String>,
 }
 
+fn translate_response_from_batch_item(
+    item: TranslateBatchItem,
+) -> Result<TranslateResponse, ApiError> {
+    let status = match item.status.as_str() {
+        "disabled" => "disabled",
+        "ready" => "ready",
+        "missing" => return Err(ApiError::internal("translation missing")),
+        "error" => {
+            return Err(ApiError::internal(
+                item.error
+                    .unwrap_or_else(|| "translation failed".to_owned()),
+            ));
+        }
+        other => {
+            return Err(ApiError::internal(format!(
+                "unexpected translation status: {other}"
+            )));
+        }
+    };
+
+    Ok(TranslateResponse {
+        lang: item.lang,
+        status: status.to_owned(),
+        title: item.title,
+        summary: item.summary,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct TranslationJson {
     title_zh: Option<String>,
@@ -3035,16 +3063,7 @@ pub async fn translate_release(
             "release not found",
         ));
     }
-    Ok(Json(TranslateResponse {
-        lang: item.lang,
-        status: if item.status == "disabled" {
-            "disabled".to_owned()
-        } else {
-            "ready".to_owned()
-        },
-        title: item.title,
-        summary: item.summary,
-    }))
+    Ok(Json(translate_response_from_batch_item(item)?))
 }
 
 async fn translate_release_detail_chunk(
@@ -3807,16 +3826,7 @@ pub async fn translate_notification(
             "notification not found",
         ));
     }
-    Ok(Json(TranslateResponse {
-        lang: item.lang,
-        status: if item.status == "disabled" {
-            "disabled".to_owned()
-        } else {
-            "ready".to_owned()
-        },
-        title: item.title,
-        summary: item.summary,
-    }))
+    Ok(Json(translate_response_from_batch_item(item)?))
 }
 
 async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
@@ -3837,12 +3847,12 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedRow, GraphQlError, github_graphql_errors_to_api_error, github_graphql_http_error,
-        has_repo_scope, markdown_structure_preserved, parse_release_id_param,
-        parse_repo_full_name_from_release_url, parse_translation_json,
+        FeedRow, GraphQlError, TranslateBatchItem, github_graphql_errors_to_api_error,
+        github_graphql_http_error, has_repo_scope, markdown_structure_preserved,
+        parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         preserve_chunk_trailing_newline, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_reactions_status,
-        resolve_release_full_name, split_markdown_chunks,
+        resolve_release_full_name, split_markdown_chunks, translate_response_from_batch_item,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -3974,6 +3984,37 @@ mod tests {
         assert_eq!(parse_release_id_param("123").expect("release id"), 123);
         assert!(parse_release_id_param("12a").is_err());
         assert!(parse_release_id_param("   ").is_err());
+    }
+
+    #[test]
+    fn translate_response_from_batch_item_keeps_ready_status() {
+        let item = TranslateBatchItem {
+            id: "1".to_owned(),
+            lang: "zh-CN".to_owned(),
+            status: "ready".to_owned(),
+            title: Some("标题".to_owned()),
+            summary: Some("摘要".to_owned()),
+            error: None,
+        };
+        let response =
+            translate_response_from_batch_item(item).expect("ready batch item should succeed");
+        let json = serde_json::to_value(response).expect("serialize response");
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("ready"));
+        assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("标题"));
+    }
+
+    #[test]
+    fn translate_response_from_batch_item_maps_error_to_internal() {
+        let item = TranslateBatchItem {
+            id: "1".to_owned(),
+            lang: "zh-CN".to_owned(),
+            status: "error".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("translation failed".to_owned()),
+        };
+        let err = translate_response_from_batch_item(item).expect_err("error item should fail");
+        assert_eq!(err.code(), "internal_error");
     }
 
     #[test]
