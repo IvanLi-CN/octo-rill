@@ -175,7 +175,18 @@ export function useAutoTranslate(params: {
 				const item = byId.get(translated.id);
 				if (!item) return;
 				const key = keyOf(item);
+
+				if (translated.status === "processing") {
+					// Keep the item in-flight; final ready/missing/disabled status will arrive later.
+					return;
+				}
 				if (handled.has(key)) return;
+				const terminal =
+					translated.status === "ready" ||
+					translated.status === "disabled" ||
+					translated.status === "missing" ||
+					translated.status === "error";
+				if (!terminal) return;
 				handled.add(key);
 
 				inFlightRef.current.delete(key);

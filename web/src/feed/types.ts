@@ -73,7 +73,7 @@ export type TranslateResponse = {
 export type TranslateBatchItem = {
 	id: string;
 	lang: string;
-	status: "ready" | "disabled" | "missing" | "error";
+	status: "ready" | "disabled" | "missing" | "error" | "processing";
 	title: string | null;
 	summary: string | null;
 	error: string | null;
