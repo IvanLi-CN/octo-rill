@@ -14,6 +14,7 @@ const mockAdminUsers: AdminUserItem[] = [
 		email: "admin@example.com",
 		is_admin: true,
 		is_disabled: false,
+		last_active_at: "2026-02-26T08:00:00Z",
 		created_at: "2026-02-25T08:00:00Z",
 		updated_at: "2026-02-25T08:00:00Z",
 	},
@@ -26,6 +27,7 @@ const mockAdminUsers: AdminUserItem[] = [
 		email: "user@example.com",
 		is_admin: false,
 		is_disabled: false,
+		last_active_at: "2026-02-26T07:30:00Z",
 		created_at: "2026-02-25T08:10:00Z",
 		updated_at: "2026-02-25T08:10:00Z",
 	},
@@ -38,6 +40,7 @@ const mockAdminUsers: AdminUserItem[] = [
 		email: "disabled@example.com",
 		is_admin: false,
 		is_disabled: true,
+		last_active_at: null,
 		created_at: "2026-02-25T08:20:00Z",
 		updated_at: "2026-02-25T08:20:00Z",
 	},
@@ -85,6 +88,38 @@ function AdminPanelPreview() {
 								(item) => item.is_admin && !item.is_disabled,
 							).length,
 						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/users/") &&
+				url.pathname.endsWith("/profile") &&
+				req.method === "GET"
+			) {
+				const id = Number(url.pathname.split("/").at(-2));
+				const target = users.find((user) => user.id === id);
+				if (!target) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: { code: "not_found", message: "user not found" },
+						}),
+						{
+							status: 404,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						user_id: target.id,
+						daily_brief_utc_time: "08:00",
+						last_active_at: target.last_active_at,
 					}),
 					{
 						status: 200,

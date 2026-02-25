@@ -1,12 +1,18 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query};
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tower_sessions::Session;
 use url::Url;
 
-use crate::{ai, sync};
+use crate::{ai, jobs, sync};
 use crate::{error::ApiError, state::AppState};
 
 fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
@@ -105,6 +111,7 @@ pub struct AdminUserItem {
     email: Option<String>,
     is_admin: bool,
     is_disabled: bool,
+    last_active_at: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -248,6 +255,7 @@ pub async fn admin_list_users(
           email,
           is_admin,
           is_disabled,
+          last_active_at,
           created_at,
           updated_at
         FROM users
@@ -408,6 +416,7 @@ pub async fn admin_patch_user(
           email,
           is_admin,
           is_disabled,
+          last_active_at,
           created_at,
           updated_at
         FROM users
@@ -421,6 +430,410 @@ pub async fn admin_patch_user(
 
     tx.commit().await.map_err(ApiError::internal)?;
     Ok(Json(updated))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUserProfileResponse {
+    user_id: i64,
+    daily_brief_utc_time: String,
+    last_active_at: Option<String>,
+}
+
+pub async fn admin_get_user_profile(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(user_id): Path<i64>,
+) -> Result<Json<AdminUserProfileResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        r#"
+        SELECT daily_brief_utc_time, last_active_at
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some((daily_brief_utc_time, last_active_at)) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "user not found",
+        ));
+    };
+
+    Ok(Json(AdminUserProfileResponse {
+        user_id,
+        daily_brief_utc_time,
+        last_active_at,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminJobsOverviewResponse {
+    queued: i64,
+    running: i64,
+    failed_24h: i64,
+    succeeded_24h: i64,
+    enabled_scheduled_slots: i64,
+    total_scheduled_slots: i64,
+}
+
+pub async fn admin_jobs_overview(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminJobsOverviewResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let queued =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM job_tasks WHERE status = 'queued'"#)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let running =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM job_tasks WHERE status = 'running'"#)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let failed_24h = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE status = 'failed'
+          AND datetime(finished_at) >= datetime('now', '-1 day')
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let succeeded_24h = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE status = 'succeeded'
+          AND datetime(finished_at) >= datetime('now', '-1 day')
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let enabled_scheduled_slots = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM daily_brief_hour_slots WHERE enabled = 1"#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let total_scheduled_slots =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM daily_brief_hour_slots"#)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminJobsOverviewResponse {
+        queued,
+        running,
+        failed_24h,
+        succeeded_24h,
+        enabled_scheduled_slots,
+        total_scheduled_slots,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRealtimeTasksQuery {
+    status: Option<String>,
+    task_type: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminRealtimeTaskItem {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    cancel_requested: bool,
+    error_message: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRealtimeTasksResponse {
+    items: Vec<AdminRealtimeTaskItem>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+}
+
+pub async fn admin_list_realtime_tasks(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminRealtimeTasksQuery>,
+) -> Result<Json<AdminRealtimeTasksResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = admin_users_offset(page, page_size)?;
+    let status = query.status.unwrap_or_else(|| "all".to_owned());
+    let task_type = query.task_type.unwrap_or_default();
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE (? = 'all' OR status = ?)
+          AND (? = '' OR task_type = ?)
+        "#,
+    )
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(task_type.as_str())
+    .bind(task_type.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminRealtimeTaskItem>(
+        r#"
+        SELECT
+          id,
+          task_type,
+          status,
+          source,
+          requested_by,
+          parent_task_id,
+          cancel_requested,
+          error_message,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM job_tasks
+        WHERE (? = 'all' OR status = ?)
+          AND (? = '' OR task_type = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(task_type.as_str())
+    .bind(task_type.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminRealtimeTasksResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminTaskEventItem {
+    id: i64,
+    event_type: String,
+    payload_json: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRealtimeTaskDetailResponse {
+    task: AdminRealtimeTaskItem,
+    events: Vec<AdminTaskEventItem>,
+}
+
+pub async fn admin_get_realtime_task_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Json<AdminRealtimeTaskDetailResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let task = sqlx::query_as::<_, AdminRealtimeTaskItem>(
+        r#"
+        SELECT
+          id,
+          task_type,
+          status,
+          source,
+          requested_by,
+          parent_task_id,
+          cancel_requested,
+          error_message,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM job_tasks
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found"))?;
+
+    let events = sqlx::query_as::<_, AdminTaskEventItem>(
+        r#"
+        SELECT id, event_type, payload_json, created_at
+        FROM job_task_events
+        WHERE task_id = ?
+        ORDER BY id DESC
+        LIMIT 200
+        "#,
+    )
+    .bind(task_id.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminRealtimeTaskDetailResponse { task, events }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTaskActionResponse {
+    task_id: String,
+    status: String,
+}
+
+fn map_job_action_error(err: anyhow::Error) -> ApiError {
+    match err.to_string().as_str() {
+        "task not found" => ApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found"),
+        "only finished tasks can be retried" => ApiError::new(
+            StatusCode::CONFLICT,
+            "invalid_task_state",
+            "only finished tasks can be retried",
+        ),
+        _ => ApiError::internal(err),
+    }
+}
+
+pub async fn admin_retry_realtime_task(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Json<AdminTaskActionResponse>, ApiError> {
+    let acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task = jobs::retry_task(state.as_ref(), task_id.as_str(), acting_user_id)
+        .await
+        .map_err(map_job_action_error)?;
+
+    Ok(Json(AdminTaskActionResponse {
+        task_id: task.task_id,
+        status: task.status,
+    }))
+}
+
+pub async fn admin_cancel_realtime_task(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Json<AdminTaskActionResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let status = jobs::cancel_task(state.as_ref(), task_id.as_str())
+        .await
+        .map_err(map_job_action_error)?;
+
+    Ok(Json(AdminTaskActionResponse { task_id, status }))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminScheduledSlotItem {
+    hour_utc: i64,
+    enabled: bool,
+    last_dispatch_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminScheduledSlotsResponse {
+    items: Vec<AdminScheduledSlotItem>,
+}
+
+pub async fn admin_list_scheduled_slots(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminScheduledSlotsResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let items = sqlx::query_as::<_, AdminScheduledSlotItem>(
+        r#"
+        SELECT hour_utc, enabled, last_dispatch_at, updated_at
+        FROM daily_brief_hour_slots
+        ORDER BY hour_utc ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(AdminScheduledSlotsResponse { items }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminPatchScheduledSlotRequest {
+    enabled: bool,
+}
+
+pub async fn admin_patch_scheduled_slot(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(hour_utc): Path<i64>,
+    Json(req): Json<AdminPatchScheduledSlotRequest>,
+) -> Result<Json<AdminScheduledSlotItem>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    if !(0..=23).contains(&hour_utc) {
+        return Err(ApiError::bad_request("hour_utc must be 0..23"));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE daily_brief_hour_slots
+        SET enabled = ?, updated_at = ?
+        WHERE hour_utc = ?
+        "#,
+    )
+    .bind(if req.enabled { 1_i64 } else { 0_i64 })
+    .bind(now.as_str())
+    .bind(hour_utc)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let item = sqlx::query_as::<_, AdminScheduledSlotItem>(
+        r#"
+        SELECT hour_utc, enabled, last_dispatch_at, updated_at
+        FROM daily_brief_hour_slots
+        WHERE hour_utc = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(hour_utc)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "slot not found"))?;
+
+    Ok(Json(item))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -728,37 +1141,152 @@ pub async fn list_briefs(
     Ok(Json(items))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ReturnModeQuery {
+    return_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReturnMode {
+    Sync,
+    TaskId,
+    Sse,
+}
+
+impl ReturnMode {
+    fn from_query(query: &ReturnModeQuery) -> Result<Self, ApiError> {
+        let raw = query
+            .return_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("sync");
+        match raw {
+            "sync" => Ok(Self::Sync),
+            "task_id" => Ok(Self::TaskId),
+            "sse" => Ok(Self::Sse),
+            _ => Err(ApiError::bad_request(
+                "invalid return_mode, expected sync|task_id|sse",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TaskAcceptedResponse {
+    mode: String,
+    task_id: String,
+    task_type: String,
+    status: String,
+}
+
+async fn enqueue_or_stream_task(
+    state: Arc<AppState>,
+    mode: ReturnMode,
+    new_task: jobs::NewTask,
+) -> Result<Response, ApiError> {
+    let task = jobs::enqueue_task(state.as_ref(), new_task)
+        .await
+        .map_err(ApiError::internal)?;
+
+    match mode {
+        ReturnMode::TaskId => Ok(Json(TaskAcceptedResponse {
+            mode: "task_id".to_owned(),
+            task_id: task.task_id,
+            task_type: task.task_type,
+            status: task.status,
+        })
+        .into_response()),
+        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id)),
+        ReturnMode::Sync => Err(ApiError::internal("unexpected sync return mode")),
+    }
+}
+
 pub async fn sync_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
-) -> Result<Json<sync::SyncStarredResult>, ApiError> {
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let res = sync::sync_starred(state.as_ref(), user_id)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(res))
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let res = sync::sync_starred(state.as_ref(), user_id)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(res).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_STARRED.to_owned(),
+            payload: json!({ "user_id": user_id }),
+            source: "api.sync_starred".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
 }
 
 pub async fn sync_releases(
     State(state): State<Arc<AppState>>,
     session: Session,
-) -> Result<Json<sync::SyncReleasesResult>, ApiError> {
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let res = sync::sync_releases(state.as_ref(), user_id)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(res))
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let res = sync::sync_releases(state.as_ref(), user_id)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(res).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
+            payload: json!({ "user_id": user_id }),
+            source: "api.sync_releases".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
 }
 
 pub async fn sync_notifications(
     State(state): State<Arc<AppState>>,
     session: Session,
-) -> Result<Json<sync::SyncNotificationsResult>, ApiError> {
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let res = sync::sync_notifications(state.as_ref(), user_id)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(res))
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let res = sync::sync_notifications(state.as_ref(), user_id)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(res).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_NOTIFICATIONS.to_owned(),
+            payload: json!({ "user_id": user_id }),
+            source: "api.sync_notifications".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -772,8 +1300,26 @@ pub struct BriefGenerateResponse {
 pub async fn generate_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
-) -> Result<Json<BriefGenerateResponse>, ApiError> {
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if !matches!(mode, ReturnMode::Sync) {
+        return enqueue_or_stream_task(
+            state,
+            mode,
+            jobs::NewTask {
+                task_type: jobs::TASK_BRIEF_GENERATE.to_owned(),
+                payload: json!({ "user_id": user_id }),
+                source: "api.generate_brief".to_owned(),
+                requested_by: Some(user_id),
+                parent_task_id: None,
+            },
+        )
+        .await;
+    }
+
     let content = ai::generate_daily_brief(state.as_ref(), user_id)
         .await
         .map_err(ApiError::internal)?;
@@ -814,7 +1360,8 @@ pub async fn generate_brief(
         window_start,
         window_end,
         content_markdown: content,
-    }))
+    })
+    .into_response())
 }
 
 #[derive(Debug, Serialize)]
@@ -2778,13 +3325,11 @@ async fn upsert_translation(
     Ok(())
 }
 
-pub async fn translate_release(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Json(req): Json<TranslateReleaseRequest>,
-) -> Result<Json<TranslateResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let release_id_raw = req.release_id.trim();
+pub async fn translate_release_for_user(
+    state: &AppState,
+    user_id: i64,
+    release_id_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
     if release_id_raw.is_empty() {
         return Err(ApiError::bad_request("release_id is required"));
     }
@@ -2793,12 +3338,12 @@ pub async fn translate_release(
         .map_err(|_| ApiError::bad_request("release_id must be an integer string"))?;
 
     if state.config.ai.is_none() {
-        return Ok(Json(TranslateResponse {
+        return Ok(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "disabled".to_owned(),
             title: None,
             summary: None,
-        }));
+        });
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -2889,7 +3434,7 @@ pub async fn translate_release(
 
                 // Normalize the cache so subsequent requests don't have to parse the blob.
                 upsert_translation(
-                    state.as_ref(),
+                    state,
                     user_id,
                     TranslationUpsert {
                         entity_type: "release",
@@ -2902,12 +3447,12 @@ pub async fn translate_release(
                 )
                 .await?;
 
-                return Ok(Json(TranslateResponse {
+                return Ok(TranslateResponse {
                     lang: "zh-CN".to_owned(),
                     status: "ready".to_owned(),
                     title: out_title,
                     summary: out_summary,
-                }));
+                });
             }
         }
 
@@ -2927,19 +3472,19 @@ pub async fn translate_release(
             .map(|s| markdown_structure_preserved(&excerpt, s))
             .unwrap_or(true);
         if !cache_is_json_blob && cache_preserves_structure {
-            return Ok(Json(TranslateResponse {
+            return Ok(TranslateResponse {
                 lang: "zh-CN".to_owned(),
                 status: "ready".to_owned(),
                 title: c.title,
                 summary: c.summary,
-            }));
+            });
         }
     }
 
     let prompt = release_translation_prompt(&row.full_name, &title, &excerpt, None);
 
     let raw = ai::chat_completion(
-        state.as_ref(),
+        state,
         "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
         &prompt,
         900,
@@ -2954,7 +3499,7 @@ pub async fn translate_release(
         let retry_prompt =
             release_translation_prompt(&row.full_name, &title, &excerpt, Some(summary));
         if let Ok(retry_raw) = ai::chat_completion(
-            state.as_ref(),
+            state,
             "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
             &retry_prompt,
             900,
@@ -2973,7 +3518,7 @@ pub async fn translate_release(
     }
 
     upsert_translation(
-        state.as_ref(),
+        state,
         user_id,
         TranslationUpsert {
             entity_type: "release",
@@ -2986,12 +3531,45 @@ pub async fn translate_release(
     )
     .await?;
 
-    Ok(Json(TranslateResponse {
+    Ok(TranslateResponse {
         lang: "zh-CN".to_owned(),
         status: "ready".to_owned(),
         title: out_title,
         summary: out_summary,
-    }))
+    })
+}
+
+pub async fn translate_release(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(mode_query): Query<ReturnModeQuery>,
+    Json(req): Json<TranslateReleaseRequest>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let release_id = req.release_id.trim().to_owned();
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let translated =
+            translate_release_for_user(state.as_ref(), user_id, release_id.as_str()).await?;
+        return Ok(Json(translated).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_TRANSLATE_RELEASE.to_owned(),
+            payload: json!({
+                "user_id": user_id,
+                "release_id": release_id,
+            }),
+            source: "api.translate_release".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
 }
 
 async fn translate_release_detail_chunk(
@@ -3050,21 +3628,20 @@ async fn translate_release_detail_chunk(
     Ok(retry)
 }
 
-pub async fn translate_release_detail(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Json(req): Json<TranslateReleaseDetailRequest>,
-) -> Result<Json<TranslateResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let release_id = parse_release_id_param(&req.release_id)?;
+pub async fn translate_release_detail_for_user(
+    state: &AppState,
+    user_id: i64,
+    release_id_raw: &str,
+) -> Result<TranslateResponse, ApiError> {
+    let release_id = parse_release_id_param(release_id_raw)?;
 
     if state.config.ai.is_none() {
-        return Ok(Json(TranslateResponse {
+        return Ok(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "disabled".to_owned(),
             title: None,
             summary: None,
-        }));
+        });
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -3135,16 +3712,16 @@ pub async fn translate_release_detail(
         && cached.source_hash == source_hash
         && release_detail_translation_ready(Some(original_body.as_str()), cached.summary.as_deref())
     {
-        return Ok(Json(TranslateResponse {
+        return Ok(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "ready".to_owned(),
             title: cached.title,
             summary: cached.summary,
-        }));
+        });
     }
 
     let translated_title = ai::chat_completion(
-        state.as_ref(),
+        state,
         "你是一个翻译助手，只把 GitHub Release 标题翻译成自然中文。输出纯文本，不要解释。",
         &format!(
             "Repo: {}\nOriginal title: {}\n\n输出中文标题：",
@@ -3171,7 +3748,7 @@ pub async fn translate_release_detail(
         let mut translated_chunks = Vec::with_capacity(total_chunks);
         for (idx, chunk) in chunks.iter().enumerate() {
             let translated = translate_release_detail_chunk(
-                state.as_ref(),
+                state,
                 &repo_full_name,
                 &original_title,
                 chunk,
@@ -3195,7 +3772,7 @@ pub async fn translate_release_detail(
     }
 
     upsert_translation(
-        state.as_ref(),
+        state,
         user_id,
         TranslationUpsert {
             entity_type: "release_detail",
@@ -3208,32 +3785,63 @@ pub async fn translate_release_detail(
     )
     .await?;
 
-    Ok(Json(TranslateResponse {
+    Ok(TranslateResponse {
         lang: "zh-CN".to_owned(),
         status: "ready".to_owned(),
         title: translated_title,
         summary: translated_summary,
-    }))
+    })
 }
 
-pub async fn translate_notification(
+pub async fn translate_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
-    Json(req): Json<TranslateNotificationRequest>,
-) -> Result<Json<TranslateResponse>, ApiError> {
+    Query(mode_query): Query<ReturnModeQuery>,
+    Json(req): Json<TranslateReleaseDetailRequest>,
+) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let thread_id = req.thread_id.trim();
+    let release_id = req.release_id.trim().to_owned();
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let translated =
+            translate_release_detail_for_user(state.as_ref(), user_id, release_id.as_str()).await?;
+        return Ok(Json(translated).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_TRANSLATE_RELEASE_DETAIL.to_owned(),
+            payload: json!({
+                "user_id": user_id,
+                "release_id": release_id,
+            }),
+            source: "api.translate_release_detail".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
+}
+
+pub async fn translate_notification_for_user(
+    state: &AppState,
+    user_id: i64,
+    thread_id: &str,
+) -> Result<TranslateResponse, ApiError> {
     if thread_id.is_empty() {
         return Err(ApiError::bad_request("thread_id is required"));
     }
 
     if state.config.ai.is_none() {
-        return Ok(Json(TranslateResponse {
+        return Ok(TranslateResponse {
             lang: "zh-CN".to_owned(),
             status: "disabled".to_owned(),
             title: None,
             summary: None,
-        }));
+        });
     }
 
     #[derive(Debug, sqlx::FromRow)]
@@ -3307,7 +3915,7 @@ pub async fn translate_notification(
                 let out_summary = t_summary.or_else(|| c.summary.clone());
 
                 upsert_translation(
-                    state.as_ref(),
+                    state,
                     user_id,
                     TranslationUpsert {
                         entity_type: "notification",
@@ -3320,12 +3928,12 @@ pub async fn translate_notification(
                 )
                 .await?;
 
-                return Ok(Json(TranslateResponse {
+                return Ok(TranslateResponse {
                     lang: "zh-CN".to_owned(),
                     status: "ready".to_owned(),
                     title: out_title,
                     summary: out_summary,
-                }));
+                });
             }
         }
 
@@ -3338,12 +3946,12 @@ pub async fn translate_notification(
             })
             .unwrap_or(false);
         if !cache_is_json_blob {
-            return Ok(Json(TranslateResponse {
+            return Ok(TranslateResponse {
                 lang: "zh-CN".to_owned(),
                 status: "ready".to_owned(),
                 title: c.title,
                 summary: c.summary,
-            }));
+            });
         }
     }
 
@@ -3356,7 +3964,7 @@ pub async fn translate_notification(
     );
 
     let raw = ai::chat_completion(
-        state.as_ref(),
+        state,
         "你是一个助理，负责把 GitHub Notifications 条目转写为中文标题与简短建议（Markdown）。不要包含任何 URL。",
         &prompt,
         500,
@@ -3387,7 +3995,7 @@ pub async fn translate_notification(
         });
 
     upsert_translation(
-        state.as_ref(),
+        state,
         user_id,
         TranslationUpsert {
             entity_type: "notification",
@@ -3400,12 +4008,45 @@ pub async fn translate_notification(
     )
     .await?;
 
-    Ok(Json(TranslateResponse {
+    Ok(TranslateResponse {
         lang: "zh-CN".to_owned(),
         status: "ready".to_owned(),
         title: out_title,
         summary: out_summary,
-    }))
+    })
+}
+
+pub async fn translate_notification(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(mode_query): Query<ReturnModeQuery>,
+    Json(req): Json<TranslateNotificationRequest>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let thread_id = req.thread_id.trim().to_owned();
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let translated =
+            translate_notification_for_user(state.as_ref(), user_id, thread_id.as_str()).await?;
+        return Ok(Json(translated).into_response());
+    }
+
+    enqueue_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_TRANSLATE_NOTIFICATION.to_owned(),
+            payload: json!({
+                "user_id": user_id,
+                "thread_id": thread_id,
+            }),
+            source: "api.translate_notification".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
 }
 
 async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
@@ -3467,6 +4108,20 @@ async fn require_active_user_id(state: &AppState, session: &Session) -> Result<i
         return Err(err);
     }
 
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET last_active_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
     Ok(user_id)
 }
 
@@ -3494,7 +4149,7 @@ mod tests {
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
         admin_list_users, admin_patch_user, admin_users_offset, ensure_account_enabled,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, markdown_structure_preserved, parse_release_id_param,
+        has_repo_scope, map_job_action_error, markdown_structure_preserved, parse_release_id_param,
         parse_repo_full_name_from_release_url, parse_translation_json,
         preserve_chunk_trailing_newline, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_reactions_status,
@@ -3762,6 +4417,18 @@ mod tests {
     fn admin_users_offset_rejects_overflow_page() {
         let err = admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
         assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn map_job_action_error_maps_not_found() {
+        let err = map_job_action_error(anyhow::anyhow!("task not found"));
+        assert_eq!(err.code(), "not_found");
+    }
+
+    #[test]
+    fn map_job_action_error_maps_invalid_state() {
+        let err = map_job_action_error(anyhow::anyhow!("only finished tasks can be retried"));
+        assert_eq!(err.code(), "invalid_task_state");
     }
 
     #[tokio::test]
