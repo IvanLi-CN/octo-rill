@@ -1138,7 +1138,7 @@ fn build_projects_batch_prompt(projects: &[(String, Vec<ReleaseDigest>)]) -> Str
         body.push_str("====\n");
         body.push_str("仓库：");
         body.push_str(full_name);
-        body.push_str("\n");
+        body.push('\n');
         for rel in releases {
             body.push_str("\n---\n");
             body.push_str(&format!("release_id: {}\n", rel.release_id));
