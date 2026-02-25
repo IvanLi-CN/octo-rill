@@ -1255,6 +1255,13 @@ async fn summarize_projects_with_ai(
         }
 
         for (full_name, releases) in &batch_projects {
+            let need_repo_fallback = !parsed_ok
+                || releases
+                    .iter()
+                    .any(|release| !merged.contains_key(&release.release_id));
+            if !need_repo_fallback {
+                continue;
+            }
             if let Ok(map) = summarize_project_with_ai(state, full_name, releases).await {
                 for (release_id, bullets) in map {
                     merged.entry(release_id).or_insert(bullets);

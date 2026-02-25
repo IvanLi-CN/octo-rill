@@ -70,7 +70,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     });
 
     spawn_daily_brief_scheduler(app_state.clone());
-    let model_catalog_abort_handle = ai::spawn_model_catalog_sync_task(app_state.clone());
+    let model_catalog_abort_handle = config
+        .ai
+        .as_ref()
+        .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -156,11 +159,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
+    let mut abort_handles = vec![deletion_abort_handle];
+    if let Some(handle) = model_catalog_abort_handle {
+        abort_handles.push(handle);
+    }
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(vec![
-            deletion_abort_handle,
-            model_catalog_abort_handle,
-        ]))
+        .with_graceful_shutdown(shutdown_signal(abort_handles))
         .await
         .context("http server exited")?;
 
