@@ -70,6 +70,25 @@ export type TranslateResponse = {
 	summary: string | null;
 };
 
+export type TranslateBatchItem = {
+	id: string;
+	lang: string;
+	status: "ready" | "disabled" | "missing" | "error" | "processing";
+	title: string | null;
+	summary: string | null;
+	error: string | null;
+};
+
+export type TranslateBatchResponse = {
+	items: TranslateBatchItem[];
+};
+
+export type TranslateBatchStreamEvent = {
+	event: "item" | "done" | "error";
+	item?: TranslateBatchItem | null;
+	error?: string | null;
+};
+
 export type ToggleReleaseReactionResponse = {
 	release_id: string;
 	reactions: ReleaseReactions;
