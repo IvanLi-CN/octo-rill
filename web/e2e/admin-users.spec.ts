@@ -176,6 +176,10 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
 	await expect(userRow).toContainText("普通用户");
 	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	await expect(
+		page.getByRole("heading", { name: "确认管理员变更" }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "确认更改" }).click();
 	await expect(userRow).toContainText("管理员");
 
 	await userRow.getByRole("button", { name: "禁用" }).click();

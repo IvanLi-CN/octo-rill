@@ -37,6 +37,11 @@ type UserManagementProps = {
 	currentUserId: number;
 };
 
+type PendingAdminConfirm = {
+	user: AdminUserItem;
+	nextIsAdmin: boolean;
+};
+
 const PAGE_SIZE = 20;
 
 export function UserManagement({ currentUserId }: UserManagementProps) {
@@ -51,6 +56,8 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 	const [items, setItems] = useState<AdminUserItem[]>([]);
 	const [total, setTotal] = useState(0);
 	const [actionBusyUserId, setActionBusyUserId] = useState<number | null>(null);
+	const [pendingAdminConfirm, setPendingAdminConfirm] =
+		useState<PendingAdminConfirm | null>(null);
 
 	const totalPages = useMemo(
 		() => Math.max(1, Math.ceil(total / PAGE_SIZE)),
@@ -95,14 +102,18 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 		setQuery(queryInput.trim());
 	}, [queryInput]);
 
-	const onToggleAdmin = useCallback(
-		async (user: AdminUserItem) => {
-			setActionBusyUserId(user.id);
+	const patchUser = useCallback(
+		async (
+			userId: number,
+			payload: { is_admin?: boolean; is_disabled?: boolean },
+		) => {
+			setActionBusyUserId(userId);
 			setError(null);
 			try {
-				await apiPatchJson<AdminUserItem>(`/api/admin/users/${user.id}`, {
-					is_admin: !user.is_admin,
-				});
+				await apiPatchJson<AdminUserItem>(
+					`/api/admin/users/${userId}`,
+					payload,
+				);
 				await loadUsers();
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));
@@ -113,22 +124,26 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 		[loadUsers],
 	);
 
+	const onToggleAdmin = useCallback((user: AdminUserItem) => {
+		setPendingAdminConfirm({
+			user,
+			nextIsAdmin: !user.is_admin,
+		});
+	}, []);
+
+	const onConfirmToggleAdmin = useCallback(async () => {
+		if (!pendingAdminConfirm) return;
+		const { user, nextIsAdmin } = pendingAdminConfirm;
+		setPendingAdminConfirm(null);
+
+		await patchUser(user.id, { is_admin: nextIsAdmin });
+	}, [patchUser, pendingAdminConfirm]);
+
 	const onToggleDisabled = useCallback(
 		async (user: AdminUserItem) => {
-			setActionBusyUserId(user.id);
-			setError(null);
-			try {
-				await apiPatchJson<AdminUserItem>(`/api/admin/users/${user.id}`, {
-					is_disabled: !user.is_disabled,
-				});
-				await loadUsers();
-			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err));
-			} finally {
-				setActionBusyUserId(null);
-			}
+			await patchUser(user.id, { is_disabled: !user.is_disabled });
 		},
-		[loadUsers],
+		[patchUser],
 	);
 
 	return (
@@ -273,6 +288,35 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 					</div>
 				</div>
 			</CardContent>
+
+			{pendingAdminConfirm ? (
+				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+					<div className="bg-card w-full max-w-lg rounded-xl border p-5 shadow-2xl">
+						<h3 className="text-lg font-semibold tracking-tight">
+							确认管理员变更
+						</h3>
+						<p className="text-muted-foreground mt-2 text-sm leading-relaxed">
+							{pendingAdminConfirm.nextIsAdmin
+								? `确认将 ${pendingAdminConfirm.user.login} 设为管理员吗？`
+								: `确认撤销 ${pendingAdminConfirm.user.login} 的管理员权限吗？`}
+						</p>
+						<p className="text-muted-foreground mt-2 text-xs">
+							此操作属于高权限变更，需要二次确认后才会提交。
+						</p>
+						<div className="mt-5 flex items-center justify-end gap-2">
+							<Button
+								variant="outline"
+								onClick={() => setPendingAdminConfirm(null)}
+							>
+								取消
+							</Button>
+							<Button onClick={() => void onConfirmToggleAdmin()}>
+								确认更改
+							</Button>
+						</div>
+					</div>
+				</div>
+			) : null}
 		</Card>
 	);
 }
