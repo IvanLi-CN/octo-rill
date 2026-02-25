@@ -9,6 +9,7 @@ type MockUser = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	last_active_at: string | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -40,6 +41,7 @@ async function installBaseMocks(
 			email: "admin@example.com",
 			is_admin: true,
 			is_disabled: false,
+			last_active_at: "2026-02-26T08:00:00Z",
 			created_at: "2026-02-24T08:00:00Z",
 			updated_at: "2026-02-24T08:00:00Z",
 		},
@@ -52,6 +54,7 @@ async function installBaseMocks(
 			email: "user@example.com",
 			is_admin: false,
 			is_disabled: false,
+			last_active_at: "2026-02-26T07:00:00Z",
 			created_at: "2026-02-25T08:00:00Z",
 			updated_at: "2026-02-25T08:00:00Z",
 		},
@@ -142,6 +145,27 @@ async function installBaseMocks(
 			}
 		}
 
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/users/") &&
+			pathname.endsWith("/profile")
+		) {
+			const id = Number(pathname.split("/").at(-2));
+			const target = users.find((u) => u.id === id);
+			if (!target) {
+				return json(
+					route,
+					{ ok: false, error: { code: "not_found", message: "not found" } },
+					404,
+				);
+			}
+			return json(route, {
+				user_id: target.id,
+				daily_brief_utc_time: "08:00",
+				last_active_at: target.last_active_at,
+			});
+		}
+
 		if (req.method() === "PATCH" && pathname.startsWith("/api/admin/users/")) {
 			const id = Number(pathname.split("/").at(-1));
 			const body = req.postDataJSON() as {
@@ -212,7 +236,12 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 		.getByText("octo-user", { exact: false })
 		.first()
 		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await expect(userRow).toContainText("最后活动：");
 	await expect(userRow).toContainText("普通用户");
+	await userRow.getByRole("button", { name: "详情" }).click();
+	await expect(page.getByRole("heading", { name: "用户详情" })).toBeVisible();
+	await expect(page.getByText("日报时间（本地时区）")).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await userRow.getByRole("button", { name: "设为管理员" }).click();
 	await expect(
 		page.getByRole("heading", { name: "确认管理员变更" }),

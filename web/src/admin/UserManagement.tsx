@@ -1,7 +1,13 @@
 import { ChevronDown } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { ApiError, apiGet, apiPatchJson } from "@/api";
+import {
+	type AdminUserProfileResponse,
+	ApiError,
+	apiGet,
+	apiGetAdminUserProfile,
+	apiPatchJson,
+} from "@/api";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -23,6 +29,7 @@ export type AdminUserItem = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	last_active_at: string | null;
 	created_at: string;
 	updated_at: string;
 };
@@ -47,8 +54,32 @@ type PendingAdminConfirm = {
 	nextIsAdmin: boolean;
 };
 
+const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
+	hour: "2-digit",
+	minute: "2-digit",
+	hour12: false,
+});
+
 const PAGE_SIZE = 20;
 const DEFAULT_GUARD = { admin_total: 0, active_admin_total: 0 };
+
+function formatLocalHm(value: string | null | undefined) {
+	if (!value) return "-";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "-";
+	return HM_FORMATTER.format(parsed);
+}
+
+function formatUtcClockToLocalHm(utcClock: string | null | undefined) {
+	if (!utcClock) return "-";
+	const [hourRaw, minuteRaw] = utcClock.split(":");
+	const hour = Number(hourRaw);
+	const minute = Number(minuteRaw ?? "0");
+	if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "-";
+	const parsed = new Date(Date.UTC(1970, 0, 1, hour, minute, 0));
+	if (Number.isNaN(parsed.getTime())) return "-";
+	return HM_FORMATTER.format(parsed);
+}
 
 function toAdminUserErrorMessage(err: unknown) {
 	if (err instanceof ApiError) {
@@ -88,6 +119,10 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 	const [actionBusyUserId, setActionBusyUserId] = useState<number | null>(null);
 	const [pendingAdminConfirm, setPendingAdminConfirm] =
 		useState<PendingAdminConfirm | null>(null);
+	const [profileUser, setProfileUser] = useState<AdminUserItem | null>(null);
+	const [profileLoading, setProfileLoading] = useState(false);
+	const [profileError, setProfileError] = useState<string | null>(null);
+	const [profile, setProfile] = useState<AdminUserProfileResponse | null>(null);
 
 	const totalPages = useMemo(
 		() => Math.max(1, Math.ceil(total / PAGE_SIZE)),
@@ -190,6 +225,28 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 		},
 		[patchUser],
 	);
+
+	const onOpenProfile = useCallback(async (user: AdminUserItem) => {
+		setProfileUser(user);
+		setProfileLoading(true);
+		setProfileError(null);
+		setProfile(null);
+		try {
+			const detail = await apiGetAdminUserProfile(user.id);
+			setProfile(detail);
+		} catch (err) {
+			setProfileError(toAdminUserErrorMessage(err));
+		} finally {
+			setProfileLoading(false);
+		}
+	}, []);
+
+	const onCloseProfile = useCallback(() => {
+		setProfileUser(null);
+		setProfile(null);
+		setProfileError(null);
+		setProfileLoading(false);
+	}, []);
 
 	return (
 		<Card>
@@ -294,6 +351,9 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 										<p className="text-muted-foreground truncate text-xs">
 											{user.name ?? "-"} · {user.email ?? "-"}
 										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											最后活动：{formatLocalHm(user.last_active_at)}
+										</p>
 										<div className="mt-1 flex flex-wrap gap-1">
 											<span className="bg-muted rounded px-2 py-0.5 font-mono text-[11px]">
 												UID:{user.id}
@@ -324,6 +384,13 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 										) : null}
 									</div>
 									<div className="flex flex-wrap gap-2">
+										<Button
+											variant="outline"
+											disabled={busy}
+											onClick={() => void onOpenProfile(user)}
+										>
+											详情
+										</Button>
 										<Button
 											variant="outline"
 											disabled={busy || adminActionBlocked}
@@ -369,6 +436,70 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 					</div>
 				</div>
 			</CardContent>
+
+			{profileUser ? (
+				<div className="fixed inset-0 z-40 flex">
+					<button
+						type="button"
+						className="flex-1 bg-black/35"
+						aria-label="关闭用户详情"
+						onClick={onCloseProfile}
+					/>
+					<div className="bg-card relative h-full w-full max-w-md border-l p-5 shadow-2xl">
+						<h3 className="text-lg font-semibold tracking-tight">用户详情</h3>
+						<p className="text-muted-foreground mt-1 text-sm">
+							{profileUser.login}
+							{profileUser.id === currentUserId ? "（你）" : ""}
+						</p>
+
+						<div className="mt-4 space-y-3 text-sm">
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									最后活动（本地时区）
+								</p>
+								<p className="mt-1 font-medium">
+									{formatLocalHm(
+										profile?.last_active_at ?? profileUser.last_active_at,
+									)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									日报时间（本地时区）
+								</p>
+								<p className="mt-1 font-medium">
+									{formatUtcClockToLocalHm(profile?.daily_brief_utc_time)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									UTC 原值：{profile?.daily_brief_utc_time ?? "-"}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">账号状态</p>
+								<p className="mt-1 font-medium">
+									{profileUser.is_disabled ? "已禁用" : "已启用"} ·{" "}
+									{profileUser.is_admin ? "管理员" : "普通用户"}
+								</p>
+							</div>
+						</div>
+
+						{profileLoading ? (
+							<p className="text-muted-foreground mt-4 text-sm">
+								详情加载中...
+							</p>
+						) : null}
+						{profileError ? (
+							<p className="text-destructive mt-4 text-sm">{profileError}</p>
+						) : null}
+
+						<div className="mt-6 flex justify-end">
+							<Button variant="outline" onClick={onCloseProfile}>
+								关闭
+							</Button>
+						</div>
+					</div>
+				</div>
+			) : null}
 
 			{pendingAdminConfirm ? (
 				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
