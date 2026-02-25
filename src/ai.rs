@@ -9,7 +9,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::state::AppState;
+use crate::{config::AiConfig, state::AppState};
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -24,6 +24,8 @@ const MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE: &str = "env_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
+const LLM_SCHEDULER_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+const LLM_REQUEST_MAX_RETRIES: usize = 3;
 
 #[derive(Debug, Default)]
 struct ModelLimitCatalog {
@@ -45,6 +47,7 @@ struct OpenRouterModelItem {
 
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
 static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+static LLM_SCHEDULER_NEXT_ALLOWED_AT: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputBudget {
@@ -55,6 +58,10 @@ pub struct InputBudget {
 
 fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
     MODEL_LIMIT_CATALOG.get_or_init(|| tokio::sync::RwLock::new(ModelLimitCatalog::default()))
+}
+
+fn llm_scheduler() -> &'static tokio::sync::Mutex<Instant> {
+    LLM_SCHEDULER_NEXT_ALLOWED_AT.get_or_init(|| tokio::sync::Mutex::new(Instant::now()))
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -655,20 +662,46 @@ pub fn recent_key_dates(
         .collect()
 }
 
-pub async fn chat_completion(
+#[derive(Debug)]
+struct ChatCompletionAttemptError {
+    err: anyhow::Error,
+    retryable: bool,
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+async fn acquire_llm_scheduler_slot() {
+    let mut next_allowed_at = llm_scheduler().lock().await;
+    let now = Instant::now();
+    if *next_allowed_at > now {
+        tokio::time::sleep(*next_allowed_at - now).await;
+    }
+    *next_allowed_at = Instant::now() + LLM_SCHEDULER_REQUEST_INTERVAL;
+}
+
+async fn chat_completion_once(
     state: &AppState,
+    ai: &AiConfig,
     system: &str,
     user: &str,
     max_tokens: u32,
-) -> Result<String> {
-    let Some(ai) = state.config.ai.clone() else {
-        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
-    };
-
+) -> std::result::Result<String, ChatCompletionAttemptError> {
     let url = ai
         .base_url
         .join("chat/completions")
-        .context("invalid AI_BASE_URL")?;
+        .context("invalid AI_BASE_URL")
+        .map_err(|err| ChatCompletionAttemptError {
+            err,
+            retryable: false,
+        })?;
 
     let req = ChatCompletionsRequest {
         model: &ai.model,
@@ -689,22 +722,40 @@ pub async fn chat_completion(
     let resp = state
         .http
         .post(url)
-        .bearer_auth(ai.api_key)
+        .bearer_auth(&ai.api_key)
         .json(&req)
         .send()
         .await
-        .context("AI request failed")?;
+        .map_err(|err| {
+            let retryable = is_retryable_transport_error(&err);
+            ChatCompletionAttemptError {
+                err: anyhow!("AI request failed: {err}"),
+                retryable,
+            }
+        })?;
 
     let status = resp.status();
-    let body = resp.bytes().await.context("AI read response failed")?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|err| ChatCompletionAttemptError {
+            err: anyhow!("AI read response failed: {err}"),
+            retryable: true,
+        })?;
 
     if !status.is_success() {
         let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
-        return Err(anyhow!("AI returned {status}: {msg}"));
+        return Err(ChatCompletionAttemptError {
+            err: anyhow!("AI returned {status}: {msg}"),
+            retryable: is_retryable_status(status),
+        });
     }
 
     let resp: ChatCompletionsResponse =
-        serde_json::from_slice(&body).context("AI response json decode failed")?;
+        serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
+            err: anyhow!("AI response json decode failed: {err}"),
+            retryable: true,
+        })?;
 
     let content = resp
         .choices
@@ -713,9 +764,49 @@ pub async fn chat_completion(
         .and_then(|c| c.message.content)
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("AI response missing content"))?;
+        .ok_or_else(|| ChatCompletionAttemptError {
+            err: anyhow!("AI response missing content"),
+            retryable: true,
+        })?;
 
     Ok(content)
+}
+
+pub async fn chat_completion(
+    state: &AppState,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<String> {
+    let Some(ai) = state.config.ai.clone() else {
+        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
+    };
+
+    let mut last_err: Option<anyhow::Error> = None;
+    let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
+    for attempt in 1..=max_attempts {
+        // Global in-process queue: always serialize request issuance and pace at 1 request/second.
+        acquire_llm_scheduler_slot().await;
+        match chat_completion_once(state, &ai, system, user, max_tokens).await {
+            Ok(content) => return Ok(content),
+            Err(attempt_err) => {
+                let retryable = attempt_err.retryable;
+                let err = attempt_err.err;
+                if !retryable || attempt >= max_attempts {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    attempt,
+                    max_attempts,
+                    retries_left = max_attempts.saturating_sub(attempt),
+                    ?err,
+                    "ai request failed; scheduler queued retry"
+                );
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("AI request failed after retries")))
 }
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
@@ -1701,6 +1792,15 @@ pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_status_detects_429_and_5xx() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
 
     #[test]
     fn daily_window_after_boundary() {
