@@ -181,6 +181,12 @@ fn guard_admin_user_update(guard: AdminUserUpdateGuard) -> Result<(), ApiError> 
     Ok(())
 }
 
+fn admin_users_offset(page: i64, page_size: i64) -> Result<i64, ApiError> {
+    page.checked_sub(1)
+        .and_then(|value| value.checked_mul(page_size))
+        .ok_or_else(|| ApiError::bad_request("page is too large"))
+}
+
 pub async fn admin_list_users(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -202,7 +208,7 @@ pub async fn admin_list_users(
         return Err(ApiError::bad_request("page must be >= 1"));
     }
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
-    let offset = (page - 1) * page_size;
+    let offset = admin_users_offset(page, page_size)?;
 
     let query_text = query.query.unwrap_or_default().trim().to_lowercase();
     let query_like = format!("%{query_text}%");
@@ -3485,7 +3491,7 @@ async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i6
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminUserUpdateGuard, FeedRow, GraphQlError, ensure_account_enabled,
+        AdminUserUpdateGuard, FeedRow, GraphQlError, admin_users_offset, ensure_account_enabled,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, markdown_structure_preserved, parse_release_id_param,
         parse_repo_full_name_from_release_url, parse_translation_json,
@@ -3670,6 +3676,21 @@ mod tests {
         })
         .expect_err("last active admin disable must fail");
         assert_eq!(err.code(), "last_admin_guard");
+    }
+
+    #[test]
+    fn admin_users_offset_supports_first_page() {
+        assert_eq!(
+            admin_users_offset(1, 20).expect("first page offset"),
+            0
+        );
+    }
+
+    #[test]
+    fn admin_users_offset_rejects_overflow_page() {
+        let err =
+            admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
+        assert_eq!(err.code(), "bad_request");
     }
 
     #[tokio::test]
