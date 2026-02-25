@@ -5,6 +5,7 @@ export type DashboardHeaderProps = {
 	inboxCount: number;
 	briefCount: number;
 	login: string;
+	isAdmin: boolean;
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	onRefresh?: () => void;
@@ -20,6 +21,7 @@ export function DashboardHeader({
 	inboxCount,
 	briefCount,
 	login,
+	isAdmin,
 	aiDisabledHint = false,
 	busy = false,
 	onRefresh,
@@ -41,6 +43,7 @@ export function DashboardHeader({
 				<p className="text-muted-foreground mt-1 text-sm">
 					Logged in as{" "}
 					<span className="text-foreground font-medium">{login}</span>
+					{isAdmin ? " · Admin" : ""}
 					{aiDisabledHint ? " · AI 未配置，将只显示原文" : ""}
 				</p>
 			</div>

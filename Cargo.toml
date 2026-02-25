@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 aes-gcm = "0.10.3"
 anyhow = "1.0.101"
+async-stream = "0.3.6"
 axum = { version = "0.8.8", features = ["macros"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.43", features = ["serde"] }

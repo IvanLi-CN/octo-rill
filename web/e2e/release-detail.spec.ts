@@ -38,6 +38,7 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 					name: "Octo",
 					avatar_url: null,
 					email: null,
+					is_admin: false,
 				},
 			});
 		}
