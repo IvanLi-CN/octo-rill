@@ -54,6 +54,8 @@ function normalizeErrorMessage(err: unknown) {
 				return "当前账号没有管理员权限。";
 			case "not_found":
 				return "目标任务不存在。";
+			case "invalid_task_state":
+				return "当前任务状态不允许执行该操作。";
 			default:
 				return err.message;
 		}
@@ -113,21 +115,27 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 	const loadRealtimeTasks = useCallback(async () => {
 		setTasksLoading(true);
-		const params = new URLSearchParams();
-		params.set("status", statusFilter);
-		params.set("page", String(taskPage));
-		params.set("page_size", String(TASK_PAGE_SIZE));
-		const res = await apiGetAdminRealtimeTasks(params);
-		setTasks(res.items);
-		setTaskTotal(res.total);
-		setTasksLoading(false);
+		try {
+			const params = new URLSearchParams();
+			params.set("status", statusFilter);
+			params.set("page", String(taskPage));
+			params.set("page_size", String(TASK_PAGE_SIZE));
+			const res = await apiGetAdminRealtimeTasks(params);
+			setTasks(res.items);
+			setTaskTotal(res.total);
+		} finally {
+			setTasksLoading(false);
+		}
 	}, [statusFilter, taskPage]);
 
 	const loadScheduled = useCallback(async () => {
 		setScheduledLoading(true);
-		const res = await apiGetAdminScheduledSlots();
-		setScheduledSlots(res.items);
-		setScheduledLoading(false);
+		try {
+			const res = await apiGetAdminScheduledSlots();
+			setScheduledSlots(res.items);
+		} finally {
+			setScheduledLoading(false);
+		}
 	}, []);
 
 	const loadAll = useCallback(async () => {
@@ -353,7 +361,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 												</Button>
 												<Button
 													variant="outline"
-													disabled={busy || task.status === "running"}
+													disabled={
+														busy ||
+														task.status === "queued" ||
+														task.status === "running"
+													}
 													onClick={() => void onRetryTask(task.id)}
 												>
 													重试
