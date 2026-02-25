@@ -2215,7 +2215,14 @@ fn translate_response_from_batch_item(
     let status = match item.status.as_str() {
         "disabled" => "disabled",
         "ready" => "ready",
-        "missing" => return Err(ApiError::internal("translation missing")),
+        "missing" => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                item.error
+                    .unwrap_or_else(|| "translation target not found".to_owned()),
+            ));
+        }
         "error" => {
             return Err(ApiError::internal(
                 item.error
@@ -2856,6 +2863,23 @@ struct TranslationCacheRow {
     summary: Option<String>,
 }
 
+fn looks_like_json_blob(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with("\"{")
+}
+
+fn release_cache_entry_reusable(cache: &TranslationCacheRow, excerpt: &str) -> bool {
+    if cache.summary.as_deref().is_some_and(looks_like_json_blob) {
+        return false;
+    }
+    let summary_is_usable = cache
+        .summary
+        .as_deref()
+        .is_some_and(|s| markdown_structure_preserved(excerpt, s));
+    let title_only_cache = cache.summary.is_none() && cache.title.is_some();
+    summary_is_usable || title_only_cache
+}
+
 async fn translate_releases_batch_internal(
     state: &AppState,
     user_id: i64,
@@ -2974,24 +2998,18 @@ async fn translate_releases_batch_internal(
         if let Some(cache) = cache
             && cache.source_hash == item.source_hash
         {
-            if let Some(raw) = cache.summary.as_deref() {
-                let t = raw.trim_start();
-                if (t.starts_with('{') || t.starts_with("\"{"))
-                    && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
-                {
-                    let out_title = t_title.or_else(|| cache.title.clone());
-                    let out_summary = t_summary.or_else(|| cache.summary.clone());
-                    if out_title.is_some() || out_summary.is_some() {
-                        translated.insert(item.release_id, (out_title, out_summary));
-                        continue;
-                    }
+            if let Some(raw) = cache.summary.as_deref()
+                && looks_like_json_blob(raw)
+                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+            {
+                let out_title = t_title.or_else(|| cache.title.clone());
+                let out_summary = t_summary.or_else(|| cache.summary.clone());
+                if out_title.is_some() || out_summary.is_some() {
+                    translated.insert(item.release_id, (out_title, out_summary));
+                    continue;
                 }
             }
-            if cache
-                .summary
-                .as_deref()
-                .is_some_and(|s| markdown_structure_preserved(&item.excerpt, s))
-            {
+            if release_cache_entry_reusable(cache, &item.excerpt) {
                 translated.insert(
                     item.release_id,
                     (cache.title.clone(), cache.summary.clone()),
@@ -3031,7 +3049,7 @@ async fn translate_releases_batch_internal(
             out.push(TranslateBatchItem {
                 id: release_id.to_string(),
                 lang: "zh-CN".to_owned(),
-                status: "error".to_owned(),
+                status: "missing".to_owned(),
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
@@ -3086,13 +3104,6 @@ pub async fn translate_release(
     let Some(item) = items.pop() else {
         return Err(ApiError::internal("missing translation result"));
     };
-    if item.status == "error" && item.error.as_deref() == Some("release not found") {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "release not found",
-        ));
-    }
     Ok(Json(translate_response_from_batch_item(item)?))
 }
 
@@ -3443,13 +3454,6 @@ pub async fn translate_release_detail(
     let Some(item) = items.pop() else {
         return Err(ApiError::internal("missing translation result"));
     };
-    if item.status == "error" && item.error.as_deref() == Some("release not found") {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "release not found",
-        ));
-    }
     Ok(Json(translate_response_from_batch_item(item)?))
 }
 
@@ -3472,7 +3476,7 @@ async fn translate_release_detail_batch_internal(
             Err(err) if err.code() == "not_found" => items.push(TranslateBatchItem {
                 id: release_id.to_string(),
                 lang: "zh-CN".to_owned(),
-                status: "error".to_owned(),
+                status: "missing".to_owned(),
                 title: None,
                 summary: None,
                 error: Some("release not found".to_owned()),
@@ -3789,28 +3793,19 @@ async fn translate_notifications_batch_internal(
         if let Some(cache) = cache_by_id.get(&item.thread_id)
             && cache.source_hash == item.source_hash
         {
-            if let Some(raw) = cache.summary.as_deref() {
-                let t = raw.trim_start();
-                if (t.starts_with('{') || t.starts_with("\"{"))
-                    && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
-                {
-                    let out_title = t_title.or_else(|| cache.title.clone());
-                    let out_summary = t_summary.or_else(|| cache.summary.clone());
-                    if out_title.is_some() || out_summary.is_some() {
-                        translated.insert(item.thread_id.clone(), (out_title, out_summary));
-                        continue;
-                    }
+            if let Some(raw) = cache.summary.as_deref()
+                && looks_like_json_blob(raw)
+                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+            {
+                let out_title = t_title.or_else(|| cache.title.clone());
+                let out_summary = t_summary.or_else(|| cache.summary.clone());
+                if out_title.is_some() || out_summary.is_some() {
+                    translated.insert(item.thread_id.clone(), (out_title, out_summary));
+                    continue;
                 }
             }
 
-            let cache_is_json_blob = cache
-                .summary
-                .as_deref()
-                .map(|raw| {
-                    let t = raw.trim_start();
-                    t.starts_with('{') || t.starts_with("\"{")
-                })
-                .unwrap_or(false);
+            let cache_is_json_blob = cache.summary.as_deref().is_some_and(looks_like_json_blob);
             if !cache_is_json_blob {
                 translated.insert(
                     item.thread_id.clone(),
@@ -3851,7 +3846,7 @@ async fn translate_notifications_batch_internal(
             out.push(TranslateBatchItem {
                 id: thread_id.clone(),
                 lang: "zh-CN".to_owned(),
-                status: "error".to_owned(),
+                status: "missing".to_owned(),
                 title: None,
                 summary: None,
                 error: Some("notification not found".to_owned()),
@@ -3913,13 +3908,6 @@ pub async fn translate_notification(
     let Some(item) = items.pop() else {
         return Err(ApiError::internal("missing translation result"));
     };
-    if item.status == "error" && item.error.as_deref() == Some("notification not found") {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "notification not found",
-        ));
-    }
     Ok(Json(translate_response_from_batch_item(item)?))
 }
 
@@ -3941,10 +3929,11 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedRow, GraphQlError, TranslateBatchItem, github_graphql_errors_to_api_error,
-        github_graphql_http_error, has_repo_scope, markdown_structure_preserved,
-        parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
-        parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
+        FeedRow, GraphQlError, TranslateBatchItem, TranslationCacheRow,
+        github_graphql_errors_to_api_error, github_graphql_http_error, has_repo_scope,
+        looks_like_json_blob, markdown_structure_preserved, parse_release_id_param,
+        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
+        parse_unique_thread_ids, preserve_chunk_trailing_newline, release_cache_entry_reusable,
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_reactions_status, resolve_release_full_name, split_markdown_chunks,
         translate_response_from_batch_item,
@@ -4128,6 +4117,43 @@ mod tests {
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
+    }
+
+    #[test]
+    fn translate_response_from_batch_item_maps_missing_to_not_found() {
+        let item = TranslateBatchItem {
+            id: "1".to_owned(),
+            lang: "zh-CN".to_owned(),
+            status: "missing".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("release not found".to_owned()),
+        };
+        let err = translate_response_from_batch_item(item).expect_err("missing item should fail");
+        assert_eq!(err.code(), "not_found");
+    }
+
+    #[test]
+    fn release_cache_entry_reusable_accepts_title_only_cache() {
+        let cache = TranslationCacheRow {
+            entity_id: "1".to_owned(),
+            source_hash: "hash".to_owned(),
+            title: Some("标题".to_owned()),
+            summary: None,
+        };
+        assert!(release_cache_entry_reusable(&cache, "body excerpt"));
+    }
+
+    #[test]
+    fn release_cache_entry_reusable_rejects_json_blob_summary() {
+        let cache = TranslationCacheRow {
+            entity_id: "1".to_owned(),
+            source_hash: "hash".to_owned(),
+            title: Some("标题".to_owned()),
+            summary: Some("{\"title_zh\":\"标题\"}".to_owned()),
+        };
+        assert!(looks_like_json_blob(cache.summary.as_deref().unwrap_or("")));
+        assert!(!release_cache_entry_reusable(&cache, "body excerpt"));
     }
 
     #[test]
