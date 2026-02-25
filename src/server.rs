@@ -106,6 +106,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/translate/releases/batch",
             post(api::translate_releases_batch),
         )
+        .route(
+            "/translate/releases/batch/stream",
+            post(api::translate_releases_batch_stream),
+        )
         .route("/translate/release", post(api::translate_release))
         .route(
             "/translate/release/detail/batch",

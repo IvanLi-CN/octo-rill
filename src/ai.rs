@@ -718,6 +718,20 @@ pub async fn chat_completion(
     Ok(content)
 }
 
+fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    let status_422_non_context =
+        msg.contains("ai returned 422") && !msg.contains("context") && !msg.contains("length");
+    msg.contains("invalid_model_error")
+        || msg.contains("model not found")
+        || msg.contains("ai returned 401")
+        || msg.contains("ai returned 403")
+        || msg.contains("ai returned 429")
+        || msg.contains("rate limit")
+        || msg.contains("insufficient_quota")
+        || status_422_non_context
+}
+
 fn non_empty_lines(md: &str) -> impl Iterator<Item = &str> {
     md.lines().map(str::trim).filter(|line| !line.is_empty())
 }
@@ -1263,7 +1277,12 @@ async fn summarize_projects_with_ai(
     );
 
     let mut merged = HashMap::<i64, Vec<String>>::new();
+    let mut abort_remaining_batches = false;
     for group in groups {
+        if abort_remaining_batches {
+            break;
+        }
+
         let batch_projects = group
             .iter()
             .map(|idx| projects[*idx].clone())
@@ -1279,27 +1298,42 @@ async fn summarize_projects_with_ai(
         .await;
 
         let mut parsed_ok = false;
-        if let Ok(raw) = raw
-            && let Some(payload) = parse_project_summary_payload(&raw)
-        {
-            parsed_ok = true;
-            for item in payload.items {
-                let bullets = item
-                    .summary_bullets
-                    .into_iter()
-                    .map(|s| sanitize_bullet_text(s.trim()))
-                    .filter(|s| !s.is_empty())
-                    .take(4)
-                    .collect::<Vec<_>>();
-                if !bullets.is_empty() {
-                    merged.insert(item.release_id, bullets);
+        match raw {
+            Ok(raw) => {
+                if let Some(payload) = parse_project_summary_payload(&raw) {
+                    parsed_ok = true;
+                    for item in payload.items {
+                        let bullets = item
+                            .summary_bullets
+                            .into_iter()
+                            .map(|s| sanitize_bullet_text(s.trim()))
+                            .filter(|s| !s.is_empty())
+                            .take(4)
+                            .collect::<Vec<_>>();
+                        if !bullets.is_empty() {
+                            merged.insert(item.release_id, bullets);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "project batch summary parse failed; fallback to per-repo summarization"
+                    );
+                }
+            }
+            Err(err) => {
+                if ai_error_is_non_retryable(&err) {
+                    abort_remaining_batches = true;
+                    tracing::warn!(
+                        ?err,
+                        "project batch summary upstream error is non-retryable; skipping per-repo fallback"
+                    );
+                } else {
+                    tracing::warn!(?err, "project batch summary failed; fallback to per-repo");
                 }
             }
         }
-        if !parsed_ok {
-            tracing::warn!(
-                "project batch summary parse failed; fallback to per-repo summarization"
-            );
+        if abort_remaining_batches {
+            continue;
         }
 
         for (full_name, releases) in &batch_projects {

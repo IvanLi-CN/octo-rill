@@ -83,6 +83,12 @@ export type TranslateBatchResponse = {
 	items: TranslateBatchItem[];
 };
 
+export type TranslateBatchStreamEvent = {
+	event: "item" | "done" | "error";
+	item?: TranslateBatchItem | null;
+	error?: string | null;
+};
+
 export type ToggleReleaseReactionResponse = {
 	release_id: string;
 	reactions: ReleaseReactions;

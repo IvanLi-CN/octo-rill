@@ -1,9 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::sync::Arc;
 
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
-use axum::{Json, extract::State, http::StatusCode};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::Response;
+use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
 
@@ -2209,6 +2215,32 @@ pub struct TranslateBatchItem {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct TranslateBatchStreamEvent {
+    event: &'static str, // item | done | error
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item: Option<TranslateBatchItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn send_batch_stream_event(
+    tx: &mpsc::Sender<Result<Bytes, Infallible>>,
+    event: TranslateBatchStreamEvent,
+) -> bool {
+    let payload = match serde_json::to_string(&event) {
+        Ok(mut line) => {
+            line.push('\n');
+            line
+        }
+        Err(err) => {
+            tracing::warn!(?err, "serialize batch stream event failed");
+            return false;
+        }
+    };
+    tx.send(Ok(Bytes::from(payload))).await.is_ok()
+}
+
 fn translate_response_from_batch_item(
     item: TranslateBatchItem,
 ) -> Result<TranslateResponse, ApiError> {
@@ -2270,6 +2302,107 @@ fn extract_json_object_span(raw: &str) -> Option<&str> {
         return None;
     }
     Some(raw[start..=end].trim())
+}
+
+fn extract_json_array_span(raw: &str) -> Option<&str> {
+    let start = raw.find('[')?;
+    let end = raw.rfind(']')?;
+    if end < start {
+        return None;
+    }
+    Some(raw[start..=end].trim())
+}
+
+fn parse_json_value_relaxed(raw: &str) -> Option<serde_json::Value> {
+    fn parse_direct(raw: &str) -> Option<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .or_else(|| {
+                let inner = serde_json::from_str::<String>(raw).ok()?;
+                serde_json::from_str::<serde_json::Value>(&inner).ok()
+            })
+    }
+
+    let trimmed = raw.trim();
+    parse_direct(trimmed)
+        .or_else(|| parse_direct(strip_markdown_code_fence(trimmed)))
+        .or_else(|| extract_json_object_span(trimmed).and_then(parse_direct))
+        .or_else(|| extract_json_array_span(trimmed).and_then(parse_direct))
+}
+
+fn value_as_i64(raw: &serde_json::Value) -> Option<i64> {
+    if let Some(v) = raw.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = raw.as_u64() {
+        return i64::try_from(v).ok();
+    }
+    raw.as_str().and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+fn value_as_usize(raw: &serde_json::Value) -> Option<usize> {
+    if let Some(v) = raw.as_u64() {
+        return usize::try_from(v).ok();
+    }
+    if let Some(v) = raw.as_i64() {
+        return usize::try_from(v).ok();
+    }
+    raw.as_str().and_then(|s| s.trim().parse::<usize>().ok())
+}
+
+fn value_as_id_string(raw: &serde_json::Value) -> Option<String> {
+    match raw {
+        serde_json::Value::String(v) => {
+            let v = v.trim();
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.to_owned())
+            }
+        }
+        serde_json::Value::Number(_) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn object_field_as_string(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    for key in keys {
+        let Some(raw) = obj.get(*key) else {
+            continue;
+        };
+        let Some(value) = value_as_id_string(raw) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn extract_items_array(value: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    match value {
+        serde_json::Value::Array(items) => Some(items.as_slice()),
+        serde_json::Value::Object(map) => map
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+            .or_else(|| {
+                map.get("data")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+            })
+            .or_else(|| {
+                map.get("translations")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+            }),
+        _ => None,
+    }
 }
 
 fn parse_translation_json(raw: &str) -> Option<TranslationJson> {
@@ -2401,46 +2534,116 @@ fn parse_unique_thread_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<S
 }
 
 fn parse_batch_release_translation_payload(raw: &str) -> Option<BatchReleaseTranslationPayload> {
-    fn parse_direct(raw: &str) -> Option<BatchReleaseTranslationPayload> {
-        serde_json::from_str::<BatchReleaseTranslationPayload>(raw)
-            .ok()
-            .or_else(|| {
-                let inner = serde_json::from_str::<String>(raw).ok()?;
-                serde_json::from_str::<BatchReleaseTranslationPayload>(&inner).ok()
-            })
+    let value = parse_json_value_relaxed(raw)?;
+    let items = extract_items_array(&value)?;
+    let mut out = Vec::new();
+
+    for entry in items {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let Some(release_id) = obj
+            .get("release_id")
+            .and_then(value_as_i64)
+            .or_else(|| obj.get("id").and_then(value_as_i64))
+        else {
+            continue;
+        };
+
+        let title_zh = object_field_as_string(obj, &["title_zh", "title", "title_cn"]);
+        let summary_md = object_field_as_string(
+            obj,
+            &["summary_md", "summary", "body_md", "body", "summary_zh"],
+        )
+        .map(|s| s.replace("\\n", "\n"));
+        out.push(BatchReleaseTranslationItem {
+            release_id,
+            title_zh,
+            summary_md,
+        });
     }
-    let trimmed = raw.trim();
-    parse_direct(trimmed).or_else(|| extract_json_object_span(trimmed).and_then(parse_direct))
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(BatchReleaseTranslationPayload { items: out })
+    }
 }
 
 fn parse_batch_notification_translation_payload(
     raw: &str,
 ) -> Option<BatchNotificationTranslationPayload> {
-    fn parse_direct(raw: &str) -> Option<BatchNotificationTranslationPayload> {
-        serde_json::from_str::<BatchNotificationTranslationPayload>(raw)
-            .ok()
-            .or_else(|| {
-                let inner = serde_json::from_str::<String>(raw).ok()?;
-                serde_json::from_str::<BatchNotificationTranslationPayload>(&inner).ok()
-            })
+    let value = parse_json_value_relaxed(raw)?;
+    let items = extract_items_array(&value)?;
+    let mut out = Vec::new();
+
+    for entry in items {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let Some(thread_id) = obj
+            .get("thread_id")
+            .and_then(value_as_id_string)
+            .or_else(|| obj.get("id").and_then(value_as_id_string))
+        else {
+            continue;
+        };
+        let title_zh = object_field_as_string(obj, &["title_zh", "title", "title_cn"]);
+        let summary_md = object_field_as_string(
+            obj,
+            &["summary_md", "summary", "body_md", "body", "summary_zh"],
+        )
+        .map(|s| s.replace("\\n", "\n"));
+        out.push(BatchNotificationTranslationItem {
+            thread_id,
+            title_zh,
+            summary_md,
+        });
     }
-    let trimmed = raw.trim();
-    parse_direct(trimmed).or_else(|| extract_json_object_span(trimmed).and_then(parse_direct))
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(BatchNotificationTranslationPayload { items: out })
+    }
 }
 
 fn parse_batch_release_detail_translation_payload(
     raw: &str,
 ) -> Option<BatchReleaseDetailTranslationPayload> {
-    fn parse_direct(raw: &str) -> Option<BatchReleaseDetailTranslationPayload> {
-        serde_json::from_str::<BatchReleaseDetailTranslationPayload>(raw)
-            .ok()
-            .or_else(|| {
-                let inner = serde_json::from_str::<String>(raw).ok()?;
-                serde_json::from_str::<BatchReleaseDetailTranslationPayload>(&inner).ok()
-            })
+    let value = parse_json_value_relaxed(raw)?;
+    let items = extract_items_array(&value)?;
+    let mut out = Vec::new();
+
+    for entry in items {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let Some(chunk_index) = obj
+            .get("chunk_index")
+            .and_then(value_as_usize)
+            .or_else(|| obj.get("index").and_then(value_as_usize))
+            .or_else(|| obj.get("id").and_then(value_as_usize))
+        else {
+            continue;
+        };
+        let Some(summary_md) = object_field_as_string(
+            obj,
+            &["summary_md", "summary", "body_md", "body", "summary_zh"],
+        ) else {
+            continue;
+        };
+        out.push(BatchReleaseDetailTranslationItem {
+            chunk_index,
+            summary_md: summary_md.replace("\\n", "\n"),
+        });
     }
-    let trimmed = raw.trim();
-    parse_direct(trimmed).or_else(|| extract_json_object_span(trimmed).and_then(parse_direct))
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(BatchReleaseDetailTranslationPayload { items: out })
+    }
 }
 
 fn line_prefix_kind(line: &str) -> &'static str {
@@ -2683,6 +2886,25 @@ fn build_release_batch_prompt(batch: &[ReleaseBatchCandidate]) -> String {
     prompt
 }
 
+const RELEASE_BATCH_MAX_TOKENS: u32 = 1_400;
+const RELEASE_BATCH_OVERHEAD_TOKENS: u32 = 320;
+const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
+const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
+
+fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    let status_422_non_context =
+        msg.contains("ai returned 422") && !msg.contains("context") && !msg.contains("length");
+    msg.contains("invalid_model_error")
+        || msg.contains("model not found")
+        || msg.contains("ai returned 401")
+        || msg.contains("ai returned 403")
+        || msg.contains("ai returned 429")
+        || msg.contains("rate limit")
+        || msg.contains("insufficient_quota")
+        || status_422_non_context
+}
+
 fn normalize_translation_fields(
     raw_title: Option<String>,
     raw_summary: Option<String>,
@@ -2749,18 +2971,11 @@ async fn translate_release_single_candidate_with_ai(
     }
 }
 
-async fn translate_release_candidates_with_ai(
+async fn plan_release_translation_groups(
     state: &AppState,
     pending: &[ReleaseBatchCandidate],
-) -> HashMap<i64, (Option<String>, Option<String>)> {
-    if pending.is_empty() {
-        return HashMap::new();
-    }
-
-    const BATCH_MAX_TOKENS: u32 = 1_400;
-    const BATCH_OVERHEAD_TOKENS: u32 = 320;
-
-    let budget_info = ai::compute_input_budget_with_source(state, BATCH_MAX_TOKENS).await;
+) -> Vec<Vec<usize>> {
+    let budget_info = ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_TOKENS).await;
     let budget = budget_info.input_budget;
     let estimated = pending
         .iter()
@@ -2770,7 +2985,7 @@ async fn translate_release_candidates_with_ai(
                 .saturating_add(64)
         })
         .collect::<Vec<_>>();
-    let groups = ai::pack_batch_indices(&estimated, budget, BATCH_OVERHEAD_TOKENS);
+    let groups = ai::pack_batch_indices(&estimated, budget, RELEASE_BATCH_OVERHEAD_TOKENS);
     let split_count = groups.len().saturating_sub(1);
     let saved_calls = pending.len().saturating_sub(groups.len());
     let estimated_tokens = estimated.iter().copied().sum::<u32>();
@@ -2784,62 +2999,108 @@ async fn translate_release_candidates_with_ai(
         model_input_limit = budget_info.model_input_limit,
         "release translation batch plan"
     );
+    groups
+}
+
+async fn translate_release_candidate_group_with_ai(
+    state: &AppState,
+    batch: &[ReleaseBatchCandidate],
+) -> (HashMap<i64, (Option<String>, Option<String>)>, bool) {
+    let prompt = build_release_batch_prompt(batch);
+    let raw = ai::chat_completion(
+        state,
+        "你是一个批量翻译助手，负责把 GitHub Release 标题与片段翻译为中文。",
+        &prompt,
+        RELEASE_BATCH_MAX_TOKENS,
+    )
+    .await;
 
     let mut translated = HashMap::new();
-    for batch_indices in groups {
-        let batch = batch_indices
-            .iter()
-            .map(|idx| pending[*idx].clone())
-            .collect::<Vec<_>>();
-        let prompt = build_release_batch_prompt(&batch);
-
-        let raw = ai::chat_completion(
-            state,
-            "你是一个批量翻译助手，负责把 GitHub Release 标题与片段翻译为中文。",
-            &prompt,
-            BATCH_MAX_TOKENS,
-        )
-        .await;
-
-        let mut parsed_ok = false;
-        if let Ok(raw) = raw
-            && let Some(payload) = parse_batch_release_translation_payload(&raw)
-        {
-            parsed_ok = true;
-            for item in payload.items {
-                if let Some(source) = batch
-                    .iter()
-                    .find(|candidate| candidate.release_id == item.release_id)
-                {
-                    let (title, summary) =
-                        normalize_translation_fields(item.title_zh, item.summary_md);
-                    if !source.excerpt.trim().is_empty() && summary.is_none() {
-                        continue;
-                    }
-                    if summary
-                        .as_deref()
-                        .is_some_and(|s| !markdown_structure_preserved(&source.excerpt, s))
+    let mut abort_remaining_batches = false;
+    match raw {
+        Ok(raw) => {
+            if let Some(payload) = parse_batch_release_translation_payload(&raw) {
+                for item in payload.items {
+                    if let Some(source) = batch
+                        .iter()
+                        .find(|candidate| candidate.release_id == item.release_id)
                     {
-                        continue;
-                    }
-                    if title.is_some() || summary.is_some() {
-                        translated.insert(item.release_id, (title, summary));
+                        let (title, summary) =
+                            normalize_translation_fields(item.title_zh, item.summary_md);
+                        if !source.excerpt.trim().is_empty() && summary.is_none() {
+                            continue;
+                        }
+                        if summary
+                            .as_deref()
+                            .is_some_and(|s| !markdown_structure_preserved(&source.excerpt, s))
+                        {
+                            continue;
+                        }
+                        if title.is_some() || summary.is_some() {
+                            translated.insert(item.release_id, (title, summary));
+                        }
                     }
                 }
+            } else {
+                tracing::warn!(
+                    "release batch translation response parse failed; fallback to single"
+                );
             }
         }
-
-        if !parsed_ok {
-            tracing::warn!("release batch translation response parse failed; fallback to single");
+        Err(err) => {
+            if ai_error_is_non_retryable(&err) {
+                abort_remaining_batches = true;
+                tracing::warn!(
+                    ?err,
+                    "release batch translation upstream error is non-retryable; skipping single fallback"
+                );
+            } else {
+                tracing::warn!(?err, "release batch translation failed; fallback to single");
+            }
         }
+    }
 
-        for item in &batch {
+    if !abort_remaining_batches {
+        for item in batch {
             if translated.contains_key(&item.release_id) {
                 continue;
             }
             if let Some(res) = translate_release_single_candidate_with_ai(state, item).await {
                 translated.insert(item.release_id, res);
             }
+        }
+    }
+
+    (translated, abort_remaining_batches)
+}
+
+async fn translate_release_candidates_with_ai(
+    state: &AppState,
+    pending: &[ReleaseBatchCandidate],
+) -> HashMap<i64, (Option<String>, Option<String>)> {
+    if pending.is_empty() {
+        return HashMap::new();
+    }
+
+    let groups = plan_release_translation_groups(state, pending).await;
+
+    let mut translated = HashMap::new();
+    let mut abort_remaining_batches = false;
+    for batch_indices in groups {
+        if abort_remaining_batches {
+            break;
+        }
+        let batch = batch_indices
+            .iter()
+            .map(|idx| pending[*idx].clone())
+            .collect::<Vec<_>>();
+        let (batch_translated, abort_after_batch) =
+            translate_release_candidate_group_with_ai(state, &batch).await;
+        for (release_id, values) in batch_translated {
+            translated.insert(release_id, values);
+        }
+        if abort_after_batch {
+            abort_remaining_batches = true;
         }
     }
 
@@ -2880,23 +3141,26 @@ fn release_cache_entry_reusable(cache: &TranslationCacheRow, excerpt: &str) -> b
     summary_is_usable || title_only_cache
 }
 
-async fn translate_releases_batch_internal(
+#[derive(Debug)]
+struct PreparedReleaseBatch {
+    candidates: Vec<ReleaseBatchCandidate>,
+    pending: Vec<ReleaseBatchCandidate>,
+    translated: HashMap<i64, (Option<String>, Option<String>)>,
+    missing: HashSet<i64>,
+}
+
+async fn prepare_release_batch(
     state: &AppState,
     user_id: i64,
     release_ids: &[i64],
-) -> Result<Vec<TranslateBatchItem>, ApiError> {
+) -> Result<PreparedReleaseBatch, ApiError> {
     if state.config.ai.is_none() {
-        return Ok(release_ids
-            .iter()
-            .map(|release_id| TranslateBatchItem {
-                id: release_id.to_string(),
-                lang: "zh-CN".to_owned(),
-                status: "disabled".to_owned(),
-                title: None,
-                summary: None,
-                error: None,
-            })
-            .collect());
+        return Ok(PreparedReleaseBatch {
+            candidates: Vec::new(),
+            pending: Vec::new(),
+            translated: HashMap::new(),
+            missing: HashSet::new(),
+        });
     }
 
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
@@ -3078,7 +3342,257 @@ async fn translate_releases_batch_internal(
         }
     }
 
-    Ok(out)
+    Ok(PreparedReleaseBatch {
+        candidates,
+        pending,
+        translated,
+        missing,
+    })
+}
+
+fn build_release_batch_item(
+    release_id: i64,
+    missing: &HashSet<i64>,
+    translated: &HashMap<i64, (Option<String>, Option<String>)>,
+) -> TranslateBatchItem {
+    if missing.contains(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: "missing".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("release not found".to_owned()),
+        };
+    }
+
+    if let Some((title, summary)) = translated.get(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: "ready".to_owned(),
+            title: title.clone(),
+            summary: summary.clone(),
+            error: None,
+        };
+    }
+
+    TranslateBatchItem {
+        id: release_id.to_string(),
+        lang: "zh-CN".to_owned(),
+        status: "error".to_owned(),
+        title: None,
+        summary: None,
+        error: Some("translation failed".to_owned()),
+    }
+}
+
+async fn upsert_release_batch_translations(
+    state: &AppState,
+    user_id: i64,
+    candidates: &[ReleaseBatchCandidate],
+    translated: &HashMap<i64, (Option<String>, Option<String>)>,
+) -> Result<(), ApiError> {
+    for item in candidates {
+        if let Some((title, summary)) = translated.get(&item.release_id) {
+            upsert_translation(
+                state,
+                user_id,
+                TranslationUpsert {
+                    entity_type: "release",
+                    entity_id: &item.entity_id,
+                    lang: "zh-CN",
+                    source_hash: &item.source_hash,
+                    title: title.as_deref(),
+                    summary: summary.as_deref(),
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn translate_releases_batch_internal(
+    state: &AppState,
+    user_id: i64,
+    release_ids: &[i64],
+) -> Result<Vec<TranslateBatchItem>, ApiError> {
+    if state.config.ai.is_none() {
+        return Ok(release_ids
+            .iter()
+            .map(|release_id| TranslateBatchItem {
+                id: release_id.to_string(),
+                lang: "zh-CN".to_owned(),
+                status: "disabled".to_owned(),
+                title: None,
+                summary: None,
+                error: None,
+            })
+            .collect());
+    }
+
+    let mut prepared = prepare_release_batch(state, user_id, release_ids).await?;
+    let translated_pending = translate_release_candidates_with_ai(state, &prepared.pending).await;
+    for (release_id, values) in translated_pending {
+        prepared.translated.insert(release_id, values);
+    }
+
+    upsert_release_batch_translations(state, user_id, &prepared.candidates, &prepared.translated)
+        .await?;
+
+    Ok(release_ids
+        .iter()
+        .map(|release_id| {
+            build_release_batch_item(*release_id, &prepared.missing, &prepared.translated)
+        })
+        .collect())
+}
+
+async fn translate_releases_batch_stream_worker(
+    state: Arc<AppState>,
+    user_id: i64,
+    release_ids: Vec<i64>,
+    tx: mpsc::Sender<Result<Bytes, Infallible>>,
+) {
+    let result = async {
+        if state.config.ai.is_none() {
+            for release_id in &release_ids {
+                let item = TranslateBatchItem {
+                    id: release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "disabled".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: None,
+                };
+                if !send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "item",
+                        item: Some(item),
+                        error: None,
+                    },
+                )
+                .await
+                {
+                    return Ok::<(), ApiError>(());
+                }
+            }
+            let _ = send_batch_stream_event(
+                &tx,
+                TranslateBatchStreamEvent {
+                    event: "done",
+                    item: None,
+                    error: None,
+                },
+            )
+            .await;
+            return Ok(());
+        }
+
+        let mut prepared = prepare_release_batch(state.as_ref(), user_id, &release_ids).await?;
+        let pending_ids = prepared
+            .pending
+            .iter()
+            .map(|item| item.release_id)
+            .collect::<HashSet<_>>();
+
+        for release_id in &release_ids {
+            if pending_ids.contains(release_id) {
+                continue;
+            }
+            let item =
+                build_release_batch_item(*release_id, &prepared.missing, &prepared.translated);
+            if !send_batch_stream_event(
+                &tx,
+                TranslateBatchStreamEvent {
+                    event: "item",
+                    item: Some(item),
+                    error: None,
+                },
+            )
+            .await
+            {
+                return Ok(());
+            }
+        }
+
+        if !prepared.pending.is_empty() {
+            let groups = plan_release_translation_groups(state.as_ref(), &prepared.pending).await;
+            let mut abort_remaining_batches = false;
+            for batch_indices in groups {
+                let batch = batch_indices
+                    .iter()
+                    .map(|idx| prepared.pending[*idx].clone())
+                    .collect::<Vec<_>>();
+
+                if !abort_remaining_batches {
+                    let (batch_translated, abort_after_batch) =
+                        translate_release_candidate_group_with_ai(state.as_ref(), &batch).await;
+                    if !batch_translated.is_empty() {
+                        upsert_release_batch_translations(
+                            state.as_ref(),
+                            user_id,
+                            &batch,
+                            &batch_translated,
+                        )
+                        .await?;
+                        for (release_id, values) in batch_translated {
+                            prepared.translated.insert(release_id, values);
+                        }
+                    }
+                    if abort_after_batch {
+                        abort_remaining_batches = true;
+                    }
+                }
+
+                for item in &batch {
+                    let out = build_release_batch_item(
+                        item.release_id,
+                        &prepared.missing,
+                        &prepared.translated,
+                    );
+                    if !send_batch_stream_event(
+                        &tx,
+                        TranslateBatchStreamEvent {
+                            event: "item",
+                            item: Some(out),
+                            error: None,
+                        },
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let _ = send_batch_stream_event(
+            &tx,
+            TranslateBatchStreamEvent {
+                event: "done",
+                item: None,
+                error: None,
+            },
+        )
+        .await;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        let _ = send_batch_stream_event(
+            &tx,
+            TranslateBatchStreamEvent {
+                event: "error",
+                item: None,
+                error: Some(format!("{}: stream worker failed", err.code())),
+            },
+        )
+        .await;
+    }
 }
 
 pub async fn translate_releases_batch(
@@ -3090,6 +3604,34 @@ pub async fn translate_releases_batch(
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
     let items = translate_releases_batch_internal(state.as_ref(), user_id, &release_ids).await?;
     Ok(Json(TranslateBatchResponse { items }))
+}
+
+pub async fn translate_releases_batch_stream(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<TranslateReleasesBatchRequest>,
+) -> Result<Response, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
+    let state_cloned = state.clone();
+
+    tokio::spawn(async move {
+        translate_releases_batch_stream_worker(state_cloned, user_id, release_ids, tx).await;
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
 }
 
 pub async fn translate_release(
@@ -3246,14 +3788,35 @@ async fn translate_release_detail_chunks_batched(
         .await;
 
         let mut parsed = HashMap::<usize, String>::new();
-        if let Ok(raw) = raw
-            && let Some(payload) = parse_batch_release_detail_translation_payload(&raw)
-        {
-            for item in payload.items {
-                if item.chunk_index == 0 || item.chunk_index > chunks.len() {
-                    continue;
+        match raw {
+            Ok(raw) => {
+                if let Some(payload) = parse_batch_release_detail_translation_payload(&raw) {
+                    for item in payload.items {
+                        if item.chunk_index == 0 || item.chunk_index > chunks.len() {
+                            continue;
+                        }
+                        parsed.insert(item.chunk_index - 1, item.summary_md);
+                    }
+                } else {
+                    tracing::warn!(
+                        "release detail chunk batch response parse failed; fallback to single chunks"
+                    );
                 }
-                parsed.insert(item.chunk_index - 1, item.summary_md);
+            }
+            Err(err) => {
+                if ai_error_is_non_retryable(&err) {
+                    tracing::warn!(
+                        ?err,
+                        "release detail chunk batch error is non-retryable; skipping single fallback"
+                    );
+                    return Err(ApiError::internal(
+                        "release detail translation unavailable: upstream model/channel rejected request",
+                    ));
+                }
+                tracing::warn!(
+                    ?err,
+                    "release detail chunk batch failed; fallback to single"
+                );
             }
         }
 
@@ -3600,10 +4163,8 @@ async fn translate_notification_candidates_with_ai(
         return HashMap::new();
     }
 
-    const BATCH_MAX_TOKENS: u32 = 1_100;
-    const BATCH_OVERHEAD_TOKENS: u32 = 220;
-
-    let budget_info = ai::compute_input_budget_with_source(state, BATCH_MAX_TOKENS).await;
+    let budget_info =
+        ai::compute_input_budget_with_source(state, NOTIFICATION_BATCH_MAX_TOKENS).await;
     let budget = budget_info.input_budget;
     let estimated = pending
         .iter()
@@ -3615,7 +4176,7 @@ async fn translate_notification_candidates_with_ai(
                 .saturating_add(32)
         })
         .collect::<Vec<_>>();
-    let groups = ai::pack_batch_indices(&estimated, budget, BATCH_OVERHEAD_TOKENS);
+    let groups = ai::pack_batch_indices(&estimated, budget, NOTIFICATION_BATCH_OVERHEAD_TOKENS);
     let split_count = groups.len().saturating_sub(1);
     let saved_calls = pending.len().saturating_sub(groups.len());
     let estimated_tokens = estimated.iter().copied().sum::<u32>();
@@ -3631,7 +4192,11 @@ async fn translate_notification_candidates_with_ai(
     );
 
     let mut translated = HashMap::new();
+    let mut abort_remaining_batches = false;
     for batch_indices in groups {
+        if abort_remaining_batches {
+            break;
+        }
         let batch = batch_indices
             .iter()
             .map(|idx| pending[*idx].clone())
@@ -3641,33 +4206,58 @@ async fn translate_notification_candidates_with_ai(
             state,
             "你是一个批量翻译助手，负责把 GitHub Notifications 条目转写为中文标题与建议。",
             &prompt,
-            BATCH_MAX_TOKENS,
+            NOTIFICATION_BATCH_MAX_TOKENS,
         )
         .await;
 
-        if let Ok(raw) = raw
-            && let Some(payload) = parse_batch_notification_translation_payload(&raw)
-        {
-            for item in payload.items {
-                if !batch
-                    .iter()
-                    .any(|candidate| candidate.thread_id == item.thread_id)
-                {
-                    continue;
+        match raw {
+            Ok(raw) => {
+                if let Some(payload) = parse_batch_notification_translation_payload(&raw) {
+                    for item in payload.items {
+                        if !batch
+                            .iter()
+                            .any(|candidate| candidate.thread_id == item.thread_id)
+                        {
+                            continue;
+                        }
+                        let (title, summary) =
+                            normalize_translation_fields(item.title_zh, item.summary_md);
+                        if title.is_some() || summary.is_some() {
+                            translated.insert(item.thread_id, (title, summary));
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "notification batch translation response parse failed; fallback to single"
+                    );
                 }
-                let (title, summary) = normalize_translation_fields(item.title_zh, item.summary_md);
-                if title.is_some() || summary.is_some() {
-                    translated.insert(item.thread_id, (title, summary));
+            }
+            Err(err) => {
+                if ai_error_is_non_retryable(&err) {
+                    abort_remaining_batches = true;
+                    tracing::warn!(
+                        ?err,
+                        "notification batch translation upstream error is non-retryable; skipping single fallback"
+                    );
+                } else {
+                    tracing::warn!(
+                        ?err,
+                        "notification batch translation failed; fallback to single"
+                    );
                 }
             }
         }
 
-        for item in &batch {
-            if translated.contains_key(&item.thread_id) {
-                continue;
-            }
-            if let Some(res) = translate_notification_single_candidate_with_ai(state, item).await {
-                translated.insert(item.thread_id.clone(), res);
+        if !abort_remaining_batches {
+            for item in &batch {
+                if translated.contains_key(&item.thread_id) {
+                    continue;
+                }
+                if let Some(res) =
+                    translate_notification_single_candidate_with_ai(state, item).await
+                {
+                    translated.insert(item.thread_id.clone(), res);
+                }
             }
         }
     }
@@ -3931,12 +4521,14 @@ mod tests {
     use super::{
         FeedRow, GraphQlError, TranslateBatchItem, TranslationCacheRow,
         github_graphql_errors_to_api_error, github_graphql_http_error, has_repo_scope,
-        looks_like_json_blob, markdown_structure_preserved, parse_release_id_param,
-        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, preserve_chunk_trailing_newline, release_cache_entry_reusable,
-        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
-        translate_response_from_batch_item,
+        looks_like_json_blob, markdown_structure_preserved,
+        parse_batch_notification_translation_payload,
+        parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
+        parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
+        parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
+        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
+        release_excerpt, release_reactions_status, resolve_release_full_name,
+        split_markdown_chunks, translate_response_from_batch_item,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -4344,6 +4936,46 @@ echo should_not_be_in_excerpt
         let parsed = parse_translation_json(raw).expect("parse translation json");
         assert_eq!(parsed.title_zh.as_deref(), Some("标题"));
         assert_eq!(parsed.summary_md.as_deref(), Some("- **加粗**\n- `code`"));
+    }
+
+    #[test]
+    fn parse_batch_release_translation_payload_accepts_relaxed_fields() {
+        let raw = r#"```json
+{"items":[{"id":"123","title":"标题","summary":"- 第一行\\n- 第二行"}]}
+```"#;
+        let parsed =
+            parse_batch_release_translation_payload(raw).expect("parse release batch payload");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].release_id, 123);
+        assert_eq!(parsed.items[0].title_zh.as_deref(), Some("标题"));
+        assert_eq!(
+            parsed.items[0].summary_md.as_deref(),
+            Some("- 第一行\n- 第二行")
+        );
+    }
+
+    #[test]
+    fn parse_batch_notification_translation_payload_accepts_array_root() {
+        let raw = r#"[{"id":"thread-1","title_cn":"标题","body":"- 第一行\\n- 第二行"}]"#;
+        let parsed = parse_batch_notification_translation_payload(raw)
+            .expect("parse notification batch payload");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].thread_id, "thread-1");
+        assert_eq!(parsed.items[0].title_zh.as_deref(), Some("标题"));
+        assert_eq!(
+            parsed.items[0].summary_md.as_deref(),
+            Some("- 第一行\n- 第二行")
+        );
+    }
+
+    #[test]
+    fn parse_batch_release_detail_payload_accepts_string_index() {
+        let raw = r#"{"translations":[{"index":"2","summary":"- a\\n- b"}]}"#;
+        let parsed = parse_batch_release_detail_translation_payload(raw)
+            .expect("parse release detail batch payload");
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].chunk_index, 2);
+        assert_eq!(parsed.items[0].summary_md, "- a\n- b");
     }
 
     #[test]
