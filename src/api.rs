@@ -2899,8 +2899,6 @@ fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
         || msg.contains("model not found")
         || msg.contains("ai returned 401")
         || msg.contains("ai returned 403")
-        || msg.contains("ai returned 429")
-        || msg.contains("rate limit")
         || msg.contains("insufficient_quota")
         || status_422_non_context
 }
@@ -4486,7 +4484,8 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
 mod tests {
     use super::{
         FeedRow, GraphQlError, TranslateBatchItem, TranslationCacheRow,
-        github_graphql_errors_to_api_error, github_graphql_http_error, has_repo_scope,
+        ai_error_is_non_retryable, github_graphql_errors_to_api_error, github_graphql_http_error,
+        has_repo_scope,
         looks_like_json_blob, markdown_structure_preserved,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -4644,6 +4643,13 @@ mod tests {
         let err =
             parse_unique_thread_ids(&raw_ids, 60).expect_err("oversized thread batch rejected");
         assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn api_non_retryable_error_keeps_rate_limit_retryable_for_fallback() {
+        assert!(!ai_error_is_non_retryable(&anyhow::anyhow!(
+            "ai returned 429: upstream rate limit"
+        )));
     }
 
     #[test]

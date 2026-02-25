@@ -12,6 +12,7 @@ import type {
 const MAX_CONCURRENT = 2;
 const BATCH_SIZE = 8;
 const BATCH_FLUSH_DELAY_MS = 300;
+const STREAM_RECOVERY_MAX_RETRIES = 3;
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -34,6 +35,7 @@ export function useAutoTranslate(params: {
 	const queuedRef = useRef<string[]>([]);
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
+	const streamRetryCountRef = useRef(new Map<string, number>());
 	const runningRef = useRef(0);
 	const flushTimerRef = useRef<number | null>(null);
 
@@ -170,6 +172,22 @@ export function useAutoTranslate(params: {
 
 			const byId = new Map(batchItems.map((item) => [item.id, item]));
 			const handled = new Set<string>();
+			const requeueAfterStreamFailure = (item: FeedItem) => {
+				const key = keyOf(item);
+				if (handled.has(key)) return;
+				if (failedRef.current.has(key)) return;
+				const retries = streamRetryCountRef.current.get(key) ?? 0;
+				if (retries >= STREAM_RECOVERY_MAX_RETRIES) {
+					failedRef.current.add(key);
+					streamRetryCountRef.current.delete(key);
+					return;
+				}
+				streamRetryCountRef.current.set(key, retries + 1);
+				if (!queuedRef.current.includes(key) && !inFlightRef.current.has(key)) {
+					queuedRef.current.push(key);
+				}
+			};
+			let streamErrored = false;
 
 			void translateBatchStream(batchItems, (translated) => {
 				const item = byId.get(translated.id);
@@ -188,6 +206,7 @@ export function useAutoTranslate(params: {
 					translated.status === "error";
 				if (!terminal) return;
 				handled.add(key);
+				streamRetryCountRef.current.delete(key);
 
 				inFlightRef.current.delete(key);
 				if (translated.status === "ready" || translated.status === "disabled") {
@@ -206,18 +225,16 @@ export function useAutoTranslate(params: {
 				forceRender((x) => x + 1);
 			})
 				.catch(() => {
+					streamErrored = true;
 					for (const item of batchItems) {
-						const key = keyOf(item);
-						if (!handled.has(key)) {
-							failedRef.current.add(key);
-						}
+						requeueAfterStreamFailure(item);
 					}
 				})
 				.finally(() => {
 					for (const item of batchItems) {
 						const key = keyOf(item);
-						if (!handled.has(key)) {
-							failedRef.current.add(key);
+						if (!handled.has(key) && !streamErrored) {
+							requeueAfterStreamFailure(item);
 						}
 						inFlightRef.current.delete(key);
 					}
