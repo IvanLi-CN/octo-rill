@@ -127,6 +127,12 @@ async function installBaseMocks(
 					page: 1,
 					page_size: 20,
 					total: filtered.length,
+					guard: {
+						admin_total: users.filter((u) => u.is_admin).length,
+						active_admin_total: users.filter(
+							(u) => u.is_admin && !u.is_disabled,
+						).length,
+					},
 				});
 			}
 		}
@@ -171,6 +177,11 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(page).toHaveURL(/\/admin$/);
 	await expect(page.getByRole("heading", { name: "管理员面板" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+	const revokeAdminButton = page
+		.getByRole("button", { name: "撤销管理员" })
+		.first();
+	await expect(revokeAdminButton).toBeDisabled();
+	await expect(page.getByText("唯一管理员，不能撤销")).toBeVisible();
 
 	const userRow = page
 		.getByText("octo-user", { exact: false })
@@ -183,6 +194,7 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	).toBeVisible();
 	await page.getByRole("button", { name: "确认更改" }).click();
 	await expect(userRow).toContainText("管理员");
+	await expect(revokeAdminButton).toBeEnabled();
 
 	await userRow.getByRole("button", { name: "禁用" }).click();
 	await expect(userRow).toContainText("已禁用");

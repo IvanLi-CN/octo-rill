@@ -31,6 +31,10 @@ type AdminUsersListResponse = {
 	page: number;
 	page_size: number;
 	total: number;
+	guard?: {
+		admin_total: number;
+		active_admin_total: number;
+	};
 };
 
 type UserManagementProps = {
@@ -43,6 +47,27 @@ type PendingAdminConfirm = {
 };
 
 const PAGE_SIZE = 20;
+const DEFAULT_GUARD = { admin_total: 0, active_admin_total: 0 };
+
+function toAdminUserErrorMessage(err: unknown) {
+	if (err instanceof ApiError) {
+		switch (err.code) {
+			case "forbidden_admin_only":
+				return "你当前没有管理员权限。请刷新页面确认账号状态。";
+			case "account_disabled":
+				return "账号已被禁用，请联系其他管理员处理。";
+			case "last_admin_guard":
+				return "至少保留一名启用管理员，当前操作已被拦截。";
+			case "cannot_disable_self":
+				return "不能禁用自己。";
+			case "not_found":
+				return "目标用户不存在，列表将自动刷新。";
+			default:
+				break;
+		}
+	}
+	return err instanceof Error ? err.message : String(err);
+}
 
 export function UserManagement({ currentUserId }: UserManagementProps) {
 	const [queryInput, setQueryInput] = useState("");
@@ -55,6 +80,10 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 	const [error, setError] = useState<string | null>(null);
 	const [items, setItems] = useState<AdminUserItem[]>([]);
 	const [total, setTotal] = useState(0);
+	const [guardSummary, setGuardSummary] = useState<{
+		admin_total: number;
+		active_admin_total: number;
+	}>(DEFAULT_GUARD);
 	const [actionBusyUserId, setActionBusyUserId] = useState<number | null>(null);
 	const [pendingAdminConfirm, setPendingAdminConfirm] =
 		useState<PendingAdminConfirm | null>(null);
@@ -80,14 +109,23 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 			);
 			setItems(res.items);
 			setTotal(res.total);
+			setGuardSummary(
+				res.guard ?? {
+					admin_total: res.items.filter((item) => item.is_admin).length,
+					active_admin_total: res.items.filter(
+						(item) => item.is_admin && !item.is_disabled,
+					).length,
+				},
+			);
 		} catch (err) {
 			if (err instanceof ApiError && err.code === "forbidden_admin_only") {
-				setError("你当前没有管理员权限。请刷新页面确认账号状态。");
+				setError(toAdminUserErrorMessage(err));
 				setItems([]);
 				setTotal(0);
+				setGuardSummary(DEFAULT_GUARD);
 				return;
 			}
-			setError(err instanceof Error ? err.message : String(err));
+			setError(toAdminUserErrorMessage(err));
 		} finally {
 			setLoading(false);
 		}
@@ -116,7 +154,8 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 				);
 				await loadUsers();
 			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err));
+				setError(toAdminUserErrorMessage(err));
+				await loadUsers();
 			} finally {
 				setActionBusyUserId(null);
 			}
@@ -205,6 +244,30 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 					) : (
 						items.map((user) => {
 							const busy = actionBusyUserId === user.id;
+							const isSelf = user.id === currentUserId;
+							const isLastAdmin =
+								user.is_admin && guardSummary.admin_total <= 1;
+							const isLastActiveAdmin =
+								user.is_admin &&
+								!user.is_disabled &&
+								guardSummary.active_admin_total <= 1;
+							const adminActionBlocked = user.is_admin
+								? isLastAdmin || isLastActiveAdmin
+								: false;
+							const disableActionBlocked =
+								(isSelf && !user.is_disabled) || isLastActiveAdmin;
+							const adminActionHint =
+								user.is_admin && isLastAdmin
+									? "唯一管理员，不能撤销"
+									: user.is_admin && isLastActiveAdmin
+										? "最后一名启用管理员，不能撤销"
+										: null;
+							const disableActionHint =
+								!user.is_disabled && isSelf
+									? "不能禁用自己"
+									: !user.is_disabled && isLastActiveAdmin
+										? "最后一名启用管理员，不能禁用"
+										: null;
 							return (
 								<div
 									key={user.id}
@@ -245,19 +308,24 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 									<div className="flex flex-wrap gap-2">
 										<Button
 											variant="outline"
-											disabled={busy}
+											disabled={busy || adminActionBlocked}
 											onClick={() => void onToggleAdmin(user)}
 										>
 											{user.is_admin ? "撤销管理员" : "设为管理员"}
 										</Button>
 										<Button
 											variant={user.is_disabled ? "secondary" : "destructive"}
-											disabled={busy}
+											disabled={busy || disableActionBlocked}
 											onClick={() => void onToggleDisabled(user)}
 										>
 											{user.is_disabled ? "启用" : "禁用"}
 										</Button>
 									</div>
+									{adminActionHint || disableActionHint ? (
+										<p className="text-muted-foreground w-full text-xs">
+											{adminActionHint ?? disableActionHint}
+										</p>
+									) : null}
 								</div>
 							);
 						})

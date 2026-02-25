@@ -79,6 +79,12 @@ function AdminPanelPreview() {
 						page: 1,
 						page_size: 20,
 						total: filtered.length,
+						guard: {
+							admin_total: users.filter((item) => item.is_admin).length,
+							active_admin_total: users.filter(
+								(item) => item.is_admin && !item.is_disabled,
+							).length,
+						},
 					}),
 					{
 						status: 200,

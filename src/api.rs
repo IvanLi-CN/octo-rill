@@ -115,6 +115,13 @@ pub struct AdminUsersListResponse {
     page: i64,
     page_size: i64,
     total: i64,
+    guard: AdminUsersGuardSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminUsersGuardSummary {
+    admin_total: i64,
+    active_admin_total: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,11 +269,28 @@ pub async fn admin_list_users(
     .await
     .map_err(ApiError::internal)?;
 
+    let admin_total =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM users WHERE is_admin = 1"#)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+
+    let active_admin_total = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM users WHERE is_admin = 1 AND is_disabled = 0"#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
     Ok(Json(AdminUsersListResponse {
         items,
         page,
         page_size,
         total,
+        guard: AdminUsersGuardSummary {
+            admin_total,
+            active_admin_total,
+        },
     }))
 }
 
