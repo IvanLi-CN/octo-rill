@@ -2750,7 +2750,8 @@ async fn translate_release_candidates_with_ai(
     const BATCH_MAX_TOKENS: u32 = 1_400;
     const BATCH_OVERHEAD_TOKENS: u32 = 320;
 
-    let budget = ai::compute_input_budget(state, BATCH_MAX_TOKENS).await;
+    let budget_info = ai::compute_input_budget_with_source(state, BATCH_MAX_TOKENS).await;
+    let budget = budget_info.input_budget;
     let estimated = pending
         .iter()
         .map(|item| {
@@ -2760,6 +2761,19 @@ async fn translate_release_candidates_with_ai(
         })
         .collect::<Vec<_>>();
     let groups = ai::pack_batch_indices(&estimated, budget, BATCH_OVERHEAD_TOKENS);
+    let split_count = groups.len().saturating_sub(1);
+    let saved_calls = pending.len().saturating_sub(groups.len());
+    let estimated_tokens = estimated.iter().copied().sum::<u32>();
+    tracing::info!(
+        batch_size = pending.len(),
+        estimated_tokens,
+        split_count,
+        saved_calls,
+        fallback_source = budget_info.fallback_source,
+        input_budget = budget_info.input_budget,
+        model_input_limit = budget_info.model_input_limit,
+        "release translation batch plan"
+    );
 
     let mut translated = HashMap::new();
     for batch_indices in groups {
@@ -3171,12 +3185,27 @@ async fn translate_release_detail_chunks_batched(
     }
 
     const CHUNK_BATCH_OVERHEAD_TOKENS: u32 = 320;
-    let budget = ai::compute_input_budget(state, RELEASE_DETAIL_CHUNK_MAX_TOKENS).await;
+    let budget_info =
+        ai::compute_input_budget_with_source(state, RELEASE_DETAIL_CHUNK_MAX_TOKENS).await;
+    let budget = budget_info.input_budget;
     let estimated = chunks
         .iter()
         .map(|chunk| ai::estimate_text_tokens(chunk).saturating_add(48))
         .collect::<Vec<_>>();
     let grouped = ai::pack_batch_indices(&estimated, budget, CHUNK_BATCH_OVERHEAD_TOKENS);
+    let split_count = grouped.len().saturating_sub(1);
+    let saved_calls = chunks.len().saturating_sub(grouped.len());
+    let estimated_tokens = estimated.iter().copied().sum::<u32>();
+    tracing::info!(
+        batch_size = chunks.len(),
+        estimated_tokens,
+        split_count,
+        saved_calls,
+        fallback_source = budget_info.fallback_source,
+        input_budget = budget_info.input_budget,
+        model_input_limit = budget_info.model_input_limit,
+        "release detail chunk batch plan"
+    );
 
     let mut translated = vec![String::new(); chunks.len()];
     for batch_indices in grouped {
@@ -3403,20 +3432,29 @@ pub async fn translate_release_detail(
 ) -> Result<Json<TranslateResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
     let release_id = parse_release_id_param(&req.release_id)?;
-    let translated = translate_release_detail_internal(state.as_ref(), user_id, release_id).await?;
-    Ok(Json(translated))
+    let mut items =
+        translate_release_detail_batch_internal(state.as_ref(), user_id, &[release_id]).await?;
+    let Some(item) = items.pop() else {
+        return Err(ApiError::internal("missing translation result"));
+    };
+    if item.status == "error" && item.error.as_deref() == Some("release not found") {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
+    Ok(Json(translate_response_from_batch_item(item)?))
 }
 
-pub async fn translate_release_detail_batch(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Json(req): Json<TranslateReleaseDetailBatchRequest>,
-) -> Result<Json<TranslateBatchResponse>, ApiError> {
-    let user_id = require_user_id(&session).await?;
-    let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
+async fn translate_release_detail_batch_internal(
+    state: &AppState,
+    user_id: i64,
+    release_ids: &[i64],
+) -> Result<Vec<TranslateBatchItem>, ApiError> {
     let mut items = Vec::with_capacity(release_ids.len());
     for release_id in release_ids {
-        match translate_release_detail_internal(state.as_ref(), user_id, release_id).await {
+        match translate_release_detail_internal(state, user_id, *release_id).await {
             Ok(translated) => items.push(TranslateBatchItem {
                 id: release_id.to_string(),
                 lang: translated.lang,
@@ -3433,9 +3471,35 @@ pub async fn translate_release_detail_batch(
                 summary: None,
                 error: Some("release not found".to_owned()),
             }),
-            Err(err) => return Err(err),
+            Err(err) => {
+                tracing::warn!(
+                    release_id,
+                    error_code = err.code(),
+                    "release detail translation failed inside batch"
+                );
+                items.push(TranslateBatchItem {
+                    id: release_id.to_string(),
+                    lang: "zh-CN".to_owned(),
+                    status: "error".to_owned(),
+                    title: None,
+                    summary: None,
+                    error: Some("translation failed".to_owned()),
+                });
+            }
         }
     }
+    Ok(items)
+}
+
+pub async fn translate_release_detail_batch(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<TranslateReleaseDetailBatchRequest>,
+) -> Result<Json<TranslateBatchResponse>, ApiError> {
+    let user_id = require_user_id(&session).await?;
+    let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
+    let items =
+        translate_release_detail_batch_internal(state.as_ref(), user_id, &release_ids).await?;
     Ok(Json(TranslateBatchResponse { items }))
 }
 
@@ -3529,7 +3593,8 @@ async fn translate_notification_candidates_with_ai(
     const BATCH_MAX_TOKENS: u32 = 1_100;
     const BATCH_OVERHEAD_TOKENS: u32 = 220;
 
-    let budget = ai::compute_input_budget(state, BATCH_MAX_TOKENS).await;
+    let budget_info = ai::compute_input_budget_with_source(state, BATCH_MAX_TOKENS).await;
+    let budget = budget_info.input_budget;
     let estimated = pending
         .iter()
         .map(|item| {
@@ -3541,6 +3606,19 @@ async fn translate_notification_candidates_with_ai(
         })
         .collect::<Vec<_>>();
     let groups = ai::pack_batch_indices(&estimated, budget, BATCH_OVERHEAD_TOKENS);
+    let split_count = groups.len().saturating_sub(1);
+    let saved_calls = pending.len().saturating_sub(groups.len());
+    let estimated_tokens = estimated.iter().copied().sum::<u32>();
+    tracing::info!(
+        batch_size = pending.len(),
+        estimated_tokens,
+        split_count,
+        saved_calls,
+        fallback_source = budget_info.fallback_source,
+        input_budget = budget_info.input_budget,
+        model_input_limit = budget_info.model_input_limit,
+        "notification translation batch plan"
+    );
 
     let mut translated = HashMap::new();
     for batch_indices in groups {

@@ -15,10 +15,13 @@ const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MODEL_LIMIT_SAFETY_MIN_TOKENS: u32 = 512;
 const MODEL_LIMIT_SAFETY_RATIO: f64 = 0.05;
-const MODEL_LIMIT_DEFAULT_OUTPUT_TOKENS: u32 = 1_024;
 const MODEL_LIMIT_SOURCE_OPENROUTER: &str = "https://openrouter.ai/api/v1/models";
 const MODEL_LIMIT_SOURCE_LITELLM: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+const MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE: &str = "env_override";
+const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
+const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
+const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
 
 #[derive(Debug, Default)]
 struct ModelLimitCatalog {
@@ -39,6 +42,13 @@ struct OpenRouterModelItem {
 
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
 static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+pub struct InputBudget {
+    pub model_input_limit: u32,
+    pub input_budget: u32,
+    pub fallback_source: &'static str,
+}
 
 fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
     MODEL_LIMIT_CATALOG.get_or_init(|| tokio::sync::RwLock::new(ModelLimitCatalog::default()))
@@ -270,9 +280,9 @@ fn lookup_model_limit_in_map(map: &HashMap<String, u32>, model: &str) -> Option<
     None
 }
 
-pub async fn resolve_model_input_limit(state: &AppState) -> u32 {
+pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'static str) {
     if let Some(limit) = state.config.ai_model_context_limit {
-        return limit.max(1);
+        return (limit.max(1), MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE);
     }
 
     let model = state
@@ -282,7 +292,10 @@ pub async fn resolve_model_input_limit(state: &AppState) -> u32 {
         .map(|cfg| cfg.model.as_str())
         .unwrap_or_default();
     if model.is_empty() {
-        return MODEL_LIMIT_UNKNOWN_FALLBACK;
+        return (
+            MODEL_LIMIT_UNKNOWN_FALLBACK,
+            MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
+        );
     }
 
     if let Err(err) = refresh_model_limits(state, false).await {
@@ -292,25 +305,33 @@ pub async fn resolve_model_input_limit(state: &AppState) -> u32 {
     {
         let guard = model_limit_catalog().read().await;
         if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model) {
-            return limit.max(1);
+            return (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG);
         }
     }
 
     if let Some(limit) = lookup_model_limit_in_map(builtin_model_limits(), model) {
-        return limit.max(1);
+        return (limit.max(1), MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG);
     }
 
-    MODEL_LIMIT_UNKNOWN_FALLBACK
+    (
+        MODEL_LIMIT_UNKNOWN_FALLBACK,
+        MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
+    )
 }
 
-pub async fn compute_input_budget(state: &AppState, max_tokens: u32) -> u32 {
-    let model_limit = resolve_model_input_limit(state).await;
-    let output_reserve = max_tokens.max(MODEL_LIMIT_DEFAULT_OUTPUT_TOKENS);
+pub async fn compute_input_budget_with_source(state: &AppState, max_tokens: u32) -> InputBudget {
+    let (model_limit, fallback_source) = resolve_model_input_limit_with_source(state).await;
+    let output_reserve = max_tokens;
     let ratio_margin = (f64::from(model_limit) * MODEL_LIMIT_SAFETY_RATIO).ceil() as u32;
     let margin = ratio_margin.max(MODEL_LIMIT_SAFETY_MIN_TOKENS);
-    model_limit
+    let input_budget = model_limit
         .saturating_sub(output_reserve)
-        .saturating_sub(margin)
+        .saturating_sub(margin);
+    InputBudget {
+        model_input_limit: model_limit,
+        input_budget,
+        fallback_source,
+    }
 }
 
 pub fn estimate_text_tokens(raw: &str) -> u32 {
@@ -364,12 +385,10 @@ pub fn pack_batch_indices(
 
 pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
     let handle = tokio::spawn(async move {
-        if let Err(err) = refresh_model_limits(state.as_ref(), true).await {
-            tracing::warn!(?err, "model catalog initial refresh failed");
-        }
-
         let mut interval = tokio::time::interval(MODEL_LIMIT_SYNC_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick happens immediately; consume it so refresh starts on the next 24h boundary.
+        interval.tick().await;
         loop {
             interval.tick().await;
             if let Err(err) = refresh_model_limits(state.as_ref(), true).await {
@@ -1211,8 +1230,22 @@ async fn summarize_projects_with_ai(
                 .max(1)
         })
         .collect::<Vec<_>>();
-    let budget = compute_input_budget(state, 1_400).await;
+    let budget_info = compute_input_budget_with_source(state, 1_400).await;
+    let budget = budget_info.input_budget;
     let groups = pack_batch_indices(&estimated, budget, 320);
+    let split_count = groups.len().saturating_sub(1);
+    let saved_calls = projects.len().saturating_sub(groups.len());
+    let estimated_tokens = estimated.iter().copied().sum::<u32>();
+    tracing::info!(
+        batch_size = projects.len(),
+        estimated_tokens,
+        split_count,
+        saved_calls,
+        fallback_source = budget_info.fallback_source,
+        input_budget = budget_info.input_budget,
+        model_input_limit = budget_info.model_input_limit,
+        "daily brief batch plan"
+    );
 
     let mut merged = HashMap::<i64, Vec<String>>::new();
     for group in groups {
