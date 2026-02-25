@@ -817,8 +817,6 @@ fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
         || msg.contains("model not found")
         || msg.contains("ai returned 401")
         || msg.contains("ai returned 403")
-        || msg.contains("ai returned 429")
-        || msg.contains("rate limit")
         || msg.contains("insufficient_quota")
         || status_422_non_context
 }
@@ -1800,6 +1798,13 @@ mod tests {
             reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
         assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn ai_non_retryable_error_keeps_rate_limit_retryable_for_fallback() {
+        assert!(!ai_error_is_non_retryable(&anyhow::anyhow!(
+            "ai returned 429: upstream rate limit"
+        )));
     }
 
     #[test]
