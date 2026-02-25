@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { UserManagement } from "@/admin/UserManagement";
 import { ApiError, apiGet, apiPost, apiPostJson, apiPutJson } from "@/api";
 import { Button } from "@/components/ui/button";
 import { FeedList } from "@/feed/FeedList";
@@ -25,7 +24,7 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
-type Tab = "all" | "releases" | "briefs" | "inbox" | "admin";
+type Tab = "all" | "releases" | "briefs" | "inbox";
 
 type MeResponse = {
 	user: {
@@ -92,10 +91,7 @@ function parseDashboardQuery() {
 
 	const rawTab = params.get("tab");
 	const tab: Tab =
-		rawTab === "releases" ||
-		rawTab === "briefs" ||
-		rawTab === "inbox" ||
-		rawTab === "admin"
+		rawTab === "releases" || rawTab === "briefs" || rawTab === "inbox"
 			? rawTab
 			: "all";
 	return { tab, releaseId };
@@ -588,12 +584,6 @@ export function Dashboard(props: { me: MeResponse }) {
 	}, []);
 
 	useEffect(() => {
-		if (!isAdmin && tab === "admin") {
-			setTab("all");
-		}
-	}, [isAdmin, tab]);
-
-	useEffect(() => {
 		const params = new URLSearchParams(window.location.search);
 		if (tab === "all") {
 			params.delete("tab");
@@ -670,23 +660,25 @@ export function Dashboard(props: { me: MeResponse }) {
 					>
 						Inbox
 					</Button>
+				</div>
+
+				<div className="flex items-center gap-2">
+					{busy ? (
+						<span className="text-muted-foreground font-mono text-xs">
+							{busy}…
+						</span>
+					) : null}
 					{isAdmin ? (
 						<Button
-							variant={tab === "admin" ? "default" : "outline"}
+							asChild
+							variant="outline"
 							size="sm"
 							className="font-mono text-xs"
-							onClick={() => onSelectTab("admin")}
 						>
-							管理员
+							<a href="/admin">管理员面板</a>
 						</Button>
 					) : null}
 				</div>
-
-				{busy ? (
-					<span className="text-muted-foreground font-mono text-xs">
-						{busy}…
-					</span>
-				) : null}
 			</div>
 
 			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
@@ -768,9 +760,6 @@ export function Dashboard(props: { me: MeResponse }) {
 					) : null}
 
 					{tab === "inbox" ? <InboxList notifications={notifications} /> : null}
-					{tab === "admin" && isAdmin ? (
-						<UserManagement currentUserId={me.user.id} />
-					) : null}
 				</section>
 
 				<aside className="space-y-6">

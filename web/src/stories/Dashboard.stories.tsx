@@ -211,6 +211,14 @@ function DashboardPreview() {
 						Inbox
 					</Button>
 				</div>
+				<Button
+					asChild
+					variant="outline"
+					size="sm"
+					className="font-mono text-xs"
+				>
+					<a href="/admin">管理员面板</a>
+				</Button>
 			</div>
 
 			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">

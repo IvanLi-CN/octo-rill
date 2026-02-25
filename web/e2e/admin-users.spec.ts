@@ -167,7 +167,9 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await installBaseMocks(page, { isAdmin: true });
 	await page.goto("/");
 
-	await page.getByRole("button", { name: "管理员" }).click();
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page).toHaveURL(/\/admin$/);
+	await expect(page.getByRole("heading", { name: "管理员面板" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
 
 	const userRow = page
@@ -186,13 +188,11 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(userRow).toContainText("已禁用");
 });
 
-test("non-admin user does not see admin tab and cannot stay on admin tab", async ({
-	page,
-}) => {
+test("non-admin user cannot stay on admin route", async ({ page }) => {
 	await installBaseMocks(page, { isAdmin: false, adminApiForbidden: true });
-	await page.goto("/?tab=admin");
+	await page.goto("/admin");
 
-	await expect(page.getByRole("button", { name: "管理员" })).toHaveCount(0);
+	await expect(page).toHaveURL("/");
+	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toHaveCount(0);
-	await expect(page).not.toHaveURL(/tab=admin/);
 });
