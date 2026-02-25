@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { apiPostJson } from "@/api";
-import type { FeedItem, TranslateResponse } from "@/feed/types";
+import type {
+	FeedItem,
+	TranslateBatchResponse,
+	TranslateResponse,
+} from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
+const BATCH_SIZE = 8;
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -39,9 +44,9 @@ export function useAutoTranslate(params: {
 		[enabled],
 	);
 
-	const translate = useCallback(async (item: FeedItem) => {
-		return apiPostJson<TranslateResponse>("/api/translate/release", {
-			release_id: item.id,
+	const translateBatch = useCallback(async (items: FeedItem[]) => {
+		return apiPostJson<TranslateBatchResponse>("/api/translate/releases/batch", {
+			release_ids: items.map((item) => item.id),
 		});
 	}, []);
 
@@ -51,37 +56,68 @@ export function useAutoTranslate(params: {
 			runningRef.current < MAX_CONCURRENT &&
 			queuedRef.current.length > 0
 		) {
-			const key = queuedRef.current.shift();
-			if (!key) break;
-			if (inFlightRef.current.has(key)) continue;
+			const keys: string[] = [];
+			while (keys.length < BATCH_SIZE && queuedRef.current.length > 0) {
+				const key = queuedRef.current.shift();
+				if (!key) break;
+				if (inFlightRef.current.has(key)) continue;
+				keys.push(key);
+			}
+			if (keys.length === 0) continue;
 
-			const item = itemByKeyRef.current.get(key);
-			if (!item || !shouldAutoTranslate(item)) continue;
+			const batchItems = keys
+				.map((key) => itemByKeyRef.current.get(key))
+				.filter((item): item is FeedItem =>
+					Boolean(item && shouldAutoTranslate(item)),
+				);
+			if (batchItems.length === 0) continue;
 
-			inFlightRef.current.add(key);
+			for (const item of batchItems) {
+				inFlightRef.current.add(keyOf(item));
+			}
 			runningRef.current += 1;
 			forceRender((x) => x + 1);
 
-			void translate(item)
+			void translateBatch(batchItems)
 				.then((res) => {
-					onTranslated(item, res);
-					if (res.status === "disabled") {
-						// Stop auto attempts; the backend says AI is off.
-						failedRef.current.add(key);
+					const byId = new Map(res.items.map((item) => [item.id, item]));
+					for (const item of batchItems) {
+						const key = keyOf(item);
+						const translated = byId.get(item.id);
+						if (
+							translated &&
+							(translated.status === "ready" || translated.status === "disabled")
+						) {
+							onTranslated(item, {
+								lang: translated.lang,
+								status:
+									translated.status === "disabled" ? "disabled" : "ready",
+								title: translated.title,
+								summary: translated.summary,
+							});
+							if (translated.status === "disabled") {
+								failedRef.current.add(key);
+							}
+						} else {
+							failedRef.current.add(key);
+						}
 					}
 				})
 				.catch(() => {
-					// Avoid infinite retries; allow manual retry from the UI.
-					failedRef.current.add(key);
+					for (const item of batchItems) {
+						failedRef.current.add(keyOf(item));
+					}
 				})
 				.finally(() => {
-					inFlightRef.current.delete(key);
+					for (const item of batchItems) {
+						inFlightRef.current.delete(keyOf(item));
+					}
 					runningRef.current -= 1;
 					forceRender((x) => x + 1);
 					pump();
 				});
 		}
-	}, [enabled, onTranslated, shouldAutoTranslate, translate]);
+	}, [enabled, onTranslated, shouldAutoTranslate, translateBatch]);
 
 	const enqueue = useCallback(
 		(key: string) => {
@@ -122,7 +158,20 @@ export function useAutoTranslate(params: {
 			forceRender((x) => x + 1);
 
 			try {
-				const res = await translate(item);
+				const batch = await translateBatch([item]);
+				const translated = batch.items[0];
+				if (
+					!translated ||
+					(translated.status !== "ready" && translated.status !== "disabled")
+				) {
+					throw new Error(translated?.error ?? "translate failed");
+				}
+				const res: TranslateResponse = {
+					lang: translated.lang,
+					status: translated.status === "disabled" ? "disabled" : "ready",
+					title: translated.title,
+					summary: translated.summary,
+				};
 				onTranslated(item, res);
 				return res;
 			} catch (err) {
@@ -133,7 +182,7 @@ export function useAutoTranslate(params: {
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, translate],
+		[onTranslated, translateBatch],
 	);
 
 	useEffect(() => {

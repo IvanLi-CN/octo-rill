@@ -70,6 +70,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     });
 
     spawn_daily_brief_scheduler(app_state.clone());
+    let model_catalog_abort_handle = ai::spawn_model_catalog_sync_task(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -98,10 +99,22 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
+        .route(
+            "/translate/releases/batch",
+            post(api::translate_releases_batch),
+        )
         .route("/translate/release", post(api::translate_release))
+        .route(
+            "/translate/release/detail/batch",
+            post(api::translate_release_detail_batch),
+        )
         .route(
             "/translate/release/detail",
             post(api::translate_release_detail),
+        )
+        .route(
+            "/translate/notifications/batch",
+            post(api::translate_notifications_batch),
         )
         .route("/translate/notification", post(api::translate_notification))
         .route("/sync/starred", post(api::sync_starred))
@@ -144,7 +157,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     info!(%addr, "listening");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(deletion_abort_handle))
+        .with_graceful_shutdown(shutdown_signal(vec![
+            deletion_abort_handle,
+            model_catalog_abort_handle,
+        ]))
         .await
         .context("http server exited")?;
 
@@ -181,7 +197,13 @@ fn ensure_sqlite_dir(database_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
+async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
+    let abort_all = || {
+        for handle in &abort_handles {
+            handle.abort();
+        }
+    };
+
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -200,8 +222,8 @@ async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => { deletion_task_abort_handle.abort(); },
-        _ = terminate => { deletion_task_abort_handle.abort(); },
+        _ = ctrl_c => abort_all(),
+        _ = terminate => abort_all(),
     }
 }
 
