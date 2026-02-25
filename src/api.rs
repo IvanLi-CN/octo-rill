@@ -3491,7 +3491,8 @@ async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i6
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminUserUpdateGuard, FeedRow, GraphQlError, admin_users_offset, ensure_account_enabled,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
+        admin_list_users, admin_patch_user, admin_users_offset, ensure_account_enabled,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, markdown_structure_preserved, parse_release_id_param,
         parse_repo_full_name_from_release_url, parse_translation_json,
@@ -3499,8 +3500,21 @@ mod tests {
         release_detail_translation_ready, release_excerpt, release_reactions_status,
         resolve_release_full_name, split_markdown_chunks,
     };
+    use std::{net::SocketAddr, sync::Arc};
+
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        state::{AppState, build_oauth_client},
+    };
+    use axum::{
+        Json,
+        extract::{Path, Query, State},
+    };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use tower_sessions::{MemoryStore, Session};
+    use url::Url;
 
     fn test_feed_row(node_id: Option<&str>) -> FeedRow {
         FeedRow {
@@ -3556,6 +3570,67 @@ mod tests {
         .expect("seed user");
 
         pool
+    }
+
+    fn setup_state(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
+
+    async fn setup_session(user_id: i64) -> Session {
+        let store = Arc::new(MemoryStore::default());
+        let session = Session::new(None, store, None);
+        session
+            .insert("user_id", user_id)
+            .await
+            .expect("insert session user id");
+        session
+    }
+
+    async fn seed_user(pool: &SqlitePool, id: i64, login: &str, is_admin: i64, is_disabled: i64) {
+        let created_at = format!("2026-02-23T00:00:{id:02}Z");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, is_admin, is_disabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(30000000_i64 + id)
+        .bind(login)
+        .bind(is_admin)
+        .bind(is_disabled)
+        .bind(created_at.as_str())
+        .bind(created_at.as_str())
+        .execute(pool)
+        .await
+        .expect("seed test user");
     }
 
     async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
@@ -3687,6 +3762,88 @@ mod tests {
     fn admin_users_offset_rejects_overflow_page() {
         let err = admin_users_offset(i64::MAX, 100).expect_err("overflow offset must be rejected");
         assert_eq!(err.code(), "bad_request");
+    }
+
+    #[tokio::test]
+    async fn admin_list_users_rejects_non_admin_session() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "viewer", 0, 0).await;
+        let state = setup_state(pool);
+        let session = setup_session(2).await;
+
+        let err = admin_list_users(
+            State(state),
+            session,
+            Query(AdminUsersQuery {
+                query: None,
+                role: None,
+                status: None,
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect_err("non-admin user should be rejected");
+
+        assert_eq!(err.code(), "forbidden_admin_only");
+    }
+
+    #[tokio::test]
+    async fn admin_list_users_clears_session_for_disabled_user() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_disabled = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("disable seeded admin");
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let probe = session.clone();
+
+        let err = admin_list_users(
+            State(state),
+            session,
+            Query(AdminUsersQuery {
+                query: None,
+                role: None,
+                status: None,
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect_err("disabled user should be blocked");
+
+        assert_eq!(err.code(), "account_disabled");
+        let remaining = probe
+            .get::<i64>("user_id")
+            .await
+            .expect("read session user id");
+        assert!(remaining.is_none(), "disabled session should be cleared");
+    }
+
+    #[tokio::test]
+    async fn admin_patch_user_rejects_demoting_last_admin_via_handler() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let err = admin_patch_user(
+            State(state),
+            session,
+            Path(1_i64),
+            Json(AdminUserPatchRequest {
+                is_admin: Some(false),
+                is_disabled: None,
+            }),
+        )
+        .await
+        .expect_err("last admin demotion should fail");
+
+        assert_eq!(err.code(), "last_admin_guard");
     }
 
     #[tokio::test]
