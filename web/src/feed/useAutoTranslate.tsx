@@ -45,9 +45,12 @@ export function useAutoTranslate(params: {
 	);
 
 	const translateBatch = useCallback(async (items: FeedItem[]) => {
-		return apiPostJson<TranslateBatchResponse>("/api/translate/releases/batch", {
-			release_ids: items.map((item) => item.id),
-		});
+		return apiPostJson<TranslateBatchResponse>(
+			"/api/translate/releases/batch",
+			{
+				release_ids: items.map((item) => item.id),
+			},
+		);
 	}, []);
 
 	const pump = useCallback(() => {
@@ -86,12 +89,12 @@ export function useAutoTranslate(params: {
 						const translated = byId.get(item.id);
 						if (
 							translated &&
-							(translated.status === "ready" || translated.status === "disabled")
+							(translated.status === "ready" ||
+								translated.status === "disabled")
 						) {
 							onTranslated(item, {
 								lang: translated.lang,
-								status:
-									translated.status === "disabled" ? "disabled" : "ready",
+								status: translated.status === "disabled" ? "disabled" : "ready",
 								title: translated.title,
 								summary: translated.summary,
 							});
