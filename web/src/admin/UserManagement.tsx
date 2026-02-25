@@ -1,3 +1,4 @@
+import { ChevronDown } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { ApiError, apiGet, apiPatchJson } from "@/api";
@@ -210,30 +211,36 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 						placeholder="搜索 login / name / email"
 						className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
 					/>
-					<select
-						value={role}
-						onChange={(e) => {
-							setRole(e.target.value as AdminRole);
-							setPage(1);
-						}}
-						className="bg-background h-9 rounded-md border px-2 text-sm outline-none"
-					>
-						<option value="all">角色：全部</option>
-						<option value="admin">角色：管理员</option>
-						<option value="user">角色：普通用户</option>
-					</select>
-					<select
-						value={status}
-						onChange={(e) => {
-							setStatus(e.target.value as AdminStatus);
-							setPage(1);
-						}}
-						className="bg-background h-9 rounded-md border px-2 text-sm outline-none"
-					>
-						<option value="all">状态：全部</option>
-						<option value="enabled">状态：启用</option>
-						<option value="disabled">状态：禁用</option>
-					</select>
+					<div className="relative">
+						<select
+							value={role}
+							onChange={(e) => {
+								setRole(e.target.value as AdminRole);
+								setPage(1);
+							}}
+							className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
+						>
+							<option value="all">角色：全部</option>
+							<option value="admin">角色：管理员</option>
+							<option value="user">角色：普通用户</option>
+						</select>
+						<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
+					</div>
+					<div className="relative">
+						<select
+							value={status}
+							onChange={(e) => {
+								setStatus(e.target.value as AdminStatus);
+								setPage(1);
+							}}
+							className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
+						>
+							<option value="all">状态：全部</option>
+							<option value="enabled">状态：启用</option>
+							<option value="disabled">状态：禁用</option>
+						</select>
+						<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
+					</div>
 					<Button onClick={onApplyFilters} disabled={loading}>
 						筛选
 					</Button>
