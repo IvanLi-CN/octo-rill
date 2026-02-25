@@ -2348,9 +2348,14 @@ fn parse_unique_release_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<
     if raw_ids.is_empty() {
         return Err(ApiError::bad_request("release_ids is required"));
     }
+    if raw_ids.len() > max_items {
+        return Err(ApiError::bad_request(format!(
+            "release_ids supports at most {max_items} items"
+        )));
+    }
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for raw in raw_ids.iter().take(max_items) {
+    for raw in raw_ids {
         let release_id = parse_release_id_param(raw)?;
         if seen.insert(release_id) {
             out.push(release_id);
@@ -2366,9 +2371,14 @@ fn parse_unique_thread_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<S
     if raw_ids.is_empty() {
         return Err(ApiError::bad_request("thread_ids is required"));
     }
+    if raw_ids.len() > max_items {
+        return Err(ApiError::bad_request(format!(
+            "thread_ids supports at most {max_items} items"
+        )));
+    }
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for raw in raw_ids.iter().take(max_items) {
+    for raw in raw_ids {
         let thread_id = raw.trim();
         if thread_id.is_empty() {
             continue;
@@ -3850,9 +3860,10 @@ mod tests {
         FeedRow, GraphQlError, TranslateBatchItem, github_graphql_errors_to_api_error,
         github_graphql_http_error, has_repo_scope, markdown_structure_preserved,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
-        preserve_chunk_trailing_newline, release_detail_source_hash,
-        release_detail_translation_ready, release_excerpt, release_reactions_status,
-        resolve_release_full_name, split_markdown_chunks, translate_response_from_batch_item,
+        parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
+        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
+        release_reactions_status, resolve_release_full_name, split_markdown_chunks,
+        translate_response_from_batch_item,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -3984,6 +3995,24 @@ mod tests {
         assert_eq!(parse_release_id_param("123").expect("release id"), 123);
         assert!(parse_release_id_param("12a").is_err());
         assert!(parse_release_id_param("   ").is_err());
+    }
+
+    #[test]
+    fn parse_unique_release_ids_rejects_oversized_requests() {
+        let raw_ids = (1..=61).map(|id| id.to_string()).collect::<Vec<_>>();
+        let err =
+            parse_unique_release_ids(&raw_ids, 60).expect_err("oversized release batch rejected");
+        assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn parse_unique_thread_ids_rejects_oversized_requests() {
+        let raw_ids = (1..=61)
+            .map(|id| format!("thread-{id}"))
+            .collect::<Vec<_>>();
+        let err =
+            parse_unique_thread_ids(&raw_ids, 60).expect_err("oversized thread batch rejected");
+        assert_eq!(err.code(), "bad_request");
     }
 
     #[test]
