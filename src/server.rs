@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     http::{HeaderValue, Method},
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 use serde_json::json;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -89,6 +89,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
+        .route("/admin/users", get(api::admin_list_users))
+        .route("/admin/users/{user_id}", patch(api::admin_patch_user))
         .route("/reaction-token/status", get(api::reaction_token_status))
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
@@ -131,7 +133,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let cors = CorsLayer::new()
         .allow_origin(cors_origin)
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST, Method::PUT])
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     let app = app.layer(cors).layer(TraceLayer::new_for_http());

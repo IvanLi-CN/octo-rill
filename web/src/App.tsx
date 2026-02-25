@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { ApiError, apiGet } from "@/api";
+import { AdminPanel } from "@/pages/AdminPanel";
 import { Dashboard } from "@/pages/Dashboard";
 import { Landing } from "@/pages/Landing";
 
@@ -12,6 +13,7 @@ type MeResponse = {
 		name: string | null;
 		avatar_url: string | null;
 		email: string | null;
+		is_admin: boolean;
 	};
 };
 
@@ -20,6 +22,9 @@ function App() {
 	const [bootError, setBootError] = useState<string | null>(null);
 
 	const isLoggedIn = Boolean(me?.user?.id);
+	const normalizedPathname =
+		window.location.pathname.replace(/\/+$/, "") || "/";
+	const isAdminRoute = normalizedPathname === "/admin";
 
 	useEffect(() => {
 		(async () => {
@@ -36,11 +41,21 @@ function App() {
 		})();
 	}, []);
 
-	if (!isLoggedIn) {
+	useEffect(() => {
+		if (!isLoggedIn || !isAdminRoute) return;
+		if (me?.user.is_admin) return;
+		window.history.replaceState({}, "", "/");
+	}, [isAdminRoute, isLoggedIn, me?.user.is_admin]);
+
+	if (!isLoggedIn || !me) {
 		return <Landing bootError={bootError} />;
 	}
 
-	return <Dashboard me={me!} />;
+	if (isAdminRoute && me.user.is_admin) {
+		return <AdminPanel me={me} />;
+	}
+
+	return <Dashboard me={me} />;
 }
 
 export default App;

@@ -34,6 +34,7 @@ type MeResponse = {
 		name: string | null;
 		avatar_url: string | null;
 		email: string | null;
+		is_admin: boolean;
 	};
 };
 
@@ -139,6 +140,7 @@ function firstPendingReactionContent(
 
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
+	const isAdmin = me.user.is_admin;
 
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
@@ -608,6 +610,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					inboxCount={notifications.length}
 					briefCount={briefs.length}
 					login={me.user.login}
+					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					onRefresh={() => void refreshAll()}
@@ -659,11 +662,23 @@ export function Dashboard(props: { me: MeResponse }) {
 					</Button>
 				</div>
 
-				{busy ? (
-					<span className="text-muted-foreground font-mono text-xs">
-						{busy}…
-					</span>
-				) : null}
+				<div className="flex items-center gap-2">
+					{busy ? (
+						<span className="text-muted-foreground font-mono text-xs">
+							{busy}…
+						</span>
+					) : null}
+					{isAdmin ? (
+						<Button
+							asChild
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
+						>
+							<a href="/admin">管理员面板</a>
+						</Button>
+					) : null}
+				</div>
 			</div>
 
 			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">

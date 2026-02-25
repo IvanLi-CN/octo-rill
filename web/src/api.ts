@@ -72,6 +72,22 @@ export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
 	return (await res.json()) as T;
 }
 
+export async function apiPatchJson<T>(
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const res = await fetch(path, {
+		method: "PATCH",
+		credentials: "include",
+		headers: { "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw toApiError(res, await parseJson(res));
+	}
+	return (await res.json()) as T;
+}
+
 export type ReleaseDetailTranslated = {
 	lang: string;
 	status: "ready" | "missing" | "disabled";
