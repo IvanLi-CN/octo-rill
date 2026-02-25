@@ -41,6 +41,9 @@ export function AdminPanel(props: { me: MeResponse }) {
 					</div>
 
 					<div className="flex flex-wrap gap-2">
+						<Button asChild variant="outline">
+							<a href="/admin/jobs">任务中心</a>
+						</Button>
 						<Button asChild variant="secondary">
 							<a href="/">返回仪表盘</a>
 						</Button>
@@ -54,7 +57,7 @@ export function AdminPanel(props: { me: MeResponse }) {
 		>
 			<div className="space-y-4">
 				<p className="text-muted-foreground text-sm">
-					这是独立的管理员界面，当前仅包含用户管理模块。
+					这是独立的管理员界面，当前包含用户管理与任务中心两个模块。
 				</p>
 				<UserManagement currentUserId={me.user.id} />
 			</div>

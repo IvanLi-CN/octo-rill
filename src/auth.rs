@@ -122,14 +122,18 @@ pub async fn github_callback(
 
     sqlx::query(
         r#"
-        INSERT INTO users (github_user_id, login, name, avatar_url, email, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO users (
+          github_user_id, login, name, avatar_url, email,
+          created_at, updated_at, last_active_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(github_user_id) DO UPDATE SET
           login = excluded.login,
           name = excluded.name,
           avatar_url = excluded.avatar_url,
           email = excluded.email,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          last_active_at = excluded.last_active_at
         "#,
     )
     .bind(user.id)
@@ -137,6 +141,7 @@ pub async fn github_callback(
     .bind(user.name.as_deref())
     .bind(user.avatar_url.as_deref())
     .bind(email.as_deref())
+    .bind(now.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(&mut *tx)

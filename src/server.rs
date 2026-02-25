@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::{ai, api, auth, state, sync};
+use crate::{api, auth, jobs, state};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -69,7 +69,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         encryption_key: config.encryption_key.clone(),
     });
 
-    spawn_daily_brief_scheduler(app_state.clone());
+    jobs::spawn_task_worker(app_state.clone());
+    jobs::spawn_hourly_scheduler(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -91,6 +92,32 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/feed", get(api::list_feed))
         .route("/admin/users", get(api::admin_list_users))
         .route("/admin/users/{user_id}", patch(api::admin_patch_user))
+        .route(
+            "/admin/users/{user_id}/profile",
+            get(api::admin_get_user_profile),
+        )
+        .route("/admin/jobs/overview", get(api::admin_jobs_overview))
+        .route("/admin/jobs/realtime", get(api::admin_list_realtime_tasks))
+        .route(
+            "/admin/jobs/realtime/{task_id}",
+            get(api::admin_get_realtime_task_detail),
+        )
+        .route(
+            "/admin/jobs/realtime/{task_id}/retry",
+            post(api::admin_retry_realtime_task),
+        )
+        .route(
+            "/admin/jobs/realtime/{task_id}/cancel",
+            post(api::admin_cancel_realtime_task),
+        )
+        .route(
+            "/admin/jobs/scheduled",
+            get(api::admin_list_scheduled_slots),
+        )
+        .route(
+            "/admin/jobs/scheduled/{hour_utc}",
+            patch(api::admin_patch_scheduled_slot),
+        )
         .route("/reaction-token/status", get(api::reaction_token_status))
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
@@ -214,70 +241,6 @@ async fn api_health() -> axum::Json<serde_json::Value> {
     }))
 }
 
-fn spawn_daily_brief_scheduler(state: Arc<AppState>) {
-    let Some(at) = state.config.ai_daily_at_local else {
-        return;
-    };
-    if state.config.ai.is_none() {
-        tracing::warn!("AI_DAILY_AT_LOCAL is set but AI_API_KEY is missing; scheduler disabled");
-        return;
-    }
-
-    tokio::spawn(async move {
-        let backfill_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            run_startup_brief_backfill(backfill_state.as_ref(), at).await;
-        });
-
-        loop {
-            let now = chrono::Local::now().naive_local();
-            let today = chrono::Local::now().date_naive();
-            let mut next = chrono::NaiveDateTime::new(today, at);
-            if next <= now {
-                next += chrono::Duration::days(1);
-            }
-
-            let sleep_for = next
-                .signed_duration_since(now)
-                .to_std()
-                .unwrap_or(Duration::from_secs(60));
-            tokio::time::sleep(sleep_for).await;
-
-            let window = ai::compute_daily_window(Some(at), chrono::Local::now());
-            let key_date = window.key_date.to_string();
-            let users = sqlx::query_scalar::<_, i64>(r#"SELECT id FROM users ORDER BY id"#)
-                .fetch_all(&state.pool)
-                .await;
-            let users = match users {
-                Ok(u) => u,
-                Err(err) => {
-                    tracing::warn!(?err, "daily brief scheduler: failed to query users");
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                    continue;
-                }
-            };
-
-            for user_id in users {
-                let exists = sqlx::query_scalar::<_, i64>(
-                    r#"SELECT 1 FROM briefs WHERE user_id = ? AND date = ? LIMIT 1"#,
-                )
-                .bind(user_id)
-                .bind(&key_date)
-                .fetch_optional(&state.pool)
-                .await;
-
-                if matches!(exists, Ok(Some(_))) {
-                    continue;
-                }
-
-                if let Err(err) = ai::generate_daily_brief(state.as_ref(), user_id).await {
-                    tracing::warn!(?err, user_id, "daily brief scheduler: generate failed");
-                }
-            }
-        }
-    });
-}
-
 fn build_session_cookie_name(config: &AppConfig) -> String {
     let host = config.public_base_url.host_str().unwrap_or("localhost");
     let port = config
@@ -294,65 +257,4 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
             }
         })
         .collect::<String>()
-}
-
-async fn run_startup_brief_backfill(state: &AppState, at: chrono::NaiveTime) {
-    let users = sqlx::query_scalar::<_, i64>(r#"SELECT id FROM users ORDER BY id"#)
-        .fetch_all(&state.pool)
-        .await;
-    let users = match users {
-        Ok(users) => users,
-        Err(err) => {
-            tracing::warn!(?err, "startup brief backfill: failed to query users");
-            return;
-        }
-    };
-
-    let key_dates = ai::recent_key_dates(at, chrono::Local::now(), 7);
-
-    for user_id in users {
-        if let Err(err) = sync::sync_starred(state, user_id).await {
-            tracing::warn!(
-                ?err,
-                user_id,
-                "startup brief backfill: sync starred failed; skip user"
-            );
-            continue;
-        }
-
-        if let Err(err) = sync::sync_releases(state, user_id).await {
-            tracing::warn!(
-                ?err,
-                user_id,
-                "startup brief backfill: sync releases failed; skip user"
-            );
-            continue;
-        }
-
-        // Backfill oldest to newest so the latest day is generated last.
-        for key_date in key_dates.iter().rev() {
-            let key_date_str = key_date.to_string();
-            let exists = sqlx::query_scalar::<_, i64>(
-                r#"SELECT 1 FROM briefs WHERE user_id = ? AND date = ? LIMIT 1"#,
-            )
-            .bind(user_id)
-            .bind(&key_date_str)
-            .fetch_optional(&state.pool)
-            .await;
-
-            if matches!(exists, Ok(Some(_))) {
-                continue;
-            }
-
-            if let Err(err) = ai::generate_daily_brief_for_key_date(state, user_id, *key_date).await
-            {
-                tracing::warn!(
-                    ?err,
-                    user_id,
-                    key_date = %key_date_str,
-                    "startup brief backfill: generate failed"
-                );
-            }
-        }
-    }
 }
