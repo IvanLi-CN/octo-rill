@@ -179,10 +179,7 @@ export function useAutoTranslate(params: {
 				handled.add(key);
 
 				inFlightRef.current.delete(key);
-				if (
-					translated.status === "ready" ||
-					translated.status === "disabled"
-				) {
+				if (translated.status === "ready" || translated.status === "disabled") {
 					onTranslated(item, {
 						lang: translated.lang,
 						status: translated.status === "disabled" ? "disabled" : "ready",
