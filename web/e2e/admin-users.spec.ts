@@ -1,0 +1,316 @@
+import { type Page, type Route, expect, test } from "@playwright/test";
+
+type MockUser = {
+	id: number;
+	github_user_id: number;
+	login: string;
+	name: string | null;
+	avatar_url: string | null;
+	email: string | null;
+	is_admin: boolean;
+	is_disabled: boolean;
+	last_active_at: string | null;
+	created_at: string;
+	updated_at: string;
+};
+
+function json(route: Route, payload: unknown, status = 200) {
+	return route.fulfill({
+		status,
+		contentType: "application/json",
+		body: JSON.stringify(payload),
+	});
+}
+
+async function installBaseMocks(
+	page: Page,
+	options: {
+		isAdmin: boolean;
+		adminApiForbidden?: boolean;
+		patchMode?: "ok" | "conflict_last_admin";
+	},
+) {
+	let currentUserIsAdmin = options.isAdmin;
+	const users: MockUser[] = [
+		{
+			id: 1,
+			github_user_id: 10,
+			login: "octo-admin",
+			name: "Octo Admin",
+			avatar_url: null,
+			email: "admin@example.com",
+			is_admin: true,
+			is_disabled: false,
+			last_active_at: "2026-02-26T08:00:00Z",
+			created_at: "2026-02-24T08:00:00Z",
+			updated_at: "2026-02-24T08:00:00Z",
+		},
+		{
+			id: 2,
+			github_user_id: 20,
+			login: "octo-user",
+			name: "Octo User",
+			avatar_url: null,
+			email: "user@example.com",
+			is_admin: false,
+			is_disabled: false,
+			last_active_at: "2026-02-26T07:00:00Z",
+			created_at: "2026-02-25T08:00:00Z",
+			updated_at: "2026-02-25T08:00:00Z",
+		},
+	];
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(route, {
+				user: {
+					id: 1,
+					github_user_id: 10,
+					login: "octo-admin",
+					name: "Octo Admin",
+					avatar_url: null,
+					email: "admin@example.com",
+					is_admin: currentUserIsAdmin,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (pathname === "/api/admin/users") {
+			if (options.adminApiForbidden || !currentUserIsAdmin) {
+				return json(
+					route,
+					{
+						ok: false,
+						error: { code: "forbidden_admin_only", message: "forbidden" },
+					},
+					403,
+				);
+			}
+			if (req.method() === "GET") {
+				const role = url.searchParams.get("role") ?? "all";
+				const status = url.searchParams.get("status") ?? "all";
+				const query = (url.searchParams.get("query") ?? "").toLowerCase();
+				const filtered = users.filter((u) => {
+					if (role === "admin" && !u.is_admin) return false;
+					if (role === "user" && u.is_admin) return false;
+					if (status === "enabled" && u.is_disabled) return false;
+					if (status === "disabled" && !u.is_disabled) return false;
+					if (!query) return true;
+					return (
+						u.login.toLowerCase().includes(query) ||
+						(u.name ?? "").toLowerCase().includes(query) ||
+						(u.email ?? "").toLowerCase().includes(query)
+					);
+				});
+				return json(route, {
+					items: filtered,
+					page: 1,
+					page_size: 20,
+					total: filtered.length,
+					guard: {
+						admin_total: users.filter((u) => u.is_admin).length,
+						active_admin_total: users.filter(
+							(u) => u.is_admin && !u.is_disabled,
+						).length,
+					},
+				});
+			}
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/users/") &&
+			pathname.endsWith("/profile")
+		) {
+			const id = Number(pathname.split("/").at(-2));
+			const target = users.find((u) => u.id === id);
+			if (!target) {
+				return json(
+					route,
+					{ ok: false, error: { code: "not_found", message: "not found" } },
+					404,
+				);
+			}
+			return json(route, {
+				user_id: target.id,
+				daily_brief_utc_time: "08:00",
+				last_active_at: target.last_active_at,
+			});
+		}
+
+		if (req.method() === "PATCH" && pathname.startsWith("/api/admin/users/")) {
+			const id = Number(pathname.split("/").at(-1));
+			const body = req.postDataJSON() as {
+				is_admin?: boolean;
+				is_disabled?: boolean;
+			};
+			if (
+				options.patchMode === "conflict_last_admin" &&
+				id === 2 &&
+				body.is_disabled === true
+			) {
+				return json(
+					route,
+					{
+						ok: false,
+						error: {
+							code: "last_admin_guard",
+							message: "at least one active admin is required",
+						},
+					},
+					409,
+				);
+			}
+			const target = users.find((u) => u.id === id);
+			if (!target) {
+				return json(
+					route,
+					{ ok: false, error: { code: "not_found", message: "not found" } },
+					404,
+				);
+			}
+			if (typeof body.is_admin === "boolean") {
+				target.is_admin = body.is_admin;
+				if (target.id === 1) {
+					currentUserIsAdmin = body.is_admin;
+				}
+			}
+			if (typeof body.is_disabled === "boolean") {
+				target.is_disabled = body.is_disabled;
+			}
+			target.updated_at = "2026-02-25T10:00:00Z";
+			return json(route, target);
+		}
+
+		return json(
+			route,
+			{ error: { message: `unhandled ${req.method()} ${pathname}` } },
+			404,
+		);
+	});
+}
+
+test("admin user can manage users in admin panel", async ({ page }) => {
+	await installBaseMocks(page, { isAdmin: true });
+	await page.goto("/");
+
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page).toHaveURL(/\/admin$/);
+	await expect(page.getByRole("heading", { name: "管理员面板" })).toBeVisible();
+	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+	const revokeAdminButton = page
+		.getByRole("button", { name: "撤销管理员" })
+		.first();
+	await expect(revokeAdminButton).toBeDisabled();
+	await expect(page.getByText("唯一管理员，不能撤销")).toBeVisible();
+
+	const userRow = page
+		.getByText("octo-user", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await expect(userRow).toContainText("最后活动：");
+	await expect(userRow).toContainText("普通用户");
+	await userRow.getByRole("button", { name: "详情" }).click();
+	await expect(page.getByRole("heading", { name: "用户详情" })).toBeVisible();
+	await expect(page.getByText("日报时间（本地时区）")).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	await expect(
+		page.getByRole("heading", { name: "确认管理员变更" }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "确认更改" }).click();
+	await expect(userRow).toContainText("管理员");
+	await expect(revokeAdminButton).toBeEnabled();
+
+	await userRow.getByRole("button", { name: "禁用" }).click();
+	await expect(userRow).toContainText("已禁用");
+});
+
+test("admin action error remains visible after list refresh", async ({
+	page,
+}) => {
+	await installBaseMocks(page, {
+		isAdmin: true,
+		patchMode: "conflict_last_admin",
+	});
+	await page.goto("/");
+
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+
+	const userRow = page
+		.getByText("octo-user", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await userRow.getByRole("button", { name: "禁用" }).click();
+
+	await expect(
+		page.getByText("至少保留一名启用管理员，当前操作已被拦截。"),
+	).toBeVisible();
+});
+
+test("self-demoted admin is redirected out of admin panel", async ({
+	page,
+}) => {
+	await installBaseMocks(page, { isAdmin: true });
+	await page.goto("/");
+
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page).toHaveURL(/\/admin$/);
+	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+
+	const userRow = page
+		.getByText("octo-user", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	await page.getByRole("button", { name: "确认更改" }).click();
+	await expect(userRow).toContainText("管理员");
+
+	const selfRow = page
+		.getByText("octo-admin（你）", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await selfRow.getByRole("button", { name: "撤销管理员" }).click();
+	await page.getByRole("button", { name: "确认更改" }).click();
+
+	await expect(page).toHaveURL("/");
+	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
+});
+
+test("non-admin user cannot stay on admin route", async ({ page }) => {
+	await installBaseMocks(page, { isAdmin: false, adminApiForbidden: true });
+	await page.goto("/admin");
+
+	await expect(page).toHaveURL("/");
+	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
+	await expect(page.getByRole("heading", { name: "用户管理" })).toHaveCount(0);
+});

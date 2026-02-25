@@ -5,6 +5,7 @@ mod config;
 mod crypto;
 mod error;
 mod github;
+mod jobs;
 mod server;
 mod state;
 mod sync;

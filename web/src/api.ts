@@ -72,6 +72,143 @@ export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
 	return (await res.json()) as T;
 }
 
+export async function apiPatchJson<T>(
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const res = await fetch(path, {
+		method: "PATCH",
+		credentials: "include",
+		headers: { "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw toApiError(res, await parseJson(res));
+	}
+	return (await res.json()) as T;
+}
+
+export type AdminUserProfileResponse = {
+	user_id: number;
+	daily_brief_utc_time: string;
+	last_active_at: string | null;
+};
+
+export type AdminJobsOverviewResponse = {
+	queued: number;
+	running: number;
+	failed_24h: number;
+	succeeded_24h: number;
+	enabled_scheduled_slots: number;
+	total_scheduled_slots: number;
+};
+
+export type AdminRealtimeTaskItem = {
+	id: string;
+	task_type: string;
+	status: string;
+	source: string;
+	requested_by: number | null;
+	parent_task_id: string | null;
+	cancel_requested: boolean;
+	error_message: string | null;
+	created_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	updated_at: string;
+};
+
+export type AdminRealtimeTasksResponse = {
+	items: AdminRealtimeTaskItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
+
+export type AdminTaskEventItem = {
+	id: number;
+	event_type: string;
+	payload_json: string;
+	created_at: string;
+};
+
+export type AdminRealtimeTaskDetailResponse = {
+	task: AdminRealtimeTaskItem;
+	events: AdminTaskEventItem[];
+};
+
+export type AdminTaskActionResponse = {
+	task_id: string;
+	status: string;
+};
+
+export type AdminScheduledSlotItem = {
+	hour_utc: number;
+	enabled: boolean;
+	last_dispatch_at: string | null;
+	updated_at: string;
+};
+
+export type AdminScheduledSlotsResponse = {
+	items: AdminScheduledSlotItem[];
+};
+
+export async function apiGetAdminUserProfile(
+	userId: number,
+): Promise<AdminUserProfileResponse> {
+	return apiGet<AdminUserProfileResponse>(`/api/admin/users/${userId}/profile`);
+}
+
+export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
+	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
+}
+
+export async function apiGetAdminRealtimeTasks(
+	params: URLSearchParams,
+): Promise<AdminRealtimeTasksResponse> {
+	return apiGet<AdminRealtimeTasksResponse>(
+		`/api/admin/jobs/realtime?${params.toString()}`,
+	);
+}
+
+export async function apiGetAdminRealtimeTaskDetail(
+	taskId: string,
+): Promise<AdminRealtimeTaskDetailResponse> {
+	return apiGet<AdminRealtimeTaskDetailResponse>(
+		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}`,
+	);
+}
+
+export async function apiRetryAdminRealtimeTask(
+	taskId: string,
+): Promise<AdminTaskActionResponse> {
+	return apiPostJson<AdminTaskActionResponse>(
+		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/retry`,
+	);
+}
+
+export async function apiCancelAdminRealtimeTask(
+	taskId: string,
+): Promise<AdminTaskActionResponse> {
+	return apiPostJson<AdminTaskActionResponse>(
+		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/cancel`,
+	);
+}
+
+export async function apiGetAdminScheduledSlots(): Promise<AdminScheduledSlotsResponse> {
+	return apiGet<AdminScheduledSlotsResponse>("/api/admin/jobs/scheduled");
+}
+
+export async function apiPatchAdminScheduledSlot(
+	hourUtc: number,
+	enabled: boolean,
+): Promise<AdminScheduledSlotItem> {
+	return apiPatchJson<AdminScheduledSlotItem>(
+		`/api/admin/jobs/scheduled/${hourUtc}`,
+		{ enabled },
+	);
+}
+
 export type ReleaseDetailTranslated = {
 	lang: string;
 	status: "ready" | "missing" | "disabled";
