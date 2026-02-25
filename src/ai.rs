@@ -13,6 +13,7 @@ use crate::state::AppState;
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MODEL_LIMIT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MODEL_LIMIT_SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MODEL_LIMIT_SAFETY_MIN_TOKENS: u32 = 512;
 const MODEL_LIMIT_SAFETY_RATIO: f64 = 0.05;
@@ -28,6 +29,7 @@ const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
 struct ModelLimitCatalog {
     synced_limits: HashMap<String, u32>,
     synced_at: Option<Instant>,
+    attempted_at: Option<Instant>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -224,13 +226,22 @@ async fn fetch_litellm_model_limits(state: &AppState) -> Result<HashMap<String, 
 
 async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
     let now = Instant::now();
-    if !force {
-        let guard = model_limit_catalog().read().await;
-        if let Some(at) = guard.synced_at
-            && now.duration_since(at) < MODEL_LIMIT_SYNC_INTERVAL
-        {
-            return Ok(());
+    {
+        let mut guard = model_limit_catalog().write().await;
+        if !force {
+            if let Some(at) = guard.synced_at
+                && now.duration_since(at) < MODEL_LIMIT_SYNC_INTERVAL
+            {
+                return Ok(());
+            }
+            if let Some(at) = guard.attempted_at
+                && now.duration_since(at) < MODEL_LIMIT_REFRESH_RETRY_INTERVAL
+            {
+                return Ok(());
+            }
         }
+        // Claim this refresh attempt so concurrent callers don't all block on upstream requests.
+        guard.attempted_at = Some(now);
     }
 
     let mut merged = HashMap::new();
@@ -270,7 +281,8 @@ async fn refresh_model_limits(state: &AppState, force: bool) -> Result<()> {
 
     let mut guard = model_limit_catalog().write().await;
     guard.synced_limits = merged;
-    guard.synced_at = Some(Instant::now());
+    guard.synced_at = Some(now);
+    guard.attempted_at = Some(now);
     Ok(())
 }
 
