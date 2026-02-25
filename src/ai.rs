@@ -13,6 +13,7 @@ use crate::state::AppState;
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MODEL_LIMIT_SOURCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MODEL_LIMIT_SAFETY_MIN_TOKENS: u32 = 512;
 const MODEL_LIMIT_SAFETY_RATIO: f64 = 0.05;
 const MODEL_LIMIT_SOURCE_OPENROUTER: &str = "https://openrouter.ai/api/v1/models";
@@ -175,6 +176,7 @@ async fn fetch_openrouter_model_limits(state: &AppState) -> Result<HashMap<Strin
     let body = state
         .http
         .get(MODEL_LIMIT_SOURCE_OPENROUTER)
+        .timeout(MODEL_LIMIT_SOURCE_REQUEST_TIMEOUT)
         .send()
         .await
         .context("openrouter model catalog request failed")?
@@ -197,6 +199,7 @@ async fn fetch_litellm_model_limits(state: &AppState) -> Result<HashMap<String, 
     let body = state
         .http
         .get(MODEL_LIMIT_SOURCE_LITELLM)
+        .timeout(MODEL_LIMIT_SOURCE_REQUEST_TIMEOUT)
         .send()
         .await
         .context("litellm model catalog request failed")?

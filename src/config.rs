@@ -138,8 +138,13 @@ impl AppConfig {
             .map(|v| v.trim().to_owned())
             .filter(|v| !v.is_empty())
             .map(|raw| {
-                raw.parse::<u32>()
-                    .context("invalid AI_MODEL_CONTEXT_LIMIT (expected positive integer)")
+                let parsed = raw
+                    .parse::<u32>()
+                    .context("invalid AI_MODEL_CONTEXT_LIMIT (expected positive integer)")?;
+                if parsed == 0 {
+                    anyhow::bail!("invalid AI_MODEL_CONTEXT_LIMIT (expected positive integer)");
+                }
+                Ok::<_, anyhow::Error>(parsed)
             })
             .transpose()?;
 
