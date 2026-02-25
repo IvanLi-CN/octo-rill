@@ -2734,6 +2734,9 @@ async fn translate_release_single_candidate_with_ai(
 
     if out_title.is_none() && out_summary.is_none() {
         None
+    } else if !item.excerpt.trim().is_empty() && out_summary.is_none() {
+        // A translated title without body summary regresses UX because the item becomes non-retryable.
+        None
     } else {
         Some((out_title, out_summary))
     }
@@ -2803,6 +2806,9 @@ async fn translate_release_candidates_with_ai(
                 {
                     let (title, summary) =
                         normalize_translation_fields(item.title_zh, item.summary_md);
+                    if !source.excerpt.trim().is_empty() && summary.is_none() {
+                        continue;
+                    }
                     if summary
                         .as_deref()
                         .is_some_and(|s| !markdown_structure_preserved(&source.excerpt, s))
