@@ -22,7 +22,9 @@ function App() {
 	const [bootError, setBootError] = useState<string | null>(null);
 
 	const isLoggedIn = Boolean(me?.user?.id);
-	const isAdminRoute = window.location.pathname === "/admin";
+	const normalizedPathname =
+		window.location.pathname.replace(/\/+$/, "") || "/";
+	const isAdminRoute = normalizedPathname === "/admin";
 
 	useEffect(() => {
 		(async () => {

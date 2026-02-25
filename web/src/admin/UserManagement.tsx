@@ -93,43 +93,49 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 		[total],
 	);
 
-	const loadUsers = useCallback(async () => {
-		setLoading(true);
-		setError(null);
-		try {
-			const params = new URLSearchParams();
-			if (query.trim()) params.set("query", query.trim());
-			params.set("role", role);
-			params.set("status", status);
-			params.set("page", String(page));
-			params.set("page_size", String(PAGE_SIZE));
-
-			const res = await apiGet<AdminUsersListResponse>(
-				`/api/admin/users?${params.toString()}`,
-			);
-			setItems(res.items);
-			setTotal(res.total);
-			setGuardSummary(
-				res.guard ?? {
-					admin_total: res.items.filter((item) => item.is_admin).length,
-					active_admin_total: res.items.filter(
-						(item) => item.is_admin && !item.is_disabled,
-					).length,
-				},
-			);
-		} catch (err) {
-			if (err instanceof ApiError && err.code === "forbidden_admin_only") {
-				setError(toAdminUserErrorMessage(err));
-				setItems([]);
-				setTotal(0);
-				setGuardSummary(DEFAULT_GUARD);
-				return;
+	const loadUsers = useCallback(
+		async (options?: { clearError?: boolean }) => {
+			const clearError = options?.clearError ?? true;
+			setLoading(true);
+			if (clearError) {
+				setError(null);
 			}
-			setError(toAdminUserErrorMessage(err));
-		} finally {
-			setLoading(false);
-		}
-	}, [page, query, role, status]);
+			try {
+				const params = new URLSearchParams();
+				if (query.trim()) params.set("query", query.trim());
+				params.set("role", role);
+				params.set("status", status);
+				params.set("page", String(page));
+				params.set("page_size", String(PAGE_SIZE));
+
+				const res = await apiGet<AdminUsersListResponse>(
+					`/api/admin/users?${params.toString()}`,
+				);
+				setItems(res.items);
+				setTotal(res.total);
+				setGuardSummary(
+					res.guard ?? {
+						admin_total: res.items.filter((item) => item.is_admin).length,
+						active_admin_total: res.items.filter(
+							(item) => item.is_admin && !item.is_disabled,
+						).length,
+					},
+				);
+			} catch (err) {
+				if (err instanceof ApiError && err.code === "forbidden_admin_only") {
+					setError(toAdminUserErrorMessage(err));
+					setItems([]);
+					setTotal(0);
+					setGuardSummary(DEFAULT_GUARD);
+					return;
+				}
+				setError(toAdminUserErrorMessage(err));
+			} finally {
+				setLoading(false);
+			}
+		},
+		[page, query, role, status],
+	);
 
 	useEffect(() => {
 		void loadUsers();
@@ -155,7 +161,7 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 				await loadUsers();
 			} catch (err) {
 				setError(toAdminUserErrorMessage(err));
-				await loadUsers();
+				await loadUsers({ clearError: false });
 			} finally {
 				setActionBusyUserId(null);
 			}

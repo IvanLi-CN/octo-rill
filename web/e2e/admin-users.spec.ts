@@ -23,7 +23,11 @@ function json(route: Route, payload: unknown, status = 200) {
 
 async function installBaseMocks(
 	page: Page,
-	options: { isAdmin: boolean; adminApiForbidden?: boolean },
+	options: {
+		isAdmin: boolean;
+		adminApiForbidden?: boolean;
+		patchMode?: "ok" | "conflict_last_admin";
+	},
 ) {
 	const users: MockUser[] = [
 		{
@@ -143,6 +147,23 @@ async function installBaseMocks(
 				is_admin?: boolean;
 				is_disabled?: boolean;
 			};
+			if (
+				options.patchMode === "conflict_last_admin" &&
+				id === 2 &&
+				body.is_disabled === true
+			) {
+				return json(
+					route,
+					{
+						ok: false,
+						error: {
+							code: "last_admin_guard",
+							message: "at least one active admin is required",
+						},
+					},
+					409,
+				);
+			}
 			const target = users.find((u) => u.id === id);
 			if (!target) {
 				return json(
@@ -198,6 +219,29 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 
 	await userRow.getByRole("button", { name: "禁用" }).click();
 	await expect(userRow).toContainText("已禁用");
+});
+
+test("admin action error remains visible after list refresh", async ({
+	page,
+}) => {
+	await installBaseMocks(page, {
+		isAdmin: true,
+		patchMode: "conflict_last_admin",
+	});
+	await page.goto("/");
+
+	await page.getByRole("link", { name: "管理员面板" }).click();
+	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+
+	const userRow = page
+		.getByText("octo-user", { exact: false })
+		.first()
+		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	await userRow.getByRole("button", { name: "禁用" }).click();
+
+	await expect(
+		page.getByText("至少保留一名启用管理员，当前操作已被拦截。"),
+	).toBeVisible();
 });
 
 test("non-admin user cannot stay on admin route", async ({ page }) => {
