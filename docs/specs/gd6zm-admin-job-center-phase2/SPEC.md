@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-02-25
-- Last: 2026-02-25
+- Last: 2026-02-26
 
 ## 背景 / 问题陈述
 
@@ -19,6 +19,7 @@
 - 落地 24 个 UTC 小时槽定时日报任务（命中槽位后按用户串行生成，失败不中断）。
 - 扩展触发类接口支持 `return_mode=sync|task_id|sse`。
 - 在用户管理中补齐新增字段可视化：`last_active_at` 列表展示、`daily_brief_utc_time` 详情抽屉展示（只读）。
+- 任务详情按 `task_type` 提供专属详情页，并在 Storybook 为各类任务提供独立示例。
 
 ### Non-goals
 
@@ -34,7 +35,8 @@
 - 后端任务运行时：队列消费、任务状态流转、重试/取消、SSE 事件流。
 - 调度器改造：每小时轮询，命中 `hour_utc` 槽位后入队日报任务。
 - 管理员 API：任务总览、实时任务列表/详情、重试、取消、定时槽位查询与启停。
-- 前端 `/admin/jobs` 页面与用户管理字段展示补齐。
+- 前端 `/admin/jobs` 页面与用户管理字段展示补齐；任务详情区按 `task_type` 渲染专属信息卡片与说明。
+- Storybook 覆盖任务详情页：为每类任务提供单独故事条目，便于视觉回归与需求对齐。
 - 自动化测试补充（Rust + Playwright）。
 
 ### Out of scope
@@ -98,13 +100,23 @@
   When 打开用户详情
   Then 显示 `daily_brief_utc_time` 的本地时区 `HH:mm` 与 UTC 原值（只读）。
 
+- Given 管理员在任务中心点击任意任务“详情”
+  When 任务详情抽屉打开
+  Then 根据该任务 `task_type` 展示对应专属详情页（包含业务字段与语义化说明），不使用单一通用模板替代。
+
+- Given Storybook 打开 `Admin/TaskTypeDetailPage`
+  When 查看故事列表
+  Then 各任务类型均有独立 story，覆盖任务详情页的专属展示分支。
+
 ## 实现里程碑（Milestones / Delivery checklist）
 
 - [x] M1: DB migration 与任务引擎基础设施（worker + scheduler + events）。
 - [x] M2: 管理员任务 API 与触发接口 `return_mode` 扩展。
 - [x] M3: 前端 `/admin/jobs` 页面与用户管理字段补齐。
 - [x] M4: Rust / Web 测试与验证通过。
+- [x] M5: 任务类型专属详情页与 Storybook 分类型示例补齐。
 
 ## 变更记录（Change log）
 
 - 2026-02-25: 新建规格并落地实现，完成本地验证。
+- 2026-02-26: 新增“任务类型专属详情页”要求并完成实现；同步 Storybook 与契约文档。

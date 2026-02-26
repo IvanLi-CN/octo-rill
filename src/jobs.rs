@@ -25,6 +25,7 @@ pub const TASK_SYNC_ALL: &str = "sync.all";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
+pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
 
@@ -189,7 +190,7 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
         json!({
             "task_id": task_id,
             "task_type": new_task.task_type,
-            "status": STATUS_QUEUED,
+            "status": STATUS_RUNNING,
             "source": new_task.source,
         }),
     )
@@ -200,6 +201,73 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
         task_type: new_task.task_type,
         status: STATUS_QUEUED.to_owned(),
     })
+}
+
+pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO job_tasks (
+          id, task_type, status, source, requested_by, parent_task_id,
+          payload_json, created_at, started_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&task_id)
+    .bind(&new_task.task_type)
+    .bind(STATUS_RUNNING)
+    .bind(&new_task.source)
+    .bind(new_task.requested_by)
+    .bind(new_task.parent_task_id.as_deref())
+    .bind(payload_json)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to insert inline task")?;
+
+    append_task_event(
+        state,
+        &task_id,
+        "task.created",
+        json!({
+            "task_id": task_id,
+            "task_type": new_task.task_type,
+            "status": STATUS_QUEUED,
+            "source": new_task.source,
+        }),
+    )
+    .await?;
+    append_task_event(
+        state,
+        &task_id,
+        "task.running",
+        json!({
+            "task_id": task_id,
+            "status": STATUS_RUNNING,
+        }),
+    )
+    .await?;
+
+    Ok(EnqueuedTask {
+        task_id,
+        task_type: new_task.task_type,
+        status: STATUS_RUNNING.to_owned(),
+    })
+}
+
+pub async fn complete_task(
+    state: &AppState,
+    task_id: &str,
+    status: &str,
+    result: Option<Value>,
+    error_message: Option<String>,
+) -> Result<()> {
+    finalize_task(state, task_id, status, result, error_message).await
 }
 
 pub async fn retry_task(
@@ -424,6 +492,89 @@ pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
         .into_response()
 }
 
+#[derive(Debug, Serialize)]
+struct AdminJobEventStreamItem {
+    event_id: i64,
+    task_id: String,
+    task_type: String,
+    status: String,
+    event_type: String,
+    created_at: String,
+}
+
+pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
+    let events = stream! {
+        #[derive(Debug, sqlx::FromRow)]
+        struct EventRow {
+            id: i64,
+            task_id: String,
+            task_type: String,
+            status: String,
+            event_type: String,
+            created_at: String,
+        }
+
+        let mut last_id = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(id), 0) FROM job_task_events"#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+        loop {
+            let rows = sqlx::query_as::<_, EventRow>(
+                r#"
+                SELECT
+                  e.id,
+                  e.task_id,
+                  t.task_type,
+                  t.status,
+                  e.event_type,
+                  e.created_at
+                FROM job_task_events e
+                JOIN job_tasks t ON t.id = e.task_id
+                WHERE e.id > ?
+                ORDER BY e.id ASC
+                LIMIT 200
+                "#,
+            )
+            .bind(last_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
+
+            for row in rows {
+                last_id = row.id;
+                let payload = AdminJobEventStreamItem {
+                    event_id: row.id,
+                    task_id: row.task_id,
+                    task_type: row.task_type,
+                    status: row.status,
+                    event_type: row.event_type,
+                    created_at: row.created_at,
+                };
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(last_id.to_string())
+                        .event("job.event")
+                        .data(data),
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+
+    Sse::new(events)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(8))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     let mut tx = state.pool.begin().await.context("begin task claim tx")?;
 
@@ -625,6 +776,14 @@ async fn execute_task(
             let res = api::translate_release_for_user(state, user_id, &release_id)
                 .await
                 .map_err(|err| anyhow!("translate_release failed: {}", err.code()))?;
+            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
+        }
+        TASK_TRANSLATE_RELEASE_BATCH => {
+            let user_id = payload_i64(payload, "user_id")?;
+            let release_ids = payload_i64_array(payload, "release_ids")?;
+            let res = api::translate_releases_batch_for_user(state, user_id, &release_ids)
+                .await
+                .map_err(|err| anyhow!("translate_releases_batch failed: {}", err.code()))?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_TRANSLATE_RELEASE_DETAIL => {
@@ -849,6 +1008,21 @@ fn payload_string(payload: &Value, key: &str) -> Result<String> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("payload missing string field: {key}"))?;
     Ok(value.to_owned())
+}
+
+fn payload_i64_array(payload: &Value, key: &str) -> Result<Vec<i64>> {
+    let values = payload
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("payload missing array field: {key}"))?;
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(id) = value.as_i64() else {
+            return Err(anyhow!("payload field {key} must be integer array"));
+        };
+        result.push(id);
+    }
+    Ok(result)
 }
 
 fn is_terminal_status(status: &str) -> bool {

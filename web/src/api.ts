@@ -132,14 +132,28 @@ export type AdminTaskEventItem = {
 	created_at: string;
 };
 
+export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
+	payload_json?: string | null;
+	result_json?: string | null;
+};
+
 export type AdminRealtimeTaskDetailResponse = {
-	task: AdminRealtimeTaskItem;
+	task: AdminRealtimeTaskDetailItem;
 	events: AdminTaskEventItem[];
 };
 
 export type AdminTaskActionResponse = {
 	task_id: string;
 	status: string;
+};
+
+export type AdminJobsStreamEvent = {
+	event_id: number;
+	task_id: string;
+	task_type: string;
+	status: string;
+	event_type: string;
+	created_at: string;
 };
 
 export type AdminScheduledSlotItem = {
@@ -193,6 +207,10 @@ export async function apiCancelAdminRealtimeTask(
 	return apiPostJson<AdminTaskActionResponse>(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/cancel`,
 	);
+}
+
+export function apiOpenAdminJobsEventsStream(): EventSource {
+	return new EventSource("/api/admin/jobs/events", { withCredentials: true });
 }
 
 export async function apiGetAdminScheduledSlots(): Promise<AdminScheduledSlotsResponse> {

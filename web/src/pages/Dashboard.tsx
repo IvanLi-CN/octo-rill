@@ -41,6 +41,12 @@ type MeResponse = {
 type SyncStarredResult = { repos: number };
 type SyncReleasesResult = { repos: number; releases: number };
 type SyncNotificationsResult = { notifications: number; since: string | null };
+type TaskAcceptedResponse = {
+	mode: "task_id";
+	task_id: string;
+	task_type: string;
+	status: string;
+};
 
 type BriefGenerateResponse = {
 	date: string;
@@ -534,30 +540,42 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const onSyncStarred = useCallback(() => {
 		void run("Sync starred", async () => {
-			await apiPost<SyncStarredResult>("/api/sync/starred");
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/starred?return_mode=task_id",
+			);
 			await refreshAll();
 		});
 	}, [refreshAll, run]);
 
 	const onSyncReleases = useCallback(() => {
 		void run("Sync releases", async () => {
-			await apiPost<SyncReleasesResult>("/api/sync/releases");
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/releases?return_mode=task_id",
+			);
 			await refreshAll();
 		});
 	}, [refreshAll, run]);
 
 	const onSyncInbox = useCallback(() => {
 		void run("Sync inbox", async () => {
-			await apiPost<SyncNotificationsResult>("/api/sync/notifications");
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/notifications?return_mode=task_id",
+			);
 			await refreshAll();
 		});
 	}, [refreshAll, run]);
 
 	const onSyncAll = useCallback(() => {
 		void run("Sync all", async () => {
-			await apiPost<SyncStarredResult>("/api/sync/starred");
-			await apiPost<SyncReleasesResult>("/api/sync/releases");
-			await apiPost<SyncNotificationsResult>("/api/sync/notifications");
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/starred?return_mode=task_id",
+			);
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/releases?return_mode=task_id",
+			);
+			await apiPost<TaskAcceptedResponse>(
+				"/api/sync/notifications?return_mode=task_id",
+			);
 			await refreshAll();
 		});
 	}, [refreshAll, run]);

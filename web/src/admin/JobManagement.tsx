@@ -1,18 +1,19 @@
 import { ChevronDown } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { TaskTypeDetailPage } from "@/admin/TaskTypeDetailPage";
 import {
 	type AdminJobsOverviewResponse,
+	type AdminJobsStreamEvent,
 	type AdminRealtimeTaskDetailResponse,
 	type AdminRealtimeTaskItem,
-	type AdminScheduledSlotItem,
+	type AdminTaskEventItem,
 	ApiError,
 	apiCancelAdminRealtimeTask,
 	apiGetAdminJobsOverview,
 	apiGetAdminRealtimeTaskDetail,
 	apiGetAdminRealtimeTasks,
-	apiGetAdminScheduledSlots,
-	apiPatchAdminScheduledSlot,
+	apiOpenAdminJobsEventsStream,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -30,6 +31,15 @@ const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	hour12: false,
 });
 
+const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+	month: "2-digit",
+	day: "2-digit",
+	hour: "2-digit",
+	minute: "2-digit",
+	second: "2-digit",
+	hour12: false,
+});
+
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
 	const parsed = new Date(value);
@@ -39,12 +49,13 @@ function formatLocalHm(value: string | null | undefined) {
 	return HM_FORMATTER.format(parsed);
 }
 
-function formatUtcHourToLocal(hourUtc: number) {
-	const parsed = new Date(Date.UTC(1970, 0, 1, hourUtc, 0, 0));
+function formatLocalDateTime(value: string | null | undefined) {
+	if (!value) return "-";
+	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) {
 		return "-";
 	}
-	return HM_FORMATTER.format(parsed);
+	return DATETIME_FORMATTER.format(parsed);
 }
 
 function normalizeErrorMessage(err: unknown) {
@@ -63,6 +74,281 @@ function normalizeErrorMessage(err: unknown) {
 	return err instanceof Error ? err.message : String(err);
 }
 
+function taskStatusLabel(status: string) {
+	switch (status) {
+		case "queued":
+			return "排队中";
+		case "running":
+			return "运行中";
+		case "succeeded":
+			return "成功";
+		case "failed":
+			return "失败";
+		case "canceled":
+			return "已取消";
+		default:
+			return status;
+	}
+}
+
+type TaskStatusTone = {
+	cardAccentClass: string;
+	badgeClass: string;
+	dotClass: string;
+};
+
+function taskStatusTone(status: string): TaskStatusTone {
+	switch (status) {
+		case "queued":
+			return {
+				cardAccentClass: "border-l-amber-500",
+				badgeClass:
+					"border-amber-300 bg-amber-100/90 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100",
+				dotClass: "bg-amber-500",
+			};
+		case "running":
+			return {
+				cardAccentClass: "border-l-sky-500",
+				badgeClass:
+					"border-sky-300 bg-sky-100/90 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100",
+				dotClass: "bg-sky-500",
+			};
+		case "succeeded":
+			return {
+				cardAccentClass: "border-l-emerald-500",
+				badgeClass:
+					"border-emerald-300 bg-emerald-100/90 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100",
+				dotClass: "bg-emerald-500",
+			};
+		case "failed":
+			return {
+				cardAccentClass: "border-l-red-500",
+				badgeClass:
+					"border-red-300 bg-red-100/90 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100",
+				dotClass: "bg-red-500",
+			};
+		case "canceled":
+			return {
+				cardAccentClass: "border-l-slate-500",
+				badgeClass:
+					"border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100",
+				dotClass: "bg-slate-500",
+			};
+		default:
+			return {
+				cardAccentClass: "border-l-border",
+				badgeClass:
+					"border-border bg-muted/60 text-foreground dark:border-border dark:bg-muted/50 dark:text-foreground",
+				dotClass: "bg-muted-foreground",
+			};
+	}
+}
+
+function taskTypeLabel(taskType: string) {
+	switch (taskType) {
+		case "brief.daily_slot":
+			return "定时执行任务";
+		case "brief.generate":
+			return "日报生成";
+		case "sync.all":
+			return "全量同步";
+		case "sync.starred":
+			return "同步 Star";
+		case "sync.releases":
+			return "同步 Release";
+		case "sync.notifications":
+			return "同步通知";
+		case "translate.release":
+			return "翻译 Release";
+		case "translate.release.batch":
+			return "批量翻译 Release";
+		case "translate.release_detail":
+			return "翻译 Release 详情";
+		case "translate.notification":
+			return "翻译通知";
+		default:
+			return taskType;
+	}
+}
+
+type EventLevel = "normal" | "success" | "warning" | "danger";
+
+type EventPresentation = {
+	title: string;
+	description: string;
+	level: EventLevel;
+	payload: Record<string, unknown> | null;
+};
+
+function asObject(payload: unknown): Record<string, unknown> | null {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+		return null;
+	}
+	return payload as Record<string, unknown>;
+}
+
+function readString(payload: Record<string, unknown> | null, key: string) {
+	if (!payload) return null;
+	const value = payload[key];
+	return typeof value === "string" ? value : null;
+}
+
+function readNumber(payload: Record<string, unknown> | null, key: string) {
+	if (!payload) return null;
+	const value = payload[key];
+	return typeof value === "number" ? value : null;
+}
+
+function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
+	let payload: Record<string, unknown> | null = null;
+	try {
+		payload = asObject(JSON.parse(event.payload_json));
+	} catch {
+		payload = null;
+	}
+
+	if (event.event_type === "task.created") {
+		const source = readString(payload, "source");
+		return {
+			title: "任务已创建",
+			description: source ? `触发来源：${source}` : "任务已进入队列等待执行。",
+			level: "normal",
+			payload,
+		};
+	}
+
+	if (event.event_type === "task.running") {
+		return {
+			title: "任务开始执行",
+			description: "任务已被执行器领取并开始处理。",
+			level: "normal",
+			payload,
+		};
+	}
+
+	if (event.event_type === "task.cancel_requested") {
+		return {
+			title: "已请求取消",
+			description: "任务运行中收到取消请求，将在安全点停止。",
+			level: "warning",
+			payload,
+		};
+	}
+
+	if (event.event_type === "task.canceled") {
+		return {
+			title: "任务已取消",
+			description: "任务在排队阶段被取消。",
+			level: "warning",
+			payload,
+		};
+	}
+
+	if (event.event_type === "task.progress") {
+		const stage = readString(payload, "stage");
+		if (stage === "collect") {
+			const totalUsers = readNumber(payload, "total_users");
+			const hourUtc = readNumber(payload, "hour_utc");
+			return {
+				title: "收集执行对象",
+				description:
+					totalUsers !== null && hourUtc !== null
+						? `UTC ${hourUtc.toString().padStart(2, "0")}:00 收集到 ${totalUsers} 位用户。`
+						: "任务正在收集本轮执行对象。",
+				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "generate") {
+			const index = readNumber(payload, "index");
+			const total = readNumber(payload, "total");
+			const userId = readNumber(payload, "user_id");
+			return {
+				title: "串行执行中",
+				description:
+					index !== null && total !== null && userId !== null
+						? `正在处理第 ${index}/${total} 位用户（#${userId}）。`
+						: "正在串行执行当前批次用户。",
+				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "user_failed") {
+			const userId = readNumber(payload, "user_id");
+			const error = readString(payload, "error");
+			return {
+				title: "单用户执行失败",
+				description:
+					userId !== null
+						? `用户 #${userId} 失败${error ? `：${error}` : ""}`
+						: "有用户执行失败，任务继续处理后续用户。",
+				level: "danger",
+				payload,
+			};
+		}
+	}
+
+	if (event.event_type === "task.completed") {
+		const status = readString(payload, "status") ?? "";
+		if (status === "succeeded") {
+			return {
+				title: "任务执行完成",
+				description: "任务已完成并写入结果。",
+				level: "success",
+				payload,
+			};
+		}
+		if (status === "failed") {
+			const error = readString(payload, "error");
+			return {
+				title: "任务执行失败",
+				description: error ? `失败原因：${error}` : "任务执行失败。",
+				level: "danger",
+				payload,
+			};
+		}
+		if (status === "canceled") {
+			return {
+				title: "任务已终止",
+				description: "任务被取消并结束。",
+				level: "warning",
+				payload,
+			};
+		}
+	}
+
+	return {
+		title: event.event_type,
+		description: "记录了一条任务事件。",
+		level: "normal",
+		payload,
+	};
+}
+
+function eventLevelClass(level: EventLevel) {
+	switch (level) {
+		case "success":
+			return "border-emerald-500/40 bg-emerald-500/5";
+		case "warning":
+			return "border-amber-500/40 bg-amber-500/5";
+		case "danger":
+			return "border-red-500/40 bg-red-500/5";
+		default:
+			return "border-border bg-card/70";
+	}
+}
+
+function sourceLabel(source: string) {
+	switch (source) {
+		case "scheduler":
+			return "定时调度";
+		case "retry":
+			return "手动重试";
+		default:
+			return source;
+	}
+}
+
 type RealtimeStatusFilter =
 	| "all"
 	| "queued"
@@ -72,6 +358,11 @@ type RealtimeStatusFilter =
 	| "canceled";
 
 const TASK_PAGE_SIZE = 20;
+const SCHEDULED_TASK_TYPE = "brief.daily_slot";
+const STREAM_REFRESH_DELAY_MS = 600;
+const STREAM_RECONNECT_DELAY_MS = 1500;
+
+type StreamStatus = "connecting" | "connected" | "reconnecting";
 
 type JobManagementProps = {
 	currentUserId: number;
@@ -90,23 +381,52 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [tasksLoading, setTasksLoading] = useState(false);
 	const [taskActionBusyId, setTaskActionBusyId] = useState<string | null>(null);
 
-	const [scheduledSlots, setScheduledSlots] = useState<
-		AdminScheduledSlotItem[]
-	>([]);
-	const [scheduledLoading, setScheduledLoading] = useState(false);
-	const [scheduledBusyHour, setScheduledBusyHour] = useState<number | null>(
-		null,
+	const [scheduledRunStatusFilter, setScheduledRunStatusFilter] =
+		useState<RealtimeStatusFilter>("all");
+	const [scheduledRuns, setScheduledRuns] = useState<AdminRealtimeTaskItem[]>(
+		[],
 	);
+	const [scheduledRunTotal, setScheduledRunTotal] = useState(0);
+	const [scheduledRunPage, setScheduledRunPage] = useState(1);
+	const [scheduledRunsLoading, setScheduledRunsLoading] = useState(false);
 
 	const [detailTask, setDetailTask] =
 		useState<AdminRealtimeTaskDetailResponse | null>(null);
 	const [detailLoading, setDetailLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
+
+	const detailTaskIdRef = useRef<string | null>(null);
+	const streamRefreshTimerRef = useRef<number | null>(null);
+	const streamRefreshInFlightRef = useRef(false);
+	const streamPendingFullRefreshRef = useRef(false);
+	const streamPendingDetailTaskIdRef = useRef<string | null>(null);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
 		[taskTotal],
 	);
+	const scheduledRunTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(scheduledRunTotal / TASK_PAGE_SIZE)),
+		[scheduledRunTotal],
+	);
+	const taskEvents = useMemo(() => {
+		if (!detailTask) return [];
+		return [...detailTask.events]
+			.sort((a, b) => a.id - b.id)
+			.map((event) => ({
+				event,
+				presentation: formatEventPresentation(event),
+			}));
+	}, [detailTask]);
+	const detailTaskTone = useMemo(
+		() => (detailTask ? taskStatusTone(detailTask.task.status) : null),
+		[detailTask],
+	);
+
+	useEffect(() => {
+		detailTaskIdRef.current = detailTask?.task.id ?? null;
+	}, [detailTask]);
 
 	const loadOverview = useCallback(async () => {
 		const res = await apiGetAdminJobsOverview();
@@ -118,34 +438,118 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		try {
 			const params = new URLSearchParams();
 			params.set("status", statusFilter);
+			params.set("exclude_task_type", SCHEDULED_TASK_TYPE);
 			params.set("page", String(taskPage));
 			params.set("page_size", String(TASK_PAGE_SIZE));
 			const res = await apiGetAdminRealtimeTasks(params);
-			setTasks(res.items);
-			setTaskTotal(res.total);
+			const realtimeOnlyItems = res.items.filter(
+				(task) => task.task_type !== SCHEDULED_TASK_TYPE,
+			);
+			// Fallback for older backend versions that ignore exclude_task_type.
+			const realtimeTotal =
+				realtimeOnlyItems.length === res.items.length
+					? res.total
+					: realtimeOnlyItems.length;
+			setTasks(realtimeOnlyItems);
+			setTaskTotal(realtimeTotal);
 		} finally {
 			setTasksLoading(false);
 		}
 	}, [statusFilter, taskPage]);
 
-	const loadScheduled = useCallback(async () => {
-		setScheduledLoading(true);
+	const loadScheduledRuns = useCallback(async () => {
+		setScheduledRunsLoading(true);
 		try {
-			const res = await apiGetAdminScheduledSlots();
-			setScheduledSlots(res.items);
+			const params = new URLSearchParams();
+			params.set("status", scheduledRunStatusFilter);
+			params.set("task_type", SCHEDULED_TASK_TYPE);
+			params.set("page", String(scheduledRunPage));
+			params.set("page_size", String(TASK_PAGE_SIZE));
+			const res = await apiGetAdminRealtimeTasks(params);
+			setScheduledRuns(res.items);
+			setScheduledRunTotal(res.total);
 		} finally {
-			setScheduledLoading(false);
+			setScheduledRunsLoading(false);
 		}
-	}, []);
+	}, [scheduledRunPage, scheduledRunStatusFilter]);
 
 	const loadAll = useCallback(async () => {
 		setError(null);
 		try {
-			await Promise.all([loadOverview(), loadRealtimeTasks(), loadScheduled()]);
+			await Promise.all([
+				loadOverview(),
+				loadRealtimeTasks(),
+				loadScheduledRuns(),
+			]);
 		} catch (err) {
 			setError(normalizeErrorMessage(err));
 		}
-	}, [loadOverview, loadRealtimeTasks, loadScheduled]);
+	}, [loadOverview, loadRealtimeTasks, loadScheduledRuns]);
+
+	const refreshTaskDetail = useCallback(async (taskId: string) => {
+		const detail = await apiGetAdminRealtimeTaskDetail(taskId);
+		setDetailTask(detail);
+	}, []);
+
+	const drainStreamRefreshQueue = useCallback(async () => {
+		if (streamRefreshInFlightRef.current) {
+			return;
+		}
+		streamRefreshInFlightRef.current = true;
+		try {
+			const needFullRefresh = streamPendingFullRefreshRef.current;
+			const pendingDetailTaskId = streamPendingDetailTaskIdRef.current;
+			streamPendingFullRefreshRef.current = false;
+			streamPendingDetailTaskIdRef.current = null;
+
+			if (needFullRefresh) {
+				await Promise.all([
+					loadOverview(),
+					loadRealtimeTasks(),
+					loadScheduledRuns(),
+				]);
+				const activeDetailTaskId = detailTaskIdRef.current;
+				if (activeDetailTaskId) {
+					await refreshTaskDetail(activeDetailTaskId);
+				}
+				return;
+			}
+
+			if (pendingDetailTaskId) {
+				await refreshTaskDetail(pendingDetailTaskId);
+			}
+		} catch (err) {
+			setError(normalizeErrorMessage(err));
+		} finally {
+			streamRefreshInFlightRef.current = false;
+			if (
+				streamPendingFullRefreshRef.current ||
+				streamPendingDetailTaskIdRef.current
+			) {
+				void drainStreamRefreshQueue();
+			}
+		}
+	}, [loadOverview, loadRealtimeTasks, loadScheduledRuns, refreshTaskDetail]);
+
+	const scheduleStreamRefresh = useCallback(
+		(mode: "all" | "detail", taskId?: string) => {
+			if (mode === "all") {
+				streamPendingFullRefreshRef.current = true;
+				streamPendingDetailTaskIdRef.current = null;
+			} else if (taskId) {
+				streamPendingDetailTaskIdRef.current = taskId;
+			}
+
+			if (streamRefreshTimerRef.current !== null) {
+				return;
+			}
+			streamRefreshTimerRef.current = window.setTimeout(() => {
+				streamRefreshTimerRef.current = null;
+				void drainStreamRefreshQueue();
+			}, STREAM_REFRESH_DELAY_MS);
+		},
+		[drainStreamRefreshQueue],
+	);
 
 	useEffect(() => {
 		void loadAll();
@@ -157,6 +561,109 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(normalizeErrorMessage(err));
 		});
 	}, [loadRealtimeTasks]);
+
+	useEffect(() => {
+		setError(null);
+		void loadScheduledRuns().catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadScheduledRuns]);
+
+	useEffect(() => {
+		return () => {
+			if (streamRefreshTimerRef.current !== null) {
+				window.clearTimeout(streamRefreshTimerRef.current);
+				streamRefreshTimerRef.current = null;
+			}
+		};
+	}, []);
+
+	useEffect(() => {
+		if (
+			typeof window === "undefined" ||
+			typeof window.EventSource === "undefined"
+		) {
+			setStreamStatus("reconnecting");
+			return;
+		}
+
+		let disposed = false;
+		let reconnectTimer: number | null = null;
+		let source: EventSource | null = null;
+
+		const closeSource = () => {
+			if (source) {
+				source.close();
+				source = null;
+			}
+		};
+
+		const connect = () => {
+			if (disposed) return;
+			setStreamStatus((prev) =>
+				prev === "connected" ? "reconnecting" : "connecting",
+			);
+			const nextSource = apiOpenAdminJobsEventsStream();
+			source = nextSource;
+
+			const onJobEvent = (evt: Event) => {
+				const message = evt as MessageEvent<string>;
+				let parsed: AdminJobsStreamEvent | null = null;
+				try {
+					parsed = JSON.parse(message.data) as AdminJobsStreamEvent;
+				} catch {
+					parsed = null;
+				}
+				if (!parsed) {
+					scheduleStreamRefresh("all");
+					return;
+				}
+
+				if (parsed.event_type === "task.progress") {
+					const activeDetailTaskId = detailTaskIdRef.current;
+					if (activeDetailTaskId && activeDetailTaskId === parsed.task_id) {
+						scheduleStreamRefresh("detail", activeDetailTaskId);
+					}
+					return;
+				}
+
+				scheduleStreamRefresh("all");
+			};
+
+			nextSource.addEventListener("job.event", onJobEvent as EventListener);
+			nextSource.onopen = () => {
+				if (disposed) return;
+				setStreamStatus("connected");
+			};
+			nextSource.onerror = () => {
+				nextSource.removeEventListener(
+					"job.event",
+					onJobEvent as EventListener,
+				);
+				closeSource();
+				if (disposed) return;
+				setStreamStatus("reconnecting");
+				if (reconnectTimer !== null) {
+					window.clearTimeout(reconnectTimer);
+				}
+				reconnectTimer = window.setTimeout(() => {
+					reconnectTimer = null;
+					connect();
+				}, STREAM_RECONNECT_DELAY_MS);
+			};
+		};
+
+		connect();
+
+		return () => {
+			disposed = true;
+			if (reconnectTimer !== null) {
+				window.clearTimeout(reconnectTimer);
+				reconnectTimer = null;
+			}
+			closeSource();
+		};
+	}, [scheduleStreamRefresh]);
 
 	const onOpenTaskDetail = useCallback(async (taskId: string) => {
 		setDetailLoading(true);
@@ -177,14 +684,18 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiRetryAdminRealtimeTask(taskId);
-				await Promise.all([loadOverview(), loadRealtimeTasks()]);
+				await Promise.all([
+					loadOverview(),
+					loadRealtimeTasks(),
+					loadScheduledRuns(),
+				]);
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[loadOverview, loadRealtimeTasks],
+		[loadOverview, loadRealtimeTasks, loadScheduledRuns],
 	);
 
 	const onCancelTask = useCallback(
@@ -193,30 +704,18 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiCancelAdminRealtimeTask(taskId);
-				await Promise.all([loadOverview(), loadRealtimeTasks()]);
+				await Promise.all([
+					loadOverview(),
+					loadRealtimeTasks(),
+					loadScheduledRuns(),
+				]);
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[loadOverview, loadRealtimeTasks],
-	);
-
-	const onToggleScheduledSlot = useCallback(
-		async (slot: AdminScheduledSlotItem) => {
-			setScheduledBusyHour(slot.hour_utc);
-			setError(null);
-			try {
-				await apiPatchAdminScheduledSlot(slot.hour_utc, !slot.enabled);
-				await Promise.all([loadOverview(), loadScheduled()]);
-			} catch (err) {
-				setError(normalizeErrorMessage(err));
-			} finally {
-				setScheduledBusyHour(null);
-			}
-		},
-		[loadOverview, loadScheduled],
+		[loadOverview, loadRealtimeTasks, loadScheduledRuns],
 	);
 
 	return (
@@ -225,7 +724,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				<CardHeader>
 					<CardTitle>任务总览</CardTitle>
 					<CardDescription>
-						展示实时异步任务与定时日报槽位状态。
+						展示实时异步任务与定时任务运行概览。
 					</CardDescription>
 				</CardHeader>
 				<CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -245,15 +744,6 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						<p className="text-muted-foreground text-xs">近24h 成功 / 失败</p>
 						<p className="mt-1 text-xl font-semibold">
 							{overview?.succeeded_24h ?? "-"} / {overview?.failed_24h ?? "-"}
-						</p>
-					</div>
-					<div className="bg-card/70 rounded-lg border p-3 sm:col-span-2 lg:col-span-3">
-						<p className="text-muted-foreground text-xs">
-							定时日报槽位启用情况
-						</p>
-						<p className="mt-1 text-xl font-semibold">
-							{overview?.enabled_scheduled_slots ?? "-"} /{" "}
-							{overview?.total_scheduled_slots ?? 24}
 						</p>
 					</div>
 				</CardContent>
@@ -279,11 +769,36 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				<Button
 					variant="secondary"
 					size="sm"
-					disabled={tasksLoading || scheduledLoading}
+					disabled={tasksLoading || scheduledRunsLoading}
 					onClick={() => void loadAll()}
 				>
 					刷新
 				</Button>
+				<span
+					className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-xs font-medium ${
+						streamStatus === "connected"
+							? "border-emerald-300 bg-emerald-100/80 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
+							: streamStatus === "reconnecting"
+								? "border-amber-300 bg-amber-100/80 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100"
+								: "border-sky-300 bg-sky-100/80 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100"
+					}`}
+				>
+					<span
+						className={`size-1.5 rounded-full ${
+							streamStatus === "connected"
+								? "bg-emerald-500"
+								: streamStatus === "reconnecting"
+									? "bg-amber-500"
+									: "bg-sky-500"
+						}`}
+					/>
+					SSE
+					{streamStatus === "connected"
+						? " 已连接"
+						: streamStatus === "reconnecting"
+							? " 重连中..."
+							: " 连接中..."}
+				</span>
 			</div>
 
 			{error ? <p className="text-destructive text-sm">{error}</p> : null}
@@ -291,10 +806,24 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			{tab === "realtime" ? (
 				<Card>
 					<CardHeader>
-						<CardTitle>实时异步任务</CardTitle>
-						<CardDescription>
-							监控系统内部任务，并支持重试与取消。
-						</CardDescription>
+						<div className="flex items-center gap-2">
+							<CardTitle>实时异步任务</CardTitle>
+							<div className="group relative">
+								<button
+									type="button"
+									aria-label="实时异步任务说明"
+									className="text-muted-foreground hover:text-foreground inline-flex size-5 items-center justify-center rounded-full border text-xs transition-colors"
+								>
+									?
+								</button>
+								<div
+									role="tooltip"
+									className="bg-foreground text-background pointer-events-none absolute top-full left-0 z-20 mt-2 w-60 rounded-md px-2 py-1.5 text-xs leading-relaxed opacity-0 shadow-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
+								>
+									监控系统内部任务，并支持重试与取消。
+								</div>
+							</div>
+						</div>
 					</CardHeader>
 					<CardContent className="space-y-4">
 						<div className="flex flex-wrap items-center gap-2">
@@ -329,25 +858,49 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							) : (
 								tasks.map((task) => {
 									const busy = taskActionBusyId === task.id;
+									const tone = taskStatusTone(task.status);
 									return (
 										<div
 											key={task.id}
-											className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 lg:flex-row lg:items-center lg:justify-between"
+											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
 										>
 											<div className="min-w-0">
-												<p className="font-medium text-sm">{task.task_type}</p>
+												<div className="flex flex-wrap items-center gap-2">
+													<p className="font-medium text-sm">
+														{taskTypeLabel(task.task_type)}
+													</p>
+													<span
+														className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
+													>
+														<span
+															className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+														/>
+														{taskStatusLabel(task.status)}
+													</span>
+													{task.cancel_requested ? (
+														<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+															已请求取消
+														</span>
+													) : null}
+												</div>
+												<p className="text-muted-foreground mt-1 text-xs">
+													类型：
+													<span className="font-mono">{task.task_type}</span>
+												</p>
 												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
 													ID: {task.id}
 												</p>
-												<p className="text-muted-foreground text-xs">
-													状态 {task.status}
-													{task.cancel_requested ? " · 已请求取消" : ""}· 创建{" "}
-													{formatLocalHm(task.created_at)}· 完成{" "}
-													{formatLocalHm(task.finished_at)}
-												</p>
+												<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+													<span className="bg-muted/60 rounded px-2 py-0.5">
+														创建 {formatLocalHm(task.created_at)}
+													</span>
+													<span className="bg-muted/60 rounded px-2 py-0.5">
+														完成 {formatLocalHm(task.finished_at)}
+													</span>
+												</div>
 												{task.error_message ? (
-													<p className="text-destructive mt-1 text-xs">
-														{task.error_message}
+													<p className="text-destructive mt-1 text-xs font-medium">
+														失败原因：{task.error_message}
 													</p>
 												) : null}
 											</div>
@@ -421,55 +974,205 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			{tab === "scheduled" ? (
 				<Card>
 					<CardHeader>
-						<CardTitle>定时任务（24小时槽）</CardTitle>
-						<CardDescription>
-							固定 24 个 UTC 小时槽，命中槽位后收集用户并串行生成日报。
-						</CardDescription>
+						<CardTitle>定时任务</CardTitle>
 					</CardHeader>
-					<CardContent className="space-y-2">
-						{scheduledLoading ? (
-							<p className="text-muted-foreground text-sm">
-								正在加载定时槽位...
-							</p>
-						) : (
-							scheduledSlots.map((slot) => (
-								<div
-									key={slot.hour_utc}
-									className="bg-card/70 flex flex-col gap-2 rounded-lg border p-3 md:flex-row md:items-center md:justify-between"
-								>
-									<div>
-										<p className="font-medium text-sm">
-											UTC {slot.hour_utc.toString().padStart(2, "0")}:00 · 本地{" "}
-											{formatUtcHourToLocal(slot.hour_utc)}
-										</p>
-										<p className="text-muted-foreground text-xs">
-											最近调度 {formatLocalHm(slot.last_dispatch_at)}· 更新时间{" "}
-											{formatLocalHm(slot.updated_at)}
-										</p>
-									</div>
-									<Button
-										variant={slot.enabled ? "destructive" : "secondary"}
-										disabled={scheduledBusyHour === slot.hour_utc}
-										onClick={() => void onToggleScheduledSlot(slot)}
+					<CardContent className="space-y-4">
+						<div className="space-y-3">
+							<div className="flex flex-wrap items-center justify-between gap-2">
+								<h4 className="font-medium text-sm">运行记录</h4>
+								<div className="relative w-full max-w-xs">
+									<select
+										value={scheduledRunStatusFilter}
+										onChange={(e) => {
+											setScheduledRunPage(1);
+											setScheduledRunStatusFilter(
+												e.target.value as RealtimeStatusFilter,
+											);
+										}}
+										className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
 									>
-										{slot.enabled ? "停用" : "启用"}
+										<option value="all">状态：全部</option>
+										<option value="queued">状态：排队</option>
+										<option value="running">状态：运行中</option>
+										<option value="failed">状态：失败</option>
+										<option value="succeeded">状态：成功</option>
+										<option value="canceled">状态：取消</option>
+									</select>
+									<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
+								</div>
+							</div>
+							<p className="text-muted-foreground text-xs">
+								共 {scheduledRunTotal} 条
+							</p>
+							<div className="space-y-2">
+								{scheduledRunsLoading ? (
+									<p className="text-muted-foreground text-sm">
+										正在加载运行记录...
+									</p>
+								) : scheduledRuns.length === 0 ? (
+									<p className="text-muted-foreground text-sm">
+										暂无运行记录。
+									</p>
+								) : (
+									scheduledRuns.map((task) => {
+										const busy = taskActionBusyId === task.id;
+										const tone = taskStatusTone(task.status);
+										return (
+											<div
+												key={task.id}
+												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+											>
+												<div className="min-w-0">
+													<div className="flex flex-wrap items-center gap-2">
+														<p className="font-medium text-sm">
+															{taskTypeLabel(task.task_type)}
+														</p>
+														<span
+															className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
+														>
+															<span
+																className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+															/>
+															{taskStatusLabel(task.status)}
+														</span>
+														{task.cancel_requested ? (
+															<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+																已请求取消
+															</span>
+														) : null}
+													</div>
+													<p className="text-muted-foreground mt-1 text-xs">
+														类型：
+														<span className="font-mono">{task.task_type}</span>
+													</p>
+													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+														ID: {task.id}
+													</p>
+													<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+														<span className="bg-muted/60 rounded px-2 py-0.5">
+															创建 {formatLocalHm(task.created_at)}
+														</span>
+														<span className="bg-muted/60 rounded px-2 py-0.5">
+															完成 {formatLocalHm(task.finished_at)}
+														</span>
+													</div>
+													{task.error_message ? (
+														<p className="text-destructive mt-1 text-xs font-medium">
+															失败原因：{task.error_message}
+														</p>
+													) : null}
+												</div>
+												<div className="flex flex-wrap gap-2">
+													<Button
+														variant="outline"
+														disabled={detailLoading}
+														onClick={() => void onOpenTaskDetail(task.id)}
+													>
+														详情
+													</Button>
+													<Button
+														variant="outline"
+														disabled={
+															busy ||
+															task.status === "queued" ||
+															task.status === "running"
+														}
+														onClick={() => void onRetryTask(task.id)}
+													>
+														重试
+													</Button>
+													<Button
+														variant="destructive"
+														disabled={
+															busy ||
+															task.status === "succeeded" ||
+															task.status === "failed" ||
+															task.status === "canceled"
+														}
+														onClick={() => void onCancelTask(task.id)}
+													>
+														取消
+													</Button>
+												</div>
+											</div>
+										);
+									})
+								)}
+							</div>
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {scheduledRunPage}/{scheduledRunTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={scheduledRunPage <= 1 || scheduledRunsLoading}
+										onClick={() =>
+											setScheduledRunPage((prev) => Math.max(1, prev - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											scheduledRunPage >= scheduledRunTotalPages ||
+											scheduledRunsLoading
+										}
+										onClick={() =>
+											setScheduledRunPage((prev) =>
+												Math.min(scheduledRunTotalPages, prev + 1),
+											)
+										}
+									>
+										下一页
 									</Button>
 								</div>
-							))
-						)}
+							</div>
+						</div>
 					</CardContent>
 				</Card>
 			) : null}
 
 			{detailTask ? (
-				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
-					<div className="bg-card w-full max-w-2xl rounded-xl border p-5 shadow-2xl">
-						<div className="flex items-center justify-between gap-3">
-							<div>
+				<div className="fixed inset-0 z-40 flex">
+					<button
+						type="button"
+						className="flex-1 bg-black/35"
+						aria-label="关闭任务详情"
+						onClick={() => setDetailTask(null)}
+					/>
+					<div className="bg-card relative h-full w-full max-w-3xl border-l p-5 shadow-2xl">
+						<div className="flex items-start justify-between gap-3">
+							<div className="min-w-0">
 								<h3 className="text-lg font-semibold tracking-tight">
 									任务详情
 								</h3>
-								<p className="text-muted-foreground font-mono text-xs">
+								<div className="mt-1 flex flex-wrap items-center gap-2">
+									<p className="text-muted-foreground text-sm">
+										{taskTypeLabel(detailTask.task.task_type)}
+									</p>
+									<span
+										className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${detailTaskTone?.badgeClass ?? ""}`}
+									>
+										<span
+											className={`mr-1.5 size-1.5 rounded-full ${detailTaskTone?.dotClass ?? "bg-muted-foreground"}`}
+										/>
+										{taskStatusLabel(detailTask.task.status)}
+									</span>
+									{detailTask.task.cancel_requested ? (
+										<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+											已请求取消
+										</span>
+									) : null}
+								</div>
+								<p className="text-muted-foreground mt-1 text-xs">
+									类型：
+									<span className="font-mono">{detailTask.task.task_type}</span>
+								</p>
+								<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
 									{detailTask.task.id}
 								</p>
 							</div>
@@ -477,23 +1180,77 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								关闭
 							</Button>
 						</div>
-						<p className="text-muted-foreground mt-2 text-sm">
-							类型 {detailTask.task.task_type} · 状态 {detailTask.task.status}
-						</p>
-						<div className="mt-4 max-h-[50vh] space-y-2 overflow-auto pr-1">
-							{detailTask.events.length === 0 ? (
+
+						<div className="mt-4 grid gap-2 md:grid-cols-2">
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">任务状态</p>
+								<p className="mt-1 font-medium">
+									{taskStatusLabel(detailTask.task.status)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">触发来源</p>
+								<p className="mt-1 font-medium">
+									{sourceLabel(detailTask.task.source)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									创建 / 开始 / 完成
+								</p>
+								<p className="mt-1 font-medium">
+									{formatLocalDateTime(detailTask.task.created_at)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									开始 {formatLocalDateTime(detailTask.task.started_at)} · 完成{" "}
+									{formatLocalDateTime(detailTask.task.finished_at)}
+								</p>
+							</div>
+						</div>
+
+						<TaskTypeDetailPage detail={detailTask} />
+
+						{detailTask.task.error_message ? (
+							<p className="text-destructive mt-3 text-sm">
+								失败原因：{detailTask.task.error_message}
+							</p>
+						) : null}
+
+						<div className="mt-4">
+							<p className="text-muted-foreground text-xs">执行时间线</p>
+						</div>
+						<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
+							{taskEvents.length === 0 ? (
 								<p className="text-muted-foreground text-sm">暂无事件日志。</p>
 							) : (
-								detailTask.events.map((event) => (
-									<div key={event.id} className="bg-card/70 rounded border p-2">
-										<p className="font-mono text-[11px]">
-											{event.event_type} · {formatLocalHm(event.created_at)}
-										</p>
-										<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
-											{event.payload_json}
-										</pre>
-									</div>
-								))
+								taskEvents
+									.slice()
+									.reverse()
+									.map(({ event, presentation }) => (
+										<div
+											key={event.id}
+											className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
+										>
+											<p className="font-medium text-sm">
+												{presentation.title}
+											</p>
+											<p className="text-muted-foreground mt-1 text-xs">
+												{presentation.description}
+											</p>
+											<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+												{event.event_type} ·{" "}
+												{formatLocalDateTime(event.created_at)}
+											</p>
+											<details className="mt-2">
+												<summary className="text-muted-foreground cursor-pointer text-xs">
+													查看原始事件
+												</summary>
+												<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
+													{event.payload_json}
+												</pre>
+											</details>
+										</div>
+									))
 							)}
 						</div>
 					</div>
