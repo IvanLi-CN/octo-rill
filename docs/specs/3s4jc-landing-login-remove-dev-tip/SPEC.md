@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（2/3）
+- Status: 已完成
 - Created: 2026-02-26
 - Last: 2026-02-26
 
@@ -118,7 +118,7 @@ None
 
 - [x] M1: 新建规格并写入 `docs/specs/README.md` 索引。
 - [x] M2: 移除 Landing 技术提示并新增 e2e 回归。
-- [ ] M3: 完成快车道交付（PR、checks、review-loop 收敛）并回写规格状态。
+- [x] M3: 完成快车道交付（PR、checks、review-loop 收敛）并回写规格状态。
 
 ## 方案概述（Approach, high-level）
 
@@ -136,6 +136,7 @@ None
 
 - 2026-02-26: 创建规格，冻结“全部移除技术提示 + 回归保障”的执行口径。
 - 2026-02-26: 完成 Landing 提示移除与 `landing-login` e2e 回归，状态更新为 `部分完成（2/3）`。
+- 2026-02-26: 创建 PR #15，CI 与标签门禁通过，review-loop 无阻塞项，状态更新为 `已完成`。
 
 ## 参考（References）
 
