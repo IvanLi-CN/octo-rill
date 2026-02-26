@@ -17,8 +17,9 @@ Persistence (Master + Overrides pattern):
 import argparse
 import sys
 import io
+from pathlib import Path
 from core import CSV_CONFIG, AVAILABLE_STACKS, MAX_RESULTS, search, search_stack
-from design_system import generate_design_system, slugify_path_segment
+from design_system import DesignSystemGenerator, format_ascii_box, format_markdown, persist_design_system
 
 # Force UTF-8 for stdout/stderr to handle emojis on Windows (cp1252 default)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
@@ -73,28 +74,37 @@ if __name__ == "__main__":
 
     # Design system takes priority
     if args.design_system:
-        result = generate_design_system(
-            args.query, 
-            args.project_name, 
-            args.format,
-            persist=args.persist,
-            page=args.page,
-            output_dir=args.output_dir
-        )
-        print(result)
+        generator = DesignSystemGenerator()
+        design_system = generator.generate(args.query, args.project_name)
+        persist_result = None
+        if args.persist:
+            persist_result = persist_design_system(
+                design_system,
+                page=args.page,
+                output_dir=args.output_dir,
+                page_query=args.query
+            )
+
+        if args.format == "markdown":
+            print(format_markdown(design_system))
+        else:
+            print(format_ascii_box(design_system))
         
         # Print persistence confirmation
-        if args.persist:
-            effective_project_name = args.project_name or args.query.upper()
-            project_slug = slugify_path_segment(effective_project_name, "default")
+        if persist_result:
+            design_system_dir = persist_result.get("design_system_dir", "")
+            created_files = persist_result.get("created_files", [])
+            master_file = next((path for path in created_files if Path(path).name == "MASTER.md"), None)
+            page_file = next((path for path in created_files if Path(path).suffix == ".md" and Path(path).name != "MASTER.md"), None)
+
             print("\n" + "=" * 60)
-            print(f"✅ Design system persisted to design-system/{project_slug}/")
-            print(f"   📄 design-system/{project_slug}/MASTER.md (Global Source of Truth)")
-            if args.page:
-                page_filename = slugify_path_segment(args.page, "page")
-                print(f"   📄 design-system/{project_slug}/pages/{page_filename}.md (Page Overrides)")
+            print(f"✅ Design system persisted to {design_system_dir}/")
+            if master_file:
+                print(f"   📄 {master_file} (Global Source of Truth)")
+            if args.page and page_file:
+                print(f"   📄 {page_file} (Page Overrides)")
             print("")
-            print(f"📖 Usage: When building a page, check design-system/{project_slug}/pages/[page].md first.")
+            print(f"📖 Usage: When building a page, check {design_system_dir}/pages/[page].md first.")
             print(f"   If exists, its rules override MASTER.md. Otherwise, use MASTER.md.")
             print("=" * 60)
     # Stack search

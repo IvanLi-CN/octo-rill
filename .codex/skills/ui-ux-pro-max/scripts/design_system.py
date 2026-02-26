@@ -14,9 +14,11 @@ Usage:
 """
 
 import csv
+import hashlib
 import json
 import os
 import re
+import textwrap
 from datetime import datetime
 from pathlib import Path
 from core import search, DATA_DIR
@@ -37,12 +39,21 @@ _SLUG_INVALID_RE = re.compile(r"[^a-z0-9-]+")
 _SLUG_SEP_RE = re.compile(r"-{2,}")
 
 
+def _stable_slug_fallback(value: str, fallback: str) -> str:
+    """Create deterministic fallback slugs for non-ASCII names."""
+    seed = (value or "").strip()
+    if not seed:
+        return fallback
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:8]
+    return f"{fallback}-{digest}"
+
+
 def slugify_path_segment(value: str, fallback: str = "default") -> str:
     """Generate a safe single path segment."""
     normalized = (value or "").strip().lower().replace("_", "-").replace(" ", "-")
     slug = _SLUG_INVALID_RE.sub("-", normalized)
     slug = _SLUG_SEP_RE.sub("-", slug).strip("-")
-    return slug or fallback
+    return slug or _stable_slug_fallback(value, fallback)
 
 
 def _resolve_within(root: Path, candidate: Path) -> Path:
@@ -52,6 +63,23 @@ def _resolve_within(root: Path, candidate: Path) -> Path:
     if candidate_resolved == root_resolved or root_resolved in candidate_resolved.parents:
         return candidate_resolved
     raise ValueError(f"Refusing to write outside {root_resolved}")
+
+
+def _merge_effect_strings(style_effects: str, reasoning_effects: str) -> str:
+    """Merge effect strings while preserving order and removing duplicates."""
+    merged = []
+    seen = set()
+    for source in (style_effects, reasoning_effects):
+        if not source:
+            continue
+        parts = [part.strip() for part in source.split("+") if part.strip()]
+        for part in parts:
+            key = part.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(part)
+    return " + ".join(merged)
 
 
 # ============ DESIGN SYSTEM GENERATOR ============
@@ -213,7 +241,7 @@ class DesignSystemGenerator:
         # Combine effects from both reasoning and style search
         style_effects = best_style.get("Effects & Animation", "")
         reasoning_effects = reasoning.get("key_effects", "")
-        combined_effects = style_effects if style_effects else reasoning_effects
+        combined_effects = _merge_effect_strings(style_effects, reasoning_effects)
 
         return {
             "project_name": project_name or query.upper(),
@@ -270,23 +298,25 @@ def format_ascii_box(design_system: dict) -> str:
     effects = design_system.get("key_effects", "")
     anti_patterns = design_system.get("anti_patterns", "")
 
-    def wrap_text(text: str, prefix: str, width: int) -> list:
-        """Wrap long text into multiple lines."""
+    inner_width = BOX_WIDTH - 2
+
+    def render_line(content: str = "") -> str:
+        return "|" + content.ljust(inner_width) + "|"
+
+    def add_wrapped(lines: list, prefix: str, text: str) -> None:
         if not text:
-            return []
-        words = text.split()
-        lines = []
-        current_line = prefix
-        for word in words:
-            if len(current_line) + len(word) + 1 <= width - 2:
-                current_line += (" " if current_line != prefix else "") + word
-            else:
-                if current_line != prefix:
-                    lines.append(current_line)
-                current_line = prefix + word
-        if current_line != prefix:
-            lines.append(current_line)
-        return lines
+            return
+        wrap_width = max(10, inner_width - len(prefix))
+        chunks = textwrap.wrap(
+            str(text),
+            width=wrap_width,
+            break_long_words=True,
+            break_on_hyphens=False
+        )
+        continuation_prefix = " " * len(prefix)
+        for index, chunk in enumerate(chunks):
+            line_prefix = prefix if index == 0 else continuation_prefix
+            lines.append(render_line(f"{line_prefix}{chunk}"))
 
     # Build sections from pattern
     sections = pattern.get("sections", "").split(">")
@@ -294,79 +324,84 @@ def format_ascii_box(design_system: dict) -> str:
 
     # Build output lines
     lines = []
-    w = BOX_WIDTH - 1
-
-    lines.append("+" + "-" * w + "+")
-    lines.append(f"|  TARGET: {project} - RECOMMENDED DESIGN SYSTEM".ljust(BOX_WIDTH) + "|")
-    lines.append("+" + "-" * w + "+")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+    border = "+" + "-" * inner_width + "+"
+    lines.append(border)
+    lines.append(render_line(f"  TARGET: {project} - RECOMMENDED DESIGN SYSTEM"))
+    lines.append(border)
+    lines.append(render_line())
 
     # Pattern section
-    lines.append(f"|  PATTERN: {pattern.get('name', '')}".ljust(BOX_WIDTH) + "|")
+    pattern_name = pattern.get("name", "")
+    if pattern_name:
+        add_wrapped(lines, "  PATTERN: ", pattern_name)
+    else:
+        lines.append(render_line("  PATTERN:"))
     if pattern.get('conversion'):
-        lines.append(f"|     Conversion: {pattern.get('conversion', '')}".ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Conversion: ", pattern.get("conversion", ""))
     if pattern.get('cta_placement'):
-        lines.append(f"|     CTA: {pattern.get('cta_placement', '')}".ljust(BOX_WIDTH) + "|")
-    lines.append("|     Sections:".ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     CTA: ", pattern.get("cta_placement", ""))
+    lines.append(render_line("     Sections:"))
     for i, section in enumerate(sections, 1):
-        lines.append(f"|       {i}. {section}".ljust(BOX_WIDTH) + "|")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+        add_wrapped(lines, f"       {i}. ", section)
+    lines.append(render_line())
 
     # Style section
-    lines.append(f"|  STYLE: {style.get('name', '')}".ljust(BOX_WIDTH) + "|")
+    style_name = style.get("name", "")
+    if style_name:
+        add_wrapped(lines, "  STYLE: ", style_name)
+    else:
+        lines.append(render_line("  STYLE:"))
     if style.get("keywords"):
-        for line in wrap_text(f"Keywords: {style.get('keywords', '')}", "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Keywords: ", style.get("keywords", ""))
     if style.get("best_for"):
-        for line in wrap_text(f"Best For: {style.get('best_for', '')}", "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Best For: ", style.get("best_for", ""))
     if style.get("performance") or style.get("accessibility"):
         perf_a11y = f"Performance: {style.get('performance', '')} | Accessibility: {style.get('accessibility', '')}"
-        lines.append(f"|     {perf_a11y}".ljust(BOX_WIDTH) + "|")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+        add_wrapped(lines, "     ", perf_a11y)
+    lines.append(render_line())
 
     # Colors section
-    lines.append("|  COLORS:".ljust(BOX_WIDTH) + "|")
-    lines.append(f"|     Primary:    {colors.get('primary', '')}".ljust(BOX_WIDTH) + "|")
-    lines.append(f"|     Secondary:  {colors.get('secondary', '')}".ljust(BOX_WIDTH) + "|")
-    lines.append(f"|     CTA:        {colors.get('cta', '')}".ljust(BOX_WIDTH) + "|")
-    lines.append(f"|     Background: {colors.get('background', '')}".ljust(BOX_WIDTH) + "|")
-    lines.append(f"|     Text:       {colors.get('text', '')}".ljust(BOX_WIDTH) + "|")
+    lines.append(render_line("  COLORS:"))
+    add_wrapped(lines, "     Primary: ", colors.get("primary", ""))
+    add_wrapped(lines, "     Secondary: ", colors.get("secondary", ""))
+    add_wrapped(lines, "     CTA: ", colors.get("cta", ""))
+    add_wrapped(lines, "     Background: ", colors.get("background", ""))
+    add_wrapped(lines, "     Text: ", colors.get("text", ""))
     if colors.get("notes"):
-        for line in wrap_text(f"Notes: {colors.get('notes', '')}", "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+        add_wrapped(lines, "     Notes: ", colors.get("notes", ""))
+    lines.append(render_line())
 
     # Typography section
-    lines.append(f"|  TYPOGRAPHY: {typography.get('heading', '')} / {typography.get('body', '')}".ljust(BOX_WIDTH) + "|")
+    heading = typography.get("heading", "")
+    body = typography.get("body", "")
+    if heading or body:
+        add_wrapped(lines, "  TYPOGRAPHY: ", f"{heading} / {body}".strip(" /"))
+    else:
+        lines.append(render_line("  TYPOGRAPHY:"))
     if typography.get("mood"):
-        for line in wrap_text(f"Mood: {typography.get('mood', '')}", "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Mood: ", typography.get("mood", ""))
     if typography.get("best_for"):
-        for line in wrap_text(f"Best For: {typography.get('best_for', '')}", "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Best For: ", typography.get("best_for", ""))
     if typography.get("google_fonts_url"):
-        lines.append(f"|     Google Fonts: {typography.get('google_fonts_url', '')}".ljust(BOX_WIDTH) + "|")
+        add_wrapped(lines, "     Google Fonts: ", typography.get("google_fonts_url", ""))
     if typography.get("css_import"):
-        lines.append(f"|     CSS Import: {typography.get('css_import', '')[:70]}...".ljust(BOX_WIDTH) + "|")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+        add_wrapped(lines, "     CSS Import: ", typography.get("css_import", ""))
+    lines.append(render_line())
 
     # Key Effects section
     if effects:
-        lines.append("|  KEY EFFECTS:".ljust(BOX_WIDTH) + "|")
-        for line in wrap_text(effects, "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
-        lines.append("|" + " " * BOX_WIDTH + "|")
+        lines.append(render_line("  KEY EFFECTS:"))
+        add_wrapped(lines, "     ", effects)
+        lines.append(render_line())
 
     # Anti-patterns section
     if anti_patterns:
-        lines.append("|  AVOID (Anti-patterns):".ljust(BOX_WIDTH) + "|")
-        for line in wrap_text(anti_patterns, "|     ", BOX_WIDTH):
-            lines.append(line.ljust(BOX_WIDTH) + "|")
-        lines.append("|" + " " * BOX_WIDTH + "|")
+        lines.append(render_line("  AVOID (Anti-patterns):"))
+        add_wrapped(lines, "     ", anti_patterns)
+        lines.append(render_line())
 
     # Pre-Delivery Checklist section
-    lines.append("|  PRE-DELIVERY CHECKLIST:".ljust(BOX_WIDTH) + "|")
+    lines.append(render_line("  PRE-DELIVERY CHECKLIST:"))
     checklist_items = [
         "[ ] No emojis as icons (use SVG: Heroicons/Lucide)",
         "[ ] cursor-pointer on all clickable elements",
@@ -377,10 +412,10 @@ def format_ascii_box(design_system: dict) -> str:
         "[ ] Responsive: 375px, 768px, 1024px, 1440px"
     ]
     for item in checklist_items:
-        lines.append(f"|     {item}".ljust(BOX_WIDTH) + "|")
-    lines.append("|" + " " * BOX_WIDTH + "|")
+        add_wrapped(lines, "     ", item)
+    lines.append(render_line())
 
-    lines.append("+" + "-" * w + "+")
+    lines.append(border)
 
     return "\n".join(lines)
 
@@ -959,8 +994,8 @@ def _generate_intelligent_overrides(page_name: str, page_query: str, design_syst
     ux_results = ux_search.get("results", [])
     landing_results = landing_search.get("results", [])
     
-    # Detect page type from search results or context
-    page_type = _detect_page_type(combined_context, style_results)
+    # Detect page type with page name precedence, then use query/style as fallback.
+    page_type = _detect_page_type(page_lower, style_results, query_lower)
     
     # Build overrides from search results
     layout = {}
@@ -1042,9 +1077,18 @@ def _generate_intelligent_overrides(page_name: str, page_query: str, design_syst
     }
 
 
-def _detect_page_type(context: str, style_results: list) -> str:
-    """Detect page type from context and search results."""
-    context_lower = context.lower()
+def _match_keywords(context: str, keywords: list) -> bool:
+    """Return True when context contains a full keyword or key phrase."""
+    for keyword in keywords:
+        if re.search(rf"\b{re.escape(keyword)}\b", context):
+            return True
+    return False
+
+
+def _detect_page_type(page_context: str, style_results: list, query_context: str = "") -> str:
+    """Detect page type from page name first, then query context and style results."""
+    page_context_lower = page_context.lower()
+    query_context_lower = query_context.lower()
     
     # Check for common page type patterns
     page_patterns = [
@@ -1061,7 +1105,11 @@ def _detect_page_type(context: str, style_results: list) -> str:
     ]
     
     for keywords, page_type in page_patterns:
-        if any(kw in context_lower for kw in keywords):
+        if _match_keywords(page_context_lower, keywords):
+            return page_type
+
+    for keywords, page_type in page_patterns:
+        if _match_keywords(query_context_lower, keywords):
             return page_type
     
     # Fallback: try to infer from style results
