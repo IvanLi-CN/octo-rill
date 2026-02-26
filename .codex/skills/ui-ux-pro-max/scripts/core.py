@@ -13,6 +13,14 @@ from collections import defaultdict
 # ============ CONFIGURATION ============
 DATA_DIR = Path(__file__).parent.parent / "data"
 MAX_RESULTS = 3
+SHORT_TOKEN_ALLOWLIST = {"ui", "ux", "ai", "ar", "vr", "3d", "2d", "bi"}
+QUERY_EXPANSIONS = {
+    "ui": "interface layout component visual design",
+    "ux": "usability accessibility navigation interaction",
+    "ai": "automation assistant intelligence",
+    "3d": "spatial volumetric depth",
+    "2d": "chart graph flat"
+}
 
 CSV_CONFIG = {
     "style": {
@@ -107,9 +115,9 @@ class BM25:
         self.N = 0
 
     def tokenize(self, text):
-        """Lowercase, split, remove punctuation, filter short words"""
+        """Lowercase, split, remove punctuation, keep meaningful short tokens."""
         text = re.sub(r'[^\w\s]', ' ', str(text).lower())
-        return [w for w in text.split() if len(w) > 2]
+        return [w for w in text.split() if len(w) > 2 or w in SHORT_TOKEN_ALLOWLIST]
 
     def fit(self, documents):
         """Build BM25 index from documents"""
@@ -157,9 +165,22 @@ class BM25:
 
 # ============ SEARCH FUNCTIONS ============
 def _load_csv(filepath):
-    """Load CSV and return list of dicts"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return list(csv.DictReader(f))
+    """Load CSV, validating row shape to prevent silent column shifts."""
+    with open(filepath, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"Malformed CSV: {filepath} (missing header)")
+
+        expected_cols = len(reader.fieldnames)
+        rows = []
+        for row_number, row in enumerate(reader, start=2):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(
+                    f"Malformed CSV: {filepath} row {row_number} does not have {expected_cols} columns"
+                )
+            rows.append(row)
+
+        return rows
 
 
 def _search_csv(filepath, search_cols, output_cols, query, max_results):
@@ -185,6 +206,15 @@ def _search_csv(filepath, search_cols, output_cols, query, max_results):
             results.append({col: row.get(col, "") for col in output_cols if col in row})
 
     return results
+
+
+def _expand_query_aliases(query):
+    """Expand common acronyms so short tokens can retrieve relevant rows."""
+    tokens = re.findall(r"[a-z0-9]+", str(query).lower())
+    expansions = [QUERY_EXPANSIONS[token] for token in tokens if token in QUERY_EXPANSIONS]
+    if not expansions:
+        return query
+    return f"{query} {' '.join(expansions)}"
 
 
 def detect_domain(query):
@@ -220,7 +250,11 @@ def search(query, domain=None, max_results=MAX_RESULTS):
     if not filepath.exists():
         return {"error": f"File not found: {filepath}", "domain": domain}
 
-    results = _search_csv(filepath, config["search_cols"], config["output_cols"], query, max_results)
+    expanded_query = _expand_query_aliases(query)
+    try:
+        results = _search_csv(filepath, config["search_cols"], config["output_cols"], expanded_query, max_results)
+    except ValueError as exc:
+        return {"error": str(exc), "domain": domain}
 
     return {
         "domain": domain,
@@ -241,7 +275,10 @@ def search_stack(query, stack, max_results=MAX_RESULTS):
     if not filepath.exists():
         return {"error": f"Stack file not found: {filepath}", "stack": stack}
 
-    results = _search_csv(filepath, _STACK_COLS["search_cols"], _STACK_COLS["output_cols"], query, max_results)
+    try:
+        results = _search_csv(filepath, _STACK_COLS["search_cols"], _STACK_COLS["output_cols"], query, max_results)
+    except ValueError as exc:
+        return {"error": str(exc), "stack": stack}
 
     return {
         "domain": "stack",
