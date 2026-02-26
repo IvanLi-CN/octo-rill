@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 
-import { TaskTypeDetailPage } from "@/admin/TaskTypeDetailPage";
+import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import type { AdminRealtimeTaskDetailResponse } from "@/api";
 
 function buildDetail(
@@ -36,8 +36,8 @@ function buildDetail(
 }
 
 const meta = {
-	title: "Admin/TaskTypeDetailPage",
-	component: TaskTypeDetailPage,
+	title: "Admin/TaskTypeDetailSection",
+	component: TaskTypeDetailSection,
 	parameters: {
 		layout: "padded",
 	},
@@ -50,10 +50,10 @@ const meta = {
 	},
 	render: (args) => (
 		<div className="mx-auto max-w-4xl">
-			<TaskTypeDetailPage {...args} />
+			<TaskTypeDetailSection {...args} />
 		</div>
 	),
-} satisfies Meta<typeof TaskTypeDetailPage>;
+} satisfies Meta<typeof TaskTypeDetailSection>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
