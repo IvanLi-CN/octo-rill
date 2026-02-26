@@ -397,44 +397,36 @@ function buildTaskDetailPageModel(
 	}
 }
 
-export function TaskTypeDetailPage(props: {
+export function TaskTypeDetailSection(props: {
 	detail: AdminRealtimeTaskDetailResponse;
 }) {
 	const model = buildTaskDetailPageModel(props.detail);
 	const payload = parseJsonRecord(props.detail.task.payload_json);
 	const result = parseJsonRecord(props.detail.task.result_json);
+	const detailCardClass = "rounded-lg border p-3";
 
 	return (
-		<section className="space-y-3 rounded-lg border border-dashed p-3">
-			<div>
-				<h4 className="text-sm font-semibold">{model.pageTitle}</h4>
-				<p className="text-muted-foreground mt-1 text-xs">
-					{model.pageSummary}
-				</p>
-			</div>
+		<section className="space-y-3">
 			<div className="grid gap-2 md:grid-cols-2">
 				{model.fields.map((item) => (
-					<div
-						key={`${item.label}:${item.value}`}
-						className="rounded border p-2.5"
-					>
+					<div key={`${item.label}:${item.value}`} className={detailCardClass}>
 						<p className="text-muted-foreground text-[11px]">{item.label}</p>
 						<p className="mt-1 text-sm font-medium">{item.value}</p>
 					</div>
 				))}
 			</div>
-			<details>
-				<summary className="text-muted-foreground cursor-pointer text-xs">
+			<details className={detailCardClass}>
+				<summary className="text-muted-foreground cursor-pointer text-xs font-medium">
 					查看任务输入/输出原始 JSON
 				</summary>
 				<div className="mt-2 grid gap-2 md:grid-cols-2">
-					<div className="rounded border p-2.5">
+					<div className={detailCardClass}>
 						<p className="text-muted-foreground text-[11px]">payload</p>
 						<pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px]">
 							{payload ? JSON.stringify(payload, null, 2) : "(empty)"}
 						</pre>
 					</div>
-					<div className="rounded border p-2.5">
+					<div className={detailCardClass}>
 						<p className="text-muted-foreground text-[11px]">result</p>
 						<pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[11px]">
 							{result ? JSON.stringify(result, null, 2) : "(empty)"}

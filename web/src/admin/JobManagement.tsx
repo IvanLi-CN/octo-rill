@@ -1,7 +1,7 @@
 import { ChevronDown } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { TaskTypeDetailPage } from "@/admin/TaskTypeDetailPage";
+import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import {
 	type AdminJobsOverviewResponse,
 	type AdminJobsStreamEvent,
@@ -1208,7 +1208,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</div>
 						</div>
 
-						<TaskTypeDetailPage detail={detailTask} />
+						<div className="mt-4 border-t pt-4">
+							<TaskTypeDetailSection detail={detailTask} />
+						</div>
 
 						{detailTask.task.error_message ? (
 							<p className="text-destructive mt-3 text-sm">
@@ -1216,7 +1218,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</p>
 						) : null}
 
-						<div className="mt-4">
+						<div className="mt-4 border-t pt-4">
 							<p className="text-muted-foreground text-xs">执行时间线</p>
 						</div>
 						<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
