@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::{api, auth, jobs, state};
+use crate::{ai, api, auth, jobs, state};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -71,6 +71,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     jobs::spawn_task_worker(app_state.clone());
     jobs::spawn_hourly_scheduler(app_state.clone());
+    let model_catalog_abort_handle = config
+        .ai
+        .as_ref()
+        .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -127,10 +131,26 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
+        .route(
+            "/translate/releases/batch",
+            post(api::translate_releases_batch),
+        )
+        .route(
+            "/translate/releases/batch/stream",
+            post(api::translate_releases_batch_stream),
+        )
         .route("/translate/release", post(api::translate_release))
+        .route(
+            "/translate/release/detail/batch",
+            post(api::translate_release_detail_batch),
+        )
         .route(
             "/translate/release/detail",
             post(api::translate_release_detail),
+        )
+        .route(
+            "/translate/notifications/batch",
+            post(api::translate_notifications_batch),
         )
         .route("/translate/notification", post(api::translate_notification))
         .route("/sync/starred", post(api::sync_starred))
@@ -172,8 +192,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
+    let mut abort_handles = vec![deletion_abort_handle];
+    if let Some(handle) = model_catalog_abort_handle {
+        abort_handles.push(handle);
+    }
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(deletion_abort_handle))
+        .with_graceful_shutdown(shutdown_signal(abort_handles))
         .await
         .context("http server exited")?;
 
@@ -210,7 +235,13 @@ fn ensure_sqlite_dir(database_url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
+async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
+    let abort_all = || {
+        for handle in &abort_handles {
+            handle.abort();
+        }
+    };
+
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -229,8 +260,8 @@ async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => { deletion_task_abort_handle.abort(); },
-        _ = terminate => { deletion_task_abort_handle.abort(); },
+        _ = ctrl_c => abort_all(),
+        _ = terminate => abort_all(),
     }
 }
 
