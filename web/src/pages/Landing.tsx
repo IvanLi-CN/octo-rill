@@ -49,11 +49,6 @@ export function Landing({ bootError }: LandingProps) {
 						{bootError ? (
 							<p className="text-destructive text-sm">{bootError}</p>
 						) : null}
-
-						<p className="text-muted-foreground text-xs">
-							Tip: 在 dev 环境，Vite 会把 <code>/api</code> 和{" "}
-							<code>/auth</code> proxy 到 Rust 后端。
-						</p>
 					</CardContent>
 				</Card>
 			</div>
