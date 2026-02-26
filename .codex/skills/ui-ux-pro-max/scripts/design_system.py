@@ -16,6 +16,7 @@ Usage:
 import csv
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from core import search, DATA_DIR
@@ -31,6 +32,26 @@ SEARCH_CONFIG = {
     "landing": {"max_results": 2},
     "typography": {"max_results": 2}
 }
+
+_SLUG_INVALID_RE = re.compile(r"[^a-z0-9-]+")
+_SLUG_SEP_RE = re.compile(r"-{2,}")
+
+
+def slugify_path_segment(value: str, fallback: str = "default") -> str:
+    """Generate a safe single path segment."""
+    normalized = (value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    slug = _SLUG_INVALID_RE.sub("-", normalized)
+    slug = _SLUG_SEP_RE.sub("-", slug).strip("-")
+    return slug or fallback
+
+
+def _resolve_within(root: Path, candidate: Path) -> Path:
+    """Resolve a path and ensure it stays under root to prevent traversal."""
+    root_resolved = root.resolve(strict=False)
+    candidate_resolved = candidate.resolve(strict=False)
+    if candidate_resolved == root_resolved or root_resolved in candidate_resolved.parents:
+        return candidate_resolved
+    raise ValueError(f"Refusing to write outside {root_resolved}")
 
 
 # ============ DESIGN SYSTEM GENERATOR ============
@@ -501,14 +522,15 @@ def persist_design_system(design_system: dict, page: str = None, output_dir: str
     Returns:
         dict with created file paths and status
     """
-    base_dir = Path(output_dir) if output_dir else Path.cwd()
-    
+    base_dir = Path(output_dir).resolve(strict=False) if output_dir else Path.cwd().resolve(strict=False)
+    design_system_root = (base_dir / "design-system").resolve(strict=False)
+
     # Use project name for project-specific folder
     project_name = design_system.get("project_name", "default")
-    project_slug = project_name.lower().replace(' ', '-')
-    
-    design_system_dir = base_dir / "design-system" / project_slug
-    pages_dir = design_system_dir / "pages"
+    project_slug = slugify_path_segment(project_name, "default")
+
+    design_system_dir = _resolve_within(design_system_root, design_system_root / project_slug)
+    pages_dir = _resolve_within(design_system_dir, design_system_dir / "pages")
     
     created_files = []
     
@@ -526,7 +548,8 @@ def persist_design_system(design_system: dict, page: str = None, output_dir: str
     
     # If page is specified, create page override file with intelligent content
     if page:
-        page_file = pages_dir / f"{page.lower().replace(' ', '-')}.md"
+        page_slug = slugify_path_segment(page, "page")
+        page_file = _resolve_within(pages_dir, pages_dir / f"{page_slug}.md")
         page_content = format_page_override_md(design_system, page, page_query)
         with open(page_file, 'w', encoding='utf-8') as f:
             f.write(page_content)
@@ -542,6 +565,7 @@ def persist_design_system(design_system: dict, page: str = None, output_dir: str
 def format_master_md(design_system: dict) -> str:
     """Format design system as MASTER.md with hierarchical override logic."""
     project = design_system.get("project_name", "PROJECT")
+    project_slug = slugify_path_segment(project, "default")
     pattern = design_system.get("pattern", {})
     style = design_system.get("style", {})
     colors = design_system.get("colors", {})
@@ -556,7 +580,7 @@ def format_master_md(design_system: dict) -> str:
     # Logic header
     lines.append("# Design System Master File")
     lines.append("")
-    lines.append("> **LOGIC:** When building a specific page, first check `design-system/pages/[page-name].md`.")
+    lines.append(f"> **LOGIC:** When building a specific page, first check `design-system/{project_slug}/pages/[page-name].md`.")
     lines.append("> If that file exists, its rules **override** this Master file.")
     lines.append("> If not, strictly follow the rules below.")
     lines.append("")
@@ -805,6 +829,7 @@ def format_master_md(design_system: dict) -> str:
 def format_page_override_md(design_system: dict, page_name: str, page_query: str = None) -> str:
     """Format a page-specific override file with intelligent AI-generated content."""
     project = design_system.get("project_name", "PROJECT")
+    project_slug = slugify_path_segment(project, "default")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     page_title = page_name.replace("-", " ").replace("_", " ").title()
     
@@ -819,7 +844,7 @@ def format_page_override_md(design_system: dict, page_name: str, page_query: str
     lines.append(f"> **Generated:** {timestamp}")
     lines.append(f"> **Page Type:** {page_overrides.get('page_type', 'General')}")
     lines.append("")
-    lines.append("> ⚠️ **IMPORTANT:** Rules in this file **override** the Master file (`design-system/MASTER.md`).")
+    lines.append(f"> ⚠️ **IMPORTANT:** Rules in this file **override** the Master file (`design-system/{project_slug}/MASTER.md`).")
     lines.append("> Only deviations from the Master are documented here. For all other rules, refer to the Master.")
     lines.append("")
     lines.append("---")
