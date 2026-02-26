@@ -25,6 +25,7 @@ pub struct AppConfig {
     pub encryption_key: EncryptionKey,
     pub github: GitHubOAuthConfig,
     pub ai: Option<AiConfig>,
+    pub ai_model_context_limit: Option<u32>,
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
 }
 
@@ -71,6 +72,7 @@ impl fmt::Debug for AppConfig {
             .field("static_dir", &self.static_dir)
             .field("github", &self.github)
             .field("ai", &self.ai)
+            .field("ai_model_context_limit", &self.ai_model_context_limit)
             .field("ai_daily_at_local", &self.ai_daily_at_local)
             .field("encryption_key", &"<redacted>")
             .finish()
@@ -131,6 +133,21 @@ impl AppConfig {
         }
         .transpose()?;
 
+        let ai_model_context_limit = env::var("AI_MODEL_CONTEXT_LIMIT")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+            .map(|raw| {
+                let parsed = raw
+                    .parse::<u32>()
+                    .context("invalid AI_MODEL_CONTEXT_LIMIT (expected positive integer)")?;
+                if parsed == 0 {
+                    anyhow::bail!("invalid AI_MODEL_CONTEXT_LIMIT (expected positive integer)");
+                }
+                Ok::<_, anyhow::Error>(parsed)
+            })
+            .transpose()?;
+
         let ai_daily_at_local = env::var("AI_DAILY_AT_LOCAL")
             .ok()
             .map(|v| v.trim().to_owned())
@@ -163,6 +180,7 @@ impl AppConfig {
                 redirect_url: github_redirect_url,
             },
             ai,
+            ai_model_context_limit,
             ai_daily_at_local,
         })
     }
