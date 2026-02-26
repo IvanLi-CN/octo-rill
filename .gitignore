@@ -39,6 +39,10 @@ web/*.tsbuildinfo
 .idea/
 
 # Codex / Serena
-.codex/
+.codex/*
+!.codex/skills/
+!.codex/skills/**
+.codex/skills/**/__pycache__/
+.codex/skills/**/*.pyc
 .serena/
 .serena
