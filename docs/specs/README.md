@@ -63,7 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
-| 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review loop clean |
+| 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
 | g4456 | LLM 批处理效率改造 | 部分完成（3/4） | `g4456-llm-batch-efficiency/SPEC.md` | 2026-02-25 | 已完成核心改造，待补前端依赖后复验 |
 | gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-02-25 | local implementation completed |
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
