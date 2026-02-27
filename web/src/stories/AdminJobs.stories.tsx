@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type {
 	AdminLlmCallDetailResponse,
@@ -257,8 +257,27 @@ function paginate<T>(
 	return { page, pageSize, pageItems, total: items.length };
 }
 
-function AdminJobsPreview() {
+type AdminJobsPreviewProps = {
+	autoOpenConversation?: boolean;
+};
+
+function setInputValue(element: HTMLInputElement, value: string) {
+	const setter = Object.getOwnPropertyDescriptor(
+		window.HTMLInputElement.prototype,
+		"value",
+	)?.set;
+	if (setter) {
+		setter.call(element, value);
+	} else {
+		element.value = value;
+	}
+	element.dispatchEvent(new Event("input", { bubbles: true }));
+	element.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function AdminJobsPreview({ autoOpenConversation = false }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
+	const autoOpenedRef = useRef(false);
 
 	useEffect(() => {
 		const originalFetch = window.fetch.bind(window);
@@ -601,6 +620,38 @@ function AdminJobsPreview() {
 		};
 	}, []);
 
+	useEffect(() => {
+		if (!ready || !autoOpenConversation || autoOpenedRef.current) {
+			return;
+		}
+		autoOpenedRef.current = true;
+		const openTimer = window.setTimeout(() => {
+			const llmTab = Array.from(document.querySelectorAll("button")).find(
+				(node) => node.textContent?.trim() === "LLM调度",
+			) as HTMLButtonElement | undefined;
+			llmTab?.click();
+			window.setTimeout(() => {
+				const sourceInput = document.querySelector(
+					'input[placeholder="来源（source）"]',
+				) as HTMLInputElement | null;
+				if (sourceInput) {
+					setInputValue(sourceInput, "job.api.translate_release");
+				}
+				window.setTimeout(() => {
+					const detailButton = Array.from(
+						document.querySelectorAll("button"),
+					).find((node) => node.textContent?.trim() === "详情") as
+						| HTMLButtonElement
+						| undefined;
+					detailButton?.click();
+				}, 80);
+			}, 80);
+		}, 80);
+		return () => {
+			window.clearTimeout(openTimer);
+		};
+	}, [ready, autoOpenConversation]);
+
 	if (!ready) return null;
 
 	return (
@@ -632,3 +683,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const LlmConversationDetail: Story = {
+	render: () => <AdminJobsPreview autoOpenConversation />,
+};
