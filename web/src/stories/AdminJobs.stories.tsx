@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type {
+	AdminLlmCallDetailResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
 } from "@/api";
@@ -69,6 +70,130 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 	},
 ];
 
+const llmCallsSeed: AdminLlmCallDetailResponse[] = [
+	{
+		id: "llm-call-1",
+		status: "failed",
+		source: "job.api.translate_release",
+		model: "gpt-4o-mini",
+		requested_by: 1,
+		parent_task_id: "task-sync-releases",
+		parent_task_type: "sync.releases",
+		max_tokens: 900,
+		attempt_count: 3,
+		scheduler_wait_ms: 1500,
+		first_token_wait_ms: 980,
+		duration_ms: 2600,
+		input_tokens: 1320,
+		output_tokens: 0,
+		cached_input_tokens: 640,
+		total_tokens: 1320,
+		input_messages_json: JSON.stringify([
+			{
+				role: "system",
+				content:
+					"You are an assistant that translates GitHub release notes into concise Chinese.",
+			},
+			{
+				role: "user",
+				content: [
+					"Repo: octo-rill",
+					"Release: v0.1.0",
+					"Notes:",
+					"- feat(admin): add LLM scheduler observability",
+					"- fix(api): normalize RFC3339 timestamps",
+					"- docs: update admin guide",
+				].join("\n"),
+			},
+			{
+				role: "assistant",
+				content: "收到。我会先给出 4 条摘要，再附 1 条排障提示。",
+			},
+			{
+				role: "user",
+				content: "请保留术语 scheduler / retry，并用中文输出。",
+			},
+		]),
+		output_messages_json: null,
+		prompt_text: `system:
+You are an assistant that translates GitHub release notes into concise Chinese.
+Preserve markdown structure and links.
+
+user:
+Repo: octo-rill
+Release: v0.1.0
+Notes:
+- feat(admin): add LLM scheduler observability
+- fix(api): normalize RFC3339 timestamps
+- docs: update admin guide`,
+		response_text: null,
+		error_text:
+			"OpenAI API timeout after 30000ms; retry budget exhausted (attempt=3).",
+		created_at: "2026-02-27T06:10:00Z",
+		started_at: "2026-02-27T06:10:01Z",
+		finished_at: "2026-02-27T06:10:04Z",
+		updated_at: "2026-02-27T06:10:04Z",
+	},
+	{
+		id: "llm-call-2",
+		status: "running",
+		source: "api.translate_releases_batch",
+		model: "gpt-4o-mini",
+		requested_by: 1,
+		parent_task_id: null,
+		parent_task_type: null,
+		max_tokens: 900,
+		attempt_count: 1,
+		scheduler_wait_ms: 120,
+		first_token_wait_ms: null,
+		duration_ms: null,
+		input_tokens: 880,
+		output_tokens: null,
+		cached_input_tokens: 420,
+		total_tokens: null,
+		input_messages_json: JSON.stringify([
+			{
+				role: "system",
+				content:
+					"You are an assistant that produces a Chinese summary for release changes.",
+			},
+			{
+				role: "user",
+				content: [
+					"Summarize the following bullet points:",
+					"1) added admin LLM scheduler status endpoint",
+					"2) added per-call prompt/response/error observability",
+					"3) added filters: status/source/requested_by/started_from/started_to",
+				].join("\n"),
+			},
+			{
+				role: "assistant",
+				content: "收到，我会整理为简明中文摘要并保留重点结构。",
+			},
+			{
+				role: "user",
+				content: "请控制在 3-4 条要点内，并突出排障价值。",
+			},
+		]),
+		output_messages_json: null,
+		prompt_text: `system:
+You are an assistant that produces a Chinese summary for release changes.
+Return markdown only.
+
+user:
+Summarize the following bullet points:
+1) added admin LLM scheduler status endpoint
+2) added per-call prompt/response/error observability
+3) added filters: status/source/requested_by/started_from/started_to`,
+		response_text: null,
+		error_text: null,
+		created_at: "2026-02-27T06:12:00Z",
+		started_at: "2026-02-27T06:12:00Z",
+		finished_at: null,
+		updated_at: "2026-02-27T06:12:00Z",
+	},
+];
+
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
@@ -132,14 +257,36 @@ function paginate<T>(
 	return { page, pageSize, pageItems, total: items.length };
 }
 
-function AdminJobsPreview() {
+type AdminJobsPreviewProps = {
+	autoOpenConversation?: boolean;
+};
+
+function setInputValue(element: HTMLInputElement, value: string) {
+	const setter = Object.getOwnPropertyDescriptor(
+		window.HTMLInputElement.prototype,
+		"value",
+	)?.set;
+	if (setter) {
+		setter.call(element, value);
+	} else {
+		element.value = value;
+	}
+	element.dispatchEvent(new Event("input", { bubbles: true }));
+	element.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function AdminJobsPreview({
+	autoOpenConversation = false,
+}: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
+	const autoOpenedRef = useRef(false);
 
 	useEffect(() => {
 		const originalFetch = window.fetch.bind(window);
 		const originalEventSource = window.EventSource;
 		const realtimeTasks = realtimeTasksSeed.map((item) => ({ ...item }));
 		const scheduledRuns = scheduledRunsSeed.map((item) => ({ ...item }));
+		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
 
 		window.fetch = async (input, init) => {
 			const req =
@@ -273,6 +420,101 @@ function AdminJobsPreview() {
 				);
 			}
 
+			if (
+				url.pathname === "/api/admin/jobs/llm/status" &&
+				req.method === "GET"
+			) {
+				return new Response(
+					JSON.stringify({
+						scheduler_enabled: true,
+						request_interval_ms: 1000,
+						waiting_calls: 1,
+						in_flight_calls: 1,
+						next_slot_in_ms: 450,
+						calls_24h: llmCalls.length,
+						failed_24h: llmCalls.filter((item) => item.status === "failed")
+							.length,
+						avg_wait_ms_24h: 810,
+						avg_duration_ms_24h: 1570,
+						last_success_at: llmCalls.at(-1)?.finished_at ?? null,
+						last_failure_at: llmCalls[0]?.finished_at ?? null,
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/llm/calls" &&
+				req.method === "GET"
+			) {
+				const status = url.searchParams.get("status");
+				const source = url.searchParams.get("source");
+				const requestedBy = url.searchParams.get("requested_by");
+				let rows = [...llmCalls];
+				if (status && status !== "all") {
+					rows = rows.filter((item) => item.status === status);
+				}
+				if (source) {
+					rows = rows.filter((item) => item.source === source);
+				}
+				if (requestedBy) {
+					rows = rows.filter(
+						(item) => String(item.requested_by ?? "") === String(requestedBy),
+					);
+				}
+				const page = url.searchParams.get("page");
+				const pageSize = url.searchParams.get("page_size");
+				const { pageItems, total } = paginate(rows, page, pageSize);
+				return new Response(
+					JSON.stringify({
+						items: pageItems.map(
+							({
+								prompt_text: _p,
+								response_text: _r,
+								error_text: _e,
+								input_messages_json: _im,
+								output_messages_json: _om,
+								...rest
+							}) => rest,
+						),
+						page: Number(page ?? "1") || 1,
+						page_size: Number(pageSize ?? "20") || 20,
+						total,
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/jobs/llm/calls/") &&
+				req.method === "GET"
+			) {
+				const callId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+				const item = llmCalls.find((call) => call.id === callId);
+				if (!item) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: { code: "not_found", message: "llm call not found" },
+						}),
+						{
+							status: 404,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				return new Response(JSON.stringify(item), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
 			return originalFetch(input, init);
 		};
 
@@ -286,21 +528,88 @@ function AdminJobsPreview() {
 			readonly OPEN = 1;
 			readonly CLOSED = 2;
 			readyState = 1;
+			private readonly listeners = new Map<
+				string,
+				Set<(event: Event) => unknown>
+			>();
+			private readonly timers: number[] = [];
 
 			constructor(_url: string, _init?: EventSourceInit) {
-				window.setTimeout(() => {
+				const openTimer = window.setTimeout(() => {
 					this.onopen?.call(this as unknown as EventSource, new Event("open"));
 				}, 10);
+				this.timers.push(openTimer);
+				const llmUpdateTimer = window.setTimeout(() => {
+					const target = llmCalls.find((item) => item.id === "llm-call-2");
+					if (!target) return;
+					target.status = "succeeded";
+					target.first_token_wait_ms = 160;
+					target.duration_ms = 540;
+					target.output_tokens = 198;
+					target.total_tokens = 1078;
+					target.output_messages_json = JSON.stringify([
+						{
+							role: "assistant",
+							content: [
+								"### 本次更新摘要",
+								"",
+								"- 新增管理员可见的 LLM 调度状态接口，便于观察等待与并发情况。",
+								"- 新增逐次调用日志，记录 prompt、response、error、等待耗时与重试次数。",
+								"- 新增筛选能力（状态 / 来源 / 用户 / 起止时间），便于快速定位异常调用。",
+							].join("\n"),
+						},
+					]);
+					target.response_text = `### 本次更新摘要
+
+- 新增管理员可见的 LLM 调度状态接口，便于观察等待与并发情况。
+- 新增逐次调用日志，记录 prompt、response、error、等待耗时与重试次数。
+- 新增筛选能力（状态 / 来源 / 用户 / 起止时间），便于快速定位异常调用。`;
+					target.finished_at = "2026-02-27T06:12:01Z";
+					target.updated_at = "2026-02-27T06:12:01Z";
+					this.emit("llm.call", {
+						event_id: 2001,
+						call_id: "llm-call-2",
+						status: target.status,
+						source: target.source,
+						requested_by: target.requested_by,
+						parent_task_id: target.parent_task_id,
+						event_type: "llm.succeeded",
+						created_at: target.updated_at,
+					});
+				}, 1600);
+				this.timers.push(llmUpdateTimer);
 			}
 
 			close() {
 				this.readyState = 2;
+				for (const timer of this.timers) {
+					window.clearTimeout(timer);
+				}
+				this.timers.length = 0;
 			}
 
-			addEventListener() {}
-			removeEventListener() {}
+			addEventListener(type: string, listener: (event: Event) => unknown) {
+				if (!this.listeners.has(type)) {
+					this.listeners.set(type, new Set());
+				}
+				this.listeners.get(type)?.add(listener);
+			}
+			removeEventListener(type: string, listener: (event: Event) => unknown) {
+				this.listeners.get(type)?.delete(listener);
+			}
 			dispatchEvent() {
 				return true;
+			}
+
+			private emit(type: string, payload: unknown) {
+				if (this.readyState === this.CLOSED) return;
+				const event = new MessageEvent(type, {
+					data: JSON.stringify(payload),
+				});
+				for (const listener of this.listeners.get(type) ?? []) {
+					listener.call(this as unknown as EventSource, event);
+				}
+				this.onmessage?.call(this as unknown as EventSource, event);
 			}
 		}
 
@@ -312,6 +621,38 @@ function AdminJobsPreview() {
 			window.EventSource = originalEventSource;
 		};
 	}, []);
+
+	useEffect(() => {
+		if (!ready || !autoOpenConversation || autoOpenedRef.current) {
+			return;
+		}
+		autoOpenedRef.current = true;
+		const openTimer = window.setTimeout(() => {
+			const llmTab = Array.from(document.querySelectorAll("button")).find(
+				(node) => node.textContent?.trim() === "LLM调度",
+			) as HTMLButtonElement | undefined;
+			llmTab?.click();
+			window.setTimeout(() => {
+				const sourceInput = document.querySelector(
+					'input[placeholder="来源（source）"]',
+				) as HTMLInputElement | null;
+				if (sourceInput) {
+					setInputValue(sourceInput, "job.api.translate_release");
+				}
+				window.setTimeout(() => {
+					const detailButton = Array.from(
+						document.querySelectorAll("button"),
+					).find((node) => node.textContent?.trim() === "详情") as
+						| HTMLButtonElement
+						| undefined;
+					detailButton?.click();
+				}, 80);
+			}, 80);
+		}, 80);
+		return () => {
+			window.clearTimeout(openTimer);
+		};
+	}, [ready, autoOpenConversation]);
 
 	if (!ready) return null;
 
@@ -344,3 +685,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const LlmConversationDetail: Story = {
+	render: () => <AdminJobsPreview autoOpenConversation />,
+};

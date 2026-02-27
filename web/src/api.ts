@@ -156,6 +156,17 @@ export type AdminJobsStreamEvent = {
 	created_at: string;
 };
 
+export type AdminLlmCallStreamEvent = {
+	event_id: number;
+	call_id: string;
+	status: string;
+	source: string;
+	requested_by: number | null;
+	parent_task_id: string | null;
+	event_type: string;
+	created_at: string;
+};
+
 export type AdminScheduledSlotItem = {
 	hour_utc: number;
 	enabled: boolean;
@@ -165,6 +176,58 @@ export type AdminScheduledSlotItem = {
 
 export type AdminScheduledSlotsResponse = {
 	items: AdminScheduledSlotItem[];
+};
+
+export type AdminLlmSchedulerStatusResponse = {
+	scheduler_enabled: boolean;
+	request_interval_ms: number;
+	waiting_calls: number;
+	in_flight_calls: number;
+	next_slot_in_ms: number;
+	calls_24h: number;
+	failed_24h: number;
+	avg_wait_ms_24h: number | null;
+	avg_duration_ms_24h: number | null;
+	last_success_at: string | null;
+	last_failure_at: string | null;
+};
+
+export type AdminLlmCallItem = {
+	id: string;
+	status: string;
+	source: string;
+	model: string;
+	requested_by: number | null;
+	parent_task_id: string | null;
+	parent_task_type: string | null;
+	max_tokens: number;
+	attempt_count: number;
+	scheduler_wait_ms: number;
+	first_token_wait_ms: number | null;
+	duration_ms: number | null;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_input_tokens: number | null;
+	total_tokens: number | null;
+	created_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	updated_at: string;
+};
+
+export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
+	input_messages_json: string | null;
+	output_messages_json: string | null;
+	prompt_text: string;
+	response_text: string | null;
+	error_text: string | null;
+};
+
+export type AdminLlmCallsResponse = {
+	items: AdminLlmCallItem[];
+	page: number;
+	page_size: number;
+	total: number;
 };
 
 export async function apiGetAdminUserProfile(
@@ -224,6 +287,26 @@ export async function apiPatchAdminScheduledSlot(
 	return apiPatchJson<AdminScheduledSlotItem>(
 		`/api/admin/jobs/scheduled/${hourUtc}`,
 		{ enabled },
+	);
+}
+
+export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {
+	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status");
+}
+
+export async function apiGetAdminLlmCalls(
+	params: URLSearchParams,
+): Promise<AdminLlmCallsResponse> {
+	return apiGet<AdminLlmCallsResponse>(
+		`/api/admin/jobs/llm/calls?${params.toString()}`,
+	);
+}
+
+export async function apiGetAdminLlmCallDetail(
+	callId: string,
+): Promise<AdminLlmCallDetailResponse> {
+	return apiGet<AdminLlmCallDetailResponse>(
+		`/api/admin/jobs/llm/calls/${encodeURIComponent(callId)}`,
 	);
 }
 
