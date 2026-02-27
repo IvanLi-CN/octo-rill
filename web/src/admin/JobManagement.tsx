@@ -155,6 +155,51 @@ function llmRoleLabel(role: string) {
 	}
 }
 
+type LlmRoleTone = {
+	containerClass: string;
+	badgeClass: string;
+};
+
+function llmRoleTone(role: string, isAssistantOutput: boolean): LlmRoleTone {
+	if (isAssistantOutput) {
+		return {
+			containerClass:
+				"border-primary/35 bg-primary/5 dark:border-primary/40 dark:bg-primary/10",
+			badgeClass:
+				"border-primary/35 bg-primary/10 text-primary dark:border-primary/40 dark:bg-primary/20 dark:text-primary-foreground",
+		};
+	}
+	switch (role) {
+		case "system":
+			return {
+				containerClass:
+					"border-zinc-300/80 bg-zinc-50/80 dark:border-zinc-600/60 dark:bg-zinc-900/40",
+				badgeClass:
+					"border-zinc-300/90 bg-zinc-100 text-zinc-700 dark:border-zinc-500/70 dark:bg-zinc-800/70 dark:text-zinc-100",
+			};
+		case "user":
+		case "input":
+			return {
+				containerClass:
+					"border-sky-300/70 bg-sky-50/70 dark:border-sky-500/50 dark:bg-sky-500/10",
+				badgeClass:
+					"border-sky-300/80 bg-sky-100 text-sky-800 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100",
+			};
+		case "tool":
+			return {
+				containerClass:
+					"border-amber-300/70 bg-amber-50/80 dark:border-amber-500/50 dark:bg-amber-500/10",
+				badgeClass:
+					"border-amber-300/90 bg-amber-100 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100",
+			};
+		default:
+			return {
+				containerClass: "border-border/80 bg-card/80",
+				badgeClass: "border-border bg-muted text-foreground",
+			};
+	}
+}
+
 function normalizeErrorMessage(err: unknown) {
 	if (err instanceof ApiError) {
 		switch (err.code) {
@@ -566,7 +611,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	}, [llmDetail]);
 	const llmConversationTimeline = useMemo<LlmConversationTimelineItem[]>(() => {
 		const timeline: LlmConversationTimelineItem[] = [];
-		const turnCount = Math.max(llmInputMessages.length, llmOutputMessages.length);
+		const turnCount = Math.max(
+			llmInputMessages.length,
+			llmOutputMessages.length,
+		);
 		for (let index = 0; index < turnCount; index += 1) {
 			const turn = index + 1;
 			const inputMessage = llmInputMessages[index];
@@ -590,8 +638,26 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		}
 		return timeline;
 	}, [llmInputMessages, llmOutputMessages]);
+	const llmConversationTurnCount = useMemo(
+		() =>
+			llmConversationTimeline.reduce(
+				(maxTurn, item) => Math.max(maxTurn, item.turn),
+				0,
+			),
+		[llmConversationTimeline],
+	);
+	const llmAssistantMessageCount = useMemo(
+		() =>
+			llmConversationTimeline.filter((item) => item.role === "assistant")
+				.length,
+		[llmConversationTimeline],
+	);
 	const lastAssistantTimelineIndex = useMemo(() => {
-		for (let index = llmConversationTimeline.length - 1; index >= 0; index -= 1) {
+		for (
+			let index = llmConversationTimeline.length - 1;
+			index >= 0;
+			index -= 1
+		) {
 			if (llmConversationTimeline[index]?.role === "assistant") {
 				return index;
 			}
@@ -1642,8 +1708,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													{formatDurationMs(call.duration_ms)}
 												</p>
 												<p className="text-muted-foreground mt-1 text-xs">
-													Token 输入/输出/缓存：{formatCount(call.input_tokens)} /{" "}
-													{formatCount(call.output_tokens)} /{" "}
+													Token 输入/输出/缓存：{formatCount(call.input_tokens)}{" "}
+													/ {formatCount(call.output_tokens)} /{" "}
 													{formatCount(call.cached_input_tokens)}
 												</p>
 												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
@@ -1706,7 +1772,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						aria-label="关闭任务详情"
 						onClick={() => setDetailTask(null)}
 					/>
-					<div className="bg-card relative h-full w-full max-w-3xl border-l p-5 shadow-2xl">
+					<div className="bg-card relative h-full w-full max-w-4xl border-l p-5 shadow-2xl">
 						<div className="flex items-start justify-between gap-3">
 							<div className="min-w-0">
 								<h3 className="text-lg font-semibold tracking-tight">
@@ -1912,69 +1978,99 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									Conversation Timeline
 								</p>
 								{llmConversationTimeline.length === 0 ? (
-										<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-											-
-										</pre>
-									) : (
-										<div className="bg-muted/20 mt-1 max-h-[30vh] space-y-2 overflow-auto rounded-lg border p-2 pr-1">
-											<p className="text-muted-foreground text-[11px]">
-												共 {formatCount(llmConversationTimeline.length)} 条消息
-											</p>
+									<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+										-
+									</pre>
+								) : (
+									<div className="bg-muted/20 mt-1 rounded-xl border">
+										<div className="border-b px-3 py-2">
+											<div className="flex flex-wrap items-center justify-between gap-2">
+												<p className="text-muted-foreground text-[11px] font-medium">
+													多轮消息
+												</p>
+												<div className="flex flex-wrap items-center gap-1 text-[10px]">
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														消息 {formatCount(llmConversationTimeline.length)}
+													</span>
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														轮次 {formatCount(llmConversationTurnCount)}
+													</span>
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														助手 {formatCount(llmAssistantMessageCount)}
+													</span>
+												</div>
+											</div>
+										</div>
+										<div className="max-h-[31vh] space-y-2.5 overflow-auto px-3 py-3 pr-2">
 											{llmConversationTimeline.map((message, index) => {
 												const isAssistantOutput =
 													message.source === "output" &&
 													message.role === "assistant";
-												const alignRight = isAssistantOutput;
 												const showAnswerLatency =
 													index === lastAssistantTimelineIndex;
+												const tone = llmRoleTone(
+													message.role,
+													isAssistantOutput,
+												);
 												return (
-												<div
-													key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
-													className={`flex ${
-														alignRight ? "justify-end" : "justify-start"
-													}`}
-												>
 													<div
-														className={`w-full max-w-[92%] rounded-lg border p-2 shadow-sm ${
+														key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+														className={`flex ${
 															isAssistantOutput
-																? "border-primary/30 bg-primary/5"
-																: "border-border/80 bg-card/70"
+																? "justify-end pl-5"
+																: "justify-start pr-5"
 														}`}
 													>
-														<div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
-															<p className="text-muted-foreground text-[11px] font-semibold">
-																第 {formatCount(message.turn)} 轮 ·{" "}
-																{llmRoleLabel(message.role)}
-															</p>
-															{showAnswerLatency ? (
-																<p className="text-muted-foreground text-[10px]">
-																	等待{" "}
-																	{formatDurationMs(llmDetail.scheduler_wait_ms)} ·
-																	首字{" "}
-																	{formatDurationMs(llmDetail.first_token_wait_ms)}
-																</p>
-															) : null}
-														</div>
-														<pre className="mt-1 text-[11px] whitespace-pre-wrap break-all">
-															{message.content}
-														</pre>
+														<article
+															className={`w-full max-w-[95%] rounded-2xl border px-3.5 py-2.5 shadow-sm ${tone.containerClass}`}
+														>
+															<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+																<span
+																	className={`inline-flex items-center rounded-md border px-1.5 py-0.5 font-semibold ${tone.badgeClass}`}
+																>
+																	{llmRoleLabel(message.role)}
+																</span>
+																<span className="text-muted-foreground">
+																	第 {formatCount(message.turn)} 轮
+																</span>
+																{showAnswerLatency ? (
+																	<span className="text-muted-foreground ml-auto text-[10px] font-medium">
+																		等待{" "}
+																		{formatDurationMs(
+																			llmDetail.scheduler_wait_ms,
+																		)}{" "}
+																		· 首字{" "}
+																		{formatDurationMs(
+																			llmDetail.first_token_wait_ms,
+																		)}
+																	</span>
+																) : null}
+															</div>
+															<div className="mt-1.5 text-[13px] leading-5 whitespace-pre-wrap break-words">
+																{message.content}
+															</div>
+														</article>
 													</div>
-												</div>
-											);
-										})}
+												);
+											})}
+										</div>
 									</div>
 								)}
 							</div>
 							{llmConversationTimeline.length === 0 ? (
 								<>
 									<div>
-										<p className="text-muted-foreground text-xs">Input Messages</p>
+										<p className="text-muted-foreground text-xs">
+											Input Messages
+										</p>
 										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
 											{llmDetail.prompt_text || "-"}
 										</pre>
 									</div>
 									<div>
-										<p className="text-muted-foreground text-xs">Output Messages</p>
+										<p className="text-muted-foreground text-xs">
+											Output Messages
+										</p>
 										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
 											{llmDetail.response_text ?? "-"}
 										</pre>
