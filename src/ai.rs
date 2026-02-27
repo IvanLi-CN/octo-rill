@@ -887,12 +887,7 @@ async fn update_llm_call_running(
 async fn finalize_llm_call(
     state: &AppState,
     call_id: &str,
-    status: &str,
-    attempt_count: i64,
-    scheduler_wait_ms: i64,
-    duration_ms: Option<i64>,
-    response_text: Option<&str>,
-    error_text: Option<&str>,
+    update: FinalizeLlmCallUpdate<'_>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -909,12 +904,12 @@ async fn finalize_llm_call(
         WHERE id = ?
         "#,
     )
-    .bind(status)
-    .bind(attempt_count)
-    .bind(scheduler_wait_ms)
-    .bind(duration_ms)
-    .bind(response_text)
-    .bind(error_text)
+    .bind(update.status)
+    .bind(update.attempt_count)
+    .bind(update.scheduler_wait_ms)
+    .bind(update.duration_ms)
+    .bind(update.response_text)
+    .bind(update.error_text)
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(call_id)
@@ -922,6 +917,16 @@ async fn finalize_llm_call(
     .await
     .context("finalize llm_call failed")?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct FinalizeLlmCallUpdate<'a> {
+    status: &'a str,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    duration_ms: Option<i64>,
+    response_text: Option<&'a str>,
+    error_text: Option<&'a str>,
 }
 
 async fn chat_completion_once(
@@ -1060,12 +1065,14 @@ pub async fn chat_completion(
                 if let Err(err) = finalize_llm_call(
                     state,
                     log_record.id.as_str(),
-                    "succeeded",
-                    i64::try_from(attempt).unwrap_or(i64::MAX),
-                    total_wait_ms,
-                    duration_ms,
-                    Some(content.as_str()),
-                    None,
+                    FinalizeLlmCallUpdate {
+                        status: "succeeded",
+                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                        scheduler_wait_ms: total_wait_ms,
+                        duration_ms,
+                        response_text: Some(content.as_str()),
+                        error_text: None,
+                    },
                 )
                 .await
                 {
@@ -1084,12 +1091,14 @@ pub async fn chat_completion(
                     if let Err(log_err) = finalize_llm_call(
                         state,
                         log_record.id.as_str(),
-                        "failed",
-                        i64::try_from(attempt).unwrap_or(i64::MAX),
-                        total_wait_ms,
-                        duration_ms,
-                        None,
-                        Some(error_message.as_str()),
+                        FinalizeLlmCallUpdate {
+                            status: "failed",
+                            attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                            scheduler_wait_ms: total_wait_ms,
+                            duration_ms,
+                            response_text: None,
+                            error_text: Some(error_message.as_str()),
+                        },
                     )
                     .await
                     {
