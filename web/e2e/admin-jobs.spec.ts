@@ -204,7 +204,7 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.goto("/admin/jobs");
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
-	await expect(page.getByRole("heading", { name: "任务中心" })).toBeVisible();
+	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "任务总览" })).toBeVisible();
 
 	await expect(page.getByText("sync.releases")).toBeVisible();
