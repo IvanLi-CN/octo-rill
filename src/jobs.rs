@@ -521,6 +521,10 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
         .await
         .unwrap_or(0);
 
+        // Emit one lightweight frame immediately so proxies/browsers can
+        // complete SSE handshake and update client connection state promptly.
+        yield Ok::<Event, Infallible>(Event::default().comment("stream-ready"));
+
         loop {
             let rows = sqlx::query_as::<_, EventRow>(
                 r#"
