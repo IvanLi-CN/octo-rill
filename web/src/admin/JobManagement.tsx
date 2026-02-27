@@ -1912,21 +1912,22 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									Conversation Timeline
 								</p>
 								{llmConversationTimeline.length === 0 ? (
-									<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-										-
-									</pre>
-								) : (
-									<div className="mt-1 max-h-[30vh] space-y-2 overflow-auto pr-1">
-										<p className="text-muted-foreground text-[11px]">
-											共 {formatCount(llmConversationTimeline.length)} 条消息
-										</p>
-										{llmConversationTimeline.map((message, index) => {
-											const alignRight =
-												message.source === "output" &&
-												message.role === "assistant";
-											const showAnswerLatency =
-												index === lastAssistantTimelineIndex;
-											return (
+										<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+											-
+										</pre>
+									) : (
+										<div className="bg-muted/20 mt-1 max-h-[30vh] space-y-2 overflow-auto rounded-lg border p-2 pr-1">
+											<p className="text-muted-foreground text-[11px]">
+												共 {formatCount(llmConversationTimeline.length)} 条消息
+											</p>
+											{llmConversationTimeline.map((message, index) => {
+												const isAssistantOutput =
+													message.source === "output" &&
+													message.role === "assistant";
+												const alignRight = isAssistantOutput;
+												const showAnswerLatency =
+													index === lastAssistantTimelineIndex;
+												return (
 												<div
 													key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
 													className={`flex ${
@@ -1934,10 +1935,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													}`}
 												>
 													<div
-														className={`w-full max-w-[92%] rounded-md border p-2 ${
-															message.source === "output"
-																? "border-emerald-200/70 bg-emerald-50/60 dark:border-emerald-500/40 dark:bg-emerald-900/20"
-																: "border-sky-200/70 bg-sky-50/60 dark:border-sky-500/40 dark:bg-sky-900/20"
+														className={`w-full max-w-[92%] rounded-lg border p-2 shadow-sm ${
+															isAssistantOutput
+																? "border-primary/30 bg-primary/5"
+																: "border-border/80 bg-card/70"
 														}`}
 													>
 														<div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
