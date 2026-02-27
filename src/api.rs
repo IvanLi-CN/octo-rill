@@ -950,6 +950,22 @@ pub struct AdminLlmCallsQuery {
     page_size: Option<i64>,
 }
 
+fn parse_llm_calls_filter_timestamp(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be RFC3339")))?;
+    Ok(Some(parsed.to_rfc3339()))
+}
+
 pub async fn admin_get_llm_scheduler_status(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1030,17 +1046,8 @@ pub async fn admin_list_llm_calls(
     }
 
     let source = query.source.unwrap_or_default().trim().to_owned();
-    let started_from = query.started_from.unwrap_or_default().trim().to_owned();
-    let started_to = query.started_to.unwrap_or_default().trim().to_owned();
-
-    if !started_from.is_empty() {
-        chrono::DateTime::parse_from_rfc3339(started_from.as_str())
-            .map_err(|_| ApiError::bad_request("started_from must be RFC3339"))?;
-    }
-    if !started_to.is_empty() {
-        chrono::DateTime::parse_from_rfc3339(started_to.as_str())
-            .map_err(|_| ApiError::bad_request("started_to must be RFC3339"))?;
-    }
+    let started_from = parse_llm_calls_filter_timestamp(query.started_from, "started_from")?;
+    let started_to = parse_llm_calls_filter_timestamp(query.started_to, "started_to")?;
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"
@@ -1049,8 +1056,8 @@ pub async fn admin_list_llm_calls(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR source = ?)
           AND (? IS NULL OR requested_by = ?)
-          AND (? = '' OR COALESCE(started_at, created_at) >= ?)
-          AND (? = '' OR COALESCE(started_at, created_at) <= ?)
+          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
         "#,
     )
     .bind(status.as_str())
@@ -1059,10 +1066,10 @@ pub async fn admin_list_llm_calls(
     .bind(source.as_str())
     .bind(query.requested_by)
     .bind(query.requested_by)
-    .bind(started_from.as_str())
-    .bind(started_from.as_str())
-    .bind(started_to.as_str())
-    .bind(started_to.as_str())
+    .bind(started_from.as_deref())
+    .bind(started_from.as_deref())
+    .bind(started_to.as_deref())
+    .bind(started_to.as_deref())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -1089,8 +1096,8 @@ pub async fn admin_list_llm_calls(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR source = ?)
           AND (? IS NULL OR requested_by = ?)
-          AND (? = '' OR COALESCE(started_at, created_at) >= ?)
-          AND (? = '' OR COALESCE(started_at, created_at) <= ?)
+          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
         ORDER BY created_at DESC, id DESC
         LIMIT ? OFFSET ?
         "#,
@@ -1101,10 +1108,10 @@ pub async fn admin_list_llm_calls(
     .bind(source.as_str())
     .bind(query.requested_by)
     .bind(query.requested_by)
-    .bind(started_from.as_str())
-    .bind(started_from.as_str())
-    .bind(started_to.as_str())
-    .bind(started_to.as_str())
+    .bind(started_from.as_deref())
+    .bind(started_from.as_deref())
+    .bind(started_to.as_deref())
+    .bind(started_to.as_deref())
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.pool)
@@ -6607,6 +6614,51 @@ mod tests {
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-failed");
         assert_eq!(resp.items[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_accepts_zulu_started_filters() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call(
+            &pool,
+            "call-zulu",
+            "succeeded",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let started_from = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let started_to = (chrono::Utc::now() + chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(1),
+                started_from: Some(started_from),
+                started_to: Some(started_to),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should accept zulu time filters")
+        .0;
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].id, "call-zulu");
     }
 
     #[tokio::test]

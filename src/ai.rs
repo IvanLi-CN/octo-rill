@@ -774,16 +774,30 @@ impl Drop for SchedulerInFlightGuard {
     }
 }
 
+struct SchedulerWaitingGuard;
+
+impl SchedulerWaitingGuard {
+    fn new() -> Self {
+        LLM_SCHEDULER_WAITING_CALLS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for SchedulerWaitingGuard {
+    fn drop(&mut self) {
+        LLM_SCHEDULER_WAITING_CALLS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn acquire_llm_scheduler_slot() -> (i64, SchedulerInFlightGuard) {
     let queue_started_at = Instant::now();
-    LLM_SCHEDULER_WAITING_CALLS.fetch_add(1, Ordering::Relaxed);
+    let _waiting_guard = SchedulerWaitingGuard::new();
     let mut next_allowed_at = llm_scheduler().lock().await;
     let now = Instant::now();
     if *next_allowed_at > now {
         tokio::time::sleep(*next_allowed_at - now).await;
     }
     *next_allowed_at = Instant::now() + LLM_SCHEDULER_REQUEST_INTERVAL;
-    LLM_SCHEDULER_WAITING_CALLS.fetch_sub(1, Ordering::Relaxed);
     LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_add(1, Ordering::Relaxed);
     let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
     (wait_ms, SchedulerInFlightGuard)
