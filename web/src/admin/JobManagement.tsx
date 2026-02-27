@@ -39,6 +39,7 @@ const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	second: "2-digit",
 	hour12: false,
 });
+const NUMBER_FORMATTER = new Intl.NumberFormat();
 
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
@@ -56,6 +57,11 @@ function formatLocalDateTime(value: string | null | undefined) {
 		return "-";
 	}
 	return DATETIME_FORMATTER.format(parsed);
+}
+
+function formatCount(value: number | null | undefined) {
+	if (typeof value !== "number") return "-";
+	return NUMBER_FORMATTER.format(value);
 }
 
 function normalizeErrorMessage(err: unknown) {
@@ -601,7 +607,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		const connect = () => {
 			if (disposed) return;
 			setStreamStatus((prev) =>
-				prev === "connected" ? "reconnecting" : "connecting",
+				prev === "connected" || prev === "reconnecting"
+					? "reconnecting"
+					: "connecting",
 			);
 			const nextSource = apiOpenAdminJobsEventsStream();
 			source = nextSource;
@@ -731,19 +739,20 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">队列中</p>
 						<p className="mt-1 text-xl font-semibold">
-							{overview?.queued ?? "-"}
+							{formatCount(overview?.queued)}
 						</p>
 					</div>
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">运行中</p>
 						<p className="mt-1 text-xl font-semibold">
-							{overview?.running ?? "-"}
+							{formatCount(overview?.running)}
 						</p>
 					</div>
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">近24h 成功 / 失败</p>
 						<p className="mt-1 text-xl font-semibold">
-							{overview?.succeeded_24h ?? "-"} / {overview?.failed_24h ?? "-"}
+							{formatCount(overview?.succeeded_24h)} /{" "}
+							{formatCount(overview?.failed_24h)}
 						</p>
 					</div>
 				</CardContent>
@@ -846,13 +855,16 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
 							</div>
 							<span className="text-muted-foreground text-xs">
-								共 {taskTotal} 个任务 · 当前用户 #{currentUserId}
+								共 {formatCount(taskTotal)} 个任务 · 当前用户 #{currentUserId}
 							</span>
 						</div>
 
 						<div className="space-y-2">
 							{tasksLoading ? (
-								<p className="text-muted-foreground text-sm">正在加载任务...</p>
+								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
+									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
+									正在加载任务...
+								</p>
 							) : tasks.length === 0 ? (
 								<p className="text-muted-foreground text-sm">暂无任务。</p>
 							) : (
@@ -862,7 +874,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									return (
 										<div
 											key={task.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
 										>
 											<div className="min-w-0">
 												<div className="flex flex-wrap items-center gap-2">
@@ -1002,11 +1014,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								</div>
 							</div>
 							<p className="text-muted-foreground text-xs">
-								共 {scheduledRunTotal} 条
+								共 {formatCount(scheduledRunTotal)} 条
 							</p>
 							<div className="space-y-2">
 								{scheduledRunsLoading ? (
-									<p className="text-muted-foreground text-sm">
+									<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
+										<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
 										正在加载运行记录...
 									</p>
 								) : scheduledRuns.length === 0 ? (
@@ -1020,7 +1033,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										return (
 											<div
 												key={task.id}
-												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
 											>
 												<div className="min-w-0">
 													<div className="flex flex-wrap items-center gap-2">
