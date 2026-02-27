@@ -40,6 +40,49 @@ async function installAdminJobsMocks(page: Page) {
 		},
 	];
 
+	const llmCalls = [
+		{
+			id: "llm-call-1",
+			status: "failed",
+			source: "job.api.translate_release",
+			model: "gpt-4o-mini",
+			requested_by: 1,
+			parent_task_id: "task-running-1",
+			parent_task_type: "sync.releases",
+			max_tokens: 900,
+			attempt_count: 3,
+			scheduler_wait_ms: 1200,
+			duration_ms: 2200,
+			prompt_text: "prompt 1",
+			response_text: null,
+			error_text: "mock llm failed",
+			created_at: "2026-02-26T02:00:00Z",
+			started_at: "2026-02-26T02:00:01Z",
+			finished_at: "2026-02-26T02:00:03Z",
+			updated_at: "2026-02-26T02:00:03Z",
+		},
+		{
+			id: "llm-call-2",
+			status: "succeeded",
+			source: "api.translate_releases_batch",
+			model: "gpt-4o-mini",
+			requested_by: 1,
+			parent_task_id: null,
+			parent_task_type: null,
+			max_tokens: 900,
+			attempt_count: 1,
+			scheduler_wait_ms: 80,
+			duration_ms: 400,
+			prompt_text: "prompt 2",
+			response_text: "ok",
+			error_text: null,
+			created_at: "2026-02-26T03:00:00Z",
+			started_at: "2026-02-26T03:00:00Z",
+			finished_at: "2026-02-26T03:00:01Z",
+			updated_at: "2026-02-26T03:00:01Z",
+		},
+	];
+
 	const slots = Array.from({ length: 24 }, (_, hour) => ({
 		hour_utc: hour,
 		enabled: hour % 2 === 0,
@@ -147,6 +190,67 @@ async function installAdminJobsMocks(page: Page) {
 			});
 		}
 
+		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/status") {
+			return json(route, {
+				scheduler_enabled: true,
+				request_interval_ms: 1000,
+				waiting_calls: 1,
+				in_flight_calls: 1,
+				next_slot_in_ms: 420,
+				calls_24h: llmCalls.length,
+				failed_24h: llmCalls.filter((item) => item.status === "failed").length,
+				avg_wait_ms_24h: 640,
+				avg_duration_ms_24h: 1300,
+				last_success_at: "2026-02-26T03:00:01Z",
+				last_failure_at: "2026-02-26T02:00:03Z",
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/calls") {
+			const status = url.searchParams.get("status") ?? "all";
+			const source = url.searchParams.get("source") ?? "";
+			const requestedBy = url.searchParams.get("requested_by");
+			const filtered = llmCalls.filter((item) => {
+				if (status !== "all" && item.status !== status) return false;
+				if (source && item.source !== source) return false;
+				if (
+					requestedBy &&
+					String(item.requested_by ?? "") !== String(requestedBy)
+				) {
+					return false;
+				}
+				return true;
+			});
+			return json(route, {
+				items: filtered.map(
+					({ prompt_text: _p, response_text: _r, error_text: _e, ...rest }) =>
+						rest,
+				),
+				page: 1,
+				page_size: 20,
+				total: filtered.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/jobs/llm/calls/")
+		) {
+			const callId = pathname.split("/").at(-1) ?? "";
+			const item = llmCalls.find((call) => call.id === callId);
+			if (!item) {
+				return json(
+					route,
+					{
+						ok: false,
+						error: { code: "not_found", message: "llm call not found" },
+					},
+					404,
+				);
+			}
+			return json(route, item);
+		}
+
 		if (
 			req.method() === "POST" &&
 			pathname.startsWith("/api/admin/jobs/realtime/") &&
@@ -217,4 +321,14 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByText("运行记录")).toBeVisible();
 	await expect(page.getByText("定时执行任务")).toBeVisible();
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await page.getByRole("button", { name: "详情" }).first().click();
+	await expect(
+		page.getByRole("heading", { name: "LLM 调用详情" }),
+	).toBeVisible();
+	await expect(page.getByText("prompt 1")).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
 });

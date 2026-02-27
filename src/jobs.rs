@@ -49,6 +49,8 @@ pub struct EnqueuedTask {
 struct TaskRow {
     id: String,
     task_type: String,
+    source: String,
+    requested_by: Option<i64>,
     payload_json: String,
     cancel_requested: i64,
 }
@@ -625,7 +627,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
 
     let task = sqlx::query_as::<_, TaskRow>(
         r#"
-        SELECT id, task_type, payload_json, cancel_requested
+        SELECT id, task_type, source, requested_by, payload_json, cancel_requested
         FROM job_tasks
         WHERE id = ?
         LIMIT 1
@@ -665,7 +667,17 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     let payload: Value = serde_json::from_str(&task.payload_json)
         .with_context(|| format!("invalid payload json for task {}", task.id))?;
 
-    let result = execute_task(state.as_ref(), &task.id, &task.task_type, &payload).await;
+    let context = ai::LlmCallContext {
+        source: format!("job.{}", task.source),
+        requested_by: task.requested_by,
+        parent_task_id: Some(task.id.clone()),
+        parent_task_type: Some(task.task_type.clone()),
+    };
+    let result = ai::with_llm_call_context(
+        context,
+        execute_task(state.as_ref(), &task.id, &task.task_type, &payload),
+    )
+    .await;
 
     if is_task_cancel_requested(state.as_ref(), &task.id)
         .await

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -875,6 +876,292 @@ pub async fn admin_patch_scheduled_slot(
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminLlmCallItem {
+    id: String,
+    status: String,
+    source: String,
+    model: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    parent_task_type: Option<String>,
+    max_tokens: i64,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    duration_ms: Option<i64>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminLlmCallDetailItem {
+    id: String,
+    status: String,
+    source: String,
+    model: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    parent_task_type: Option<String>,
+    max_tokens: i64,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    duration_ms: Option<i64>,
+    prompt_text: String,
+    response_text: Option<String>,
+    error_text: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLlmCallsResponse {
+    items: Vec<AdminLlmCallItem>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminLlmSchedulerStatusResponse {
+    scheduler_enabled: bool,
+    request_interval_ms: i64,
+    waiting_calls: i64,
+    in_flight_calls: i64,
+    next_slot_in_ms: i64,
+    calls_24h: i64,
+    failed_24h: i64,
+    avg_wait_ms_24h: Option<i64>,
+    avg_duration_ms_24h: Option<i64>,
+    last_success_at: Option<String>,
+    last_failure_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminLlmCallsQuery {
+    status: Option<String>,
+    source: Option<String>,
+    requested_by: Option<i64>,
+    started_from: Option<String>,
+    started_to: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+pub async fn admin_get_llm_scheduler_status(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let runtime = ai::llm_scheduler_runtime_status().await;
+
+    let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let (calls_24h, failed_24h, avg_wait_raw, avg_duration_raw) =
+        sqlx::query_as::<_, (i64, i64, Option<f64>, Option<f64>)>(
+            r#"
+            SELECT
+              COUNT(*) AS calls_24h,
+              COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_24h,
+              AVG(CAST(scheduler_wait_ms AS REAL)) AS avg_wait_ms_24h,
+              AVG(CAST(duration_ms AS REAL)) AS avg_duration_ms_24h
+            FROM llm_calls
+            WHERE created_at >= ?
+            "#,
+        )
+        .bind(cutoff.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let last_success_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT MAX(finished_at)
+        FROM llm_calls
+        WHERE status = 'succeeded'
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let last_failure_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT MAX(finished_at)
+        FROM llm_calls
+        WHERE status = 'failed'
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminLlmSchedulerStatusResponse {
+        scheduler_enabled: state.config.ai.is_some(),
+        request_interval_ms: runtime.request_interval_ms,
+        waiting_calls: runtime.waiting_calls,
+        in_flight_calls: runtime.in_flight_calls,
+        next_slot_in_ms: runtime.next_slot_in_ms,
+        calls_24h,
+        failed_24h,
+        avg_wait_ms_24h: avg_wait_raw.map(|value| value.round() as i64),
+        avg_duration_ms_24h: avg_duration_raw.map(|value| value.round() as i64),
+        last_success_at,
+        last_failure_at,
+    }))
+}
+
+pub async fn admin_list_llm_calls(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminLlmCallsQuery>,
+) -> Result<Json<AdminLlmCallsResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = admin_users_offset(page, page_size)?;
+    let status = query.status.unwrap_or_else(|| "all".to_owned());
+    if !matches!(
+        status.as_str(),
+        "all" | "queued" | "running" | "succeeded" | "failed"
+    ) {
+        return Err(ApiError::bad_request("invalid status filter"));
+    }
+
+    let source = query.source.unwrap_or_default().trim().to_owned();
+    let started_from = query.started_from.unwrap_or_default().trim().to_owned();
+    let started_to = query.started_to.unwrap_or_default().trim().to_owned();
+
+    if !started_from.is_empty() {
+        chrono::DateTime::parse_from_rfc3339(started_from.as_str())
+            .map_err(|_| ApiError::bad_request("started_from must be RFC3339"))?;
+    }
+    if !started_to.is_empty() {
+        chrono::DateTime::parse_from_rfc3339(started_to.as_str())
+            .map_err(|_| ApiError::bad_request("started_to must be RFC3339"))?;
+    }
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM llm_calls
+        WHERE (? = 'all' OR status = ?)
+          AND (? = '' OR source = ?)
+          AND (? IS NULL OR requested_by = ?)
+          AND (? = '' OR COALESCE(started_at, created_at) >= ?)
+          AND (? = '' OR COALESCE(started_at, created_at) <= ?)
+        "#,
+    )
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(source.as_str())
+    .bind(source.as_str())
+    .bind(query.requested_by)
+    .bind(query.requested_by)
+    .bind(started_from.as_str())
+    .bind(started_from.as_str())
+    .bind(started_to.as_str())
+    .bind(started_to.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminLlmCallItem>(
+        r#"
+        SELECT
+          id,
+          status,
+          source,
+          model,
+          requested_by,
+          parent_task_id,
+          parent_task_type,
+          max_tokens,
+          attempt_count,
+          scheduler_wait_ms,
+          duration_ms,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM llm_calls
+        WHERE (? = 'all' OR status = ?)
+          AND (? = '' OR source = ?)
+          AND (? IS NULL OR requested_by = ?)
+          AND (? = '' OR COALESCE(started_at, created_at) >= ?)
+          AND (? = '' OR COALESCE(started_at, created_at) <= ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(status.as_str())
+    .bind(status.as_str())
+    .bind(source.as_str())
+    .bind(source.as_str())
+    .bind(query.requested_by)
+    .bind(query.requested_by)
+    .bind(started_from.as_str())
+    .bind(started_from.as_str())
+    .bind(started_to.as_str())
+    .bind(started_to.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminLlmCallsResponse {
+        items,
+        page,
+        page_size,
+        total,
+    }))
+}
+
+pub async fn admin_get_llm_call_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(call_id): Path<String>,
+) -> Result<Json<AdminLlmCallDetailItem>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
+        r#"
+        SELECT
+          id,
+          status,
+          source,
+          model,
+          requested_by,
+          parent_task_id,
+          parent_task_type,
+          max_tokens,
+          attempt_count,
+          scheduler_wait_ms,
+          duration_ms,
+          prompt_text,
+          response_text,
+          error_text,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM llm_calls
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(call_id.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "llm call not found"))?;
+
+    Ok(Json(item))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct StarredRepoItem {
     repo_id: i64,
     full_name: String,
@@ -1240,6 +1527,22 @@ async fn enqueue_or_stream_task(
     }
 }
 
+async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<i64>, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    ai::with_llm_call_context(
+        ai::LlmCallContext {
+            source: source.to_owned(),
+            requested_by,
+            parent_task_id: None,
+            parent_task_type: None,
+        },
+        fut,
+    )
+    .await
+}
+
 pub async fn sync_starred(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1358,9 +1661,13 @@ pub async fn generate_brief(
         .await;
     }
 
-    let content = ai::generate_daily_brief(state.as_ref(), user_id)
-        .await
-        .map_err(ApiError::internal)?;
+    let content = run_with_api_llm_context(
+        "api.generate_brief.sync",
+        Some(user_id),
+        ai::generate_daily_brief(state.as_ref(), user_id),
+    )
+    .await
+    .map_err(ApiError::internal)?;
 
     // The brief row is keyed by date. Read the most recent one to include window hints.
     let row = sqlx::query_as::<_, (String,)>(
@@ -4360,7 +4667,14 @@ async fn translate_releases_batch_stream_worker(
     let mut missing_count = 0usize;
     let mut error_count = 0usize;
 
-    let result = async {
+    let context = ai::LlmCallContext {
+        source: "api.translate_releases_batch_stream".to_owned(),
+        requested_by: Some(user_id),
+        parent_task_id: Some(task_id.clone()),
+        parent_task_type: Some(jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned()),
+    };
+
+    let result = ai::with_llm_call_context(context, async {
         jobs::append_task_event(
             state.as_ref(),
             task_id.as_str(),
@@ -4590,7 +4904,7 @@ async fn translate_releases_batch_stream_worker(
             return Err(ApiError::internal("stream client disconnected"));
         }
         Ok::<(), ApiError>(())
-    }
+    })
     .await;
 
     match result {
@@ -4663,7 +4977,12 @@ pub async fn translate_releases_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
-    let items = translate_releases_batch_internal(state.as_ref(), user_id, &release_ids).await?;
+    let items = run_with_api_llm_context(
+        "api.translate_releases_batch",
+        Some(user_id),
+        translate_releases_batch_internal(state.as_ref(), user_id, &release_ids),
+    )
+    .await?;
     Ok(Json(TranslateBatchResponse { items }))
 }
 
@@ -4743,8 +5062,12 @@ pub async fn translate_release(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let translated =
-            translate_release_for_user(state.as_ref(), user_id, release_id.as_str()).await?;
+        let translated = run_with_api_llm_context(
+            "api.translate_release.sync",
+            Some(user_id),
+            translate_release_for_user(state.as_ref(), user_id, release_id.as_str()),
+        )
+        .await?;
         return Ok(Json(translated).into_response());
     }
 
@@ -5132,8 +5455,12 @@ pub async fn translate_release_detail(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let translated =
-            translate_release_detail_for_user(state.as_ref(), user_id, release_id.as_str()).await?;
+        let translated = run_with_api_llm_context(
+            "api.translate_release_detail.sync",
+            Some(user_id),
+            translate_release_detail_for_user(state.as_ref(), user_id, release_id.as_str()),
+        )
+        .await?;
         return Ok(Json(translated).into_response());
     }
 
@@ -5217,8 +5544,12 @@ pub async fn translate_release_detail_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
-    let items =
-        translate_release_detail_batch_internal(state.as_ref(), user_id, &release_ids).await?;
+    let items = run_with_api_llm_context(
+        "api.translate_release_detail_batch",
+        Some(user_id),
+        translate_release_detail_batch_internal(state.as_ref(), user_id, &release_ids),
+    )
+    .await?;
     Ok(Json(TranslateBatchResponse { items }))
 }
 
@@ -5620,8 +5951,12 @@ pub async fn translate_notifications_batch(
 ) -> Result<Json<TranslateBatchResponse>, ApiError> {
     let user_id = require_user_id(&session).await?;
     let thread_ids = parse_unique_thread_ids(&req.thread_ids, 60)?;
-    let items =
-        translate_notifications_batch_internal(state.as_ref(), user_id, &thread_ids).await?;
+    let items = run_with_api_llm_context(
+        "api.translate_notifications_batch",
+        Some(user_id),
+        translate_notifications_batch_internal(state.as_ref(), user_id, &thread_ids),
+    )
+    .await?;
     Ok(Json(TranslateBatchResponse { items }))
 }
 
@@ -5636,8 +5971,12 @@ pub async fn translate_notification(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let translated =
-            translate_notification_for_user(state.as_ref(), user_id, thread_id.as_str()).await?;
+        let translated = run_with_api_llm_context(
+            "api.translate_notification.sync",
+            Some(user_id),
+            translate_notification_for_user(state.as_ref(), user_id, thread_id.as_str()),
+        )
+        .await?;
         return Ok(Json(translated).into_response());
     }
 
@@ -5774,8 +6113,9 @@ async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i6
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
-        TranslateBatchItem, TranslationCacheRow, admin_list_users, admin_patch_user,
+        AdminLlmCallsQuery, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
+        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_get_llm_call_detail,
+        admin_get_llm_scheduler_status, admin_list_llm_calls, admin_list_users, admin_patch_user,
         admin_users_offset, ai_error_is_non_retryable, ensure_account_enabled,
         extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
         guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
@@ -5973,6 +6313,52 @@ mod tests {
         .expect("seed starred");
     }
 
+    async fn seed_llm_call(
+        pool: &SqlitePool,
+        call_id: &str,
+        status: &str,
+        source: &str,
+        requested_by: Option<i64>,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id,
+              status,
+              source,
+              model,
+              requested_by,
+              parent_task_id,
+              parent_task_type,
+              max_tokens,
+              attempt_count,
+              scheduler_wait_ms,
+              duration_ms,
+              prompt_text,
+              response_text,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, 'gpt-4o-mini', ?, NULL, NULL, 900, 1, 120, 800, 'prompt', 'ok', NULL, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(call_id)
+        .bind(status)
+        .bind(source)
+        .bind(requested_by)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(pool)
+        .await
+        .expect("seed llm call");
+    }
+
     #[test]
     fn has_repo_scope_accepts_comma_delimited_scopes() {
         assert!(has_repo_scope("read:user,user:email,repo,notifications"));
@@ -6145,6 +6531,134 @@ mod tests {
         .expect_err("last admin demotion should fail");
 
         assert_eq!(err.code(), "last_admin_guard");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_rejects_non_admin_session() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "viewer", 0, 0).await;
+        let state = setup_state(pool);
+        let session = setup_session(2).await;
+
+        let err = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: None,
+                source: None,
+                requested_by: None,
+                started_from: None,
+                started_to: None,
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect_err("non-admin user should be rejected");
+
+        assert_eq!(err.code(), "forbidden_admin_only");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_filters_status_and_source() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call(
+            &pool,
+            "call-failed",
+            "failed",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+        seed_llm_call(
+            &pool,
+            "call-ok",
+            "succeeded",
+            "api.translate_release",
+            Some(1),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("failed".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(1),
+                started_from: None,
+                started_to: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should pass")
+        .0;
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].id, "call-failed");
+        assert_eq!(resp.items[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_call_detail_returns_not_found() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let err = admin_get_llm_call_detail(State(state), session, Path("missing".to_owned()))
+            .await
+            .expect_err("missing llm call should fail");
+        assert_eq!(err.code(), "not_found");
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_scheduler_status_reads_aggregates() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call(
+            &pool,
+            "call-1",
+            "failed",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+        seed_llm_call(
+            &pool,
+            "call-2",
+            "succeeded",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let resp = admin_get_llm_scheduler_status(State(state), session)
+            .await
+            .expect("status should succeed")
+            .0;
+
+        assert_eq!(resp.calls_24h, 2);
+        assert_eq!(resp.failed_24h, 1);
+        assert!(resp.avg_wait_ms_24h.is_some());
     }
 
     #[tokio::test]

@@ -75,6 +75,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .ai
         .as_ref()
         .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
+    let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -122,6 +123,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/admin/jobs/scheduled/{hour_utc}",
             patch(api::admin_patch_scheduled_slot),
+        )
+        .route(
+            "/admin/jobs/llm/status",
+            get(api::admin_get_llm_scheduler_status),
+        )
+        .route("/admin/jobs/llm/calls", get(api::admin_list_llm_calls))
+        .route(
+            "/admin/jobs/llm/calls/{call_id}",
+            get(api::admin_get_llm_call_detail),
         )
         .route("/reaction-token/status", get(api::reaction_token_status))
         .route("/reaction-token/check", post(api::check_reaction_token))
@@ -193,7 +203,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
-    let mut abort_handles = vec![deletion_abort_handle];
+    let mut abort_handles = vec![deletion_abort_handle, llm_call_retention_abort_handle];
     if let Some(handle) = model_catalog_abort_handle {
         abort_handles.push(handle);
     }

@@ -69,6 +69,49 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 	},
 ];
 
+const llmCallsSeed = [
+	{
+		id: "llm-call-1",
+		status: "failed",
+		source: "job.api.translate_release",
+		model: "gpt-4o-mini",
+		requested_by: 1,
+		parent_task_id: "task-sync-releases",
+		parent_task_type: "sync.releases",
+		max_tokens: 900,
+		attempt_count: 3,
+		scheduler_wait_ms: 1500,
+		duration_ms: 2600,
+		prompt_text: "prompt 1",
+		response_text: null,
+		error_text: "mock llm failed",
+		created_at: "2026-02-27T06:10:00Z",
+		started_at: "2026-02-27T06:10:01Z",
+		finished_at: "2026-02-27T06:10:04Z",
+		updated_at: "2026-02-27T06:10:04Z",
+	},
+	{
+		id: "llm-call-2",
+		status: "succeeded",
+		source: "api.translate_releases_batch",
+		model: "gpt-4o-mini",
+		requested_by: 1,
+		parent_task_id: null,
+		parent_task_type: null,
+		max_tokens: 900,
+		attempt_count: 1,
+		scheduler_wait_ms: 120,
+		duration_ms: 540,
+		prompt_text: "prompt 2",
+		response_text: "ok",
+		error_text: null,
+		created_at: "2026-02-27T06:12:00Z",
+		started_at: "2026-02-27T06:12:00Z",
+		finished_at: "2026-02-27T06:12:01Z",
+		updated_at: "2026-02-27T06:12:01Z",
+	},
+];
+
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
@@ -140,6 +183,7 @@ function AdminJobsPreview() {
 		const originalEventSource = window.EventSource;
 		const realtimeTasks = realtimeTasksSeed.map((item) => ({ ...item }));
 		const scheduledRuns = scheduledRunsSeed.map((item) => ({ ...item }));
+		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
 
 		window.fetch = async (input, init) => {
 			const req =
@@ -271,6 +315,99 @@ function AdminJobsPreview() {
 						headers: { "content-type": "application/json" },
 					},
 				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/llm/status" &&
+				req.method === "GET"
+			) {
+				return new Response(
+					JSON.stringify({
+						scheduler_enabled: true,
+						request_interval_ms: 1000,
+						waiting_calls: 1,
+						in_flight_calls: 1,
+						next_slot_in_ms: 450,
+						calls_24h: llmCalls.length,
+						failed_24h: llmCalls.filter((item) => item.status === "failed")
+							.length,
+						avg_wait_ms_24h: 810,
+						avg_duration_ms_24h: 1570,
+						last_success_at: llmCalls.at(-1)?.finished_at ?? null,
+						last_failure_at: llmCalls[0]?.finished_at ?? null,
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/llm/calls" &&
+				req.method === "GET"
+			) {
+				const status = url.searchParams.get("status");
+				const source = url.searchParams.get("source");
+				const requestedBy = url.searchParams.get("requested_by");
+				let rows = [...llmCalls];
+				if (status && status !== "all") {
+					rows = rows.filter((item) => item.status === status);
+				}
+				if (source) {
+					rows = rows.filter((item) => item.source === source);
+				}
+				if (requestedBy) {
+					rows = rows.filter(
+						(item) => String(item.requested_by ?? "") === String(requestedBy),
+					);
+				}
+				const page = url.searchParams.get("page");
+				const pageSize = url.searchParams.get("page_size");
+				const { pageItems, total } = paginate(rows, page, pageSize);
+				return new Response(
+					JSON.stringify({
+						items: pageItems.map(
+							({
+								prompt_text: _p,
+								response_text: _r,
+								error_text: _e,
+								...rest
+							}) => rest,
+						),
+						page: Number(page ?? "1") || 1,
+						page_size: Number(pageSize ?? "20") || 20,
+						total,
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/jobs/llm/calls/") &&
+				req.method === "GET"
+			) {
+				const callId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
+				const item = llmCalls.find((call) => call.id === callId);
+				if (!item) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: { code: "not_found", message: "llm call not found" },
+						}),
+						{
+							status: 404,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				return new Response(JSON.stringify(item), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 
 			return originalFetch(input, init);

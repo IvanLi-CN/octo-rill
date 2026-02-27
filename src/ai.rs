@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,6 +28,8 @@ const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
 const LLM_SCHEDULER_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const LLM_REQUEST_MAX_RETRIES: usize = 3;
+const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Default)]
 struct ModelLimitCatalog {
@@ -48,6 +52,28 @@ struct OpenRouterModelItem {
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
 static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
 static LLM_SCHEDULER_NEXT_ALLOWED_AT: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
+static LLM_SCHEDULER_WAITING_CALLS: AtomicUsize = AtomicUsize::new(0);
+static LLM_SCHEDULER_IN_FLIGHT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+tokio::task_local! {
+    static LLM_CALL_CONTEXT: LlmCallContext;
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmCallContext {
+    pub source: String,
+    pub requested_by: Option<i64>,
+    pub parent_task_id: Option<String>,
+    pub parent_task_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LlmSchedulerRuntimeStatus {
+    pub request_interval_ms: i64,
+    pub waiting_calls: i64,
+    pub in_flight_calls: i64,
+    pub next_slot_in_ms: i64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputBudget {
@@ -62,6 +88,37 @@ fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
 
 fn llm_scheduler() -> &'static tokio::sync::Mutex<Instant> {
     LLM_SCHEDULER_NEXT_ALLOWED_AT.get_or_init(|| tokio::sync::Mutex::new(Instant::now()))
+}
+
+pub async fn with_llm_call_context<F, T>(context: LlmCallContext, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    LLM_CALL_CONTEXT.scope(context, fut).await
+}
+
+fn current_llm_call_context() -> Option<LlmCallContext> {
+    LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
+}
+
+pub async fn llm_scheduler_runtime_status() -> LlmSchedulerRuntimeStatus {
+    let now = Instant::now();
+    let next_allowed_at = *llm_scheduler().lock().await;
+    let next_slot_in_ms = if next_allowed_at > now {
+        i64::try_from((next_allowed_at - now).as_millis()).unwrap_or(i64::MAX)
+    } else {
+        0
+    };
+
+    LlmSchedulerRuntimeStatus {
+        request_interval_ms: i64::try_from(LLM_SCHEDULER_REQUEST_INTERVAL.as_millis())
+            .unwrap_or(i64::MAX),
+        waiting_calls: i64::try_from(LLM_SCHEDULER_WAITING_CALLS.load(Ordering::Relaxed))
+            .unwrap_or(i64::MAX),
+        in_flight_calls: i64::try_from(LLM_SCHEDULER_IN_FLIGHT_CALLS.load(Ordering::Relaxed))
+            .unwrap_or(i64::MAX),
+        next_slot_in_ms,
+    }
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -421,6 +478,36 @@ pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::Abort
     handle.abort_handle()
 }
 
+async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
+    let retention_seconds = i64::try_from(LLM_CALL_LOG_RETENTION.as_secs()).unwrap_or(i64::MAX);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(retention_seconds)).to_rfc3339();
+    let deleted = sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
+        .bind(cutoff.as_str())
+        .execute(&state.pool)
+        .await
+        .context("delete expired llm_calls failed")?
+        .rows_affected();
+    Ok(deleted)
+}
+
+pub fn spawn_llm_call_retention_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        loop {
+            match cleanup_expired_llm_calls(state.as_ref()).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "llm call retention cleanup removed expired rows");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(?err, "llm call retention cleanup failed");
+                }
+            }
+            tokio::time::sleep(LLM_CALL_LOG_CLEANUP_INTERVAL).await;
+        }
+    });
+    handle.abort_handle()
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReleaseRow {
     release_id: i64,
@@ -679,13 +766,162 @@ fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
 
-async fn acquire_llm_scheduler_slot() {
+struct SchedulerInFlightGuard;
+
+impl Drop for SchedulerInFlightGuard {
+    fn drop(&mut self) {
+        LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn acquire_llm_scheduler_slot() -> (i64, SchedulerInFlightGuard) {
+    let queue_started_at = Instant::now();
+    LLM_SCHEDULER_WAITING_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut next_allowed_at = llm_scheduler().lock().await;
     let now = Instant::now();
     if *next_allowed_at > now {
         tokio::time::sleep(*next_allowed_at - now).await;
     }
     *next_allowed_at = Instant::now() + LLM_SCHEDULER_REQUEST_INTERVAL;
+    LLM_SCHEDULER_WAITING_CALLS.fetch_sub(1, Ordering::Relaxed);
+    LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_add(1, Ordering::Relaxed);
+    let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+    (wait_ms, SchedulerInFlightGuard)
+}
+
+#[derive(Debug)]
+struct LlmCallLogRecord {
+    id: String,
+    source: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    parent_task_type: Option<String>,
+}
+
+fn build_llm_call_log_record() -> LlmCallLogRecord {
+    let context = current_llm_call_context();
+    LlmCallLogRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: context
+            .as_ref()
+            .map(|ctx| ctx.source.clone())
+            .unwrap_or_else(|| "ai.chat_completion".to_owned()),
+        requested_by: context.as_ref().and_then(|ctx| ctx.requested_by),
+        parent_task_id: context.as_ref().and_then(|ctx| ctx.parent_task_id.clone()),
+        parent_task_type: context
+            .as_ref()
+            .and_then(|ctx| ctx.parent_task_type.clone()),
+    }
+}
+
+async fn insert_llm_call(
+    state: &AppState,
+    log: &LlmCallLogRecord,
+    model: &str,
+    max_tokens: u32,
+    prompt_text: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO llm_calls (
+          id,
+          status,
+          source,
+          model,
+          requested_by,
+          parent_task_id,
+          parent_task_type,
+          max_tokens,
+          prompt_text,
+          created_at,
+          updated_at
+        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(log.id.as_str())
+    .bind(log.source.as_str())
+    .bind(model)
+    .bind(log.requested_by)
+    .bind(log.parent_task_id.as_deref())
+    .bind(log.parent_task_type.as_deref())
+    .bind(i64::from(max_tokens))
+    .bind(prompt_text)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("insert llm_call failed")?;
+    Ok(())
+}
+
+async fn update_llm_call_running(
+    state: &AppState,
+    call_id: &str,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET status = 'running',
+            started_at = COALESCE(started_at, ?),
+            attempt_count = ?,
+            scheduler_wait_ms = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(attempt_count)
+    .bind(scheduler_wait_ms)
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("update llm_call running failed")?;
+    Ok(())
+}
+
+async fn finalize_llm_call(
+    state: &AppState,
+    call_id: &str,
+    status: &str,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    duration_ms: Option<i64>,
+    response_text: Option<&str>,
+    error_text: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET status = ?,
+            attempt_count = ?,
+            scheduler_wait_ms = ?,
+            duration_ms = ?,
+            response_text = ?,
+            error_text = ?,
+            finished_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(status)
+    .bind(attempt_count)
+    .bind(scheduler_wait_ms)
+    .bind(duration_ms)
+    .bind(response_text)
+    .bind(error_text)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("finalize llm_call failed")?;
+    Ok(())
 }
 
 async fn chat_completion_once(
@@ -783,17 +1019,82 @@ pub async fn chat_completion(
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     };
 
+    let log_record = build_llm_call_log_record();
+    let prompt_text = format!("system:\n{system}\n\nuser:\n{user}");
+    if let Err(err) = insert_llm_call(state, &log_record, &ai.model, max_tokens, &prompt_text).await
+    {
+        tracing::warn!(?err, "llm call log insert failed");
+    }
+
     let mut last_err: Option<anyhow::Error> = None;
+    let mut total_wait_ms = 0_i64;
+    let mut started_at: Option<Instant> = None;
     let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
     for attempt in 1..=max_attempts {
         // Global in-process queue: always serialize request issuance and pace at 1 request/second.
-        acquire_llm_scheduler_slot().await;
-        match chat_completion_once(state, &ai, system, user, max_tokens).await {
-            Ok(content) => return Ok(content),
+        let (wait_ms, in_flight_guard) = acquire_llm_scheduler_slot().await;
+        total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
+
+        if started_at.is_none() {
+            started_at = Some(Instant::now());
+        }
+
+        if let Err(err) = update_llm_call_running(
+            state,
+            log_record.id.as_str(),
+            i64::try_from(attempt).unwrap_or(i64::MAX),
+            total_wait_ms,
+        )
+        .await
+        {
+            tracing::warn!(?err, "llm call log running update failed");
+        }
+
+        let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
+        drop(in_flight_guard);
+        match attempt_result {
+            Ok(content) => {
+                let duration_ms = started_at.map(|started| {
+                    i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+                });
+                if let Err(err) = finalize_llm_call(
+                    state,
+                    log_record.id.as_str(),
+                    "succeeded",
+                    i64::try_from(attempt).unwrap_or(i64::MAX),
+                    total_wait_ms,
+                    duration_ms,
+                    Some(content.as_str()),
+                    None,
+                )
+                .await
+                {
+                    tracing::warn!(?err, "llm call log finalize success failed");
+                }
+                return Ok(content);
+            }
             Err(attempt_err) => {
                 let retryable = attempt_err.retryable;
                 let err = attempt_err.err;
                 if !retryable || attempt >= max_attempts {
+                    let duration_ms = started_at.map(|started| {
+                        i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+                    });
+                    let error_message = err.to_string();
+                    if let Err(log_err) = finalize_llm_call(
+                        state,
+                        log_record.id.as_str(),
+                        "failed",
+                        i64::try_from(attempt).unwrap_or(i64::MAX),
+                        total_wait_ms,
+                        duration_ms,
+                        None,
+                        Some(error_message.as_str()),
+                    )
+                    .await
+                    {
+                        tracing::warn!(?log_err, "llm call log finalize failure failed");
+                    }
                     return Err(err);
                 }
                 tracing::warn!(
