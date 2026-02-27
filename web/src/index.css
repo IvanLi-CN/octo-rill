@@ -6,10 +6,12 @@
 
 :root {
 	--radius: 0.875rem;
-	--font-sans: "IBM Plex Sans SC", ui-sans-serif, system-ui, -apple-system,
-		"Segoe UI", sans-serif;
-	--font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
-		Consolas, "Liberation Mono", "Courier New", monospace;
+	--font-sans:
+		"IBM Plex Sans SC", ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+		sans-serif;
+	--font-mono:
+		"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+		"Liberation Mono", "Courier New", monospace;
 
 	/* Paper-like light theme */
 	--background: oklch(0.985 0.01 95);
@@ -85,13 +87,18 @@
 	body {
 		@apply bg-background text-foreground antialiased;
 		font-family: var(--font-sans);
-		background-image: radial-gradient(
+		background-image:
+			radial-gradient(
 				1200px circle at 15% 10%,
 				rgb(0 0 0 / 3%),
 				transparent 60%
-			), linear-gradient(to right, rgb(0 0 0 / 3%) 1px, transparent 1px),
+			),
+			linear-gradient(to right, rgb(0 0 0 / 3%) 1px, transparent 1px),
 			linear-gradient(to bottom, rgb(0 0 0 / 3%) 1px, transparent 1px);
-		background-size: auto, 32px 32px, 32px 32px;
+		background-size:
+			auto,
+			32px 32px,
+			32px 32px;
 		background-position: center;
 	}
 

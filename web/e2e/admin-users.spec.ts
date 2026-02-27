@@ -224,7 +224,7 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
 	await expect(page).toHaveURL(/\/admin$/);
-	await expect(page.getByRole("heading", { name: "管理员面板" })).toBeVisible();
+	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
 	const revokeAdminButton = page
 		.getByRole("button", { name: "撤销管理员" })

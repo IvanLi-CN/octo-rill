@@ -40,6 +40,15 @@ if (
 
 const preview: Preview = {
 	tags: ["autodocs"],
+	decorators: [
+		(Story) => {
+			if (typeof document !== "undefined") {
+				document.body.style.backgroundImage = "none";
+				document.body.style.backgroundColor = "#f7f4ed";
+			}
+			return Story();
+		},
+	],
 	parameters: {
 		actions: { argTypesRegex: "^on[A-Z].*" },
 		controls: {
@@ -47,6 +56,15 @@ const preview: Preview = {
 				color: /(background|color)$/i,
 				date: /Date$/i,
 			},
+		},
+		backgrounds: {
+			default: "solid-paper",
+			values: [
+				{
+					name: "solid-paper",
+					value: "#f7f4ed",
+				},
+			],
 		},
 	},
 };
