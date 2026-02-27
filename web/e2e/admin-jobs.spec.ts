@@ -393,7 +393,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByText("Input Messages")).toHaveCount(0);
 	await expect(page.getByText("耗时 / 重试")).toBeVisible();
 	await expect(page.getByText("等待 / 首字 / 耗时 / 重试")).toHaveCount(0);
-	await expect(page.getByText("等待 1.20s · 首字 860ms", { exact: true })).toBeVisible();
+	await expect(
+		page.getByText("等待 1.20s · 首字 860ms", { exact: true }),
+	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 });

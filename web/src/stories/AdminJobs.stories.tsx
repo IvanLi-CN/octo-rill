@@ -275,7 +275,9 @@ function setInputValue(element: HTMLInputElement, value: string) {
 	element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function AdminJobsPreview({ autoOpenConversation = false }: AdminJobsPreviewProps) {
+function AdminJobsPreview({
+	autoOpenConversation = false,
+}: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
 
