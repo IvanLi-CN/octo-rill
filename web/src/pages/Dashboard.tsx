@@ -38,9 +38,6 @@ type MeResponse = {
 	};
 };
 
-type SyncStarredResult = { repos: number };
-type SyncReleasesResult = { repos: number; releases: number };
-type SyncNotificationsResult = { notifications: number; since: string | null };
 type TaskAcceptedResponse = {
 	mode: "task_id";
 	task_id: string;
