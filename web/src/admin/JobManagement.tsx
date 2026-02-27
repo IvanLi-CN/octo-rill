@@ -3,6 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import {
+	type AdminLlmCallDetailResponse,
+	type AdminLlmCallItem,
+	type AdminLlmCallStreamEvent,
+	type AdminLlmSchedulerStatusResponse,
 	type AdminJobsOverviewResponse,
 	type AdminJobsStreamEvent,
 	type AdminRealtimeTaskDetailResponse,
@@ -10,6 +14,9 @@ import {
 	type AdminTaskEventItem,
 	ApiError,
 	apiCancelAdminRealtimeTask,
+	apiGetAdminLlmCallDetail,
+	apiGetAdminLlmCalls,
+	apiGetAdminLlmSchedulerStatus,
 	apiGetAdminJobsOverview,
 	apiGetAdminRealtimeTaskDetail,
 	apiGetAdminRealtimeTasks,
@@ -62,6 +69,135 @@ function formatLocalDateTime(value: string | null | undefined) {
 function formatCount(value: number | null | undefined) {
 	if (typeof value !== "number") return "-";
 	return NUMBER_FORMATTER.format(value);
+}
+
+function formatDurationMs(value: number | null | undefined) {
+	if (typeof value !== "number") return "-";
+	if (value < 1000) return `${value}ms`;
+	return `${(value / 1000).toFixed(2)}s`;
+}
+
+function localInputToUtc(value: string) {
+	if (!value) return "";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "";
+	return parsed.toISOString();
+}
+
+type LlmConversationMessage = {
+	role: string;
+	content: string;
+};
+type LlmConversationTimelineItem = {
+	turn: number;
+	source: "input" | "output";
+	role: string;
+	content: string;
+};
+
+function normalizeLlmMessageContent(raw: unknown): string {
+	if (typeof raw === "string") {
+		return raw;
+	}
+	if (Array.isArray(raw)) {
+		return raw
+			.map((item) => {
+				if (typeof item === "string") return item;
+				if (item && typeof item === "object" && "text" in item) {
+					const text = (item as { text?: unknown }).text;
+					return typeof text === "string" ? text : "";
+				}
+				return "";
+			})
+			.filter(Boolean)
+			.join("\n");
+	}
+	return "";
+}
+
+function parseLlmConversationMessages(
+	raw: string | null | undefined,
+): LlmConversationMessage[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((item) => {
+				if (!item || typeof item !== "object") return null;
+				const roleRaw = (item as { role?: unknown }).role;
+				const contentRaw = (item as { content?: unknown }).content;
+				const role = typeof roleRaw === "string" ? roleRaw : "unknown";
+				const content = normalizeLlmMessageContent(contentRaw);
+				if (!content) return null;
+				return { role, content };
+			})
+			.filter((item): item is LlmConversationMessage => item !== null);
+	} catch {
+		return [];
+	}
+}
+
+function llmRoleLabel(role: string) {
+	switch (role) {
+		case "system":
+			return "系统";
+		case "user":
+			return "用户";
+		case "assistant":
+			return "助手";
+		case "tool":
+			return "工具";
+		case "input":
+			return "输入文本";
+		default:
+			return role;
+	}
+}
+
+type LlmRoleTone = {
+	containerClass: string;
+	badgeClass: string;
+};
+
+function llmRoleTone(role: string, isAssistantOutput: boolean): LlmRoleTone {
+	if (isAssistantOutput) {
+		return {
+			containerClass:
+				"border-primary/35 bg-primary/5 dark:border-primary/40 dark:bg-primary/10",
+			badgeClass:
+				"border-primary/35 bg-primary/10 text-primary dark:border-primary/40 dark:bg-primary/20 dark:text-primary-foreground",
+		};
+	}
+	switch (role) {
+		case "system":
+			return {
+				containerClass:
+					"border-zinc-300/80 bg-zinc-50/80 dark:border-zinc-600/60 dark:bg-zinc-900/40",
+				badgeClass:
+					"border-zinc-300/90 bg-zinc-100 text-zinc-700 dark:border-zinc-500/70 dark:bg-zinc-800/70 dark:text-zinc-100",
+			};
+		case "user":
+		case "input":
+			return {
+				containerClass:
+					"border-border/80 bg-background/70 dark:border-border/80 dark:bg-background/30",
+				badgeClass:
+					"border-border bg-muted text-muted-foreground dark:border-border/80 dark:bg-muted/50 dark:text-foreground",
+			};
+		case "tool":
+			return {
+				containerClass:
+					"border-border/80 bg-muted/50 dark:border-border/80 dark:bg-muted/30",
+				badgeClass:
+					"border-border bg-muted text-muted-foreground dark:border-border/80 dark:bg-muted/50 dark:text-foreground",
+			};
+		default:
+			return {
+				containerClass: "border-border/80 bg-card/80",
+				badgeClass: "border-border bg-muted text-foreground",
+			};
+	}
 }
 
 function normalizeErrorMessage(err: unknown) {
@@ -363,6 +499,8 @@ type RealtimeStatusFilter =
 	| "succeeded"
 	| "canceled";
 
+type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
+
 const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPE = "brief.daily_slot";
 const STREAM_REFRESH_DELAY_MS = 600;
@@ -375,7 +513,7 @@ type JobManagementProps = {
 };
 
 export function JobManagement({ currentUserId }: JobManagementProps) {
-	const [tab, setTab] = useState<"realtime" | "scheduled">("realtime");
+	const [tab, setTab] = useState<"realtime" | "scheduled" | "llm">("realtime");
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -396,6 +534,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
 	const [scheduledRunsLoading, setScheduledRunsLoading] = useState(false);
 
+	const [llmStatus, setLlmStatus] =
+		useState<AdminLlmSchedulerStatusResponse | null>(null);
+	const [llmStatusFilter, setLlmStatusFilter] =
+		useState<LlmStatusFilter>("all");
+	const [llmSourceFilter, setLlmSourceFilter] = useState("");
+	const [llmRequestedByFilter, setLlmRequestedByFilter] = useState("");
+	const [llmStartedFromFilter, setLlmStartedFromFilter] = useState("");
+	const [llmStartedToFilter, setLlmStartedToFilter] = useState("");
+	const [llmCalls, setLlmCalls] = useState<AdminLlmCallItem[]>([]);
+	const [llmCallTotal, setLlmCallTotal] = useState(0);
+	const [llmCallPage, setLlmCallPage] = useState(1);
+	const [llmCallsLoading, setLlmCallsLoading] = useState(false);
+	const [llmDetail, setLlmDetail] = useState<AdminLlmCallDetailResponse | null>(
+		null,
+	);
+	const [llmDetailLoading, setLlmDetailLoading] = useState(false);
+
 	const [detailTask, setDetailTask] =
 		useState<AdminRealtimeTaskDetailResponse | null>(null);
 	const [detailLoading, setDetailLoading] = useState(false);
@@ -403,10 +558,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 
 	const detailTaskIdRef = useRef<string | null>(null);
+	const llmDetailIdRef = useRef<string | null>(null);
 	const streamRefreshTimerRef = useRef<number | null>(null);
 	const streamRefreshInFlightRef = useRef(false);
 	const streamPendingFullRefreshRef = useRef(false);
 	const streamPendingDetailTaskIdRef = useRef<string | null>(null);
+	const streamPendingLlmRefreshRef = useRef(false);
+	const streamPendingLlmDetailCallIdRef = useRef<string | null>(null);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
@@ -415,6 +573,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const scheduledRunTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(scheduledRunTotal / TASK_PAGE_SIZE)),
 		[scheduledRunTotal],
+	);
+	const llmCallTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(llmCallTotal / TASK_PAGE_SIZE)),
+		[llmCallTotal],
 	);
 	const taskEvents = useMemo(() => {
 		if (!detailTask) return [];
@@ -429,10 +591,87 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		() => (detailTask ? taskStatusTone(detailTask.task.status) : null),
 		[detailTask],
 	);
+	const llmInputMessages = useMemo(() => {
+		if (!llmDetail) return [];
+		const parsed = parseLlmConversationMessages(llmDetail.input_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (llmDetail.prompt_text.trim()) {
+			return [{ role: "input", content: llmDetail.prompt_text }];
+		}
+		return [];
+	}, [llmDetail]);
+	const llmOutputMessages = useMemo(() => {
+		if (!llmDetail) return [];
+		const parsed = parseLlmConversationMessages(llmDetail.output_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (llmDetail.response_text?.trim()) {
+			return [{ role: "assistant", content: llmDetail.response_text }];
+		}
+		return [];
+	}, [llmDetail]);
+	const llmConversationTimeline = useMemo<LlmConversationTimelineItem[]>(() => {
+		const timeline: LlmConversationTimelineItem[] = [];
+		const turnCount = Math.max(
+			llmInputMessages.length,
+			llmOutputMessages.length,
+		);
+		for (let index = 0; index < turnCount; index += 1) {
+			const turn = index + 1;
+			const inputMessage = llmInputMessages[index];
+			if (inputMessage) {
+				timeline.push({
+					turn,
+					source: "input",
+					role: inputMessage.role,
+					content: inputMessage.content,
+				});
+			}
+			const outputMessage = llmOutputMessages[index];
+			if (outputMessage) {
+				timeline.push({
+					turn,
+					source: "output",
+					role: outputMessage.role,
+					content: outputMessage.content,
+				});
+			}
+		}
+		return timeline;
+	}, [llmInputMessages, llmOutputMessages]);
+	const llmConversationTurnCount = useMemo(
+		() =>
+			llmConversationTimeline.reduce(
+				(maxTurn, item) => Math.max(maxTurn, item.turn),
+				0,
+			),
+		[llmConversationTimeline],
+	);
+	const llmAssistantMessageCount = useMemo(
+		() =>
+			llmConversationTimeline.filter((item) => item.role === "assistant")
+				.length,
+		[llmConversationTimeline],
+	);
+	const lastAssistantTimelineIndex = useMemo(() => {
+		for (
+			let index = llmConversationTimeline.length - 1;
+			index >= 0;
+			index -= 1
+		) {
+			if (llmConversationTimeline[index]?.role === "assistant") {
+				return index;
+			}
+		}
+		return -1;
+	}, [llmConversationTimeline]);
 
 	useEffect(() => {
 		detailTaskIdRef.current = detailTask?.task.id ?? null;
 	}, [detailTask]);
+
+	useEffect(() => {
+		llmDetailIdRef.current = llmDetail?.id ?? null;
+	}, [llmDetail]);
 
 	const loadOverview = useCallback(async () => {
 		const res = await apiGetAdminJobsOverview();
@@ -479,6 +718,48 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		}
 	}, [scheduledRunPage, scheduledRunStatusFilter]);
 
+	const loadLlmSchedulerStatus = useCallback(async () => {
+		const res = await apiGetAdminLlmSchedulerStatus();
+		setLlmStatus(res);
+	}, []);
+
+	const loadLlmCalls = useCallback(async () => {
+		setLlmCallsLoading(true);
+		try {
+			const params = new URLSearchParams();
+			params.set("status", llmStatusFilter);
+			params.set("page", String(llmCallPage));
+			params.set("page_size", String(TASK_PAGE_SIZE));
+			if (llmSourceFilter.trim()) {
+				params.set("source", llmSourceFilter.trim());
+			}
+			const requestedBy = Number(llmRequestedByFilter.trim());
+			if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
+				params.set("requested_by", String(requestedBy));
+			}
+			const startedFromUtc = localInputToUtc(llmStartedFromFilter);
+			if (startedFromUtc) {
+				params.set("started_from", startedFromUtc);
+			}
+			const startedToUtc = localInputToUtc(llmStartedToFilter);
+			if (startedToUtc) {
+				params.set("started_to", startedToUtc);
+			}
+			const res = await apiGetAdminLlmCalls(params);
+			setLlmCalls(res.items);
+			setLlmCallTotal(res.total);
+		} finally {
+			setLlmCallsLoading(false);
+		}
+	}, [
+		llmStatusFilter,
+		llmCallPage,
+		llmSourceFilter,
+		llmRequestedByFilter,
+		llmStartedFromFilter,
+		llmStartedToFilter,
+	]);
+
 	const loadAll = useCallback(async () => {
 		setError(null);
 		try {
@@ -486,15 +767,28 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				loadOverview(),
 				loadRealtimeTasks(),
 				loadScheduledRuns(),
+				loadLlmSchedulerStatus(),
+				loadLlmCalls(),
 			]);
 		} catch (err) {
 			setError(normalizeErrorMessage(err));
 		}
-	}, [loadOverview, loadRealtimeTasks, loadScheduledRuns]);
+	}, [
+		loadOverview,
+		loadRealtimeTasks,
+		loadScheduledRuns,
+		loadLlmSchedulerStatus,
+		loadLlmCalls,
+	]);
 
 	const refreshTaskDetail = useCallback(async (taskId: string) => {
 		const detail = await apiGetAdminRealtimeTaskDetail(taskId);
 		setDetailTask(detail);
+	}, []);
+
+	const refreshLlmDetail = useCallback(async (callId: string) => {
+		const detail = await apiGetAdminLlmCallDetail(callId);
+		setLlmDetail(detail);
 	}, []);
 
 	const drainStreamRefreshQueue = useCallback(async () => {
@@ -504,25 +798,43 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		streamRefreshInFlightRef.current = true;
 		try {
 			const needFullRefresh = streamPendingFullRefreshRef.current;
+			const needLlmRefresh = streamPendingLlmRefreshRef.current;
 			const pendingDetailTaskId = streamPendingDetailTaskIdRef.current;
+			const pendingLlmDetailCallId = streamPendingLlmDetailCallIdRef.current;
 			streamPendingFullRefreshRef.current = false;
+			streamPendingLlmRefreshRef.current = false;
 			streamPendingDetailTaskIdRef.current = null;
+			streamPendingLlmDetailCallIdRef.current = null;
 
 			if (needFullRefresh) {
 				await Promise.all([
 					loadOverview(),
 					loadRealtimeTasks(),
 					loadScheduledRuns(),
+					loadLlmSchedulerStatus(),
+					loadLlmCalls(),
 				]);
 				const activeDetailTaskId = detailTaskIdRef.current;
 				if (activeDetailTaskId) {
 					await refreshTaskDetail(activeDetailTaskId);
 				}
+				const activeLlmDetailId = llmDetailIdRef.current;
+				if (activeLlmDetailId) {
+					await refreshLlmDetail(activeLlmDetailId);
+				}
 				return;
+			}
+
+			if (needLlmRefresh) {
+				await Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]);
 			}
 
 			if (pendingDetailTaskId) {
 				await refreshTaskDetail(pendingDetailTaskId);
+			}
+
+			if (pendingLlmDetailCallId) {
+				await refreshLlmDetail(pendingLlmDetailCallId);
 			}
 		} catch (err) {
 			setError(normalizeErrorMessage(err));
@@ -530,20 +842,37 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			streamRefreshInFlightRef.current = false;
 			if (
 				streamPendingFullRefreshRef.current ||
-				streamPendingDetailTaskIdRef.current
+				streamPendingLlmRefreshRef.current ||
+				streamPendingDetailTaskIdRef.current ||
+				streamPendingLlmDetailCallIdRef.current
 			) {
 				void drainStreamRefreshQueue();
 			}
 		}
-	}, [loadOverview, loadRealtimeTasks, loadScheduledRuns, refreshTaskDetail]);
+	}, [
+		loadOverview,
+		loadRealtimeTasks,
+		loadScheduledRuns,
+		loadLlmSchedulerStatus,
+		loadLlmCalls,
+		refreshTaskDetail,
+		refreshLlmDetail,
+	]);
 
 	const scheduleStreamRefresh = useCallback(
-		(mode: "all" | "detail", taskId?: string) => {
+		(mode: "all" | "detail" | "llm" | "llm_detail", id?: string) => {
 			if (mode === "all") {
 				streamPendingFullRefreshRef.current = true;
 				streamPendingDetailTaskIdRef.current = null;
-			} else if (taskId) {
-				streamPendingDetailTaskIdRef.current = taskId;
+				streamPendingLlmRefreshRef.current = false;
+				streamPendingLlmDetailCallIdRef.current = null;
+			} else if (mode === "detail" && id) {
+				streamPendingDetailTaskIdRef.current = id;
+			} else if (mode === "llm") {
+				streamPendingLlmRefreshRef.current = true;
+			} else if (mode === "llm_detail" && id) {
+				streamPendingLlmRefreshRef.current = true;
+				streamPendingLlmDetailCallIdRef.current = id;
 			}
 
 			if (streamRefreshTimerRef.current !== null) {
@@ -574,6 +903,15 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(normalizeErrorMessage(err));
 		});
 	}, [loadScheduledRuns]);
+
+	useEffect(() => {
+		setError(null);
+		void Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]).catch(
+			(err) => {
+				setError(normalizeErrorMessage(err));
+			},
+		);
+	}, [loadLlmSchedulerStatus, loadLlmCalls]);
 
 	useEffect(() => {
 		return () => {
@@ -637,8 +975,30 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				scheduleStreamRefresh("all");
 			};
+			const onLlmCallEvent = (evt: Event) => {
+				const message = evt as MessageEvent<string>;
+				let parsed: AdminLlmCallStreamEvent | null = null;
+				try {
+					parsed = JSON.parse(message.data) as AdminLlmCallStreamEvent;
+				} catch {
+					parsed = null;
+				}
+				if (!parsed) {
+					scheduleStreamRefresh("llm");
+					return;
+				}
+
+				const activeLlmDetailId = llmDetailIdRef.current;
+				if (activeLlmDetailId && activeLlmDetailId === parsed.call_id) {
+					scheduleStreamRefresh("llm_detail", activeLlmDetailId);
+					return;
+				}
+
+				scheduleStreamRefresh("llm");
+			};
 
 			nextSource.addEventListener("job.event", onJobEvent as EventListener);
+			nextSource.addEventListener("llm.call", onLlmCallEvent as EventListener);
 			nextSource.onopen = () => {
 				if (disposed) return;
 				setStreamStatus("connected");
@@ -647,6 +1007,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				nextSource.removeEventListener(
 					"job.event",
 					onJobEvent as EventListener,
+				);
+				nextSource.removeEventListener(
+					"llm.call",
+					onLlmCallEvent as EventListener,
 				);
 				closeSource();
 				if (disposed) return;
@@ -686,6 +1050,28 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		}
 	}, []);
 
+	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
+		setLlmDetailLoading(true);
+		setError(null);
+		try {
+			const detail = await apiGetAdminLlmCallDetail(callId);
+			setLlmDetail(detail);
+		} catch (err) {
+			setError(normalizeErrorMessage(err));
+		} finally {
+			setLlmDetailLoading(false);
+		}
+	}, []);
+
+	const onOpenParentTaskFromLlm = useCallback(
+		async (taskId: string | null) => {
+			if (!taskId) return;
+			setLlmDetail(null);
+			await onOpenTaskDetail(taskId);
+		},
+		[onOpenTaskDetail],
+	);
+
 	const onRetryTask = useCallback(
 		async (taskId: string) => {
 			setTaskActionBusyId(taskId);
@@ -696,6 +1082,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					loadOverview(),
 					loadRealtimeTasks(),
 					loadScheduledRuns(),
+					loadLlmSchedulerStatus(),
+					loadLlmCalls(),
 				]);
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
@@ -703,7 +1091,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				setTaskActionBusyId(null);
 			}
 		},
-		[loadOverview, loadRealtimeTasks, loadScheduledRuns],
+		[
+			loadOverview,
+			loadRealtimeTasks,
+			loadScheduledRuns,
+			loadLlmSchedulerStatus,
+			loadLlmCalls,
+		],
 	);
 
 	const onCancelTask = useCallback(
@@ -716,6 +1110,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					loadOverview(),
 					loadRealtimeTasks(),
 					loadScheduledRuns(),
+					loadLlmSchedulerStatus(),
+					loadLlmCalls(),
 				]);
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
@@ -723,7 +1119,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				setTaskActionBusyId(null);
 			}
 		},
-		[loadOverview, loadRealtimeTasks, loadScheduledRuns],
+		[
+			loadOverview,
+			loadRealtimeTasks,
+			loadScheduledRuns,
+			loadLlmSchedulerStatus,
+			loadLlmCalls,
+		],
 	);
 
 	return (
@@ -776,9 +1178,17 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					定时任务
 				</Button>
 				<Button
+					variant={tab === "llm" ? "default" : "outline"}
+					size="sm"
+					className="font-mono text-xs"
+					onClick={() => setTab("llm")}
+				>
+					LLM调度
+				</Button>
+				<Button
 					variant="secondary"
 					size="sm"
-					disabled={tasksLoading || scheduledRunsLoading}
+					disabled={tasksLoading || scheduledRunsLoading || llmCallsLoading}
 					onClick={() => void loadAll()}
 				>
 					刷新
@@ -1149,6 +1559,211 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				</Card>
 			) : null}
 
+			{tab === "llm" ? (
+				<Card>
+					<CardHeader>
+						<CardTitle>LLM 调度</CardTitle>
+						<CardDescription>
+							查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
+						</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-4">
+						<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+							<div className="bg-card/70 rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">调度器状态</p>
+								<p className="mt-1 text-sm font-semibold">
+									{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									节流{" "}
+									{formatDurationMs(llmStatus?.request_interval_ms ?? null)}
+								</p>
+							</div>
+							<div className="bg-card/70 rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">等待 / 进行中</p>
+								<p className="mt-1 text-sm font-semibold">
+									{formatCount(llmStatus?.waiting_calls)} /{" "}
+									{formatCount(llmStatus?.in_flight_calls)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									下一个发放槽位{" "}
+									{formatDurationMs(llmStatus?.next_slot_in_ms ?? null)}
+								</p>
+							</div>
+							<div className="bg-card/70 rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									近24h 调用 / 失败
+								</p>
+								<p className="mt-1 text-sm font-semibold">
+									{formatCount(llmStatus?.calls_24h)} /{" "}
+									{formatCount(llmStatus?.failed_24h)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									平均等待{" "}
+									{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
+								</p>
+							</div>
+						</div>
+
+						<div className="grid gap-2 lg:grid-cols-4">
+							<div className="relative w-full">
+								<select
+									value={llmStatusFilter}
+									onChange={(e) => {
+										setLlmCallPage(1);
+										setLlmStatusFilter(e.target.value as LlmStatusFilter);
+									}}
+									className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
+								>
+									<option value="all">状态：全部</option>
+									<option value="queued">状态：排队</option>
+									<option value="running">状态：运行中</option>
+									<option value="failed">状态：失败</option>
+									<option value="succeeded">状态：成功</option>
+								</select>
+								<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
+							</div>
+							<input
+								value={llmSourceFilter}
+								onChange={(e) => {
+									setLlmCallPage(1);
+									setLlmSourceFilter(e.target.value);
+								}}
+								placeholder="来源（source）"
+								className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
+							/>
+							<input
+								value={llmRequestedByFilter}
+								onChange={(e) => {
+									setLlmCallPage(1);
+									setLlmRequestedByFilter(e.target.value);
+								}}
+								placeholder="用户ID（requested_by）"
+								className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
+							/>
+							<div className="grid grid-cols-2 gap-2">
+								<input
+									type="datetime-local"
+									value={llmStartedFromFilter}
+									onChange={(e) => {
+										setLlmCallPage(1);
+										setLlmStartedFromFilter(e.target.value);
+									}}
+									className="bg-background h-9 rounded-md border px-2 text-xs outline-none"
+								/>
+								<input
+									type="datetime-local"
+									value={llmStartedToFilter}
+									onChange={(e) => {
+										setLlmCallPage(1);
+										setLlmStartedToFilter(e.target.value);
+									}}
+									className="bg-background h-9 rounded-md border px-2 text-xs outline-none"
+								/>
+							</div>
+						</div>
+
+						<p className="text-muted-foreground text-xs">
+							共 {formatCount(llmCallTotal)} 条调用
+						</p>
+
+						<div className="space-y-2">
+							{llmCallsLoading ? (
+								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
+									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
+									正在加载调用记录...
+								</p>
+							) : llmCalls.length === 0 ? (
+								<p className="text-muted-foreground text-sm">暂无调用记录。</p>
+							) : (
+								llmCalls.map((call) => {
+									const tone = taskStatusTone(call.status);
+									return (
+										<div
+											key={call.id}
+											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+										>
+											<div className="min-w-0">
+												<div className="flex flex-wrap items-center gap-2">
+													<p className="font-medium text-sm">{call.source}</p>
+													<span
+														className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
+													>
+														<span
+															className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+														/>
+														{taskStatusLabel(call.status)}
+													</span>
+												</div>
+												<p className="text-muted-foreground mt-1 text-xs">
+													模型：<span className="font-mono">{call.model}</span>
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													用户：{call.requested_by ?? "-"} · 重试次数：
+													{formatCount(call.attempt_count)}
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													等待 {formatDurationMs(call.scheduler_wait_ms)} · 首字{" "}
+													{formatDurationMs(call.first_token_wait_ms)} · 耗时{" "}
+													{formatDurationMs(call.duration_ms)}
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													Token 输入/输出/缓存：{formatCount(call.input_tokens)}{" "}
+													/ {formatCount(call.output_tokens)} /{" "}
+													{formatCount(call.cached_input_tokens)}
+												</p>
+												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+													ID: {call.id}
+												</p>
+											</div>
+											<div className="flex flex-wrap gap-2">
+												<Button
+													variant="outline"
+													disabled={llmDetailLoading}
+													onClick={() => void onOpenLlmCallDetail(call.id)}
+												>
+													详情
+												</Button>
+											</div>
+										</div>
+									);
+								})
+							)}
+						</div>
+
+						<div className="flex items-center justify-between">
+							<p className="text-muted-foreground text-xs">
+								第 {llmCallPage}/{llmCallTotalPages} 页
+							</p>
+							<div className="flex gap-2">
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={llmCallPage <= 1 || llmCallsLoading}
+									onClick={() =>
+										setLlmCallPage((prev) => Math.max(1, prev - 1))
+									}
+								>
+									上一页
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={llmCallPage >= llmCallTotalPages || llmCallsLoading}
+									onClick={() =>
+										setLlmCallPage((prev) =>
+											Math.min(llmCallTotalPages, prev + 1),
+										)
+									}
+								>
+									下一页
+								</Button>
+							</div>
+						</div>
+					</CardContent>
+				</Card>
+			) : null}
+
 			{detailTask ? (
 				<div className="fixed inset-0 z-40 flex">
 					<button
@@ -1157,7 +1772,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						aria-label="关闭任务详情"
 						onClick={() => setDetailTask(null)}
 					/>
-					<div className="bg-card relative h-full w-full max-w-3xl border-l p-5 shadow-2xl">
+					<div className="bg-card relative h-full w-full max-w-4xl border-l p-5 shadow-2xl">
 						<div className="flex items-start justify-between gap-3">
 							<div className="min-w-0">
 								<h3 className="text-lg font-semibold tracking-tight">
@@ -1267,6 +1882,207 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										</div>
 									))
 							)}
+						</div>
+					</div>
+				</div>
+			) : null}
+
+			{llmDetail ? (
+				<div className="fixed inset-0 z-40 flex">
+					<button
+						type="button"
+						className="flex-1 bg-black/35"
+						aria-label="关闭 LLM 调用详情"
+						onClick={() => setLlmDetail(null)}
+					/>
+					<div className="bg-card relative h-full w-full max-w-3xl border-l p-5 shadow-2xl">
+						<div className="flex items-start justify-between gap-3">
+							<div className="min-w-0">
+								<h3 className="text-lg font-semibold tracking-tight">
+									LLM 调用详情
+								</h3>
+								<p className="text-muted-foreground mt-1 text-sm">
+									来源：<span className="font-mono">{llmDetail.source}</span>
+								</p>
+								<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
+									{llmDetail.id}
+								</p>
+							</div>
+							<Button variant="outline" onClick={() => setLlmDetail(null)}>
+								关闭
+							</Button>
+						</div>
+
+						<div className="mt-4 grid gap-2 md:grid-cols-2">
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">状态 / 模型</p>
+								<p className="mt-1 font-medium">
+									{taskStatusLabel(llmDetail.status)} · {llmDetail.model}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">用户 / 父任务</p>
+								<p className="mt-1 font-medium">
+									用户 #{llmDetail.requested_by ?? "-"}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									父任务 {llmDetail.parent_task_id ?? "-"}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">耗时 / 重试</p>
+								<p className="mt-1 font-medium">
+									{formatDurationMs(llmDetail.duration_ms)} /{" "}
+									{formatCount(llmDetail.attempt_count)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									Token（输入 / 输出 / 缓存）
+								</p>
+								<p className="mt-1 font-medium">
+									{formatCount(llmDetail.input_tokens)} /{" "}
+									{formatCount(llmDetail.output_tokens)} /{" "}
+									{formatCount(llmDetail.cached_input_tokens)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									总计 {formatCount(llmDetail.total_tokens)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">创建 / 完成</p>
+								<p className="mt-1 font-medium">
+									{formatLocalDateTime(llmDetail.created_at)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									完成 {formatLocalDateTime(llmDetail.finished_at)}
+								</p>
+							</div>
+						</div>
+
+						<div className="mt-3 flex flex-wrap gap-2">
+							<Button
+								variant="outline"
+								disabled={!llmDetail.parent_task_id}
+								onClick={() =>
+									void onOpenParentTaskFromLlm(llmDetail.parent_task_id)
+								}
+							>
+								查看父任务
+							</Button>
+						</div>
+
+						<div className="mt-4 space-y-3 border-t pt-4">
+							<div>
+								<p className="text-muted-foreground text-xs">
+									Conversation Timeline
+								</p>
+								{llmConversationTimeline.length === 0 ? (
+									<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+										-
+									</pre>
+								) : (
+									<div className="bg-muted/20 mt-1 rounded-xl border">
+										<div className="border-b px-3 py-2">
+											<div className="flex flex-wrap items-center justify-between gap-2">
+												<p className="text-muted-foreground text-[11px] font-medium">
+													多轮消息
+												</p>
+												<div className="flex flex-wrap items-center gap-1 text-[10px]">
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														消息 {formatCount(llmConversationTimeline.length)}
+													</span>
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														轮次 {formatCount(llmConversationTurnCount)}
+													</span>
+													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+														助手 {formatCount(llmAssistantMessageCount)}
+													</span>
+												</div>
+											</div>
+										</div>
+										<div className="max-h-[31vh] space-y-2.5 overflow-auto px-3 py-3 pr-2">
+											{llmConversationTimeline.map((message, index) => {
+												const isAssistantOutput =
+													message.source === "output" &&
+													message.role === "assistant";
+												const showAnswerLatency =
+													index === lastAssistantTimelineIndex;
+												const tone = llmRoleTone(
+													message.role,
+													isAssistantOutput,
+												);
+												return (
+													<div
+														key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+														className={`flex ${
+															isAssistantOutput
+																? "justify-end pl-5"
+																: "justify-start pr-5"
+														}`}
+													>
+														<article
+															className={`w-full max-w-[95%] rounded-2xl border px-3.5 py-2.5 shadow-sm ${tone.containerClass}`}
+														>
+															<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+																<span
+																	className={`inline-flex items-center rounded-md border px-1.5 py-0.5 font-semibold ${tone.badgeClass}`}
+																>
+																	{llmRoleLabel(message.role)}
+																</span>
+																<span className="text-muted-foreground">
+																	第 {formatCount(message.turn)} 轮
+																</span>
+																{showAnswerLatency ? (
+																	<span className="text-muted-foreground ml-auto text-[10px] font-medium">
+																		等待{" "}
+																		{formatDurationMs(
+																			llmDetail.scheduler_wait_ms,
+																		)}{" "}
+																		· 首字{" "}
+																		{formatDurationMs(
+																			llmDetail.first_token_wait_ms,
+																		)}
+																	</span>
+																) : null}
+															</div>
+															<div className="mt-1.5 text-[13px] leading-5 whitespace-pre-wrap break-words">
+																{message.content}
+															</div>
+														</article>
+													</div>
+												);
+											})}
+										</div>
+									</div>
+								)}
+							</div>
+							{llmConversationTimeline.length === 0 ? (
+								<>
+									<div>
+										<p className="text-muted-foreground text-xs">
+											Input Messages
+										</p>
+										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+											{llmDetail.prompt_text || "-"}
+										</pre>
+									</div>
+									<div>
+										<p className="text-muted-foreground text-xs">
+											Output Messages
+										</p>
+										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+											{llmDetail.response_text ?? "-"}
+										</pre>
+									</div>
+								</>
+							) : null}
+							<div>
+								<p className="text-muted-foreground text-xs">Error</p>
+								<pre className="bg-muted/40 mt-1 max-h-[12vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+									{llmDetail.error_text ?? "-"}
+								</pre>
+							</div>
 						</div>
 					</div>
 				</div>

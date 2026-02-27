@@ -49,6 +49,8 @@ pub struct EnqueuedTask {
 struct TaskRow {
     id: String,
     task_type: String,
+    source: String,
+    requested_by: Option<i64>,
     payload_json: String,
     cancel_requested: i64,
 }
@@ -502,6 +504,18 @@ struct AdminJobEventStreamItem {
     created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminLlmCallEventStreamItem {
+    event_id: i64,
+    call_id: String,
+    status: String,
+    source: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    event_type: String,
+    created_at: String,
+}
+
 pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
     let events = stream! {
         #[derive(Debug, sqlx::FromRow)]
@@ -514,8 +528,26 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
             created_at: String,
         }
 
-        let mut last_id = sqlx::query_scalar::<_, i64>(
+        #[derive(Debug, sqlx::FromRow)]
+        struct LlmEventRow {
+            id: i64,
+            call_id: String,
+            status: String,
+            source: String,
+            requested_by: Option<i64>,
+            parent_task_id: Option<String>,
+            event_type: String,
+            created_at: String,
+        }
+
+        let mut last_job_event_id = sqlx::query_scalar::<_, i64>(
             r#"SELECT COALESCE(MAX(id), 0) FROM job_task_events"#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+        let mut last_llm_event_id = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(id), 0) FROM llm_call_events"#,
         )
         .fetch_one(&state.pool)
         .await
@@ -526,7 +558,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
         yield Ok::<Event, Infallible>(Event::default().comment("stream-ready"));
 
         loop {
-            let rows = sqlx::query_as::<_, EventRow>(
+            let job_rows = sqlx::query_as::<_, EventRow>(
                 r#"
                 SELECT
                   e.id,
@@ -542,13 +574,13 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                 LIMIT 200
                 "#,
             )
-            .bind(last_id)
+            .bind(last_job_event_id)
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
 
-            for row in rows {
-                last_id = row.id;
+            for row in job_rows {
+                last_job_event_id = row.id;
                 let payload = AdminJobEventStreamItem {
                     event_id: row.id,
                     task_id: row.task_id,
@@ -560,8 +592,51 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                 let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
                 yield Ok::<Event, Infallible>(
                     Event::default()
-                        .id(last_id.to_string())
+                        .id(format!("job-{}", row.id))
                         .event("job.event")
+                        .data(data),
+                );
+            }
+
+            let llm_rows = sqlx::query_as::<_, LlmEventRow>(
+                r#"
+                SELECT
+                  id,
+                  call_id,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  event_type,
+                  created_at
+                FROM llm_call_events
+                WHERE id > ?
+                ORDER BY id ASC
+                LIMIT 200
+                "#,
+            )
+            .bind(last_llm_event_id)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap_or_default();
+
+            for row in llm_rows {
+                last_llm_event_id = row.id;
+                let payload = AdminLlmCallEventStreamItem {
+                    event_id: row.id,
+                    call_id: row.call_id,
+                    status: row.status,
+                    source: row.source,
+                    requested_by: row.requested_by,
+                    parent_task_id: row.parent_task_id,
+                    event_type: row.event_type,
+                    created_at: row.created_at,
+                };
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(format!("llm-{}", row.id))
+                        .event("llm.call")
                         .data(data),
                 );
             }
@@ -625,7 +700,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
 
     let task = sqlx::query_as::<_, TaskRow>(
         r#"
-        SELECT id, task_type, payload_json, cancel_requested
+        SELECT id, task_type, source, requested_by, payload_json, cancel_requested
         FROM job_tasks
         WHERE id = ?
         LIMIT 1
@@ -665,7 +740,17 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
     let payload: Value = serde_json::from_str(&task.payload_json)
         .with_context(|| format!("invalid payload json for task {}", task.id))?;
 
-    let result = execute_task(state.as_ref(), &task.id, &task.task_type, &payload).await;
+    let context = ai::LlmCallContext {
+        source: format!("job.{}", task.source),
+        requested_by: task.requested_by,
+        parent_task_id: Some(task.id.clone()),
+        parent_task_type: Some(task.task_type.clone()),
+    };
+    let result = ai::with_llm_call_context(
+        context,
+        execute_task(state.as_ref(), &task.id, &task.task_type, &payload),
+    )
+    .await;
 
     if is_task_cancel_requested(state.as_ref(), &task.id)
         .await
