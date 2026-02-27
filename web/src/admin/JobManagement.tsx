@@ -181,16 +181,16 @@ function llmRoleTone(role: string, isAssistantOutput: boolean): LlmRoleTone {
 		case "input":
 			return {
 				containerClass:
-					"border-sky-300/70 bg-sky-50/70 dark:border-sky-500/50 dark:bg-sky-500/10",
+					"border-border/80 bg-background/70 dark:border-border/80 dark:bg-background/30",
 				badgeClass:
-					"border-sky-300/80 bg-sky-100 text-sky-800 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100",
+					"border-border bg-muted text-muted-foreground dark:border-border/80 dark:bg-muted/50 dark:text-foreground",
 			};
 		case "tool":
 			return {
 				containerClass:
-					"border-amber-300/70 bg-amber-50/80 dark:border-amber-500/50 dark:bg-amber-500/10",
+					"border-border/80 bg-muted/50 dark:border-border/80 dark:bg-muted/30",
 				badgeClass:
-					"border-amber-300/90 bg-amber-100 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100",
+					"border-border bg-muted text-muted-foreground dark:border-border/80 dark:bg-muted/50 dark:text-foreground",
 			};
 		default:
 			return {
