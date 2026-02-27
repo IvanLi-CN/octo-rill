@@ -65,7 +65,22 @@
 
 ```json
 {
-  "task": { "id": "...", "task_type": "...", "status": "..." },
+  "task": {
+    "id": "...",
+    "task_type": "translate.release.batch",
+    "status": "running",
+    "source": "api.translate_release_batch",
+    "requested_by": 1,
+    "parent_task_id": null,
+    "cancel_requested": false,
+    "error_message": null,
+    "payload_json": "{\"user_id\":1,\"release_ids\":[290836643]}",
+    "result_json": "{\"total\":1,\"ready\":1,\"missing\":0,\"disabled\":0,\"error\":0}",
+    "created_at": "2026-02-25T00:00:00Z",
+    "started_at": "2026-02-25T00:00:01Z",
+    "finished_at": "2026-02-25T00:00:05Z",
+    "updated_at": "2026-02-25T00:00:05Z"
+  },
   "events": [
     {
       "id": 1,
@@ -76,6 +91,8 @@
   ]
 }
 ```
+
+`payload_json` 与 `result_json` 由前端任务详情页用于按 `task_type` 渲染专属业务信息，不再依赖单一通用文案。
 
 ### `PATCH /api/admin/jobs/scheduled/{hour_utc}` request
 

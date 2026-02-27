@@ -547,10 +547,19 @@ pub async fn admin_jobs_overview(
     }))
 }
 
+pub async fn admin_jobs_events_sse(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Response, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    Ok(jobs::admin_jobs_sse_response(state))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminRealtimeTasksQuery {
     status: Option<String>,
     task_type: Option<String>,
+    exclude_task_type: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
 }
@@ -565,6 +574,24 @@ pub struct AdminRealtimeTaskItem {
     parent_task_id: Option<String>,
     cancel_requested: bool,
     error_message: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminRealtimeTaskDetailItem {
+    id: String,
+    task_type: String,
+    status: String,
+    source: String,
+    requested_by: Option<i64>,
+    parent_task_id: Option<String>,
+    cancel_requested: bool,
+    error_message: Option<String>,
+    payload_json: String,
+    result_json: Option<String>,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -591,6 +618,7 @@ pub async fn admin_list_realtime_tasks(
     let offset = admin_users_offset(page, page_size)?;
     let status = query.status.unwrap_or_else(|| "all".to_owned());
     let task_type = query.task_type.unwrap_or_default();
+    let exclude_task_type = query.exclude_task_type.unwrap_or_default();
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"
@@ -598,12 +626,15 @@ pub async fn admin_list_realtime_tasks(
         FROM job_tasks
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR task_type = ?)
+          AND (? = '' OR task_type != ?)
         "#,
     )
     .bind(status.as_str())
     .bind(status.as_str())
     .bind(task_type.as_str())
     .bind(task_type.as_str())
+    .bind(exclude_task_type.as_str())
+    .bind(exclude_task_type.as_str())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -626,6 +657,7 @@ pub async fn admin_list_realtime_tasks(
         FROM job_tasks
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR task_type = ?)
+          AND (? = '' OR task_type != ?)
         ORDER BY created_at DESC, id DESC
         LIMIT ? OFFSET ?
         "#,
@@ -634,6 +666,8 @@ pub async fn admin_list_realtime_tasks(
     .bind(status.as_str())
     .bind(task_type.as_str())
     .bind(task_type.as_str())
+    .bind(exclude_task_type.as_str())
+    .bind(exclude_task_type.as_str())
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.pool)
@@ -658,7 +692,7 @@ pub struct AdminTaskEventItem {
 
 #[derive(Debug, Serialize)]
 pub struct AdminRealtimeTaskDetailResponse {
-    task: AdminRealtimeTaskItem,
+    task: AdminRealtimeTaskDetailItem,
     events: Vec<AdminTaskEventItem>,
 }
 
@@ -669,7 +703,7 @@ pub async fn admin_get_realtime_task_detail(
 ) -> Result<Json<AdminRealtimeTaskDetailResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
 
-    let task = sqlx::query_as::<_, AdminRealtimeTaskItem>(
+    let task = sqlx::query_as::<_, AdminRealtimeTaskDetailItem>(
         r#"
         SELECT
           id,
@@ -680,6 +714,8 @@ pub async fn admin_get_realtime_task_detail(
           parent_task_id,
           cancel_requested,
           error_message,
+          payload_json,
+          result_json,
           created_at,
           started_at,
           finished_at,
@@ -3104,6 +3140,22 @@ async fn send_batch_stream_event(
     tx.send(Ok(Bytes::from(payload))).await.is_ok()
 }
 
+fn accumulate_batch_item_stats(
+    item: &TranslateBatchItem,
+    ready_count: &mut usize,
+    disabled_count: &mut usize,
+    missing_count: &mut usize,
+    error_count: &mut usize,
+) {
+    match item.status.as_str() {
+        "ready" => *ready_count += 1,
+        "disabled" => *disabled_count += 1,
+        "missing" => *missing_count += 1,
+        "error" => *error_count += 1,
+        _ => {}
+    }
+}
+
 fn translate_response_from_batch_item(
     item: TranslateBatchItem,
 ) -> Result<TranslateResponse, ApiError> {
@@ -3650,7 +3702,10 @@ fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
         .map(|s| s.to_owned())
         .or_else(|| {
             let s = raw.trim();
-            if s.is_empty() {
+            // Fallback to raw text only when it's plain markdown/plaintext.
+            // If the model output looks like a JSON blob but failed to parse,
+            // treat it as invalid instead of persisting broken cache content.
+            if s.is_empty() || looks_like_json_blob(s) {
                 None
             } else {
                 Some(s.to_owned())
@@ -3770,16 +3825,37 @@ fn normalize_translation_fields(
     raw_title: Option<String>,
     raw_summary: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    let title = raw_title
+    let mut title = raw_title
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    let summary = raw_summary
+    let mut summary = raw_summary
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+
+    // Guard against model outputs where summary field accidentally embeds a full JSON blob.
+    if let Some(raw) = summary.as_deref() {
+        let trimmed = raw.trim_start();
+        let looks_like_embedded_json = trimmed.starts_with('{')
+            || trimmed.starts_with("\"{")
+            || trimmed.contains("\"summary_md\"")
+            || trimmed.contains("\"title_zh\"")
+            || trimmed.contains("\"body_md\"");
+        if looks_like_embedded_json {
+            if let Some((blob_title, blob_summary)) = extract_translation_from_json_blob(raw) {
+                if title.is_none() {
+                    title = blob_title;
+                }
+                summary = blob_summary;
+            } else {
+                summary = None;
+            }
+        }
+    }
+
     (title, summary)
 }
 
@@ -3987,7 +4063,18 @@ struct TranslationCacheRow {
 
 fn looks_like_json_blob(raw: &str) -> bool {
     let trimmed = raw.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with("\"{")
+    if trimmed.starts_with('{') || trimmed.starts_with("\"{") {
+        return true;
+    }
+
+    let unfenced = strip_markdown_code_fence(trimmed).trim_start();
+    if unfenced.starts_with('{') || unfenced.starts_with("\"{") {
+        return true;
+    }
+
+    trimmed.contains("\"summary_md\"")
+        || trimmed.contains("\"title_zh\"")
+        || trimmed.contains("\"body_md\"")
 }
 
 fn release_cache_entry_reusable(cache: &TranslationCacheRow, excerpt: &str) -> bool {
@@ -4252,13 +4339,41 @@ async fn translate_releases_batch_internal(
         .collect())
 }
 
+pub async fn translate_releases_batch_for_user(
+    state: &AppState,
+    user_id: i64,
+    release_ids: &[i64],
+) -> Result<TranslateBatchResponse, ApiError> {
+    let items = translate_releases_batch_internal(state, user_id, release_ids).await?;
+    Ok(TranslateBatchResponse { items })
+}
+
 async fn translate_releases_batch_stream_worker(
     state: Arc<AppState>,
     user_id: i64,
     release_ids: Vec<i64>,
+    task_id: String,
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
+    let mut ready_count = 0usize;
+    let mut disabled_count = 0usize;
+    let mut missing_count = 0usize;
+    let mut error_count = 0usize;
+
     let result = async {
+        jobs::append_task_event(
+            state.as_ref(),
+            task_id.as_str(),
+            "task.progress",
+            json!({
+                "task_id": task_id.as_str(),
+                "stage": "collect",
+                "total_releases": release_ids.len(),
+            }),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
         if state.config.ai.is_none() {
             for release_id in &release_ids {
                 let item = TranslateBatchItem {
@@ -4273,16 +4388,37 @@ async fn translate_releases_batch_stream_worker(
                     &tx,
                     TranslateBatchStreamEvent {
                         event: "item",
-                        item: Some(item),
+                        item: Some(item.clone()),
                         error: None,
                     },
                 )
                 .await
                 {
-                    return Ok::<(), ApiError>(());
+                    return Err(ApiError::internal("stream client disconnected"));
                 }
+
+                accumulate_batch_item_stats(
+                    &item,
+                    &mut ready_count,
+                    &mut disabled_count,
+                    &mut missing_count,
+                    &mut error_count,
+                );
+                jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.progress",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "stage": "release",
+                        "release_id": item.id,
+                        "item_status": item.status,
+                    }),
+                )
+                .await
+                .map_err(ApiError::internal)?;
             }
-            let _ = send_batch_stream_event(
+            if !send_batch_stream_event(
                 &tx,
                 TranslateBatchStreamEvent {
                     event: "done",
@@ -4290,7 +4426,10 @@ async fn translate_releases_batch_stream_worker(
                     error: None,
                 },
             )
-            .await;
+            .await
+            {
+                return Err(ApiError::internal("stream client disconnected"));
+            }
             return Ok(());
         }
 
@@ -4311,14 +4450,35 @@ async fn translate_releases_batch_stream_worker(
                 &tx,
                 TranslateBatchStreamEvent {
                     event: "item",
-                    item: Some(item),
+                    item: Some(item.clone()),
                     error: None,
                 },
             )
             .await
             {
-                return Ok(());
+                return Err(ApiError::internal("stream client disconnected"));
             }
+
+            accumulate_batch_item_stats(
+                &item,
+                &mut ready_count,
+                &mut disabled_count,
+                &mut missing_count,
+                &mut error_count,
+            );
+            jobs::append_task_event(
+                state.as_ref(),
+                task_id.as_str(),
+                "task.progress",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "stage": "release",
+                    "release_id": item.id,
+                    "item_status": item.status,
+                }),
+            )
+            .await
+            .map_err(ApiError::internal)?;
         }
 
         if !prepared.pending.is_empty() {
@@ -4342,7 +4502,7 @@ async fn translate_releases_batch_stream_worker(
                 )
                 .await
                 {
-                    return Ok(());
+                    return Err(ApiError::internal("stream client disconnected"));
                 }
             }
 
@@ -4384,19 +4544,40 @@ async fn translate_releases_batch_stream_worker(
                         &tx,
                         TranslateBatchStreamEvent {
                             event: "item",
-                            item: Some(out),
+                            item: Some(out.clone()),
                             error: None,
                         },
                     )
                     .await
                     {
-                        return Ok(());
+                        return Err(ApiError::internal("stream client disconnected"));
                     }
+
+                    accumulate_batch_item_stats(
+                        &out,
+                        &mut ready_count,
+                        &mut disabled_count,
+                        &mut missing_count,
+                        &mut error_count,
+                    );
+                    jobs::append_task_event(
+                        state.as_ref(),
+                        task_id.as_str(),
+                        "task.progress",
+                        json!({
+                            "task_id": task_id.as_str(),
+                            "stage": "release",
+                            "release_id": out.id,
+                            "item_status": out.status,
+                        }),
+                    )
+                    .await
+                    .map_err(ApiError::internal)?;
                 }
             }
         }
 
-        let _ = send_batch_stream_event(
+        if !send_batch_stream_event(
             &tx,
             TranslateBatchStreamEvent {
                 event: "done",
@@ -4404,21 +4585,74 @@ async fn translate_releases_batch_stream_worker(
                 error: None,
             },
         )
-        .await;
+        .await
+        {
+            return Err(ApiError::internal("stream client disconnected"));
+        }
         Ok::<(), ApiError>(())
     }
     .await;
 
-    if let Err(err) = result {
-        let _ = send_batch_stream_event(
-            &tx,
-            TranslateBatchStreamEvent {
-                event: "error",
-                item: None,
-                error: Some(format!("{}: stream worker failed", err.code())),
-            },
-        )
-        .await;
+    match result {
+        Ok(()) => {
+            let summary = json!({
+                "total": release_ids.len(),
+                "ready": ready_count,
+                "disabled": disabled_count,
+                "missing": missing_count,
+                "error": error_count,
+            });
+            let _ = jobs::complete_task(
+                state.as_ref(),
+                task_id.as_str(),
+                jobs::STATUS_SUCCEEDED,
+                Some(summary.clone()),
+                None,
+            )
+            .await;
+            let _ = jobs::append_task_event(
+                state.as_ref(),
+                task_id.as_str(),
+                "task.completed",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "status": jobs::STATUS_SUCCEEDED,
+                    "summary": summary,
+                }),
+            )
+            .await;
+        }
+        Err(err) => {
+            let error_message = format!("{}: stream worker failed", err.code());
+            let _ = jobs::complete_task(
+                state.as_ref(),
+                task_id.as_str(),
+                jobs::STATUS_FAILED,
+                None,
+                Some(error_message.clone()),
+            )
+            .await;
+            let _ = jobs::append_task_event(
+                state.as_ref(),
+                task_id.as_str(),
+                "task.completed",
+                json!({
+                    "task_id": task_id.as_str(),
+                    "status": jobs::STATUS_FAILED,
+                    "error": error_message,
+                }),
+            )
+            .await;
+            let _ = send_batch_stream_event(
+                &tx,
+                TranslateBatchStreamEvent {
+                    event: "error",
+                    item: None,
+                    error: Some(error_message),
+                },
+            )
+            .await;
+        }
     }
 }
 
@@ -4438,13 +4672,37 @@ pub async fn translate_releases_batch_stream(
     session: Session,
     Json(req): Json<TranslateReleasesBatchRequest>,
 ) -> Result<Response, ApiError> {
-    let user_id = require_user_id(&session).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
+    let tracking_task = jobs::start_inline_task(
+        state.as_ref(),
+        jobs::NewTask {
+            task_type: jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned(),
+            payload: json!({
+                "user_id": user_id,
+                "release_ids": release_ids.clone(),
+            }),
+            source: "api.translate_releases_batch_stream".to_owned(),
+            requested_by: Some(user_id),
+            parent_task_id: None,
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
     let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(64);
     let state_cloned = state.clone();
+    let tracking_task_id = tracking_task.task_id;
 
     tokio::spawn(async move {
-        translate_releases_batch_stream_worker(state_cloned, user_id, release_ids, tx).await;
+        translate_releases_batch_stream_worker(
+            state_cloned,
+            user_id,
+            release_ids,
+            tracking_task_id,
+            tx,
+        )
+        .await;
     });
 
     let stream = ReceiverStream::new(rx);
@@ -5519,8 +5777,9 @@ mod tests {
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
         TranslateBatchItem, TranslationCacheRow, admin_list_users, admin_patch_user,
         admin_users_offset, ai_error_is_non_retryable, ensure_account_enabled,
-        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, looks_like_json_blob, map_job_action_error, markdown_structure_preserved,
+        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
+        guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
@@ -6262,6 +6521,40 @@ echo should_not_be_in_excerpt
             parsed.items[0].summary_md.as_deref(),
             Some("- 第一行\n- 第二行")
         );
+    }
+
+    #[test]
+    fn normalize_translation_fields_extracts_embedded_json_blob() {
+        let (title, summary) = normalize_translation_fields(
+            None,
+            Some(r#"{"title_zh":"发布 1.2.3","summary_md":"- 第一行\\n- 第二行"}"#.to_owned()),
+        );
+        assert_eq!(title.as_deref(), Some("发布 1.2.3"));
+        assert_eq!(summary.as_deref(), Some("- 第一行\n- 第二行"));
+    }
+
+    #[test]
+    fn normalize_translation_fields_discards_malformed_json_blob() {
+        let (title, summary) = normalize_translation_fields(
+            Some("原始标题".to_owned()),
+            Some(r#"{"title_zh":"发布 1.2.3","summary_md":""#.to_owned()),
+        );
+        assert_eq!(title.as_deref(), Some("原始标题"));
+        assert_eq!(summary, None);
+    }
+
+    #[test]
+    fn extract_translation_fields_rejects_malformed_json_blob() {
+        let (title, summary) =
+            extract_translation_fields(r#"{"title_zh":"发布 1.2.3","summary_md":""#);
+        assert_eq!(title, None);
+        assert_eq!(summary, None);
+    }
+
+    #[test]
+    fn looks_like_json_blob_accepts_fenced_json() {
+        let raw = "```json\n{\"title_zh\":\"标题\",\"summary_md\":\"- 一行\"}\n```";
+        assert!(looks_like_json_blob(raw));
     }
 
     #[test]

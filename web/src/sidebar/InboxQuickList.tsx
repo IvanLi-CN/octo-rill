@@ -31,9 +31,7 @@ function threadUrl(threadId: string) {
 	return `https://github.com/notifications/thread/${threadId}`;
 }
 
-export function InboxQuickList(props: {
-	notifications: NotificationItem[];
-}) {
+export function InboxQuickList(props: { notifications: NotificationItem[] }) {
 	const { notifications } = props;
 	const top = notifications.slice(0, 8);
 

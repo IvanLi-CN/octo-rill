@@ -1,5 +1,5 @@
 import { UserManagement } from "@/admin/UserManagement";
-import { Button } from "@/components/ui/button";
+import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 
@@ -20,39 +20,7 @@ export function AdminPanel(props: { me: MeResponse }) {
 
 	return (
 		<AppShell
-			header={
-				<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-					<div className="min-w-0">
-						<div className="flex flex-wrap items-center gap-2">
-							<h1 className="text-xl font-semibold tracking-tight">
-								管理员面板
-							</h1>
-							<span className="text-muted-foreground font-mono text-xs">
-								OctoRill
-							</span>
-						</div>
-						<p className="text-muted-foreground mt-1 text-sm">
-							Logged in as{" "}
-							<span className="text-foreground font-medium">
-								{me.user.login}
-							</span>
-							{" · Admin"}
-						</p>
-					</div>
-
-					<div className="flex flex-wrap gap-2">
-						<Button asChild variant="outline">
-							<a href="/admin/jobs">任务中心</a>
-						</Button>
-						<Button asChild variant="secondary">
-							<a href="/">返回仪表盘</a>
-						</Button>
-						<Button asChild variant="ghost">
-							<a href="/auth/logout">Logout</a>
-						</Button>
-					</div>
-				</div>
-			}
+			header={<AdminHeader user={me.user} activeNav="users" />}
 			footer={<AppMetaFooter />}
 		>
 			<div className="space-y-4">

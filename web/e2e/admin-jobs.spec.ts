@@ -78,11 +78,40 @@ async function installAdminJobsMocks(page: Page) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/realtime") {
+			const status = url.searchParams.get("status") ?? "all";
+			const taskType = url.searchParams.get("task_type") ?? "";
+			const excludeTaskType = url.searchParams.get("exclude_task_type") ?? "";
+			const filtered = tasks.filter((task) => {
+				if (status !== "all" && task.status !== status) return false;
+				if (taskType && task.task_type !== taskType) return false;
+				if (excludeTaskType && task.task_type === excludeTaskType) return false;
+				return true;
+			});
 			return json(route, {
-				items: tasks,
+				items: filtered,
 				page: 1,
 				page_size: 20,
-				total: tasks.length,
+				total: filtered.length,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/admin/jobs/events") {
+			return route.fulfill({
+				status: 200,
+				contentType: "text/event-stream",
+				body: [
+					"event: job.event",
+					`data: ${JSON.stringify({
+						event_id: 9001,
+						task_id: "task-running-1",
+						task_type: "sync.releases",
+						status: "running",
+						event_type: "task.running",
+						created_at: "2026-02-26T01:00:05Z",
+					})}`,
+					"",
+					"",
+				].join("\n"),
 			});
 		}
 
@@ -175,18 +204,17 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.goto("/admin/jobs");
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
-	await expect(page.getByRole("heading", { name: "任务中心" })).toBeVisible();
+	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "任务总览" })).toBeVisible();
 
-	await expect(page.getByText("brief.daily_slot")).toBeVisible();
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
-	await page.getByRole("button", { name: "关闭" }).click();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
 
 	await page.getByRole("button", { name: "定时任务" }).click();
-	await expect(page.getByText("UTC 00:00")).toBeVisible();
-	await page.getByRole("button", { name: "停用" }).first().click();
-	await expect(
-		page.getByRole("button", { name: "启用" }).first(),
-	).toBeVisible();
+	await expect(page.getByText("运行记录")).toBeVisible();
+	await expect(page.getByText("定时执行任务")).toBeVisible();
+	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 });

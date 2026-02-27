@@ -101,6 +101,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::admin_get_user_profile),
         )
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
+        .route("/admin/jobs/events", get(api::admin_jobs_events_sse))
         .route("/admin/jobs/realtime", get(api::admin_list_realtime_tasks))
         .route(
             "/admin/jobs/realtime/{task_id}",
