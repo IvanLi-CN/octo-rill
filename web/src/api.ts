@@ -156,6 +156,17 @@ export type AdminJobsStreamEvent = {
 	created_at: string;
 };
 
+export type AdminLlmCallStreamEvent = {
+	event_id: number;
+	call_id: string;
+	status: string;
+	source: string;
+	requested_by: number | null;
+	parent_task_id: string | null;
+	event_type: string;
+	created_at: string;
+};
+
 export type AdminScheduledSlotItem = {
 	hour_utc: number;
 	enabled: boolean;
@@ -192,7 +203,12 @@ export type AdminLlmCallItem = {
 	max_tokens: number;
 	attempt_count: number;
 	scheduler_wait_ms: number;
+	first_token_wait_ms: number | null;
 	duration_ms: number | null;
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_input_tokens: number | null;
+	total_tokens: number | null;
 	created_at: string;
 	started_at: string | null;
 	finished_at: string | null;
@@ -200,6 +216,8 @@ export type AdminLlmCallItem = {
 };
 
 export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
+	input_messages_json: string | null;
+	output_messages_json: string | null;
 	prompt_text: string;
 	response_text: string | null;
 	error_text: string | null;

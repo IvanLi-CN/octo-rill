@@ -887,7 +887,12 @@ pub struct AdminLlmCallItem {
     max_tokens: i64,
     attempt_count: i64,
     scheduler_wait_ms: i64,
+    first_token_wait_ms: Option<i64>,
     duration_ms: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    total_tokens: Option<i64>,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -906,7 +911,14 @@ pub struct AdminLlmCallDetailItem {
     max_tokens: i64,
     attempt_count: i64,
     scheduler_wait_ms: i64,
+    first_token_wait_ms: Option<i64>,
     duration_ms: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    input_messages_json: Option<String>,
+    output_messages_json: Option<String>,
     prompt_text: String,
     response_text: Option<String>,
     error_text: Option<String>,
@@ -1087,7 +1099,12 @@ pub async fn admin_list_llm_calls(
           max_tokens,
           attempt_count,
           scheduler_wait_ms,
+          first_token_wait_ms,
           duration_ms,
+          input_tokens,
+          output_tokens,
+          cached_input_tokens,
+          total_tokens,
           created_at,
           started_at,
           finished_at,
@@ -1146,7 +1163,14 @@ pub async fn admin_get_llm_call_detail(
           max_tokens,
           attempt_count,
           scheduler_wait_ms,
+          first_token_wait_ms,
           duration_ms,
+          input_tokens,
+          output_tokens,
+          cached_input_tokens,
+          total_tokens,
+          input_messages_json,
+          output_messages_json,
           prompt_text,
           response_text,
           error_text,
@@ -6341,7 +6365,14 @@ mod tests {
               max_tokens,
               attempt_count,
               scheduler_wait_ms,
+              first_token_wait_ms,
               duration_ms,
+              input_tokens,
+              output_tokens,
+              cached_input_tokens,
+              total_tokens,
+              input_messages_json,
+              output_messages_json,
               prompt_text,
               response_text,
               error_text,
@@ -6350,7 +6381,7 @@ mod tests {
               finished_at,
               updated_at
             )
-            VALUES (?, ?, ?, 'gpt-4o-mini', ?, NULL, NULL, 900, 1, 120, 800, 'prompt', 'ok', NULL, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'gpt-4o-mini', ?, NULL, NULL, 900, 1, 120, 340, 800, 120, 55, 20, 175, '[{"role":"system","content":"s"},{"role":"user","content":"u"}]', '[{"role":"assistant","content":"ok"}]', 'prompt', 'ok', NULL, ?, ?, ?, ?)
             "#,
         )
         .bind(call_id)
@@ -6675,6 +6706,47 @@ mod tests {
             .await
             .expect_err("missing llm call should fail");
         assert_eq!(err.code(), "not_found");
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_call_detail_includes_tokens_and_messages() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call(
+            &pool,
+            "call-detail",
+            "succeeded",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+        let resp = admin_get_llm_call_detail(State(state), session, Path("call-detail".to_owned()))
+            .await
+            .expect("llm call detail should pass")
+            .0;
+
+        assert_eq!(resp.id, "call-detail");
+        assert_eq!(resp.first_token_wait_ms, Some(340));
+        assert_eq!(resp.input_tokens, Some(120));
+        assert_eq!(resp.output_tokens, Some(55));
+        assert_eq!(resp.cached_input_tokens, Some(20));
+        assert_eq!(resp.total_tokens, Some(175));
+        assert!(
+            resp.input_messages_json
+                .as_deref()
+                .is_some_and(|value| value.contains("\"role\":\"user\""))
+        );
+        assert!(
+            resp.output_messages_json
+                .as_deref()
+                .is_some_and(|value| value.contains("\"assistant\""))
+        );
     }
 
     #[tokio::test]

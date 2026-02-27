@@ -16,6 +16,7 @@
 
 - 在 `/admin/jobs` 提供 LLM 调度状态与调用列表（含筛选）。
 - 提供调用详情（完整 prompt/response/error）与父任务跳转能力。
+- 详情支持多轮输入/输出消息展示，并展示输入/输出/缓存 token 指标。
 - 为调用级观测新增后端日志落库与 7 天自动清理。
 
 ### Non-goals
@@ -68,7 +69,7 @@
 
 - Given 点击某条调用详情
   When 抽屉打开
-  Then 可见完整 prompt/response/error 与等待/耗时/重试次数。
+  Then 可见完整 prompt/response/error 与等待/首字/耗时/重试次数。
 
 - Given 调用记录存在 `parent_task_id`
   When 点击 “查看父任务”
@@ -121,3 +122,6 @@
 
 - 2026-02-27: 创建规格并冻结实现边界。
 - 2026-02-27: 完成后端/前端实现，新增迁移与管理员 LLM 观测页面，并通过 `cargo test` + `web build` + `admin-jobs e2e` 验证。
+- 2026-02-27: 增补多轮消息 JSON 展示与 token 指标（含 cached tokens），扩展 llm_calls schema 与 admin API/UI。
+- 2026-02-27: 增补首字等待时间（first token wait）落库与详情/列表展示，用于排查模型首包延迟。
+- 2026-02-27: 新增 `llm_call_events` 与 `llm.call` SSE 事件，支持后台页面对 LLM 调用列表/状态/详情的实时刷新。

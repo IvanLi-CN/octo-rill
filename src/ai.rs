@@ -565,6 +565,7 @@ struct ChatMessage<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsResponse {
     choices: Vec<Choice>,
+    usage: Option<ChatCompletionsUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,6 +576,35 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct ChoiceMessage {
     content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    prompt_tokens_details: Option<ChatPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatPromptTokensDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug)]
+struct LlmTokenUsage {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+}
+
+#[derive(Debug)]
+struct ChatCompletionOutput {
+    content: String,
+    output_messages_json: String,
+    first_token_wait_ms: Option<i64>,
+    usage: LlmTokenUsage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -603,6 +633,14 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+fn safe_i64_from_u64(value: Option<u64>) -> Option<i64> {
+    value.and_then(|raw| i64::try_from(raw).ok())
+}
+
+fn build_llm_messages_json(messages: &[ChatMessage<'_>]) -> Option<String> {
+    serde_json::to_string(messages).ok()
 }
 
 fn escape_markdown_link_text(raw: &str) -> String {
@@ -754,6 +792,7 @@ pub fn recent_key_dates(
 struct ChatCompletionAttemptError {
     err: anyhow::Error,
     retryable: bool,
+    first_token_wait_ms: Option<i64>,
 }
 
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -834,6 +873,7 @@ async fn insert_llm_call(
     model: &str,
     max_tokens: u32,
     prompt_text: &str,
+    input_messages_json: Option<&str>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
@@ -848,9 +888,10 @@ async fn insert_llm_call(
           parent_task_type,
           max_tokens,
           prompt_text,
+          input_messages_json,
           created_at,
           updated_at
-        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(log.id.as_str())
@@ -861,11 +902,73 @@ async fn insert_llm_call(
     .bind(log.parent_task_type.as_deref())
     .bind(i64::from(max_tokens))
     .bind(prompt_text)
+    .bind(input_messages_json)
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(&state.pool)
     .await
     .context("insert llm_call failed")?;
+    append_llm_call_event(
+        state,
+        log.id.as_str(),
+        "llm.queued",
+        "queued",
+        serde_json::json!({
+            "model": model,
+            "max_tokens": max_tokens,
+        }),
+    )
+    .await
+    .context("append llm_call queued event failed")?;
+    Ok(())
+}
+
+async fn append_llm_call_event(
+    state: &AppState,
+    call_id: &str,
+    event_type: &str,
+    status: &str,
+    payload: Value,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO llm_call_events (
+          call_id,
+          event_type,
+          status,
+          source,
+          requested_by,
+          parent_task_id,
+          payload_json,
+          created_at
+        )
+        SELECT
+          id,
+          ?,
+          ?,
+          source,
+          requested_by,
+          parent_task_id,
+          ?,
+          ?
+        FROM llm_calls
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(event_type)
+    .bind(status)
+    .bind(payload_json)
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("insert llm_call event failed")?;
+    if inserted.rows_affected() == 0 {
+        return Err(anyhow!("insert llm_call event failed: call not found"));
+    }
     Ok(())
 }
 
@@ -895,6 +998,18 @@ async fn update_llm_call_running(
     .execute(&state.pool)
     .await
     .context("update llm_call running failed")?;
+    append_llm_call_event(
+        state,
+        call_id,
+        "llm.running",
+        "running",
+        serde_json::json!({
+            "attempt_count": attempt_count,
+            "scheduler_wait_ms": scheduler_wait_ms,
+        }),
+    )
+    .await
+    .context("append llm_call running event failed")?;
     Ok(())
 }
 
@@ -910,9 +1025,15 @@ async fn finalize_llm_call(
         SET status = ?,
             attempt_count = ?,
             scheduler_wait_ms = ?,
+            first_token_wait_ms = ?,
             duration_ms = ?,
+            output_messages_json = ?,
             response_text = ?,
             error_text = ?,
+            input_tokens = ?,
+            output_tokens = ?,
+            cached_input_tokens = ?,
+            total_tokens = ?,
             finished_at = ?,
             updated_at = ?
         WHERE id = ?
@@ -921,15 +1042,45 @@ async fn finalize_llm_call(
     .bind(update.status)
     .bind(update.attempt_count)
     .bind(update.scheduler_wait_ms)
+    .bind(update.first_token_wait_ms)
     .bind(update.duration_ms)
+    .bind(update.output_messages_json)
     .bind(update.response_text)
     .bind(update.error_text)
+    .bind(update.input_tokens)
+    .bind(update.output_tokens)
+    .bind(update.cached_input_tokens)
+    .bind(update.total_tokens)
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(call_id)
     .execute(&state.pool)
     .await
     .context("finalize llm_call failed")?;
+    append_llm_call_event(
+        state,
+        call_id,
+        if update.status == "succeeded" {
+            "llm.succeeded"
+        } else {
+            "llm.failed"
+        },
+        update.status,
+        serde_json::json!({
+            "attempt_count": update.attempt_count,
+            "scheduler_wait_ms": update.scheduler_wait_ms,
+            "first_token_wait_ms": update.first_token_wait_ms,
+            "duration_ms": update.duration_ms,
+            "input_tokens": update.input_tokens,
+            "output_tokens": update.output_tokens,
+            "cached_input_tokens": update.cached_input_tokens,
+            "total_tokens": update.total_tokens,
+            "has_output": update.response_text.is_some(),
+            "error_text_preview": update.error_text.map(|value| truncate_chars(value, 200)),
+        }),
+    )
+    .await
+    .context("append llm_call finalized event failed")?;
     Ok(())
 }
 
@@ -938,9 +1089,15 @@ struct FinalizeLlmCallUpdate<'a> {
     status: &'a str,
     attempt_count: i64,
     scheduler_wait_ms: i64,
+    first_token_wait_ms: Option<i64>,
     duration_ms: Option<i64>,
+    output_messages_json: Option<&'a str>,
     response_text: Option<&'a str>,
     error_text: Option<&'a str>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    total_tokens: Option<i64>,
 }
 
 async fn chat_completion_once(
@@ -949,7 +1106,7 @@ async fn chat_completion_once(
     system: &str,
     user: &str,
     max_tokens: u32,
-) -> std::result::Result<String, ChatCompletionAttemptError> {
+) -> std::result::Result<ChatCompletionOutput, ChatCompletionAttemptError> {
     let url = ai
         .base_url
         .join("chat/completions")
@@ -957,6 +1114,7 @@ async fn chat_completion_once(
         .map_err(|err| ChatCompletionAttemptError {
             err,
             retryable: false,
+            first_token_wait_ms: None,
         })?;
 
     let req = ChatCompletionsRequest {
@@ -975,6 +1133,7 @@ async fn chat_completion_once(
         max_tokens,
     };
 
+    let response_wait_started_at = Instant::now();
     let resp = state
         .http
         .post(url)
@@ -987,8 +1146,11 @@ async fn chat_completion_once(
             ChatCompletionAttemptError {
                 err: anyhow!("AI request failed: {err}"),
                 retryable,
+                first_token_wait_ms: None,
             }
         })?;
+    let first_token_wait_ms =
+        Some(i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
 
     let status = resp.status();
     let body = resp
@@ -997,6 +1159,7 @@ async fn chat_completion_once(
         .map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI read response failed: {err}"),
             retryable: true,
+            first_token_wait_ms,
         })?;
 
     if !status.is_success() {
@@ -1004,6 +1167,7 @@ async fn chat_completion_once(
         return Err(ChatCompletionAttemptError {
             err: anyhow!("AI returned {status}: {msg}"),
             retryable: is_retryable_status(status),
+            first_token_wait_ms,
         });
     }
 
@@ -1011,10 +1175,12 @@ async fn chat_completion_once(
         serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI response json decode failed: {err}"),
             retryable: true,
+            first_token_wait_ms,
         })?;
 
-    let content = resp
-        .choices
+    let ChatCompletionsResponse { choices, usage } = resp;
+
+    let content = choices
         .into_iter()
         .next()
         .and_then(|c| c.message.content)
@@ -1023,9 +1189,36 @@ async fn chat_completion_once(
         .ok_or_else(|| ChatCompletionAttemptError {
             err: anyhow!("AI response missing content"),
             retryable: true,
+            first_token_wait_ms,
         })?;
 
-    Ok(content)
+    let output_messages_json = serde_json::to_string(&[ChatMessage {
+        role: "assistant",
+        content: content.as_str(),
+    }])
+    .unwrap_or_else(|_| "[]".to_owned());
+    let usage = usage
+        .map(|raw| LlmTokenUsage {
+            input_tokens: safe_i64_from_u64(raw.prompt_tokens),
+            output_tokens: safe_i64_from_u64(raw.completion_tokens),
+            cached_input_tokens: raw
+                .prompt_tokens_details
+                .and_then(|details| safe_i64_from_u64(details.cached_tokens)),
+            total_tokens: safe_i64_from_u64(raw.total_tokens),
+        })
+        .unwrap_or(LlmTokenUsage {
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+        });
+
+    Ok(ChatCompletionOutput {
+        content,
+        output_messages_json,
+        first_token_wait_ms,
+        usage,
+    })
 }
 
 pub async fn chat_completion(
@@ -1040,7 +1233,26 @@ pub async fn chat_completion(
 
     let log_record = build_llm_call_log_record();
     let prompt_text = format!("system:\n{system}\n\nuser:\n{user}");
-    if let Err(err) = insert_llm_call(state, &log_record, &ai.model, max_tokens, &prompt_text).await
+    let input_messages = vec![
+        ChatMessage {
+            role: "system",
+            content: system,
+        },
+        ChatMessage {
+            role: "user",
+            content: user,
+        },
+    ];
+    let input_messages_json = build_llm_messages_json(&input_messages);
+    if let Err(err) = insert_llm_call(
+        state,
+        &log_record,
+        &ai.model,
+        max_tokens,
+        &prompt_text,
+        input_messages_json.as_deref(),
+    )
+    .await
     {
         tracing::warn!(?err, "llm call log insert failed");
     }
@@ -1072,7 +1284,7 @@ pub async fn chat_completion(
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         drop(in_flight_guard);
         match attempt_result {
-            Ok(content) => {
+            Ok(output) => {
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
@@ -1083,20 +1295,29 @@ pub async fn chat_completion(
                         status: "succeeded",
                         attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
                         scheduler_wait_ms: total_wait_ms,
+                        first_token_wait_ms: output.first_token_wait_ms,
                         duration_ms,
-                        response_text: Some(content.as_str()),
+                        output_messages_json: Some(output.output_messages_json.as_str()),
+                        response_text: Some(output.content.as_str()),
                         error_text: None,
+                        input_tokens: output.usage.input_tokens,
+                        output_tokens: output.usage.output_tokens,
+                        cached_input_tokens: output.usage.cached_input_tokens,
+                        total_tokens: output.usage.total_tokens,
                     },
                 )
                 .await
                 {
                     tracing::warn!(?err, "llm call log finalize success failed");
                 }
-                return Ok(content);
+                return Ok(output.content);
             }
             Err(attempt_err) => {
-                let retryable = attempt_err.retryable;
-                let err = attempt_err.err;
+                let ChatCompletionAttemptError {
+                    retryable,
+                    err,
+                    first_token_wait_ms,
+                } = attempt_err;
                 if !retryable || attempt >= max_attempts {
                     let duration_ms = started_at.map(|started| {
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
@@ -1109,9 +1330,15 @@ pub async fn chat_completion(
                             status: "failed",
                             attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
                             scheduler_wait_ms: total_wait_ms,
+                            first_token_wait_ms,
                             duration_ms,
+                            output_messages_json: None,
                             response_text: None,
                             error_text: Some(error_message.as_str()),
+                            input_tokens: None,
+                            output_tokens: None,
+                            cached_input_tokens: None,
+                            total_tokens: None,
                         },
                     )
                     .await

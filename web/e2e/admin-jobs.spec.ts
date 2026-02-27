@@ -52,7 +52,19 @@ async function installAdminJobsMocks(page: Page) {
 			max_tokens: 900,
 			attempt_count: 3,
 			scheduler_wait_ms: 1200,
+			first_token_wait_ms: 860,
 			duration_ms: 2200,
+			input_tokens: 1230,
+			output_tokens: 0,
+			cached_input_tokens: 640,
+			total_tokens: 1230,
+			input_messages_json: JSON.stringify([
+				{ role: "system", content: "You are a release translator." },
+				{ role: "user", content: "translate notes to Chinese" },
+				{ role: "assistant", content: "收到，我将输出三条重点。" },
+				{ role: "user", content: "请强调排障价值" },
+			]),
+			output_messages_json: null,
 			prompt_text: "prompt 1",
 			response_text: null,
 			error_text: "mock llm failed",
@@ -63,7 +75,7 @@ async function installAdminJobsMocks(page: Page) {
 		},
 		{
 			id: "llm-call-2",
-			status: "succeeded",
+			status: "running",
 			source: "api.translate_releases_batch",
 			model: "gpt-4o-mini",
 			requested_by: 1,
@@ -72,14 +84,26 @@ async function installAdminJobsMocks(page: Page) {
 			max_tokens: 900,
 			attempt_count: 1,
 			scheduler_wait_ms: 80,
-			duration_ms: 400,
+			first_token_wait_ms: null,
+			duration_ms: null,
+			input_tokens: 780,
+			output_tokens: null,
+			cached_input_tokens: 320,
+			total_tokens: null,
+			input_messages_json: JSON.stringify([
+				{ role: "system", content: "You are a summary assistant." },
+				{ role: "user", content: "summarize changes" },
+				{ role: "assistant", content: "收到，我将输出三条重点。" },
+				{ role: "user", content: "请强调排障价值" },
+			]),
+			output_messages_json: null,
 			prompt_text: "prompt 2",
-			response_text: "ok",
+			response_text: null,
 			error_text: null,
 			created_at: "2026-02-26T03:00:00Z",
 			started_at: "2026-02-26T03:00:00Z",
-			finished_at: "2026-02-26T03:00:01Z",
-			updated_at: "2026-02-26T03:00:01Z",
+			finished_at: null,
+			updated_at: "2026-02-26T03:00:00Z",
 		},
 	];
 
@@ -139,6 +163,23 @@ async function installAdminJobsMocks(page: Page) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/events") {
+			const call = llmCalls.find((item) => item.id === "llm-call-2");
+			if (call && call.status === "running") {
+				call.status = "succeeded";
+				call.first_token_wait_ms = 140;
+				call.duration_ms = 400;
+				call.output_tokens = 160;
+				call.total_tokens = 940;
+				call.output_messages_json = JSON.stringify([
+					{
+						role: "assistant",
+						content: "- added scheduler status endpoint\n- added call logging",
+					},
+				]);
+				call.response_text = "ok";
+				call.finished_at = "2026-02-26T03:00:01Z";
+				call.updated_at = "2026-02-26T03:00:01Z";
+			}
 			return route.fulfill({
 				status: 200,
 				contentType: "text/event-stream",
@@ -151,6 +192,18 @@ async function installAdminJobsMocks(page: Page) {
 						status: "running",
 						event_type: "task.running",
 						created_at: "2026-02-26T01:00:05Z",
+					})}`,
+					"",
+					"event: llm.call",
+					`data: ${JSON.stringify({
+						event_id: 9101,
+						call_id: "llm-call-2",
+						status: "succeeded",
+						source: "api.translate_releases_batch",
+						requested_by: 1,
+						parent_task_id: null,
+						event_type: "llm.succeeded",
+						created_at: "2026-02-26T03:00:01Z",
 					})}`,
 					"",
 					"",
@@ -223,8 +276,14 @@ async function installAdminJobsMocks(page: Page) {
 			});
 			return json(route, {
 				items: filtered.map(
-					({ prompt_text: _p, response_text: _r, error_text: _e, ...rest }) =>
-						rest,
+					({
+						prompt_text: _p,
+						response_text: _r,
+						error_text: _e,
+						input_messages_json: _im,
+						output_messages_json: _om,
+						...rest
+					}) => rest,
 				),
 				page: 1,
 				page_size: 20,
@@ -325,10 +384,16 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.getByRole("button", { name: "LLM调度" }).click();
 	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("Token 输入/输出/缓存").first()).toBeVisible();
 	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(
 		page.getByRole("heading", { name: "LLM 调用详情" }),
 	).toBeVisible();
-	await expect(page.getByText("prompt 1")).toBeVisible();
+	await expect(page.getByText("Conversation Timeline")).toBeVisible();
+	await expect(page.getByText("Input Messages")).toHaveCount(0);
+	await expect(page.getByText("耗时 / 重试")).toBeVisible();
+	await expect(page.getByText("等待 / 首字 / 耗时 / 重试")).toHaveCount(0);
+	await expect(page.getByText("等待 1.20s · 首字 860ms", { exact: true })).toBeVisible();
+	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 });

@@ -5,6 +5,7 @@ import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import {
 	type AdminLlmCallDetailResponse,
 	type AdminLlmCallItem,
+	type AdminLlmCallStreamEvent,
 	type AdminLlmSchedulerStatusResponse,
 	type AdminJobsOverviewResponse,
 	type AdminJobsStreamEvent,
@@ -81,6 +82,77 @@ function localInputToUtc(value: string) {
 	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) return "";
 	return parsed.toISOString();
+}
+
+type LlmConversationMessage = {
+	role: string;
+	content: string;
+};
+type LlmConversationTimelineItem = {
+	turn: number;
+	source: "input" | "output";
+	role: string;
+	content: string;
+};
+
+function normalizeLlmMessageContent(raw: unknown): string {
+	if (typeof raw === "string") {
+		return raw;
+	}
+	if (Array.isArray(raw)) {
+		return raw
+			.map((item) => {
+				if (typeof item === "string") return item;
+				if (item && typeof item === "object" && "text" in item) {
+					const text = (item as { text?: unknown }).text;
+					return typeof text === "string" ? text : "";
+				}
+				return "";
+			})
+			.filter(Boolean)
+			.join("\n");
+	}
+	return "";
+}
+
+function parseLlmConversationMessages(
+	raw: string | null | undefined,
+): LlmConversationMessage[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!Array.isArray(parsed)) return [];
+		return parsed
+			.map((item) => {
+				if (!item || typeof item !== "object") return null;
+				const roleRaw = (item as { role?: unknown }).role;
+				const contentRaw = (item as { content?: unknown }).content;
+				const role = typeof roleRaw === "string" ? roleRaw : "unknown";
+				const content = normalizeLlmMessageContent(contentRaw);
+				if (!content) return null;
+				return { role, content };
+			})
+			.filter((item): item is LlmConversationMessage => item !== null);
+	} catch {
+		return [];
+	}
+}
+
+function llmRoleLabel(role: string) {
+	switch (role) {
+		case "system":
+			return "系统";
+		case "user":
+			return "用户";
+		case "assistant":
+			return "助手";
+		case "tool":
+			return "工具";
+		case "input":
+			return "输入文本";
+		default:
+			return role;
+	}
 }
 
 function normalizeErrorMessage(err: unknown) {
@@ -441,10 +513,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 
 	const detailTaskIdRef = useRef<string | null>(null);
+	const llmDetailIdRef = useRef<string | null>(null);
 	const streamRefreshTimerRef = useRef<number | null>(null);
 	const streamRefreshInFlightRef = useRef(false);
 	const streamPendingFullRefreshRef = useRef(false);
 	const streamPendingDetailTaskIdRef = useRef<string | null>(null);
+	const streamPendingLlmRefreshRef = useRef(false);
+	const streamPendingLlmDetailCallIdRef = useRef<string | null>(null);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
@@ -471,10 +546,66 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		() => (detailTask ? taskStatusTone(detailTask.task.status) : null),
 		[detailTask],
 	);
+	const llmInputMessages = useMemo(() => {
+		if (!llmDetail) return [];
+		const parsed = parseLlmConversationMessages(llmDetail.input_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (llmDetail.prompt_text.trim()) {
+			return [{ role: "input", content: llmDetail.prompt_text }];
+		}
+		return [];
+	}, [llmDetail]);
+	const llmOutputMessages = useMemo(() => {
+		if (!llmDetail) return [];
+		const parsed = parseLlmConversationMessages(llmDetail.output_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (llmDetail.response_text?.trim()) {
+			return [{ role: "assistant", content: llmDetail.response_text }];
+		}
+		return [];
+	}, [llmDetail]);
+	const llmConversationTimeline = useMemo<LlmConversationTimelineItem[]>(() => {
+		const timeline: LlmConversationTimelineItem[] = [];
+		const turnCount = Math.max(llmInputMessages.length, llmOutputMessages.length);
+		for (let index = 0; index < turnCount; index += 1) {
+			const turn = index + 1;
+			const inputMessage = llmInputMessages[index];
+			if (inputMessage) {
+				timeline.push({
+					turn,
+					source: "input",
+					role: inputMessage.role,
+					content: inputMessage.content,
+				});
+			}
+			const outputMessage = llmOutputMessages[index];
+			if (outputMessage) {
+				timeline.push({
+					turn,
+					source: "output",
+					role: outputMessage.role,
+					content: outputMessage.content,
+				});
+			}
+		}
+		return timeline;
+	}, [llmInputMessages, llmOutputMessages]);
+	const lastAssistantTimelineIndex = useMemo(() => {
+		for (let index = llmConversationTimeline.length - 1; index >= 0; index -= 1) {
+			if (llmConversationTimeline[index]?.role === "assistant") {
+				return index;
+			}
+		}
+		return -1;
+	}, [llmConversationTimeline]);
 
 	useEffect(() => {
 		detailTaskIdRef.current = detailTask?.task.id ?? null;
 	}, [detailTask]);
+
+	useEffect(() => {
+		llmDetailIdRef.current = llmDetail?.id ?? null;
+	}, [llmDetail]);
 
 	const loadOverview = useCallback(async () => {
 		const res = await apiGetAdminJobsOverview();
@@ -589,6 +720,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		setDetailTask(detail);
 	}, []);
 
+	const refreshLlmDetail = useCallback(async (callId: string) => {
+		const detail = await apiGetAdminLlmCallDetail(callId);
+		setLlmDetail(detail);
+	}, []);
+
 	const drainStreamRefreshQueue = useCallback(async () => {
 		if (streamRefreshInFlightRef.current) {
 			return;
@@ -596,9 +732,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		streamRefreshInFlightRef.current = true;
 		try {
 			const needFullRefresh = streamPendingFullRefreshRef.current;
+			const needLlmRefresh = streamPendingLlmRefreshRef.current;
 			const pendingDetailTaskId = streamPendingDetailTaskIdRef.current;
+			const pendingLlmDetailCallId = streamPendingLlmDetailCallIdRef.current;
 			streamPendingFullRefreshRef.current = false;
+			streamPendingLlmRefreshRef.current = false;
 			streamPendingDetailTaskIdRef.current = null;
+			streamPendingLlmDetailCallIdRef.current = null;
 
 			if (needFullRefresh) {
 				await Promise.all([
@@ -612,11 +752,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (activeDetailTaskId) {
 					await refreshTaskDetail(activeDetailTaskId);
 				}
+				const activeLlmDetailId = llmDetailIdRef.current;
+				if (activeLlmDetailId) {
+					await refreshLlmDetail(activeLlmDetailId);
+				}
 				return;
+			}
+
+			if (needLlmRefresh) {
+				await Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]);
 			}
 
 			if (pendingDetailTaskId) {
 				await refreshTaskDetail(pendingDetailTaskId);
+			}
+
+			if (pendingLlmDetailCallId) {
+				await refreshLlmDetail(pendingLlmDetailCallId);
 			}
 		} catch (err) {
 			setError(normalizeErrorMessage(err));
@@ -624,7 +776,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			streamRefreshInFlightRef.current = false;
 			if (
 				streamPendingFullRefreshRef.current ||
-				streamPendingDetailTaskIdRef.current
+				streamPendingLlmRefreshRef.current ||
+				streamPendingDetailTaskIdRef.current ||
+				streamPendingLlmDetailCallIdRef.current
 			) {
 				void drainStreamRefreshQueue();
 			}
@@ -636,15 +790,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		loadLlmSchedulerStatus,
 		loadLlmCalls,
 		refreshTaskDetail,
+		refreshLlmDetail,
 	]);
 
 	const scheduleStreamRefresh = useCallback(
-		(mode: "all" | "detail", taskId?: string) => {
+		(mode: "all" | "detail" | "llm" | "llm_detail", id?: string) => {
 			if (mode === "all") {
 				streamPendingFullRefreshRef.current = true;
 				streamPendingDetailTaskIdRef.current = null;
-			} else if (taskId) {
-				streamPendingDetailTaskIdRef.current = taskId;
+				streamPendingLlmRefreshRef.current = false;
+				streamPendingLlmDetailCallIdRef.current = null;
+			} else if (mode === "detail" && id) {
+				streamPendingDetailTaskIdRef.current = id;
+			} else if (mode === "llm") {
+				streamPendingLlmRefreshRef.current = true;
+			} else if (mode === "llm_detail" && id) {
+				streamPendingLlmRefreshRef.current = true;
+				streamPendingLlmDetailCallIdRef.current = id;
 			}
 
 			if (streamRefreshTimerRef.current !== null) {
@@ -747,8 +909,30 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				scheduleStreamRefresh("all");
 			};
+			const onLlmCallEvent = (evt: Event) => {
+				const message = evt as MessageEvent<string>;
+				let parsed: AdminLlmCallStreamEvent | null = null;
+				try {
+					parsed = JSON.parse(message.data) as AdminLlmCallStreamEvent;
+				} catch {
+					parsed = null;
+				}
+				if (!parsed) {
+					scheduleStreamRefresh("llm");
+					return;
+				}
+
+				const activeLlmDetailId = llmDetailIdRef.current;
+				if (activeLlmDetailId && activeLlmDetailId === parsed.call_id) {
+					scheduleStreamRefresh("llm_detail", activeLlmDetailId);
+					return;
+				}
+
+				scheduleStreamRefresh("llm");
+			};
 
 			nextSource.addEventListener("job.event", onJobEvent as EventListener);
+			nextSource.addEventListener("llm.call", onLlmCallEvent as EventListener);
 			nextSource.onopen = () => {
 				if (disposed) return;
 				setStreamStatus("connected");
@@ -757,6 +941,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				nextSource.removeEventListener(
 					"job.event",
 					onJobEvent as EventListener,
+				);
+				nextSource.removeEventListener(
+					"llm.call",
+					onLlmCallEvent as EventListener,
 				);
 				closeSource();
 				if (disposed) return;
@@ -1449,8 +1637,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													{formatCount(call.attempt_count)}
 												</p>
 												<p className="text-muted-foreground mt-1 text-xs">
-													等待 {formatDurationMs(call.scheduler_wait_ms)} · 耗时{" "}
+													等待 {formatDurationMs(call.scheduler_wait_ms)} · 首字{" "}
+													{formatDurationMs(call.first_token_wait_ms)} · 耗时{" "}
 													{formatDurationMs(call.duration_ms)}
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													Token 输入/输出/缓存：{formatCount(call.input_tokens)} /{" "}
+													{formatCount(call.output_tokens)} /{" "}
+													{formatCount(call.cached_input_tokens)}
 												</p>
 												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
 													ID: {call.id}
@@ -1670,13 +1864,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								</p>
 							</div>
 							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									等待 / 耗时 / 重试
-								</p>
+								<p className="text-muted-foreground text-xs">耗时 / 重试</p>
 								<p className="mt-1 font-medium">
-									{formatDurationMs(llmDetail.scheduler_wait_ms)} /{" "}
 									{formatDurationMs(llmDetail.duration_ms)} /{" "}
 									{formatCount(llmDetail.attempt_count)}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">
+									Token（输入 / 输出 / 缓存）
+								</p>
+								<p className="mt-1 font-medium">
+									{formatCount(llmDetail.input_tokens)} /{" "}
+									{formatCount(llmDetail.output_tokens)} /{" "}
+									{formatCount(llmDetail.cached_input_tokens)}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									总计 {formatCount(llmDetail.total_tokens)}
 								</p>
 							</div>
 							<div className="rounded-lg border p-3">
@@ -1704,17 +1908,78 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 						<div className="mt-4 space-y-3 border-t pt-4">
 							<div>
-								<p className="text-muted-foreground text-xs">Prompt</p>
-								<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-									{llmDetail.prompt_text}
-								</pre>
+								<p className="text-muted-foreground text-xs">
+									Conversation Timeline
+								</p>
+								{llmConversationTimeline.length === 0 ? (
+									<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+										-
+									</pre>
+								) : (
+									<div className="mt-1 max-h-[30vh] space-y-2 overflow-auto pr-1">
+										<p className="text-muted-foreground text-[11px]">
+											共 {formatCount(llmConversationTimeline.length)} 条消息
+										</p>
+										{llmConversationTimeline.map((message, index) => {
+											const alignRight =
+												message.source === "output" &&
+												message.role === "assistant";
+											const showAnswerLatency =
+												index === lastAssistantTimelineIndex;
+											return (
+												<div
+													key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+													className={`flex ${
+														alignRight ? "justify-end" : "justify-start"
+													}`}
+												>
+													<div
+														className={`w-full max-w-[92%] rounded-md border p-2 ${
+															message.source === "output"
+																? "border-emerald-200/70 bg-emerald-50/60 dark:border-emerald-500/40 dark:bg-emerald-900/20"
+																: "border-sky-200/70 bg-sky-50/60 dark:border-sky-500/40 dark:bg-sky-900/20"
+														}`}
+													>
+														<div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1">
+															<p className="text-muted-foreground text-[11px] font-semibold">
+																第 {formatCount(message.turn)} 轮 ·{" "}
+																{llmRoleLabel(message.role)}
+															</p>
+															{showAnswerLatency ? (
+																<p className="text-muted-foreground text-[10px]">
+																	等待{" "}
+																	{formatDurationMs(llmDetail.scheduler_wait_ms)} ·
+																	首字{" "}
+																	{formatDurationMs(llmDetail.first_token_wait_ms)}
+																</p>
+															) : null}
+														</div>
+														<pre className="mt-1 text-[11px] whitespace-pre-wrap break-all">
+															{message.content}
+														</pre>
+													</div>
+												</div>
+											);
+										})}
+									</div>
+								)}
 							</div>
-							<div>
-								<p className="text-muted-foreground text-xs">Response</p>
-								<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-									{llmDetail.response_text ?? "-"}
-								</pre>
-							</div>
+							{llmConversationTimeline.length === 0 ? (
+								<>
+									<div>
+										<p className="text-muted-foreground text-xs">Input Messages</p>
+										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+											{llmDetail.prompt_text || "-"}
+										</pre>
+									</div>
+									<div>
+										<p className="text-muted-foreground text-xs">Output Messages</p>
+										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+											{llmDetail.response_text ?? "-"}
+										</pre>
+									</div>
+								</>
+							) : null}
 							<div>
 								<p className="text-muted-foreground text-xs">Error</p>
 								<pre className="bg-muted/40 mt-1 max-h-[12vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">

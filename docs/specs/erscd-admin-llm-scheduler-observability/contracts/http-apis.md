@@ -48,7 +48,12 @@
       "max_tokens": 900,
       "attempt_count": 1,
       "scheduler_wait_ms": 123,
+      "first_token_wait_ms": 180,
       "duration_ms": 780,
+      "input_tokens": 860,
+      "output_tokens": 212,
+      "cached_input_tokens": 420,
+      "total_tokens": 1072,
       "created_at": "2026-02-27T12:00:00Z",
       "started_at": "2026-02-27T12:00:00Z",
       "finished_at": "2026-02-27T12:00:01Z",
@@ -77,7 +82,14 @@
   "max_tokens": 900,
   "attempt_count": 4,
   "scheduler_wait_ms": 3102,
+  "first_token_wait_ms": 640,
   "duration_ms": 5098,
+  "input_tokens": 1420,
+  "output_tokens": null,
+  "cached_input_tokens": 700,
+  "total_tokens": 1420,
+  "input_messages_json": "[{\"role\":\"system\",\"content\":\"...\"},{\"role\":\"user\",\"content\":\"...\"}]",
+  "output_messages_json": null,
   "prompt_text": "full prompt ...",
   "response_text": null,
   "error_text": "AI returned 429: rate limited",
@@ -85,6 +97,25 @@
   "started_at": "2026-02-27T12:00:01Z",
   "finished_at": "2026-02-27T12:00:06Z",
   "updated_at": "2026-02-27T12:00:06Z"
+}
+```
+
+## Extended: `GET /api/admin/jobs/events` (SSE)
+
+Besides existing `job.event`, this stream now emits `llm.call` in real time.
+
+### Event: `llm.call`
+
+```json
+{
+  "event_id": 21001,
+  "call_id": "3a0f5147-4cb1-4f0e-a2c4-67cb4d70d2f5",
+  "status": "running",
+  "source": "api.translate_releases_batch",
+  "requested_by": 1,
+  "parent_task_id": null,
+  "event_type": "llm.running",
+  "created_at": "2026-02-27T12:00:00Z"
 }
 ```
 
