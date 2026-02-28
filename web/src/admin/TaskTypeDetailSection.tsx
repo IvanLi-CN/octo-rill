@@ -518,6 +518,10 @@ function llmCallStatusLabel(status: string) {
 	}
 }
 
+function shouldShowRelatedLlmCalls(taskType: string) {
+	return taskType.startsWith("translate.") || taskType.startsWith("brief.");
+}
+
 type TaskTypeDetailSectionProps = {
 	detail: AdminRealtimeTaskDetailResponse;
 	relatedLlmCalls?: AdminLlmCallItem[];
@@ -541,6 +545,9 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 			?.item_error ??
 		diagnostics?.brief_daily_slot?.users?.find((item) => item.error)?.error ??
 		null;
+	const showRelatedLlmCalls = shouldShowRelatedLlmCalls(
+		props.detail.task.task_type,
+	);
 
 	return (
 		<section className="space-y-3">
@@ -640,39 +647,41 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					</div>
 				</div>
 			) : null}
-			<div className={detailCardClass}>
-				<p className="text-muted-foreground text-[11px]">关联 LLM 调用</p>
-				{relatedLlmCallsLoading ? (
-					<p className="text-muted-foreground mt-2 text-xs">
-						正在加载关联调用...
-					</p>
-				) : relatedLlmCalls.length === 0 ? (
-					<p className="text-muted-foreground mt-2 text-xs">暂无关联调用。</p>
-				) : (
-					<div className="mt-2 space-y-2">
-						{relatedLlmCalls.map((call) => (
-							<div key={call.id} className="rounded-md border p-2">
-								<div className="flex flex-wrap items-center justify-between gap-2">
-									<div className="min-w-0">
-										<p className="truncate font-mono text-xs">{call.id}</p>
-										<p className="text-muted-foreground mt-1 text-[11px]">
-											{call.source} · {llmCallStatusLabel(call.status)}
-										</p>
+			{showRelatedLlmCalls ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">关联 LLM 调用</p>
+					{relatedLlmCallsLoading ? (
+						<p className="text-muted-foreground mt-2 text-xs">
+							正在加载关联调用...
+						</p>
+					) : relatedLlmCalls.length === 0 ? (
+						<p className="text-muted-foreground mt-2 text-xs">暂无关联调用。</p>
+					) : (
+						<div className="mt-2 space-y-2">
+							{relatedLlmCalls.map((call) => (
+								<div key={call.id} className="rounded-md border p-2">
+									<div className="flex flex-wrap items-center justify-between gap-2">
+										<div className="min-w-0">
+											<p className="truncate font-mono text-xs">{call.id}</p>
+											<p className="text-muted-foreground mt-1 text-[11px]">
+												{call.source} · {llmCallStatusLabel(call.status)}
+											</p>
+										</div>
+										<Button
+											size="sm"
+											variant="outline"
+											disabled={!props.onOpenLlmCallDetail}
+											onClick={() => props.onOpenLlmCallDetail?.(call.id)}
+										>
+											查看 LLM 详情
+										</Button>
 									</div>
-									<Button
-										size="sm"
-										variant="outline"
-										disabled={!props.onOpenLlmCallDetail}
-										onClick={() => props.onOpenLlmCallDetail?.(call.id)}
-									>
-										查看 LLM 详情
-									</Button>
 								</div>
-							</div>
-						))}
-					</div>
-				)}
-			</div>
+							))}
+						</div>
+					)}
+				</div>
+			) : null}
 			<details className={detailCardClass}>
 				<summary className="text-muted-foreground cursor-pointer text-xs font-medium">
 					查看任务输入/输出原始 JSON
