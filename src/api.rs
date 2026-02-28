@@ -1576,6 +1576,7 @@ pub struct AdminLlmCallsQuery {
     status: Option<String>,
     source: Option<String>,
     requested_by: Option<i64>,
+    parent_task_id: Option<String>,
     started_from: Option<String>,
     started_to: Option<String>,
     page: Option<i64>,
@@ -1678,6 +1679,7 @@ pub async fn admin_list_llm_calls(
     }
 
     let source = query.source.unwrap_or_default().trim().to_owned();
+    let parent_task_id = query.parent_task_id.unwrap_or_default().trim().to_owned();
     let started_from = parse_llm_calls_filter_timestamp(query.started_from, "started_from")?;
     let started_to = parse_llm_calls_filter_timestamp(query.started_to, "started_to")?;
 
@@ -1688,6 +1690,7 @@ pub async fn admin_list_llm_calls(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR source = ?)
           AND (? IS NULL OR requested_by = ?)
+          AND (? = '' OR parent_task_id = ?)
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
         "#,
@@ -1698,6 +1701,8 @@ pub async fn admin_list_llm_calls(
     .bind(source.as_str())
     .bind(query.requested_by)
     .bind(query.requested_by)
+    .bind(parent_task_id.as_str())
+    .bind(parent_task_id.as_str())
     .bind(started_from.as_deref())
     .bind(started_from.as_deref())
     .bind(started_to.as_deref())
@@ -1733,6 +1738,7 @@ pub async fn admin_list_llm_calls(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR source = ?)
           AND (? IS NULL OR requested_by = ?)
+          AND (? = '' OR parent_task_id = ?)
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
         ORDER BY created_at DESC, id DESC
@@ -1745,6 +1751,8 @@ pub async fn admin_list_llm_calls(
     .bind(source.as_str())
     .bind(query.requested_by)
     .bind(query.requested_by)
+    .bind(parent_task_id.as_str())
+    .bind(parent_task_id.as_str())
     .bind(started_from.as_deref())
     .bind(started_from.as_deref())
     .bind(started_to.as_deref())
@@ -7244,6 +7252,7 @@ mod tests {
                 status: None,
                 source: None,
                 requested_by: None,
+                parent_task_id: None,
                 started_from: None,
                 started_to: None,
                 page: None,
@@ -7290,6 +7299,7 @@ mod tests {
                 status: Some("failed".to_owned()),
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(1),
+                parent_task_id: None,
                 started_from: None,
                 started_to: None,
                 page: Some(1),
@@ -7336,6 +7346,7 @@ mod tests {
                 status: Some("all".to_owned()),
                 source: Some("api.translate_releases_batch".to_owned()),
                 requested_by: Some(1),
+                parent_task_id: None,
                 started_from: Some(started_from),
                 started_to: Some(started_to),
                 page: Some(1),
@@ -7349,6 +7360,115 @@ mod tests {
         assert_eq!(resp.total, 1);
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-zulu");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_filters_parent_task_id() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call(
+            &pool,
+            "call-parent-a",
+            "succeeded",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+        seed_llm_call(
+            &pool,
+            "call-parent-b",
+            "succeeded",
+            "api.translate_releases_batch",
+            Some(1),
+        )
+        .await;
+        let now = chrono::Utc::now().to_rfc3339();
+        for task_id in ["task-123", "task-456"] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id,
+                  task_type,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  payload_json,
+                  result_json,
+                  error_message,
+                  cancel_requested,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                )
+                VALUES (?, 'sync.releases', 'succeeded', 'tests', 1, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(task_id)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed parent task");
+        }
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET parent_task_id = ?, parent_task_type = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("task-123")
+        .bind("translate.release.batch")
+        .bind("call-parent-a")
+        .execute(&pool)
+        .await
+        .expect("set parent task for call-parent-a");
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET parent_task_id = ?, parent_task_type = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("task-456")
+        .bind("sync.releases")
+        .bind("call-parent-b")
+        .execute(&pool)
+        .await
+        .expect("set parent task for call-parent-b");
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: None,
+                requested_by: Some(1),
+                parent_task_id: Some("task-123".to_owned()),
+                started_from: None,
+                started_to: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should filter by parent_task_id")
+        .0;
+
+        assert_eq!(resp.total, 1);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].id, "call-parent-a");
+        assert_eq!(resp.items[0].parent_task_id.as_deref(), Some("task-123"));
     }
 
     #[tokio::test]
