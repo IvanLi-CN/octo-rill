@@ -490,7 +490,9 @@ test("admin can manage jobs center", async ({ page }) => {
 		.getByText("ID: task-translate-batch-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
 	await translateTaskCard.getByRole("button", { name: "详情" }).click();
-	await expect(page.getByText("task-translate-batch-1")).toBeVisible();
+	await expect(
+		page.getByText("task-translate-batch-1", { exact: true }),
+	).toBeVisible();
 	await expect(page.getByText("业务结果：业务失败")).toBeVisible();
 	await expect(
 		page.getByText("仅展示最近 2 条事件（已加载 2/4）。"),
