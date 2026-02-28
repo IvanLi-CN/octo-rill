@@ -140,8 +140,8 @@ Notes:
 		source: "api.translate_releases_batch",
 		model: "gpt-4o-mini",
 		requested_by: 1,
-		parent_task_id: null,
-		parent_task_type: null,
+		parent_task_id: "task-sync-releases",
+		parent_task_type: "sync.releases",
 		max_tokens: 900,
 		attempt_count: 1,
 		scheduler_wait_ms: 120,
@@ -453,6 +453,7 @@ function AdminJobsPreview({
 				const status = url.searchParams.get("status");
 				const source = url.searchParams.get("source");
 				const requestedBy = url.searchParams.get("requested_by");
+				const parentTaskId = url.searchParams.get("parent_task_id");
 				let rows = [...llmCalls];
 				if (status && status !== "all") {
 					rows = rows.filter((item) => item.status === status);
@@ -464,6 +465,9 @@ function AdminJobsPreview({
 					rows = rows.filter(
 						(item) => String(item.requested_by ?? "") === String(requestedBy),
 					);
+				}
+				if (parentTaskId) {
+					rows = rows.filter((item) => item.parent_task_id === parentTaskId);
 				}
 				const page = url.searchParams.get("page");
 				const pageSize = url.searchParams.get("page_size");

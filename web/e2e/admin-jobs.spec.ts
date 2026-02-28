@@ -93,8 +93,8 @@ async function installAdminJobsMocks(page: Page) {
 			source: "api.translate_releases_batch",
 			model: "gpt-4o-mini",
 			requested_by: 1,
-			parent_task_id: null,
-			parent_task_type: null,
+			parent_task_id: "task-translate-batch-1",
+			parent_task_type: "translate.release.batch",
 			max_tokens: 900,
 			attempt_count: 1,
 			scheduler_wait_ms: 80,
@@ -373,6 +373,7 @@ async function installAdminJobsMocks(page: Page) {
 			const status = url.searchParams.get("status") ?? "all";
 			const source = url.searchParams.get("source") ?? "";
 			const requestedBy = url.searchParams.get("requested_by");
+			const parentTaskId = url.searchParams.get("parent_task_id") ?? "";
 			const filtered = llmCalls.filter((item) => {
 				if (status !== "all" && item.status !== status) return false;
 				if (source && item.source !== source) return false;
@@ -380,6 +381,9 @@ async function installAdminJobsMocks(page: Page) {
 					requestedBy &&
 					String(item.requested_by ?? "") !== String(requestedBy)
 				) {
+					return false;
+				}
+				if (parentTaskId && item.parent_task_id !== parentTaskId) {
 					return false;
 				}
 				return true;
@@ -473,6 +477,7 @@ async function installAdminJobsMocks(page: Page) {
 }
 
 test("admin can manage jobs center", async ({ page }) => {
+	test.slow();
 	await installAdminJobsMocks(page);
 	await page.goto("/admin/jobs");
 
@@ -483,8 +488,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
 	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
 	const translateTaskCard = page
 		.getByText("ID: task-translate-batch-1")
@@ -500,7 +507,25 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByText("Release #290978079 · error · translation failed"),
 	).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: "查看 LLM 详情" }),
+	).toBeVisible();
+	const llmDetailButton = page.getByRole("button", { name: "查看 LLM 详情" });
+	await llmDetailButton.scrollIntoViewIfNeeded();
+	await llmDetailButton.evaluate((node: HTMLElement) => node.click());
+	await expect(
+		page.getByRole("heading", { name: "任务详情 · LLM 调用详情" }),
+	).toBeVisible();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-translate-batch-1\/llm\/llm-call-2$/,
+	);
+	await expect(
+		page.getByText("来源：api.translate_releases_batch"),
+	).toBeVisible();
+	await page.getByRole("button", { name: "返回任务详情" }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-translate-batch-1$/);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
 	await page.getByRole("button", { name: "定时任务" }).click();
 	await expect(page.getByText("运行记录")).toBeVisible();

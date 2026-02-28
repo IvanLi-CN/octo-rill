@@ -1,4 +1,5 @@
-import type { AdminRealtimeTaskDetailResponse } from "@/api";
+import type { AdminLlmCallItem, AdminRealtimeTaskDetailResponse } from "@/api";
+import { Button } from "@/components/ui/button";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -502,9 +503,31 @@ function dailyUserStateLabel(state: string) {
 	}
 }
 
-export function TaskTypeDetailSection(props: {
+function llmCallStatusLabel(status: string) {
+	switch (status) {
+		case "queued":
+			return "排队中";
+		case "running":
+			return "运行中";
+		case "succeeded":
+			return "成功";
+		case "failed":
+			return "失败";
+		default:
+			return status;
+	}
+}
+
+type TaskTypeDetailSectionProps = {
 	detail: AdminRealtimeTaskDetailResponse;
-}) {
+	relatedLlmCalls?: AdminLlmCallItem[];
+	relatedLlmCallsLoading?: boolean;
+	onOpenLlmCallDetail?: (callId: string) => void;
+};
+
+export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
+	const relatedLlmCalls = props.relatedLlmCalls ?? [];
+	const relatedLlmCallsLoading = props.relatedLlmCallsLoading ?? false;
 	const model = buildTaskDetailPageModel(props.detail);
 	const payload = parseJsonRecord(props.detail.task.payload_json);
 	const result = parseJsonRecord(props.detail.task.result_json);
@@ -617,6 +640,39 @@ export function TaskTypeDetailSection(props: {
 					</div>
 				</div>
 			) : null}
+			<div className={detailCardClass}>
+				<p className="text-muted-foreground text-[11px]">关联 LLM 调用</p>
+				{relatedLlmCallsLoading ? (
+					<p className="text-muted-foreground mt-2 text-xs">
+						正在加载关联调用...
+					</p>
+				) : relatedLlmCalls.length === 0 ? (
+					<p className="text-muted-foreground mt-2 text-xs">暂无关联调用。</p>
+				) : (
+					<div className="mt-2 space-y-2">
+						{relatedLlmCalls.map((call) => (
+							<div key={call.id} className="rounded-md border p-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<div className="min-w-0">
+										<p className="truncate font-mono text-xs">{call.id}</p>
+										<p className="text-muted-foreground mt-1 text-[11px]">
+											{call.source} · {llmCallStatusLabel(call.status)}
+										</p>
+									</div>
+									<Button
+										size="sm"
+										variant="outline"
+										disabled={!props.onOpenLlmCallDetail}
+										onClick={() => props.onOpenLlmCallDetail?.(call.id)}
+									>
+										查看 LLM 详情
+									</Button>
+								</div>
+							</div>
+						))}
+					</div>
+				)}
+			</div>
 			<details className={detailCardClass}>
 				<summary className="text-muted-foreground cursor-pointer text-xs font-medium">
 					查看任务输入/输出原始 JSON

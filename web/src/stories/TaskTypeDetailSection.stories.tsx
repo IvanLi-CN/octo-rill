@@ -116,6 +116,40 @@ export const BriefGenerate: Story = {
 	},
 };
 
+export const WithRelatedLlmCalls: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.releases",
+			{ user_id: 4 },
+			{ repos: 9, releases: 278 },
+		),
+		relatedLlmCalls: [
+			{
+				id: "llm-call-story-1",
+				status: "failed",
+				source: "job.api.translate_release",
+				model: "gpt-4o-mini",
+				requested_by: 4,
+				parent_task_id: "task-sync.releases",
+				parent_task_type: "sync.releases",
+				max_tokens: 900,
+				attempt_count: 2,
+				scheduler_wait_ms: 240,
+				first_token_wait_ms: 310,
+				duration_ms: 1400,
+				input_tokens: 800,
+				output_tokens: 0,
+				cached_input_tokens: 320,
+				total_tokens: 800,
+				created_at: "2026-02-26T12:00:20Z",
+				started_at: "2026-02-26T12:00:21Z",
+				finished_at: "2026-02-26T12:00:22Z",
+				updated_at: "2026-02-26T12:00:22Z",
+			},
+		],
+	},
+};
+
 export const BriefDailySlot: Story = {
 	args: {
 		detail: buildDetail(

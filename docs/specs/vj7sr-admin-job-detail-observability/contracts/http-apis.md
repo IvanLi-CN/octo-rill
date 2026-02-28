@@ -164,7 +164,18 @@ New progress stages:
 - `stage=summary`
   - `total`, `succeeded`, `failed`, `canceled`
 
+## Modified: `GET /api/admin/jobs/llm/calls`
+
+### Query params (new)
+
+- `parent_task_id` (optional): 按父任务 ID 过滤调用记录。
+
+### Example
+
+`GET /api/admin/jobs/llm/calls?status=all&page=1&page_size=50&parent_task_id=task-translate-batch-1`
+
 ## Compatibility
 
 - Existing fields remain unchanged.
 - `event_meta` and `diagnostics` are additive; old frontend clients remain compatible.
+- `parent_task_id` is optional; omitting it keeps previous list behavior.
