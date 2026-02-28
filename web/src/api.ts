@@ -132,6 +132,72 @@ export type AdminTaskEventItem = {
 	created_at: string;
 };
 
+export type AdminTaskEventMeta = {
+	returned: number;
+	total: number;
+	limit: number;
+	truncated: boolean;
+};
+
+export type AdminBusinessOutcome = {
+	code: "ok" | "partial" | "failed" | "disabled" | "unknown";
+	label: string;
+	message: string;
+};
+
+export type AdminTranslateReleaseBatchDiagnostics = {
+	target_user_id: number | null;
+	release_total: number;
+	summary: {
+		total: number;
+		ready: number;
+		missing: number;
+		disabled: number;
+		error: number;
+	};
+	progress: {
+		processed: number;
+		last_stage: string | null;
+	};
+	items: Array<{
+		release_id: string;
+		item_status: string;
+		item_error: string | null;
+		last_event_at: string;
+	}>;
+};
+
+export type AdminBriefDailySlotDiagnostics = {
+	hour_utc: number | null;
+	summary: {
+		total_users: number;
+		progressed_users: number;
+		succeeded_users: number;
+		failed_users: number;
+		canceled: boolean;
+	};
+	users: Array<{
+		user_id: number;
+		key_date: string | null;
+		state: "succeeded" | "failed" | "running";
+		error: string | null;
+		last_event_at: string;
+	}>;
+};
+
+export type AdminBriefGenerateDiagnostics = {
+	target_user_id: number | null;
+	content_length: number | null;
+	key_date: string | null;
+};
+
+export type AdminTaskDiagnostics = {
+	business_outcome: AdminBusinessOutcome;
+	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
+	brief_daily_slot?: AdminBriefDailySlotDiagnostics | null;
+	brief_generate?: AdminBriefGenerateDiagnostics | null;
+};
+
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
 	payload_json?: string | null;
 	result_json?: string | null;
@@ -140,6 +206,8 @@ export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
 export type AdminRealtimeTaskDetailResponse = {
 	task: AdminRealtimeTaskDetailItem;
 	events: AdminTaskEventItem[];
+	event_meta?: AdminTaskEventMeta | null;
+	diagnostics?: AdminTaskDiagnostics | null;
 };
 
 export type AdminTaskActionResponse = {

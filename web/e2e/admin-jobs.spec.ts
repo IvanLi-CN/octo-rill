@@ -38,6 +38,20 @@ async function installAdminJobsMocks(page: Page) {
 			finished_at: null,
 			updated_at: "2026-02-26T01:00:20Z",
 		},
+		{
+			id: "task-translate-batch-1",
+			task_type: "translate.release.batch",
+			status: "succeeded",
+			source: "api.translate_releases_batch_stream",
+			requested_by: 1,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-02-26T01:10:00Z",
+			started_at: "2026-02-26T01:10:02Z",
+			finished_at: "2026-02-26T01:10:40Z",
+			updated_at: "2026-02-26T01:10:40Z",
+		},
 	];
 
 	const llmCalls = [
@@ -227,8 +241,104 @@ async function installAdminJobsMocks(page: Page) {
 					404,
 				);
 			}
+			if (taskId === "task-translate-batch-1") {
+				return json(route, {
+					task: {
+						...task,
+						payload_json: JSON.stringify({
+							user_id: 1,
+							release_ids: [290978079, 290980132],
+						}),
+						result_json: JSON.stringify({
+							total: 2,
+							ready: 0,
+							missing: 0,
+							disabled: 0,
+							error: 2,
+						}),
+					},
+					event_meta: {
+						returned: 2,
+						total: 4,
+						limit: 2,
+						truncated: true,
+					},
+					diagnostics: {
+						business_outcome: {
+							code: "failed",
+							label: "业务失败",
+							message: "任务运行完成，但全部翻译项失败。",
+						},
+						translate_release_batch: {
+							target_user_id: 1,
+							release_total: 2,
+							summary: {
+								total: 2,
+								ready: 0,
+								missing: 0,
+								disabled: 0,
+								error: 2,
+							},
+							progress: {
+								processed: 2,
+								last_stage: "release",
+							},
+							items: [
+								{
+									release_id: "290978079",
+									item_status: "error",
+									item_error: "translation failed",
+									last_event_at: "2026-02-26T01:10:30Z",
+								},
+								{
+									release_id: "290980132",
+									item_status: "error",
+									item_error: "translation failed",
+									last_event_at: "2026-02-26T01:10:32Z",
+								},
+							],
+						},
+					},
+					events: [
+						{
+							id: 20,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "release",
+								release_id: "290978079",
+								item_status: "error",
+								item_error: "translation failed",
+							}),
+							created_at: "2026-02-26T01:10:30Z",
+						},
+						{
+							id: 21,
+							event_type: "task.completed",
+							payload_json: JSON.stringify({
+								status: "succeeded",
+							}),
+							created_at: "2026-02-26T01:10:40Z",
+						},
+					],
+				});
+			}
+
 			return json(route, {
-				task,
+				task: {
+					...task,
+					payload_json: JSON.stringify({
+						task_id: task.id,
+						status: task.status,
+					}),
+					result_json:
+						task.status === "failed" ? null : JSON.stringify({ ok: true }),
+				},
+				event_meta: {
+					returned: 1,
+					total: 1,
+					limit: 200,
+					truncated: false,
+				},
 				events: [
 					{
 						id: 1,
@@ -374,6 +484,20 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+
+	const translateTaskCard = page
+		.getByText("ID: task-translate-batch-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await translateTaskCard.getByRole("button", { name: "详情" }).click();
+	await expect(page.getByText("task-translate-batch-1")).toBeVisible();
+	await expect(page.getByText("业务结果：业务失败")).toBeVisible();
+	await expect(
+		page.getByText("仅展示最近 2 条事件（已加载 2/4）。"),
+	).toBeVisible();
+	await expect(
+		page.getByText("Release #290978079 · error · translation failed"),
+	).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 
 	await page.getByRole("button", { name: "定时任务" }).click();
