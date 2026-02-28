@@ -45,6 +45,18 @@ function readNumber(payload: JsonRecord | null, key: string): number | null {
 	return typeof value === "number" ? value : null;
 }
 
+function readBoolean(payload: JsonRecord | null, key: string): boolean | null {
+	if (!payload) return null;
+	const value = payload[key];
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		if (value === "true" || value === "1") return true;
+		if (value === "false" || value === "0") return false;
+	}
+	if (typeof value === "number") return value !== 0;
+	return null;
+}
+
 function readNumberArray(payload: JsonRecord | null, key: string): number[] {
 	if (!payload) return [];
 	const value = payload[key];
@@ -170,7 +182,8 @@ function summarizeTranslateBatchProgress(
 ) {
 	let processed = 0;
 	let lastStage: string | null = null;
-	for (const event of detail.events) {
+	const orderedEvents = [...detail.events].sort((a, b) => a.id - b.id);
+	for (const event of orderedEvents) {
 		if (event.event_type !== "task.progress") continue;
 		const payload = parseJsonRecord(event.payload_json);
 		const stage = readString(payload, "stage");
@@ -266,25 +279,41 @@ function buildTaskDetailPageModel(
 			};
 		}
 		case "brief.generate": {
-			const contentLength = readNumber(result, "content_length");
+			const diagnostics = detail.diagnostics?.brief_generate ?? null;
+			const contentLength =
+				diagnostics?.content_length ?? readNumber(result, "content_length");
+			const keyDate = diagnostics?.key_date ?? readString(payload, "key_date");
+			const targetUser =
+				diagnostics?.target_user_id !== null &&
+				diagnostics?.target_user_id !== undefined
+					? `#${diagnostics.target_user_id}`
+					: userId
+						? `#${userId}`
+						: null;
 			return {
 				pageTitle: "日报生成详情页",
 				pageSummary: "展示单用户日报生成任务的输入用户与输出长度。",
 				fields: buildFields(
-					field("目标用户", userId ? `#${userId}` : null),
+					field("目标用户", targetUser),
 					field(
 						"生成字符数",
 						contentLength !== null ? `${contentLength} chars` : null,
 					),
+					field("key_date", keyDate),
 				),
 			};
 		}
 		case "brief.daily_slot": {
-			const hourUtc = readNumber(payload, "hour_utc");
-			const total = readNumber(result, "total");
-			const succeeded = readNumber(result, "succeeded");
-			const failed = readNumber(result, "failed");
-			const canceled = readString(result, "canceled");
+			const diagnostics = detail.diagnostics?.brief_daily_slot ?? null;
+			const hourUtc = diagnostics?.hour_utc ?? readNumber(payload, "hour_utc");
+			const total =
+				diagnostics?.summary.total_users ?? readNumber(result, "total");
+			const succeeded =
+				diagnostics?.summary.succeeded_users ?? readNumber(result, "succeeded");
+			const failed =
+				diagnostics?.summary.failed_users ?? readNumber(result, "failed");
+			const canceled =
+				diagnostics?.summary.canceled ?? readBoolean(result, "canceled");
 			const summary = summarizeDailySlotEvents(detail);
 			return {
 				pageTitle: "日报定时槽详情页",
@@ -299,13 +328,20 @@ function buildTaskDetailPageModel(
 					),
 					field(
 						"收集用户数",
-						summary.collectedUsers !== null
-							? `${summary.collectedUsers}`
-							: total !== null
-								? `${total}`
+						total !== null
+							? `${total}`
+							: summary.collectedUsers !== null
+								? `${summary.collectedUsers}`
 								: null,
 					),
-					field("串行已推进", `${summary.progressedUsers}`),
+					field(
+						"串行已推进",
+						`${
+							diagnostics?.summary.progressed_users !== undefined
+								? diagnostics.summary.progressed_users
+								: summary.progressedUsers
+						}`,
+					),
 					field("成功", succeeded !== null ? `${succeeded}` : null),
 					field(
 						"失败",
@@ -313,7 +349,7 @@ function buildTaskDetailPageModel(
 					),
 					field(
 						"是否取消",
-						canceled === "true" ? "是" : canceled ? "否" : null,
+						canceled === true ? "是" : canceled === false ? "否" : null,
 					),
 				),
 			};
@@ -332,29 +368,53 @@ function buildTaskDetailPageModel(
 			};
 		}
 		case "translate.release.batch": {
+			const diagnostics = detail.diagnostics?.translate_release_batch ?? null;
 			const releaseIds = readNumberArray(payload, "release_ids");
 			const summary = summarizeTranslateBatchResult(result);
 			const progress = summarizeTranslateBatchProgress(detail);
+			const totalCount = diagnostics?.summary.total ?? summary.total;
+			const readyCount = diagnostics?.summary.ready ?? summary.ready;
+			const missingCount = diagnostics?.summary.missing ?? summary.missing;
+			const disabledCount = diagnostics?.summary.disabled ?? summary.disabled;
+			const errorCount = diagnostics?.summary.error ?? summary.error;
+			const targetUser =
+				diagnostics?.target_user_id !== null &&
+				diagnostics?.target_user_id !== undefined
+					? `#${diagnostics.target_user_id}`
+					: userId
+						? `#${userId}`
+						: null;
 			return {
 				pageTitle: "批量翻译 Release 详情页",
 				pageSummary:
 					"展示批量翻译任务的目标 Release 数量、进度与 ready/missing/error 结果分布。",
 				fields: buildFields(
-					field("目标用户", userId ? `#${userId}` : null),
-					field("目标 Release 数", `${releaseIds.length}`),
-					field("事件已处理条数", `${progress.processed}`),
-					field("最后阶段", progress.lastStage),
-					field("总数", summary.total !== null ? `${summary.total}` : null),
-					field("ready", summary.ready !== null ? `${summary.ready}` : null),
+					field("目标用户", targetUser),
 					field(
-						"missing",
-						summary.missing !== null ? `${summary.missing}` : null,
+						"目标 Release 数",
+						`${
+							diagnostics?.release_total !== undefined
+								? diagnostics.release_total
+								: releaseIds.length
+						}`,
 					),
 					field(
-						"disabled",
-						summary.disabled !== null ? `${summary.disabled}` : null,
+						"事件已处理条数",
+						`${
+							diagnostics?.progress.processed !== undefined
+								? diagnostics.progress.processed
+								: progress.processed
+						}`,
 					),
-					field("error", summary.error !== null ? `${summary.error}` : null),
+					field(
+						"最后阶段",
+						diagnostics?.progress.last_stage ?? progress.lastStage,
+					),
+					field("总数", totalCount !== null ? `${totalCount}` : null),
+					field("ready", readyCount !== null ? `${readyCount}` : null),
+					field("missing", missingCount !== null ? `${missingCount}` : null),
+					field("disabled", disabledCount !== null ? `${disabledCount}` : null),
+					field("error", errorCount !== null ? `${errorCount}` : null),
 				),
 			};
 		}
@@ -397,16 +457,103 @@ function buildTaskDetailPageModel(
 	}
 }
 
+function businessOutcomeClass(code: string | undefined) {
+	switch (code) {
+		case "ok":
+			return "border-emerald-500/40 bg-emerald-500/5";
+		case "partial":
+			return "border-amber-500/40 bg-amber-500/5";
+		case "failed":
+			return "border-red-500/40 bg-red-500/5";
+		case "disabled":
+			return "border-slate-500/40 bg-slate-500/5";
+		default:
+			return "border-border bg-muted/30";
+	}
+}
+
+function translateItemStatusLabel(status: string) {
+	switch (status) {
+		case "ready":
+			return "已就绪";
+		case "missing":
+			return "缺失";
+		case "disabled":
+			return "已禁用";
+		case "error":
+			return "失败";
+		case "processing":
+			return "处理中";
+		default:
+			return status;
+	}
+}
+
+function dailyUserStateLabel(state: string) {
+	switch (state) {
+		case "succeeded":
+			return "成功";
+		case "failed":
+			return "失败";
+		case "running":
+			return "执行中";
+		default:
+			return state;
+	}
+}
+
 export function TaskTypeDetailSection(props: {
 	detail: AdminRealtimeTaskDetailResponse;
 }) {
 	const model = buildTaskDetailPageModel(props.detail);
 	const payload = parseJsonRecord(props.detail.task.payload_json);
 	const result = parseJsonRecord(props.detail.task.result_json);
+	const diagnostics = props.detail.diagnostics ?? null;
+	const eventMeta = props.detail.event_meta ?? null;
+	const isEventsTruncated = eventMeta?.truncated === true;
 	const detailCardClass = "rounded-lg border p-3";
+	const diagnosticsPrimaryError =
+		props.detail.task.error_message ??
+		diagnostics?.translate_release_batch?.items?.find((item) => item.item_error)
+			?.item_error ??
+		diagnostics?.brief_daily_slot?.users?.find((item) => item.error)?.error ??
+		null;
 
 	return (
 		<section className="space-y-3">
+			{diagnostics ? (
+				<div
+					className={`rounded-lg border p-3 ${businessOutcomeClass(diagnostics.business_outcome.code)}`}
+				>
+					<p className="text-muted-foreground text-[11px]">业务结果诊断</p>
+					<p className="mt-1 text-sm font-semibold">
+						{diagnostics.business_outcome.label}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						{diagnostics.business_outcome.message}
+					</p>
+					{diagnosticsPrimaryError ? (
+						<div className="mt-2 rounded-md border border-red-500/35 bg-red-500/5 p-2">
+							<p className="text-[11px] font-medium text-red-700 dark:text-red-300">
+								失败主因
+							</p>
+							<p className="mt-1 text-sm font-medium text-red-700 dark:text-red-200">
+								{diagnosticsPrimaryError}
+							</p>
+						</div>
+					) : null}
+				</div>
+			) : null}
+			{isEventsTruncated ? (
+				<div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+					<p className="text-[11px] font-medium text-amber-800 dark:text-amber-200">
+						明细可能非全量
+					</p>
+					<p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+						当前仅基于最近 {eventMeta?.limit ?? 200} 条事件生成明细诊断。
+					</p>
+				</div>
+			) : null}
 			<div className="grid gap-2 md:grid-cols-2">
 				{model.fields.map((item) => (
 					<div key={`${item.label}:${item.value}`} className={detailCardClass}>
@@ -415,6 +562,61 @@ export function TaskTypeDetailSection(props: {
 					</div>
 				))}
 			</div>
+			{diagnostics?.translate_release_batch?.items?.length ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">Release 翻译明细</p>
+					<div className="mt-2 space-y-2">
+						{diagnostics.translate_release_batch.items.map((item) => (
+							<div key={item.release_id} className="rounded-md border p-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="font-mono text-xs">#{item.release_id}</p>
+									<span className="text-xs font-medium">
+										{translateItemStatusLabel(item.item_status)}
+									</span>
+								</div>
+								{item.item_error ? (
+									<p className="mt-1 text-sm font-medium text-red-700 dark:text-red-300">
+										错误原因：{item.item_error}
+									</p>
+								) : null}
+								<p className="text-muted-foreground mt-1 text-[11px]">
+									最后事件：{item.last_event_at}
+								</p>
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
+			{diagnostics?.brief_daily_slot?.users?.length ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">用户执行明细</p>
+					<div className="mt-2 space-y-2">
+						{diagnostics.brief_daily_slot.users.map((item) => (
+							<div key={item.user_id} className="rounded-md border p-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="text-xs font-medium">用户 #{item.user_id}</p>
+									<span className="text-xs font-medium">
+										{dailyUserStateLabel(item.state)}
+									</span>
+								</div>
+								{item.key_date ? (
+									<p className="text-muted-foreground mt-1 text-xs">
+										key_date: {item.key_date}
+									</p>
+								) : null}
+								{item.error ? (
+									<p className="mt-1 text-sm font-medium text-red-700 dark:text-red-300">
+										错误原因：{item.error}
+									</p>
+								) : null}
+								<p className="text-muted-foreground mt-1 text-[11px]">
+									最后事件：{item.last_event_at}
+								</p>
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
 			<details className={detailCardClass}>
 				<summary className="text-muted-foreground cursor-pointer text-xs font-medium">
 					查看任务输入/输出原始 JSON
