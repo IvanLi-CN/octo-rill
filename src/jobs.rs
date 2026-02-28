@@ -976,8 +976,21 @@ async fn execute_daily_slot_task(
         .await?;
 
         match ai::generate_daily_brief_for_key_date_at(state, user.id, key_date, at).await {
-            Ok(_) => {
+            Ok(content) => {
                 succeeded += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "user_succeeded",
+                        "user_id": user.id,
+                        "key_date": key_date,
+                        "content_length": content.chars().count(),
+                    }),
+                )
+                .await?;
             }
             Err(err) => {
                 failed += 1;
@@ -996,6 +1009,21 @@ async fn execute_daily_slot_task(
             }
         }
     }
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "summary",
+            "total": users.len(),
+            "succeeded": succeeded,
+            "failed": failed,
+            "canceled": canceled,
+        }),
+    )
+    .await?;
 
     if canceled {
         return Ok(json!({

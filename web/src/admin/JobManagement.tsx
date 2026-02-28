@@ -341,6 +341,18 @@ function readNumber(payload: Record<string, unknown> | null, key: string) {
 	return typeof value === "number" ? value : null;
 }
 
+function readBoolean(payload: Record<string, unknown> | null, key: string) {
+	if (!payload) return null;
+	const value = payload[key];
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		if (value === "true" || value === "1") return true;
+		if (value === "false" || value === "0") return false;
+	}
+	if (typeof value === "number") return value !== 0;
+	return null;
+}
+
 function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 	let payload: Record<string, unknown> | null = null;
 	try {
@@ -390,13 +402,16 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 		const stage = readString(payload, "stage");
 		if (stage === "collect") {
 			const totalUsers = readNumber(payload, "total_users");
+			const totalReleases = readNumber(payload, "total_releases");
 			const hourUtc = readNumber(payload, "hour_utc");
 			return {
 				title: "收集执行对象",
 				description:
 					totalUsers !== null && hourUtc !== null
 						? `UTC ${hourUtc.toString().padStart(2, "0")}:00 收集到 ${totalUsers} 位用户。`
-						: "任务正在收集本轮执行对象。",
+						: totalReleases !== null
+							? `收集到 ${totalReleases} 条 Release 待处理。`
+							: "任务正在收集本轮执行对象。",
 				level: "normal",
 				payload,
 			};
@@ -415,6 +430,43 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 				payload,
 			};
 		}
+		if (stage === "release") {
+			const releaseId = readString(payload, "release_id");
+			const itemStatus = readString(payload, "item_status");
+			const itemError = readString(payload, "item_error");
+			const level =
+				itemStatus === "error"
+					? "danger"
+					: itemStatus === "ready"
+						? "success"
+						: itemStatus === "missing" || itemStatus === "disabled"
+							? "warning"
+							: "normal";
+			return {
+				title: "Release 处理结果",
+				description: releaseId
+					? `Release #${releaseId} · ${itemStatus ?? "unknown"}${itemError ? ` · ${itemError}` : ""}`
+					: "记录了单条 Release 处理结果。",
+				level,
+				payload,
+			};
+		}
+		if (stage === "user_succeeded") {
+			const userId = readNumber(payload, "user_id");
+			const keyDate = readString(payload, "key_date");
+			const contentLength = readNumber(payload, "content_length");
+			return {
+				title: "单用户执行成功",
+				description:
+					userId !== null
+						? `用户 #${userId} 生成成功${keyDate ? ` · key_date=${keyDate}` : ""}${
+								contentLength !== null ? ` · ${contentLength} chars` : ""
+							}`
+						: "有用户日报生成成功。",
+				level: "success",
+				payload,
+			};
+		}
 		if (stage === "user_failed") {
 			const userId = readNumber(payload, "user_id");
 			const error = readString(payload, "error");
@@ -425,6 +477,28 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 						? `用户 #${userId} 失败${error ? `：${error}` : ""}`
 						: "有用户执行失败，任务继续处理后续用户。",
 				level: "danger",
+				payload,
+			};
+		}
+		if (stage === "summary") {
+			const total = readNumber(payload, "total");
+			const succeeded = readNumber(payload, "succeeded");
+			const failed = readNumber(payload, "failed");
+			const canceled = readBoolean(payload, "canceled");
+			return {
+				title: "任务汇总",
+				description:
+					total !== null || succeeded !== null || failed !== null
+						? `总计 ${total ?? "-"} · 成功 ${succeeded ?? "-"} · 失败 ${failed ?? "-"}${
+								canceled === true ? " · 已取消" : ""
+							}`
+						: "任务输出了汇总统计。",
+				level:
+					failed !== null && failed > 0
+						? "warning"
+						: canceled === true
+							? "warning"
+							: "success",
 				payload,
 			};
 		}
@@ -477,6 +551,19 @@ function eventLevelClass(level: EventLevel) {
 			return "border-red-500/40 bg-red-500/5";
 		default:
 			return "border-border bg-card/70";
+	}
+}
+
+function businessOutcomeBannerClass(code: string) {
+	switch (code) {
+		case "failed":
+			return "border-red-500/40 bg-red-500/5 text-red-900 dark:text-red-100";
+		case "partial":
+			return "border-amber-500/40 bg-amber-500/5 text-amber-900 dark:text-amber-100";
+		case "disabled":
+			return "border-slate-500/40 bg-slate-500/5 text-slate-900 dark:text-slate-100";
+		default:
+			return "border-border bg-muted/30 text-foreground";
 	}
 }
 
@@ -664,6 +751,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		}
 		return -1;
 	}, [llmConversationTimeline]);
+	const detailBusinessOutcome =
+		detailTask?.diagnostics?.business_outcome ?? null;
+	const detailEventMeta = detailTask?.event_meta ?? null;
 
 	useEffect(() => {
 		detailTaskIdRef.current = detailTask?.task.id ?? null;
@@ -1840,6 +1930,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							<TaskTypeDetailSection detail={detailTask} />
 						</div>
 
+						{detailTask.task.status === "succeeded" &&
+						detailBusinessOutcome &&
+						detailBusinessOutcome.code !== "ok" ? (
+							<div
+								className={`mt-3 rounded-lg border p-3 ${businessOutcomeBannerClass(
+									detailBusinessOutcome.code,
+								)}`}
+							>
+								<p className="text-xs font-semibold">
+									业务结果：{detailBusinessOutcome.label}
+								</p>
+								<p className="mt-1 text-xs opacity-90">
+									{detailBusinessOutcome.message}
+								</p>
+							</div>
+						) : null}
+
 						{detailTask.task.error_message ? (
 							<p className="text-destructive mt-3 text-sm">
 								失败原因：{detailTask.task.error_message}
@@ -1848,6 +1955,17 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 						<div className="mt-4 border-t pt-4">
 							<p className="text-muted-foreground text-xs">执行时间线</p>
+							{detailEventMeta?.truncated ? (
+								<p className="text-amber-700 mt-1 text-xs dark:text-amber-200">
+									仅展示最近 {detailEventMeta.limit} 条事件（已加载{" "}
+									{detailEventMeta.returned}/{detailEventMeta.total}）。
+								</p>
+							) : detailEventMeta ? (
+								<p className="text-muted-foreground mt-1 text-xs">
+									事件总数 {detailEventMeta.total}，当前已加载{" "}
+									{detailEventMeta.returned} 条。
+								</p>
+							) : null}
 						</div>
 						<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
 							{taskEvents.length === 0 ? (

@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-02-27 | local implementation completed |
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
 | g4456 | LLM 批处理效率改造 | 部分完成（3/4） | `g4456-llm-batch-efficiency/SPEC.md` | 2026-02-25 | 已完成核心改造，待补前端依赖后复验 |

@@ -691,10 +691,600 @@ pub struct AdminTaskEventItem {
     created_at: String,
 }
 
+const ADMIN_TASK_DETAIL_EVENT_LIMIT: i64 = 200;
+
+#[derive(Debug, Serialize)]
+pub struct AdminTaskEventMeta {
+    returned: i64,
+    total: i64,
+    limit: i64,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBusinessOutcome {
+    code: String, // ok | partial | failed | disabled | unknown
+    label: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTaskDiagnostics {
+    business_outcome: AdminBusinessOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    translate_release_batch: Option<AdminTranslateReleaseBatchDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brief_daily_slot: Option<AdminBriefDailySlotDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brief_generate: Option<AdminBriefGenerateDiagnostics>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTranslateReleaseBatchDiagnostics {
+    target_user_id: Option<i64>,
+    release_total: i64,
+    summary: AdminTranslateReleaseBatchSummary,
+    progress: AdminTranslateReleaseBatchProgress,
+    items: Vec<AdminTranslateReleaseBatchItemDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTranslateReleaseBatchSummary {
+    total: i64,
+    ready: i64,
+    missing: i64,
+    disabled: i64,
+    error: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTranslateReleaseBatchProgress {
+    processed: i64,
+    last_stage: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminTranslateReleaseBatchItemDiagnostic {
+    release_id: String,
+    item_status: String,
+    item_error: Option<String>,
+    last_event_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefDailySlotDiagnostics {
+    hour_utc: Option<i64>,
+    summary: AdminBriefDailySlotSummary,
+    users: Vec<AdminBriefDailySlotUserDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefDailySlotSummary {
+    total_users: i64,
+    progressed_users: i64,
+    succeeded_users: i64,
+    failed_users: i64,
+    canceled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefDailySlotUserDiagnostic {
+    user_id: i64,
+    key_date: Option<String>,
+    state: String, // succeeded | failed | running
+    error: Option<String>,
+    last_event_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefGenerateDiagnostics {
+    target_user_id: Option<i64>,
+    content_length: Option<i64>,
+    key_date: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AdminRealtimeTaskDetailResponse {
     task: AdminRealtimeTaskDetailItem,
     events: Vec<AdminTaskEventItem>,
+    event_meta: AdminTaskEventMeta,
+    diagnostics: Option<AdminTaskDiagnostics>,
+}
+
+fn parse_json_value(raw: Option<&str>) -> Option<serde_json::Value> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    serde_json::from_str(raw).ok()
+}
+
+fn json_value_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(raw) = value.as_str() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    } else if value.is_number() || value.is_boolean() {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn json_value_to_i64(value: &serde_json::Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_u64() {
+        return i64::try_from(number).ok();
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .and_then(|raw| raw.parse::<i64>().ok())
+}
+
+fn json_value_to_bool(value: &serde_json::Value) -> Option<bool> {
+    if let Some(boolean) = value.as_bool() {
+        return Some(boolean);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number != 0);
+    }
+    value.as_str().map(str::trim).and_then(|raw| match raw {
+        "1" | "true" | "TRUE" => Some(true),
+        "0" | "false" | "FALSE" => Some(false),
+        _ => None,
+    })
+}
+
+fn json_object_get_i64(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<i64> {
+    object
+        .and_then(|obj| obj.get(key))
+        .and_then(json_value_to_i64)
+}
+
+fn json_object_get_string(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    object
+        .and_then(|obj| obj.get(key))
+        .and_then(json_value_to_string)
+}
+
+fn json_object_get_bool(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<bool> {
+    object
+        .and_then(|obj| obj.get(key))
+        .and_then(json_value_to_bool)
+}
+
+fn business_outcome(code: &str, label: &str, message: impl Into<String>) -> AdminBusinessOutcome {
+    AdminBusinessOutcome {
+        code: code.to_owned(),
+        label: label.to_owned(),
+        message: message.into(),
+    }
+}
+
+fn build_translate_release_batch_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminTranslateReleaseBatchDiagnostics) {
+    let payload_value = parse_json_value(Some(task.payload_json.as_str()));
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let target_user_id = json_object_get_i64(payload_object, "user_id");
+
+    let release_total_from_payload = payload_object
+        .and_then(|obj| obj.get("release_ids"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| i64::try_from(items.len()).unwrap_or(0))
+        .unwrap_or(0);
+
+    let mut summary = AdminTranslateReleaseBatchSummary {
+        total: json_object_get_i64(result_object, "total").unwrap_or(0),
+        ready: json_object_get_i64(result_object, "ready").unwrap_or(0),
+        missing: json_object_get_i64(result_object, "missing").unwrap_or(0),
+        disabled: json_object_get_i64(result_object, "disabled").unwrap_or(0),
+        error: json_object_get_i64(result_object, "error").unwrap_or(0),
+    };
+
+    if summary.total == 0 {
+        summary.total = release_total_from_payload;
+    }
+
+    let mut ordered_events = events.iter().collect::<Vec<_>>();
+    ordered_events.sort_by_key(|event| event.id);
+
+    let mut processed = 0_i64;
+    let mut last_stage: Option<String> = None;
+    let mut item_pos_by_release_id = HashMap::<String, usize>::new();
+    let mut items: Vec<AdminTranslateReleaseBatchItemDiagnostic> = Vec::new();
+    for event in ordered_events {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+        last_stage = Some(stage.clone());
+        if stage != "release" {
+            continue;
+        }
+
+        processed += 1;
+        let release_id = json_object_get_string(payload_object, "release_id")
+            .unwrap_or_else(|| "unknown".to_owned());
+        let item_status = json_object_get_string(payload_object, "item_status")
+            .unwrap_or_else(|| "unknown".to_owned());
+        let item_error = json_object_get_string(payload_object, "item_error");
+        if let Some(pos) = item_pos_by_release_id.get(&release_id).copied() {
+            items[pos].item_status = item_status;
+            items[pos].item_error = item_error;
+            items[pos].last_event_at = event.created_at.clone();
+            continue;
+        }
+        let pos = items.len();
+        item_pos_by_release_id.insert(release_id.clone(), pos);
+        items.push(AdminTranslateReleaseBatchItemDiagnostic {
+            release_id,
+            item_status,
+            item_error,
+            last_event_at: event.created_at.clone(),
+        });
+    }
+
+    if summary.total == 0 {
+        summary.total = processed;
+    }
+
+    let release_total = summary.total.max(release_total_from_payload);
+    let progress = AdminTranslateReleaseBatchProgress {
+        processed,
+        last_stage,
+    };
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "任务执行失败，未产出可用翻译。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_CANCELED {
+        business_outcome("partial", "已取消", "任务已取消，结果可能不完整。")
+    } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
+        business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。")
+    } else if release_total == 0 {
+        business_outcome("ok", "无需翻译", "任务未命中可翻译的 Release。")
+    } else if summary.disabled == release_total {
+        business_outcome("disabled", "AI 已禁用", "翻译能力未启用，任务未进行翻译。")
+    } else if summary.error > 0 && summary.ready == 0 {
+        business_outcome("failed", "业务失败", "任务已运行完成，但全部翻译项失败。")
+    } else if summary.error > 0 || summary.missing > 0 {
+        business_outcome(
+            "partial",
+            "部分成功",
+            "部分 Release 翻译成功，部分失败或缺失。",
+        )
+    } else if summary.ready > 0 && summary.ready >= release_total {
+        business_outcome("ok", "业务成功", "所有目标 Release 已完成翻译。")
+    } else if summary.ready > 0 {
+        business_outcome("partial", "部分成功", "已有翻译结果，但统计未完全收敛。")
+    } else {
+        business_outcome(
+            "unknown",
+            "结果未知",
+            "任务状态显示成功，但缺少可判定的翻译结果统计。",
+        )
+    };
+
+    (
+        outcome,
+        AdminTranslateReleaseBatchDiagnostics {
+            target_user_id,
+            release_total,
+            summary,
+            progress,
+            items,
+        },
+    )
+}
+
+fn upsert_daily_slot_user_diag(
+    users: &mut Vec<AdminBriefDailySlotUserDiagnostic>,
+    index: &mut HashMap<i64, usize>,
+    user_id: i64,
+    event_created_at: &str,
+) -> usize {
+    if let Some(pos) = index.get(&user_id).copied() {
+        users[pos].last_event_at = event_created_at.to_owned();
+        return pos;
+    }
+    let pos = users.len();
+    users.push(AdminBriefDailySlotUserDiagnostic {
+        user_id,
+        key_date: None,
+        state: "running".to_owned(),
+        error: None,
+        last_event_at: event_created_at.to_owned(),
+    });
+    index.insert(user_id, pos);
+    pos
+}
+
+fn build_brief_daily_slot_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminBriefDailySlotDiagnostics) {
+    let payload_value = parse_json_value(Some(task.payload_json.as_str()));
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let hour_utc = json_object_get_i64(payload_object, "hour_utc");
+    let mut collected_total_users = 0_i64;
+    let mut progressed_users = 0_i64;
+    let mut summary_total_from_event: Option<i64> = None;
+    let mut summary_succeeded_from_event: Option<i64> = None;
+    let mut summary_failed_from_event: Option<i64> = None;
+    let mut summary_canceled_from_event: Option<bool> = None;
+    let mut succeeded_from_events = 0_i64;
+    let mut failed_from_events = 0_i64;
+
+    let mut users: Vec<AdminBriefDailySlotUserDiagnostic> = Vec::new();
+    let mut user_index = HashMap::<i64, usize>::new();
+    let mut ordered_events = events.iter().collect::<Vec<_>>();
+    ordered_events.sort_by_key(|event| event.id);
+    for event in ordered_events {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+        match stage.as_str() {
+            "collect" => {
+                if let Some(total_users) = json_object_get_i64(payload_object, "total_users") {
+                    collected_total_users = total_users;
+                }
+            }
+            "generate" => {
+                if let Some(index_value) = json_object_get_i64(payload_object, "index") {
+                    progressed_users = progressed_users.max(index_value);
+                }
+                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                    let pos = upsert_daily_slot_user_diag(
+                        &mut users,
+                        &mut user_index,
+                        user_id,
+                        &event.created_at,
+                    );
+                    if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
+                        users[pos].key_date = Some(key_date);
+                    }
+                }
+            }
+            "user_failed" => {
+                failed_from_events += 1;
+                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                    let pos = upsert_daily_slot_user_diag(
+                        &mut users,
+                        &mut user_index,
+                        user_id,
+                        &event.created_at,
+                    );
+                    users[pos].state = "failed".to_owned();
+                    users[pos].error = json_object_get_string(payload_object, "error");
+                    if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
+                        users[pos].key_date = Some(key_date);
+                    }
+                }
+            }
+            "user_succeeded" => {
+                succeeded_from_events += 1;
+                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                    let pos = upsert_daily_slot_user_diag(
+                        &mut users,
+                        &mut user_index,
+                        user_id,
+                        &event.created_at,
+                    );
+                    users[pos].state = "succeeded".to_owned();
+                    users[pos].error = None;
+                    if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
+                        users[pos].key_date = Some(key_date);
+                    }
+                }
+            }
+            "summary" => {
+                summary_total_from_event = json_object_get_i64(payload_object, "total");
+                summary_succeeded_from_event = json_object_get_i64(payload_object, "succeeded");
+                summary_failed_from_event = json_object_get_i64(payload_object, "failed");
+                summary_canceled_from_event = json_object_get_bool(payload_object, "canceled");
+            }
+            _ => {}
+        }
+    }
+
+    let total_users = summary_total_from_event
+        .or_else(|| json_object_get_i64(result_object, "total"))
+        .unwrap_or(collected_total_users.max(i64::try_from(users.len()).unwrap_or(0)));
+    let succeeded_users = summary_succeeded_from_event
+        .or_else(|| json_object_get_i64(result_object, "succeeded"))
+        .unwrap_or(succeeded_from_events);
+    let failed_users = summary_failed_from_event
+        .or_else(|| json_object_get_i64(result_object, "failed"))
+        .unwrap_or(failed_from_events);
+    let canceled = summary_canceled_from_event
+        .or_else(|| json_object_get_bool(result_object, "canceled"))
+        .unwrap_or(false);
+
+    let summary = AdminBriefDailySlotSummary {
+        total_users,
+        progressed_users,
+        succeeded_users,
+        failed_users,
+        canceled,
+    };
+
+    users.sort_by_key(|item| item.user_id);
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "日报任务执行失败。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_CANCELED {
+        business_outcome(
+            "partial",
+            "已取消",
+            "任务在执行中被取消，部分用户可能未处理。",
+        )
+    } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
+        business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。")
+    } else if canceled {
+        business_outcome(
+            "partial",
+            "已取消",
+            "任务在执行中被取消，部分用户可能未处理。",
+        )
+    } else if total_users == 0 {
+        business_outcome("ok", "无需执行", "当前小时槽没有可执行用户。")
+    } else if failed_users > 0 && succeeded_users == 0 {
+        business_outcome(
+            "failed",
+            "业务失败",
+            "日报任务执行完成，但全部用户处理失败。",
+        )
+    } else if failed_users > 0 {
+        business_outcome("partial", "部分成功", "部分用户日报生成成功，部分失败。")
+    } else if succeeded_users > 0 {
+        business_outcome("ok", "业务成功", "日报任务已完成，目标用户处理成功。")
+    } else {
+        business_outcome(
+            "unknown",
+            "结果未知",
+            "任务已完成，但缺少可判定的用户执行结果。",
+        )
+    };
+
+    (
+        outcome,
+        AdminBriefDailySlotDiagnostics {
+            hour_utc,
+            summary,
+            users,
+        },
+    )
+}
+
+fn build_brief_generate_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+) -> (AdminBusinessOutcome, AdminBriefGenerateDiagnostics) {
+    let payload_value = parse_json_value(Some(task.payload_json.as_str()));
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let content_length = json_object_get_i64(result_object, "content_length");
+    let diagnostics = AdminBriefGenerateDiagnostics {
+        target_user_id: json_object_get_i64(payload_object, "user_id"),
+        content_length,
+        key_date: json_object_get_string(payload_object, "key_date"),
+    };
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "日报生成失败。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_SUCCEEDED {
+        if content_length.unwrap_or(0) > 0 {
+            business_outcome("ok", "业务成功", "日报内容已生成并写入。")
+        } else {
+            business_outcome(
+                "unknown",
+                "结果未知",
+                "任务已完成，但缺少可见的日报内容长度。",
+            )
+        }
+    } else {
+        business_outcome("unknown", "处理中", "任务尚未完成。")
+    };
+
+    (outcome, diagnostics)
+}
+
+fn build_task_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> Option<AdminTaskDiagnostics> {
+    match task.task_type.as_str() {
+        jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+            let (business_outcome, diagnostics) =
+                build_translate_release_batch_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: Some(diagnostics),
+                brief_daily_slot: None,
+                brief_generate: None,
+            })
+        }
+        jobs::TASK_BRIEF_DAILY_SLOT => {
+            let (business_outcome, diagnostics) = build_brief_daily_slot_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: Some(diagnostics),
+                brief_generate: None,
+            })
+        }
+        jobs::TASK_BRIEF_GENERATE => {
+            let (business_outcome, diagnostics) = build_brief_generate_diagnostics(task);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: Some(diagnostics),
+            })
+        }
+        _ => None,
+    }
 }
 
 pub async fn admin_get_realtime_task_detail(
@@ -732,21 +1322,48 @@ pub async fn admin_get_realtime_task_detail(
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "task not found"))?;
 
+    let event_total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_task_events
+        WHERE task_id = ?
+        "#,
+    )
+    .bind(task_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
     let events = sqlx::query_as::<_, AdminTaskEventItem>(
         r#"
         SELECT id, event_type, payload_json, created_at
         FROM job_task_events
         WHERE task_id = ?
         ORDER BY id DESC
-        LIMIT 200
+        LIMIT ?
         "#,
     )
     .bind(task_id.as_str())
+    .bind(ADMIN_TASK_DETAIL_EVENT_LIMIT)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(Json(AdminRealtimeTaskDetailResponse { task, events }))
+    let returned = i64::try_from(events.len()).unwrap_or(ADMIN_TASK_DETAIL_EVENT_LIMIT);
+    let event_meta = AdminTaskEventMeta {
+        returned,
+        total: event_total,
+        limit: ADMIN_TASK_DETAIL_EVENT_LIMIT,
+        truncated: event_total > returned,
+    };
+    let diagnostics = build_task_diagnostics(&task, &events);
+
+    Ok(Json(AdminRealtimeTaskDetailResponse {
+        task,
+        events,
+        event_meta,
+        diagnostics,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -4758,6 +5375,7 @@ async fn translate_releases_batch_stream_worker(
                         "stage": "release",
                         "release_id": item.id,
                         "item_status": item.status,
+                        "item_error": item.error.clone(),
                     }),
                 )
                 .await
@@ -4820,6 +5438,7 @@ async fn translate_releases_batch_stream_worker(
                     "stage": "release",
                     "release_id": item.id,
                     "item_status": item.status,
+                    "item_error": item.error.clone(),
                 }),
             )
             .await
@@ -4914,6 +5533,7 @@ async fn translate_releases_batch_stream_worker(
                             "stage": "release",
                             "release_id": out.id,
                             "item_status": out.status,
+                            "item_error": out.error.clone(),
                         }),
                     )
                     .await
@@ -6144,10 +6764,11 @@ async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i6
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLlmCallsQuery, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
-        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_get_llm_call_detail,
-        admin_get_llm_scheduler_status, admin_list_llm_calls, admin_list_users, admin_patch_user,
-        admin_users_offset, ai_error_is_non_retryable, ensure_account_enabled,
+        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminTaskEventItem, AdminUserPatchRequest,
+        AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError, TranslateBatchItem,
+        TranslationCacheRow, admin_get_llm_call_detail, admin_get_llm_scheduler_status,
+        admin_list_llm_calls, admin_list_users, admin_patch_user, admin_users_offset,
+        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
         extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
         guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
         markdown_structure_preserved, normalize_translation_fields,
@@ -6164,6 +6785,7 @@ mod tests {
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
+        jobs,
         state::{AppState, build_oauth_client},
     };
     use axum::{
@@ -6201,6 +6823,40 @@ mod tests {
             trans_source_hash: None,
             trans_title: None,
             trans_summary: None,
+        }
+    }
+
+    fn test_task_detail_item(
+        task_type: &str,
+        status: &str,
+        payload_json: &str,
+        result_json: Option<&str>,
+        error_message: Option<&str>,
+    ) -> AdminRealtimeTaskDetailItem {
+        AdminRealtimeTaskDetailItem {
+            id: "task-test".to_owned(),
+            task_type: task_type.to_owned(),
+            status: status.to_owned(),
+            source: "tests".to_owned(),
+            requested_by: Some(1),
+            parent_task_id: None,
+            cancel_requested: false,
+            error_message: error_message.map(str::to_owned),
+            payload_json: payload_json.to_owned(),
+            result_json: result_json.map(str::to_owned),
+            created_at: "2026-02-27T00:00:00Z".to_owned(),
+            started_at: Some("2026-02-27T00:00:01Z".to_owned()),
+            finished_at: Some("2026-02-27T00:00:02Z".to_owned()),
+            updated_at: "2026-02-27T00:00:02Z".to_owned(),
+        }
+    }
+
+    fn test_task_event(id: i64, event_type: &str, payload_json: &str) -> AdminTaskEventItem {
+        AdminTaskEventItem {
+            id,
+            event_type: event_type.to_owned(),
+            payload_json: payload_json.to_owned(),
+            created_at: format!("2026-02-27T00:00:{:02}Z", (id % 60)),
         }
     }
 
@@ -6930,6 +7586,149 @@ mod tests {
         };
         let err = translate_response_from_batch_item(item).expect_err("missing item should fail");
         assert_eq!(err.code(), "not_found");
+    }
+
+    #[test]
+    fn task_diagnostics_translate_batch_surfaces_business_failure() {
+        let task = test_task_detail_item(
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"user_id":1,"release_ids":[291058027,291042015]}"#,
+            Some(r#"{"total":2,"ready":0,"missing":0,"disabled":0,"error":2}"#),
+            None,
+        );
+        // Intentionally out of order to verify diagnostics sorts by event id.
+        let events = vec![
+            test_task_event(
+                11,
+                "task.progress",
+                r#"{"stage":"release","release_id":"291042015","item_status":"error","item_error":"translation failed"}"#,
+            ),
+            test_task_event(
+                10,
+                "task.progress",
+                r#"{"stage":"release","release_id":"291058027","item_status":"error","item_error":"translation failed"}"#,
+            ),
+            test_task_event(
+                9,
+                "task.progress",
+                r#"{"stage":"collect","total_releases":2}"#,
+            ),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "failed");
+        let translate_diag = diagnostics
+            .translate_release_batch
+            .expect("translate batch diagnostics");
+        assert_eq!(translate_diag.release_total, 2);
+        assert_eq!(translate_diag.summary.error, 2);
+        assert_eq!(translate_diag.progress.processed, 2);
+        assert_eq!(
+            translate_diag.progress.last_stage.as_deref(),
+            Some("release")
+        );
+        assert_eq!(translate_diag.items.len(), 2);
+        assert_eq!(translate_diag.items[0].release_id, "291058027");
+        assert_eq!(
+            translate_diag.items[0].item_error.as_deref(),
+            Some("translation failed")
+        );
+    }
+
+    #[test]
+    fn task_diagnostics_translate_batch_running_shows_processing() {
+        let task = test_task_detail_item(
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_RUNNING,
+            r#"{"user_id":1,"release_ids":[291058027]}"#,
+            None,
+            None,
+        );
+        let events = vec![test_task_event(
+            1,
+            "task.progress",
+            r#"{"stage":"collect","total_releases":1}"#,
+        )];
+
+        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "unknown");
+        assert_eq!(diagnostics.business_outcome.label, "处理中");
+    }
+
+    #[test]
+    fn task_diagnostics_daily_slot_aggregates_user_states() {
+        let task = test_task_detail_item(
+            jobs::TASK_BRIEF_DAILY_SLOT,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"hour_utc":0}"#,
+            Some(r#"{"total":2,"succeeded":1,"failed":1}"#),
+            None,
+        );
+        let events = vec![
+            test_task_event(1, "task.progress", r#"{"stage":"collect","total_users":2}"#),
+            test_task_event(
+                2,
+                "task.progress",
+                r#"{"stage":"generate","index":1,"total":2,"user_id":1,"key_date":"2026-02-27"}"#,
+            ),
+            test_task_event(
+                3,
+                "task.progress",
+                r#"{"stage":"user_succeeded","user_id":1,"key_date":"2026-02-27","content_length":1200}"#,
+            ),
+            test_task_event(
+                4,
+                "task.progress",
+                r#"{"stage":"generate","index":2,"total":2,"user_id":2,"key_date":"2026-02-27"}"#,
+            ),
+            test_task_event(
+                5,
+                "task.progress",
+                r#"{"stage":"user_failed","user_id":2,"error":"ai timeout"}"#,
+            ),
+            test_task_event(
+                6,
+                "task.progress",
+                r#"{"stage":"summary","total":2,"succeeded":1,"failed":1,"canceled":false}"#,
+            ),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        let slot_diag = diagnostics
+            .brief_daily_slot
+            .expect("daily slot diagnostics");
+        assert_eq!(slot_diag.summary.total_users, 2);
+        assert_eq!(slot_diag.summary.progressed_users, 2);
+        assert_eq!(slot_diag.summary.succeeded_users, 1);
+        assert_eq!(slot_diag.summary.failed_users, 1);
+        assert_eq!(slot_diag.users.len(), 2);
+        assert_eq!(slot_diag.users[0].user_id, 1);
+        assert_eq!(slot_diag.users[0].state, "succeeded");
+        assert_eq!(slot_diag.users[1].user_id, 2);
+        assert_eq!(slot_diag.users[1].state, "failed");
+        assert_eq!(slot_diag.users[1].error.as_deref(), Some("ai timeout"));
+    }
+
+    #[test]
+    fn task_diagnostics_daily_slot_canceled_shows_canceled_outcome() {
+        let task = test_task_detail_item(
+            jobs::TASK_BRIEF_DAILY_SLOT,
+            jobs::STATUS_CANCELED,
+            r#"{"hour_utc":8}"#,
+            Some(r#"{"total":4,"succeeded":1,"failed":1,"canceled":true}"#),
+            None,
+        );
+        let events = vec![test_task_event(
+            1,
+            "task.progress",
+            r#"{"stage":"summary","total":4,"succeeded":1,"failed":1,"canceled":true}"#,
+        )];
+
+        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        assert_eq!(diagnostics.business_outcome.label, "已取消");
     }
 
     #[test]
