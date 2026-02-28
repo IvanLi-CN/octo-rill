@@ -1233,6 +1233,8 @@ fn build_brief_generate_diagnostics(
                 .clone()
                 .unwrap_or_else(|| "日报生成失败。".to_owned()),
         )
+    } else if task.status == jobs::STATUS_CANCELED {
+        business_outcome("partial", "已取消", "任务在执行中被取消，结果可能不完整。")
     } else if task.status == jobs::STATUS_SUCCEEDED {
         if content_length.unwrap_or(0) > 0 {
             business_outcome("ok", "业务成功", "日报内容已生成并写入。")
@@ -1350,6 +1352,7 @@ pub async fn admin_get_realtime_task_detail(
     .map_err(ApiError::internal)?;
 
     let returned = i64::try_from(events.len()).unwrap_or(ADMIN_TASK_DETAIL_EVENT_LIMIT);
+    let event_total = event_total.max(returned);
     let event_meta = AdminTaskEventMeta {
         returned,
         total: event_total,
@@ -7729,6 +7732,26 @@ mod tests {
         let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "partial");
         assert_eq!(diagnostics.business_outcome.label, "已取消");
+    }
+
+    #[test]
+    fn task_diagnostics_brief_generate_canceled_shows_canceled_outcome() {
+        let task = test_task_detail_item(
+            jobs::TASK_BRIEF_GENERATE,
+            jobs::STATUS_CANCELED,
+            r#"{"user_id":7,"key_date":"2026-02-27"}"#,
+            Some(r#"{"content_length":200}"#),
+            None,
+        );
+
+        let diagnostics = build_task_diagnostics(&task, &[]).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        assert_eq!(diagnostics.business_outcome.label, "已取消");
+        let brief_generate = diagnostics
+            .brief_generate
+            .expect("brief generate diagnostics");
+        assert_eq!(brief_generate.target_user_id, Some(7));
+        assert_eq!(brief_generate.content_length, Some(200));
     }
 
     #[test]
