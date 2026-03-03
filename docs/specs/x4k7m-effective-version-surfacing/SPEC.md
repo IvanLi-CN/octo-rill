@@ -91,3 +91,4 @@
 
 - 2026-03-03: 建立规格并冻结修复范围与接口决策。
 - 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
+- 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
