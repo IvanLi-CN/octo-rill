@@ -19,6 +19,8 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ARG APP_EFFECTIVE_VERSION
+ENV APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
@@ -39,4 +41,3 @@ ENV OCTORILL_BIND_ADDR=0.0.0.0:3000
 EXPOSE 3000
 
 CMD ["/app/octo-rill"]
-

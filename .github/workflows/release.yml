@@ -70,6 +70,17 @@ jobs:
           echo "app_release_tag=${APP_RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
           echo "app_is_prerelease=${APP_IS_PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
 
+      - name: Validate effective version export
+        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${APP_EFFECTIVE_VERSION:-}" ]]; then
+            echo "APP_EFFECTIVE_VERSION is empty; stop release to avoid stale UI version."
+            exit 1
+          fi
+          echo "APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}"
+
       - name: Configure Git user
         if: ${{ steps.intent.outputs.should_release == 'true' }}
         run: |
