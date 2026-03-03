@@ -200,6 +200,241 @@ function llmRoleTone(role: string, isAssistantOutput: boolean): LlmRoleTone {
 	}
 }
 
+function LlmCallDetailSection(props: {
+	detail: AdminLlmCallDetailResponse;
+	onOpenParentTask: (taskId: string | null) => void;
+}) {
+	const { detail, onOpenParentTask } = props;
+	const llmInputMessages = useMemo(() => {
+		const parsed = parseLlmConversationMessages(detail.input_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (detail.prompt_text.trim()) {
+			return [{ role: "input", content: detail.prompt_text }];
+		}
+		return [];
+	}, [detail.input_messages_json, detail.prompt_text]);
+	const llmOutputMessages = useMemo(() => {
+		const parsed = parseLlmConversationMessages(detail.output_messages_json);
+		if (parsed.length > 0) return parsed;
+		if (detail.response_text?.trim()) {
+			return [{ role: "assistant", content: detail.response_text }];
+		}
+		return [];
+	}, [detail.output_messages_json, detail.response_text]);
+	const llmConversationTimeline = useMemo<LlmConversationTimelineItem[]>(() => {
+		const timeline: LlmConversationTimelineItem[] = [];
+		const turnCount = Math.max(
+			llmInputMessages.length,
+			llmOutputMessages.length,
+		);
+		for (let index = 0; index < turnCount; index += 1) {
+			const turn = index + 1;
+			const inputMessage = llmInputMessages[index];
+			if (inputMessage) {
+				timeline.push({
+					turn,
+					source: "input",
+					role: inputMessage.role,
+					content: inputMessage.content,
+				});
+			}
+			const outputMessage = llmOutputMessages[index];
+			if (outputMessage) {
+				timeline.push({
+					turn,
+					source: "output",
+					role: outputMessage.role,
+					content: outputMessage.content,
+				});
+			}
+		}
+		return timeline;
+	}, [llmInputMessages, llmOutputMessages]);
+	const llmConversationTurnCount = useMemo(
+		() =>
+			llmConversationTimeline.reduce(
+				(maxTurn, item) => Math.max(maxTurn, item.turn),
+				0,
+			),
+		[llmConversationTimeline],
+	);
+	const llmAssistantMessageCount = useMemo(
+		() =>
+			llmConversationTimeline.filter((item) => item.role === "assistant")
+				.length,
+		[llmConversationTimeline],
+	);
+	const lastAssistantTimelineIndex = useMemo(() => {
+		for (
+			let index = llmConversationTimeline.length - 1;
+			index >= 0;
+			index -= 1
+		) {
+			if (llmConversationTimeline[index]?.role === "assistant") {
+				return index;
+			}
+		}
+		return -1;
+	}, [llmConversationTimeline]);
+
+	return (
+		<>
+			<div className="mt-4 grid gap-2 md:grid-cols-2">
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">状态 / 模型</p>
+					<p className="mt-1 font-medium">
+						{taskStatusLabel(detail.status)} · {detail.model}
+					</p>
+				</div>
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">用户 / 父任务</p>
+					<p className="mt-1 font-medium">用户 #{detail.requested_by ?? "-"}</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						父任务 {detail.parent_task_id ?? "-"}
+					</p>
+				</div>
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">耗时 / 重试</p>
+					<p className="mt-1 font-medium">
+						{formatDurationMs(detail.duration_ms)} /{" "}
+						{formatCount(detail.attempt_count)}
+					</p>
+				</div>
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">
+						Token（输入 / 输出 / 缓存）
+					</p>
+					<p className="mt-1 font-medium">
+						{formatCount(detail.input_tokens)} /{" "}
+						{formatCount(detail.output_tokens)} /{" "}
+						{formatCount(detail.cached_input_tokens)}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						总计 {formatCount(detail.total_tokens)}
+					</p>
+				</div>
+				<div className="rounded-lg border p-3">
+					<p className="text-muted-foreground text-xs">创建 / 完成</p>
+					<p className="mt-1 font-medium">
+						{formatLocalDateTime(detail.created_at)}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						完成 {formatLocalDateTime(detail.finished_at)}
+					</p>
+				</div>
+			</div>
+
+			<div className="mt-3 flex flex-wrap gap-2">
+				<Button
+					variant="outline"
+					disabled={!detail.parent_task_id}
+					onClick={() => void onOpenParentTask(detail.parent_task_id)}
+				>
+					查看父任务
+				</Button>
+			</div>
+
+			<div className="mt-4 space-y-3 border-t pt-4">
+				<div>
+					<p className="text-muted-foreground text-xs">Conversation Timeline</p>
+					{llmConversationTimeline.length === 0 ? (
+						<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+							-
+						</pre>
+					) : (
+						<div className="bg-muted/20 mt-1 rounded-xl border">
+							<div className="border-b px-3 py-2">
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="text-muted-foreground text-[11px] font-medium">
+										多轮消息
+									</p>
+									<div className="flex flex-wrap items-center gap-1 text-[10px]">
+										<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+											消息 {formatCount(llmConversationTimeline.length)}
+										</span>
+										<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+											轮次 {formatCount(llmConversationTurnCount)}
+										</span>
+										<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
+											助手 {formatCount(llmAssistantMessageCount)}
+										</span>
+									</div>
+								</div>
+							</div>
+							<div className="max-h-[31vh] space-y-2.5 overflow-auto px-3 py-3 pr-2">
+								{llmConversationTimeline.map((message, index) => {
+									const isAssistantOutput =
+										message.source === "output" && message.role === "assistant";
+									const showAnswerLatency =
+										index === lastAssistantTimelineIndex;
+									const tone = llmRoleTone(message.role, isAssistantOutput);
+									return (
+										<div
+											key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+											className={`flex ${
+												isAssistantOutput
+													? "justify-end pl-5"
+													: "justify-start pr-5"
+											}`}
+										>
+											<article
+												className={`w-full max-w-[95%] rounded-2xl border px-3.5 py-2.5 shadow-sm ${tone.containerClass}`}
+											>
+												<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+													<span
+														className={`inline-flex items-center rounded-md border px-1.5 py-0.5 font-semibold ${tone.badgeClass}`}
+													>
+														{llmRoleLabel(message.role)}
+													</span>
+													<span className="text-muted-foreground">
+														第 {formatCount(message.turn)} 轮
+													</span>
+													{showAnswerLatency ? (
+														<span className="text-muted-foreground ml-auto text-[10px] font-medium">
+															等待 {formatDurationMs(detail.scheduler_wait_ms)}{" "}
+															· 首字{" "}
+															{formatDurationMs(detail.first_token_wait_ms)}
+														</span>
+													) : null}
+												</div>
+												<div className="mt-1.5 text-[13px] leading-5 whitespace-pre-wrap break-words">
+													{message.content}
+												</div>
+											</article>
+										</div>
+									);
+								})}
+							</div>
+						</div>
+					)}
+				</div>
+				{llmConversationTimeline.length === 0 ? (
+					<>
+						<div>
+							<p className="text-muted-foreground text-xs">Input Messages</p>
+							<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+								{detail.prompt_text || "-"}
+							</pre>
+						</div>
+						<div>
+							<p className="text-muted-foreground text-xs">Output Messages</p>
+							<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+								{detail.response_text ?? "-"}
+							</pre>
+						</div>
+					</>
+				) : null}
+				<div>
+					<p className="text-muted-foreground text-xs">Error</p>
+					<pre className="bg-muted/40 mt-1 max-h-[12vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
+						{detail.error_text ?? "-"}
+					</pre>
+				</div>
+			</div>
+		</>
+	);
+}
+
 function normalizeErrorMessage(err: unknown) {
 	if (err instanceof ApiError) {
 		switch (err.code) {
@@ -341,6 +576,18 @@ function readNumber(payload: Record<string, unknown> | null, key: string) {
 	return typeof value === "number" ? value : null;
 }
 
+function readBoolean(payload: Record<string, unknown> | null, key: string) {
+	if (!payload) return null;
+	const value = payload[key];
+	if (typeof value === "boolean") return value;
+	if (typeof value === "string") {
+		if (value === "true" || value === "1") return true;
+		if (value === "false" || value === "0") return false;
+	}
+	if (typeof value === "number") return value !== 0;
+	return null;
+}
+
 function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 	let payload: Record<string, unknown> | null = null;
 	try {
@@ -390,13 +637,16 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 		const stage = readString(payload, "stage");
 		if (stage === "collect") {
 			const totalUsers = readNumber(payload, "total_users");
+			const totalReleases = readNumber(payload, "total_releases");
 			const hourUtc = readNumber(payload, "hour_utc");
 			return {
 				title: "收集执行对象",
 				description:
 					totalUsers !== null && hourUtc !== null
 						? `UTC ${hourUtc.toString().padStart(2, "0")}:00 收集到 ${totalUsers} 位用户。`
-						: "任务正在收集本轮执行对象。",
+						: totalReleases !== null
+							? `收集到 ${totalReleases} 条 Release 待处理。`
+							: "任务正在收集本轮执行对象。",
 				level: "normal",
 				payload,
 			};
@@ -415,6 +665,43 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 				payload,
 			};
 		}
+		if (stage === "release") {
+			const releaseId = readString(payload, "release_id");
+			const itemStatus = readString(payload, "item_status");
+			const itemError = readString(payload, "item_error");
+			const level =
+				itemStatus === "error"
+					? "danger"
+					: itemStatus === "ready"
+						? "success"
+						: itemStatus === "missing" || itemStatus === "disabled"
+							? "warning"
+							: "normal";
+			return {
+				title: "Release 处理结果",
+				description: releaseId
+					? `Release #${releaseId} · ${itemStatus ?? "unknown"}${itemError ? ` · ${itemError}` : ""}`
+					: "记录了单条 Release 处理结果。",
+				level,
+				payload,
+			};
+		}
+		if (stage === "user_succeeded") {
+			const userId = readNumber(payload, "user_id");
+			const keyDate = readString(payload, "key_date");
+			const contentLength = readNumber(payload, "content_length");
+			return {
+				title: "单用户执行成功",
+				description:
+					userId !== null
+						? `用户 #${userId} 生成成功${keyDate ? ` · key_date=${keyDate}` : ""}${
+								contentLength !== null ? ` · ${contentLength} chars` : ""
+							}`
+						: "有用户日报生成成功。",
+				level: "success",
+				payload,
+			};
+		}
 		if (stage === "user_failed") {
 			const userId = readNumber(payload, "user_id");
 			const error = readString(payload, "error");
@@ -425,6 +712,28 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 						? `用户 #${userId} 失败${error ? `：${error}` : ""}`
 						: "有用户执行失败，任务继续处理后续用户。",
 				level: "danger",
+				payload,
+			};
+		}
+		if (stage === "summary") {
+			const total = readNumber(payload, "total");
+			const succeeded = readNumber(payload, "succeeded");
+			const failed = readNumber(payload, "failed");
+			const canceled = readBoolean(payload, "canceled");
+			return {
+				title: "任务汇总",
+				description:
+					total !== null || succeeded !== null || failed !== null
+						? `总计 ${total ?? "-"} · 成功 ${succeeded ?? "-"} · 失败 ${failed ?? "-"}${
+								canceled === true ? " · 已取消" : ""
+							}`
+						: "任务输出了汇总统计。",
+				level:
+					failed !== null && failed > 0
+						? "warning"
+						: canceled === true
+							? "warning"
+							: "success",
 				payload,
 			};
 		}
@@ -480,6 +789,19 @@ function eventLevelClass(level: EventLevel) {
 	}
 }
 
+function businessOutcomeBannerClass(code: string) {
+	switch (code) {
+		case "failed":
+			return "border-red-500/40 bg-red-500/5 text-red-900 dark:text-red-100";
+		case "partial":
+			return "border-amber-500/40 bg-amber-500/5 text-amber-900 dark:text-amber-100";
+		case "disabled":
+			return "border-slate-500/40 bg-slate-500/5 text-slate-900 dark:text-slate-100";
+		default:
+			return "border-border bg-muted/30 text-foreground";
+	}
+}
+
 function sourceLabel(source: string) {
 	switch (source) {
 		case "scheduler":
@@ -505,8 +827,39 @@ const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPE = "brief.daily_slot";
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
+const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
+const TASK_DRAWER_ROUTE_PATTERN =
+	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 
 type StreamStatus = "connecting" | "connected" | "reconnecting";
+type TaskDrawerRoute = {
+	taskId: string;
+	llmCallId: string | null;
+};
+
+function normalizePathname(pathname: string) {
+	return pathname.replace(/\/+$/, "") || "/";
+}
+
+function buildTaskDrawerPath(taskId: string, llmCallId?: string | null) {
+	const base = `${ADMIN_JOBS_BASE_PATH}/tasks/${encodeURIComponent(taskId)}`;
+	if (!llmCallId) return base;
+	return `${base}/llm/${encodeURIComponent(llmCallId)}`;
+}
+
+function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
+	const normalized = normalizePathname(pathname);
+	const matched = normalized.match(TASK_DRAWER_ROUTE_PATTERN);
+	if (!matched) return null;
+	try {
+		return {
+			taskId: decodeURIComponent(matched[1] ?? ""),
+			llmCallId: matched[2] ? decodeURIComponent(matched[2]) : null,
+		};
+	} catch {
+		return null;
+	}
+}
 
 type JobManagementProps = {
 	currentUserId: number;
@@ -550,6 +903,17 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		null,
 	);
 	const [llmDetailLoading, setLlmDetailLoading] = useState(false);
+	const [taskDrawerRoute, setTaskDrawerRoute] =
+		useState<TaskDrawerRoute | null>(() =>
+			parseTaskDrawerRoute(window.location.pathname),
+		);
+	const [taskDrawerLlmDetail, setTaskDrawerLlmDetail] =
+		useState<AdminLlmCallDetailResponse | null>(null);
+	const [taskDrawerLlmLoading, setTaskDrawerLlmLoading] = useState(false);
+	const [taskRelatedLlmCalls, setTaskRelatedLlmCalls] = useState<
+		AdminLlmCallItem[]
+	>([]);
+	const [taskRelatedLlmLoading, setTaskRelatedLlmLoading] = useState(false);
 
 	const [detailTask, setDetailTask] =
 		useState<AdminRealtimeTaskDetailResponse | null>(null);
@@ -591,87 +955,61 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		() => (detailTask ? taskStatusTone(detailTask.task.status) : null),
 		[detailTask],
 	);
-	const llmInputMessages = useMemo(() => {
-		if (!llmDetail) return [];
-		const parsed = parseLlmConversationMessages(llmDetail.input_messages_json);
-		if (parsed.length > 0) return parsed;
-		if (llmDetail.prompt_text.trim()) {
-			return [{ role: "input", content: llmDetail.prompt_text }];
-		}
-		return [];
-	}, [llmDetail]);
-	const llmOutputMessages = useMemo(() => {
-		if (!llmDetail) return [];
-		const parsed = parseLlmConversationMessages(llmDetail.output_messages_json);
-		if (parsed.length > 0) return parsed;
-		if (llmDetail.response_text?.trim()) {
-			return [{ role: "assistant", content: llmDetail.response_text }];
-		}
-		return [];
-	}, [llmDetail]);
-	const llmConversationTimeline = useMemo<LlmConversationTimelineItem[]>(() => {
-		const timeline: LlmConversationTimelineItem[] = [];
-		const turnCount = Math.max(
-			llmInputMessages.length,
-			llmOutputMessages.length,
-		);
-		for (let index = 0; index < turnCount; index += 1) {
-			const turn = index + 1;
-			const inputMessage = llmInputMessages[index];
-			if (inputMessage) {
-				timeline.push({
-					turn,
-					source: "input",
-					role: inputMessage.role,
-					content: inputMessage.content,
-				});
-			}
-			const outputMessage = llmOutputMessages[index];
-			if (outputMessage) {
-				timeline.push({
-					turn,
-					source: "output",
-					role: outputMessage.role,
-					content: outputMessage.content,
-				});
-			}
-		}
-		return timeline;
-	}, [llmInputMessages, llmOutputMessages]);
-	const llmConversationTurnCount = useMemo(
-		() =>
-			llmConversationTimeline.reduce(
-				(maxTurn, item) => Math.max(maxTurn, item.turn),
-				0,
-			),
-		[llmConversationTimeline],
-	);
-	const llmAssistantMessageCount = useMemo(
-		() =>
-			llmConversationTimeline.filter((item) => item.role === "assistant")
-				.length,
-		[llmConversationTimeline],
-	);
-	const lastAssistantTimelineIndex = useMemo(() => {
-		for (
-			let index = llmConversationTimeline.length - 1;
-			index >= 0;
-			index -= 1
-		) {
-			if (llmConversationTimeline[index]?.role === "assistant") {
-				return index;
-			}
-		}
-		return -1;
-	}, [llmConversationTimeline]);
+	const activeTaskDrawerTaskId = taskDrawerRoute?.taskId ?? null;
+	const activeTaskDrawerLlmCallId = taskDrawerRoute?.llmCallId ?? null;
+	const isTaskDrawerOpen = activeTaskDrawerTaskId !== null;
+	const isTaskDrawerLlmRoute = activeTaskDrawerLlmCallId !== null;
+	const activeTaskDetail =
+		detailTask && detailTask.task.id === activeTaskDrawerTaskId
+			? detailTask
+			: null;
+	const detailBusinessOutcome =
+		activeTaskDetail?.diagnostics?.business_outcome ?? null;
+	const detailEventMeta = activeTaskDetail?.event_meta ?? null;
 
 	useEffect(() => {
-		detailTaskIdRef.current = detailTask?.task.id ?? null;
-	}, [detailTask]);
+		detailTaskIdRef.current = activeTaskDetail?.task.id ?? null;
+	}, [activeTaskDetail]);
 
 	useEffect(() => {
-		llmDetailIdRef.current = llmDetail?.id ?? null;
-	}, [llmDetail]);
+		llmDetailIdRef.current = activeTaskDrawerLlmCallId ?? llmDetail?.id ?? null;
+	}, [activeTaskDrawerLlmCallId, llmDetail]);
+
+	const navigateTaskDrawerRoute = useCallback(
+		(
+			nextRoute: TaskDrawerRoute | null,
+			options?: {
+				replace?: boolean;
+			},
+		) => {
+			const nextPath = nextRoute
+				? buildTaskDrawerPath(nextRoute.taskId, nextRoute.llmCallId)
+				: ADMIN_JOBS_BASE_PATH;
+			const currentPath = normalizePathname(window.location.pathname);
+			const allowPathSync =
+				currentPath === ADMIN_JOBS_BASE_PATH ||
+				currentPath.startsWith(`${ADMIN_JOBS_BASE_PATH}/`);
+			if (allowPathSync && normalizePathname(nextPath) !== currentPath) {
+				if (options?.replace) {
+					window.history.replaceState({}, "", nextPath);
+				} else {
+					window.history.pushState({}, "", nextPath);
+				}
+			}
+			setTaskDrawerRoute(nextRoute);
+		},
+		[],
+	);
+
+	useEffect(() => {
+		const onPopState = () => {
+			setTaskDrawerRoute(parseTaskDrawerRoute(window.location.pathname));
+		};
+		window.addEventListener("popstate", onPopState);
+		return () => {
+			window.removeEventListener("popstate", onPopState);
+		};
+	}, []);
 
 	const loadOverview = useCallback(async () => {
 		const res = await apiGetAdminJobsOverview();
@@ -786,9 +1124,31 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		setDetailTask(detail);
 	}, []);
 
-	const refreshLlmDetail = useCallback(async (callId: string) => {
+	const refreshLlmDetail = useCallback(
+		async (callId: string) => {
+			const detail = await apiGetAdminLlmCallDetail(callId);
+			if (activeTaskDrawerLlmCallId === callId) {
+				setTaskDrawerLlmDetail(detail);
+				return;
+			}
+			setLlmDetail(detail);
+		},
+		[activeTaskDrawerLlmCallId],
+	);
+
+	const loadTaskRelatedLlmCalls = useCallback(async (taskId: string) => {
+		const params = new URLSearchParams();
+		params.set("status", "all");
+		params.set("page", "1");
+		params.set("page_size", "50");
+		params.set("parent_task_id", taskId);
+		const res = await apiGetAdminLlmCalls(params);
+		setTaskRelatedLlmCalls(res.items);
+	}, []);
+
+	const loadTaskDrawerLlmDetail = useCallback(async (callId: string) => {
 		const detail = await apiGetAdminLlmCallDetail(callId);
-		setLlmDetail(detail);
+		setTaskDrawerLlmDetail(detail);
 	}, []);
 
 	const drainStreamRefreshQueue = useCallback(async () => {
@@ -914,6 +1274,90 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	}, [loadLlmSchedulerStatus, loadLlmCalls]);
 
 	useEffect(() => {
+		if (!activeTaskDrawerTaskId) {
+			setDetailTask(null);
+			setDetailLoading(false);
+			return;
+		}
+		if (detailTask?.task.id === activeTaskDrawerTaskId) {
+			return;
+		}
+		let canceled = false;
+		setDetailLoading(true);
+		setError(null);
+		void refreshTaskDetail(activeTaskDrawerTaskId)
+			.catch((err) => {
+				if (!canceled) {
+					setError(normalizeErrorMessage(err));
+				}
+			})
+			.finally(() => {
+				if (!canceled) {
+					setDetailLoading(false);
+				}
+			});
+		return () => {
+			canceled = true;
+		};
+	}, [activeTaskDrawerTaskId, detailTask?.task.id, refreshTaskDetail]);
+
+	useEffect(() => {
+		if (!activeTaskDrawerTaskId) {
+			setTaskRelatedLlmCalls([]);
+			setTaskRelatedLlmLoading(false);
+			return;
+		}
+		let canceled = false;
+		setTaskRelatedLlmLoading(true);
+		void loadTaskRelatedLlmCalls(activeTaskDrawerTaskId)
+			.catch((err) => {
+				if (!canceled) {
+					setError(normalizeErrorMessage(err));
+				}
+			})
+			.finally(() => {
+				if (!canceled) {
+					setTaskRelatedLlmLoading(false);
+				}
+			});
+		return () => {
+			canceled = true;
+		};
+	}, [activeTaskDrawerTaskId, loadTaskRelatedLlmCalls]);
+
+	useEffect(() => {
+		if (!activeTaskDrawerLlmCallId) {
+			setTaskDrawerLlmDetail(null);
+			setTaskDrawerLlmLoading(false);
+			return;
+		}
+		if (taskDrawerLlmDetail?.id === activeTaskDrawerLlmCallId) {
+			return;
+		}
+		let canceled = false;
+		setTaskDrawerLlmLoading(true);
+		setError(null);
+		void loadTaskDrawerLlmDetail(activeTaskDrawerLlmCallId)
+			.catch((err) => {
+				if (!canceled) {
+					setError(normalizeErrorMessage(err));
+				}
+			})
+			.finally(() => {
+				if (!canceled) {
+					setTaskDrawerLlmLoading(false);
+				}
+			});
+		return () => {
+			canceled = true;
+		};
+	}, [
+		activeTaskDrawerLlmCallId,
+		loadTaskDrawerLlmDetail,
+		taskDrawerLlmDetail?.id,
+	]);
+
+	useEffect(() => {
 		return () => {
 			if (streamRefreshTimerRef.current !== null) {
 				window.clearTimeout(streamRefreshTimerRef.current);
@@ -1037,18 +1481,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		};
 	}, [scheduleStreamRefresh]);
 
-	const onOpenTaskDetail = useCallback(async (taskId: string) => {
-		setDetailLoading(true);
-		setError(null);
-		try {
-			const detail = await apiGetAdminRealtimeTaskDetail(taskId);
-			setDetailTask(detail);
-		} catch (err) {
-			setError(normalizeErrorMessage(err));
-		} finally {
-			setDetailLoading(false);
-		}
-	}, []);
+	const onOpenTaskDetail = useCallback(
+		(taskId: string) => {
+			setError(null);
+			setLlmDetail(null);
+			navigateTaskDrawerRoute({ taskId, llmCallId: null });
+		},
+		[navigateTaskDrawerRoute],
+	);
 
 	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
 		setLlmDetailLoading(true);
@@ -1063,11 +1503,35 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		}
 	}, []);
 
+	const onOpenTaskLlmDetail = useCallback(
+		(callId: string) => {
+			if (!activeTaskDrawerTaskId) return;
+			setError(null);
+			navigateTaskDrawerRoute({
+				taskId: activeTaskDrawerTaskId,
+				llmCallId: callId,
+			});
+		},
+		[activeTaskDrawerTaskId, navigateTaskDrawerRoute],
+	);
+
+	const onCloseTaskDrawer = useCallback(() => {
+		navigateTaskDrawerRoute(null);
+	}, [navigateTaskDrawerRoute]);
+
+	const onBackToTaskDetail = useCallback(() => {
+		if (!activeTaskDrawerTaskId) return;
+		navigateTaskDrawerRoute({
+			taskId: activeTaskDrawerTaskId,
+			llmCallId: null,
+		});
+	}, [activeTaskDrawerTaskId, navigateTaskDrawerRoute]);
+
 	const onOpenParentTaskFromLlm = useCallback(
-		async (taskId: string | null) => {
+		(taskId: string | null) => {
 			if (!taskId) return;
 			setLlmDetail(null);
-			await onOpenTaskDetail(taskId);
+			onOpenTaskDetail(taskId);
 		},
 		[onOpenTaskDetail],
 	);
@@ -1764,125 +2228,245 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				</Card>
 			) : null}
 
-			{detailTask ? (
+			{isTaskDrawerOpen ? (
 				<div className="fixed inset-0 z-40 flex">
 					<button
 						type="button"
 						className="flex-1 bg-black/35"
 						aria-label="关闭任务详情"
-						onClick={() => setDetailTask(null)}
+						onClick={onCloseTaskDrawer}
 					/>
 					<div className="bg-card relative h-full w-full max-w-4xl border-l p-5 shadow-2xl">
-						<div className="flex items-start justify-between gap-3">
-							<div className="min-w-0">
-								<h3 className="text-lg font-semibold tracking-tight">
-									任务详情
-								</h3>
-								<div className="mt-1 flex flex-wrap items-center gap-2">
-									<p className="text-muted-foreground text-sm">
-										{taskTypeLabel(detailTask.task.task_type)}
-									</p>
-									<span
-										className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${detailTaskTone?.badgeClass ?? ""}`}
-									>
-										<span
-											className={`mr-1.5 size-1.5 rounded-full ${detailTaskTone?.dotClass ?? "bg-muted-foreground"}`}
-										/>
-										{taskStatusLabel(detailTask.task.status)}
-									</span>
-									{detailTask.task.cancel_requested ? (
-										<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-											已请求取消
-										</span>
-									) : null}
-								</div>
-								<p className="text-muted-foreground mt-1 text-xs">
-									类型：
-									<span className="font-mono">{detailTask.task.task_type}</span>
-								</p>
-								<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
-									{detailTask.task.id}
-								</p>
-							</div>
-							<Button variant="outline" onClick={() => setDetailTask(null)}>
-								关闭
-							</Button>
-						</div>
-
-						<div className="mt-4 grid gap-2 md:grid-cols-2">
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">任务状态</p>
-								<p className="mt-1 font-medium">
-									{taskStatusLabel(detailTask.task.status)}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">触发来源</p>
-								<p className="mt-1 font-medium">
-									{sourceLabel(detailTask.task.source)}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									创建 / 开始 / 完成
-								</p>
-								<p className="mt-1 font-medium">
-									{formatLocalDateTime(detailTask.task.created_at)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									开始 {formatLocalDateTime(detailTask.task.started_at)} · 完成{" "}
-									{formatLocalDateTime(detailTask.task.finished_at)}
-								</p>
-							</div>
-						</div>
-
-						<div className="mt-4 border-t pt-4">
-							<TaskTypeDetailSection detail={detailTask} />
-						</div>
-
-						{detailTask.task.error_message ? (
-							<p className="text-destructive mt-3 text-sm">
-								失败原因：{detailTask.task.error_message}
-							</p>
-						) : null}
-
-						<div className="mt-4 border-t pt-4">
-							<p className="text-muted-foreground text-xs">执行时间线</p>
-						</div>
-						<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
-							{taskEvents.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无事件日志。</p>
-							) : (
-								taskEvents
-									.slice()
-									.reverse()
-									.map(({ event, presentation }) => (
-										<div
-											key={event.id}
-											className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
-										>
-											<p className="font-medium text-sm">
-												{presentation.title}
+						{activeTaskDetail ? (
+							<>
+								<div className="flex items-start justify-between gap-3">
+									<div className="min-w-0">
+										<h3 className="text-lg font-semibold tracking-tight">
+											{isTaskDrawerLlmRoute
+												? "任务详情 · LLM 调用详情"
+												: "任务详情"}
+										</h3>
+										<div className="mt-1 flex flex-wrap items-center gap-2">
+											<p className="text-muted-foreground text-sm">
+												{taskTypeLabel(activeTaskDetail.task.task_type)}
 											</p>
-											<p className="text-muted-foreground mt-1 text-xs">
-												{presentation.description}
-											</p>
-											<p className="text-muted-foreground mt-1 font-mono text-[11px]">
-												{event.event_type} ·{" "}
-												{formatLocalDateTime(event.created_at)}
-											</p>
-											<details className="mt-2">
-												<summary className="text-muted-foreground cursor-pointer text-xs">
-													查看原始事件
-												</summary>
-												<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
-													{event.payload_json}
-												</pre>
-											</details>
+											<span
+												className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${detailTaskTone?.badgeClass ?? ""}`}
+											>
+												<span
+													className={`mr-1.5 size-1.5 rounded-full ${detailTaskTone?.dotClass ?? "bg-muted-foreground"}`}
+												/>
+												{taskStatusLabel(activeTaskDetail.task.status)}
+											</span>
+											{activeTaskDetail.task.cancel_requested ? (
+												<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+													已请求取消
+												</span>
+											) : null}
 										</div>
-									))
-							)}
-						</div>
+										<p className="text-muted-foreground mt-1 text-xs">
+											类型：
+											<span className="font-mono">
+												{activeTaskDetail.task.task_type}
+											</span>
+										</p>
+										<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
+											{activeTaskDetail.task.id}
+										</p>
+									</div>
+									<Button variant="outline" onClick={onCloseTaskDrawer}>
+										关闭
+									</Button>
+								</div>
+
+								{isTaskDrawerLlmRoute ? (
+									<>
+										<div className="mt-4 border-t pt-4">
+											<div className="flex flex-wrap items-center justify-between gap-2">
+												<div className="min-w-0">
+													<p className="text-muted-foreground text-xs">
+														LLM 调用
+													</p>
+													<p className="mt-1 truncate font-mono text-sm">
+														{activeTaskDrawerLlmCallId}
+													</p>
+												</div>
+												<Button
+													variant="outline"
+													size="sm"
+													onClick={onBackToTaskDetail}
+												>
+													返回任务详情
+												</Button>
+											</div>
+										</div>
+										{taskDrawerLlmLoading && !taskDrawerLlmDetail ? (
+											<p className="text-muted-foreground mt-4 inline-flex items-center gap-2 text-sm">
+												<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
+												正在加载 LLM 调用详情...
+											</p>
+										) : taskDrawerLlmDetail ? (
+											<>
+												<p className="text-muted-foreground mt-3 text-sm">
+													来源：
+													<span className="font-mono">
+														{taskDrawerLlmDetail.source}
+													</span>
+												</p>
+												<LlmCallDetailSection
+													detail={taskDrawerLlmDetail}
+													onOpenParentTask={onOpenParentTaskFromLlm}
+												/>
+											</>
+										) : (
+											<p className="text-muted-foreground mt-4 text-sm">
+												未找到该 LLM 调用详情。
+											</p>
+										)}
+									</>
+								) : (
+									<>
+										<div className="mt-4 grid gap-2 md:grid-cols-2">
+											<div className="rounded-lg border p-3">
+												<p className="text-muted-foreground text-xs">
+													任务状态
+												</p>
+												<p className="mt-1 font-medium">
+													{taskStatusLabel(activeTaskDetail.task.status)}
+												</p>
+											</div>
+											<div className="rounded-lg border p-3">
+												<p className="text-muted-foreground text-xs">
+													触发来源
+												</p>
+												<p className="mt-1 font-medium">
+													{sourceLabel(activeTaskDetail.task.source)}
+												</p>
+											</div>
+											<div className="rounded-lg border p-3">
+												<p className="text-muted-foreground text-xs">
+													创建 / 开始 / 完成
+												</p>
+												<p className="mt-1 font-medium">
+													{formatLocalDateTime(
+														activeTaskDetail.task.created_at,
+													)}
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													开始{" "}
+													{formatLocalDateTime(
+														activeTaskDetail.task.started_at,
+													)}{" "}
+													· 完成{" "}
+													{formatLocalDateTime(
+														activeTaskDetail.task.finished_at,
+													)}
+												</p>
+											</div>
+										</div>
+
+										<div className="mt-4 border-t pt-4">
+											<TaskTypeDetailSection
+												detail={activeTaskDetail}
+												relatedLlmCalls={taskRelatedLlmCalls}
+												relatedLlmCallsLoading={taskRelatedLlmLoading}
+												onOpenLlmCallDetail={onOpenTaskLlmDetail}
+											/>
+										</div>
+
+										{activeTaskDetail.task.status === "succeeded" &&
+										detailBusinessOutcome &&
+										detailBusinessOutcome.code !== "ok" ? (
+											<div
+												className={`mt-3 rounded-lg border p-3 ${businessOutcomeBannerClass(
+													detailBusinessOutcome.code,
+												)}`}
+											>
+												<p className="text-xs font-semibold">
+													业务结果：{detailBusinessOutcome.label}
+												</p>
+												<p className="mt-1 text-xs opacity-90">
+													{detailBusinessOutcome.message}
+												</p>
+											</div>
+										) : null}
+
+										{activeTaskDetail.task.error_message ? (
+											<p className="text-destructive mt-3 text-sm">
+												失败原因：{activeTaskDetail.task.error_message}
+											</p>
+										) : null}
+
+										<div className="mt-4 border-t pt-4">
+											<p className="text-muted-foreground text-xs">
+												执行时间线
+											</p>
+											{detailEventMeta?.truncated ? (
+												<p className="text-amber-700 mt-1 text-xs dark:text-amber-200">
+													仅展示最近 {detailEventMeta.limit} 条事件（已加载{" "}
+													{detailEventMeta.returned}/{detailEventMeta.total}）。
+												</p>
+											) : detailEventMeta ? (
+												<p className="text-muted-foreground mt-1 text-xs">
+													事件总数 {detailEventMeta.total}，当前已加载{" "}
+													{detailEventMeta.returned} 条。
+												</p>
+											) : null}
+										</div>
+										<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
+											{taskEvents.length === 0 ? (
+												<p className="text-muted-foreground text-sm">
+													暂无事件日志。
+												</p>
+											) : (
+												taskEvents
+													.slice()
+													.reverse()
+													.map(({ event, presentation }) => (
+														<div
+															key={event.id}
+															className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
+														>
+															<p className="font-medium text-sm">
+																{presentation.title}
+															</p>
+															<p className="text-muted-foreground mt-1 text-xs">
+																{presentation.description}
+															</p>
+															<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+																{event.event_type} ·{" "}
+																{formatLocalDateTime(event.created_at)}
+															</p>
+															<details className="mt-2">
+																<summary className="text-muted-foreground cursor-pointer text-xs">
+																	查看原始事件
+																</summary>
+																<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
+																	{event.payload_json}
+																</pre>
+															</details>
+														</div>
+													))
+											)}
+										</div>
+									</>
+								)}
+							</>
+						) : detailLoading ? (
+							<p className="text-muted-foreground mt-4 inline-flex items-center gap-2 text-sm">
+								<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
+								正在加载任务详情...
+							</p>
+						) : (
+							<div className="mt-4 space-y-3">
+								<p className="text-muted-foreground text-sm">
+									任务详情加载失败，请刷新后重试。
+								</p>
+								<Button variant="outline" onClick={onCloseTaskDrawer}>
+									关闭
+								</Button>
+							</div>
+						)}
 					</div>
 				</div>
 			) : null}
@@ -1912,178 +2496,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								关闭
 							</Button>
 						</div>
-
-						<div className="mt-4 grid gap-2 md:grid-cols-2">
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">状态 / 模型</p>
-								<p className="mt-1 font-medium">
-									{taskStatusLabel(llmDetail.status)} · {llmDetail.model}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">用户 / 父任务</p>
-								<p className="mt-1 font-medium">
-									用户 #{llmDetail.requested_by ?? "-"}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									父任务 {llmDetail.parent_task_id ?? "-"}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">耗时 / 重试</p>
-								<p className="mt-1 font-medium">
-									{formatDurationMs(llmDetail.duration_ms)} /{" "}
-									{formatCount(llmDetail.attempt_count)}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									Token（输入 / 输出 / 缓存）
-								</p>
-								<p className="mt-1 font-medium">
-									{formatCount(llmDetail.input_tokens)} /{" "}
-									{formatCount(llmDetail.output_tokens)} /{" "}
-									{formatCount(llmDetail.cached_input_tokens)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									总计 {formatCount(llmDetail.total_tokens)}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">创建 / 完成</p>
-								<p className="mt-1 font-medium">
-									{formatLocalDateTime(llmDetail.created_at)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									完成 {formatLocalDateTime(llmDetail.finished_at)}
-								</p>
-							</div>
-						</div>
-
-						<div className="mt-3 flex flex-wrap gap-2">
-							<Button
-								variant="outline"
-								disabled={!llmDetail.parent_task_id}
-								onClick={() =>
-									void onOpenParentTaskFromLlm(llmDetail.parent_task_id)
-								}
-							>
-								查看父任务
-							</Button>
-						</div>
-
-						<div className="mt-4 space-y-3 border-t pt-4">
-							<div>
-								<p className="text-muted-foreground text-xs">
-									Conversation Timeline
-								</p>
-								{llmConversationTimeline.length === 0 ? (
-									<pre className="bg-muted/40 mt-1 max-h-[24vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-										-
-									</pre>
-								) : (
-									<div className="bg-muted/20 mt-1 rounded-xl border">
-										<div className="border-b px-3 py-2">
-											<div className="flex flex-wrap items-center justify-between gap-2">
-												<p className="text-muted-foreground text-[11px] font-medium">
-													多轮消息
-												</p>
-												<div className="flex flex-wrap items-center gap-1 text-[10px]">
-													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
-														消息 {formatCount(llmConversationTimeline.length)}
-													</span>
-													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
-														轮次 {formatCount(llmConversationTurnCount)}
-													</span>
-													<span className="bg-background text-muted-foreground inline-flex items-center rounded-full border px-2 py-0.5">
-														助手 {formatCount(llmAssistantMessageCount)}
-													</span>
-												</div>
-											</div>
-										</div>
-										<div className="max-h-[31vh] space-y-2.5 overflow-auto px-3 py-3 pr-2">
-											{llmConversationTimeline.map((message, index) => {
-												const isAssistantOutput =
-													message.source === "output" &&
-													message.role === "assistant";
-												const showAnswerLatency =
-													index === lastAssistantTimelineIndex;
-												const tone = llmRoleTone(
-													message.role,
-													isAssistantOutput,
-												);
-												return (
-													<div
-														key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
-														className={`flex ${
-															isAssistantOutput
-																? "justify-end pl-5"
-																: "justify-start pr-5"
-														}`}
-													>
-														<article
-															className={`w-full max-w-[95%] rounded-2xl border px-3.5 py-2.5 shadow-sm ${tone.containerClass}`}
-														>
-															<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
-																<span
-																	className={`inline-flex items-center rounded-md border px-1.5 py-0.5 font-semibold ${tone.badgeClass}`}
-																>
-																	{llmRoleLabel(message.role)}
-																</span>
-																<span className="text-muted-foreground">
-																	第 {formatCount(message.turn)} 轮
-																</span>
-																{showAnswerLatency ? (
-																	<span className="text-muted-foreground ml-auto text-[10px] font-medium">
-																		等待{" "}
-																		{formatDurationMs(
-																			llmDetail.scheduler_wait_ms,
-																		)}{" "}
-																		· 首字{" "}
-																		{formatDurationMs(
-																			llmDetail.first_token_wait_ms,
-																		)}
-																	</span>
-																) : null}
-															</div>
-															<div className="mt-1.5 text-[13px] leading-5 whitespace-pre-wrap break-words">
-																{message.content}
-															</div>
-														</article>
-													</div>
-												);
-											})}
-										</div>
-									</div>
-								)}
-							</div>
-							{llmConversationTimeline.length === 0 ? (
-								<>
-									<div>
-										<p className="text-muted-foreground text-xs">
-											Input Messages
-										</p>
-										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-											{llmDetail.prompt_text || "-"}
-										</pre>
-									</div>
-									<div>
-										<p className="text-muted-foreground text-xs">
-											Output Messages
-										</p>
-										<pre className="bg-muted/40 mt-1 max-h-[18vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-											{llmDetail.response_text ?? "-"}
-										</pre>
-									</div>
-								</>
-							) : null}
-							<div>
-								<p className="text-muted-foreground text-xs">Error</p>
-								<pre className="bg-muted/40 mt-1 max-h-[12vh] overflow-auto rounded-md border p-2 text-[11px] whitespace-pre-wrap break-all">
-									{llmDetail.error_text ?? "-"}
-								</pre>
-							</div>
-						</div>
+						<LlmCallDetailSection
+							detail={llmDetail}
+							onOpenParentTask={onOpenParentTaskFromLlm}
+						/>
 					</div>
 				</div>
 			) : null}

@@ -26,7 +26,9 @@ function App() {
 	const normalizedPathname =
 		window.location.pathname.replace(/\/+$/, "") || "/";
 	const isAdminUsersRoute = normalizedPathname === "/admin";
-	const isAdminJobsRoute = normalizedPathname === "/admin/jobs";
+	const isAdminJobsRoute =
+		normalizedPathname === "/admin/jobs" ||
+		normalizedPathname.startsWith("/admin/jobs/");
 	const isAdminRoute = isAdminUsersRoute || isAdminJobsRoute;
 
 	useEffect(() => {

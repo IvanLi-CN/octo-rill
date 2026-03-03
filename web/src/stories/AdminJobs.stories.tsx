@@ -37,6 +37,20 @@ const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 		finished_at: "2026-02-27T05:54:13Z",
 		updated_at: "2026-02-27T05:54:13Z",
 	},
+	{
+		id: "task-translate-batch-story",
+		task_type: "translate.release.batch",
+		status: "succeeded",
+		source: "api.translate_releases_batch_stream",
+		requested_by: 1,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T05:50:00Z",
+		started_at: "2026-02-27T05:50:01Z",
+		finished_at: "2026-02-27T05:50:30Z",
+		updated_at: "2026-02-27T05:50:30Z",
+	},
 ];
 
 const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
@@ -140,8 +154,8 @@ Notes:
 		source: "api.translate_releases_batch",
 		model: "gpt-4o-mini",
 		requested_by: 1,
-		parent_task_id: null,
-		parent_task_type: null,
+		parent_task_id: "task-translate-batch-story",
+		parent_task_type: "translate.release.batch",
 		max_tokens: 900,
 		attempt_count: 1,
 		scheduler_wait_ms: 120,
@@ -259,6 +273,8 @@ function paginate<T>(
 
 type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
+	autoOpenTaskDrawer?: boolean;
+	autoOpenTaskDrawerLlmRoute?: boolean;
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -277,6 +293,8 @@ function setInputValue(element: HTMLInputElement, value: string) {
 
 function AdminJobsPreview({
 	autoOpenConversation = false,
+	autoOpenTaskDrawer = false,
+	autoOpenTaskDrawerLlmRoute = false,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -453,6 +471,7 @@ function AdminJobsPreview({
 				const status = url.searchParams.get("status");
 				const source = url.searchParams.get("source");
 				const requestedBy = url.searchParams.get("requested_by");
+				const parentTaskId = url.searchParams.get("parent_task_id");
 				let rows = [...llmCalls];
 				if (status && status !== "all") {
 					rows = rows.filter((item) => item.status === status);
@@ -464,6 +483,9 @@ function AdminJobsPreview({
 					rows = rows.filter(
 						(item) => String(item.requested_by ?? "") === String(requestedBy),
 					);
+				}
+				if (parentTaskId) {
+					rows = rows.filter((item) => item.parent_task_id === parentTaskId);
 				}
 				const page = url.searchParams.get("page");
 				const pageSize = url.searchParams.get("page_size");
@@ -654,6 +676,68 @@ function AdminJobsPreview({
 		};
 	}, [ready, autoOpenConversation]);
 
+	useEffect(() => {
+		if (
+			!ready ||
+			(!autoOpenTaskDrawer && !autoOpenTaskDrawerLlmRoute) ||
+			autoOpenedRef.current
+		) {
+			return;
+		}
+		autoOpenedRef.current = true;
+		let llmDetailPollTimer: number | null = null;
+		const openTimer = window.setTimeout(() => {
+			const targetTask = Array.from(document.querySelectorAll("p")).find(
+				(node) => node.textContent?.includes("ID: task-translate-batch-story"),
+			);
+			let taskCard: HTMLElement | null =
+				targetTask instanceof HTMLElement ? targetTask : null;
+			while (taskCard) {
+				const hasDetailButton = Array.from(
+					taskCard.querySelectorAll("button"),
+				).some((node) => node.textContent?.trim() === "详情");
+				if (hasDetailButton) {
+					break;
+				}
+				taskCard = taskCard.parentElement;
+			}
+			const detailButton = Array.from(
+				taskCard?.querySelectorAll("button") ?? [],
+			).find((node) => node.textContent?.trim() === "详情");
+			detailButton?.click();
+			if (!autoOpenTaskDrawerLlmRoute) {
+				return;
+			}
+			let attempts = 0;
+			llmDetailPollTimer = window.setInterval(() => {
+				const llmDetailButton = Array.from(
+					document.querySelectorAll("button"),
+				).find((node) => node.textContent?.trim() === "查看 LLM 详情") as
+					| HTMLButtonElement
+					| undefined;
+				if (llmDetailButton) {
+					llmDetailButton.click();
+					if (llmDetailPollTimer !== null) {
+						window.clearInterval(llmDetailPollTimer);
+						llmDetailPollTimer = null;
+					}
+					return;
+				}
+				attempts += 1;
+				if (attempts >= 30 && llmDetailPollTimer !== null) {
+					window.clearInterval(llmDetailPollTimer);
+					llmDetailPollTimer = null;
+				}
+			}, 120);
+		}, 120);
+		return () => {
+			window.clearTimeout(openTimer);
+			if (llmDetailPollTimer !== null) {
+				window.clearInterval(llmDetailPollTimer);
+			}
+		};
+	}, [ready, autoOpenTaskDrawer, autoOpenTaskDrawerLlmRoute]);
+
 	if (!ready) return null;
 
 	return (
@@ -688,4 +772,12 @@ export const Default: Story = {};
 
 export const LlmConversationDetail: Story = {
 	render: () => <AdminJobsPreview autoOpenConversation />,
+};
+
+export const TaskDrawerDetail: Story = {
+	render: () => <AdminJobsPreview autoOpenTaskDrawer />,
+};
+
+export const TaskDrawerLlmRoute: Story = {
+	render: () => <AdminJobsPreview autoOpenTaskDrawerLlmRoute />,
 };
