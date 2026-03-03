@@ -9,6 +9,7 @@ mod jobs;
 mod server;
 mod state;
 mod sync;
+mod version;
 
 use anyhow::Result;
 use dotenvy::{dotenv, from_filename};
