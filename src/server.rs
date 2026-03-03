@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::{ai, api, auth, jobs, state};
+use crate::{ai, api, auth, jobs, state, version};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -86,6 +86,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let api_router = Router::new()
         .route("/health", get(api_health))
+        .route("/version", get(api_version))
         .route("/me", get(api::me))
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
@@ -277,9 +278,19 @@ async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
 }
 
 async fn api_health() -> axum::Json<serde_json::Value> {
+    let info = version::resolve_effective_version();
     axum::Json(json!({
         "ok": true,
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": info.version,
+    }))
+}
+
+async fn api_version() -> axum::Json<serde_json::Value> {
+    let info = version::resolve_effective_version();
+    axum::Json(json!({
+        "ok": true,
+        "version": info.version,
+        "source": info.source,
     }))
 }
 
@@ -299,4 +310,43 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
             }
         })
         .collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{api_health, api_version};
+
+    #[tokio::test]
+    async fn api_version_reports_non_empty_version_and_source() {
+        let payload = api_version().await.0;
+
+        let version = payload
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .expect("version should be present");
+        assert!(!version.trim().is_empty(), "version should never be blank");
+
+        let source = payload
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .expect("source should be present");
+        assert!(
+            matches!(source, "APP_EFFECTIVE_VERSION" | "CARGO_PKG_VERSION"),
+            "unexpected source: {source}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_health_and_api_version_share_the_same_version_value() {
+        let health_payload = api_health().await.0;
+        let version_payload = api_version().await.0;
+
+        assert_eq!(health_payload.get("ok"), Some(&serde_json::json!(true)));
+        assert_eq!(version_payload.get("ok"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            health_payload.get("version"),
+            version_payload.get("version"),
+            "health/version endpoints should agree on effective version"
+        );
+    }
 }

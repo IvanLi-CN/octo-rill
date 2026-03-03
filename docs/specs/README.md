@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-03-03 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health |
 | vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-02-28 | task drawer route outlet + in-drawer LLM detail navigation |
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |

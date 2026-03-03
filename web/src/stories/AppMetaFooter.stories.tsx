@@ -5,7 +5,7 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 
 type FooterPreviewProps = {
 	delayMs: number;
-	mockMode: "success" | "failure";
+	mockMode: "success" | "fallback" | "failure";
 	mockVersion: string;
 };
 
@@ -23,6 +23,28 @@ function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
 					: input instanceof URL
 						? input.toString()
 						: input.url;
+
+			if (url.endsWith("/api/version")) {
+				if (mockMode === "failure" || mockMode === "fallback") {
+					return new Response(null, { status: 503, statusText: "Unavailable" });
+				}
+
+				if (delayMs > 0) {
+					await new Promise((resolve) => setTimeout(resolve, delayMs));
+				}
+
+				return new Response(
+					JSON.stringify({
+						ok: true,
+						version: mockVersion,
+						source: "APP_EFFECTIVE_VERSION",
+					}),
+					{
+						headers: { "Content-Type": "application/json" },
+						status: 200,
+					},
+				);
+			}
 
 			if (url.endsWith("/api/health")) {
 				if (mockMode === "failure") {
@@ -78,7 +100,7 @@ const meta = {
 	argTypes: {
 		mockMode: {
 			control: "inline-radio",
-			options: ["success", "failure"],
+			options: ["success", "fallback", "failure"],
 		},
 		mockVersion: {
 			control: "text",
@@ -97,6 +119,12 @@ export const Default: Story = {};
 export const BuildMetadataVersion: Story = {
 	args: {
 		mockVersion: "0.2.0-beta.1+git.abc123",
+	},
+};
+
+export const VersionEndpointFallback: Story = {
+	args: {
+		mockMode: "fallback",
 	},
 };
 
