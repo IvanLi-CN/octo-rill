@@ -1,14 +1,32 @@
+use std::{
+    cmp::Ordering,
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    time::Duration,
+};
+
 use anyhow::{Context, Result, anyhow};
 use axum::http::StatusCode;
-use reqwest::header::{ACCEPT, USER_AGENT};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use reqwest::{
+    Response,
+    header::{ACCEPT, HeaderMap, USER_AGENT},
+};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
-use crate::state::AppState;
+use crate::{jobs, state::AppState};
 
 const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2022-11-28";
+const SUBSCRIPTION_STAR_WORKERS: usize = 5;
+const SUBSCRIPTION_RELEASE_WORKERS: usize = 5;
+const SUBSCRIPTION_RETRY_LIMIT: usize = 3;
+const SUBSCRIPTION_RETRY_BACKOFF_MS: [u64; 3] = [500, 1_000, 2_000];
 
 #[derive(Debug, Serialize)]
 pub struct SyncStarredResult {
@@ -27,10 +45,53 @@ pub struct SyncNotificationsResult {
     pub since: Option<String>,
 }
 
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SyncSubscriptionStarSummary {
+    pub total_users: usize,
+    pub succeeded_users: usize,
+    pub failed_users: usize,
+    pub total_repos: usize,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SyncSubscriptionReleaseSummary {
+    pub total_repos: usize,
+    pub succeeded_repos: usize,
+    pub failed_repos: usize,
+    pub candidate_failures: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SyncSubscriptionsResult {
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
+    pub star: SyncSubscriptionStarSummary,
+    pub release: SyncSubscriptionReleaseSummary,
+    pub releases_written: usize,
+    pub critical_events: usize,
+}
+
+pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Value {
+    json!({
+        "skipped": true,
+        "skip_reason": skip_reason,
+        "star": SyncSubscriptionStarSummary::default(),
+        "release": SyncSubscriptionReleaseSummary::default(),
+        "releases_written": 0,
+        "critical_events": 0,
+    })
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct StarredRepoRow {
     repo_id: i64,
     full_name: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EligibleUserRow {
+    id: i64,
+    last_active_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +154,18 @@ struct RepoOwner {
     login: String,
 }
 
+#[derive(Debug, Clone)]
+struct StarredRepoSnapshot {
+    repo_id: i64,
+    full_name: String,
+    owner_login: String,
+    name: String,
+    description: Option<String>,
+    html_url: String,
+    stargazed_at: String,
+    is_private: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     id: i64,
@@ -144,9 +217,973 @@ struct NotificationRepo {
     html_url: Option<String>,
 }
 
-pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredResult> {
-    let token = state.load_access_token(user_id).await?;
+#[derive(Debug, Clone)]
+struct RelatedUserRef {
+    user_id: i64,
+    last_active_at: Option<String>,
+}
 
+#[derive(Debug, Clone)]
+struct AggregatedRepo {
+    repo_id: i64,
+    full_name: String,
+    is_private: bool,
+    related_users: Vec<RelatedUserRef>,
+}
+
+#[derive(Debug)]
+struct StarPhaseSuccess {
+    user_id: i64,
+    last_active_at: Option<String>,
+    repos: Vec<StarredRepoSnapshot>,
+}
+
+#[derive(Debug)]
+struct ReleasePhaseOutcome {
+    succeeded: bool,
+    releases_written: usize,
+    candidate_failures: usize,
+}
+
+#[derive(Clone)]
+struct SubscriptionRunContext {
+    state: Arc<AppState>,
+    task_id: String,
+    logger: Arc<SubscriptionRunLogger>,
+    critical_events: Arc<AtomicUsize>,
+}
+
+impl SubscriptionRunContext {
+    async fn new(state: &AppState, task_id: &str) -> Result<Self> {
+        let state = Arc::new(state.clone());
+        let logger = Arc::new(SubscriptionRunLogger::open(state.as_ref(), task_id).await?);
+        Ok(Self {
+            state,
+            task_id: task_id.to_owned(),
+            logger,
+            critical_events: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    async fn log(
+        &self,
+        level: &str,
+        stage: &str,
+        event_type: &str,
+        message: impl Into<String>,
+        payload: Value,
+    ) -> Result<()> {
+        let message = message.into();
+        self.logger
+            .write(level, stage, event_type, &self.task_id, &message, payload)
+            .await
+    }
+
+    async fn key_event(
+        &self,
+        message: impl Into<String>,
+        event: SubscriptionEventRecord<'_>,
+    ) -> Result<()> {
+        let message = message.into();
+        let event_payload = merge_message_into_payload(event.payload, &message);
+        self.logger
+            .write(
+                event.severity,
+                event.stage,
+                event.event_type,
+                &self.task_id,
+                &message,
+                event_payload.clone(),
+            )
+            .await?;
+        append_subscription_event(
+            self.state.as_ref(),
+            &self.task_id,
+            SubscriptionEventRecord {
+                stage: event.stage,
+                event_type: event.event_type,
+                severity: event.severity,
+                recoverable: event.recoverable,
+                attempt: event.attempt,
+                user_id: event.user_id,
+                repo_id: event.repo_id,
+                repo_full_name: event.repo_full_name,
+                payload: event_payload,
+            },
+        )
+        .await?;
+        self.critical_events.fetch_add(1, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+}
+
+struct SubscriptionEventRecord<'a> {
+    stage: &'a str,
+    event_type: &'a str,
+    severity: &'a str,
+    recoverable: bool,
+    attempt: usize,
+    user_id: Option<i64>,
+    repo_id: Option<i64>,
+    repo_full_name: Option<&'a str>,
+    payload: Value,
+}
+
+struct SubscriptionRunLogger {
+    file: Mutex<tokio::fs::File>,
+}
+
+impl SubscriptionRunLogger {
+    async fn open(state: &AppState, task_id: &str) -> Result<Self> {
+        let path = jobs::load_task_log_path(state, task_id)
+            .await?
+            .ok_or_else(|| anyhow!("subscription sync log path missing"))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("failed to open subscription log file {path}"))?;
+        Ok(Self {
+            file: Mutex::new(file),
+        })
+    }
+
+    async fn write(
+        &self,
+        level: &str,
+        stage: &str,
+        event_type: &str,
+        task_id: &str,
+        message: &str,
+        payload: Value,
+    ) -> Result<()> {
+        let line = serde_json::to_vec(&json!({
+            "at": chrono::Utc::now().to_rfc3339(),
+            "level": level,
+            "stage": stage,
+            "event_type": event_type,
+            "task_id": task_id,
+            "message": message,
+            "payload": payload,
+        }))
+        .context("serialize subscription log line")?;
+        let mut file = self.file.lock().await;
+        file.write_all(&line)
+            .await
+            .context("failed to write subscription log line")?;
+        file.write_all(b"\n")
+            .await
+            .context("failed to write subscription log newline")?;
+        file.flush()
+            .await
+            .context("failed to flush subscription log line")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncRequestError {
+    reason_code: &'static str,
+    message: String,
+    retryable: bool,
+    status: Option<u16>,
+}
+
+impl SyncRequestError {
+    fn retryable(
+        reason_code: &'static str,
+        message: impl Into<String>,
+        status: Option<StatusCode>,
+    ) -> Self {
+        Self {
+            reason_code,
+            message: message.into(),
+            retryable: true,
+            status: status.map(|value| value.as_u16()),
+        }
+    }
+
+    fn non_retryable(
+        reason_code: &'static str,
+        message: impl Into<String>,
+        status: Option<StatusCode>,
+    ) -> Self {
+        Self {
+            reason_code,
+            message: message.into(),
+            retryable: false,
+            status: status.map(|value| value.as_u16()),
+        }
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        anyhow!(self.message)
+    }
+}
+
+pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredResult> {
+    let repos = fetch_starred_snapshot(state, user_id)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    replace_starred_repos(state, user_id, &repos).await?;
+    Ok(SyncStarredResult { repos: repos.len() })
+}
+
+pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncReleasesResult> {
+    let repos = sqlx::query_as::<_, StarredRepoRow>(
+        r#"
+        SELECT repo_id, full_name
+        FROM starred_repos
+        WHERE user_id = ?
+        ORDER BY stargazed_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query starred repos")?;
+
+    let mut total_releases = 0usize;
+    for repo in &repos {
+        let releases = fetch_repo_releases_for_user(state, user_id, &repo.full_name)
+            .await
+            .map_err(SyncRequestError::into_anyhow)?;
+        total_releases += releases.len();
+        upsert_releases_for_users(state, repo.repo_id, &[user_id], &releases).await?;
+    }
+
+    Ok(SyncReleasesResult {
+        repos: repos.len(),
+        releases: total_releases,
+    })
+}
+
+pub async fn sync_subscriptions(
+    state: &AppState,
+    task_id: &str,
+    payload: &Value,
+) -> Result<SyncSubscriptionsResult> {
+    let trigger = payload
+        .get("trigger")
+        .and_then(Value::as_str)
+        .unwrap_or("manual")
+        .to_owned();
+    let schedule_key = payload
+        .get("schedule_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| jobs::current_subscription_schedule_key(chrono::Utc::now()));
+
+    let context = SubscriptionRunContext::new(state, task_id).await?;
+    context
+        .log(
+            "info",
+            "scheduler",
+            "run_started",
+            "subscription sync run started",
+            json!({
+                "trigger": trigger,
+                "schedule_key": schedule_key,
+            }),
+        )
+        .await?;
+
+    let users = sqlx::query_as::<_, EligibleUserRow>(
+        r#"
+        SELECT id, last_active_at
+        FROM users
+        WHERE is_disabled = 0
+        ORDER BY
+          CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
+          last_active_at DESC,
+          id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query users for subscription sync")?;
+
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "collect",
+            "trigger": trigger,
+            "schedule_key": schedule_key,
+            "total_users": users.len(),
+        }),
+    )
+    .await?;
+
+    let (successful_users, star_summary) = run_star_phase(&context, users).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "star_summary",
+            "total_users": star_summary.total_users,
+            "succeeded_users": star_summary.succeeded_users,
+            "failed_users": star_summary.failed_users,
+            "total_repos": star_summary.total_repos,
+        }),
+    )
+    .await?;
+
+    let repos = aggregate_repos(&successful_users);
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "repo_collect",
+            "total_repos": repos.len(),
+        }),
+    )
+    .await?;
+
+    let (release_summary, releases_written) = run_release_phase(&context, repos).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "release_summary",
+            "total_repos": release_summary.total_repos,
+            "succeeded_repos": release_summary.succeeded_repos,
+            "failed_repos": release_summary.failed_repos,
+            "candidate_failures": release_summary.candidate_failures,
+            "releases_written": releases_written,
+        }),
+    )
+    .await?;
+
+    let result = SyncSubscriptionsResult {
+        skipped: false,
+        skip_reason: None,
+        star: star_summary,
+        release: release_summary,
+        releases_written,
+        critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+    };
+
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "summary",
+            "critical_events": result.critical_events,
+            "releases_written": result.releases_written,
+        }),
+    )
+    .await?;
+
+    context
+        .log(
+            "info",
+            "scheduler",
+            "run_completed",
+            "subscription sync run completed",
+            serde_json::to_value(&result).unwrap_or_else(|_| json!({"ok": true})),
+        )
+        .await?;
+
+    Ok(result)
+}
+
+async fn run_star_phase(
+    context: &SubscriptionRunContext,
+    users: Vec<EligibleUserRow>,
+) -> Result<(Vec<StarPhaseSuccess>, SyncSubscriptionStarSummary)> {
+    let mut join_set = JoinSet::new();
+    let mut successful_users = Vec::new();
+    let mut summary = SyncSubscriptionStarSummary {
+        total_users: users.len(),
+        ..SyncSubscriptionStarSummary::default()
+    };
+
+    for user in users {
+        while join_set.len() >= SUBSCRIPTION_STAR_WORKERS {
+            collect_star_result(
+                join_set.join_next().await,
+                &mut successful_users,
+                &mut summary,
+            )?;
+        }
+        let worker_context = context.clone();
+        join_set.spawn(async move { sync_starred_for_user(worker_context, user).await });
+    }
+
+    while !join_set.is_empty() {
+        collect_star_result(
+            join_set.join_next().await,
+            &mut successful_users,
+            &mut summary,
+        )?;
+    }
+
+    Ok((successful_users, summary))
+}
+
+fn collect_star_result(
+    joined: Option<Result<Result<Option<StarPhaseSuccess>>, tokio::task::JoinError>>,
+    successful_users: &mut Vec<StarPhaseSuccess>,
+    summary: &mut SyncSubscriptionStarSummary,
+) -> Result<()> {
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+    match joined {
+        Ok(Ok(Some(success))) => {
+            summary.succeeded_users += 1;
+            summary.total_repos += success.repos.len();
+            successful_users.push(success);
+            Ok(())
+        }
+        Ok(Ok(None)) => {
+            summary.failed_users += 1;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(anyhow!("star worker join failed: {err}")),
+    }
+}
+
+async fn sync_starred_for_user(
+    context: SubscriptionRunContext,
+    user: EligibleUserRow,
+) -> Result<Option<StarPhaseSuccess>> {
+    context
+        .log(
+            "info",
+            "star",
+            "user_started",
+            format!("refreshing starred repositories for user #{}", user.id),
+            json!({
+                "user_id": user.id,
+                "last_active_at": user.last_active_at,
+            }),
+        )
+        .await?;
+
+    match fetch_starred_snapshot(context.state.as_ref(), user.id).await {
+        Ok(repos) => {
+            replace_starred_repos(context.state.as_ref(), user.id, &repos).await?;
+            context
+                .log(
+                    "info",
+                    "star",
+                    "user_succeeded",
+                    format!("user #{} starred snapshot refreshed", user.id),
+                    json!({
+                        "user_id": user.id,
+                        "repo_count": repos.len(),
+                    }),
+                )
+                .await?;
+            Ok(Some(StarPhaseSuccess {
+                user_id: user.id,
+                last_active_at: user.last_active_at,
+                repos,
+            }))
+        }
+        Err(err) => {
+            context
+                .key_event(
+                    format!(
+                        "failed to refresh starred repositories for user #{}",
+                        user.id
+                    ),
+                    SubscriptionEventRecord {
+                        stage: "star",
+                        event_type: err.reason_code,
+                        severity: if err.retryable { "warning" } else { "error" },
+                        recoverable: err.retryable,
+                        attempt: 1,
+                        user_id: Some(user.id),
+                        repo_id: None,
+                        repo_full_name: None,
+                        payload: json!({
+                            "user_id": user.id,
+                            "reason_code": err.reason_code,
+                            "status": err.status,
+                            "error": err.message,
+                        }),
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
+    }
+}
+
+fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
+    let mut grouped = HashMap::<i64, AggregatedRepo>::new();
+    for user in users {
+        for repo in &user.repos {
+            let entry = grouped
+                .entry(repo.repo_id)
+                .or_insert_with(|| AggregatedRepo {
+                    repo_id: repo.repo_id,
+                    full_name: repo.full_name.clone(),
+                    is_private: repo.is_private,
+                    related_users: Vec::new(),
+                });
+            entry.is_private = entry.is_private || repo.is_private;
+            entry.related_users.push(RelatedUserRef {
+                user_id: user.user_id,
+                last_active_at: user.last_active_at.clone(),
+            });
+        }
+    }
+
+    let mut repos = grouped.into_values().collect::<Vec<_>>();
+    for repo in &mut repos {
+        repo.related_users.sort_by(|left, right| {
+            cmp_last_active_desc(
+                left.last_active_at.as_deref(),
+                right.last_active_at.as_deref(),
+            )
+            .then_with(|| left.user_id.cmp(&right.user_id))
+        });
+    }
+    repos.sort_by(|left, right| {
+        right
+            .related_users
+            .len()
+            .cmp(&left.related_users.len())
+            .then_with(|| left.full_name.cmp(&right.full_name))
+    });
+    repos
+}
+
+async fn run_release_phase(
+    context: &SubscriptionRunContext,
+    repos: Vec<AggregatedRepo>,
+) -> Result<(SyncSubscriptionReleaseSummary, usize)> {
+    let mut join_set = JoinSet::new();
+    let mut summary = SyncSubscriptionReleaseSummary {
+        total_repos: repos.len(),
+        ..SyncSubscriptionReleaseSummary::default()
+    };
+    let mut releases_written = 0usize;
+
+    for repo in repos {
+        while join_set.len() >= SUBSCRIPTION_RELEASE_WORKERS {
+            collect_release_result(
+                join_set.join_next().await,
+                &mut summary,
+                &mut releases_written,
+            )?;
+        }
+        let worker_context = context.clone();
+        join_set.spawn(async move { sync_releases_for_repo(worker_context, repo).await });
+    }
+
+    while !join_set.is_empty() {
+        collect_release_result(
+            join_set.join_next().await,
+            &mut summary,
+            &mut releases_written,
+        )?;
+    }
+
+    Ok((summary, releases_written))
+}
+
+fn collect_release_result(
+    joined: Option<Result<Result<ReleasePhaseOutcome>, tokio::task::JoinError>>,
+    summary: &mut SyncSubscriptionReleaseSummary,
+    releases_written: &mut usize,
+) -> Result<()> {
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+    match joined {
+        Ok(Ok(outcome)) => {
+            if outcome.succeeded {
+                summary.succeeded_repos += 1;
+            } else {
+                summary.failed_repos += 1;
+            }
+            summary.candidate_failures += outcome.candidate_failures;
+            *releases_written += outcome.releases_written;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(anyhow!("release worker join failed: {err}")),
+    }
+}
+
+async fn sync_releases_for_repo(
+    context: SubscriptionRunContext,
+    repo: AggregatedRepo,
+) -> Result<ReleasePhaseOutcome> {
+    context
+        .log(
+            "info",
+            "release",
+            "repo_started",
+            format!("syncing releases for {}", repo.full_name),
+            json!({
+                "repo_id": repo.repo_id,
+                "repo_full_name": repo.full_name,
+                "is_private": repo.is_private,
+                "related_users": repo.related_users.iter().map(|item| item.user_id).collect::<Vec<_>>(),
+            }),
+        )
+        .await?;
+
+    let related_user_ids = repo
+        .related_users
+        .iter()
+        .map(|item| item.user_id)
+        .collect::<Vec<_>>();
+    let mut candidate_failures = 0usize;
+
+    for candidate in &repo.related_users {
+        for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
+            match fetch_repo_releases_for_user(
+                context.state.as_ref(),
+                candidate.user_id,
+                &repo.full_name,
+            )
+            .await
+            {
+                Ok(releases) => {
+                    let written = upsert_releases_for_users(
+                        context.state.as_ref(),
+                        repo.repo_id,
+                        &related_user_ids,
+                        &releases,
+                    )
+                    .await?;
+                    context
+                        .log(
+                            "info",
+                            "release",
+                            "repo_succeeded",
+                            format!("synced releases for {}", repo.full_name),
+                            json!({
+                                "repo_id": repo.repo_id,
+                                "repo_full_name": repo.full_name,
+                                "candidate_user_id": candidate.user_id,
+                                "release_count": releases.len(),
+                                "releases_written": written,
+                            }),
+                        )
+                        .await?;
+                    return Ok(ReleasePhaseOutcome {
+                        succeeded: true,
+                        releases_written: written,
+                        candidate_failures,
+                    });
+                }
+                Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
+                    candidate_failures += 1;
+                    context
+                        .key_event(
+                            format!(
+                                "retryable release sync error for {} with user #{}",
+                                repo.full_name, candidate.user_id
+                            ),
+                            SubscriptionEventRecord {
+                                stage: "release",
+                                event_type: err.reason_code,
+                                severity: "warning",
+                                recoverable: true,
+                                attempt,
+                                user_id: Some(candidate.user_id),
+                                repo_id: Some(repo.repo_id),
+                                repo_full_name: Some(repo.full_name.as_str()),
+                                payload: json!({
+                                    "repo_id": repo.repo_id,
+                                    "repo_full_name": repo.full_name,
+                                    "candidate_user_id": candidate.user_id,
+                                    "reason_code": err.reason_code,
+                                    "status": err.status,
+                                    "error": err.message,
+                                }),
+                            },
+                        )
+                        .await?;
+                    let delay_ms = SUBSCRIPTION_RETRY_BACKOFF_MS
+                        .get(attempt - 1)
+                        .copied()
+                        .unwrap_or(2_000);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(err) => {
+                    candidate_failures += 1;
+                    context
+                        .key_event(
+                            format!(
+                                "release sync candidate failed for {} with user #{}",
+                                repo.full_name, candidate.user_id
+                            ),
+                            SubscriptionEventRecord {
+                                stage: "release",
+                                event_type: err.reason_code,
+                                severity: if err.retryable { "warning" } else { "error" },
+                                recoverable: err.retryable,
+                                attempt,
+                                user_id: Some(candidate.user_id),
+                                repo_id: Some(repo.repo_id),
+                                repo_full_name: Some(repo.full_name.as_str()),
+                                payload: json!({
+                                    "repo_id": repo.repo_id,
+                                    "repo_full_name": repo.full_name,
+                                    "candidate_user_id": candidate.user_id,
+                                    "reason_code": err.reason_code,
+                                    "status": err.status,
+                                    "error": err.message,
+                                }),
+                            },
+                        )
+                        .await?;
+                    break;
+                }
+            }
+        }
+    }
+
+    context
+        .key_event(
+            format!("all candidates failed for {}", repo.full_name),
+            SubscriptionEventRecord {
+                stage: "release",
+                event_type: "repo_unreachable",
+                severity: "error",
+                recoverable: false,
+                attempt: 0,
+                user_id: None,
+                repo_id: Some(repo.repo_id),
+                repo_full_name: Some(repo.full_name.as_str()),
+                payload: json!({
+                    "repo_id": repo.repo_id,
+                    "repo_full_name": repo.full_name,
+                    "candidate_user_ids": related_user_ids,
+                }),
+            },
+        )
+        .await?;
+
+    Ok(ReleasePhaseOutcome {
+        succeeded: false,
+        releases_written: 0,
+        candidate_failures,
+    })
+}
+
+fn cmp_last_active_desc(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn merge_message_into_payload(payload: Value, message: &str) -> Value {
+    match payload {
+        Value::Object(mut object) => {
+            object.insert("message".to_owned(), Value::String(message.to_owned()));
+            Value::Object(object)
+        }
+        other => json!({
+            "message": message,
+            "details": other,
+        }),
+    }
+}
+
+async fn append_subscription_event(
+    state: &AppState,
+    task_id: &str,
+    event: SubscriptionEventRecord<'_>,
+) -> Result<()> {
+    let payload_json =
+        serde_json::to_string(&event.payload).context("serialize subscription event")?;
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO sync_subscription_events (
+          task_id,
+          stage,
+          event_type,
+          severity,
+          recoverable,
+          attempt,
+          user_id,
+          repo_id,
+          repo_full_name,
+          payload_json,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(task_id)
+    .bind(event.stage)
+    .bind(event.event_type)
+    .bind(event.severity)
+    .bind(if event.recoverable { 1_i64 } else { 0_i64 })
+    .bind(i64::try_from(event.attempt).unwrap_or(i64::MAX))
+    .bind(event.user_id)
+    .bind(event.repo_id)
+    .bind(event.repo_full_name)
+    .bind(payload_json)
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to insert sync_subscription_event")?;
+    Ok(())
+}
+
+fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestError {
+    if err.is_timeout() || err.is_connect() || err.is_request() {
+        return SyncRequestError::retryable("network_error", format!("{operation}: {err}"), None);
+    }
+    SyncRequestError::non_retryable("request_error", format!("{operation}: {err}"), None)
+}
+
+fn classify_github_http_error(
+    operation: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> SyncRequestError {
+    let remaining = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let body_lower = body.to_ascii_lowercase();
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+        || remaining == "0"
+        || body_lower.contains("secondary rate limit")
+        || body_lower.contains("abuse detection")
+    {
+        return SyncRequestError::retryable(
+            "rate_limited",
+            format!("{operation}: github returned {status}"),
+            Some(status),
+        );
+    }
+
+    if status == StatusCode::UNAUTHORIZED {
+        return SyncRequestError::non_retryable(
+            "credentials_invalid",
+            format!("{operation}: github returned 401"),
+            Some(status),
+        );
+    }
+
+    if status == StatusCode::FORBIDDEN {
+        let reason_code =
+            if body_lower.contains("scope") || body_lower.contains("resource not accessible") {
+                "scope_insufficient"
+            } else {
+                "credentials_forbidden"
+            };
+        return SyncRequestError::non_retryable(
+            reason_code,
+            format!("{operation}: github returned 403"),
+            Some(status),
+        );
+    }
+
+    if status == StatusCode::NOT_FOUND || status.as_u16() == 451 {
+        return SyncRequestError::non_retryable(
+            "repo_inaccessible",
+            format!("{operation}: github returned {status}"),
+            Some(status),
+        );
+    }
+
+    SyncRequestError::non_retryable(
+        "github_http_error",
+        format!("{operation}: github returned {status}"),
+        Some(status),
+    )
+}
+
+fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequestError {
+    let message = errors
+        .iter()
+        .map(|item| item.message.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let message_lower = message.to_ascii_lowercase();
+    if message_lower.contains("rate limit") {
+        return SyncRequestError::retryable(
+            "rate_limited",
+            format!("{operation}: {message}"),
+            None,
+        );
+    }
+    if message_lower.contains("scope") || message_lower.contains("resource not accessible") {
+        return SyncRequestError::non_retryable(
+            "scope_insufficient",
+            format!("{operation}: {message}"),
+            None,
+        );
+    }
+    SyncRequestError::non_retryable("graphql_error", format!("{operation}: {message}"), None)
+}
+
+async fn load_access_token_or_classified(
+    state: &AppState,
+    user_id: i64,
+) -> Result<String, SyncRequestError> {
+    state.load_access_token(user_id).await.map_err(|err| {
+        let message = err.to_string();
+        if message.contains("access token not found") {
+            SyncRequestError::non_retryable(
+                "credentials_missing",
+                format!("load access token for user #{user_id}: {message}"),
+                None,
+            )
+        } else {
+            SyncRequestError::non_retryable(
+                "credentials_invalid",
+                format!("load access token for user #{user_id}: {message}"),
+                None,
+            )
+        }
+    })
+}
+
+async fn fetch_json_response<T: DeserializeOwned>(
+    response: Response,
+    operation: &str,
+) -> Result<T, SyncRequestError> {
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(classify_github_http_error(
+            operation, status, &headers, &body,
+        ));
+    }
+    response.json::<T>().await.map_err(|err| {
+        SyncRequestError::non_retryable("decode_error", format!("{operation}: {err}"), Some(status))
+    })
+}
+
+async fn fetch_starred_snapshot(
+    state: &AppState,
+    user_id: i64,
+) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
+    let token = load_access_token_or_classified(state, user_id).await?;
     let query = r#"
       query($after: String) {
         viewer {
@@ -170,71 +1207,86 @@ pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredR
     "#;
 
     let mut after: Option<String> = None;
-    let mut all: Vec<StarredEdge> = Vec::new();
+    let mut all = Vec::new();
 
     loop {
-        let payload = json!({
-            "query": query,
-            "variables": { "after": after },
-        });
-
-        let resp = state
+        let response = state
             .http
             .post(GRAPHQL_URL)
             .bearer_auth(&token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&payload)
+            .json(&json!({
+                "query": query,
+                "variables": { "after": after },
+            }))
             .send()
             .await
-            .context("github graphql request failed")?
-            .error_for_status()
-            .context("github graphql returned error")?
-            .json::<GraphQlResponse<StarredData>>()
-            .await
-            .context("github graphql json decode failed")?;
+            .map_err(|err| classify_reqwest_error("sync starred graphql", err))?;
 
-        if let Some(errors) = resp.errors
-            && !errors.is_empty()
-        {
-            let msg = errors
-                .into_iter()
-                .map(|e| e.message)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(anyhow!("github graphql error: {msg}"));
+        let payload =
+            fetch_json_response::<GraphQlResponse<StarredData>>(response, "sync starred graphql")
+                .await?;
+        if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+            return Err(classify_graphql_errors("sync starred graphql", errors));
         }
-
-        let data = resp.data.context("missing graphql data")?;
-        let page = data.viewer.starred_repositories;
-        all.extend(page.edges);
-
+        let page = payload
+            .data
+            .ok_or_else(|| {
+                SyncRequestError::non_retryable(
+                    "graphql_missing_data",
+                    "sync starred graphql: missing graphql data",
+                    None,
+                )
+            })?
+            .viewer
+            .starred_repositories;
+        for edge in page.edges {
+            let Some(repo_id) = edge.node.database_id else {
+                continue;
+            };
+            all.push(StarredRepoSnapshot {
+                repo_id,
+                full_name: edge.node.name_with_owner,
+                owner_login: edge.node.owner.login,
+                name: edge.node.name,
+                description: edge.node.description,
+                html_url: edge.node.url,
+                stargazed_at: edge.starred_at,
+                is_private: edge.node.is_private,
+            });
+        }
         if !page.page_info.has_next_page {
             break;
         }
-
         after = page.page_info.end_cursor;
         if after.is_none() {
             break;
         }
     }
 
+    Ok(all)
+}
+
+async fn replace_starred_repos(
+    state: &AppState,
+    user_id: i64,
+    repos: &[StarredRepoSnapshot],
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("begin replace starred_repos tx")?;
     sqlx::query(r#"DELETE FROM starred_repos WHERE user_id = ?"#)
         .bind(user_id)
         .execute(&mut *tx)
         .await
         .context("failed to clear starred_repos")?;
 
-    let mut inserted = 0usize;
-    for edge in all {
-        let Some(repo_id) = edge.node.database_id else {
-            continue;
-        };
-        inserted += 1;
-
+    for repo in repos {
         sqlx::query(
             r#"
             INSERT INTO starred_repos (
@@ -243,152 +1295,175 @@ pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredR
             "#,
         )
         .bind(user_id)
-        .bind(repo_id)
-        .bind(&edge.node.name_with_owner)
-        .bind(&edge.node.owner.login)
-        .bind(&edge.node.name)
-        .bind(edge.node.description.as_deref())
-        .bind(&edge.node.url)
-        .bind(&edge.starred_at)
-        .bind(edge.node.is_private as i64)
+        .bind(repo.repo_id)
+        .bind(&repo.full_name)
+        .bind(&repo.owner_login)
+        .bind(&repo.name)
+        .bind(repo.description.as_deref())
+        .bind(&repo.html_url)
+        .bind(&repo.stargazed_at)
+        .bind(repo.is_private as i64)
         .bind(&now)
         .execute(&mut *tx)
         .await
-        .with_context(|| format!("failed to insert starred repo {}", edge.node.name_with_owner))?;
+        .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
     }
 
-    tx.commit().await?;
-
-    Ok(SyncStarredResult { repos: inserted })
+    tx.commit()
+        .await
+        .context("commit replace starred_repos tx")?;
+    Ok(())
 }
 
-pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncReleasesResult> {
-    let token = state.load_access_token(user_id).await?;
+async fn fetch_repo_releases_for_user(
+    state: &AppState,
+    user_id: i64,
+    repo_full_name: &str,
+) -> Result<Vec<GitHubRelease>, SyncRequestError> {
+    let token = load_access_token_or_classified(state, user_id).await?;
+    fetch_repo_releases_with_token(state, &token, repo_full_name).await
+}
 
-    let repos = sqlx::query_as::<_, StarredRepoRow>(
-        r#"
-        SELECT repo_id, full_name
-        FROM starred_repos
-        WHERE user_id = ?
-        ORDER BY stargazed_at DESC
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query starred repos")?;
+async fn fetch_repo_releases_with_token(
+    state: &AppState,
+    token: &str,
+    repo_full_name: &str,
+) -> Result<Vec<GitHubRelease>, SyncRequestError> {
+    let mut page = 1usize;
+    let mut releases = Vec::new();
+    loop {
+        let url =
+            format!("{REST_API_BASE}/repos/{repo_full_name}/releases?per_page=100&page={page}");
+        let response = state
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|err| {
+                classify_reqwest_error(&format!("sync releases {repo_full_name}"), err)
+            })?;
+        let page_releases = fetch_json_response::<Vec<GitHubRelease>>(
+            response,
+            &format!("sync releases {repo_full_name}"),
+        )
+        .await?;
+        if page_releases.is_empty() {
+            break;
+        }
+        releases.extend(page_releases);
+        if page >= 50 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(releases)
+}
 
-    let mut total_releases = 0usize;
+async fn upsert_releases_for_users(
+    state: &AppState,
+    repo_id: i64,
+    user_ids: &[i64],
+    releases: &[GitHubRelease],
+) -> Result<usize> {
     let now = chrono::Utc::now().to_rfc3339();
-
-    for repo in &repos {
-        let mut page = 1usize;
-        loop {
-            let url = format!(
-                "{REST_API_BASE}/repos/{}/releases?per_page=100&page={}",
-                repo.full_name, page
-            );
-
-            let res = state
-                .http
-                .get(url)
-                .bearer_auth(&token)
-                .header(USER_AGENT, "OctoRill")
-                .header(ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", API_VERSION)
-                .send()
-                .await
-                .with_context(|| format!("github releases request failed: {}", repo.full_name))?;
-
-            if res.status() == StatusCode::FORBIDDEN {
-                let remaining = res
-                    .headers()
-                    .get("x-ratelimit-remaining")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("");
-                if remaining == "0" {
-                    return Err(anyhow!("github rate limit exceeded while syncing releases"));
-                }
-            }
-
-            let releases = res
-                .error_for_status()
-                .with_context(|| format!("github releases returned error: {}", repo.full_name))?
-                .json::<Vec<GitHubRelease>>()
-                .await
-                .with_context(|| {
-                    format!("github releases json decode failed: {}", repo.full_name)
-                })?;
-
-            if releases.is_empty() {
-                break;
-            }
-
-            for r in releases {
-                total_releases += 1;
-                sqlx::query(
-                    r#"
-                    INSERT INTO releases (
-                      user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
-                      published_at, created_at, is_prerelease, is_draft, updated_at,
-                      react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id, release_id) DO UPDATE SET
-                      node_id = excluded.node_id,
-                      tag_name = excluded.tag_name,
-                      name = excluded.name,
-                      body = excluded.body,
-                      html_url = excluded.html_url,
-                      published_at = excluded.published_at,
-                      created_at = excluded.created_at,
-                      is_prerelease = excluded.is_prerelease,
-                      is_draft = excluded.is_draft,
-                      react_plus1 = excluded.react_plus1,
-                      react_laugh = excluded.react_laugh,
-                      react_heart = excluded.react_heart,
-                      react_hooray = excluded.react_hooray,
-                      react_rocket = excluded.react_rocket,
-                      react_eyes = excluded.react_eyes,
-                      updated_at = excluded.updated_at
-                    "#,
+    for user_id in user_ids {
+        for release in releases {
+            sqlx::query(
+                r#"
+                INSERT INTO releases (
+                  user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+                  published_at, created_at, is_prerelease, is_draft, updated_at,
+                  react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, release_id) DO UPDATE SET
+                  node_id = excluded.node_id,
+                  tag_name = excluded.tag_name,
+                  name = excluded.name,
+                  body = excluded.body,
+                  html_url = excluded.html_url,
+                  published_at = excluded.published_at,
+                  created_at = excluded.created_at,
+                  is_prerelease = excluded.is_prerelease,
+                  is_draft = excluded.is_draft,
+                  react_plus1 = excluded.react_plus1,
+                  react_laugh = excluded.react_laugh,
+                  react_heart = excluded.react_heart,
+                  react_hooray = excluded.react_hooray,
+                  react_rocket = excluded.react_rocket,
+                  react_eyes = excluded.react_eyes,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(user_id)
+            .bind(repo_id)
+            .bind(release.id)
+            .bind(release.node_id.as_deref())
+            .bind(&release.tag_name)
+            .bind(release.name.as_deref())
+            .bind(release.body.as_deref())
+            .bind(&release.html_url)
+            .bind(release.published_at.as_deref())
+            .bind(release.created_at.as_deref())
+            .bind(release.prerelease as i64)
+            .bind(release.draft as i64)
+            .bind(&now)
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.plus1)
+                    .unwrap_or(0),
+            )
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.laugh)
+                    .unwrap_or(0),
+            )
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.heart)
+                    .unwrap_or(0),
+            )
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.hooray)
+                    .unwrap_or(0),
+            )
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.rocket)
+                    .unwrap_or(0),
+            )
+            .bind(
+                release
+                    .reactions
+                    .as_ref()
+                    .map(|value| value.eyes)
+                    .unwrap_or(0),
+            )
+            .execute(&state.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upsert release {} for user #{}",
+                    release.tag_name, user_id
                 )
-                .bind(user_id)
-                .bind(repo.repo_id)
-                .bind(r.id)
-                .bind(r.node_id.as_deref())
-                .bind(&r.tag_name)
-                .bind(r.name.as_deref())
-                .bind(r.body.as_deref())
-                .bind(&r.html_url)
-                .bind(r.published_at.as_deref())
-                .bind(r.created_at.as_deref())
-                .bind(r.prerelease as i64)
-                .bind(r.draft as i64)
-                .bind(&now)
-                .bind(r.reactions.as_ref().map(|v| v.plus1).unwrap_or(0))
-                .bind(r.reactions.as_ref().map(|v| v.laugh).unwrap_or(0))
-                .bind(r.reactions.as_ref().map(|v| v.heart).unwrap_or(0))
-                .bind(r.reactions.as_ref().map(|v| v.hooray).unwrap_or(0))
-                .bind(r.reactions.as_ref().map(|v| v.rocket).unwrap_or(0))
-                .bind(r.reactions.as_ref().map(|v| v.eyes).unwrap_or(0))
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!("failed to upsert release {} {}", repo.full_name, r.tag_name)
-                })?;
-            }
-
-            if page >= 50 {
-                break;
-            }
-            page += 1;
+            })?;
         }
     }
-
-    Ok(SyncReleasesResult {
-        repos: repos.len(),
-        releases: total_releases,
-    })
+    Ok(user_ids.len() * releases.len())
 }
 
 pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNotificationsResult> {
@@ -482,4 +1557,72 @@ pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNo
         notifications: res.len(),
         since,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StarPhaseSuccess, aggregate_repos, cmp_last_active_desc};
+
+    #[test]
+    fn cmp_last_active_desc_places_recent_users_first() {
+        let recent = Some("2026-03-06T12:30:00Z");
+        let stale = Some("2026-03-05T12:30:00Z");
+        assert!(cmp_last_active_desc(recent, stale).is_lt());
+        assert!(cmp_last_active_desc(stale, recent).is_gt());
+        assert!(cmp_last_active_desc(recent, None).is_lt());
+        assert!(cmp_last_active_desc(None, recent).is_gt());
+    }
+
+    #[test]
+    fn aggregate_repos_orders_by_related_users_then_name() {
+        let users = vec![
+            StarPhaseSuccess {
+                user_id: 2,
+                last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
+                repos: vec![
+                    super::StarredRepoSnapshot {
+                        repo_id: 2,
+                        full_name: "octo/beta".to_owned(),
+                        owner_login: "octo".to_owned(),
+                        name: "beta".to_owned(),
+                        description: None,
+                        html_url: "https://github.com/octo/beta".to_owned(),
+                        stargazed_at: "2026-03-06T12:00:00Z".to_owned(),
+                        is_private: false,
+                    },
+                    super::StarredRepoSnapshot {
+                        repo_id: 1,
+                        full_name: "octo/alpha".to_owned(),
+                        owner_login: "octo".to_owned(),
+                        name: "alpha".to_owned(),
+                        description: None,
+                        html_url: "https://github.com/octo/alpha".to_owned(),
+                        stargazed_at: "2026-03-06T12:00:00Z".to_owned(),
+                        is_private: false,
+                    },
+                ],
+            },
+            StarPhaseSuccess {
+                user_id: 1,
+                last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
+                repos: vec![super::StarredRepoSnapshot {
+                    repo_id: 1,
+                    full_name: "octo/alpha".to_owned(),
+                    owner_login: "octo".to_owned(),
+                    name: "alpha".to_owned(),
+                    description: None,
+                    html_url: "https://github.com/octo/alpha".to_owned(),
+                    stargazed_at: "2026-03-06T13:00:00Z".to_owned(),
+                    is_private: false,
+                }],
+            },
+        ];
+
+        let repos = aggregate_repos(&users);
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].full_name, "octo/alpha");
+        assert_eq!(repos[0].related_users.len(), 2);
+        assert_eq!(repos[0].related_users[0].user_id, 1);
+        assert_eq!(repos[1].full_name, "octo/beta");
+    }
 }
