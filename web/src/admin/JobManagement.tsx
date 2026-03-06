@@ -941,13 +941,20 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [error, setError] = useState<string | null>(null);
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 
+	const overviewLoadedOnceRef = useRef(false);
+	const overviewInitialRequestInFlightRef = useRef(false);
 	const overviewRequestIdRef = useRef(0);
 	const tasksLoadedOnceRef = useRef(false);
+	const tasksInitialRequestInFlightRef = useRef(false);
 	const tasksRequestIdRef = useRef(0);
 	const scheduledRunsLoadedOnceRef = useRef(false);
+	const scheduledRunsInitialRequestInFlightRef = useRef(false);
 	const scheduledRunsRequestIdRef = useRef(0);
+	const llmStatusLoadedOnceRef = useRef(false);
+	const llmStatusInitialRequestInFlightRef = useRef(false);
 	const llmStatusRequestIdRef = useRef(0);
 	const llmCallsLoadedOnceRef = useRef(false);
+	const llmCallsInitialRequestInFlightRef = useRef(false);
 	const llmCallsRequestIdRef = useRef(0);
 	const detailTaskIdRef = useRef<string | null>(null);
 	const llmDetailIdRef = useRef<string | null>(null);
@@ -1053,9 +1060,17 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		};
 	}, []);
 
-	const loadOverview = useCallback(async () => {
+	const loadOverview = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!overviewLoadedOnceRef.current &&
+			overviewInitialRequestInFlightRef.current
+		) {
+			return;
+		}
 		const requestId = overviewRequestIdRef.current + 1;
 		overviewRequestIdRef.current = requestId;
+		overviewInitialRequestInFlightRef.current = !overviewLoadedOnceRef.current;
 		setOverviewLoading(true);
 		try {
 			const res = await apiGetAdminJobsOverview();
@@ -1063,6 +1078,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				return;
 			}
 			setOverview(res);
+			overviewLoadedOnceRef.current = true;
 		} catch (err) {
 			if (requestId !== overviewRequestIdRef.current) {
 				return;
@@ -1071,14 +1087,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		} finally {
 			if (requestId === overviewRequestIdRef.current) {
 				setOverviewLoading(false);
+				overviewInitialRequestInFlightRef.current = false;
 			}
 		}
 	}, []);
 
 	const loadRealtimeTasks = useCallback(
 		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!tasksLoadedOnceRef.current &&
+				tasksInitialRequestInFlightRef.current
+			) {
+				return;
+			}
 			const requestId = tasksRequestIdRef.current + 1;
 			tasksRequestIdRef.current = requestId;
+			tasksInitialRequestInFlightRef.current = !tasksLoadedOnceRef.current;
 			setTasksLoadPhase(
 				resolveListLoadPhase(tasksLoadedOnceRef.current, options),
 			);
@@ -1111,6 +1136,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			} finally {
 				if (requestId === tasksRequestIdRef.current) {
 					setTasksLoadPhase("idle");
+					tasksInitialRequestInFlightRef.current = false;
 				}
 			}
 		},
@@ -1119,8 +1145,17 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 	const loadScheduledRuns = useCallback(
 		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!scheduledRunsLoadedOnceRef.current &&
+				scheduledRunsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
 			const requestId = scheduledRunsRequestIdRef.current + 1;
 			scheduledRunsRequestIdRef.current = requestId;
+			scheduledRunsInitialRequestInFlightRef.current =
+				!scheduledRunsLoadedOnceRef.current;
 			setScheduledRunsLoadPhase(
 				resolveListLoadPhase(scheduledRunsLoadedOnceRef.current, options),
 			);
@@ -1145,15 +1180,25 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			} finally {
 				if (requestId === scheduledRunsRequestIdRef.current) {
 					setScheduledRunsLoadPhase("idle");
+					scheduledRunsInitialRequestInFlightRef.current = false;
 				}
 			}
 		},
 		[scheduledRunPage, scheduledRunStatusFilter],
 	);
 
-	const loadLlmSchedulerStatus = useCallback(async () => {
+	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!llmStatusLoadedOnceRef.current &&
+			llmStatusInitialRequestInFlightRef.current
+		) {
+			return;
+		}
 		const requestId = llmStatusRequestIdRef.current + 1;
 		llmStatusRequestIdRef.current = requestId;
+		llmStatusInitialRequestInFlightRef.current =
+			!llmStatusLoadedOnceRef.current;
 		setLlmStatusLoading(true);
 		try {
 			const res = await apiGetAdminLlmSchedulerStatus();
@@ -1161,6 +1206,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				return;
 			}
 			setLlmStatus(res);
+			llmStatusLoadedOnceRef.current = true;
 		} catch (err) {
 			if (requestId !== llmStatusRequestIdRef.current) {
 				return;
@@ -1169,14 +1215,24 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		} finally {
 			if (requestId === llmStatusRequestIdRef.current) {
 				setLlmStatusLoading(false);
+				llmStatusInitialRequestInFlightRef.current = false;
 			}
 		}
 	}, []);
 
 	const loadLlmCalls = useCallback(
 		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!llmCallsLoadedOnceRef.current &&
+				llmCallsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
 			const requestId = llmCallsRequestIdRef.current + 1;
 			llmCallsRequestIdRef.current = requestId;
+			llmCallsInitialRequestInFlightRef.current =
+				!llmCallsLoadedOnceRef.current;
 			setLlmCallsLoadPhase(
 				resolveListLoadPhase(llmCallsLoadedOnceRef.current, options),
 			);
@@ -1215,6 +1271,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			} finally {
 				if (requestId === llmCallsRequestIdRef.current) {
 					setLlmCallsLoadPhase("idle");
+					llmCallsInitialRequestInFlightRef.current = false;
 				}
 			}
 		},
@@ -1233,10 +1290,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await Promise.all([
-					loadOverview(),
+					loadOverview({ background: true }),
 					loadRealtimeTasks(options),
 					loadScheduledRuns(options),
-					loadLlmSchedulerStatus(),
+					loadLlmSchedulerStatus(options),
 					loadLlmCalls(options),
 				]);
 			} catch (err) {
@@ -1301,10 +1358,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 			if (needFullRefresh) {
 				await Promise.all([
-					loadOverview(),
+					loadOverview({ background: true }),
 					loadRealtimeTasks({ background: true }),
 					loadScheduledRuns({ background: true }),
-					loadLlmSchedulerStatus(),
+					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
 				const activeDetailTaskId = detailTaskIdRef.current;
@@ -1320,7 +1377,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 			if (needLlmRefresh) {
 				await Promise.all([
-					loadLlmSchedulerStatus(),
+					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
 			}
