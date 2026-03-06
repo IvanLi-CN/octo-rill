@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::HashMap,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -284,6 +285,7 @@ impl SubscriptionRunContext {
         message: impl Into<String>,
         event: SubscriptionEventRecord<'_>,
     ) -> Result<()> {
+        let counts_as_critical = subscription_event_counts_as_critical(event.severity);
         let message = message.into();
         let event_payload = merge_message_into_payload(event.payload, &message);
         self.logger
@@ -312,9 +314,24 @@ impl SubscriptionRunContext {
             },
         )
         .await?;
-        self.critical_events.fetch_add(1, AtomicOrdering::Relaxed);
+        if counts_as_critical {
+            self.critical_events.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         Ok(())
     }
+}
+
+fn subscription_event_counts_as_critical(severity: &str) -> bool {
+    severity == "error"
+}
+
+fn subscription_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(
+        SUBSCRIPTION_RETRY_BACKOFF_MS
+            .get(attempt.saturating_sub(1))
+            .copied()
+            .unwrap_or(2_000),
+    )
 }
 
 struct SubscriptionEventRecord<'a> {
@@ -661,6 +678,33 @@ async fn sync_starred_for_user(
     context: SubscriptionRunContext,
     user: EligibleUserRow,
 ) -> Result<Option<StarPhaseSuccess>> {
+    let state = context.state.clone();
+    sync_starred_for_user_with_fetch(
+        context,
+        user,
+        move |user_id| {
+            let state = state.clone();
+            async move { fetch_starred_snapshot(state.as_ref(), user_id).await }
+        },
+        |attempt| async move {
+            tokio::time::sleep(subscription_retry_delay(attempt)).await;
+        },
+    )
+    .await
+}
+
+async fn sync_starred_for_user_with_fetch<Fetch, FetchFut, Sleep, SleepFut>(
+    context: SubscriptionRunContext,
+    user: EligibleUserRow,
+    mut fetch: Fetch,
+    mut sleep: Sleep,
+) -> Result<Option<StarPhaseSuccess>>
+where
+    Fetch: FnMut(i64) -> FetchFut,
+    FetchFut: Future<Output = Result<Vec<StarredRepoSnapshot>, SyncRequestError>>,
+    Sleep: FnMut(usize) -> SleepFut,
+    SleepFut: Future<Output = ()>,
+{
     context
         .log(
             "info",
@@ -674,55 +718,92 @@ async fn sync_starred_for_user(
         )
         .await?;
 
-    match fetch_starred_snapshot(context.state.as_ref(), user.id).await {
-        Ok(repos) => {
-            replace_starred_repos(context.state.as_ref(), user.id, &repos).await?;
-            context
-                .log(
-                    "info",
-                    "star",
-                    "user_succeeded",
-                    format!("user #{} starred snapshot refreshed", user.id),
-                    json!({
-                        "user_id": user.id,
-                        "repo_count": repos.len(),
-                    }),
-                )
-                .await?;
-            Ok(Some(StarPhaseSuccess {
-                user_id: user.id,
-                last_active_at: user.last_active_at,
-                repos,
-            }))
-        }
-        Err(err) => {
-            context
-                .key_event(
+    for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
+        match fetch(user.id).await {
+            Ok(repos) => {
+                replace_starred_repos(context.state.as_ref(), user.id, &repos).await?;
+                context
+                    .log(
+                        "info",
+                        "star",
+                        "user_succeeded",
+                        format!("user #{} starred snapshot refreshed", user.id),
+                        json!({
+                            "user_id": user.id,
+                            "repo_count": repos.len(),
+                            "attempt": attempt,
+                        }),
+                    )
+                    .await?;
+                return Ok(Some(StarPhaseSuccess {
+                    user_id: user.id,
+                    last_active_at: user.last_active_at,
+                    repos,
+                }));
+            }
+            Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
+                context
+                    .key_event(
+                        format!("retryable star sync error for user #{}", user.id),
+                        SubscriptionEventRecord {
+                            stage: "star",
+                            event_type: err.reason_code,
+                            severity: "warning",
+                            recoverable: true,
+                            attempt,
+                            user_id: Some(user.id),
+                            repo_id: None,
+                            repo_full_name: None,
+                            payload: json!({
+                                "user_id": user.id,
+                                "reason_code": err.reason_code,
+                                "status": err.status,
+                                "error": err.message,
+                            }),
+                        },
+                    )
+                    .await?;
+                sleep(attempt).await;
+            }
+            Err(err) => {
+                let failure_message = if err.retryable && attempt > 1 {
+                    format!(
+                        "failed to refresh starred repositories for user #{} after {} attempts",
+                        user.id, attempt
+                    )
+                } else {
                     format!(
                         "failed to refresh starred repositories for user #{}",
                         user.id
-                    ),
-                    SubscriptionEventRecord {
-                        stage: "star",
-                        event_type: err.reason_code,
-                        severity: if err.retryable { "warning" } else { "error" },
-                        recoverable: err.retryable,
-                        attempt: 1,
-                        user_id: Some(user.id),
-                        repo_id: None,
-                        repo_full_name: None,
-                        payload: json!({
-                            "user_id": user.id,
-                            "reason_code": err.reason_code,
-                            "status": err.status,
-                            "error": err.message,
-                        }),
-                    },
-                )
-                .await?;
-            Ok(None)
+                    )
+                };
+                context
+                    .key_event(
+                        failure_message,
+                        SubscriptionEventRecord {
+                            stage: "star",
+                            event_type: err.reason_code,
+                            severity: "error",
+                            recoverable: false,
+                            attempt,
+                            user_id: Some(user.id),
+                            repo_id: None,
+                            repo_full_name: None,
+                            payload: json!({
+                                "user_id": user.id,
+                                "reason_code": err.reason_code,
+                                "status": err.status,
+                                "error": err.message,
+                            }),
+                        },
+                    )
+                    .await?;
+                return Ok(None);
+            }
         }
     }
+
+    unreachable!("star sync retry loop must return before exhausting attempts")
 }
 
 fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
@@ -915,11 +996,7 @@ async fn sync_releases_for_repo(
                             },
                         )
                         .await?;
-                    let delay_ms = SUBSCRIPTION_RETRY_BACKOFF_MS
-                        .get(attempt - 1)
-                        .copied()
-                        .unwrap_or(2_000);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(subscription_retry_delay(attempt)).await;
                 }
                 Err(err) => {
                     candidate_failures += 1;
@@ -1561,7 +1638,29 @@ pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNo
 
 #[cfg(test)]
 mod tests {
-    use super::{StarPhaseSuccess, aggregate_repos, cmp_last_active_desc};
+    use std::{
+        fs,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicTestOrdering},
+        },
+    };
+
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use url::Url;
+
+    use super::{
+        EligibleUserRow, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, cmp_last_active_desc,
+        subscription_event_counts_as_critical, sync_starred_for_user_with_fetch,
+    };
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        jobs,
+        state::{AppState, build_oauth_client},
+    };
 
     #[test]
     fn cmp_last_active_desc_places_recent_users_first() {
@@ -1580,7 +1679,7 @@ mod tests {
                 user_id: 2,
                 last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
                 repos: vec![
-                    super::StarredRepoSnapshot {
+                    StarredRepoSnapshot {
                         repo_id: 2,
                         full_name: "octo/beta".to_owned(),
                         owner_login: "octo".to_owned(),
@@ -1590,7 +1689,7 @@ mod tests {
                         stargazed_at: "2026-03-06T12:00:00Z".to_owned(),
                         is_private: false,
                     },
-                    super::StarredRepoSnapshot {
+                    StarredRepoSnapshot {
                         repo_id: 1,
                         full_name: "octo/alpha".to_owned(),
                         owner_login: "octo".to_owned(),
@@ -1605,7 +1704,7 @@ mod tests {
             StarPhaseSuccess {
                 user_id: 1,
                 last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
-                repos: vec![super::StarredRepoSnapshot {
+                repos: vec![StarredRepoSnapshot {
                     repo_id: 1,
                     full_name: "octo/alpha".to_owned(),
                     owner_login: "octo".to_owned(),
@@ -1624,5 +1723,274 @@ mod tests {
         assert_eq!(repos[0].related_users.len(), 2);
         assert_eq!(repos[0].related_users[0].user_id, 1);
         assert_eq!(repos[1].full_name, "octo/beta");
+    }
+
+    #[test]
+    fn subscription_event_counts_only_errors_as_critical() {
+        assert!(subscription_event_counts_as_critical("error"));
+        assert!(!subscription_event_counts_as_critical("warning"));
+        assert!(!subscription_event_counts_as_critical("info"));
+    }
+
+    #[tokio::test]
+    async fn sync_starred_for_user_retries_recoverable_errors_before_success() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 7).await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-star-retry-success").await;
+        let context = SubscriptionRunContext::new(state.as_ref(), "task-star-retry-success")
+            .await
+            .expect("build subscription context");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let repos = vec![StarredRepoSnapshot {
+            repo_id: 100,
+            full_name: "octo/alpha".to_owned(),
+            owner_login: "octo".to_owned(),
+            name: "alpha".to_owned(),
+            description: Some("alpha repo".to_owned()),
+            html_url: "https://github.com/octo/alpha".to_owned(),
+            stargazed_at: "2026-03-06T13:00:00Z".to_owned(),
+            is_private: false,
+        }];
+
+        let result = sync_starred_for_user_with_fetch(
+            context.clone(),
+            EligibleUserRow {
+                id: 7,
+                last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
+            },
+            {
+                let attempts = attempts.clone();
+                let repos = repos.clone();
+                move |_user_id| {
+                    let attempts = attempts.clone();
+                    let repos = repos.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                        if attempt < 3 {
+                            Err(SyncRequestError::retryable(
+                                "network_error",
+                                format!("temporary failure #{attempt}"),
+                                None,
+                            ))
+                        } else {
+                            Ok(repos)
+                        }
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("sync starred for user");
+
+        let success = result.expect("successful star sync");
+        assert_eq!(success.repos.len(), 1);
+        assert_eq!(attempts.load(AtomicTestOrdering::SeqCst), 3);
+
+        let critical_events = context.critical_events.load(AtomicTestOrdering::Relaxed);
+        assert_eq!(critical_events, 0);
+
+        let stored_repos =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(7_i64)
+                .fetch_one(&pool)
+                .await
+                .expect("count starred repos");
+        assert_eq!(stored_repos, 1);
+
+        let event_rows = sqlx::query_as::<_, (String, String, i64, i64)>(
+            r#"
+            SELECT severity, event_type, attempt, recoverable
+            FROM sync_subscription_events
+            WHERE task_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind("task-star-retry-success")
+        .fetch_all(&pool)
+        .await
+        .expect("load retry events");
+        assert_eq!(event_rows.len(), 2);
+        assert_eq!(
+            event_rows[0],
+            ("warning".to_owned(), "network_error".to_owned(), 1, 1)
+        );
+        assert_eq!(
+            event_rows[1],
+            ("warning".to_owned(), "network_error".to_owned(), 2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_starred_for_user_marks_exhausted_retry_as_critical_failure() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 8).await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-star-retry-failure").await;
+        let context = SubscriptionRunContext::new(state.as_ref(), "task-star-retry-failure")
+            .await
+            .expect("build subscription context");
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = sync_starred_for_user_with_fetch(
+            context.clone(),
+            EligibleUserRow {
+                id: 8,
+                last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
+            },
+            {
+                let attempts = attempts.clone();
+                move |_user_id| {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                        Err(SyncRequestError::retryable(
+                            "network_error",
+                            format!("temporary failure #{attempt}"),
+                            None,
+                        ))
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("sync starred for user");
+
+        assert!(result.is_none());
+        assert_eq!(attempts.load(AtomicTestOrdering::SeqCst), 3);
+        assert_eq!(
+            context.critical_events.load(AtomicTestOrdering::Relaxed),
+            1,
+            "exhausted retry should count as a critical failure"
+        );
+
+        let event_rows = sqlx::query_as::<_, (String, i64, i64)>(
+            r#"
+            SELECT severity, attempt, recoverable
+            FROM sync_subscription_events
+            WHERE task_id = ?
+            ORDER BY id ASC
+            "#,
+        )
+        .bind("task-star-retry-failure")
+        .fetch_all(&pool)
+        .await
+        .expect("load failure events");
+        assert_eq!(event_rows.len(), 3);
+        assert_eq!(event_rows[0], ("warning".to_owned(), 1, 1));
+        assert_eq!(event_rows[1], ("warning".to_owned(), 2, 1));
+        assert_eq!(event_rows[2], ("error".to_owned(), 3, 0));
+    }
+
+    async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
+        fs::create_dir_all(&state.config.task_log_dir).expect("create task log dir");
+        let log_path = state.config.task_log_dir.join(format!("{task_id}.ndjson"));
+        let now = "2026-03-06T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("test")
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(log_path.to_string_lossy().to_string())
+        .execute(&state.pool)
+        .await
+        .expect("seed subscription task");
+    }
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn setup_state(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-sync-tests"),
+            job_worker_concurrency: 4,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
+
+    async fn seed_user(pool: &SqlitePool, user_id: i64) {
+        let now = "2026-03-06T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(user_id)
+        .bind(30_215_105_i64 + user_id)
+        .bind(format!("user-{user_id}"))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed user");
     }
 }
