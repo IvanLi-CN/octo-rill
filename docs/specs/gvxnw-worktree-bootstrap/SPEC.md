@@ -61,7 +61,7 @@
 ### Core flows
 
 - 开发者在主工作区根目录安装 repo-local hooks 后，任意 linked worktree 在首次 checkout 触发 `post-checkout`，同步脚本自动读取资源清单并执行“缺失时复制”。
-- 同步脚本默认通过 Git 元数据定位主工作区根目录；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
+- 同步脚本默认优先读取共享 Git 配置中记录的主工作区根目录，并在标准布局下回退到 Git 元数据推导；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
 - hook 安装脚本在共享 `.git/hooks` 中注入固定 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行。
 
@@ -99,6 +99,10 @@
 - Given CI 在 macOS 与 Linux runner 上执行 smoke test  
   When 运行 worktree bootstrap 测试入口  
   Then 两个平台均通过，且测试过程不依赖当前开发机绝对路径。
+
+- Given 仓库通过 `git clone --separate-git-dir=<dir>` 初始化，且主工作区已安装 repo-local hooks  
+  When 再创建 linked worktree  
+  Then 新 worktree 仍会从主工作区复制缺失资源，且共享 hooks 不会把二进制或源目录固定到外置 Git 目录。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -140,7 +144,7 @@
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：开发者若未在主工作区执行一次根目录 `bun install`，hooks 不会自动安装。
-- 风险：非常规 Git 布局若未设置 override，默认源目录推导可能不符合预期。
+- 风险：若主工作区被手工移动后未重新安装 hooks，记录在共享 Git 配置中的主工作区根目录可能过期，需要重新执行 `bun install` 或显式设置 override。
 - 开放问题：无。
 - 假设：团队接受把 `.env.local` 作为推荐的 per-developer secrets 文件。
 
@@ -149,3 +153,4 @@
 - 2026-03-06：创建规格，冻结仓库级 worktree bootstrap 方案与验收口径。
 - 2026-03-06：完成 repo-local hook 安装入口、worktree bootstrap 脚本、smoke test 与 CI matrix 校验。
 - 2026-03-06：补充共享 hooks 的 `LEFTHOOK_BIN` 固定逻辑，避免全局 Lefthook 抢占。
+- 2026-03-06：补充共享 Git 配置里的主工作区根目录记录，并增加 `--separate-git-dir` smoke 覆盖。
