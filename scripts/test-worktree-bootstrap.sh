@@ -83,6 +83,7 @@ if [[ "$hook_path" != /* ]]; then
   hook_path="$fixture_repo/$hook_path"
 fi
 hook_body="$(cat "$hook_path")"
+assert_output_contains "$hook_body" "LEFTHOOK_BIN=\""
 assert_output_contains "$hook_body" "$fixture_repo"
 if [[ "$hook_body" == *"$worktree_default"* ]]; then
   echo "hook installation must stay pinned to main worktree" >&2
