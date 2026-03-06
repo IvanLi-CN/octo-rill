@@ -1,5 +1,15 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+type AdminJobsMockOptions = {
+	responseDelayMs?: number;
+	delayedPaths?: string[];
+	emitStreamEvents?: boolean;
+};
+
+function sleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -8,7 +18,10 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function installAdminJobsMocks(page: Page) {
+async function installAdminJobsMocks(
+	page: Page,
+	options: AdminJobsMockOptions = {},
+) {
 	const tasks = [
 		{
 			id: "task-failed-1",
@@ -128,10 +141,29 @@ async function installAdminJobsMocks(page: Page) {
 		updated_at: "2026-02-26T00:00:00Z",
 	}));
 
+	const delayedPathSet = new Set(options.delayedPaths ?? []);
+	const requestCounts = new Map<string, number>();
+	const emitStreamEvents = options.emitStreamEvents ?? true;
+
+	async function maybeDelay(pathname: string) {
+		const nextCount = (requestCounts.get(pathname) ?? 0) + 1;
+		requestCounts.set(pathname, nextCount);
+		if (
+			options.responseDelayMs &&
+			options.responseDelayMs > 0 &&
+			delayedPathSet.has(pathname) &&
+			nextCount > 1
+		) {
+			await sleep(options.responseDelayMs);
+		}
+	}
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
 		const { pathname } = url;
+
+		await maybeDelay(pathname);
 
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
@@ -177,6 +209,14 @@ async function installAdminJobsMocks(page: Page) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/events") {
+			if (!emitStreamEvents) {
+				return route.fulfill({
+					status: 200,
+					contentType: "text/event-stream",
+					body: "",
+				});
+			}
+
 			const call = llmCalls.find((item) => item.id === "llm-call-2");
 			if (call && call.status === "running") {
 				call.status = "succeeded";
@@ -549,4 +589,50 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+});
+
+test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/llm/calls"],
+		emitStreamEvents: true,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+});
+
+test("admin refresh keeps existing jobs and llm calls visible", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/realtime", "/api/admin/jobs/llm/calls"],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("任务列表更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+
+	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
+	await expect(page.getByText("LLM 调度更新中...")).toHaveCount(0);
 });
