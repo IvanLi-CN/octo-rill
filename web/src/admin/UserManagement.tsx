@@ -1,5 +1,4 @@
-import { ChevronDown } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	type AdminUserProfileResponse,
@@ -8,6 +7,17 @@ import {
 	apiGetAdminUserProfile,
 	apiPatchJson,
 } from "@/api";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogCancel,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -16,6 +26,21 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
+import {
+	Sheet,
+	SheetContent,
+	SheetDescription,
+	SheetHeader,
+	SheetTitle,
+} from "@/components/ui/sheet";
 
 type AdminRole = "all" | "admin" | "user";
 type AdminStatus = "all" | "enabled" | "disabled";
@@ -45,8 +70,18 @@ type AdminUsersListResponse = {
 	};
 };
 
+export type UserManagementStoryState = {
+	queryInput?: string;
+	query?: string;
+	role?: AdminRole;
+	status?: AdminStatus;
+	profileUserId?: number;
+	pendingAdminConfirmUserId?: number;
+};
+
 type UserManagementProps = {
 	currentUserId: number;
+	storyState?: UserManagementStoryState;
 };
 
 type PendingAdminConfirm = {
@@ -62,6 +97,16 @@ const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
 
 const PAGE_SIZE = 20;
 const DEFAULT_GUARD = { admin_total: 0, active_admin_total: 0 };
+const ROLE_OPTIONS: Array<{ value: AdminRole; label: string }> = [
+	{ value: "all", label: "角色：全部" },
+	{ value: "admin", label: "角色：管理员" },
+	{ value: "user", label: "角色：普通用户" },
+];
+const STATUS_OPTIONS: Array<{ value: AdminStatus; label: string }> = [
+	{ value: "all", label: "状态：全部" },
+	{ value: "enabled", label: "状态：启用" },
+	{ value: "disabled", label: "状态：禁用" },
+];
 
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
@@ -101,11 +146,28 @@ function toAdminUserErrorMessage(err: unknown) {
 	return err instanceof Error ? err.message : String(err);
 }
 
-export function UserManagement({ currentUserId }: UserManagementProps) {
-	const [queryInput, setQueryInput] = useState("");
-	const [query, setQuery] = useState("");
-	const [role, setRole] = useState<AdminRole>("all");
-	const [status, setStatus] = useState<AdminStatus>("all");
+function userRoleBadgeClass(isAdmin: boolean) {
+	return isAdmin
+		? "border-emerald-300 bg-emerald-100 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
+		: "bg-muted/70 text-foreground";
+}
+
+function userStatusBadgeClass(isDisabled: boolean) {
+	return isDisabled
+		? "border-red-300 bg-red-100 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100"
+		: "border-sky-300 bg-sky-100 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100";
+}
+
+export function UserManagement({
+	currentUserId,
+	storyState,
+}: UserManagementProps) {
+	const [queryInput, setQueryInput] = useState(storyState?.queryInput ?? "");
+	const [query, setQuery] = useState(storyState?.query ?? "");
+	const [role, setRole] = useState<AdminRole>(storyState?.role ?? "all");
+	const [status, setStatus] = useState<AdminStatus>(
+		storyState?.status ?? "all",
+	);
 	const [page, setPage] = useState(1);
 
 	const [loading, setLoading] = useState(false);
@@ -123,6 +185,9 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 	const [profileLoading, setProfileLoading] = useState(false);
 	const [profileError, setProfileError] = useState<string | null>(null);
 	const [profile, setProfile] = useState<AdminUserProfileResponse | null>(null);
+
+	const storyProfileInitializedRef = useRef(false);
+	const storyConfirmInitializedRef = useRef(false);
 
 	const totalPages = useMemo(
 		() => Math.max(1, Math.ceil(total / PAGE_SIZE)),
@@ -248,6 +313,29 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 		setProfileLoading(false);
 	}, []);
 
+	useEffect(() => {
+		if (storyProfileInitializedRef.current) return;
+		if (!storyState?.profileUserId || items.length === 0) return;
+		const target = items.find((user) => user.id === storyState.profileUserId);
+		if (!target) return;
+		storyProfileInitializedRef.current = true;
+		void onOpenProfile(target);
+	}, [items, onOpenProfile, storyState?.profileUserId]);
+
+	useEffect(() => {
+		if (storyConfirmInitializedRef.current) return;
+		if (!storyState?.pendingAdminConfirmUserId || items.length === 0) return;
+		const target = items.find(
+			(user) => user.id === storyState.pendingAdminConfirmUserId,
+		);
+		if (!target) return;
+		storyConfirmInitializedRef.current = true;
+		setPendingAdminConfirm({
+			user: target,
+			nextIsAdmin: !target.is_admin,
+		});
+	}, [items, storyState?.pendingAdminConfirmUserId]);
+
 	return (
 		<Card>
 			<CardHeader>
@@ -257,8 +345,8 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 				</CardDescription>
 			</CardHeader>
 			<CardContent className="space-y-4">
-				<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_160px_160px_auto]">
-					<input
+				<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px_180px_auto]">
+					<Input
 						type="text"
 						value={queryInput}
 						onChange={(e) => setQueryInput(e.target.value)}
@@ -266,38 +354,44 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 							if (e.key === "Enter") onApplyFilters();
 						}}
 						placeholder="搜索 login / name / email"
-						className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
+						aria-label="搜索 login、name 或 email"
 					/>
-					<div className="relative">
-						<select
-							value={role}
-							onChange={(e) => {
-								setRole(e.target.value as AdminRole);
-								setPage(1);
-							}}
-							className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
-						>
-							<option value="all">角色：全部</option>
-							<option value="admin">角色：管理员</option>
-							<option value="user">角色：普通用户</option>
-						</select>
-						<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
-					</div>
-					<div className="relative">
-						<select
-							value={status}
-							onChange={(e) => {
-								setStatus(e.target.value as AdminStatus);
-								setPage(1);
-							}}
-							className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
-						>
-							<option value="all">状态：全部</option>
-							<option value="enabled">状态：启用</option>
-							<option value="disabled">状态：禁用</option>
-						</select>
-						<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
-					</div>
+					<Select
+						value={role}
+						onValueChange={(value) => {
+							setRole(value as AdminRole);
+							setPage(1);
+						}}
+					>
+						<SelectTrigger className="w-full" aria-label="按角色筛选">
+							<SelectValue placeholder="角色：全部" />
+						</SelectTrigger>
+						<SelectContent>
+							{ROLE_OPTIONS.map((option) => (
+								<SelectItem key={option.value} value={option.value}>
+									{option.label}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
+					<Select
+						value={status}
+						onValueChange={(value) => {
+							setStatus(value as AdminStatus);
+							setPage(1);
+						}}
+					>
+						<SelectTrigger className="w-full" aria-label="按状态筛选">
+							<SelectValue placeholder="状态：全部" />
+						</SelectTrigger>
+						<SelectContent>
+							{STATUS_OPTIONS.map((option) => (
+								<SelectItem key={option.value} value={option.value}>
+									{option.label}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
 					<Button onClick={onApplyFilters} disabled={loading}>
 						筛选
 					</Button>
@@ -355,27 +449,24 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 											最后活动：{formatLocalHm(user.last_active_at)}
 										</p>
 										<div className="mt-1 flex flex-wrap gap-1">
-											<span className="bg-muted rounded px-2 py-0.5 font-mono text-[11px]">
+											<Badge
+												variant="outline"
+												className="font-mono text-[11px]"
+											>
 												UID:{user.id}
-											</span>
-											<span
-												className={
-													user.is_admin
-														? "rounded bg-emerald-100 px-2 py-0.5 text-[11px] text-emerald-800"
-														: "bg-muted rounded px-2 py-0.5 text-[11px]"
-												}
+											</Badge>
+											<Badge
+												variant="outline"
+												className={userRoleBadgeClass(user.is_admin)}
 											>
 												{user.is_admin ? "管理员" : "普通用户"}
-											</span>
-											<span
-												className={
-													user.is_disabled
-														? "rounded bg-red-100 px-2 py-0.5 text-[11px] text-red-800"
-														: "rounded bg-sky-100 px-2 py-0.5 text-[11px] text-sky-800"
-												}
+											</Badge>
+											<Badge
+												variant="outline"
+												className={userStatusBadgeClass(user.is_disabled)}
 											>
 												{user.is_disabled ? "已禁用" : "已启用"}
-											</span>
+											</Badge>
 										</div>
 										{guardHint ? (
 											<p className="text-muted-foreground mt-1 text-xs">
@@ -437,29 +528,33 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 				</div>
 			</CardContent>
 
-			{profileUser ? (
-				<div className="fixed inset-0 z-40 flex">
-					<button
-						type="button"
-						className="flex-1 bg-black/35"
-						aria-label="关闭用户详情"
-						onClick={onCloseProfile}
-					/>
-					<div className="bg-card relative h-full w-full max-w-md border-l p-5 shadow-2xl">
-						<h3 className="text-lg font-semibold tracking-tight">用户详情</h3>
-						<p className="text-muted-foreground mt-1 text-sm">
-							{profileUser.login}
-							{profileUser.id === currentUserId ? "（你）" : ""}
-						</p>
-
-						<div className="mt-4 space-y-3 text-sm">
+			<Sheet
+				open={Boolean(profileUser)}
+				onOpenChange={(open) => {
+					if (!open) onCloseProfile();
+				}}
+			>
+				<SheetContent
+					side="right"
+					className="w-full max-w-md gap-0 p-0 sm:max-w-md"
+				>
+					<SheetHeader className="px-5 pt-5">
+						<SheetTitle>用户详情</SheetTitle>
+						<SheetDescription>
+							{profileUser
+								? `${profileUser.login}${profileUser.id === currentUserId ? "（你）" : ""}`
+								: "用户详情加载中"}
+						</SheetDescription>
+					</SheetHeader>
+					<div className="space-y-4 px-5 pb-5">
+						<div className="space-y-3 text-sm">
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">
 									最后活动（本地时区）
 								</p>
 								<p className="mt-1 font-medium">
 									{formatLocalHm(
-										profile?.last_active_at ?? profileUser.last_active_at,
+										profile?.last_active_at ?? profileUser?.last_active_at,
 									)}
 								</p>
 							</div>
@@ -477,58 +572,56 @@ export function UserManagement({ currentUserId }: UserManagementProps) {
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">账号状态</p>
 								<p className="mt-1 font-medium">
-									{profileUser.is_disabled ? "已禁用" : "已启用"} ·{" "}
-									{profileUser.is_admin ? "管理员" : "普通用户"}
+									{profileUser?.is_disabled ? "已禁用" : "已启用"} ·{" "}
+									{profileUser?.is_admin ? "管理员" : "普通用户"}
 								</p>
 							</div>
 						</div>
 
 						{profileLoading ? (
-							<p className="text-muted-foreground mt-4 text-sm">
-								详情加载中...
-							</p>
+							<p className="text-muted-foreground text-sm">详情加载中...</p>
 						) : null}
 						{profileError ? (
-							<p className="text-destructive mt-4 text-sm">{profileError}</p>
+							<p className="text-destructive text-sm">{profileError}</p>
 						) : null}
 
-						<div className="mt-6 flex justify-end">
+						<div className="flex justify-end">
 							<Button variant="outline" onClick={onCloseProfile}>
 								关闭
 							</Button>
 						</div>
 					</div>
-				</div>
-			) : null}
+				</SheetContent>
+			</Sheet>
 
-			{pendingAdminConfirm ? (
-				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
-					<div className="bg-card w-full max-w-lg rounded-xl border p-5 shadow-2xl">
-						<h3 className="text-lg font-semibold tracking-tight">
-							确认管理员变更
-						</h3>
-						<p className="text-muted-foreground mt-2 text-sm leading-relaxed">
-							{pendingAdminConfirm.nextIsAdmin
-								? `确认将 ${pendingAdminConfirm.user.login} 设为管理员吗？`
-								: `确认撤销 ${pendingAdminConfirm.user.login} 的管理员权限吗？`}
-						</p>
-						<p className="text-muted-foreground mt-2 text-xs">
-							此操作属于高权限变更，需要二次确认后才会提交。
-						</p>
-						<div className="mt-5 flex items-center justify-end gap-2">
-							<Button
-								variant="outline"
-								onClick={() => setPendingAdminConfirm(null)}
-							>
-								取消
-							</Button>
-							<Button onClick={() => void onConfirmToggleAdmin()}>
-								确认更改
-							</Button>
-						</div>
-					</div>
-				</div>
-			) : null}
+			<AlertDialog
+				open={Boolean(pendingAdminConfirm)}
+				onOpenChange={(open) => {
+					if (!open) setPendingAdminConfirm(null);
+				}}
+			>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>确认管理员变更</AlertDialogTitle>
+						<AlertDialogDescription>
+							{pendingAdminConfirm
+								? pendingAdminConfirm.nextIsAdmin
+									? `确认将 ${pendingAdminConfirm.user.login} 设为管理员吗？`
+									: `确认撤销 ${pendingAdminConfirm.user.login} 的管理员权限吗？`
+								: "确认管理员权限变更"}
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<p className="text-muted-foreground text-xs">
+						此操作属于高权限变更，需要二次确认后才会提交。
+					</p>
+					<AlertDialogFooter>
+						<AlertDialogCancel>取消</AlertDialogCancel>
+						<AlertDialogAction onClick={() => void onConfirmToggleAdmin()}>
+							确认更改
+						</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
 		</Card>
 	);
 }

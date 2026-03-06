@@ -1,5 +1,6 @@
 import { CalendarDays } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import {
 	Card,
 	CardContent,
@@ -49,15 +50,17 @@ export function BriefListCard(props: {
 						{list.map((b) => {
 							const active = selectedDate === b.date;
 							return (
-								<button
+								<Button
 									key={b.date}
 									type="button"
+									variant={active ? "outline" : "ghost"}
+									size="sm"
 									onClick={() => onSelectDate(b.date)}
 									className={cn(
-										"flex w-full items-center justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs transition-colors hover:bg-background",
+										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none",
 										active
-											? "border-primary/40 bg-background"
-											: "border-transparent bg-background/40",
+											? "border-primary/40 bg-background hover:bg-background"
+											: "border-transparent bg-background/40 hover:bg-background",
 									)}
 								>
 									<span className={active ? "text-foreground" : ""}>
@@ -66,7 +69,7 @@ export function BriefListCard(props: {
 									<span className="text-muted-foreground truncate text-[11px]">
 										{formatIsoShort(b.created_at)}
 									</span>
-								</button>
+								</Button>
 							);
 						})}
 					</div>

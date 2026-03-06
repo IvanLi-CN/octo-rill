@@ -1,4 +1,6 @@
 import type { Preview } from "@storybook/react-vite";
+import { createElement } from "react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import "../src/index.css";
 
 const STORYBOOK_HEALTH_VERSION = "0.1.0";
@@ -46,7 +48,7 @@ const preview: Preview = {
 				document.body.style.backgroundImage = "none";
 				document.body.style.backgroundColor = "#f7f4ed";
 			}
-			return Story();
+			return createElement(TooltipProvider, null, Story());
 		},
 	],
 	parameters: {
