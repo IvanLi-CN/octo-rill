@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
@@ -1682,7 +1682,7 @@ pub async fn admin_download_realtime_task_log(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "task log not found"))?;
 
-    let body = tokio::fs::read(&log_file_path).await.map_err(|err| {
+    let file = tokio::fs::File::open(&log_file_path).await.map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             ApiError::new(StatusCode::NOT_FOUND, "not_found", "task log not found")
         } else {
@@ -1690,20 +1690,35 @@ pub async fn admin_download_realtime_task_log(
         }
     })?;
 
-    let filename = format!("{}.ndjson", task_id);
-    let headers = [
-        (
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        ),
-        (
-            header::CONTENT_DISPOSITION,
-            HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename))
-                .map_err(ApiError::internal)?,
-        ),
-    ];
+    let stream = async_stream::stream! {
+        let mut file = file;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..read])),
+                Err(err) => {
+                    yield Err::<Bytes, std::io::Error>(err);
+                    break;
+                }
+            }
+        }
+    };
 
-    Ok((headers, Body::from(body)).into_response())
+    let filename = format!("{}.ndjson", task_id);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(r#"attachment; filename="{}""#, filename))
+            .map_err(ApiError::internal)?,
+    );
+
+    Ok(response)
 }
 
 #[derive(Debug, Serialize)]
@@ -8195,6 +8210,43 @@ mod tests {
         let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "partial");
         assert_eq!(diagnostics.business_outcome.label, "已取消");
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_warning_events_do_not_force_partial_outcome() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
+            Some(
+                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":8,"failed_repos":0,"candidate_failures":2},"releases_written":42,"critical_events":0}"#,
+            ),
+            None,
+        );
+        let subscription_events = vec![AdminSyncSubscriptionEventItem {
+            id: 1,
+            stage: "release".to_owned(),
+            event_type: "rate_limited".to_owned(),
+            severity: "warning".to_owned(),
+            recoverable: true,
+            attempt: 1,
+            user_id: Some(7),
+            repo_id: Some(9),
+            repo_full_name: Some("octo/alpha".to_owned()),
+            message: Some("retryable release sync error for octo/alpha with user #7".to_owned()),
+            created_at: "2026-03-06T14:30:01Z".to_owned(),
+        }];
+
+        let diagnostics =
+            build_task_diagnostics(&task, &[], &subscription_events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "ok");
+        assert_eq!(diagnostics.business_outcome.label, "业务成功");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.critical_events, 0);
+        assert_eq!(sync_diag.recent_events.len(), 1);
+        assert_eq!(sync_diag.recent_events[0].severity, "warning");
     }
 
     #[test]
