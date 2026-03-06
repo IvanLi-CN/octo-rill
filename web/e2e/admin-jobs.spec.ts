@@ -694,8 +694,8 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 			{
 				pathname: "/api/admin/jobs/llm/calls",
 				search: "status=all",
-				afterCount: 1,
-				times: 1,
+				afterCount: 2,
+				times: 2,
 				delayMs: 1200,
 			},
 			{
@@ -734,8 +734,17 @@ test("admin keeps blocking loader before first realtime load completes", async (
 			{
 				pathname: "/api/admin/jobs/realtime",
 				search: "exclude_task_type=brief.daily_slot",
-				times: 2,
+				times: 1,
 				delayMs: 1200,
+			},
+		],
+		failureRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "exclude_task_type=brief.daily_slot",
+				afterCount: 1,
+				times: 1,
+				message: "ignored background refresh failure",
 			},
 		],
 		emitStreamEvents: true,
@@ -747,6 +756,9 @@ test("admin keeps blocking loader before first realtime load completes", async (
 	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
 	await expect(page.getByText("暂无任务。")).toHaveCount(0);
 	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(
+		page.getByText("ignored background refresh failure"),
+	).toHaveCount(0);
 });
 
 test("admin ignores stale llm refresh errors after filter change", async ({
