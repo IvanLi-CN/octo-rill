@@ -865,17 +865,31 @@ type JobManagementProps = {
 	currentUserId: number;
 };
 
+type LoadOptions = {
+	background?: boolean;
+};
+
+type ListLoadPhase = "idle" | "initial" | "refreshing";
+
+function resolveListLoadPhase(
+	hasLoadedOnce: boolean,
+	options?: LoadOptions,
+): ListLoadPhase {
+	return !hasLoadedOnce && !options?.background ? "initial" : "refreshing";
+}
+
 export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [tab, setTab] = useState<"realtime" | "scheduled" | "llm">("realtime");
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
+	const [overviewLoading, setOverviewLoading] = useState(false);
 
 	const [statusFilter, setStatusFilter] = useState<RealtimeStatusFilter>("all");
 	const [tasks, setTasks] = useState<AdminRealtimeTaskItem[]>([]);
 	const [taskTotal, setTaskTotal] = useState(0);
 	const [taskPage, setTaskPage] = useState(1);
-	const [tasksLoading, setTasksLoading] = useState(false);
+	const [tasksLoadPhase, setTasksLoadPhase] = useState<ListLoadPhase>("idle");
 	const [taskActionBusyId, setTaskActionBusyId] = useState<string | null>(null);
 
 	const [scheduledRunStatusFilter, setScheduledRunStatusFilter] =
@@ -885,10 +899,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	);
 	const [scheduledRunTotal, setScheduledRunTotal] = useState(0);
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
-	const [scheduledRunsLoading, setScheduledRunsLoading] = useState(false);
+	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
+	const [llmStatusLoading, setLlmStatusLoading] = useState(false);
 	const [llmStatusFilter, setLlmStatusFilter] =
 		useState<LlmStatusFilter>("all");
 	const [llmSourceFilter, setLlmSourceFilter] = useState("");
@@ -898,7 +914,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [llmCalls, setLlmCalls] = useState<AdminLlmCallItem[]>([]);
 	const [llmCallTotal, setLlmCallTotal] = useState(0);
 	const [llmCallPage, setLlmCallPage] = useState(1);
-	const [llmCallsLoading, setLlmCallsLoading] = useState(false);
+	const [llmCallsLoadPhase, setLlmCallsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 	const [llmDetail, setLlmDetail] = useState<AdminLlmCallDetailResponse | null>(
 		null,
 	);
@@ -921,6 +938,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [error, setError] = useState<string | null>(null);
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 
+	const tasksLoadedOnceRef = useRef(false);
+	const scheduledRunsLoadedOnceRef = useRef(false);
+	const llmCallsLoadedOnceRef = useRef(false);
 	const detailTaskIdRef = useRef<string | null>(null);
 	const llmDetailIdRef = useRef<string | null>(null);
 	const streamRefreshTimerRef = useRef<number | null>(null);
@@ -966,6 +986,20 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const detailBusinessOutcome =
 		activeTaskDetail?.diagnostics?.business_outcome ?? null;
 	const detailEventMeta = activeTaskDetail?.event_meta ?? null;
+	const tasksInitialLoading = tasksLoadPhase === "initial";
+	const tasksRefreshing = tasksLoadPhase === "refreshing";
+	const scheduledRunsInitialLoading = scheduledRunsLoadPhase === "initial";
+	const scheduledRunsRefreshing = scheduledRunsLoadPhase === "refreshing";
+	const llmCallsInitialLoading = llmCallsLoadPhase === "initial";
+	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
+	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
+	const llmRefreshing = llmStatusRefreshing || llmCallsRefreshing;
+	const isRefreshingData =
+		overviewLoading ||
+		tasksLoadPhase !== "idle" ||
+		scheduledRunsLoadPhase !== "idle" ||
+		llmStatusLoading ||
+		llmCallsLoadPhase !== "idle";
 
 	useEffect(() => {
 		detailTaskIdRef.current = activeTaskDetail?.task.id ?? null;
@@ -1012,112 +1046,143 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	}, []);
 
 	const loadOverview = useCallback(async () => {
-		const res = await apiGetAdminJobsOverview();
-		setOverview(res);
+		setOverviewLoading(true);
+		try {
+			const res = await apiGetAdminJobsOverview();
+			setOverview(res);
+		} finally {
+			setOverviewLoading(false);
+		}
 	}, []);
 
-	const loadRealtimeTasks = useCallback(async () => {
-		setTasksLoading(true);
-		try {
-			const params = new URLSearchParams();
-			params.set("status", statusFilter);
-			params.set("exclude_task_type", SCHEDULED_TASK_TYPE);
-			params.set("page", String(taskPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			const res = await apiGetAdminRealtimeTasks(params);
-			const realtimeOnlyItems = res.items.filter(
-				(task) => task.task_type !== SCHEDULED_TASK_TYPE,
+	const loadRealtimeTasks = useCallback(
+		async (options?: LoadOptions) => {
+			setTasksLoadPhase(
+				resolveListLoadPhase(tasksLoadedOnceRef.current, options),
 			);
-			// Fallback for older backend versions that ignore exclude_task_type.
-			const realtimeTotal =
-				realtimeOnlyItems.length === res.items.length
-					? res.total
-					: realtimeOnlyItems.length;
-			setTasks(realtimeOnlyItems);
-			setTaskTotal(realtimeTotal);
-		} finally {
-			setTasksLoading(false);
-		}
-	}, [statusFilter, taskPage]);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", statusFilter);
+				params.set("exclude_task_type", SCHEDULED_TASK_TYPE);
+				params.set("page", String(taskPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				const realtimeOnlyItems = res.items.filter(
+					(task) => task.task_type !== SCHEDULED_TASK_TYPE,
+				);
+				// Fallback for older backend versions that ignore exclude_task_type.
+				const realtimeTotal =
+					realtimeOnlyItems.length === res.items.length
+						? res.total
+						: realtimeOnlyItems.length;
+				setTasks(realtimeOnlyItems);
+				setTaskTotal(realtimeTotal);
+				tasksLoadedOnceRef.current = true;
+			} finally {
+				setTasksLoadPhase("idle");
+			}
+		},
+		[statusFilter, taskPage],
+	);
 
-	const loadScheduledRuns = useCallback(async () => {
-		setScheduledRunsLoading(true);
-		try {
-			const params = new URLSearchParams();
-			params.set("status", scheduledRunStatusFilter);
-			params.set("task_type", SCHEDULED_TASK_TYPE);
-			params.set("page", String(scheduledRunPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			const res = await apiGetAdminRealtimeTasks(params);
-			setScheduledRuns(res.items);
-			setScheduledRunTotal(res.total);
-		} finally {
-			setScheduledRunsLoading(false);
-		}
-	}, [scheduledRunPage, scheduledRunStatusFilter]);
+	const loadScheduledRuns = useCallback(
+		async (options?: LoadOptions) => {
+			setScheduledRunsLoadPhase(
+				resolveListLoadPhase(scheduledRunsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", scheduledRunStatusFilter);
+				params.set("task_type", SCHEDULED_TASK_TYPE);
+				params.set("page", String(scheduledRunPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				setScheduledRuns(res.items);
+				setScheduledRunTotal(res.total);
+				scheduledRunsLoadedOnceRef.current = true;
+			} finally {
+				setScheduledRunsLoadPhase("idle");
+			}
+		},
+		[scheduledRunPage, scheduledRunStatusFilter],
+	);
 
 	const loadLlmSchedulerStatus = useCallback(async () => {
-		const res = await apiGetAdminLlmSchedulerStatus();
-		setLlmStatus(res);
+		setLlmStatusLoading(true);
+		try {
+			const res = await apiGetAdminLlmSchedulerStatus();
+			setLlmStatus(res);
+		} finally {
+			setLlmStatusLoading(false);
+		}
 	}, []);
 
-	const loadLlmCalls = useCallback(async () => {
-		setLlmCallsLoading(true);
-		try {
-			const params = new URLSearchParams();
-			params.set("status", llmStatusFilter);
-			params.set("page", String(llmCallPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			if (llmSourceFilter.trim()) {
-				params.set("source", llmSourceFilter.trim());
+	const loadLlmCalls = useCallback(
+		async (options?: LoadOptions) => {
+			setLlmCallsLoadPhase(
+				resolveListLoadPhase(llmCallsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", llmStatusFilter);
+				params.set("page", String(llmCallPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				if (llmSourceFilter.trim()) {
+					params.set("source", llmSourceFilter.trim());
+				}
+				const requestedBy = Number(llmRequestedByFilter.trim());
+				if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
+					params.set("requested_by", String(requestedBy));
+				}
+				const startedFromUtc = localInputToUtc(llmStartedFromFilter);
+				if (startedFromUtc) {
+					params.set("started_from", startedFromUtc);
+				}
+				const startedToUtc = localInputToUtc(llmStartedToFilter);
+				if (startedToUtc) {
+					params.set("started_to", startedToUtc);
+				}
+				const res = await apiGetAdminLlmCalls(params);
+				setLlmCalls(res.items);
+				setLlmCallTotal(res.total);
+				llmCallsLoadedOnceRef.current = true;
+			} finally {
+				setLlmCallsLoadPhase("idle");
 			}
-			const requestedBy = Number(llmRequestedByFilter.trim());
-			if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
-				params.set("requested_by", String(requestedBy));
-			}
-			const startedFromUtc = localInputToUtc(llmStartedFromFilter);
-			if (startedFromUtc) {
-				params.set("started_from", startedFromUtc);
-			}
-			const startedToUtc = localInputToUtc(llmStartedToFilter);
-			if (startedToUtc) {
-				params.set("started_to", startedToUtc);
-			}
-			const res = await apiGetAdminLlmCalls(params);
-			setLlmCalls(res.items);
-			setLlmCallTotal(res.total);
-		} finally {
-			setLlmCallsLoading(false);
-		}
-	}, [
-		llmStatusFilter,
-		llmCallPage,
-		llmSourceFilter,
-		llmRequestedByFilter,
-		llmStartedFromFilter,
-		llmStartedToFilter,
-	]);
+		},
+		[
+			llmStatusFilter,
+			llmCallPage,
+			llmSourceFilter,
+			llmRequestedByFilter,
+			llmStartedFromFilter,
+			llmStartedToFilter,
+		],
+	);
 
-	const loadAll = useCallback(async () => {
-		setError(null);
-		try {
-			await Promise.all([
-				loadOverview(),
-				loadRealtimeTasks(),
-				loadScheduledRuns(),
-				loadLlmSchedulerStatus(),
-				loadLlmCalls(),
-			]);
-		} catch (err) {
-			setError(normalizeErrorMessage(err));
-		}
-	}, [
-		loadOverview,
-		loadRealtimeTasks,
-		loadScheduledRuns,
-		loadLlmSchedulerStatus,
-		loadLlmCalls,
-	]);
+	const loadAll = useCallback(
+		async (options?: LoadOptions) => {
+			setError(null);
+			try {
+				await Promise.all([
+					loadOverview(),
+					loadRealtimeTasks(options),
+					loadScheduledRuns(options),
+					loadLlmSchedulerStatus(),
+					loadLlmCalls(options),
+				]);
+			} catch (err) {
+				setError(normalizeErrorMessage(err));
+			}
+		},
+		[
+			loadOverview,
+			loadRealtimeTasks,
+			loadScheduledRuns,
+			loadLlmSchedulerStatus,
+			loadLlmCalls,
+		],
+	);
 
 	const refreshTaskDetail = useCallback(async (taskId: string) => {
 		const detail = await apiGetAdminRealtimeTaskDetail(taskId);
@@ -1169,10 +1234,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			if (needFullRefresh) {
 				await Promise.all([
 					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
+					loadRealtimeTasks({ background: true }),
+					loadScheduledRuns({ background: true }),
 					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
+					loadLlmCalls({ background: true }),
 				]);
 				const activeDetailTaskId = detailTaskIdRef.current;
 				if (activeDetailTaskId) {
@@ -1186,7 +1251,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			}
 
 			if (needLlmRefresh) {
-				await Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]);
+				await Promise.all([
+					loadLlmSchedulerStatus(),
+					loadLlmCalls({ background: true }),
+				]);
 			}
 
 			if (pendingDetailTaskId) {
@@ -1247,8 +1315,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	);
 
 	useEffect(() => {
-		void loadAll();
-	}, [loadAll]);
+		setError(null);
+		void loadOverview().catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadOverview]);
 
 	useEffect(() => {
 		setError(null);
@@ -1542,26 +1613,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiRetryAdminRealtimeTask(taskId);
-				await Promise.all([
-					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
-					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
-				]);
+				await loadAll({ background: true });
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[
-			loadOverview,
-			loadRealtimeTasks,
-			loadScheduledRuns,
-			loadLlmSchedulerStatus,
-			loadLlmCalls,
-		],
+		[loadAll],
 	);
 
 	const onCancelTask = useCallback(
@@ -1570,26 +1629,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiCancelAdminRealtimeTask(taskId);
-				await Promise.all([
-					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
-					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
-				]);
+				await loadAll({ background: true });
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[
-			loadOverview,
-			loadRealtimeTasks,
-			loadScheduledRuns,
-			loadLlmSchedulerStatus,
-			loadLlmCalls,
-		],
+		[loadAll],
 	);
 
 	return (
@@ -1652,8 +1699,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				<Button
 					variant="secondary"
 					size="sm"
-					disabled={tasksLoading || scheduledRunsLoading || llmCallsLoading}
-					onClick={() => void loadAll()}
+					disabled={isRefreshingData}
+					onClick={() => void loadAll({ background: true })}
 				>
 					刷新
 				</Button>
@@ -1734,97 +1781,109 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						</div>
 
 						<div className="space-y-2">
-							{tasksLoading ? (
+							{tasksInitialLoading ? (
 								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
 									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
 									正在加载任务...
 								</p>
-							) : tasks.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无任务。</p>
 							) : (
-								tasks.map((task) => {
-									const busy = taskActionBusyId === task.id;
-									const tone = taskStatusTone(task.status);
-									return (
-										<div
-											key={task.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
-										>
-											<div className="min-w-0">
-												<div className="flex flex-wrap items-center gap-2">
-													<p className="font-medium text-sm">
-														{taskTypeLabel(task.task_type)}
-													</p>
-													<span
-														className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
-													>
-														<span
-															className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
-														/>
-														{taskStatusLabel(task.status)}
-													</span>
-													{task.cancel_requested ? (
-														<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-															已请求取消
-														</span>
-													) : null}
+								<>
+									{tasksRefreshing ? (
+										<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+											<span className="size-2 rounded-full bg-amber-500/80" />
+											任务列表更新中...
+										</p>
+									) : null}
+									{tasks.length === 0 ? (
+										<p className="text-muted-foreground text-sm">暂无任务。</p>
+									) : (
+										tasks.map((task) => {
+											const busy = taskActionBusyId === task.id;
+											const tone = taskStatusTone(task.status);
+											return (
+												<div
+													key={task.id}
+													className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+												>
+													<div className="min-w-0">
+														<div className="flex flex-wrap items-center gap-2">
+															<p className="font-medium text-sm">
+																{taskTypeLabel(task.task_type)}
+															</p>
+															<span
+																className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
+															>
+																<span
+																	className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+																/>
+																{taskStatusLabel(task.status)}
+															</span>
+															{task.cancel_requested ? (
+																<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+																	已请求取消
+																</span>
+															) : null}
+														</div>
+														<p className="text-muted-foreground mt-1 text-xs">
+															类型：
+															<span className="font-mono">
+																{task.task_type}
+															</span>
+														</p>
+														<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+															ID: {task.id}
+														</p>
+														<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																创建 {formatLocalHm(task.created_at)}
+															</span>
+															<span className="bg-muted/60 rounded px-2 py-0.5">
+																完成 {formatLocalHm(task.finished_at)}
+															</span>
+														</div>
+														{task.error_message ? (
+															<p className="text-destructive mt-1 text-xs font-medium">
+																失败原因：{task.error_message}
+															</p>
+														) : null}
+													</div>
+													<div className="flex flex-wrap gap-2">
+														<Button
+															variant="outline"
+															disabled={detailLoading}
+															onClick={() => void onOpenTaskDetail(task.id)}
+														>
+															详情
+														</Button>
+														<Button
+															variant="outline"
+															disabled={
+																busy ||
+																task.status === "queued" ||
+																task.status === "running"
+															}
+															onClick={() => void onRetryTask(task.id)}
+														>
+															重试
+														</Button>
+														<Button
+															variant="destructive"
+															disabled={
+																busy ||
+																task.status === "succeeded" ||
+																task.status === "failed" ||
+																task.status === "canceled"
+															}
+															onClick={() => void onCancelTask(task.id)}
+														>
+															取消
+														</Button>
+													</div>
 												</div>
-												<p className="text-muted-foreground mt-1 text-xs">
-													类型：
-													<span className="font-mono">{task.task_type}</span>
-												</p>
-												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-													ID: {task.id}
-												</p>
-												<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-													<span className="bg-muted/60 rounded px-2 py-0.5">
-														创建 {formatLocalHm(task.created_at)}
-													</span>
-													<span className="bg-muted/60 rounded px-2 py-0.5">
-														完成 {formatLocalHm(task.finished_at)}
-													</span>
-												</div>
-												{task.error_message ? (
-													<p className="text-destructive mt-1 text-xs font-medium">
-														失败原因：{task.error_message}
-													</p>
-												) : null}
-											</div>
-											<div className="flex flex-wrap gap-2">
-												<Button
-													variant="outline"
-													disabled={detailLoading}
-													onClick={() => void onOpenTaskDetail(task.id)}
-												>
-													详情
-												</Button>
-												<Button
-													variant="outline"
-													disabled={
-														busy ||
-														task.status === "queued" ||
-														task.status === "running"
-													}
-													onClick={() => void onRetryTask(task.id)}
-												>
-													重试
-												</Button>
-												<Button
-													variant="destructive"
-													disabled={
-														busy ||
-														task.status === "succeeded" ||
-														task.status === "failed" ||
-														task.status === "canceled"
-													}
-													onClick={() => void onCancelTask(task.id)}
-												>
-													取消
-												</Button>
-											</div>
-										</div>
-									);
-								})
+											);
+										})
+									)}
+								</>
 							)}
 						</div>
 
@@ -1836,7 +1895,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								<Button
 									variant="outline"
 									size="sm"
-									disabled={taskPage <= 1 || tasksLoading}
+									disabled={taskPage <= 1 || tasksLoadPhase !== "idle"}
 									onClick={() => setTaskPage((prev) => Math.max(1, prev - 1))}
 								>
 									上一页
@@ -1844,7 +1903,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								<Button
 									variant="outline"
 									size="sm"
-									disabled={taskPage >= taskTotalPages || tasksLoading}
+									disabled={
+										taskPage >= taskTotalPages || tasksLoadPhase !== "idle"
+									}
 									onClick={() =>
 										setTaskPage((prev) => Math.min(taskTotalPages, prev + 1))
 									}
@@ -1891,99 +1952,111 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								共 {formatCount(scheduledRunTotal)} 条
 							</p>
 							<div className="space-y-2">
-								{scheduledRunsLoading ? (
+								{scheduledRunsInitialLoading ? (
 									<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
 										<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
 										正在加载运行记录...
 									</p>
-								) : scheduledRuns.length === 0 ? (
-									<p className="text-muted-foreground text-sm">
-										暂无运行记录。
-									</p>
 								) : (
-									scheduledRuns.map((task) => {
-										const busy = taskActionBusyId === task.id;
-										const tone = taskStatusTone(task.status);
-										return (
-											<div
-												key={task.id}
-												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
-											>
-												<div className="min-w-0">
-													<div className="flex flex-wrap items-center gap-2">
-														<p className="font-medium text-sm">
-															{taskTypeLabel(task.task_type)}
-														</p>
-														<span
-															className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
-														>
-															<span
-																className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
-															/>
-															{taskStatusLabel(task.status)}
-														</span>
-														{task.cancel_requested ? (
-															<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-																已请求取消
-															</span>
-														) : null}
+									<>
+										{scheduledRunsRefreshing ? (
+											<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+												<span className="size-2 rounded-full bg-amber-500/80" />
+												运行记录更新中...
+											</p>
+										) : null}
+										{scheduledRuns.length === 0 ? (
+											<p className="text-muted-foreground text-sm">
+												暂无运行记录。
+											</p>
+										) : (
+											scheduledRuns.map((task) => {
+												const busy = taskActionBusyId === task.id;
+												const tone = taskStatusTone(task.status);
+												return (
+													<div
+														key={task.id}
+														className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+													>
+														<div className="min-w-0">
+															<div className="flex flex-wrap items-center gap-2">
+																<p className="font-medium text-sm">
+																	{taskTypeLabel(task.task_type)}
+																</p>
+																<span
+																	className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
+																>
+																	<span
+																		className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+																	/>
+																	{taskStatusLabel(task.status)}
+																</span>
+																{task.cancel_requested ? (
+																	<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
+																		已请求取消
+																	</span>
+																) : null}
+															</div>
+															<p className="text-muted-foreground mt-1 text-xs">
+																类型：
+																<span className="font-mono">
+																	{task.task_type}
+																</span>
+															</p>
+															<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+																ID: {task.id}
+															</p>
+															<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+																<span className="bg-muted/60 rounded px-2 py-0.5">
+																	创建 {formatLocalHm(task.created_at)}
+																</span>
+																<span className="bg-muted/60 rounded px-2 py-0.5">
+																	完成 {formatLocalHm(task.finished_at)}
+																</span>
+															</div>
+															{task.error_message ? (
+																<p className="text-destructive mt-1 text-xs font-medium">
+																	失败原因：{task.error_message}
+																</p>
+															) : null}
+														</div>
+														<div className="flex flex-wrap gap-2">
+															<Button
+																variant="outline"
+																disabled={detailLoading}
+																onClick={() => void onOpenTaskDetail(task.id)}
+															>
+																详情
+															</Button>
+															<Button
+																variant="outline"
+																disabled={
+																	busy ||
+																	task.status === "queued" ||
+																	task.status === "running"
+																}
+																onClick={() => void onRetryTask(task.id)}
+															>
+																重试
+															</Button>
+															<Button
+																variant="destructive"
+																disabled={
+																	busy ||
+																	task.status === "succeeded" ||
+																	task.status === "failed" ||
+																	task.status === "canceled"
+																}
+																onClick={() => void onCancelTask(task.id)}
+															>
+																取消
+															</Button>
+														</div>
 													</div>
-													<p className="text-muted-foreground mt-1 text-xs">
-														类型：
-														<span className="font-mono">{task.task_type}</span>
-													</p>
-													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-														ID: {task.id}
-													</p>
-													<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															创建 {formatLocalHm(task.created_at)}
-														</span>
-														<span className="bg-muted/60 rounded px-2 py-0.5">
-															完成 {formatLocalHm(task.finished_at)}
-														</span>
-													</div>
-													{task.error_message ? (
-														<p className="text-destructive mt-1 text-xs font-medium">
-															失败原因：{task.error_message}
-														</p>
-													) : null}
-												</div>
-												<div className="flex flex-wrap gap-2">
-													<Button
-														variant="outline"
-														disabled={detailLoading}
-														onClick={() => void onOpenTaskDetail(task.id)}
-													>
-														详情
-													</Button>
-													<Button
-														variant="outline"
-														disabled={
-															busy ||
-															task.status === "queued" ||
-															task.status === "running"
-														}
-														onClick={() => void onRetryTask(task.id)}
-													>
-														重试
-													</Button>
-													<Button
-														variant="destructive"
-														disabled={
-															busy ||
-															task.status === "succeeded" ||
-															task.status === "failed" ||
-															task.status === "canceled"
-														}
-														onClick={() => void onCancelTask(task.id)}
-													>
-														取消
-													</Button>
-												</div>
-											</div>
-										);
-									})
+												);
+											})
+										)}
+									</>
 								)}
 							</div>
 							<div className="flex items-center justify-between">
@@ -1994,7 +2067,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									<Button
 										variant="outline"
 										size="sm"
-										disabled={scheduledRunPage <= 1 || scheduledRunsLoading}
+										disabled={
+											scheduledRunPage <= 1 || scheduledRunsLoadPhase !== "idle"
+										}
 										onClick={() =>
 											setScheduledRunPage((prev) => Math.max(1, prev - 1))
 										}
@@ -2006,7 +2081,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										size="sm"
 										disabled={
 											scheduledRunPage >= scheduledRunTotalPages ||
-											scheduledRunsLoading
+											scheduledRunsLoadPhase !== "idle"
 										}
 										onClick={() =>
 											setScheduledRunPage((prev) =>
@@ -2132,7 +2207,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						</p>
 
 						<div className="space-y-2">
-							{llmCallsLoading ? (
+							{llmRefreshing ? (
+								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+									<span className="size-2 rounded-full bg-amber-500/80" />
+									LLM 调度更新中...
+								</p>
+							) : null}
+							{llmCallsInitialLoading ? (
 								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
 									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
 									正在加载调用记录...
@@ -2203,7 +2284,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								<Button
 									variant="outline"
 									size="sm"
-									disabled={llmCallPage <= 1 || llmCallsLoading}
+									disabled={llmCallPage <= 1 || llmCallsLoadPhase !== "idle"}
 									onClick={() =>
 										setLlmCallPage((prev) => Math.max(1, prev - 1))
 									}
@@ -2213,7 +2294,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								<Button
 									variant="outline"
 									size="sm"
-									disabled={llmCallPage >= llmCallTotalPages || llmCallsLoading}
+									disabled={
+										llmCallPage >= llmCallTotalPages ||
+										llmCallsLoadPhase !== "idle"
+									}
 									onClick={() =>
 										setLlmCallPage((prev) =>
 											Math.min(llmCallTotalPages, prev + 1),
