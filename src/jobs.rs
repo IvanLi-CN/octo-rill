@@ -931,11 +931,23 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         SELECT id
         FROM job_tasks
         WHERE status = ?
+          AND (
+            task_type != ?
+            OR NOT EXISTS (
+              SELECT 1
+              FROM job_tasks running
+              WHERE running.task_type = ?
+                AND running.status = ?
+            )
+          )
         ORDER BY created_at ASC
         LIMIT 1
         "#,
     )
     .bind(STATUS_QUEUED)
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(STATUS_RUNNING)
     .fetch_optional(&mut *tx)
     .await
     .context("select queued task")?;
@@ -1421,11 +1433,21 @@ fn is_terminal_status(status: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::{net::SocketAddr, sync::Arc};
+
     use super::{
-        TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS, current_subscription_schedule_key,
-        is_scheduled_task_type,
+        STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS,
+        claim_next_queued_task, current_subscription_schedule_key, is_scheduled_task_type,
     };
     use chrono::{TimeZone, Utc};
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use url::Url;
+
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        state::{AppState, build_oauth_client},
+    };
 
     #[test]
     fn current_subscription_schedule_key_uses_half_hour_buckets() {
@@ -1453,5 +1475,161 @@ mod tests {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
         assert!(!is_scheduled_task_type("translate.release"));
+    }
+
+    #[tokio::test]
+    async fn claim_next_queued_task_defers_subscription_when_one_is_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "sync-running",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "sync-queued",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_QUEUED,
+            1,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "brief-queued",
+            TASK_BRIEF_DAILY_SLOT,
+            STATUS_QUEUED,
+            2,
+        )
+        .await;
+
+        let claimed = claim_next_queued_task(state.as_ref())
+            .await
+            .expect("claim queued task")
+            .expect("task claimed");
+        assert_eq!(claimed.id, "brief-queued");
+        assert_eq!(claimed.task_type, TASK_BRIEF_DAILY_SLOT);
+    }
+
+    #[tokio::test]
+    async fn claim_next_queued_task_allows_subscription_when_no_run_is_active() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "sync-queued",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_QUEUED,
+            0,
+        )
+        .await;
+
+        let claimed = claim_next_queued_task(state.as_ref())
+            .await
+            .expect("claim queued task")
+            .expect("task claimed");
+        assert_eq!(claimed.id, "sync-queued");
+        assert_eq!(claimed.task_type, TASK_SYNC_SUBSCRIPTIONS);
+    }
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn setup_state(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-jobs-tests"),
+            job_worker_concurrency: 4,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
+
+    async fn seed_task(
+        pool: &SqlitePool,
+        task_id: &str,
+        task_type: &str,
+        status: &str,
+        offset_seconds: i64,
+    ) {
+        let created_at = format!("2026-03-06T00:00:{offset_seconds:02}Z");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(task_type)
+        .bind(status)
+        .bind("test")
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(created_at.as_str())
+        .bind((status == STATUS_RUNNING).then_some(created_at.as_str()))
+        .bind(Option::<String>::None)
+        .bind(created_at.as_str())
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("seed task");
     }
 }
