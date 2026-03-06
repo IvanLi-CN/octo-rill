@@ -19,6 +19,7 @@ bun install
 
 - 请优先在主工作区根目录执行 `bun install`；它会安装本仓库的 Git tooling，并通过 `prepare` 自动把 hooks 装到共享 `.git/hooks`。
 - 若你在 linked worktree 内执行 `bun install`，安装脚本会尝试复用主工作区的 `node_modules`；若主工作区尚未完成初始化，会提示你先回主工作区执行一次。
+- hooks 安装后会把共享 `.git/hooks` 固定到仓库内解析出的 `lefthook` 二进制，避免被全局 `lefthook` 抢占。
 - 当 `lefthook.yml`、`package.json` 或根目录依赖发生变化时，重新执行 `bun install` 或 `bun run hooks:install`。
 
 ### 1) 配置环境变量

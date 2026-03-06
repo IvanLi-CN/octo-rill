@@ -47,7 +47,7 @@
 - 新 linked worktree 首次 checkout 时，若源路径存在且目标缺失，则自动复制 `.env.local` 与 `.env`。
 - 同步脚本不得写死机器绝对路径、用户名目录或 Codex 私有目录模式。
 - 主工作区执行 hook、普通 checkout、缺失源路径、重复执行必须安全 no-op 或 skip。
-- 仓库内必须提供无需全局 `lefthook` 的安装入口。
+- 仓库内必须提供无需全局 `lefthook` 的安装入口，并把共享 hooks 固定到仓库内解析出的 `lefthook` 二进制。
 - CI 必须在 `ubuntu-latest` 与 `macos-latest` 上验证 smoke flow。
 
 ### SHOULD
@@ -63,6 +63,7 @@
 - 开发者在主工作区根目录安装 repo-local hooks 后，任意 linked worktree 在首次 checkout 触发 `post-checkout`，同步脚本自动读取资源清单并执行“缺失时复制”。
 - 同步脚本默认通过 Git 元数据定位主工作区根目录；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
+- hook 安装脚本在共享 `.git/hooks` 中注入固定 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行。
 
 ### Edge cases / errors
 
@@ -147,3 +148,4 @@
 
 - 2026-03-06：创建规格，冻结仓库级 worktree bootstrap 方案与验收口径。
 - 2026-03-06：完成 repo-local hook 安装入口、worktree bootstrap 脚本、smoke test 与 CI matrix 校验。
+- 2026-03-06：补充共享 hooks 的 `LEFTHOOK_BIN` 固定逻辑，避免全局 Lefthook 抢占。
