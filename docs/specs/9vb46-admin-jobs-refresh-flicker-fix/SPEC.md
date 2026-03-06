@@ -24,7 +24,7 @@
 - 首次进入 `/admin/jobs` 仍允许阻塞式加载；首载完成后，手动刷新与 SSE 自动刷新必须保留现有内容。
 - 为三块内容增加轻量刷新提示，避免整块内容消失。
 - 消除组件自身重复首载请求，保留一套清晰的初始化加载来源。
-- 补齐 e2e 回归，覆盖 realtime 与 llm 两种刷新不闪烁场景。
+- 补齐 e2e 回归，覆盖 realtime / scheduled / llm 三块在手动刷新、SSE 刷新与重叠请求下的不闪烁场景。
 
 ### Non-goals
 
@@ -76,7 +76,7 @@ None。
 
 ### Testing
 
-- E2E tests: 扩展 `web/e2e/admin-jobs.spec.ts`，覆盖 realtime 与 llm 刷新期间保留已渲染内容。
+- E2E tests: 扩展 `web/e2e/admin-jobs.spec.ts`，覆盖 realtime / scheduled / llm 刷新期间保留已渲染内容、首次未加载完成时仍保持阻塞 loader，以及重叠请求失败路径不会冒出过期错误横幅。
 - Browser verification: 本地浏览器复核 `/admin/jobs` 的手动刷新与 SSE 自动刷新体验。
 
 ### Quality checks
@@ -97,20 +97,22 @@ None。
 
 ## 方案概述（Approach, high-level）
 
-- 为 overview / realtime / scheduled / llm status / llm calls 建立显式加载阶段，首载与刷新共用同一套数据加载函数但走不同 UI 分支。
+- 为 overview / realtime / scheduled / llm status / llm calls 建立显式加载阶段：仅手动刷新与 SSE 走后台刷新，筛选/分页切换继续使用阻塞式列表加载，避免新筛选文案与旧列表并存。
+- 为 overview / realtime / scheduled / llm status / llm calls 增加“仅最新请求可提交结果”的保护，避免 SSE / 手动刷新 / 筛选分页切换并发时被旧响应回写。
 - 挂载阶段只保留必要的初始化 effect，后续分页、筛选、手动刷新与 SSE 刷新统一复用分区加载函数。
 - 当列表已有数据时，刷新期间显示内联“刷新中/更新中”提示，而不是替换整个内容区。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
-- 风险：筛选切换时短暂保留旧列表，可能带来极短时间的“旧筛选结果仍可见”窗口。
-- 风险：SSE 与手动刷新重叠时可能产生并发请求，需要用现有节流/排队逻辑避免 UI 抖动回退。
+- 风险：背景刷新期间保留旧列表，会带来短时间的“旧结果仍可见”窗口；仅限手动刷新与 SSE 使用，并通过请求序号保护避免旧响应覆盖新结果。
+- 风险：SSE 与手动刷新重叠时仍可能产生并发请求，需要与现有节流/排队逻辑一起保持最新请求优先。
 - 假设：管理员接受“后台刷新保留旧数据”的交互优先级高于“立刻清空显示新筛选的空态”。
 
 ## 变更记录（Change log）
 
 - 2026-03-06: 新建规格，冻结 `/admin/jobs` 刷新闪烁修复范围、非目标与验收标准。
 - 2026-03-06: 完成 `JobManagement` 刷新态重构与请求编排收敛，补充手动刷新 / SSE 刷新不闪烁回归测试。
+- 2026-03-06: 根据 review-loop 补上 overview / llm status / 三组列表的最新请求保护，收紧“后台刷新”只用于手动刷新与 SSE，并补齐 scheduled / 首载阻塞 / 重叠刷新 / 过期错误回归测试。
 
 ## 参考（References）
 
