@@ -15,12 +15,17 @@ fixture_repo="$tmp_root/repo"
 worktree_default="$tmp_root/default-worktree"
 worktree_override="$tmp_root/override-worktree"
 override_source="$tmp_root/override-source"
+separate_git_dir="$tmp_root/separate.git"
+separate_repo="$tmp_root/separate-repo"
+separate_worktree="$tmp_root/separate-worktree"
+missing_absolute_source="$tmp_root/does-not-exist/deeper"
 mkdir -p "$fixture_repo" "$override_source"
 
 cleanup() {
   set +e
   git -C "$fixture_repo" worktree remove -f "$worktree_default" >/dev/null 2>&1
   git -C "$fixture_repo" worktree remove -f "$worktree_override" >/dev/null 2>&1
+  git -C "$separate_repo" worktree remove -f "$separate_worktree" >/dev/null 2>&1
   rm -rf "$tmp_root"
 }
 trap cleanup EXIT
@@ -51,6 +56,16 @@ assert_output_contains() {
   fi
 }
 
+assert_output_not_contains() {
+  local output="$1"
+  local needle="$2"
+  if [[ "$output" == *"$needle"* ]]; then
+    echo "expected output to omit '$needle'" >&2
+    printf 'actual output:\n%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
 cp "$repo_root/package.json" "$fixture_repo/package.json"
 cp "$repo_root/bun.lock" "$fixture_repo/bun.lock"
 cp "$repo_root/lefthook.yml" "$fixture_repo/lefthook.yml"
@@ -65,6 +80,11 @@ git -C "$fixture_repo" add package.json bun.lock lefthook.yml scripts
 git -C "$fixture_repo" commit -m 'test: bootstrap fixture' >/dev/null
 
 bun install --cwd "$fixture_repo" --frozen-lockfile >/dev/null
+fixture_main_root="$(git -C "$fixture_repo" config --local --get codex.worktree-sync.main-root || true)"
+if [[ "$fixture_main_root" != "$fixture_repo" ]]; then
+  echo "expected shared main root config for fixture repo" >&2
+  exit 1
+fi
 
 cat > "$fixture_repo/.env.local" <<'ENVLOCAL'
 OCTORILL_ENCRYPTION_KEY_BASE64=source-local
@@ -139,6 +159,47 @@ assert_output_contains "$dry_run_output" "would copy: .env.local"
 assert_output_contains "$dry_run_output" "dry-run complete"
 if [[ -e "$worktree_override/.env.local" || -e "$worktree_override/.env" ]]; then
   echo "dry-run should not materialize target files" >&2
+  exit 1
+fi
+
+git -C "$fixture_repo" config --local codex.worktree-sync.source-root missing/dir
+invalid_override_output="$(cd "$worktree_override" && WORKTREE_SYNC_FORCE=1 "$fixture_repo/scripts/sync-worktree-resources.sh" ignored ignored 1 2>&1)"
+assert_output_contains "$invalid_override_output" "skip source missing: .env.local"
+assert_output_not_contains "$invalid_override_output" "No such file or directory"
+
+git -C "$fixture_repo" config --local codex.worktree-sync.source-root "$missing_absolute_source"
+absolute_invalid_override_output="$(cd "$worktree_override" && WORKTREE_SYNC_FORCE=1 "$fixture_repo/scripts/sync-worktree-resources.sh" ignored ignored 1 2>&1)"
+assert_output_contains "$absolute_invalid_override_output" "skip source missing: .env.local"
+assert_output_not_contains "$absolute_invalid_override_output" "No such file or directory"
+git -C "$fixture_repo" config --local --unset codex.worktree-sync.source-root
+
+git clone --separate-git-dir="$separate_git_dir" "$fixture_repo" "$separate_repo" >/dev/null
+bun install --cwd "$separate_repo" --frozen-lockfile >/dev/null
+separate_main_root="$(git -C "$separate_repo" config --local --get codex.worktree-sync.main-root || true)"
+if [[ "$separate_main_root" != "$separate_repo" ]]; then
+  echo "expected shared main root config for separate git dir repo" >&2
+  exit 1
+fi
+cat > "$separate_repo/.env.local" <<'SEPARATELOCAL'
+OCTORILL_ENCRYPTION_KEY_BASE64=separate-local
+SEPARATELOCAL
+cat > "$separate_repo/.env" <<'SEPARATEENV'
+GITHUB_CLIENT_ID=separate-env
+SEPARATEENV
+
+git -C "$separate_repo" worktree add --detach "$separate_worktree" HEAD >/dev/null
+assert_file_content "$separate_worktree/.env.local" "OCTORILL_ENCRYPTION_KEY_BASE64=separate-local"
+assert_file_content "$separate_worktree/.env" "GITHUB_CLIENT_ID=separate-env"
+
+separate_hook_path="$(git -C "$separate_repo" rev-parse --git-path hooks/post-checkout)"
+if [[ "$separate_hook_path" != /* ]]; then
+  separate_hook_path="$separate_repo/$separate_hook_path"
+fi
+separate_hook_body="$(cat "$separate_hook_path")"
+assert_output_contains "$separate_hook_body" "LEFTHOOK_BIN=\""
+assert_output_contains "$separate_hook_body" "$separate_repo"
+if [[ "$separate_hook_body" == *"$separate_git_dir"* ]]; then
+  echo "hook installation must not pin the shared git dir path" >&2
   exit 1
 fi
 
