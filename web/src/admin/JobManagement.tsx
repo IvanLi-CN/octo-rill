@@ -370,7 +370,7 @@ function LlmCallDetailSection(props: {
 									const tone = llmRoleTone(message.role, isAssistantOutput);
 									return (
 										<div
-											key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+											key={`timeline-${message.source}-${message.role}-${message.turn}`}
 											className={`flex ${
 												isAssistantOutput
 													? "justify-end pl-5"
