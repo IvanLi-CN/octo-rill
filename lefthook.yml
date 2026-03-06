@@ -38,3 +38,8 @@ commit-msg:
         fi
         echo "commitlint is not installed. Install it (recommended) or remove the commit-msg hook." >&2
         exit 1
+
+post-checkout:
+  commands:
+    sync-worktree-resources:
+      run: ./scripts/sync-worktree-resources.sh {1} {2} {3}

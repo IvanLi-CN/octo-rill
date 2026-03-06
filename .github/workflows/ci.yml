@@ -164,10 +164,43 @@ jobs:
           cd web
           bun run e2e
 
+  worktree-bootstrap:
+    name: Worktree Bootstrap Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Cache root Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            node_modules
+          key: ${{ runner.os }}-root-bun-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-root-bun-
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run worktree bootstrap smoke test
+        run: bun run test:worktree-bootstrap
+
   build:
     name: Build (Release)
     runs-on: ubuntu-latest
-    needs: [lint, unit-tests, frontend-e2e]
+    needs: [lint, unit-tests, frontend-e2e, worktree-bootstrap]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     timeout-minutes: 25
     steps:
