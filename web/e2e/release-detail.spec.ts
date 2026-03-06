@@ -5,6 +5,7 @@ type ApiOptions = {
 	detailTitle: string;
 	translatedTitle: string;
 	translatedSummary: string;
+	withReactionFeed?: boolean;
 };
 
 function json(route: Route, payload: unknown, status = 200) {
@@ -44,7 +45,51 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
-			return json(route, { items: [], next_cursor: null });
+			return json(route, {
+				items: cfg.withReactionFeed
+					? [
+							{
+								kind: "release",
+								ts: "2026-02-22T11:22:33Z",
+								id: cfg.releaseId,
+								repo_full_name: "owner/repo",
+								title: cfg.detailTitle,
+								excerpt: "- fix A\n- fix B",
+								subtitle: null,
+								reason: null,
+								subject_type: null,
+								html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
+								unread: null,
+								translated: {
+									lang: "zh-CN",
+									status: "ready",
+									title: cfg.translatedTitle,
+									summary: cfg.translatedSummary,
+								},
+								reactions: {
+									counts: {
+										plus1: 2,
+										laugh: 0,
+										heart: 0,
+										hooray: 0,
+										rocket: 0,
+										eyes: 0,
+									},
+									viewer: {
+										plus1: false,
+										laugh: false,
+										heart: false,
+										hooray: false,
+										rocket: false,
+										eyes: false,
+									},
+									status: "ready",
+								},
+							},
+						]
+					: [],
+				next_cursor: null,
+			});
 		}
 
 		if (req.method() === "GET" && pathname === "/api/notifications") {
@@ -139,6 +184,10 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 
 	await expect(page).toHaveURL(/tab=briefs/);
 	await expect(page).toHaveURL(/release=289513858/);
+	await expect(page.getByRole("tab", { name: "日报" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
 	await expect(
 		page.getByRole("heading", { name: "Release 详情" }),
 	).toBeVisible();
@@ -177,6 +226,33 @@ test("detail translate button updates card content", async ({ page }) => {
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
+});
+
+test("reaction fallback opens PAT dialog with accessible controls", async ({
+	page,
+}) => {
+	await installApiMocks(page, { withReactionFeed: true });
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await page.getByTitle("赞").click();
+
+	const patDialog = page.getByRole("dialog", {
+		name: "配置 GitHub PAT 以启用反馈表情",
+	});
+	await expect(patDialog).toBeVisible();
+	await expect(patDialog.getByLabel("GitHub PAT")).toBeVisible();
+	await expect(
+		patDialog.getByRole("button", { name: "稍后再说" }),
+	).toBeVisible();
+	await expect(
+		patDialog.getByRole("button", { name: "保存并继续" }),
+	).toBeDisabled();
+	await patDialog.getByRole("button", { name: "稍后再说" }).click();
+	await expect(patDialog).toHaveCount(0);
 });
 
 test("deep link with zero-padded release id still resolves detail", async ({
