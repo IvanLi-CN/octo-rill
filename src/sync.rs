@@ -28,6 +28,7 @@ const SUBSCRIPTION_STAR_WORKERS: usize = 5;
 const SUBSCRIPTION_RELEASE_WORKERS: usize = 5;
 const SUBSCRIPTION_RETRY_LIMIT: usize = 3;
 const SUBSCRIPTION_RETRY_BACKOFF_MS: [u64; 3] = [500, 1_000, 2_000];
+const SUBSCRIPTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 pub struct SyncStarredResult {
@@ -319,6 +320,23 @@ impl SubscriptionRunContext {
         }
         Ok(())
     }
+
+    async fn is_cancel_requested(&self) -> Result<bool> {
+        let flag = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT cancel_requested
+            FROM job_tasks
+            WHERE id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(self.task_id.as_str())
+        .fetch_optional(&self.state.pool)
+        .await
+        .context("failed to query subscription cancel_requested")?;
+
+        Ok(flag.unwrap_or(0) != 0)
+    }
 }
 
 fn subscription_event_counts_as_critical(severity: &str) -> bool {
@@ -332,6 +350,29 @@ fn subscription_retry_delay(attempt: usize) -> Duration {
             .copied()
             .unwrap_or(2_000),
     )
+}
+
+fn subscription_timeout_error(operation: &str) -> SyncRequestError {
+    SyncRequestError::retryable(
+        "timeout",
+        format!(
+            "{operation}: timed out after {}s",
+            SUBSCRIPTION_HTTP_TIMEOUT.as_secs()
+        ),
+        None,
+    )
+}
+
+async fn with_subscription_timeout<T, Fut>(
+    operation: &str,
+    future: Fut,
+) -> Result<T, SyncRequestError>
+where
+    Fut: Future<Output = Result<T, SyncRequestError>>,
+{
+    tokio::time::timeout(SUBSCRIPTION_HTTP_TIMEOUT, future)
+        .await
+        .map_err(|_| subscription_timeout_error(operation))?
 }
 
 struct SubscriptionEventRecord<'a> {
@@ -634,6 +675,36 @@ async fn run_star_phase(
                 &mut successful_users,
                 &mut summary,
             )?;
+            if context.is_cancel_requested().await? {
+                context
+                    .log(
+                        "warning",
+                        "star",
+                        "run_canceled",
+                        "subscription sync canceled during star phase",
+                        json!({
+                            "completed_users": summary.succeeded_users + summary.failed_users,
+                            "total_users": summary.total_users,
+                        }),
+                    )
+                    .await?;
+                return Ok((successful_users, summary));
+            }
+        }
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "star",
+                    "run_canceled",
+                    "subscription sync canceled during star phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok((successful_users, summary));
         }
         let worker_context = context.clone();
         join_set.spawn(async move { sync_starred_for_user(worker_context, user).await });
@@ -645,6 +716,21 @@ async fn run_star_phase(
             &mut successful_users,
             &mut summary,
         )?;
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "star",
+                    "run_canceled",
+                    "subscription sync canceled during star phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok((successful_users, summary));
+        }
     }
 
     Ok((successful_users, summary))
@@ -719,6 +805,21 @@ where
         .await?;
 
     for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "star",
+                    "user_canceled",
+                    format!("star sync canceled for user #{}", user.id),
+                    json!({
+                        "user_id": user.id,
+                        "attempt": attempt,
+                    }),
+                )
+                .await?;
+            return Ok(None);
+        }
         match fetch(user.id).await {
             Ok(repos) => {
                 replace_starred_repos(context.state.as_ref(), user.id, &repos).await?;
@@ -864,6 +965,38 @@ async fn run_release_phase(
                 &mut summary,
                 &mut releases_written,
             )?;
+            if context.is_cancel_requested().await? {
+                context
+                    .log(
+                        "warning",
+                        "release",
+                        "run_canceled",
+                        "subscription sync canceled during release phase",
+                        json!({
+                            "completed_repos": summary.succeeded_repos + summary.failed_repos,
+                            "total_repos": summary.total_repos,
+                            "releases_written": releases_written,
+                        }),
+                    )
+                    .await?;
+                return Ok((summary, releases_written));
+            }
+        }
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "release",
+                    "run_canceled",
+                    "subscription sync canceled during release phase",
+                    json!({
+                        "completed_repos": summary.succeeded_repos + summary.failed_repos,
+                        "total_repos": summary.total_repos,
+                        "releases_written": releases_written,
+                    }),
+                )
+                .await?;
+            return Ok((summary, releases_written));
         }
         let worker_context = context.clone();
         join_set.spawn(async move { sync_releases_for_repo(worker_context, repo).await });
@@ -875,6 +1008,22 @@ async fn run_release_phase(
             &mut summary,
             &mut releases_written,
         )?;
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "release",
+                    "run_canceled",
+                    "subscription sync canceled during release phase",
+                    json!({
+                        "completed_repos": summary.succeeded_repos + summary.failed_repos,
+                        "total_repos": summary.total_repos,
+                        "releases_written": releases_written,
+                    }),
+                )
+                .await?;
+            return Ok((summary, releases_written));
+        }
     }
 
     Ok((summary, releases_written))
@@ -932,6 +1081,27 @@ async fn sync_releases_for_repo(
 
     for candidate in &repo.related_users {
         for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
+            if context.is_cancel_requested().await? {
+                context
+                    .log(
+                        "warning",
+                        "release",
+                        "repo_canceled",
+                        format!("release sync canceled for {}", repo.full_name),
+                        json!({
+                            "repo_id": repo.repo_id,
+                            "repo_full_name": repo.full_name,
+                            "candidate_user_id": candidate.user_id,
+                            "attempt": attempt,
+                        }),
+                    )
+                    .await?;
+                return Ok(ReleasePhaseOutcome {
+                    succeeded: false,
+                    releases_written: 0,
+                    candidate_failures,
+                });
+            }
             match fetch_repo_releases_for_user(
                 context.state.as_ref(),
                 candidate.user_id,
@@ -1287,24 +1457,26 @@ async fn fetch_starred_snapshot(
     let mut all = Vec::new();
 
     loop {
-        let response = state
-            .http
-            .post(GRAPHQL_URL)
-            .bearer_auth(&token)
-            .header(USER_AGENT, "OctoRill")
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .json(&json!({
-                "query": query,
-                "variables": { "after": after },
-            }))
-            .send()
-            .await
-            .map_err(|err| classify_reqwest_error("sync starred graphql", err))?;
+        let payload = with_subscription_timeout("sync starred graphql", async {
+            let response = state
+                .http
+                .post(GRAPHQL_URL)
+                .bearer_auth(&token)
+                .header(USER_AGENT, "OctoRill")
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .json(&json!({
+                    "query": query,
+                    "variables": { "after": after },
+                }))
+                .send()
+                .await
+                .map_err(|err| classify_reqwest_error("sync starred graphql", err))?;
 
-        let payload =
             fetch_json_response::<GraphQlResponse<StarredData>>(response, "sync starred graphql")
-                .await?;
+                .await
+        })
+        .await?;
         if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
             return Err(classify_graphql_errors("sync starred graphql", errors));
         }
@@ -1411,22 +1583,20 @@ async fn fetch_repo_releases_with_token(
     loop {
         let url =
             format!("{REST_API_BASE}/repos/{repo_full_name}/releases?per_page=100&page={page}");
-        let response = state
-            .http
-            .get(url)
-            .bearer_auth(token)
-            .header(USER_AGENT, "OctoRill")
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .send()
-            .await
-            .map_err(|err| {
-                classify_reqwest_error(&format!("sync releases {repo_full_name}"), err)
-            })?;
-        let page_releases = fetch_json_response::<Vec<GitHubRelease>>(
-            response,
-            &format!("sync releases {repo_full_name}"),
-        )
+        let operation = format!("sync releases {repo_full_name}");
+        let page_releases = with_subscription_timeout(operation.as_str(), async {
+            let response = state
+                .http
+                .get(url)
+                .bearer_auth(token)
+                .header(USER_AGENT, "OctoRill")
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .send()
+                .await
+                .map_err(|err| classify_reqwest_error(operation.as_str(), err))?;
+            fetch_json_response::<Vec<GitHubRelease>>(response, operation.as_str()).await
+        })
         .await?;
         if page_releases.is_empty() {
             break;
@@ -1653,7 +1823,8 @@ mod tests {
     use super::{
         EligibleUserRow, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
         SyncRequestError, aggregate_repos, cmp_last_active_desc,
-        subscription_event_counts_as_critical, sync_starred_for_user_with_fetch,
+        subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_starred_for_user_with_fetch,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -1730,6 +1901,14 @@ mod tests {
         assert!(subscription_event_counts_as_critical("error"));
         assert!(!subscription_event_counts_as_critical("warning"));
         assert!(!subscription_event_counts_as_critical("info"));
+    }
+
+    #[test]
+    fn subscription_timeout_error_is_retryable() {
+        let err = subscription_timeout_error("sync starred graphql");
+        assert!(err.retryable);
+        assert_eq!(err.reason_code, "timeout");
+        assert!(err.message.contains("timed out after"));
     }
 
     #[tokio::test]
