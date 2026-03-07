@@ -166,6 +166,71 @@ async function installAdminJobsMocks(
 		},
 	];
 
+	const translationRequests = [
+		{
+			id: "req-translation-1",
+			status: "completed",
+			source: "feed.auto_translate",
+			requested_by: 1,
+			scope_user_id: 1,
+			item_count: 1,
+			completed_item_count: 1,
+			created_at: "2026-02-26T04:00:00Z",
+			started_at: "2026-02-26T04:00:01Z",
+			finished_at: "2026-02-26T04:00:03Z",
+			updated_at: "2026-02-26T04:00:03Z",
+		},
+	];
+
+	const translationRequestDetail = {
+		request: translationRequests[0],
+		items: [
+			{
+				producer_ref: "290978079",
+				entity_id: "290978079",
+				kind: "release_summary",
+				variant: "feed_card",
+				status: "ready",
+				title_zh: "发布说明 290978079",
+				summary_md: "- 修复了调度窗口\n- 保持整组返回",
+				body_md: null,
+				error: null,
+				work_item_id: "work-translation-1",
+				batch_id: "batch-translation-1",
+			},
+		],
+	};
+
+	const translationBatches = [
+		{
+			id: "batch-translation-1",
+			status: "completed",
+			trigger_reason: "deadline",
+			item_count: 1,
+			estimated_input_tokens: 512,
+			created_at: "2026-02-26T04:00:01Z",
+			started_at: "2026-02-26T04:00:01Z",
+			finished_at: "2026-02-26T04:00:03Z",
+			updated_at: "2026-02-26T04:00:03Z",
+		},
+	];
+
+	const translationBatchDetail = {
+		batch: translationBatches[0],
+		items: translationRequestDetail.items,
+		llm_calls: [
+			{
+				id: "llm-translation-1",
+				status: "succeeded",
+				source: "translation.scheduler.deadline",
+				model: "gpt-4o-mini",
+				scheduler_wait_ms: 240,
+				duration_ms: 820,
+				created_at: "2026-02-26T04:00:01Z",
+			},
+		],
+	};
+
 	const slots = Array.from({ length: 24 }, (_, hour) => ({
 		hour_utc: hour,
 		enabled: hour % 2 === 0,
@@ -688,6 +753,39 @@ async function installAdminJobsMocks(
 			pathname.startsWith("/api/admin/jobs/llm/calls/")
 		) {
 			const callId = pathname.split("/").at(-1) ?? "";
+			if (callId === "llm-translation-1") {
+				return json(route, {
+					id: "llm-translation-1",
+					status: "succeeded",
+					source: "translation.scheduler.deadline",
+					model: "gpt-4o-mini",
+					requested_by: null,
+					parent_task_id: null,
+					parent_task_type: null,
+					max_tokens: 900,
+					attempt_count: 1,
+					scheduler_wait_ms: 240,
+					first_token_wait_ms: 120,
+					duration_ms: 820,
+					input_tokens: 420,
+					output_tokens: 110,
+					cached_input_tokens: 0,
+					total_tokens: 530,
+					input_messages_json: JSON.stringify([
+						{ role: "user", content: "translate grouped items" },
+					]),
+					output_messages_json: JSON.stringify([
+						{ role: "assistant", content: "- grouped result" },
+					]),
+					prompt_text: "translate grouped items",
+					response_text: "- grouped result",
+					error_text: null,
+					created_at: "2026-02-26T04:00:01Z",
+					started_at: "2026-02-26T04:00:01Z",
+					finished_at: "2026-02-26T04:00:02Z",
+					updated_at: "2026-02-26T04:00:02Z",
+				});
+			}
 			const item = llmCalls.find((call) => call.id === callId);
 			if (!item) {
 				return json(
@@ -719,6 +817,64 @@ async function installAdminJobsMocks(
 				task_id: pathname.split("/").at(-2),
 				status: "running",
 			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/translations/status"
+		) {
+			return json(route, {
+				scheduler_enabled: true,
+				llm_enabled: true,
+				scan_interval_ms: 250,
+				batch_token_threshold: 1800,
+				queued_requests: 0,
+				queued_work_items: 0,
+				running_batches: 0,
+				requests_24h: 1,
+				completed_batches_24h: 1,
+				failed_batches_24h: 0,
+				avg_wait_ms_24h: 320,
+				last_batch_finished_at: "2026-02-26T04:00:03Z",
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/translations/requests"
+		) {
+			return json(route, {
+				items: translationRequests,
+				page: 1,
+				page_size: 20,
+				total: translationRequests.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/jobs/translations/requests/")
+		) {
+			return json(route, translationRequestDetail);
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/translations/batches"
+		) {
+			return json(route, {
+				items: translationBatches,
+				page: 1,
+				page_size: 20,
+				total: translationBatches.length,
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/jobs/translations/batches/")
+		) {
+			return json(route, translationBatchDetail);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/scheduled") {
@@ -1076,4 +1232,29 @@ test("admin refresh keeps existing jobs and llm calls visible", async ({
 	await expect(refreshButton).toBeEnabled();
 	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
 	await expect(page.getByText("LLM 调度更新中...")).toHaveCount(0);
+});
+
+test("admin can inspect translation scheduler", async ({ page }) => {
+	await installAdminJobsMocks(page);
+
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click();
+	await expect(page.getByRole("heading", { name: "翻译调度" })).toBeVisible();
+	await expect(page.getByText("feed.auto_translate")).toBeVisible();
+	await page.getByRole("button", { name: "详情" }).first().click();
+	await expect(
+		page.getByRole("heading", { name: "翻译请求详情" }),
+	).toBeVisible();
+	await expect(page.getByText("release_summary · feed_card")).toBeVisible();
+	await page.getByRole("button", { name: "查看批次" }).click();
+	await expect(
+		page.getByRole("heading", { name: "翻译批次详情" }),
+	).toBeVisible();
+	await expect(page.getByText("translation.scheduler.deadline")).toBeVisible();
+	await page.getByRole("button", { name: "打开 LLM 详情" }).click();
+	const llmDialog = page.getByRole("dialog", { name: "LLM 调用详情" });
+	await expect(
+		llmDialog.getByRole("heading", { name: "LLM 调用详情" }),
+	).toBeVisible();
+	await expect(llmDialog.getByText("llm-translation-1")).toBeVisible();
 });

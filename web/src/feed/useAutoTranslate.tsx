@@ -1,18 +1,57 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiPostJson } from "@/api";
-import type {
-	FeedItem,
-	TranslateBatchItem,
-	TranslateBatchResponse,
-	TranslateBatchStreamEvent,
-	TranslateResponse,
-} from "@/feed/types";
+import {
+	apiOpenTranslationRequestStream,
+	apiSubmitTranslationRequest,
+	type TranslationRequestItemInput,
+	type TranslationRequestStreamEvent,
+} from "@/api";
+import type { FeedItem, TranslateResponse } from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
 const BATCH_SIZE = 8;
 const BATCH_FLUSH_DELAY_MS = 300;
 const STREAM_RECOVERY_MAX_RETRIES = 3;
+
+function buildReleaseSummaryRequestItem(
+	item: FeedItem,
+): TranslationRequestItemInput {
+	const title = item.title?.trim() || `release:${item.id}`;
+	const excerpt = item.excerpt?.trim();
+	const metadata = [item.repo_full_name, item.reason, item.subject_type]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join("\n");
+	return {
+		producer_ref: item.id,
+		kind: "release_summary",
+		variant: "feed_card",
+		entity_id: item.id,
+		target_lang: "zh-CN",
+		max_wait_ms: 4_000,
+		source_blocks: [
+			{ slot: "title", text: title },
+			...(excerpt ? [{ slot: "excerpt" as const, text: excerpt }] : []),
+			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+		],
+		target_slots: ["title_zh", "summary_md"],
+	};
+}
+
+function mapTranslationItemToFeedResponse(item: {
+	status: "ready" | "disabled" | "missing" | "error" | "queued";
+	title_zh: string | null;
+	summary_md: string | null;
+}): TranslateResponse | null {
+	if (item.status !== "ready" && item.status !== "disabled") {
+		return null;
+	}
+	return {
+		lang: "zh-CN",
+		status: item.status === "disabled" ? "disabled" : "ready",
+		title: item.title_zh,
+		summary: item.summary_md,
+	};
+}
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -51,40 +90,29 @@ export function useAutoTranslate(params: {
 	);
 
 	const translateBatch = useCallback(async (items: FeedItem[]) => {
-		return apiPostJson<TranslateBatchResponse>(
-			"/api/translate/releases/batch",
-			{
-				release_ids: items.map((item) => item.id),
-			},
-		);
+		return apiSubmitTranslationRequest({
+			mode: "wait",
+			items: items.map(buildReleaseSummaryRequestItem),
+		});
 	}, []);
 
 	const translateBatchStream = useCallback(
 		async (
 			items: FeedItem[],
-			onItem: (item: TranslateBatchItem) => void,
+			onItems: (
+				items: Array<{
+					id: string;
+					status: "ready" | "disabled" | "missing" | "error" | "queued";
+					title_zh: string | null;
+					summary_md: string | null;
+					error: string | null;
+				}>,
+			) => void,
 		): Promise<void> => {
-			const res = await fetch("/api/translate/releases/batch/stream", {
-				method: "POST",
-				credentials: "include",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					release_ids: items.map((item) => item.id),
-				}),
+			const res = await apiOpenTranslationRequestStream({
+				mode: "stream",
+				items: items.map(buildReleaseSummaryRequestItem),
 			});
-
-			if (!res.ok) {
-				let msg = `translate stream failed (${res.status})`;
-				try {
-					const body = (await res.json()) as {
-						error?: { message?: string };
-					};
-					if (body?.error?.message) msg = body.error.message;
-				} catch {
-					// Keep fallback message.
-				}
-				throw new Error(msg);
-			}
 
 			if (!res.body) {
 				throw new Error("translate stream missing response body");
@@ -93,26 +121,30 @@ export function useAutoTranslate(params: {
 			const reader = res.body.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";
-			let doneEventSeen = false;
+			let terminalSeen = false;
 
 			const handleLine = (rawLine: string) => {
 				const line = rawLine.trim();
 				if (!line) return;
-				let evt: TranslateBatchStreamEvent;
+				let evt: TranslationRequestStreamEvent;
 				try {
-					evt = JSON.parse(line) as TranslateBatchStreamEvent;
+					evt = JSON.parse(line) as TranslationRequestStreamEvent;
 				} catch {
-					// Ignore malformed lines to keep stream resilient.
 					return;
 				}
-				if (evt.event === "item" && evt.item) {
-					onItem(evt.item);
+				if (evt.items?.length) {
+					onItems(
+						evt.items.map((item) => ({
+							id: item.entity_id,
+							status: item.status,
+							title_zh: item.title_zh,
+							summary_md: item.summary_md,
+							error: item.error,
+						})),
+					);
 				}
-				if (evt.event === "error") {
-					throw new Error(evt.error ?? "translate stream failed");
-				}
-				if (evt.event === "done") {
-					doneEventSeen = true;
+				if (evt.event === "completed" || evt.event === "failed") {
+					terminalSeen = true;
 				}
 			};
 
@@ -120,7 +152,6 @@ export function useAutoTranslate(params: {
 				const { done, value } = await reader.read();
 				if (done) break;
 				buffer += decoder.decode(value, { stream: true });
-
 				let newlineIdx = buffer.indexOf("\n");
 				while (newlineIdx >= 0) {
 					const line = buffer.slice(0, newlineIdx);
@@ -135,8 +166,8 @@ export function useAutoTranslate(params: {
 				handleLine(buffer);
 			}
 
-			if (!doneEventSeen) {
-				throw new Error("translate stream ended before done event");
+			if (!terminalSeen) {
+				throw new Error("translate stream ended before terminal event");
 			}
 		},
 		[],
@@ -189,38 +220,25 @@ export function useAutoTranslate(params: {
 			};
 			let streamErrored = false;
 
-			void translateBatchStream(batchItems, (translated) => {
-				const item = byId.get(translated.id);
-				if (!item) return;
-				const key = keyOf(item);
+			void translateBatchStream(batchItems, (translatedItems) => {
+				for (const translated of translatedItems) {
+					const item = byId.get(translated.id);
+					if (!item) continue;
+					const key = keyOf(item);
+					if (handled.has(key)) continue;
+					handled.add(key);
+					streamRetryCountRef.current.delete(key);
 
-				if (translated.status === "processing") {
-					// Keep the item in-flight; final ready/missing/disabled status will arrive later.
-					return;
-				}
-				if (handled.has(key)) return;
-				const terminal =
-					translated.status === "ready" ||
-					translated.status === "disabled" ||
-					translated.status === "missing" ||
-					translated.status === "error";
-				if (!terminal) return;
-				handled.add(key);
-				streamRetryCountRef.current.delete(key);
-
-				inFlightRef.current.delete(key);
-				if (translated.status === "ready" || translated.status === "disabled") {
-					onTranslated(item, {
-						lang: translated.lang,
-						status: translated.status === "disabled" ? "disabled" : "ready",
-						title: translated.title,
-						summary: translated.summary,
-					});
-					if (translated.status === "disabled") {
+					inFlightRef.current.delete(key);
+					const mapped = mapTranslationItemToFeedResponse(translated);
+					if (mapped) {
+						onTranslated(item, mapped);
+						if (translated.status === "disabled") {
+							failedRef.current.add(key);
+						}
+					} else {
 						failedRef.current.add(key);
 					}
-				} else {
-					failedRef.current.add(key);
 				}
 				forceRender((x) => x + 1);
 			})
@@ -294,19 +312,13 @@ export function useAutoTranslate(params: {
 
 			try {
 				const batch = await translateBatch([item]);
-				const translated = batch.items[0];
-				if (
-					!translated ||
-					(translated.status !== "ready" && translated.status !== "disabled")
-				) {
+				const translated = batch.items?.[0];
+				const res = translated
+					? mapTranslationItemToFeedResponse(translated)
+					: null;
+				if (!translated || !res) {
 					throw new Error(translated?.error ?? "translate failed");
 				}
-				const res: TranslateResponse = {
-					lang: translated.lang,
-					status: translated.status === "disabled" ? "disabled" : "ready",
-					title: translated.title,
-					summary: translated.summary,
-				};
 				onTranslated(item, res);
 				return res;
 			} catch (err) {

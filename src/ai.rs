@@ -65,6 +65,7 @@ pub struct LlmCallContext {
     pub requested_by: Option<i64>,
     pub parent_task_id: Option<String>,
     pub parent_task_type: Option<String>,
+    pub parent_translation_batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -849,6 +850,7 @@ struct LlmCallLogRecord {
     requested_by: Option<i64>,
     parent_task_id: Option<String>,
     parent_task_type: Option<String>,
+    parent_translation_batch_id: Option<String>,
 }
 
 fn build_llm_call_log_record() -> LlmCallLogRecord {
@@ -864,6 +866,9 @@ fn build_llm_call_log_record() -> LlmCallLogRecord {
         parent_task_type: context
             .as_ref()
             .and_then(|ctx| ctx.parent_task_type.clone()),
+        parent_translation_batch_id: context
+            .as_ref()
+            .and_then(|ctx| ctx.parent_translation_batch_id.clone()),
     }
 }
 
@@ -886,12 +891,13 @@ async fn insert_llm_call(
           requested_by,
           parent_task_id,
           parent_task_type,
+          parent_translation_batch_id,
           max_tokens,
           prompt_text,
           input_messages_json,
           created_at,
           updated_at
-        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(log.id.as_str())
@@ -900,6 +906,7 @@ async fn insert_llm_call(
     .bind(log.requested_by)
     .bind(log.parent_task_id.as_deref())
     .bind(log.parent_task_type.as_deref())
+    .bind(log.parent_translation_batch_id.as_deref())
     .bind(i64::from(max_tokens))
     .bind(prompt_text)
     .bind(input_messages_json)

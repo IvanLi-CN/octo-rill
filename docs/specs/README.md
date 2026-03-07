@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| 35r55 | 统一翻译调度器与独立管理界面改造 | 已实现 | `35r55-translation-scheduler/SPEC.md` | 2026-03-07 | ready for fast-flow delivery |
 | gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
 | s8qkn | 全用户 Star / Release 半小时定时同步闭环 | 待实现 | `s8qkn-subscription-sync/SPEC.md` | 2026-03-06 | scheduler + sync.subscriptions + log download |
 | dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-07 | PR #25; shadcn/ui 全量收口 + Storybook/e2e/spec synced |
