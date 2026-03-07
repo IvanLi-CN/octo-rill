@@ -115,8 +115,13 @@ pin_hook_binary() {
   {
     IFS= read -r first_line || first_line='#!/bin/sh'
     printf '%s\n' "$first_line"
-    printf 'LEFTHOOK_BIN="%s"\n' "$escaped_bin"
-    printf 'export LEFTHOOK_BIN\n\n'
+    printf 'if [ -n "${LEFTHOOK_BIN:-}" ] && [ ! -x "${LEFTHOOK_BIN}" ]; then\n'
+    printf '  unset LEFTHOOK_BIN\n'
+    printf 'fi\n'
+    printf 'if [ -z "${LEFTHOOK_BIN:-}" ] && [ -x "%s" ]; then\n' "$escaped_bin"
+    printf '  LEFTHOOK_BIN="%s"\n' "$escaped_bin"
+    printf '  export LEFTHOOK_BIN\n'
+    printf 'fi\n\n'
     cat
   } < "$hook_path" > "$tmp_path"
 
