@@ -1,5 +1,33 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+type MockRequestRule = {
+	pathname: string;
+	search?: string;
+	afterCount?: number;
+	times?: number;
+};
+
+type MockDelayRule = MockRequestRule & {
+	delayMs: number;
+};
+
+type MockFailureRule = MockRequestRule & {
+	status?: number;
+	message?: string;
+};
+
+type AdminJobsMockOptions = {
+	responseDelayMs?: number;
+	delayedPaths?: string[];
+	delayRules?: MockDelayRule[];
+	failureRules?: MockFailureRule[];
+	emitStreamEvents?: boolean;
+};
+
+function sleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -8,7 +36,10 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function installAdminJobsMocks(page: Page) {
+async function installAdminJobsMocks(
+	page: Page,
+	options: AdminJobsMockOptions = {},
+) {
 	const tasks = [
 		{
 			id: "task-failed-1",
@@ -142,10 +173,89 @@ async function installAdminJobsMocks(page: Page) {
 		updated_at: "2026-02-26T00:00:00Z",
 	}));
 
+	const delayedPathSet = new Set(options.delayedPaths ?? []);
+	const requestCounts = new Map<string, number>();
+	const delayRuleCounts = new Map<number, number>();
+	const failureRuleCounts = new Map<number, number>();
+	const emitStreamEvents = options.emitStreamEvents ?? true;
+
+	function matchesRule(rule: MockRequestRule, url: URL) {
+		if (rule.pathname !== url.pathname) {
+			return false;
+		}
+		if (!rule.search) {
+			return true;
+		}
+		return url.search.includes(rule.search);
+	}
+
+	function ruleApplies(
+		rule: MockRequestRule,
+		url: URL,
+		ruleCounts: Map<number, number>,
+		index: number,
+	) {
+		if (!matchesRule(rule, url)) {
+			return false;
+		}
+		const nextCount = (ruleCounts.get(index) ?? 0) + 1;
+		ruleCounts.set(index, nextCount);
+		const afterCount = rule.afterCount ?? 0;
+		const times = rule.times ?? Number.POSITIVE_INFINITY;
+		return nextCount > afterCount && nextCount <= afterCount + times;
+	}
+
+	async function maybeDelay(url: URL) {
+		const pathname = url.pathname;
+		const nextCount = (requestCounts.get(pathname) ?? 0) + 1;
+		requestCounts.set(pathname, nextCount);
+		if (
+			options.responseDelayMs &&
+			options.responseDelayMs > 0 &&
+			delayedPathSet.has(pathname) &&
+			nextCount > 1
+		) {
+			await sleep(options.responseDelayMs);
+		}
+
+		for (const [index, rule] of (options.delayRules ?? []).entries()) {
+			if (ruleApplies(rule, url, delayRuleCounts, index)) {
+				await sleep(rule.delayMs);
+			}
+		}
+	}
+
+	function nextFailure(url: URL) {
+		for (const [index, rule] of (options.failureRules ?? []).entries()) {
+			if (ruleApplies(rule, url, failureRuleCounts, index)) {
+				return {
+					status: rule.status ?? 500,
+					message: rule.message ?? `mock failure for ${url.pathname}`,
+				};
+			}
+		}
+		return null;
+	}
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
 		const { pathname } = url;
+
+		await maybeDelay(url);
+
+		const failure = nextFailure(url);
+		if (failure) {
+			return json(
+				route,
+				{
+					error: {
+						message: failure.message,
+					},
+				},
+				failure.status,
+			);
+		}
 
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
@@ -202,6 +312,14 @@ async function installAdminJobsMocks(page: Page) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/events") {
+			if (!emitStreamEvents) {
+				return route.fulfill({
+					status: 200,
+					contentType: "text/event-stream",
+					body: "",
+				});
+			}
+
 			const call = llmCalls.find((item) => item.id === "llm-call-2");
 			if (call && call.status === "running") {
 				call.status = "succeeded";
@@ -722,4 +840,195 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+});
+
+test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/llm/calls"],
+		emitStreamEvents: true,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+});
+
+test("admin keeps newest llm filter results after overlapping refreshes", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 2,
+				times: 2,
+				delayMs: 1200,
+			},
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=failed",
+				times: 1,
+				delayMs: 300,
+			},
+		],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+	await page.locator("select").last().selectOption("failed");
+
+	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(refreshButton).toBeEnabled();
+
+	await page.waitForTimeout(1300);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+});
+
+test("admin keeps blocking loader before first realtime load completes", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "exclude_task_type=brief.daily_slot",
+				times: 1,
+				delayMs: 1200,
+			},
+		],
+		failureRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "exclude_task_type=brief.daily_slot",
+				afterCount: 1,
+				times: 1,
+				message: "ignored background refresh failure",
+			},
+		],
+		emitStreamEvents: true,
+	});
+	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
+
+	await expect(page.getByText("正在加载任务...")).toBeVisible();
+	await expect(page.getByText(/^SSE (已连接|重连中\.\.\.)$/)).toBeVisible();
+	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
+	await expect(page.getByText("暂无任务。")).toHaveCount(0);
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(
+		page.getByText("ignored background refresh failure"),
+	).toHaveCount(0);
+});
+
+test("admin ignores stale llm refresh errors after filter change", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 1,
+				times: 1,
+				delayMs: 600,
+			},
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=failed",
+				times: 1,
+				delayMs: 300,
+			},
+		],
+		failureRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 1,
+				times: 1,
+				message: "stale llm refresh failed",
+			},
+		],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+	await page.locator("select").last().selectOption("failed");
+
+	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
+
+	await page.waitForTimeout(700);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
+});
+
+test("admin refresh keeps scheduled runs visible", async ({ page }) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/realtime"],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("button", { name: "定时任务" }).click();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("运行记录更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载运行记录...")).toHaveCount(0);
+	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("运行记录更新中...")).toHaveCount(0);
+});
+
+test("admin refresh keeps existing jobs and llm calls visible", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/realtime", "/api/admin/jobs/llm/calls"],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("任务列表更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
+
+	await page.getByRole("button", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+
+	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
+	await expect(page.getByText("LLM 调度更新中...")).toHaveCount(0);
 });
