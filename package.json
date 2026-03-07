@@ -2,9 +2,15 @@
   "name": "octo-rill",
   "private": true,
   "type": "module",
+  "scripts": {
+    "hooks:install": "sh ./scripts/install-hooks.sh",
+    "prepare": "sh ./scripts/install-hooks.sh",
+    "test:worktree-bootstrap": "bash ./scripts/test-worktree-bootstrap.sh"
+  },
   "devDependencies": {
     "@commitlint/cli": "^19.8.1",
     "@commitlint/config-conventional": "^19.8.1",
-    "commitlint-plugin-function-rules": "^4.0.2"
+    "commitlint-plugin-function-rules": "^4.0.2",
+    "lefthook": "^2.1.2"
   }
 }

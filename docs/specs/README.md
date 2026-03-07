@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
 | s8qkn | 全用户 Star / Release 半小时定时同步闭环 | 待实现 | `s8qkn-subscription-sync/SPEC.md` | 2026-03-06 | scheduler + sync.subscriptions + log download |
 | dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-07 | PR #25; shadcn/ui 全量收口 + Storybook/e2e/spec synced |
 | x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-03-03 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health |
