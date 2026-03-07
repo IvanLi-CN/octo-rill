@@ -64,12 +64,14 @@
 - 同步脚本默认优先读取共享 Git 配置中记录的主工作区根目录，并在标准布局下回退到 Git 元数据推导；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
 - hook 安装脚本在共享 `.git/hooks` 中注入固定 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行。
+- `post-checkout` hook 必须在当前 revision 缺少同步脚本时安全跳过，避免切回历史提交或维护分支时因共享 hooks 报错。
 
 ### Edge cases / errors
 
 - 若源路径不存在：记录 `skip source missing`，继续处理清单中的其他条目。
 - 若目标已存在文件、目录或软链接：记录 `keep target exists`，不覆盖。
 - 若在主工作区执行脚本：直接记录 `skip main worktree` 并退出。
+- 若当前 checkout 缺少 `scripts/sync-worktree-resources.sh`：共享 `post-checkout` hook 必须直接 no-op，不得让 checkout 失败。
 - 若启用 `WORKTREE_SYNC_DRY_RUN=1`：只输出将执行的动作，不落盘。
 
 ## 接口契约（Interfaces & Contracts）
@@ -99,6 +101,10 @@
 - Given CI 在 macOS 与 Linux runner 上执行 smoke test  
   When 运行 worktree bootstrap 测试入口  
   Then 两个平台均通过，且测试过程不依赖当前开发机绝对路径。
+
+- Given 共享 hooks 已安装，随后 checkout 到仍保留 `lefthook.yml` 但缺少同步脚本的历史 revision  
+  When Git 触发 `post-checkout`  
+  Then hook 必须直接跳过，不得因为脚本不存在导致 checkout 失败。
 
 - Given 仓库通过 `git clone --separate-git-dir=<dir>` 初始化，且主工作区已安装 repo-local hooks  
   When 再创建 linked worktree  
@@ -154,3 +160,4 @@
 - 2026-03-06：完成 repo-local hook 安装入口、worktree bootstrap 脚本、smoke test 与 CI matrix 校验。
 - 2026-03-06：补充共享 hooks 的 `LEFTHOOK_BIN` 固定逻辑，避免全局 Lefthook 抢占。
 - 2026-03-06：补充共享 Git 配置里的主工作区根目录记录，并增加 `--separate-git-dir` smoke 覆盖。
+- 2026-03-07：补充共享 `post-checkout` hook 的历史 revision 安全跳过逻辑，并收紧 README 对 linked worktree `bun install` 行为的表述。
