@@ -12,6 +12,12 @@ import {
 	type AdminRealtimeTaskDetailResponse,
 	type AdminRealtimeTaskItem,
 	type AdminTaskEventItem,
+	type AdminTranslationBatchDetailResponse,
+	type AdminTranslationStreamEvent,
+	type AdminTranslationBatchListItem,
+	type AdminTranslationRequestDetailResponse,
+	type AdminTranslationRequestListItem,
+	type AdminTranslationStatusResponse,
 	ApiError,
 	apiCancelAdminRealtimeTask,
 	apiGetAdminLlmCallDetail,
@@ -20,6 +26,11 @@ import {
 	apiGetAdminJobsOverview,
 	apiGetAdminRealtimeTaskDetail,
 	apiGetAdminRealtimeTasks,
+	apiGetAdminTranslationBatchDetail,
+	apiGetAdminTranslationBatches,
+	apiGetAdminTranslationRequestDetail,
+	apiGetAdminTranslationRequests,
+	apiGetAdminTranslationStatus,
 	apiOpenAdminJobsEventsStream,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
@@ -1080,8 +1091,764 @@ function resolveListLoadPhase(
 	return "refreshing";
 }
 
+type TranslationStatusFilter =
+	| "all"
+	| "queued"
+	| "running"
+	| "completed"
+	| "failed";
+
+type TranslationDrawerState =
+	| { kind: "request"; id: string }
+	| { kind: "batch"; id: string }
+	| null;
+
+const TRANSLATION_STATUS_FILTER_OPTIONS: Array<{
+	value: TranslationStatusFilter;
+	label: string;
+}> = [
+	{ value: "all", label: "状态：全部" },
+	{ value: "queued", label: "状态：排队" },
+	{ value: "running", label: "状态：运行中" },
+	{ value: "completed", label: "状态：已完成" },
+	{ value: "failed", label: "状态：失败" },
+];
+
+function translationRunStatusLabel(status: string) {
+	switch (status) {
+		case "completed":
+			return "已完成";
+		case "queued":
+			return "排队中";
+		case "running":
+			return "运行中";
+		case "failed":
+			return "失败";
+		default:
+			return status;
+	}
+}
+
+function translationItemStatusLabel(status: string) {
+	switch (status) {
+		case "ready":
+			return "就绪";
+		case "disabled":
+			return "已禁用";
+		case "missing":
+			return "缺失";
+		case "error":
+			return "错误";
+		case "queued":
+			return "排队中";
+		default:
+			return status;
+	}
+}
+
+function translationRunTone(status: string): TaskStatusTone {
+	switch (status) {
+		case "completed":
+			return taskStatusTone("succeeded");
+		default:
+			return taskStatusTone(status);
+	}
+}
+
+function translationItemTone(status: string): BadgeTone {
+	switch (status) {
+		case "ready":
+			return taskStatusTone("succeeded");
+		case "disabled":
+			return taskStatusTone("canceled");
+		case "missing":
+			return taskStatusTone("queued");
+		case "error":
+			return taskStatusTone("failed");
+		case "queued":
+			return taskStatusTone("queued");
+		default:
+			return taskStatusTone(status);
+	}
+}
+
+function TranslationSchedulerSection(props: {
+	refreshNonce: number;
+	onOpenLlmCallDetail: (callId: string) => void;
+}) {
+	const { refreshNonce, onOpenLlmCallDetail } = props;
+	const [status, setStatus] = useState<AdminTranslationStatusResponse | null>(
+		null,
+	);
+	const [statusLoading, setStatusLoading] = useState(false);
+	const [requestStatusFilter, setRequestStatusFilter] =
+		useState<TranslationStatusFilter>("all");
+	const [requests, setRequests] = useState<AdminTranslationRequestListItem[]>(
+		[],
+	);
+	const [requestTotal, setRequestTotal] = useState(0);
+	const [requestPage, setRequestPage] = useState(1);
+	const [requestLoadPhase, setRequestLoadPhase] =
+		useState<ListLoadPhase>("idle");
+	const [batchStatusFilter, setBatchStatusFilter] =
+		useState<TranslationStatusFilter>("all");
+	const [batches, setBatches] = useState<AdminTranslationBatchListItem[]>([]);
+	const [batchTotal, setBatchTotal] = useState(0);
+	const [batchPage, setBatchPage] = useState(1);
+	const [batchLoadPhase, setBatchLoadPhase] = useState<ListLoadPhase>("idle");
+	const [drawer, setDrawer] = useState<TranslationDrawerState>(null);
+	const [requestDetail, setRequestDetail] =
+		useState<AdminTranslationRequestDetailResponse | null>(null);
+	const [batchDetail, setBatchDetail] =
+		useState<AdminTranslationBatchDetailResponse | null>(null);
+	const [drawerLoading, setDrawerLoading] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const requestLoadedRef = useRef(false);
+	const batchLoadedRef = useRef(false);
+	const requestTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(requestTotal / TASK_PAGE_SIZE)),
+		[requestTotal],
+	);
+	const batchTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(batchTotal / TASK_PAGE_SIZE)),
+		[batchTotal],
+	);
+	const requestsRefreshing = requestLoadPhase === "refreshing";
+	const requestsInitialLoading = requestLoadPhase === "initial";
+	const batchesRefreshing = batchLoadPhase === "refreshing";
+	const batchesInitialLoading = batchLoadPhase === "initial";
+
+	const loadStatus = useCallback(async () => {
+		setStatusLoading(true);
+		try {
+			setStatus(await apiGetAdminTranslationStatus());
+		} finally {
+			setStatusLoading(false);
+		}
+	}, []);
+
+	const loadRequests = useCallback(
+		async (background = false) => {
+			setRequestLoadPhase(
+				resolveListLoadPhase(requestLoadedRef.current, { background }),
+			);
+			try {
+				const params = new URLSearchParams();
+				if (requestStatusFilter !== "all") {
+					params.set("status", requestStatusFilter);
+				}
+				params.set("page", String(requestPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminTranslationRequests(params);
+				setRequests(res.items);
+				setRequestTotal(res.total);
+				requestLoadedRef.current = true;
+			} finally {
+				setRequestLoadPhase("idle");
+			}
+		},
+		[requestPage, requestStatusFilter],
+	);
+
+	const loadBatches = useCallback(
+		async (background = false) => {
+			setBatchLoadPhase(
+				resolveListLoadPhase(batchLoadedRef.current, { background }),
+			);
+			try {
+				const params = new URLSearchParams();
+				if (batchStatusFilter !== "all") {
+					params.set("status", batchStatusFilter);
+				}
+				params.set("page", String(batchPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminTranslationBatches(params);
+				setBatches(res.items);
+				setBatchTotal(res.total);
+				batchLoadedRef.current = true;
+			} finally {
+				setBatchLoadPhase("idle");
+			}
+		},
+		[batchPage, batchStatusFilter],
+	);
+
+	const openRequestDetail = useCallback(async (requestId: string) => {
+		setDrawer({ kind: "request", id: requestId });
+		setDrawerLoading(true);
+		setError(null);
+		try {
+			setBatchDetail(null);
+			setRequestDetail(await apiGetAdminTranslationRequestDetail(requestId));
+		} catch (err) {
+			setError(normalizeErrorMessage(err));
+		} finally {
+			setDrawerLoading(false);
+		}
+	}, []);
+
+	const openBatchDetail = useCallback(async (batchId: string) => {
+		setDrawer({ kind: "batch", id: batchId });
+		setDrawerLoading(true);
+		setError(null);
+		try {
+			setRequestDetail(null);
+			setBatchDetail(await apiGetAdminTranslationBatchDetail(batchId));
+		} catch (err) {
+			setError(normalizeErrorMessage(err));
+		} finally {
+			setDrawerLoading(false);
+		}
+	}, []);
+
+	useEffect(() => {
+		if (refreshNonce < 0) return;
+		setError(null);
+		void loadStatus().catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadStatus, refreshNonce]);
+
+	useEffect(() => {
+		setError(null);
+		void loadRequests(refreshNonce > 0).catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadRequests, refreshNonce]);
+
+	useEffect(() => {
+		setError(null);
+		void loadBatches(refreshNonce > 0).catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadBatches, refreshNonce]);
+
+	useEffect(() => {
+		if (refreshNonce < 0) return;
+		if (!drawer) {
+			setRequestDetail(null);
+			setBatchDetail(null);
+			setDrawerLoading(false);
+			return;
+		}
+		let canceled = false;
+		setDrawerLoading(true);
+		const load = async () => {
+			try {
+				if (drawer.kind === "request") {
+					const detail = await apiGetAdminTranslationRequestDetail(drawer.id);
+					if (!canceled) {
+						setRequestDetail(detail);
+						setBatchDetail(null);
+					}
+				} else {
+					const detail = await apiGetAdminTranslationBatchDetail(drawer.id);
+					if (!canceled) {
+						setBatchDetail(detail);
+						setRequestDetail(null);
+					}
+				}
+			} catch (err) {
+				if (!canceled) {
+					setError(normalizeErrorMessage(err));
+				}
+			} finally {
+				if (!canceled) {
+					setDrawerLoading(false);
+				}
+			}
+		};
+		void load();
+		return () => {
+			canceled = true;
+		};
+	}, [drawer, refreshNonce]);
+
+	return (
+		<>
+			{error ? <p className="text-destructive text-sm">{error}</p> : null}
+			<Card>
+				<CardHeader>
+					<CardTitle>翻译调度</CardTitle>
+					<CardDescription>
+						统一查看翻译请求、组批结果与关联 LLM 调用。
+					</CardDescription>
+				</CardHeader>
+				<CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+					<div className="bg-card/70 rounded-lg border p-3">
+						<p className="text-muted-foreground text-xs">调度器 / LLM</p>
+						<p className="mt-1 text-sm font-semibold">
+							{status?.scheduler_enabled ? "已启用" : "未启用"} /{" "}
+							{status?.llm_enabled ? "可翻译" : "AI未配置"}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							扫描 {formatDurationMs(status?.scan_interval_ms ?? null)}
+						</p>
+					</div>
+					<div className="bg-card/70 rounded-lg border p-3">
+						<p className="text-muted-foreground text-xs">请求 / 工作项</p>
+						<p className="mt-1 text-sm font-semibold">
+							{formatCount(status?.queued_requests)} /{" "}
+							{formatCount(status?.queued_work_items)}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							待处理请求 / 待处理 work item
+						</p>
+					</div>
+					<div className="bg-card/70 rounded-lg border p-3">
+						<p className="text-muted-foreground text-xs">运行中批次</p>
+						<p className="mt-1 text-sm font-semibold">
+							{formatCount(status?.running_batches)}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							阈值 {formatCount(status?.batch_token_threshold)} tokens
+						</p>
+					</div>
+					<div className="bg-card/70 rounded-lg border p-3">
+						<p className="text-muted-foreground text-xs">近24h 批次</p>
+						<p className="mt-1 text-sm font-semibold">
+							{formatCount(status?.completed_batches_24h)} /{" "}
+							{formatCount(status?.failed_batches_24h)}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							平均等待 {formatDurationMs(status?.avg_wait_ms_24h ?? null)}
+						</p>
+					</div>
+				</CardContent>
+			</Card>
+
+			{statusLoading && !status ? (
+				<LoadingMessage>正在加载翻译调度状态...</LoadingMessage>
+			) : null}
+
+			<div className="grid gap-4 xl:grid-cols-2">
+				<Card>
+					<CardHeader>
+						<CardTitle>翻译请求</CardTitle>
+						<CardDescription>
+							从请求方视角查看谁发起、等了多久、拿到了什么结果。
+						</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-4">
+						<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+							<FilterSelect
+								value={requestStatusFilter}
+								onValueChange={(value) => {
+									setRequestPage(1);
+									setRequestStatusFilter(value);
+								}}
+								options={TRANSLATION_STATUS_FILTER_OPTIONS}
+								placeholder="状态筛选"
+								ariaLabel="翻译请求状态筛选"
+								className="w-full sm:w-[220px]"
+							/>
+							<span className="text-muted-foreground text-xs">
+								共 {formatCount(requestTotal)} 条
+							</span>
+						</div>
+						<div className="space-y-2">
+							{requestsRefreshing ? (
+								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+									<span className="size-2 rounded-full bg-amber-500/80" />
+									翻译请求更新中...
+								</p>
+							) : null}
+							{requestsInitialLoading ? (
+								<LoadingMessage>正在加载翻译请求...</LoadingMessage>
+							) : requests.length === 0 ? (
+								<p className="text-muted-foreground text-sm">暂无翻译请求。</p>
+							) : (
+								requests.map((request) => {
+									const tone = translationRunTone(request.status);
+									return (
+										<div
+											key={request.id}
+											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+										>
+											<div className="flex flex-wrap items-center gap-2">
+												<p className="font-medium text-sm">{request.source}</p>
+												<StatusBadge
+													label={translationRunStatusLabel(request.status)}
+													tone={tone}
+												/>
+											</div>
+											<p className="text-muted-foreground truncate font-mono text-[11px]">
+												ID: {request.id}
+											</p>
+											<p className="text-muted-foreground text-xs">
+												请求人 {request.requested_by ?? "-"} · 作用域 #
+												{request.scope_user_id}
+											</p>
+											<p className="text-muted-foreground text-xs">
+												item {formatCount(request.completed_item_count)}/
+												{formatCount(request.item_count)} · 创建{" "}
+												{formatLocalHm(request.created_at)}
+											</p>
+											<div className="flex justify-end">
+												<Button
+													variant="outline"
+													size="sm"
+													onClick={() => void openRequestDetail(request.id)}
+												>
+													详情
+												</Button>
+											</div>
+										</div>
+									);
+								})
+							)}
+						</div>
+						<div className="flex items-center justify-between">
+							<p className="text-muted-foreground text-xs">
+								第 {requestPage}/{requestTotalPages} 页
+							</p>
+							<div className="flex gap-2">
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={requestPage <= 1 || requestLoadPhase !== "idle"}
+									onClick={() =>
+										setRequestPage((prev) => Math.max(1, prev - 1))
+									}
+								>
+									上一页
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={
+										requestPage >= requestTotalPages ||
+										requestLoadPhase !== "idle"
+									}
+									onClick={() =>
+										setRequestPage((prev) =>
+											Math.min(requestTotalPages, prev + 1),
+										)
+									}
+								>
+									下一页
+								</Button>
+							</div>
+						</div>
+					</CardContent>
+				</Card>
+
+				<Card>
+					<CardHeader>
+						<CardTitle>翻译批次</CardTitle>
+						<CardDescription>
+							查看为何封批、混了哪些 kind、token 预算与执行结果。
+						</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-4">
+						<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+							<FilterSelect
+								value={batchStatusFilter}
+								onValueChange={(value) => {
+									setBatchPage(1);
+									setBatchStatusFilter(value);
+								}}
+								options={TRANSLATION_STATUS_FILTER_OPTIONS}
+								placeholder="状态筛选"
+								ariaLabel="翻译批次状态筛选"
+								className="w-full sm:w-[220px]"
+							/>
+							<span className="text-muted-foreground text-xs">
+								共 {formatCount(batchTotal)} 条
+							</span>
+						</div>
+						<div className="space-y-2">
+							{batchesRefreshing ? (
+								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+									<span className="size-2 rounded-full bg-amber-500/80" />
+									翻译批次更新中...
+								</p>
+							) : null}
+							{batchesInitialLoading ? (
+								<LoadingMessage>正在加载翻译批次...</LoadingMessage>
+							) : batches.length === 0 ? (
+								<p className="text-muted-foreground text-sm">暂无翻译批次。</p>
+							) : (
+								batches.map((batch) => {
+									const tone = translationRunTone(batch.status);
+									return (
+										<div
+											key={batch.id}
+											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+										>
+											<div className="flex flex-wrap items-center gap-2">
+												<p className="font-medium text-sm">
+													{batch.trigger_reason}
+												</p>
+												<StatusBadge
+													label={translationRunStatusLabel(batch.status)}
+													tone={tone}
+												/>
+											</div>
+											<p className="text-muted-foreground truncate font-mono text-[11px]">
+												ID: {batch.id}
+											</p>
+											<p className="text-muted-foreground text-xs">
+												items {formatCount(batch.item_count)} · 预算{" "}
+												{formatCount(batch.estimated_input_tokens)} tokens
+											</p>
+											<p className="text-muted-foreground text-xs">
+												创建 {formatLocalHm(batch.created_at)} · 完成{" "}
+												{formatLocalHm(batch.finished_at)}
+											</p>
+											<div className="flex justify-end">
+												<Button
+													variant="outline"
+													size="sm"
+													onClick={() => void openBatchDetail(batch.id)}
+												>
+													详情
+												</Button>
+											</div>
+										</div>
+									);
+								})
+							)}
+						</div>
+						<div className="flex items-center justify-between">
+							<p className="text-muted-foreground text-xs">
+								第 {batchPage}/{batchTotalPages} 页
+							</p>
+							<div className="flex gap-2">
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={batchPage <= 1 || batchLoadPhase !== "idle"}
+									onClick={() => setBatchPage((prev) => Math.max(1, prev - 1))}
+								>
+									上一页
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={
+										batchPage >= batchTotalPages || batchLoadPhase !== "idle"
+									}
+									onClick={() =>
+										setBatchPage((prev) => Math.min(batchTotalPages, prev + 1))
+									}
+								>
+									下一页
+								</Button>
+							</div>
+						</div>
+					</CardContent>
+				</Card>
+			</div>
+
+			<Sheet
+				open={Boolean(drawer)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setDrawer(null);
+					}
+				}}
+			>
+				<SheetContent
+					side="right"
+					showCloseButton={false}
+					className="w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl"
+				>
+					<SheetHeader className="gap-3 border-b px-5 py-4 text-left">
+						<div className="flex items-start justify-between gap-3">
+							<div className="min-w-0 space-y-2">
+								<SheetTitle className="text-lg">
+									{drawer?.kind === "batch" ? "翻译批次详情" : "翻译请求详情"}
+								</SheetTitle>
+								<SheetDescription>
+									{drawer?.kind === "batch"
+										? "查看批次 item、错误原因与关联 LLM 调用。"
+										: "查看请求内 item 结果与 fan-out 归属。"}
+								</SheetDescription>
+							</div>
+							<Button variant="outline" onClick={() => setDrawer(null)}>
+								关闭
+							</Button>
+						</div>
+					</SheetHeader>
+					<div className="space-y-4 px-5 py-4">
+						{drawerLoading ? (
+							<LoadingMessage>正在加载详情...</LoadingMessage>
+						) : drawer?.kind === "request" && requestDetail ? (
+							<>
+								<div className="grid gap-2 md:grid-cols-2">
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">请求状态</p>
+										<p className="mt-1 font-medium">
+											{translationRunStatusLabel(requestDetail.request.status)}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">
+											来源 / 请求人
+										</p>
+										<p className="mt-1 font-medium">
+											{requestDetail.request.source}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											requested_by {requestDetail.request.requested_by ?? "-"} ·
+											scope #{requestDetail.request.scope_user_id}
+										</p>
+									</div>
+								</div>
+								<div className="space-y-2">
+									{requestDetail.items.map((item) => (
+										<div
+											key={`${item.work_item_id ?? "request-item"}:${item.producer_ref}:${item.entity_id}:${item.kind}:${item.variant}`}
+											className="rounded-lg border p-3"
+										>
+											<div className="flex flex-wrap items-center gap-2">
+												<p className="font-medium text-sm">
+													{item.kind} · {item.variant}
+												</p>
+												<StatusBadge
+													label={translationItemStatusLabel(item.status)}
+													tone={translationItemTone(item.status)}
+												/>
+											</div>
+											<p className="text-muted-foreground mt-1 text-xs">
+												entity {item.entity_id} · producer_ref{" "}
+												{item.producer_ref}
+											</p>
+											{item.title_zh || item.summary_md || item.body_md ? (
+												<div className="text-muted-foreground mt-2 space-y-1 text-xs">
+													{item.title_zh ? <p>标题：{item.title_zh}</p> : null}
+													{item.summary_md ? (
+														<p>摘要：{item.summary_md}</p>
+													) : null}
+													{item.body_md ? <p>正文：{item.body_md}</p> : null}
+												</div>
+											) : null}
+											<div className="mt-2 flex flex-wrap items-center gap-2">
+												{item.batch_id ? (
+													<Button
+														variant="outline"
+														size="sm"
+														onClick={() => void openBatchDetail(item.batch_id!)}
+													>
+														查看批次
+													</Button>
+												) : null}
+												{item.error ? (
+													<span className="text-destructive text-xs">
+														{item.error}
+													</span>
+												) : null}
+											</div>
+										</div>
+									))}
+								</div>
+							</>
+						) : drawer?.kind === "batch" && batchDetail ? (
+							<>
+								<div className="grid gap-2 md:grid-cols-2">
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">批次状态</p>
+										<p className="mt-1 font-medium">
+											{translationRunStatusLabel(batchDetail.batch.status)}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											{batchDetail.batch.trigger_reason}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">预算 / 数量</p>
+										<p className="mt-1 font-medium">
+											{formatCount(batchDetail.batch.estimated_input_tokens)}{" "}
+											tokens
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											items {formatCount(batchDetail.batch.item_count)}
+										</p>
+									</div>
+								</div>
+								<div className="space-y-2">
+									<p className="text-muted-foreground text-xs">批次条目</p>
+									{batchDetail.items.map((item) => (
+										<div
+											key={`${item.work_item_id ?? "batch-item"}:${item.entity_id}:${item.kind}:${item.variant}`}
+											className="rounded-lg border p-3"
+										>
+											<div className="flex flex-wrap items-center gap-2">
+												<p className="font-medium text-sm">
+													{item.kind} · {item.variant}
+												</p>
+												<StatusBadge
+													label={translationItemStatusLabel(item.status)}
+													tone={translationItemTone(item.status)}
+												/>
+											</div>
+											<p className="text-muted-foreground mt-1 text-xs">
+												entity {item.entity_id} · fan-out batch{" "}
+												{item.batch_id ?? "-"}
+											</p>
+											{item.error ? (
+												<p className="text-destructive mt-1 text-xs">
+													{item.error}
+												</p>
+											) : null}
+										</div>
+									))}
+								</div>
+								<div className="space-y-2 border-t pt-4">
+									<div className="flex items-center justify-between gap-2">
+										<p className="text-muted-foreground text-xs">
+											关联 LLM 调用
+										</p>
+										<span className="text-muted-foreground text-xs">
+											{formatCount(batchDetail.llm_calls.length)} 条
+										</span>
+									</div>
+									{batchDetail.llm_calls.length === 0 ? (
+										<p className="text-muted-foreground text-sm">
+											暂无关联 LLM 调用。
+										</p>
+									) : (
+										batchDetail.llm_calls.map((call) => (
+											<div key={call.id} className="rounded-lg border p-3">
+												<div className="flex flex-wrap items-center justify-between gap-2">
+													<div>
+														<p className="font-medium text-sm">{call.source}</p>
+														<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+															{call.id}
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															等待 {formatDurationMs(call.scheduler_wait_ms)} ·
+															耗时 {formatDurationMs(call.duration_ms)}
+														</p>
+													</div>
+													<Button
+														variant="outline"
+														size="sm"
+														onClick={() => onOpenLlmCallDetail(call.id)}
+													>
+														打开 LLM 详情
+													</Button>
+												</div>
+											</div>
+										))
+									)}
+								</div>
+							</>
+						) : (
+							<p className="text-muted-foreground text-sm">未找到详情数据。</p>
+						)}
+					</div>
+				</SheetContent>
+			</Sheet>
+		</>
+	);
+}
+
 export function JobManagement({ currentUserId }: JobManagementProps) {
-	const [tab, setTab] = useState<"realtime" | "scheduled" | "llm">("realtime");
+	const [tab, setTab] = useState<
+		"realtime" | "scheduled" | "llm" | "translations"
+	>("realtime");
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -1139,6 +1906,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [detailLoading, setDetailLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
+	const [refreshNonce, setRefreshNonce] = useState(0);
 
 	const overviewLoadedOnceRef = useRef(false);
 	const overviewInitialRequestInFlightRef = useRef(false);
@@ -1164,6 +1932,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const streamPendingDetailTaskIdRef = useRef<string | null>(null);
 	const streamPendingLlmRefreshRef = useRef(false);
 	const streamPendingLlmDetailCallIdRef = useRef<string | null>(null);
+	const streamPendingTranslationRefreshRef = useRef(false);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
@@ -1562,10 +2331,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		try {
 			const needFullRefresh = streamPendingFullRefreshRef.current;
 			const needLlmRefresh = streamPendingLlmRefreshRef.current;
+			const needTranslationRefresh = streamPendingTranslationRefreshRef.current;
 			const pendingDetailTaskId = streamPendingDetailTaskIdRef.current;
 			const pendingLlmDetailCallId = streamPendingLlmDetailCallIdRef.current;
 			streamPendingFullRefreshRef.current = false;
 			streamPendingLlmRefreshRef.current = false;
+			streamPendingTranslationRefreshRef.current = false;
 			streamPendingDetailTaskIdRef.current = null;
 			streamPendingLlmDetailCallIdRef.current = null;
 
@@ -1585,6 +2356,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (activeLlmDetailId) {
 					await refreshLlmDetail(activeLlmDetailId);
 				}
+				if (needTranslationRefresh) {
+					setRefreshNonce((prev) => prev + 1);
+				}
 				return;
 			}
 
@@ -1593,6 +2367,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
+			}
+
+			if (needTranslationRefresh) {
+				setRefreshNonce((prev) => prev + 1);
 			}
 
 			if (pendingDetailTaskId) {
@@ -1609,6 +2387,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			if (
 				streamPendingFullRefreshRef.current ||
 				streamPendingLlmRefreshRef.current ||
+				streamPendingTranslationRefreshRef.current ||
 				streamPendingDetailTaskIdRef.current ||
 				streamPendingLlmDetailCallIdRef.current
 			) {
@@ -1626,7 +2405,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	]);
 
 	const scheduleStreamRefresh = useCallback(
-		(mode: "all" | "detail" | "llm" | "llm_detail", id?: string) => {
+		(
+			mode: "all" | "detail" | "llm" | "llm_detail" | "translation",
+			id?: string,
+		) => {
 			if (mode === "all") {
 				streamPendingFullRefreshRef.current = true;
 				streamPendingDetailTaskIdRef.current = null;
@@ -1639,6 +2421,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			} else if (mode === "llm_detail" && id) {
 				streamPendingLlmRefreshRef.current = true;
 				streamPendingLlmDetailCallIdRef.current = id;
+			} else if (mode === "translation") {
+				streamPendingTranslationRefreshRef.current = true;
 			}
 
 			if (streamRefreshTimerRef.current !== null) {
@@ -1862,9 +2646,28 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				scheduleStreamRefresh("llm");
 			};
+			const onTranslationEvent = (evt: Event) => {
+				const message = evt as MessageEvent<string>;
+				let parsed: AdminTranslationStreamEvent | null = null;
+				try {
+					parsed = JSON.parse(message.data) as AdminTranslationStreamEvent;
+				} catch {
+					parsed = null;
+				}
+				if (!parsed) {
+					scheduleStreamRefresh("translation");
+					return;
+				}
+
+				scheduleStreamRefresh("translation");
+			};
 
 			nextSource.addEventListener("job.event", onJobEvent as EventListener);
 			nextSource.addEventListener("llm.call", onLlmCallEvent as EventListener);
+			nextSource.addEventListener(
+				"translation.event",
+				onTranslationEvent as EventListener,
+			);
 			nextSource.onopen = () => {
 				if (disposed) return;
 				setStreamStatus("connected");
@@ -1877,6 +2680,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				nextSource.removeEventListener(
 					"llm.call",
 					onLlmCallEvent as EventListener,
+				);
+				nextSource.removeEventListener(
+					"translation.event",
+					onTranslationEvent as EventListener,
 				);
 				closeSource();
 				if (disposed) return;
@@ -2040,12 +2847,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			<Tabs
 				value={tab}
 				onValueChange={(nextValue) =>
-					setTab(nextValue as "realtime" | "scheduled" | "llm")
+					setTab(nextValue as "realtime" | "scheduled" | "llm" | "translations")
 				}
 				className="space-y-4"
 			>
 				<div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-					<TabsList className="grid w-full grid-cols-3 sm:inline-flex sm:w-auto">
+					<TabsList className="grid w-full grid-cols-4 sm:inline-flex sm:w-auto">
 						<TabsTrigger value="realtime" className="font-mono text-xs">
 							实时异步任务
 						</TabsTrigger>
@@ -2055,13 +2862,19 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 						<TabsTrigger value="llm" className="font-mono text-xs">
 							LLM调度
 						</TabsTrigger>
+						<TabsTrigger value="translations" className="font-mono text-xs">
+							翻译调度
+						</TabsTrigger>
 					</TabsList>
 					<div className="flex flex-wrap items-center gap-2">
 						<Button
 							variant="secondary"
 							size="sm"
 							disabled={isRefreshingData}
-							onClick={() => void loadAll({ background: true })}
+							onClick={() => {
+								setRefreshNonce((prev) => prev + 1);
+								void loadAll({ background: true });
+							}}
 						>
 							刷新
 						</Button>
@@ -2614,6 +3427,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</div>
 						</CardContent>
 					</Card>
+				</TabsContent>
+
+				<TabsContent value="translations">
+					<TranslationSchedulerSection
+						refreshNonce={refreshNonce}
+						onOpenLlmCallDetail={(callId) => void onOpenLlmCallDetail(callId)}
+					/>
 				</TabsContent>
 			</Tabs>
 

@@ -1,14 +1,12 @@
 export class ApiError extends Error {
 	public status: number;
 	public code: string;
-
 	constructor(status: number, message: string, code = "unknown_error") {
 		super(message);
 		this.status = status;
 		this.code = code;
 	}
 }
-
 async function parseJson(res: Response) {
 	const text = await res.text();
 	if (!text) return null;
@@ -18,7 +16,6 @@ async function parseJson(res: Response) {
 		return text;
 	}
 }
-
 function toApiError(res: Response, body: unknown) {
 	if (typeof body === "object" && body && "error" in body) {
 		const payload = body as {
@@ -32,7 +29,6 @@ function toApiError(res: Response, body: unknown) {
 	}
 	return new ApiError(res.status, res.statusText);
 }
-
 export async function apiGet<T>(path: string): Promise<T> {
 	const res = await fetch(path, { credentials: "include" });
 	if (!res.ok) {
@@ -41,11 +37,9 @@ export async function apiGet<T>(path: string): Promise<T> {
 	}
 	return (await res.json()) as T;
 }
-
 export async function apiPost<T>(path: string): Promise<T> {
 	return apiPostJson<T>(path);
 }
-
 export async function apiPostJson<T>(path: string, body?: unknown): Promise<T> {
 	const res = await fetch(path, {
 		method: "POST",
@@ -58,7 +52,6 @@ export async function apiPostJson<T>(path: string, body?: unknown): Promise<T> {
 	}
 	return (await res.json()) as T;
 }
-
 export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
 	const res = await fetch(path, {
 		method: "PUT",
@@ -71,7 +64,6 @@ export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
 	}
 	return (await res.json()) as T;
 }
-
 export async function apiPatchJson<T>(
 	path: string,
 	body?: unknown,
@@ -87,13 +79,11 @@ export async function apiPatchJson<T>(
 	}
 	return (await res.json()) as T;
 }
-
 export type AdminUserProfileResponse = {
 	user_id: number;
 	daily_brief_utc_time: string;
 	last_active_at: string | null;
 };
-
 export type AdminJobsOverviewResponse = {
 	queued: number;
 	running: number;
@@ -102,7 +92,6 @@ export type AdminJobsOverviewResponse = {
 	enabled_scheduled_slots: number;
 	total_scheduled_slots: number;
 };
-
 export type AdminRealtimeTaskItem = {
 	id: string;
 	task_type: string;
@@ -117,34 +106,29 @@ export type AdminRealtimeTaskItem = {
 	finished_at: string | null;
 	updated_at: string;
 };
-
 export type AdminRealtimeTasksResponse = {
 	items: AdminRealtimeTaskItem[];
 	page: number;
 	page_size: number;
 	total: number;
 };
-
 export type AdminTaskEventItem = {
 	id: number;
 	event_type: string;
 	payload_json: string;
 	created_at: string;
 };
-
 export type AdminTaskEventMeta = {
 	returned: number;
 	total: number;
 	limit: number;
 	truncated: boolean;
 };
-
 export type AdminBusinessOutcome = {
 	code: "ok" | "partial" | "failed" | "disabled" | "unknown";
 	label: string;
 	message: string;
 };
-
 export type AdminTranslateReleaseBatchDiagnostics = {
 	target_user_id: number | null;
 	release_total: number;
@@ -166,7 +150,6 @@ export type AdminTranslateReleaseBatchDiagnostics = {
 		last_event_at: string;
 	}>;
 };
-
 export type AdminBriefDailySlotDiagnostics = {
 	hour_utc: number | null;
 	summary: {
@@ -184,13 +167,11 @@ export type AdminBriefDailySlotDiagnostics = {
 		last_event_at: string;
 	}>;
 };
-
 export type AdminBriefGenerateDiagnostics = {
 	target_user_id: number | null;
 	content_length: number | null;
 	key_date: string | null;
 };
-
 export type AdminSyncSubscriptionsDiagnostics = {
 	trigger: string | null;
 	schedule_key: string | null;
@@ -226,7 +207,6 @@ export type AdminSyncSubscriptionsDiagnostics = {
 		created_at: string;
 	}>;
 };
-
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;
 	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
@@ -234,24 +214,20 @@ export type AdminTaskDiagnostics = {
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
 	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
-
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
 	payload_json?: string | null;
 	result_json?: string | null;
 };
-
 export type AdminRealtimeTaskDetailResponse = {
 	task: AdminRealtimeTaskDetailItem;
 	events: AdminTaskEventItem[];
 	event_meta?: AdminTaskEventMeta | null;
 	diagnostics?: AdminTaskDiagnostics | null;
 };
-
 export type AdminTaskActionResponse = {
 	task_id: string;
 	status: string;
 };
-
 export type AdminJobsStreamEvent = {
 	event_id: number;
 	task_id: string;
@@ -260,7 +236,6 @@ export type AdminJobsStreamEvent = {
 	event_type: string;
 	created_at: string;
 };
-
 export type AdminLlmCallStreamEvent = {
 	event_id: number;
 	call_id: string;
@@ -271,18 +246,23 @@ export type AdminLlmCallStreamEvent = {
 	event_type: string;
 	created_at: string;
 };
-
+export type AdminTranslationStreamEvent = {
+	event_id: string;
+	resource_type: "request" | "batch";
+	resource_id: string;
+	status: string;
+	event_type: string;
+	created_at: string;
+};
 export type AdminScheduledSlotItem = {
 	hour_utc: number;
 	enabled: boolean;
 	last_dispatch_at: string | null;
 	updated_at: string;
 };
-
 export type AdminScheduledSlotsResponse = {
 	items: AdminScheduledSlotItem[];
 };
-
 export type AdminLlmSchedulerStatusResponse = {
 	scheduler_enabled: boolean;
 	request_interval_ms: number;
@@ -296,7 +276,6 @@ export type AdminLlmSchedulerStatusResponse = {
 	last_success_at: string | null;
 	last_failure_at: string | null;
 };
-
 export type AdminLlmCallItem = {
 	id: string;
 	status: string;
@@ -319,7 +298,6 @@ export type AdminLlmCallItem = {
 	finished_at: string | null;
 	updated_at: string;
 };
-
 export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
 	input_messages_json: string | null;
 	output_messages_json: string | null;
@@ -327,24 +305,20 @@ export type AdminLlmCallDetailResponse = AdminLlmCallItem & {
 	response_text: string | null;
 	error_text: string | null;
 };
-
 export type AdminLlmCallsResponse = {
 	items: AdminLlmCallItem[];
 	page: number;
 	page_size: number;
 	total: number;
 };
-
 export async function apiGetAdminUserProfile(
 	userId: number,
 ): Promise<AdminUserProfileResponse> {
 	return apiGet<AdminUserProfileResponse>(`/api/admin/users/${userId}/profile`);
 }
-
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
 }
-
 export async function apiGetAdminRealtimeTasks(
 	params: URLSearchParams,
 ): Promise<AdminRealtimeTasksResponse> {
@@ -352,7 +326,6 @@ export async function apiGetAdminRealtimeTasks(
 		`/api/admin/jobs/realtime?${params.toString()}`,
 	);
 }
-
 export async function apiGetAdminRealtimeTaskDetail(
 	taskId: string,
 ): Promise<AdminRealtimeTaskDetailResponse> {
@@ -360,11 +333,9 @@ export async function apiGetAdminRealtimeTaskDetail(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}`,
 	);
 }
-
 export function buildAdminRealtimeTaskLogDownloadPath(taskId: string): string {
 	return `/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/log`;
 }
-
 export async function apiRetryAdminRealtimeTask(
 	taskId: string,
 ): Promise<AdminTaskActionResponse> {
@@ -372,7 +343,6 @@ export async function apiRetryAdminRealtimeTask(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/retry`,
 	);
 }
-
 export async function apiCancelAdminRealtimeTask(
 	taskId: string,
 ): Promise<AdminTaskActionResponse> {
@@ -380,15 +350,12 @@ export async function apiCancelAdminRealtimeTask(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/cancel`,
 	);
 }
-
 export function apiOpenAdminJobsEventsStream(): EventSource {
 	return new EventSource("/api/admin/jobs/events", { withCredentials: true });
 }
-
 export async function apiGetAdminScheduledSlots(): Promise<AdminScheduledSlotsResponse> {
 	return apiGet<AdminScheduledSlotsResponse>("/api/admin/jobs/scheduled");
 }
-
 export async function apiPatchAdminScheduledSlot(
 	hourUtc: number,
 	enabled: boolean,
@@ -398,11 +365,9 @@ export async function apiPatchAdminScheduledSlot(
 		{ enabled },
 	);
 }
-
 export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {
 	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status");
 }
-
 export async function apiGetAdminLlmCalls(
 	params: URLSearchParams,
 ): Promise<AdminLlmCallsResponse> {
@@ -410,7 +375,6 @@ export async function apiGetAdminLlmCalls(
 		`/api/admin/jobs/llm/calls?${params.toString()}`,
 	);
 }
-
 export async function apiGetAdminLlmCallDetail(
 	callId: string,
 ): Promise<AdminLlmCallDetailResponse> {
@@ -418,14 +382,12 @@ export async function apiGetAdminLlmCallDetail(
 		`/api/admin/jobs/llm/calls/${encodeURIComponent(callId)}`,
 	);
 }
-
 export type ReleaseDetailTranslated = {
 	lang: string;
 	status: "ready" | "missing" | "disabled";
 	title: string | null;
 	summary: string | null;
 };
-
 export type ReleaseDetailResponse = {
 	release_id: string;
 	repo_full_name: string | null;
@@ -438,7 +400,6 @@ export type ReleaseDetailResponse = {
 	is_draft: number;
 	translated: ReleaseDetailTranslated | null;
 };
-
 export async function apiGetReleaseDetail(
 	releaseId: string,
 ): Promise<ReleaseDetailResponse> {
@@ -446,11 +407,223 @@ export async function apiGetReleaseDetail(
 		`/api/releases/${encodeURIComponent(releaseId)}/detail`,
 	);
 }
-
-export async function apiTranslateReleaseDetail(
-	releaseId: string,
-): Promise<ReleaseDetailTranslated> {
-	return apiPostJson<ReleaseDetailTranslated>("/api/translate/release/detail", {
-		release_id: releaseId,
+export type TranslationSourceBlock = {
+	slot: "title" | "excerpt" | "body_markdown" | "metadata";
+	text: string;
+};
+export type TranslationRequestItemInput = {
+	producer_ref: string;
+	kind: "release_summary" | "release_detail" | "notification";
+	variant: string;
+	entity_id: string;
+	target_lang: string;
+	max_wait_ms: number;
+	source_blocks: TranslationSourceBlock[];
+	target_slots: Array<"title_zh" | "summary_md" | "body_md">;
+};
+export type TranslationSubmitRequest = {
+	mode: "async" | "wait" | "stream";
+	items: TranslationRequestItemInput[];
+};
+export type TranslationResultItem = {
+	producer_ref: string;
+	entity_id: string;
+	kind: string;
+	variant: string;
+	status: "queued" | "ready" | "disabled" | "missing" | "error";
+	title_zh: string | null;
+	summary_md: string | null;
+	body_md: string | null;
+	error: string | null;
+	work_item_id: string | null;
+	batch_id: string | null;
+};
+export type TranslationRequestResponse = {
+	request_id: string;
+	status: "queued" | "running" | "completed" | "failed";
+	items?: TranslationResultItem[] | null;
+};
+export type TranslationRequestStreamEvent = {
+	event: "queued" | "batched" | "running" | "completed" | "failed";
+	request_id: string;
+	status: "queued" | "running" | "completed" | "failed";
+	batch_ids?: string[] | null;
+	items?: TranslationResultItem[] | null;
+	error?: string | null;
+};
+export type AdminTranslationStatusResponse = {
+	scheduler_enabled: boolean;
+	llm_enabled: boolean;
+	scan_interval_ms: number;
+	batch_token_threshold: number;
+	queued_requests: number;
+	queued_work_items: number;
+	running_batches: number;
+	requests_24h: number;
+	completed_batches_24h: number;
+	failed_batches_24h: number;
+	avg_wait_ms_24h: number | null;
+	last_batch_finished_at: string | null;
+};
+export type AdminTranslationRequestListItem = {
+	id: string;
+	status: string;
+	source: string;
+	requested_by: number | null;
+	scope_user_id: number;
+	item_count: number;
+	completed_item_count: number;
+	created_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	updated_at: string;
+};
+export type AdminTranslationRequestsResponse = {
+	items: AdminTranslationRequestListItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
+export type AdminTranslationRequestDetailResponse = {
+	request: AdminTranslationRequestListItem;
+	items: TranslationResultItem[];
+};
+export type AdminTranslationBatchListItem = {
+	id: string;
+	status: string;
+	trigger_reason: string;
+	item_count: number;
+	estimated_input_tokens: number;
+	created_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+	updated_at: string;
+};
+export type AdminTranslationBatchesResponse = {
+	items: AdminTranslationBatchListItem[];
+	page: number;
+	page_size: number;
+	total: number;
+};
+export type AdminTranslationLinkedLlmCall = {
+	id: string;
+	status: string;
+	source: string;
+	model: string;
+	scheduler_wait_ms: number;
+	duration_ms: number | null;
+	created_at: string;
+};
+export type AdminTranslationBatchDetailResponse = {
+	batch: AdminTranslationBatchListItem;
+	items: TranslationResultItem[];
+	llm_calls: AdminTranslationLinkedLlmCall[];
+};
+export async function apiSubmitTranslationRequest(
+	body: TranslationSubmitRequest,
+): Promise<TranslationRequestResponse> {
+	return apiPostJson<TranslationRequestResponse>(
+		"/api/translate/requests",
+		body,
+	);
+}
+export async function apiOpenTranslationRequestStream(
+	body: TranslationSubmitRequest,
+): Promise<Response> {
+	const res = await fetch("/api/translate/requests", {
+		method: "POST",
+		credentials: "include",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
 	});
+	if (!res.ok) {
+		throw toApiError(res, await parseJson(res));
+	}
+	return res;
+}
+export async function apiGetTranslationRequest(
+	requestId: string,
+): Promise<TranslationRequestResponse> {
+	return apiGet<TranslationRequestResponse>(
+		`/api/translate/requests/${encodeURIComponent(requestId)}`,
+	);
+}
+export async function apiGetAdminTranslationStatus(): Promise<AdminTranslationStatusResponse> {
+	return apiGet<AdminTranslationStatusResponse>(
+		"/api/admin/jobs/translations/status",
+	);
+}
+export async function apiGetAdminTranslationRequests(
+	params: URLSearchParams,
+): Promise<AdminTranslationRequestsResponse> {
+	return apiGet<AdminTranslationRequestsResponse>(
+		`/api/admin/jobs/translations/requests?${params.toString()}`,
+	);
+}
+export async function apiGetAdminTranslationRequestDetail(
+	requestId: string,
+): Promise<AdminTranslationRequestDetailResponse> {
+	return apiGet<AdminTranslationRequestDetailResponse>(
+		`/api/admin/jobs/translations/requests/${encodeURIComponent(requestId)}`,
+	);
+}
+export async function apiGetAdminTranslationBatches(
+	params: URLSearchParams,
+): Promise<AdminTranslationBatchesResponse> {
+	return apiGet<AdminTranslationBatchesResponse>(
+		`/api/admin/jobs/translations/batches?${params.toString()}`,
+	);
+}
+export async function apiGetAdminTranslationBatchDetail(
+	batchId: string,
+): Promise<AdminTranslationBatchDetailResponse> {
+	return apiGet<AdminTranslationBatchDetailResponse>(
+		`/api/admin/jobs/translations/batches/${encodeURIComponent(batchId)}`,
+	);
+}
+export async function apiTranslateReleaseDetail(
+	detail: ReleaseDetailResponse,
+): Promise<ReleaseDetailTranslated> {
+	const originalTitle = detail.name?.trim() || detail.tag_name;
+	const body = detail.body?.trim();
+	const metadata = [detail.repo_full_name, detail.published_at]
+		.filter((value): value is string => Boolean(value?.trim()))
+		.join("\n");
+	const source_blocks: TranslationSourceBlock[] = [
+		{ slot: "title", text: originalTitle },
+		...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
+		...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+	];
+	const response = await apiSubmitTranslationRequest({
+		mode: "wait",
+		items: [
+			{
+				producer_ref: `release_detail:${detail.release_id}`,
+				kind: "release_detail",
+				variant: "detail_card",
+				entity_id: detail.release_id,
+				target_lang: "zh-CN",
+				max_wait_ms: 5_000,
+				source_blocks,
+				target_slots: ["title_zh", "body_md"],
+			},
+		],
+	});
+	const translated = response.items?.[0];
+	if (
+		!translated ||
+		(translated.status !== "ready" && translated.status !== "disabled")
+	) {
+		throw new ApiError(
+			500,
+			translated?.error ?? "translate failed",
+			"translate_failed",
+		);
+	}
+	return {
+		lang: "zh-CN",
+		status: translated.status === "disabled" ? "disabled" : "ready",
+		title: translated.title_zh,
+		summary: translated.body_md,
+	};
 }

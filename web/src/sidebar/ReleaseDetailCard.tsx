@@ -88,7 +88,7 @@ export function ReleaseDetailCard(props: {
 		const requestReleaseId = activeDetail.release_id;
 		setTranslating(true);
 		setTranslateError(null);
-		void apiTranslateReleaseDetail(requestReleaseId)
+		void apiTranslateReleaseDetail(activeDetail)
 			.then((translated) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				setDetail((prev) => {

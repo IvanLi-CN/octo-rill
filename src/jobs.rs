@@ -785,6 +785,69 @@ struct AdminLlmCallEventStreamItem {
     created_at: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TranslationStreamCursor {
+    updated_at: String,
+    entity_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminTranslationEventStreamItem {
+    event_id: String,
+    resource_type: String,
+    resource_id: String,
+    status: String,
+    event_type: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TranslationStreamCursorRow {
+    id: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TranslationStreamRow {
+    id: String,
+    status: String,
+    updated_at: String,
+}
+
+async fn load_translation_stream_cursor(
+    pool: &sqlx::SqlitePool,
+    table_name: &str,
+) -> std::result::Result<TranslationStreamCursor, sqlx::Error> {
+    let query = format!(
+        "SELECT id, updated_at FROM {table_name} ORDER BY updated_at DESC, id DESC LIMIT 1"
+    );
+    let row = sqlx::query_as::<_, TranslationStreamCursorRow>(&query)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row
+        .map(|value| TranslationStreamCursor {
+            updated_at: value.updated_at,
+            entity_id: value.id,
+        })
+        .unwrap_or_default())
+}
+
+async fn load_translation_stream_rows(
+    pool: &sqlx::SqlitePool,
+    table_name: &str,
+    cursor: &TranslationStreamCursor,
+) -> std::result::Result<Vec<TranslationStreamRow>, sqlx::Error> {
+    let query = format!(
+        "SELECT id, status, updated_at FROM {table_name} WHERE updated_at > ? OR (updated_at = ? AND id > ?) ORDER BY updated_at ASC, id ASC LIMIT 200"
+    );
+    sqlx::query_as::<_, TranslationStreamRow>(&query)
+        .bind(cursor.updated_at.as_str())
+        .bind(cursor.updated_at.as_str())
+        .bind(cursor.entity_id.as_str())
+        .fetch_all(pool)
+        .await
+}
+
 pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
     let events = stream! {
         #[derive(Debug, sqlx::FromRow)]
@@ -821,6 +884,18 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
         .fetch_one(&state.pool)
         .await
         .unwrap_or(0);
+        let mut last_translation_request_cursor = load_translation_stream_cursor(
+            &state.pool,
+            "translation_requests",
+        )
+        .await
+        .unwrap_or_default();
+        let mut last_translation_batch_cursor = load_translation_stream_cursor(
+            &state.pool,
+            "translation_batches",
+        )
+        .await
+        .unwrap_or_default();
 
         // Emit one lightweight frame immediately so proxies/browsers can
         // complete SSE handshake and update client connection state promptly.
@@ -906,6 +981,68 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                     Event::default()
                         .id(format!("llm-{}", row.id))
                         .event("llm.call")
+                        .data(data),
+                );
+            }
+
+            let request_rows = load_translation_stream_rows(
+                &state.pool,
+                "translation_requests",
+                &last_translation_request_cursor,
+            )
+            .await
+            .unwrap_or_default();
+
+            for row in request_rows {
+                let event_id = format!("request:{}:{}", row.updated_at, row.id);
+                last_translation_request_cursor = TranslationStreamCursor {
+                    updated_at: row.updated_at.clone(),
+                    entity_id: row.id.clone(),
+                };
+                let payload = AdminTranslationEventStreamItem {
+                    event_id: event_id.clone(),
+                    resource_type: "request".to_owned(),
+                    resource_id: row.id,
+                    status: row.status,
+                    event_type: "translation.request.updated".to_owned(),
+                    created_at: row.updated_at,
+                };
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(format!("translation-{}", event_id))
+                        .event("translation.event")
+                        .data(data),
+                );
+            }
+
+            let batch_rows = load_translation_stream_rows(
+                &state.pool,
+                "translation_batches",
+                &last_translation_batch_cursor,
+            )
+            .await
+            .unwrap_or_default();
+
+            for row in batch_rows {
+                let event_id = format!("batch:{}:{}", row.updated_at, row.id);
+                last_translation_batch_cursor = TranslationStreamCursor {
+                    updated_at: row.updated_at.clone(),
+                    entity_id: row.id.clone(),
+                };
+                let payload = AdminTranslationEventStreamItem {
+                    event_id: event_id.clone(),
+                    resource_type: "batch".to_owned(),
+                    resource_id: row.id,
+                    status: row.status,
+                    event_type: "translation.batch.updated".to_owned(),
+                    created_at: row.updated_at,
+                };
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(format!("translation-{}", event_id))
+                        .event("translation.event")
                         .data(data),
                 );
             }
@@ -1026,6 +1163,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         requested_by: task.requested_by,
         parent_task_id: Some(task.id.clone()),
         parent_task_type: Some(task.task_type.clone()),
+        parent_translation_batch_id: None,
     };
     let result = ai::with_llm_call_context(
         context,
@@ -1437,7 +1575,8 @@ mod tests {
 
     use super::{
         STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS,
-        claim_next_queued_task, current_subscription_schedule_key, is_scheduled_task_type,
+        TranslationStreamCursor, claim_next_queued_task, current_subscription_schedule_key,
+        is_scheduled_task_type, load_translation_stream_cursor, load_translation_stream_rows,
     };
     use chrono::{TimeZone, Utc};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -1537,6 +1676,46 @@ mod tests {
         assert_eq!(claimed.task_type, TASK_SYNC_SUBSCRIPTIONS);
     }
 
+    #[tokio::test]
+    async fn translation_stream_cursor_defaults_for_empty_tables() {
+        let pool = setup_pool().await;
+
+        let cursor = load_translation_stream_cursor(&pool, "translation_requests")
+            .await
+            .expect("load empty translation cursor");
+
+        assert_eq!(cursor, TranslationStreamCursor::default());
+    }
+
+    #[tokio::test]
+    async fn translation_stream_rows_follow_updated_at_and_id_cursor() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        seed_translation_request(&pool, "req-1", "queued", "2026-03-07T00:00:00Z").await;
+        seed_translation_request(&pool, "req-2", "running", "2026-03-07T00:00:00Z").await;
+        seed_translation_request(&pool, "req-3", "completed", "2026-03-07T00:00:01Z").await;
+
+        let rows = load_translation_stream_rows(
+            &pool,
+            "translation_requests",
+            &TranslationStreamCursor {
+                updated_at: "2026-03-07T00:00:00Z".to_owned(),
+                entity_id: "req-1".to_owned(),
+            },
+        )
+        .await
+        .expect("load translation rows from cursor");
+
+        let ids = rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+        let statuses = rows
+            .iter()
+            .map(|row| row.status.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["req-2", "req-3"]);
+        assert_eq!(statuses, vec!["running", "completed"]);
+    }
+
     async fn setup_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1582,6 +1761,65 @@ mod tests {
             oauth,
             encryption_key,
         })
+    }
+
+    async fn seed_user(pool: &SqlitePool, id: i64, login: &str) {
+        let now = "2026-03-07T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(id)
+        .bind(40_000_000_i64 + id)
+        .bind(login)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed user");
+    }
+
+    async fn seed_translation_request(
+        pool: &SqlitePool,
+        request_id: &str,
+        status: &str,
+        updated_at: &str,
+    ) {
+        let completed_item_count = i64::from(matches!(status, "completed" | "failed"));
+        let started_at = match status {
+            "queued" => None,
+            _ => Some(updated_at),
+        };
+        let finished_at = match status {
+            "completed" | "failed" => Some(updated_at),
+            _ => None,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_requests (
+              id, mode, source, requested_by, scope_user_id, status,
+              item_count, completed_item_count, created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(request_id)
+        .bind("async")
+        .bind("feed.auto_translate")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(status)
+        .bind(1_i64)
+        .bind(completed_item_count)
+        .bind(updated_at)
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .expect("seed translation request");
     }
 
     async fn seed_task(
