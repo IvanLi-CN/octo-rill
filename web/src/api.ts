@@ -191,11 +191,48 @@ export type AdminBriefGenerateDiagnostics = {
 	key_date: string | null;
 };
 
+export type AdminSyncSubscriptionsDiagnostics = {
+	trigger: string | null;
+	schedule_key: string | null;
+	skipped: boolean;
+	skip_reason: string | null;
+	log_available: boolean;
+	log_download_path: string | null;
+	star: {
+		total_users: number;
+		succeeded_users: number;
+		failed_users: number;
+		total_repos: number;
+	};
+	release: {
+		total_repos: number;
+		succeeded_repos: number;
+		failed_repos: number;
+		candidate_failures: number;
+	};
+	releases_written: number;
+	critical_events: number;
+	recent_events: Array<{
+		id: number;
+		stage: string;
+		event_type: string;
+		severity: string;
+		recoverable: boolean;
+		attempt: number;
+		user_id: number | null;
+		repo_id: number | null;
+		repo_full_name: string | null;
+		message: string | null;
+		created_at: string;
+	}>;
+};
+
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;
 	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
 	brief_daily_slot?: AdminBriefDailySlotDiagnostics | null;
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
+	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
 
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
@@ -322,6 +359,10 @@ export async function apiGetAdminRealtimeTaskDetail(
 	return apiGet<AdminRealtimeTaskDetailResponse>(
 		`/api/admin/jobs/realtime/${encodeURIComponent(taskId)}`,
 	);
+}
+
+export function buildAdminRealtimeTaskLogDownloadPath(taskId: string): string {
+	return `/api/admin/jobs/realtime/${encodeURIComponent(taskId)}/log`;
 }
 
 export async function apiRetryAdminRealtimeTask(

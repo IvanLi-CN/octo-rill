@@ -89,6 +89,7 @@ type LlmConversationMessage = {
 	content: string;
 };
 type LlmConversationTimelineItem = {
+	key: string;
 	turn: number;
 	source: "input" | "output";
 	role: string;
@@ -232,6 +233,7 @@ function LlmCallDetailSection(props: {
 			const inputMessage = llmInputMessages[index];
 			if (inputMessage) {
 				timeline.push({
+					key: `input-${turn}-${inputMessage.role}`,
 					turn,
 					source: "input",
 					role: inputMessage.role,
@@ -241,6 +243,7 @@ function LlmCallDetailSection(props: {
 			const outputMessage = llmOutputMessages[index];
 			if (outputMessage) {
 				timeline.push({
+					key: `output-${turn}-${outputMessage.role}`,
 					turn,
 					source: "output",
 					role: outputMessage.role,
@@ -370,7 +373,7 @@ function LlmCallDetailSection(props: {
 									const tone = llmRoleTone(message.role, isAssistantOutput);
 									return (
 										<div
-											key={`timeline-${message.source}-${message.role}-${message.turn}-${index}`}
+											key={message.key}
 											className={`flex ${
 												isAssistantOutput
 													? "justify-end pl-5"
@@ -524,7 +527,9 @@ function taskStatusTone(status: string): TaskStatusTone {
 function taskTypeLabel(taskType: string) {
 	switch (taskType) {
 		case "brief.daily_slot":
-			return "定时执行任务";
+			return "定时日报";
+		case "sync.subscriptions":
+			return "订阅同步";
 		case "brief.generate":
 			return "日报生成";
 		case "sync.all":
@@ -648,6 +653,58 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 							? `收集到 ${totalReleases} 条 Release 待处理。`
 							: "任务正在收集本轮执行对象。",
 				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "star_summary") {
+			const totalUsers = readNumber(payload, "total_users");
+			const succeededUsers = readNumber(payload, "succeeded_users");
+			const failedUsers = readNumber(payload, "failed_users");
+			return {
+				title: "Star 阶段完成",
+				description:
+					totalUsers !== null
+						? `用户 ${totalUsers} · 成功 ${succeededUsers ?? "-"} · 失败 ${failedUsers ?? "-"}`
+						: "Star 阶段已输出汇总。",
+				level: failedUsers !== null && failedUsers > 0 ? "warning" : "success",
+				payload,
+			};
+		}
+		if (stage === "repo_collect") {
+			const totalRepos = readNumber(payload, "total_repos");
+			return {
+				title: "聚合仓库队列",
+				description:
+					totalRepos !== null
+						? `本轮聚合出 ${totalRepos} 个待抓取 Release 的仓库。`
+						: "已完成仓库聚合。",
+				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "release_summary") {
+			const totalRepos = readNumber(payload, "total_repos");
+			const succeededRepos = readNumber(payload, "succeeded_repos");
+			const failedRepos = readNumber(payload, "failed_repos");
+			const releasesWritten = readNumber(payload, "releases_written");
+			return {
+				title: "Release 阶段完成",
+				description:
+					totalRepos !== null
+						? `仓库 ${totalRepos} · 成功 ${succeededRepos ?? "-"} · 失败 ${failedRepos ?? "-"} · 写入 ${releasesWritten ?? "-"}`
+						: "Release 阶段已输出汇总。",
+				level: failedRepos !== null && failedRepos > 0 ? "warning" : "success",
+				payload,
+			};
+		}
+		if (stage === "skipped") {
+			const skipReason = readString(payload, "skip_reason");
+			return {
+				title: "本轮已跳过",
+				description: skipReason
+					? `定时任务未执行，原因：${skipReason}`
+					: "定时任务被跳过。",
+				level: "warning",
 				payload,
 			};
 		}
@@ -824,7 +881,10 @@ type RealtimeStatusFilter =
 type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
 
 const TASK_PAGE_SIZE = 20;
-const SCHEDULED_TASK_TYPE = "brief.daily_slot";
+const SCHEDULED_TASK_TYPES = new Set([
+	"brief.daily_slot",
+	"sync.subscriptions",
+]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
 const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
@@ -1110,7 +1170,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			try {
 				const params = new URLSearchParams();
 				params.set("status", statusFilter);
-				params.set("exclude_task_type", SCHEDULED_TASK_TYPE);
+				params.set("task_group", "realtime");
 				params.set("page", String(taskPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
 				const res = await apiGetAdminRealtimeTasks(params);
@@ -1118,9 +1178,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					return;
 				}
 				const realtimeOnlyItems = res.items.filter(
-					(task) => task.task_type !== SCHEDULED_TASK_TYPE,
+					(task) => !SCHEDULED_TASK_TYPES.has(task.task_type),
 				);
-				// Fallback for older backend versions that ignore exclude_task_type.
+				// Fallback for older backend versions that ignore task_group.
 				const realtimeTotal =
 					realtimeOnlyItems.length === res.items.length
 						? res.total
@@ -1162,15 +1222,22 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			try {
 				const params = new URLSearchParams();
 				params.set("status", scheduledRunStatusFilter);
-				params.set("task_type", SCHEDULED_TASK_TYPE);
+				params.set("task_group", "scheduled");
 				params.set("page", String(scheduledRunPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
 				const res = await apiGetAdminRealtimeTasks(params);
 				if (requestId !== scheduledRunsRequestIdRef.current) {
 					return;
 				}
-				setScheduledRuns(res.items);
-				setScheduledRunTotal(res.total);
+				const scheduledItems = res.items.filter((task) =>
+					SCHEDULED_TASK_TYPES.has(task.task_type),
+				);
+				const scheduledTotal =
+					scheduledItems.length === res.items.length
+						? res.total
+						: scheduledItems.length;
+				setScheduledRuns(scheduledItems);
+				setScheduledRunTotal(scheduledTotal);
 				scheduledRunsLoadedOnceRef.current = true;
 			} catch (err) {
 				if (requestId !== scheduledRunsRequestIdRef.current) {
