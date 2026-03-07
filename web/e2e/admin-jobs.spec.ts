@@ -932,14 +932,21 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
 	await page.getByRole("option", { name: "状态：失败" }).click();
 
-	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
-	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
-	await expect(page.getByText("job.api.translate_release")).toBeVisible();
-	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	const staleLlmCard = page
+		.getByText("ID: llm-call-2")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await expect(
+		staleLlmCard.getByRole("button", { name: "详情" }),
+	).toBeDisabled();
+	await expect(refreshButton).toBeDisabled();
 
 	await page.waitForTimeout(1300);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+	await expect(refreshButton).toBeEnabled();
 });
 
 test("admin keeps blocking loader before first realtime load completes", async ({
@@ -950,7 +957,7 @@ test("admin keeps blocking loader before first realtime load completes", async (
 		delayRules: [
 			{
 				pathname: "/api/admin/jobs/realtime",
-				search: "exclude_task_type=brief.daily_slot",
+				search: "task_group=realtime",
 				times: 1,
 				delayMs: 1200,
 			},
@@ -958,7 +965,7 @@ test("admin keeps blocking loader before first realtime load completes", async (
 		failureRules: [
 			{
 				pathname: "/api/admin/jobs/realtime",
-				search: "exclude_task_type=brief.daily_slot",
+				search: "task_group=realtime",
 				afterCount: 1,
 				times: 1,
 				message: "ignored background refresh failure",
@@ -1017,13 +1024,59 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
 	await page.getByRole("option", { name: "状态：失败" }).click();
 
-	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
-	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	const staleLlmCard = page
+		.getByText("ID: llm-call-2")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await expect(
+		staleLlmCard.getByRole("button", { name: "详情" }),
+	).toBeDisabled();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
+});
+
+test("admin keeps realtime tasks visible while status filter refreshes", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "status=running",
+				times: 1,
+				delayMs: 600,
+			},
+		],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translate.release.batch")).toBeVisible();
+	await page.getByRole("combobox", { name: "实时异步任务状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：运行中" }).click();
+
+	await expect(page.getByText("任务列表更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translate.release.batch")).toBeVisible();
+	const staleTaskCard = page
+		.getByText("ID: task-translate-batch-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await expect(
+		staleTaskCard.getByRole("button", { name: "详情" }),
+	).toBeDisabled();
+
+	await page.waitForTimeout(700);
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("translate.release.batch")).toHaveCount(0);
 });
 
 test("admin refresh keeps scheduled runs visible", async ({ page }) => {
