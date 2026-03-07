@@ -1106,7 +1106,7 @@ test("admin keeps blocking loader before first realtime load completes", async (
 		delayRules: [
 			{
 				pathname: "/api/admin/jobs/realtime",
-				search: "exclude_task_type=brief.daily_slot",
+				search: "task_group=realtime",
 				times: 1,
 				delayMs: 1200,
 			},
@@ -1114,7 +1114,7 @@ test("admin keeps blocking loader before first realtime load completes", async (
 		failureRules: [
 			{
 				pathname: "/api/admin/jobs/realtime",
-				search: "exclude_task_type=brief.daily_slot",
+				search: "task_group=realtime",
 				afterCount: 1,
 				times: 1,
 				message: "ignored background refresh failure",

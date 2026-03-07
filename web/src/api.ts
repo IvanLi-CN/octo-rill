@@ -590,7 +590,7 @@ export async function apiTranslateReleaseDetail(
 		mode: "wait",
 		items: [
 			{
-				producer_ref: detail.release_id,
+				producer_ref: `release_detail:${detail.release_id}`,
 				kind: "release_detail",
 				variant: "detail_card",
 				entity_id: detail.release_id,
