@@ -224,10 +224,20 @@ async function installAdminJobsMocks(
 	};
 
 	const emitTranslationEvents = options.emitTranslationEvents ?? false;
-	let translationIsCompleted = !emitTranslationEvents;
+	let translationEventDelivered = !emitTranslationEvents;
+	const translationViewResponseCounts = new Map<string, number>();
 
-	function buildTranslationStatus() {
-		if (translationIsCompleted) {
+	function shouldServeCompletedTranslationView(key: string) {
+		const nextCount = (translationViewResponseCounts.get(key) ?? 0) + 1;
+		translationViewResponseCounts.set(key, nextCount);
+		if (!emitTranslationEvents) {
+			return true;
+		}
+		return translationEventDelivered && nextCount > 1;
+	}
+
+	function buildTranslationStatus(completed: boolean) {
+		if (completed) {
 			return {
 				scheduler_enabled: true,
 				llm_enabled: true,
@@ -260,8 +270,8 @@ async function installAdminJobsMocks(
 		};
 	}
 
-	function buildTranslationRequests() {
-		if (translationIsCompleted) {
+	function buildTranslationRequests(completed: boolean) {
+		if (completed) {
 			return [completedTranslationRequest];
 		}
 
@@ -277,12 +287,12 @@ async function installAdminJobsMocks(
 		];
 	}
 
-	function buildTranslationRequestDetail() {
-		const [request] = buildTranslationRequests();
+	function buildTranslationRequestDetail(completed: boolean) {
+		const [request] = buildTranslationRequests(completed);
 		return {
 			request,
 			items: [
-				translationIsCompleted
+				completed
 					? completedTranslationRequestItem
 					: {
 							...completedTranslationRequestItem,
@@ -295,8 +305,8 @@ async function installAdminJobsMocks(
 		};
 	}
 
-	function buildTranslationBatches() {
-		return translationIsCompleted ? [completedTranslationBatch] : [];
+	function buildTranslationBatches(completed: boolean) {
+		return completed ? [completedTranslationBatch] : [];
 	}
 
 	function buildTranslationBatchDetail() {
@@ -500,9 +510,9 @@ async function installAdminJobsMocks(
 				"",
 			];
 
-			if (emitTranslationEvents && !translationIsCompleted) {
-				await sleep(1200);
-				translationIsCompleted = true;
+			if (emitTranslationEvents && !translationEventDelivered) {
+				await sleep(200);
+				translationEventDelivered = true;
 				streamBody.push(
 					"event: translation.event",
 					`data: ${JSON.stringify({
@@ -925,14 +935,19 @@ async function installAdminJobsMocks(
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/status"
 		) {
-			return json(route, buildTranslationStatus());
+			return json(
+				route,
+				buildTranslationStatus(shouldServeCompletedTranslationView("status")),
+			);
 		}
 
 		if (
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/requests"
 		) {
-			const requests = buildTranslationRequests();
+			const requests = buildTranslationRequests(
+				shouldServeCompletedTranslationView("requests"),
+			);
 			return json(route, {
 				items: requests,
 				page: 1,
@@ -945,14 +960,21 @@ async function installAdminJobsMocks(
 			req.method() === "GET" &&
 			pathname.startsWith("/api/admin/jobs/translations/requests/")
 		) {
-			return json(route, buildTranslationRequestDetail());
+			return json(
+				route,
+				buildTranslationRequestDetail(
+					shouldServeCompletedTranslationView("request_detail"),
+				),
+			);
 		}
 
 		if (
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/batches"
 		) {
-			const batches = buildTranslationBatches();
+			const batches = buildTranslationBatches(
+				shouldServeCompletedTranslationView("batches"),
+			);
 			return json(route, {
 				items: batches,
 				page: 1,
@@ -1356,7 +1378,24 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 	await installAdminJobsMocks(page, {
 		emitTranslationEvents: true,
 		delayRules: [
-			{ pathname: "/api/admin/jobs/events", times: 1, delayMs: 4000 },
+			{
+				pathname: "/api/admin/jobs/translations/status",
+				afterCount: 1,
+				times: 1,
+				delayMs: 1200,
+			},
+			{
+				pathname: "/api/admin/jobs/translations/requests",
+				afterCount: 1,
+				times: 1,
+				delayMs: 1200,
+			},
+			{
+				pathname: "/api/admin/jobs/translations/batches",
+				afterCount: 1,
+				times: 1,
+				delayMs: 1200,
+			},
 		],
 	});
 
