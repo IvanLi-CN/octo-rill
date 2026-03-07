@@ -65,6 +65,7 @@
 - 同步脚本默认优先读取共享 Git 配置中记录的主工作区根目录，并在标准布局下回退到 Git 元数据推导；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
 - hook 安装脚本在共享 `.git/hooks` 中优先注入仓库内解析出的 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行；若该路径失效，则回退到 hook 自带的常规 `lefthook` 发现逻辑。
+- hook 安装脚本写入 `LEFTHOOK_BIN` 时必须保持 shell-safe，避免仓库路径中的 `$` 等特殊字符在 hook 运行时被意外展开。
 - hook 安装脚本会把 repo-local `core.hooksPath` 重定向到共享 hook 目录，再执行 `lefthook install --force`，避免已有自定义 hooksPath 阻断安装或落到单个 worktree。
 - 当安装命令从 linked worktree 触发且该 worktree 的 `lefthook.yml` 增加了新的 hook 类型时，共享 wrappers 也必须按当前 worktree 的配置更新，同时继续复用主工作区的 repo-local `lefthook` 二进制。
 - `post-checkout` hook 必须在当前 revision 缺少同步脚本时安全跳过，避免切回历史提交或维护分支时因共享 hooks 报错。
@@ -76,6 +77,7 @@
 - 若在主工作区执行脚本：直接记录 `skip main worktree` 并退出。
 - 若当前 checkout 缺少 `scripts/sync-worktree-resources.sh`：共享 `post-checkout` hook 必须直接 no-op，不得让 checkout 失败。
 - 若共享 hook 中记录的 `LEFTHOOK_BIN` 已不存在：hook 必须回退到当前环境可用的 `lefthook` 发现逻辑，不得因为陈旧绝对路径导致 checkout 失败。
+- 若仓库路径包含 `$` 等 shell 特殊字符：固定到 hook 中的 `LEFTHOOK_BIN` 不得发生运行时展开，且 hook 仍须正常执行。
 - 若仓库已配置本地 `core.hooksPath`：安装入口必须仍能成功完成，并把 hooks 收敛到共享 hook 目录。
 - 若启用 `WORKTREE_SYNC_DRY_RUN=1`：只输出将执行的动作，不落盘。
 
@@ -122,6 +124,10 @@
 - Given linked worktree 的 `lefthook.yml` 新增了主工作区尚未包含的 hook 类型  
   When 在该 linked worktree 内执行 `bun install`  
   Then 共享 hook 目录必须生成对应 wrapper，且 wrapper 继续固定到主工作区的 repo-local `lefthook` 二进制。
+
+- Given 主工作区路径包含 `$` 等 shell 特殊字符  
+  When 执行 `bun install` 并触发共享 hooks  
+  Then hook 中固定的 `LEFTHOOK_BIN` 不得被 shell 展开，且 linked worktree bootstrap 仍能成功执行。
 
 - Given 仓库通过 `git clone --separate-git-dir=<dir>` 初始化，且主工作区已安装 repo-local hooks  
   When 再创建 linked worktree  
@@ -183,3 +189,4 @@
 - 2026-03-07：补充共享 hook 对失效 `LEFTHOOK_BIN` 的自动回退，并在 README 中显式标注 `macOS/Linux` 支持边界。
 - 2026-03-07：补充对 repo-local `core.hooksPath` 的共享目录收敛，避免自定义 hooksPath 阻断安装或让 hooks 漏到单个 worktree。
 - 2026-03-07：补充 linked worktree 本地 `lefthook.yml` 新增 hook 类型时的共享 wrapper 更新与 pinning 覆盖。
+- 2026-03-07：补充 `LEFTHOOK_BIN` 的 shell-safe 写入与带 `$` 路径 smoke 覆盖，避免 hook 运行时意外展开。
