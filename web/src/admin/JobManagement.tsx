@@ -1657,25 +1657,38 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 	useEffect(() => {
 		setError(null);
-		void loadRealtimeTasks().catch((err) => {
+		const options = tasksLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void loadRealtimeTasks(options).catch((err) => {
 			setError(normalizeErrorMessage(err));
 		});
 	}, [loadRealtimeTasks]);
 
 	useEffect(() => {
 		setError(null);
-		void loadScheduledRuns().catch((err) => {
+		const options = scheduledRunsLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void loadScheduledRuns(options).catch((err) => {
 			setError(normalizeErrorMessage(err));
 		});
 	}, [loadScheduledRuns]);
 
 	useEffect(() => {
 		setError(null);
-		void Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]).catch(
-			(err) => {
-				setError(normalizeErrorMessage(err));
-			},
-		);
+		const llmStatusOptions = llmStatusLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		const llmCallOptions = llmCallsLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void Promise.all([
+			loadLlmSchedulerStatus(llmStatusOptions),
+			loadLlmCalls(llmCallOptions),
+		]).catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
 	}, [loadLlmSchedulerStatus, loadLlmCalls]);
 
 	useEffect(() => {
