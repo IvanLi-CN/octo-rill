@@ -1203,12 +1203,16 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const detailEventMeta = activeTaskDetail?.event_meta ?? null;
 	const tasksInitialLoading = tasksLoadPhase === "initial";
 	const tasksRefreshing = tasksLoadPhase === "refreshing";
+	const tasksActionsDisabled = detailLoading || tasksLoadPhase !== "idle";
 	const scheduledRunsInitialLoading = scheduledRunsLoadPhase === "initial";
 	const scheduledRunsRefreshing = scheduledRunsLoadPhase === "refreshing";
+	const scheduledRunActionsDisabled =
+		detailLoading || scheduledRunsLoadPhase !== "idle";
 	const llmCallsInitialLoading = llmCallsLoadPhase === "initial";
 	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
 	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
 	const llmRefreshing = llmStatusRefreshing || llmCallsRefreshing;
+	const llmCallActionsDisabled = llmDetailLoading || llmRefreshing;
 	const isRefreshingData =
 		overviewLoading ||
 		tasksLoadPhase !== "idle" ||
@@ -2174,7 +2178,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 												<div className="flex flex-wrap gap-2">
 													<Button
 														variant="outline"
-														disabled={detailLoading}
+														disabled={tasksActionsDisabled}
 														onClick={() => void onOpenTaskDetail(task.id)}
 													>
 														详情
@@ -2182,6 +2186,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													<Button
 														variant="outline"
 														disabled={
+															tasksActionsDisabled ||
 															busy ||
 															task.status === "queued" ||
 															task.status === "running"
@@ -2193,6 +2198,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													<Button
 														variant="destructive"
 														disabled={
+															tasksActionsDisabled ||
 															busy ||
 															task.status === "succeeded" ||
 															task.status === "failed" ||
@@ -2328,7 +2334,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 												<div className="flex flex-wrap gap-2">
 													<Button
 														variant="outline"
-														disabled={detailLoading}
+														disabled={scheduledRunActionsDisabled}
 														onClick={() => void onOpenTaskDetail(task.id)}
 													>
 														详情
@@ -2336,6 +2342,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													<Button
 														variant="outline"
 														disabled={
+															scheduledRunActionsDisabled ||
 															busy ||
 															task.status === "queued" ||
 															task.status === "running"
@@ -2347,6 +2354,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 													<Button
 														variant="destructive"
 														disabled={
+															scheduledRunActionsDisabled ||
 															busy ||
 															task.status === "succeeded" ||
 															task.status === "failed" ||
@@ -2560,7 +2568,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 												<div className="flex flex-wrap gap-2">
 													<Button
 														variant="outline"
-														disabled={llmDetailLoading}
+														disabled={llmCallActionsDisabled}
 														onClick={() => void onOpenLlmCallDetail(call.id)}
 													>
 														详情
