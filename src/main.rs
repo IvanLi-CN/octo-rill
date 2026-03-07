@@ -9,6 +9,7 @@ mod jobs;
 mod server;
 mod state;
 mod sync;
+mod translations;
 mod version;
 
 use anyhow::Result;

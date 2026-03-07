@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::config::AppConfig;
 use crate::state::AppState;
-use crate::{ai, api, auth, jobs, state, version};
+use crate::{ai, api, auth, jobs, state, translations, version};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -78,6 +78,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .as_ref()
         .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
     let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
+    let translation_scheduler_abort_handle =
+        translations::spawn_translation_scheduler(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -140,6 +142,26 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/jobs/llm/calls/{call_id}",
             get(api::admin_get_llm_call_detail),
         )
+        .route(
+            "/admin/jobs/translations/status",
+            get(translations::admin_get_translation_status),
+        )
+        .route(
+            "/admin/jobs/translations/requests",
+            get(translations::admin_list_translation_requests),
+        )
+        .route(
+            "/admin/jobs/translations/requests/{request_id}",
+            get(translations::admin_get_translation_request_detail),
+        )
+        .route(
+            "/admin/jobs/translations/batches",
+            get(translations::admin_list_translation_batches),
+        )
+        .route(
+            "/admin/jobs/translations/batches/{batch_id}",
+            get(translations::admin_get_translation_batch_detail),
+        )
         .route("/reaction-token/status", get(api::reaction_token_status))
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
@@ -150,27 +172,45 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/briefs", get(api::list_briefs))
         .route("/briefs/generate", post(api::generate_brief))
         .route(
+            "/translate/requests",
+            post(translations::submit_translation_request),
+        )
+        .route(
+            "/translate/requests/{request_id}",
+            get(translations::get_translation_request),
+        )
+        .route(
+            "/translate/requests/{request_id}/stream",
+            get(translations::stream_translation_request),
+        )
+        .route(
             "/translate/releases/batch",
-            post(api::translate_releases_batch),
+            post(translations::reject_legacy_translation_routes),
         )
         .route(
             "/translate/releases/batch/stream",
-            post(api::translate_releases_batch_stream),
+            post(translations::reject_legacy_translation_routes),
         )
-        .route("/translate/release", post(api::translate_release))
+        .route(
+            "/translate/release",
+            post(translations::reject_legacy_translation_routes),
+        )
         .route(
             "/translate/release/detail/batch",
-            post(api::translate_release_detail_batch),
+            post(translations::reject_legacy_translation_routes),
         )
         .route(
             "/translate/release/detail",
-            post(api::translate_release_detail),
+            post(translations::reject_legacy_translation_routes),
         )
         .route(
             "/translate/notifications/batch",
-            post(api::translate_notifications_batch),
+            post(translations::reject_legacy_translation_routes),
         )
-        .route("/translate/notification", post(api::translate_notification))
+        .route(
+            "/translate/notification",
+            post(translations::reject_legacy_translation_routes),
+        )
         .route("/sync/starred", post(api::sync_starred))
         .route("/sync/releases", post(api::sync_releases))
         .route("/sync/notifications", post(api::sync_notifications));
@@ -210,7 +250,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
-    let mut abort_handles = vec![deletion_abort_handle, llm_call_retention_abort_handle];
+    let mut abort_handles = vec![
+        deletion_abort_handle,
+        llm_call_retention_abort_handle,
+        translation_scheduler_abort_handle,
+    ];
     if let Some(handle) = model_catalog_abort_handle {
         abort_handles.push(handle);
     }

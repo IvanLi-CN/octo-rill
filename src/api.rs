@@ -2548,6 +2548,7 @@ where
             requested_by,
             parent_task_id: None,
             parent_task_type: None,
+            parent_translation_batch_id: None,
         },
         fut,
     )
@@ -4379,31 +4380,37 @@ pub async fn toggle_release_reaction(
     }))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateReleaseRequest {
     release_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateReleasesBatchRequest {
     release_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateReleaseDetailRequest {
     release_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateReleaseDetailBatchRequest {
     release_ids: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateNotificationRequest {
     thread_id: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TranslateNotificationsBatchRequest {
     thread_ids: Vec<String>,
@@ -4411,27 +4418,28 @@ pub struct TranslateNotificationsBatchRequest {
 
 #[derive(Debug, Serialize)]
 pub struct TranslateResponse {
-    lang: String,
-    status: String, // ready | disabled
-    title: Option<String>,
-    summary: Option<String>,
+    pub lang: String,
+    pub status: String, // ready | disabled
+    pub title: Option<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct TranslateBatchResponse {
-    items: Vec<TranslateBatchItem>,
+    pub items: Vec<TranslateBatchItem>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub struct TranslateBatchItem {
-    id: String,
-    lang: String,
-    status: String, // ready | disabled | missing | error | processing(stream)
-    title: Option<String>,
-    summary: Option<String>,
-    error: Option<String>,
+    pub id: String,
+    pub lang: String,
+    pub status: String, // ready | disabled | missing | error | processing(stream)
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub error: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct TranslateBatchStreamEvent {
     event: &'static str, // item | done | error
@@ -4441,6 +4449,7 @@ struct TranslateBatchStreamEvent {
     error: Option<String>,
 }
 
+#[allow(dead_code)]
 async fn send_batch_stream_event(
     tx: &mpsc::Sender<Result<Bytes, Infallible>>,
     event: TranslateBatchStreamEvent,
@@ -4458,6 +4467,7 @@ async fn send_batch_stream_event(
     tx.send(Ok(Bytes::from(payload))).await.is_ok()
 }
 
+#[allow(dead_code)]
 fn accumulate_batch_item_stats(
     item: &TranslateBatchItem,
     ready_count: &mut usize,
@@ -4717,6 +4727,7 @@ struct BatchReleaseDetailTranslationItem {
     summary_md: String,
 }
 
+#[allow(dead_code)]
 fn parse_unique_release_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<i64>, ApiError> {
     if raw_ids.is_empty() {
         return Err(ApiError::bad_request("release_ids is required"));
@@ -4740,6 +4751,7 @@ fn parse_unique_release_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn parse_unique_thread_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<String>, ApiError> {
     if raw_ids.is_empty() {
         return Err(ApiError::bad_request("thread_ids is required"));
@@ -5666,6 +5678,7 @@ pub async fn translate_releases_batch_for_user(
     Ok(TranslateBatchResponse { items })
 }
 
+#[allow(dead_code)]
 async fn translate_releases_batch_stream_worker(
     state: Arc<AppState>,
     user_id: i64,
@@ -5683,6 +5696,7 @@ async fn translate_releases_batch_stream_worker(
         requested_by: Some(user_id),
         parent_task_id: Some(task_id.clone()),
         parent_task_type: Some(jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned()),
+        parent_translation_batch_id: None,
     };
 
     let result = ai::with_llm_call_context(context, async {
@@ -5984,6 +5998,7 @@ async fn translate_releases_batch_stream_worker(
     }
 }
 
+#[allow(dead_code)]
 pub async fn translate_releases_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6000,6 +6015,7 @@ pub async fn translate_releases_batch(
     Ok(Json(TranslateBatchResponse { items }))
 }
 
+#[allow(dead_code)]
 pub async fn translate_releases_batch_stream(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6065,6 +6081,7 @@ pub async fn translate_release_for_user(
     translate_response_from_batch_item(item)
 }
 
+#[allow(dead_code)]
 pub async fn translate_release(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6458,6 +6475,7 @@ async fn translate_release_detail_internal(
     })
 }
 
+#[allow(dead_code)]
 pub async fn translate_release_detail(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6551,6 +6569,7 @@ async fn translate_release_detail_batch_internal(
     Ok(items)
 }
 
+#[allow(dead_code)]
 pub async fn translate_release_detail_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6958,6 +6977,7 @@ async fn translate_notifications_batch_internal(
     Ok(out)
 }
 
+#[allow(dead_code)]
 pub async fn translate_notifications_batch(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -6974,6 +6994,7 @@ pub async fn translate_notifications_batch(
     Ok(Json(TranslateBatchResponse { items }))
 }
 
+#[allow(dead_code)]
 pub async fn translate_notification(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -7061,7 +7082,10 @@ struct SessionAccessRow {
     is_disabled: i64,
 }
 
-async fn require_active_user_id(state: &AppState, session: &Session) -> Result<i64, ApiError> {
+pub(crate) async fn require_active_user_id(
+    state: &AppState,
+    session: &Session,
+) -> Result<i64, ApiError> {
     let user_id = require_user_id(session).await?;
     let row = sqlx::query_as::<_, SessionAccessRow>(
         r#"
@@ -7106,7 +7130,10 @@ async fn require_active_user_id(state: &AppState, session: &Session) -> Result<i
     Ok(user_id)
 }
 
-async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i64, ApiError> {
+pub(crate) async fn require_admin_user_id(
+    state: &AppState,
+    session: &Session,
+) -> Result<i64, ApiError> {
     let user_id = require_active_user_id(state, session).await?;
     let is_admin =
         sqlx::query_scalar::<_, i64>(r#"SELECT is_admin FROM users WHERE id = ? LIMIT 1"#)
