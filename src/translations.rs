@@ -384,12 +384,7 @@ pub async fn admin_get_translation_status(
     .await
     .map_err(ApiError::internal)?
     .map(|v| v.round() as i64);
-    let last_batch_finished_at = sqlx::query_scalar::<_, Option<String>>(
-        r#"SELECT finished_at FROM translation_batches WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"#,
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let last_batch_finished_at = load_last_batch_finished_at(state.as_ref()).await?;
 
     let budget = i64::from(
         ai::compute_input_budget_with_source(state.as_ref(), TRANSLATION_BATCH_MAX_TOKENS)
@@ -2193,6 +2188,15 @@ async fn scalar_i64(state: &AppState, sql: &str, binds: &[&str]) -> Result<i64, 
         .map_err(ApiError::internal)
 }
 
+async fn load_last_batch_finished_at(state: &AppState) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar::<_, Option<String>>(
+        r#"SELECT MAX(finished_at) FROM translation_batches WHERE finished_at IS NOT NULL"#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, sync::Arc};
@@ -2369,6 +2373,18 @@ mod tests {
         };
 
         assert_eq!(derive_request_stream_phase(&detail), "running");
+    }
+
+    #[tokio::test]
+    async fn load_last_batch_finished_at_returns_none_for_empty_tables() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let last_finished = load_last_batch_finished_at(state.as_ref())
+            .await
+            .expect("load last finished batch time");
+
+        assert_eq!(last_finished, None);
     }
 
     #[test]

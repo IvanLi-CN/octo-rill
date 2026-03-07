@@ -22,6 +22,7 @@ type AdminJobsMockOptions = {
 	delayRules?: MockDelayRule[];
 	failureRules?: MockFailureRule[];
 	emitStreamEvents?: boolean;
+	emitTranslationEvents?: boolean;
 };
 
 function sleep(ms: number) {
@@ -166,58 +167,49 @@ async function installAdminJobsMocks(
 		},
 	];
 
-	const translationRequests = [
-		{
-			id: "req-translation-1",
-			status: "completed",
-			source: "feed.auto_translate",
-			requested_by: 1,
-			scope_user_id: 1,
-			item_count: 1,
-			completed_item_count: 1,
-			created_at: "2026-02-26T04:00:00Z",
-			started_at: "2026-02-26T04:00:01Z",
-			finished_at: "2026-02-26T04:00:03Z",
-			updated_at: "2026-02-26T04:00:03Z",
-		},
-	];
-
-	const translationRequestDetail = {
-		request: translationRequests[0],
-		items: [
-			{
-				producer_ref: "290978079",
-				entity_id: "290978079",
-				kind: "release_summary",
-				variant: "feed_card",
-				status: "ready",
-				title_zh: "发布说明 290978079",
-				summary_md: "- 修复了调度窗口\n- 保持整组返回",
-				body_md: null,
-				error: null,
-				work_item_id: "work-translation-1",
-				batch_id: "batch-translation-1",
-			},
-		],
+	const completedTranslationRequest = {
+		id: "req-translation-1",
+		status: "completed",
+		source: "feed.auto_translate",
+		requested_by: 1,
+		scope_user_id: 1,
+		item_count: 1,
+		completed_item_count: 1,
+		created_at: "2026-02-26T04:00:00Z",
+		started_at: "2026-02-26T04:00:01Z",
+		finished_at: "2026-02-26T04:00:03Z",
+		updated_at: "2026-02-26T04:00:03Z",
 	};
 
-	const translationBatches = [
-		{
-			id: "batch-translation-1",
-			status: "completed",
-			trigger_reason: "deadline",
-			item_count: 1,
-			estimated_input_tokens: 512,
-			created_at: "2026-02-26T04:00:01Z",
-			started_at: "2026-02-26T04:00:01Z",
-			finished_at: "2026-02-26T04:00:03Z",
-			updated_at: "2026-02-26T04:00:03Z",
-		},
-	];
+	const completedTranslationRequestItem = {
+		producer_ref: "290978079",
+		entity_id: "290978079",
+		kind: "release_summary",
+		variant: "feed_card",
+		status: "ready",
+		title_zh: "发布说明 290978079",
+		summary_md: "- 修复了调度窗口\n- 保持整组返回",
+		body_md: null,
+		error: null,
+		work_item_id: "work-translation-1",
+		batch_id: "batch-translation-1",
+	};
 
-	const translationBatchDetail = {
-		batch: translationBatches[0],
-		items: translationRequestDetail.items,
+	const completedTranslationBatch = {
+		id: "batch-translation-1",
+		status: "completed",
+		trigger_reason: "deadline",
+		item_count: 1,
+		estimated_input_tokens: 512,
+		created_at: "2026-02-26T04:00:01Z",
+		started_at: "2026-02-26T04:00:01Z",
+		finished_at: "2026-02-26T04:00:03Z",
+		updated_at: "2026-02-26T04:00:03Z",
+	};
+
+	const completedTranslationBatchDetail = {
+		batch: completedTranslationBatch,
+		items: [completedTranslationRequestItem],
 		llm_calls: [
 			{
 				id: "llm-translation-1",
@@ -230,6 +222,86 @@ async function installAdminJobsMocks(
 			},
 		],
 	};
+
+	const emitTranslationEvents = options.emitTranslationEvents ?? false;
+	let translationIsCompleted = !emitTranslationEvents;
+
+	function buildTranslationStatus() {
+		if (translationIsCompleted) {
+			return {
+				scheduler_enabled: true,
+				llm_enabled: true,
+				scan_interval_ms: 250,
+				batch_token_threshold: 1800,
+				queued_requests: 0,
+				queued_work_items: 0,
+				running_batches: 0,
+				requests_24h: 1,
+				completed_batches_24h: 1,
+				failed_batches_24h: 0,
+				avg_wait_ms_24h: 320,
+				last_batch_finished_at: "2026-02-26T04:00:03Z",
+			};
+		}
+
+		return {
+			scheduler_enabled: true,
+			llm_enabled: true,
+			scan_interval_ms: 250,
+			batch_token_threshold: 1800,
+			queued_requests: 1,
+			queued_work_items: 1,
+			running_batches: 0,
+			requests_24h: 1,
+			completed_batches_24h: 0,
+			failed_batches_24h: 0,
+			avg_wait_ms_24h: null,
+			last_batch_finished_at: null,
+		};
+	}
+
+	function buildTranslationRequests() {
+		if (translationIsCompleted) {
+			return [completedTranslationRequest];
+		}
+
+		return [
+			{
+				...completedTranslationRequest,
+				status: "queued",
+				completed_item_count: 0,
+				started_at: null,
+				finished_at: null,
+				updated_at: "2026-02-26T04:00:00Z",
+			},
+		];
+	}
+
+	function buildTranslationRequestDetail() {
+		const [request] = buildTranslationRequests();
+		return {
+			request,
+			items: [
+				translationIsCompleted
+					? completedTranslationRequestItem
+					: {
+							...completedTranslationRequestItem,
+							status: "queued",
+							title_zh: null,
+							summary_md: null,
+							batch_id: null,
+						},
+			],
+		};
+	}
+
+	function buildTranslationBatches() {
+		return translationIsCompleted ? [completedTranslationBatch] : [];
+	}
+
+	function buildTranslationBatchDetail() {
+		return completedTranslationBatchDetail;
+	}
 
 	const slots = Array.from({ length: 24 }, (_, hour) => ({
 		hour_utc: hour,
@@ -402,34 +474,64 @@ async function installAdminJobsMocks(
 				call.finished_at = "2026-02-26T03:00:01Z";
 				call.updated_at = "2026-02-26T03:00:01Z";
 			}
+
+			const streamBody = [
+				"event: job.event",
+				`data: ${JSON.stringify({
+					event_id: 9001,
+					task_id: "task-running-1",
+					task_type: "sync.releases",
+					status: "running",
+					event_type: "task.running",
+					created_at: "2026-02-26T01:00:05Z",
+				})}`,
+				"",
+				"event: llm.call",
+				`data: ${JSON.stringify({
+					event_id: 9101,
+					call_id: "llm-call-2",
+					status: "succeeded",
+					source: "api.translate_releases_batch",
+					requested_by: 1,
+					parent_task_id: null,
+					event_type: "llm.succeeded",
+					created_at: "2026-02-26T03:00:01Z",
+				})}`,
+				"",
+			];
+
+			if (emitTranslationEvents && !translationIsCompleted) {
+				await sleep(1200);
+				translationIsCompleted = true;
+				streamBody.push(
+					"event: translation.event",
+					`data: ${JSON.stringify({
+						event_id: "request:2026-02-26T04:00:03Z:req-translation-1",
+						resource_type: "request",
+						resource_id: "req-translation-1",
+						status: "completed",
+						event_type: "translation.request.updated",
+						created_at: "2026-02-26T04:00:03Z",
+					})}`,
+					"",
+					"event: translation.event",
+					`data: ${JSON.stringify({
+						event_id: "batch:2026-02-26T04:00:03Z:batch-translation-1",
+						resource_type: "batch",
+						resource_id: "batch-translation-1",
+						status: "completed",
+						event_type: "translation.batch.updated",
+						created_at: "2026-02-26T04:00:03Z",
+					})}`,
+					"",
+				);
+			}
+
+			streamBody.push("");
 			return route.fulfill({
 				status: 200,
 				contentType: "text/event-stream",
-				body: [
-					"event: job.event",
-					`data: ${JSON.stringify({
-						event_id: 9001,
-						task_id: "task-running-1",
-						task_type: "sync.releases",
-						status: "running",
-						event_type: "task.running",
-						created_at: "2026-02-26T01:00:05Z",
-					})}`,
-					"",
-					"event: llm.call",
-					`data: ${JSON.stringify({
-						event_id: 9101,
-						call_id: "llm-call-2",
-						status: "succeeded",
-						source: "api.translate_releases_batch",
-						requested_by: 1,
-						parent_task_id: null,
-						event_type: "llm.succeeded",
-						created_at: "2026-02-26T03:00:01Z",
-					})}`,
-					"",
-					"",
-				].join("\n"),
+				body: streamBody.join("\n"),
 			});
 		}
 
@@ -823,31 +925,19 @@ async function installAdminJobsMocks(
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/status"
 		) {
-			return json(route, {
-				scheduler_enabled: true,
-				llm_enabled: true,
-				scan_interval_ms: 250,
-				batch_token_threshold: 1800,
-				queued_requests: 0,
-				queued_work_items: 0,
-				running_batches: 0,
-				requests_24h: 1,
-				completed_batches_24h: 1,
-				failed_batches_24h: 0,
-				avg_wait_ms_24h: 320,
-				last_batch_finished_at: "2026-02-26T04:00:03Z",
-			});
+			return json(route, buildTranslationStatus());
 		}
 
 		if (
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/requests"
 		) {
+			const requests = buildTranslationRequests();
 			return json(route, {
-				items: translationRequests,
+				items: requests,
 				page: 1,
 				page_size: 20,
-				total: translationRequests.length,
+				total: requests.length,
 			});
 		}
 
@@ -855,18 +945,19 @@ async function installAdminJobsMocks(
 			req.method() === "GET" &&
 			pathname.startsWith("/api/admin/jobs/translations/requests/")
 		) {
-			return json(route, translationRequestDetail);
+			return json(route, buildTranslationRequestDetail());
 		}
 
 		if (
 			req.method() === "GET" &&
 			pathname === "/api/admin/jobs/translations/batches"
 		) {
+			const batches = buildTranslationBatches();
 			return json(route, {
-				items: translationBatches,
+				items: batches,
 				page: 1,
 				page_size: 20,
-				total: translationBatches.length,
+				total: batches.length,
 			});
 		}
 
@@ -874,7 +965,7 @@ async function installAdminJobsMocks(
 			req.method() === "GET" &&
 			pathname.startsWith("/api/admin/jobs/translations/batches/")
 		) {
-			return json(route, translationBatchDetail);
+			return json(route, buildTranslationBatchDetail());
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/scheduled") {
@@ -913,7 +1004,7 @@ async function installAdminJobsMocks(
 test("admin can manage jobs center", async ({ page }) => {
 	test.slow();
 	await installAdminJobsMocks(page);
-	await page.goto("/admin/jobs");
+	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
 	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
 	const scheduledTab = page.getByRole("tab", { name: "定时任务" });
@@ -1257,4 +1348,22 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 		llmDialog.getByRole("heading", { name: "LLM 调用详情" }),
 	).toBeVisible();
 	await expect(llmDialog.getByText("llm-translation-1")).toBeVisible();
+});
+
+test("admin refreshes translation scheduler via shared sse stream", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, {
+		emitTranslationEvents: true,
+		delayRules: [
+			{ pathname: "/api/admin/jobs/events", times: 1, delayMs: 4000 },
+		],
+	});
+
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click();
+	await expect(page.getByText("item 0/1")).toBeVisible();
+	await expect(page.getByText("暂无翻译批次。")).toBeVisible();
+	await expect(page.getByText("item 1/1")).toBeVisible();
+	await expect(page.getByText("deadline")).toBeVisible();
 });

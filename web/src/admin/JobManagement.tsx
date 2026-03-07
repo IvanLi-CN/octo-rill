@@ -13,6 +13,7 @@ import {
 	type AdminRealtimeTaskItem,
 	type AdminTaskEventItem,
 	type AdminTranslationBatchDetailResponse,
+	type AdminTranslationStreamEvent,
 	type AdminTranslationBatchListItem,
 	type AdminTranslationRequestDetailResponse,
 	type AdminTranslationRequestListItem,
@@ -1931,6 +1932,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const streamPendingDetailTaskIdRef = useRef<string | null>(null);
 	const streamPendingLlmRefreshRef = useRef(false);
 	const streamPendingLlmDetailCallIdRef = useRef<string | null>(null);
+	const streamPendingTranslationRefreshRef = useRef(false);
 
 	const taskTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(taskTotal / TASK_PAGE_SIZE)),
@@ -2325,10 +2327,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		try {
 			const needFullRefresh = streamPendingFullRefreshRef.current;
 			const needLlmRefresh = streamPendingLlmRefreshRef.current;
+			const needTranslationRefresh = streamPendingTranslationRefreshRef.current;
 			const pendingDetailTaskId = streamPendingDetailTaskIdRef.current;
 			const pendingLlmDetailCallId = streamPendingLlmDetailCallIdRef.current;
 			streamPendingFullRefreshRef.current = false;
 			streamPendingLlmRefreshRef.current = false;
+			streamPendingTranslationRefreshRef.current = false;
 			streamPendingDetailTaskIdRef.current = null;
 			streamPendingLlmDetailCallIdRef.current = null;
 
@@ -2348,6 +2352,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (activeLlmDetailId) {
 					await refreshLlmDetail(activeLlmDetailId);
 				}
+				if (needTranslationRefresh) {
+					setRefreshNonce((prev) => prev + 1);
+				}
 				return;
 			}
 
@@ -2356,6 +2363,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
+			}
+
+			if (needTranslationRefresh) {
+				setRefreshNonce((prev) => prev + 1);
 			}
 
 			if (pendingDetailTaskId) {
@@ -2372,6 +2383,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			if (
 				streamPendingFullRefreshRef.current ||
 				streamPendingLlmRefreshRef.current ||
+				streamPendingTranslationRefreshRef.current ||
 				streamPendingDetailTaskIdRef.current ||
 				streamPendingLlmDetailCallIdRef.current
 			) {
@@ -2389,7 +2401,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	]);
 
 	const scheduleStreamRefresh = useCallback(
-		(mode: "all" | "detail" | "llm" | "llm_detail", id?: string) => {
+		(
+			mode: "all" | "detail" | "llm" | "llm_detail" | "translation",
+			id?: string,
+		) => {
 			if (mode === "all") {
 				streamPendingFullRefreshRef.current = true;
 				streamPendingDetailTaskIdRef.current = null;
@@ -2402,6 +2417,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			} else if (mode === "llm_detail" && id) {
 				streamPendingLlmRefreshRef.current = true;
 				streamPendingLlmDetailCallIdRef.current = id;
+			} else if (mode === "translation") {
+				streamPendingTranslationRefreshRef.current = true;
 			}
 
 			if (streamRefreshTimerRef.current !== null) {
@@ -2612,9 +2629,28 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				scheduleStreamRefresh("llm");
 			};
+			const onTranslationEvent = (evt: Event) => {
+				const message = evt as MessageEvent<string>;
+				let parsed: AdminTranslationStreamEvent | null = null;
+				try {
+					parsed = JSON.parse(message.data) as AdminTranslationStreamEvent;
+				} catch {
+					parsed = null;
+				}
+				if (!parsed) {
+					scheduleStreamRefresh("translation");
+					return;
+				}
+
+				scheduleStreamRefresh("translation");
+			};
 
 			nextSource.addEventListener("job.event", onJobEvent as EventListener);
 			nextSource.addEventListener("llm.call", onLlmCallEvent as EventListener);
+			nextSource.addEventListener(
+				"translation.event",
+				onTranslationEvent as EventListener,
+			);
 			nextSource.onopen = () => {
 				if (disposed) return;
 				setStreamStatus("connected");
@@ -2627,6 +2663,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				nextSource.removeEventListener(
 					"llm.call",
 					onLlmCallEvent as EventListener,
+				);
+				nextSource.removeEventListener(
+					"translation.event",
+					onTranslationEvent as EventListener,
 				);
 				closeSource();
 				if (disposed) return;
