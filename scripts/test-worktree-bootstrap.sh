@@ -18,6 +18,7 @@ override_source="$tmp_root/override-source"
 separate_git_dir="$tmp_root/separate.git"
 separate_repo="$tmp_root/separate-repo"
 separate_worktree="$tmp_root/separate-worktree"
+legacy_repo="$tmp_root/legacy-repo"
 missing_absolute_source="$tmp_root/does-not-exist/deeper"
 mkdir -p "$fixture_repo" "$override_source"
 
@@ -64,6 +65,16 @@ assert_output_not_contains() {
     printf 'actual output:\n%s\n' "$output" >&2
     exit 1
   fi
+}
+
+assert_checkout_succeeds_without_missing_script() {
+  local repo="$1"
+  local base_sha="$2"
+  local checkout_output
+
+  checkout_output="$(git -C "$repo" checkout "$base_sha" 2>&1)"
+  assert_output_not_contains "$checkout_output" "No such file or directory"
+  assert_output_not_contains "$checkout_output" "exit status 127"
 }
 
 cp "$repo_root/package.json" "$fixture_repo/package.json"
@@ -202,5 +213,21 @@ if [[ "$separate_hook_body" == *"$separate_git_dir"* ]]; then
   echo "hook installation must not pin the shared git dir path" >&2
   exit 1
 fi
+
+mkdir -p "$legacy_repo"
+git -C "$legacy_repo" init -b main >/dev/null
+git -C "$legacy_repo" config user.name 'Codex Test'
+git -C "$legacy_repo" config user.email 'codex-test@example.com'
+cp "$repo_root/lefthook.yml" "$legacy_repo/lefthook.yml"
+git -C "$legacy_repo" add lefthook.yml
+git -C "$legacy_repo" commit -m 'test: legacy hook config' >/dev/null
+legacy_base_sha="$(git -C "$legacy_repo" rev-parse HEAD)"
+cp "$repo_root/package.json" "$legacy_repo/package.json"
+cp "$repo_root/bun.lock" "$legacy_repo/bun.lock"
+cp -R "$repo_root/scripts" "$legacy_repo/scripts"
+git -C "$legacy_repo" add package.json bun.lock scripts
+git -C "$legacy_repo" commit -m 'test: add worktree bootstrap scripts' >/dev/null
+bun install --cwd "$legacy_repo" --frozen-lockfile >/dev/null
+assert_checkout_succeeds_without_missing_script "$legacy_repo" "$legacy_base_sha"
 
 echo "worktree bootstrap smoke test passed"

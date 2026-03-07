@@ -42,4 +42,7 @@ commit-msg:
 post-checkout:
   commands:
     sync-worktree-resources:
-      run: ./scripts/sync-worktree-resources.sh {1} {2} {3}
+      run: |
+        if [ -x ./scripts/sync-worktree-resources.sh ]; then
+          ./scripts/sync-worktree-resources.sh {1} {2} {3}
+        fi
