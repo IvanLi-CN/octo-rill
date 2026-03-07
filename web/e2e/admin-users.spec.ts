@@ -1,7 +1,7 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
 type MockUser = {
-	id: number;
+	id: string;
 	github_user_id: number;
 	login: string;
 	name: string | null;
@@ -13,6 +13,9 @@ type MockUser = {
 	created_at: string;
 	updated_at: string;
 };
+
+const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
+const STANDARD_USER_ID = "3g5n8q2r4y7d9w3b";
 
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
@@ -33,7 +36,7 @@ async function installBaseMocks(
 	let currentUserIsAdmin = options.isAdmin;
 	const users: MockUser[] = [
 		{
-			id: 1,
+			id: CURRENT_USER_ID,
 			github_user_id: 10,
 			login: "octo-admin",
 			name: "Octo Admin",
@@ -46,7 +49,7 @@ async function installBaseMocks(
 			updated_at: "2026-02-24T08:00:00Z",
 		},
 		{
-			id: 2,
+			id: STANDARD_USER_ID,
 			github_user_id: 20,
 			login: "octo-user",
 			name: "Octo User",
@@ -68,7 +71,7 @@ async function installBaseMocks(
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
 				user: {
-					id: 1,
+					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "octo-admin",
 					name: "Octo Admin",
@@ -150,7 +153,7 @@ async function installBaseMocks(
 			pathname.startsWith("/api/admin/users/") &&
 			pathname.endsWith("/profile")
 		) {
-			const id = Number(pathname.split("/").at(-2));
+			const id = decodeURIComponent(pathname.split("/").at(-2) ?? "");
 			const target = users.find((u) => u.id === id);
 			if (!target) {
 				return json(
@@ -167,14 +170,14 @@ async function installBaseMocks(
 		}
 
 		if (req.method() === "PATCH" && pathname.startsWith("/api/admin/users/")) {
-			const id = Number(pathname.split("/").at(-1));
+			const id = decodeURIComponent(pathname.split("/").at(-1) ?? "");
 			const body = req.postDataJSON() as {
 				is_admin?: boolean;
 				is_disabled?: boolean;
 			};
 			if (
 				options.patchMode === "conflict_last_admin" &&
-				id === 2 &&
+				id === STANDARD_USER_ID &&
 				body.is_disabled === true
 			) {
 				return json(
@@ -199,7 +202,7 @@ async function installBaseMocks(
 			}
 			if (typeof body.is_admin === "boolean") {
 				target.is_admin = body.is_admin;
-				if (target.id === 1) {
+				if (target.id === CURRENT_USER_ID) {
 					currentUserIsAdmin = body.is_admin;
 				}
 			}

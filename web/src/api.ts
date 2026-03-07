@@ -79,8 +79,20 @@ export async function apiPatchJson<T>(
 	}
 	return (await res.json()) as T;
 }
+export type LocalUserId = string;
+export type MeResponse = {
+	user: {
+		id: LocalUserId;
+		github_user_id: number;
+		login: string;
+		name: string | null;
+		avatar_url: string | null;
+		email: string | null;
+		is_admin: boolean;
+	};
+};
 export type AdminUserProfileResponse = {
-	user_id: number;
+	user_id: LocalUserId;
 	daily_brief_utc_time: string;
 	last_active_at: string | null;
 };
@@ -97,7 +109,7 @@ export type AdminRealtimeTaskItem = {
 	task_type: string;
 	status: string;
 	source: string;
-	requested_by: number | null;
+	requested_by: LocalUserId | null;
 	parent_task_id: string | null;
 	cancel_requested: boolean;
 	error_message: string | null;
@@ -113,7 +125,7 @@ export type AdminRealtimeTasksResponse = {
 	total: number;
 };
 export type AdminTaskEventItem = {
-	id: number;
+	id: string;
 	event_type: string;
 	payload_json: string;
 	created_at: string;
@@ -130,7 +142,7 @@ export type AdminBusinessOutcome = {
 	message: string;
 };
 export type AdminTranslateReleaseBatchDiagnostics = {
-	target_user_id: number | null;
+	target_user_id: LocalUserId | null;
 	release_total: number;
 	summary: {
 		total: number;
@@ -160,7 +172,7 @@ export type AdminBriefDailySlotDiagnostics = {
 		canceled: boolean;
 	};
 	users: Array<{
-		user_id: number;
+		user_id: LocalUserId;
 		key_date: string | null;
 		state: "succeeded" | "failed" | "running";
 		error: string | null;
@@ -168,7 +180,7 @@ export type AdminBriefDailySlotDiagnostics = {
 	}>;
 };
 export type AdminBriefGenerateDiagnostics = {
-	target_user_id: number | null;
+	target_user_id: LocalUserId | null;
 	content_length: number | null;
 	key_date: string | null;
 };
@@ -194,13 +206,13 @@ export type AdminSyncSubscriptionsDiagnostics = {
 	releases_written: number;
 	critical_events: number;
 	recent_events: Array<{
-		id: number;
+		id: string;
 		stage: string;
 		event_type: string;
 		severity: string;
 		recoverable: boolean;
 		attempt: number;
-		user_id: number | null;
+		user_id: LocalUserId | null;
 		repo_id: number | null;
 		repo_full_name: string | null;
 		message: string | null;
@@ -229,7 +241,7 @@ export type AdminTaskActionResponse = {
 	status: string;
 };
 export type AdminJobsStreamEvent = {
-	event_id: number;
+	event_id: string;
 	task_id: string;
 	task_type: string;
 	status: string;
@@ -237,11 +249,11 @@ export type AdminJobsStreamEvent = {
 	created_at: string;
 };
 export type AdminLlmCallStreamEvent = {
-	event_id: number;
+	event_id: string;
 	call_id: string;
 	status: string;
 	source: string;
-	requested_by: number | null;
+	requested_by: LocalUserId | null;
 	parent_task_id: string | null;
 	event_type: string;
 	created_at: string;
@@ -281,7 +293,7 @@ export type AdminLlmCallItem = {
 	status: string;
 	source: string;
 	model: string;
-	requested_by: number | null;
+	requested_by: LocalUserId | null;
 	parent_task_id: string | null;
 	parent_task_type: string | null;
 	max_tokens: number;
@@ -312,9 +324,11 @@ export type AdminLlmCallsResponse = {
 	total: number;
 };
 export async function apiGetAdminUserProfile(
-	userId: number,
+	userId: LocalUserId,
 ): Promise<AdminUserProfileResponse> {
-	return apiGet<AdminUserProfileResponse>(`/api/admin/users/${userId}/profile`);
+	return apiGet<AdminUserProfileResponse>(
+		`/api/admin/users/${encodeURIComponent(userId)}/profile`,
+	);
 }
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
@@ -469,8 +483,8 @@ export type AdminTranslationRequestListItem = {
 	id: string;
 	status: string;
 	source: string;
-	requested_by: number | null;
-	scope_user_id: number;
+	requested_by: LocalUserId | null;
+	scope_user_id: LocalUserId;
 	item_count: number;
 	completed_item_count: number;
 	created_at: string;
