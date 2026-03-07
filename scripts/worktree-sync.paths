@@ -1,0 +1,4 @@
+# Repo-relative resources that should be copied into new linked worktrees.
+# Copy happens only when the source exists and the destination is missing.
+.env.local
+.env
