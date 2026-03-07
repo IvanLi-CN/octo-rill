@@ -19,7 +19,12 @@ separate_git_dir="$tmp_root/separate.git"
 separate_repo="$tmp_root/separate-repo"
 separate_worktree="$tmp_root/separate-worktree"
 legacy_repo="$tmp_root/legacy-repo"
+default_hooks_repo="$tmp_root/default-hooks-repo"
+default_hooks_worktree="$tmp_root/default-hooks-worktree"
 missing_absolute_source="$tmp_root/does-not-exist/deeper"
+custom_hooks_dir="$fixture_repo/custom-hooks"
+custom_checkout_marker="$tmp_root/custom-post-checkout.log"
+default_checkout_marker="$tmp_root/default-post-checkout.log"
 mkdir -p "$fixture_repo" "$override_source"
 
 canonical_path() {
@@ -35,6 +40,7 @@ cleanup() {
   set +e
   git -C "$fixture_repo" worktree remove -f "$worktree_default" >/dev/null 2>&1
   git -C "$fixture_repo" worktree remove -f "$worktree_override" >/dev/null 2>&1
+  git -C "$default_hooks_repo" worktree remove -f "$default_hooks_worktree" >/dev/null 2>&1
   git -C "$separate_repo" worktree remove -f "$separate_worktree" >/dev/null 2>&1
   rm -rf "$tmp_root"
 }
@@ -100,6 +106,12 @@ git -C "$fixture_repo" add package.json bun.lock lefthook.yml scripts
 git -C "$fixture_repo" commit -m 'test: bootstrap fixture' >/dev/null
 
 fixture_hooks_dir="$(canonical_path "$fixture_repo/.git/hooks")"
+mkdir -p "$custom_hooks_dir"
+cat > "$custom_hooks_dir/post-checkout" <<HOOK
+#!/bin/sh
+printf 'custom-post-checkout-preserved\n' >> '$custom_checkout_marker'
+HOOK
+chmod +x "$custom_hooks_dir/post-checkout"
 git -C "$fixture_repo" config --local core.hooksPath custom-hooks
 bun install --cwd "$fixture_repo" --frozen-lockfile >/dev/null
 fixture_hooks_path="$(git -C "$fixture_repo" config --local --get core.hooksPath || true)"
@@ -112,6 +124,7 @@ if [[ "$fixture_main_root" != "$fixture_repo" ]]; then
   echo "expected shared main root config for fixture repo" >&2
   exit 1
 fi
+rm -f "$custom_checkout_marker"
 
 cat > "$fixture_repo/.env.local" <<'ENVLOCAL'
 OCTORILL_ENCRYPTION_KEY_BASE64=source-local
@@ -123,8 +136,8 @@ ENVFILE
 git -C "$fixture_repo" worktree add --detach "$worktree_default" HEAD >/dev/null
 assert_file_content "$worktree_default/.env.local" "OCTORILL_ENCRYPTION_KEY_BASE64=source-local"
 assert_file_content "$worktree_default/.env" "GITHUB_CLIENT_ID=source-env"
+assert_file_content "$custom_checkout_marker" "custom-post-checkout-preserved"
 
-bun install --cwd "$worktree_default" --frozen-lockfile >/dev/null
 hook_path="$(git -C "$fixture_repo" rev-parse --git-path hooks/post-checkout)"
 if [[ "$hook_path" != /* ]]; then
   hook_path="$fixture_repo/$hook_path"
@@ -133,7 +146,17 @@ hook_body="$(cat "$hook_path")"
 assert_output_contains "$hook_body" "LEFTHOOK_BIN="
 assert_output_contains "$hook_body" "$fixture_repo"
 if [[ "$hook_body" == *"$worktree_default"* ]]; then
-  echo "hook installation must stay pinned to main worktree" >&2
+  echo "main worktree install should not pin linked worktree binary" >&2
+  exit 1
+fi
+
+bun install --cwd "$worktree_default" --frozen-lockfile >/dev/null
+hook_body="$(cat "$hook_path")"
+assert_output_contains "$hook_body" "LEFTHOOK_BIN="
+assert_output_contains "$hook_body" "$worktree_default/node_modules"
+assert_output_contains "$hook_body" "$fixture_repo/node_modules"
+if [[ "$hook_body" != *"$worktree_default/node_modules"*"$fixture_repo/node_modules"* ]]; then
+  echo "linked worktree install must prefer its own lefthook binary before the main fallback" >&2
   exit 1
 fi
 
@@ -155,9 +178,10 @@ if [[ ! -f "$post_merge_hook_path" ]]; then
 fi
 post_merge_hook_body="$(cat "$post_merge_hook_path")"
 assert_output_contains "$post_merge_hook_body" "LEFTHOOK_BIN="
-assert_output_contains "$post_merge_hook_body" "$fixture_repo"
-if [[ "$post_merge_hook_body" == *"$worktree_default/node_modules"* ]]; then
-  echo "dynamic hook installation must stay pinned to main worktree binary" >&2
+assert_output_contains "$post_merge_hook_body" "$worktree_default/node_modules"
+assert_output_contains "$post_merge_hook_body" "$fixture_repo/node_modules"
+if [[ "$post_merge_hook_body" != *"$worktree_default/node_modules"*"$fixture_repo/node_modules"* ]]; then
+  echo "dynamic hook installation must prefer the current worktree binary before the main fallback" >&2
   exit 1
 fi
 
@@ -248,6 +272,26 @@ if [[ "$separate_hook_body" == *"$separate_git_dir"* ]]; then
   echo "hook installation must not pin the shared git dir path" >&2
   exit 1
 fi
+
+mkdir -p "$default_hooks_repo"
+git -C "$default_hooks_repo" init -b main >/dev/null
+git -C "$default_hooks_repo" config user.name 'Codex Test'
+git -C "$default_hooks_repo" config user.email 'codex-test@example.com'
+cp "$repo_root/package.json" "$default_hooks_repo/package.json"
+cp "$repo_root/bun.lock" "$default_hooks_repo/bun.lock"
+cp "$repo_root/lefthook.yml" "$default_hooks_repo/lefthook.yml"
+cp -R "$repo_root/scripts" "$default_hooks_repo/scripts"
+git -C "$default_hooks_repo" add package.json bun.lock lefthook.yml scripts
+git -C "$default_hooks_repo" commit -m 'test: default hooks fixture' >/dev/null
+cat > "$default_hooks_repo/.git/hooks/post-checkout" <<HOOK
+#!/bin/sh
+printf 'default-post-checkout-preserved\n' >> '$default_checkout_marker'
+HOOK
+chmod +x "$default_hooks_repo/.git/hooks/post-checkout"
+bun install --cwd "$default_hooks_repo" --frozen-lockfile >/dev/null
+rm -f "$default_checkout_marker"
+git -C "$default_hooks_repo" worktree add --detach "$default_hooks_worktree" HEAD >/dev/null
+assert_file_content "$default_checkout_marker" "default-post-checkout-preserved"
 
 mkdir -p "$legacy_repo"
 git -C "$legacy_repo" init -b main >/dev/null
