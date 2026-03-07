@@ -759,23 +759,40 @@ test("admin can manage jobs center", async ({ page }) => {
 	await installAdminJobsMocks(page);
 	await page.goto("/admin/jobs");
 
+	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
+	const scheduledTab = page.getByRole("tab", { name: "定时任务" });
+	const llmTab = page.getByRole("tab", { name: "LLM调度" });
+
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "任务总览" })).toBeVisible();
+	await expect(realtimeTab).toHaveAttribute("aria-selected", "true");
+	await expect(
+		page.getByRole("combobox", { name: "实时异步任务状态筛选" }),
+	).toBeVisible();
+
+	const realtimeHelp = page.getByRole("button", { name: "实时异步任务说明" });
+	await realtimeHelp.hover();
+	await expect(page.getByRole("tooltip")).toContainText(
+		"监控系统内部任务，并支持重试与取消。",
+	);
 
 	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
 	await expect(page.getByText("sync.subscriptions")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
+	const taskSheet = page.getByRole("dialog", { name: "任务详情" });
+	await expect(taskSheet).toBeVisible();
 	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
-	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
 	const translateTaskCard = page
 		.getByText("ID: task-translate-batch-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
 	await translateTaskCard.getByRole("button", { name: "详情" }).click();
+	await expect(taskSheet).toBeVisible();
 	await expect(
 		page.getByText("task-translate-batch-1", { exact: true }),
 	).toBeVisible();
@@ -786,15 +803,15 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByText("Release #290978079 · error · translation failed"),
 	).toBeVisible();
-	await expect(
-		page.getByRole("button", { name: "查看 LLM 详情" }),
-	).toBeVisible();
-	const llmDetailButton = page.getByRole("button", { name: "查看 LLM 详情" });
-	await llmDetailButton.scrollIntoViewIfNeeded();
-	await llmDetailButton.evaluate((node: HTMLElement) => node.click());
-	await expect(
-		page.getByRole("heading", { name: "任务详情 · LLM 调用详情" }),
-	).toBeVisible();
+	const taskLlmDetailButton = page.getByRole("button", {
+		name: "查看 LLM 详情",
+	});
+	await taskLlmDetailButton.scrollIntoViewIfNeeded();
+	await taskLlmDetailButton.click();
+	const taskLlmSheet = page.getByRole("dialog", {
+		name: "任务详情 · LLM 调用详情",
+	});
+	await expect(taskLlmSheet).toBeVisible();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/tasks\/task-translate-batch-1\/llm\/llm-call-2$/,
 	);
@@ -802,14 +819,24 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByText("来源：api.translate_releases_batch"),
 	).toBeVisible();
 	await page.getByRole("button", { name: "返回任务详情" }).click();
+	await expect(taskSheet).toBeVisible();
 	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-translate-batch-1$/);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
-	await page.getByRole("button", { name: "定时任务" }).click();
+	await scheduledTab.click();
+	await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
+	await expect(
+		page.getByRole("combobox", { name: "定时任务状态筛选" }),
+	).toBeVisible();
 	await expect(page.getByText("运行记录")).toBeVisible();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("订阅同步")).toBeVisible();
 	await expect(page.getByText("sync.subscriptions")).toBeVisible();
-	await expect(page.getByText("brief.daily_slot")).toBeVisible();
+	await expect(
+		page.getByText("brief.daily_slot", { exact: true }),
+	).toBeVisible();
 	const subscriptionTaskCard = page
 		.getByText("ID: task-subscriptions-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
@@ -823,14 +850,29 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await llmTab.click();
+	await expect(llmTab).toHaveAttribute("aria-selected", "true");
 	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	await expect(page.getByText("Token 输入/输出/缓存").first()).toBeVisible();
-	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(
-		page.getByRole("heading", { name: "LLM 调用详情" }),
+		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
 	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
+	).toBeVisible();
+	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await page
+		.getByRole("textbox", { name: "LLM 调用来源筛选" })
+		.fill("job.api.translate_release");
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+
+	const llmCallCard = page
+		.getByText("ID: llm-call-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await llmCallCard.getByRole("button", { name: "详情" }).click();
+	const llmSheet = page.getByRole("dialog", { name: "LLM 调用详情" });
+	await expect(llmSheet).toBeVisible();
 	await expect(page.getByText("Conversation Timeline")).toBeVisible();
 	await expect(page.getByText("Input Messages")).toHaveCount(0);
 	await expect(page.getByText("耗时 / 重试")).toBeVisible();
@@ -840,6 +882,7 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(llmSheet).toHaveCount(0);
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
@@ -851,7 +894,7 @@ test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
@@ -882,11 +925,12 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
-	await page.locator("select").last().selectOption("failed");
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
 
 	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
@@ -967,10 +1011,11 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
-	await page.locator("select").last().selectOption("failed");
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
 
 	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
@@ -990,7 +1035,7 @@ test("admin refresh keeps scheduled runs visible", async ({ page }) => {
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "定时任务" }).click();
+	await page.getByRole("tab", { name: "定时任务" }).click();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
@@ -1023,7 +1068,7 @@ test("admin refresh keeps existing jobs and llm calls visible", async ({
 	await expect(page.getByText("任务列表更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);

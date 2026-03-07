@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
 
+import type { UserManagementStoryState } from "@/admin/UserManagement";
 import type { AdminUserItem } from "@/admin/UserManagement";
 import { AdminPanel } from "@/pages/AdminPanel";
 
@@ -46,7 +47,11 @@ const mockAdminUsers: AdminUserItem[] = [
 	},
 ];
 
-function AdminPanelPreview() {
+type AdminPanelPreviewProps = {
+	storyState?: UserManagementStoryState;
+};
+
+function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 	const [ready, setReady] = useState(false);
 
 	useEffect(() => {
@@ -192,6 +197,7 @@ function AdminPanelPreview() {
 					is_admin: true,
 				},
 			}}
+			userManagementStoryState={storyState}
 		/>
 	);
 }
@@ -208,3 +214,30 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const Filtered: Story = {
+	args: {
+		storyState: {
+			queryInput: "octo",
+			query: "octo",
+			role: "user",
+			status: "enabled",
+		},
+	},
+};
+
+export const ProfileSheetOpen: Story = {
+	args: {
+		storyState: {
+			profileUserId: 2,
+		},
+	},
+};
+
+export const AdminConfirmOpen: Story = {
+	args: {
+		storyState: {
+			pendingAdminConfirmUserId: 2,
+		},
+	},
+};

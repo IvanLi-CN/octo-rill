@@ -1,4 +1,7 @@
-import { UserManagement } from "@/admin/UserManagement";
+import {
+	UserManagement,
+	type UserManagementStoryState,
+} from "@/admin/UserManagement";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -15,8 +18,11 @@ type MeResponse = {
 	};
 };
 
-export function AdminPanel(props: { me: MeResponse }) {
-	const { me } = props;
+export function AdminPanel(props: {
+	me: MeResponse;
+	userManagementStoryState?: UserManagementStoryState;
+}) {
+	const { me, userManagementStoryState } = props;
 
 	return (
 		<AppShell
@@ -27,7 +33,10 @@ export function AdminPanel(props: { me: MeResponse }) {
 				<p className="text-muted-foreground text-sm">
 					这是独立的管理员界面，当前包含用户管理与任务中心两个模块。
 				</p>
-				<UserManagement currentUserId={me.user.id} />
+				<UserManagement
+					currentUserId={me.user.id}
+					storyState={userManagementStoryState}
+				/>
 			</div>
 		</AppShell>
 	);

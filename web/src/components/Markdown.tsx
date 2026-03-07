@@ -2,6 +2,14 @@ import { normalizeReleaseId } from "@/lib/releaseId";
 import { cn } from "@/lib/utils";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/components/ui/table";
 
 function parseInternalReleaseLink(href: string | undefined): string | null {
 	if (!href) return null;
@@ -78,16 +86,15 @@ function buildMarkdownComponents(
 			</blockquote>
 		),
 		table: ({ children }) => (
-			<div className="overflow-x-auto">
-				<table className="w-full border-collapse text-left text-sm">
-					{children}
-				</table>
+			<div className="overflow-x-auto rounded-md border">
+				<Table>{children}</Table>
 			</div>
 		),
-		th: ({ children }) => (
-			<th className="border-b px-2 py-1 font-semibold">{children}</th>
-		),
-		td: ({ children }) => <td className="border-b px-2 py-1">{children}</td>,
+		thead: ({ children }) => <TableHeader>{children}</TableHeader>,
+		tbody: ({ children }) => <TableBody>{children}</TableBody>,
+		tr: ({ children }) => <TableRow>{children}</TableRow>,
+		th: ({ children }) => <TableHead>{children}</TableHead>,
+		td: ({ children }) => <TableCell>{children}</TableCell>,
 	};
 }
 
