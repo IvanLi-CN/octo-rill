@@ -22,6 +22,28 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
+async function installFrozenNow(page: Page, isoString: string) {
+	const fixedTime = new Date(isoString).getTime();
+	await page.addInitScript((time) => {
+		const RealDate = Date;
+		function MockDate(this: Date, ...args: unknown[]) {
+			if (!new.target) {
+				return new RealDate(time).toString();
+			}
+			if (args.length === 0) {
+				return new RealDate(time);
+			}
+			return Reflect.construct(RealDate, args) as Date;
+		}
+		MockDate.UTC = RealDate.UTC;
+		MockDate.parse = RealDate.parse;
+		MockDate.now = () => time;
+		MockDate.prototype = RealDate.prototype;
+		Object.setPrototypeOf(MockDate, RealDate);
+		window.Date = MockDate as unknown as DateConstructor;
+	}, fixedTime);
+}
+
 async function installBaseMocks(
 	page: Page,
 	options: {
@@ -250,7 +272,9 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await userRow.getByRole("button", { name: "详情" }).click();
 	const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 	await expect(profileSheet).toBeVisible();
-	await expect(profileSheet.getByText("日报时间（本地时区）")).toBeVisible();
+	await expect(
+		profileSheet.getByText("日报时间（浏览器当前时区）"),
+	).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(profileSheet).toHaveCount(0);
 	await userRow.getByRole("button", { name: "设为管理员" }).click();
@@ -324,4 +348,62 @@ test("non-admin user cannot stay on admin route", async ({ page }) => {
 	await expect(page).toHaveURL("/");
 	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toHaveCount(0);
+});
+
+test.describe("daily brief time formatting", () => {
+	test.describe("DST browser timezone", () => {
+		test.use({ timezoneId: "America/New_York" });
+
+		test("daily brief time uses the current browser DST offset", async ({
+			page,
+		}) => {
+			await installFrozenNow(page, "2026-07-15T12:00:00Z");
+			await installBaseMocks(page, { isAdmin: true });
+			await page.goto("/");
+
+			await page.getByRole("link", { name: "管理员面板" }).click();
+			const userRow = page
+				.getByText("octo-user", { exact: false })
+				.first()
+				.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+			await userRow.getByRole("button", { name: "详情" }).click();
+
+			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
+			await expect(
+				profileSheet.getByText("日报时间（浏览器当前时区）"),
+			).toBeVisible();
+			await expect(
+				profileSheet.getByText("04:00", { exact: true }),
+			).toBeVisible();
+			await expect(profileSheet.getByText("UTC 原值：08:00")).toBeVisible();
+		});
+	});
+
+	test.describe("fixed-offset browser timezone", () => {
+		test.use({ timezoneId: "Asia/Shanghai" });
+
+		test("daily brief time stays correct in a non-DST timezone", async ({
+			page,
+		}) => {
+			await installFrozenNow(page, "2026-07-15T12:00:00Z");
+			await installBaseMocks(page, { isAdmin: true });
+			await page.goto("/");
+
+			await page.getByRole("link", { name: "管理员面板" }).click();
+			const userRow = page
+				.getByText("octo-user", { exact: false })
+				.first()
+				.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+			await userRow.getByRole("button", { name: "详情" }).click();
+
+			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
+			await expect(
+				profileSheet.getByText("日报时间（浏览器当前时区）"),
+			).toBeVisible();
+			await expect(
+				profileSheet.getByText("16:00", { exact: true }),
+			).toBeVisible();
+			await expect(profileSheet.getByText("UTC 原值：08:00")).toBeVisible();
+		});
+	});
 });
