@@ -1587,27 +1587,33 @@ async fn refresh_requests_after_completion(
         if counts.is_none() {
             continue;
         }
-        let total = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM translation_request_items WHERE request_id = ?"#,
+        let (total, completed, failures): (i64, i64, i64) = sqlx::query_as(
+            r#"
+            SELECT
+              COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN result_status IS NOT NULL THEN 1 ELSE 0 END), 0) AS completed,
+              COALESCE(SUM(CASE WHEN result_status IN ('error', 'missing') THEN 1 ELSE 0 END), 0) AS failures
+            FROM translation_request_items
+            WHERE request_id = ?
+            "#,
         )
         .bind(request_id.as_str())
         .fetch_one(&mut **tx)
         .await?;
-        let completed = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM translation_request_items WHERE request_id = ? AND result_status IS NOT NULL"#,
-        )
-        .bind(request_id.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
-        let status = if completed >= total {
-            "completed"
-        } else {
+        let status = if completed < total {
             "running"
+        } else if failures > 0 {
+            "failed"
+        } else {
+            "completed"
         };
         sqlx::query(
             r#"
             UPDATE translation_requests
-            SET status = ?, completed_item_count = ?, finished_at = CASE WHEN ? = 'completed' THEN ? ELSE finished_at END, updated_at = ?
+            SET status = ?,
+                completed_item_count = ?,
+                finished_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE finished_at END,
+                updated_at = ?
             WHERE id = ?
             "#,
         )
@@ -1909,19 +1915,13 @@ fn detail_to_public_response(detail: LoadedRequestDetail) -> TranslationRequestR
 }
 
 fn derive_request_stream_phase(detail: &LoadedRequestDetail) -> String {
-    if detail.request.status == "completed" {
-        return "completed".to_owned();
+    match detail.request.status.as_str() {
+        "completed" => "completed".to_owned(),
+        "failed" => "failed".to_owned(),
+        "running" => "running".to_owned(),
+        _ if detail.items.iter().any(|item| item.batch_id.is_some()) => "batched".to_owned(),
+        _ => "queued".to_owned(),
     }
-    if detail.request.status == "failed" {
-        return "failed".to_owned();
-    }
-    if detail.items.iter().any(|item| item.batch_id.is_some()) {
-        if detail.items.iter().any(|item| item.status == "queued") {
-            return "batched".to_owned();
-        }
-        return "running".to_owned();
-    }
-    "queued".to_owned()
 }
 
 fn normalize_mode(raw: &str) -> Result<&'static str, ApiError> {
@@ -2070,18 +2070,36 @@ fn estimate_item_tokens(item: &TranslationRequestItemInput) -> u32 {
 }
 
 fn derive_request_source(items: &[TranslationRequestItemInput]) -> String {
-    items
-        .first()
-        .map(|item| {
-            item.producer_ref
-                .split(':')
-                .next()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("translation")
-                .to_owned()
-        })
-        .unwrap_or_else(|| "translation".to_owned())
+    let sources = items
+        .iter()
+        .filter_map(derive_item_source)
+        .collect::<HashSet<_>>();
+    match sources.len() {
+        0 => "translation".to_owned(),
+        1 => sources
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "translation".to_owned()),
+        _ => "mixed".to_owned(),
+    }
+}
+
+fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
+    if let Some(source) = item
+        .producer_ref
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        return Some(source.to_owned());
+    }
+    match (item.kind.as_str(), item.variant.as_str()) {
+        ("release_summary", "feed_card") => Some("feed.auto_translate".to_owned()),
+        ("release_detail", _) => Some("release_detail".to_owned()),
+        ("notification", _) => Some("notification".to_owned()),
+        _ => Some(item.kind.clone()),
+    }
 }
 
 fn current_model_profile() -> String {
@@ -2280,9 +2298,115 @@ mod tests {
         assert_eq!(task_count, 0);
     }
 
+    #[tokio::test]
+    async fn refresh_requests_marks_terminal_errors_as_failed() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("123");
+        let request_id =
+            create_translation_request(state.as_ref(), 1, "async", std::slice::from_ref(&item))
+                .await
+                .expect("request created");
+        let now = Utc::now().to_rfc3339();
+        let mut tx = pool.begin().await.expect("begin tx");
+        sqlx::query(
+            r#"
+            UPDATE translation_request_items
+            SET result_status = 'error', error_text = 'boom', updated_at = ?
+            WHERE request_id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(request_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("mark request item failed");
+        refresh_requests_after_completion(&mut tx, vec![request_id.clone()], now.as_str())
+            .await
+            .expect("refresh request status");
+        tx.commit().await.expect("commit tx");
+
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+
+        assert_eq!(request_status, "failed");
+    }
+
+    #[test]
+    fn derive_request_stream_phase_uses_running_request_status() {
+        let detail = LoadedRequestDetail {
+            request: AdminTranslationRequestListItem {
+                id: "req-1".to_owned(),
+                status: "running".to_owned(),
+                source: "feed.auto_translate".to_owned(),
+                requested_by: Some(1),
+                scope_user_id: 1,
+                item_count: 1,
+                completed_item_count: 0,
+                created_at: "2026-03-07T00:00:00Z".to_owned(),
+                started_at: Some("2026-03-07T00:00:01Z".to_owned()),
+                finished_at: None,
+                updated_at: "2026-03-07T00:00:01Z".to_owned(),
+            },
+            items: vec![TranslationResultItem {
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                entity_id: "123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                status: "queued".to_owned(),
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error: None,
+                work_item_id: Some("work-1".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
+            }],
+        };
+
+        assert_eq!(derive_request_stream_phase(&detail), "running");
+    }
+
+    #[test]
+    fn derive_request_source_falls_back_to_kind_mapping() {
+        let feed_item = TranslationRequestItemInput {
+            producer_ref: "123".to_owned(),
+            kind: "release_summary".to_owned(),
+            variant: "feed_card".to_owned(),
+            entity_id: "123".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 1000,
+            source_blocks: vec![TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "hello".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+        let detail_item = TranslationRequestItemInput {
+            producer_ref: "456".to_owned(),
+            kind: "release_detail".to_owned(),
+            variant: "detail_card".to_owned(),
+            entity_id: "456".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 1000,
+            source_blocks: vec![TranslationSourceBlock {
+                slot: "title".to_owned(),
+                text: "hello".to_owned(),
+            }],
+            target_slots: vec!["title_zh".to_owned()],
+        };
+
+        assert_eq!(derive_request_source(&[feed_item]), "feed.auto_translate");
+        assert_eq!(derive_request_source(&[detail_item]), "release_detail");
+    }
+
     fn sample_release_item(entity_id: &str) -> TranslationRequestItemInput {
         TranslationRequestItemInput {
-            producer_ref: entity_id.to_owned(),
+            producer_ref: format!("feed.auto_translate:release:{entity_id}"),
             kind: "release_summary".to_owned(),
             variant: "feed_card".to_owned(),
             entity_id: entity_id.to_owned(),

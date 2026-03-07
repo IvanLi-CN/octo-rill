@@ -22,7 +22,7 @@ function buildReleaseSummaryRequestItem(
 		.filter((value): value is string => Boolean(value?.trim()))
 		.join("\n");
 	return {
-		producer_ref: item.id,
+		producer_ref: `feed.auto_translate:release:${item.id}`,
 		kind: "release_summary",
 		variant: "feed_card",
 		entity_id: item.id,
