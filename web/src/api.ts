@@ -246,6 +246,14 @@ export type AdminLlmCallStreamEvent = {
 	event_type: string;
 	created_at: string;
 };
+export type AdminTranslationStreamEvent = {
+	event_id: string;
+	resource_type: "request" | "batch";
+	resource_id: string;
+	status: string;
+	event_type: string;
+	created_at: string;
+};
 export type AdminScheduledSlotItem = {
 	hour_utc: number;
 	enabled: boolean;
