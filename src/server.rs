@@ -26,6 +26,7 @@ use crate::{ai, api, auth, jobs, state, version};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
+    ensure_dir_exists(&config.task_log_dir)?;
 
     let connect_opts = SqliteConnectOptions::from_str(&config.database_url)
         .context("invalid DATABASE_URL for sqlite")?
@@ -69,8 +70,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         encryption_key: config.encryption_key.clone(),
     });
 
-    jobs::spawn_task_worker(app_state.clone());
+    jobs::spawn_task_workers(app_state.clone(), config.job_worker_concurrency);
     jobs::spawn_hourly_scheduler(app_state.clone());
+    jobs::spawn_subscription_scheduler(app_state.clone());
     let model_catalog_abort_handle = config
         .ai
         .as_ref()
@@ -108,6 +110,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/admin/jobs/realtime/{task_id}",
             get(api::admin_get_realtime_task_detail),
+        )
+        .route(
+            "/admin/jobs/realtime/{task_id}/log",
+            get(api::admin_download_realtime_task_log),
         )
         .route(
             "/admin/jobs/realtime/{task_id}/retry",
@@ -215,6 +221,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("http server exited")?;
 
     Ok(())
+}
+
+fn ensure_dir_exists(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory {}", path.display()))
 }
 
 fn ensure_sqlite_dir(database_url: &str) -> Result<()> {

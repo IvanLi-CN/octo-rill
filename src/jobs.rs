@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use async_stream::stream;
@@ -9,6 +9,7 @@ use axum::response::{
 use chrono::{DateTime, NaiveTime, Timelike, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 
 use crate::{ai, api, state::AppState, sync};
 
@@ -22,12 +23,15 @@ pub const TASK_SYNC_STARRED: &str = "sync.starred";
 pub const TASK_SYNC_RELEASES: &str = "sync.releases";
 pub const TASK_SYNC_NOTIFICATIONS: &str = "sync.notifications";
 pub const TASK_SYNC_ALL: &str = "sync.all";
+pub const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
+
+pub const SCHEDULED_TASK_TYPES: &[&str] = &[TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS];
 
 #[derive(Debug, Clone)]
 pub struct NewTask {
@@ -61,6 +65,23 @@ struct SlotRow {
     last_dispatch_at: Option<String>,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct DispatchStateRow {
+    last_dispatch_key: Option<String>,
+}
+
+const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
+
+pub fn is_scheduled_task_type(task_type: &str) -> bool {
+    SCHEDULED_TASK_TYPES.contains(&task_type)
+}
+
+pub fn spawn_task_workers(state: Arc<AppState>, count: usize) {
+    for _ in 0..count.max(1) {
+        spawn_task_worker(state.clone());
+    }
+}
+
 pub fn spawn_task_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -90,6 +111,18 @@ pub fn spawn_hourly_scheduler(state: Arc<AppState>) {
                 tracing::warn!(?err, "hourly scheduler: enqueue due slot failed");
             }
             tokio::time::sleep(Duration::from_secs(45)).await;
+        }
+    });
+}
+
+pub fn spawn_subscription_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let now = Utc::now();
+            if let Err(err) = enqueue_subscription_run_if_due(state.as_ref(), now).await {
+                tracing::warn!(?err, "subscription scheduler: enqueue due run failed");
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await;
         }
     });
 }
@@ -159,31 +192,290 @@ pub async fn enqueue_hour_slot_if_due(
     Ok(Some(task.task_id))
 }
 
-pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
+pub async fn enqueue_subscription_run_if_due(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let schedule_key = current_subscription_schedule_key(now);
+    let row = sqlx::query_as::<_, DispatchStateRow>(
+        r#"
+        SELECT last_dispatch_key
+        FROM scheduled_task_dispatch_state
+        WHERE schedule_name = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(SUBSCRIPTION_SCHEDULE_NAME)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to query subscription dispatch state")?;
+
+    if row
+        .as_ref()
+        .and_then(|current| current.last_dispatch_key.as_deref())
+        == Some(schedule_key.as_str())
+    {
+        return Ok(None);
+    }
+
+    let payload = json!({
+        "trigger": "schedule",
+        "schedule_key": schedule_key,
+    });
+
+    let task = if subscription_run_in_flight(state).await? {
+        record_skipped_subscription_run(state, payload).await?
+    } else {
+        enqueue_task(
+            state,
+            NewTask {
+                task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+                payload,
+                source: "scheduler".to_owned(),
+                requested_by: None,
+                parent_task_id: None,
+            },
+        )
+        .await?
+    };
+
+    upsert_dispatch_state(state, &schedule_key, &task.task_id).await?;
+    Ok(Some(task.task_id))
+}
+
+pub(crate) fn current_subscription_schedule_key(now: DateTime<Utc>) -> String {
+    let minute = if now.minute() < 30 { 0 } else { 30 };
+    format!("{}:{minute:02}", now.format("%Y-%m-%dT%H"))
+}
+
+async fn subscription_run_in_flight(state: &AppState) -> Result<bool> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status IN (?, ?)
+        "#,
+    )
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to query in-flight subscription runs")?;
+
+    Ok(count > 0)
+}
+
+async fn upsert_dispatch_state(state: &AppState, schedule_key: &str, task_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO scheduled_task_dispatch_state (
+          schedule_name,
+          last_dispatch_key,
+          last_task_id,
+          updated_at
+        ) VALUES (?, ?, ?, ?)
+        ON CONFLICT(schedule_name) DO UPDATE SET
+          last_dispatch_key = excluded.last_dispatch_key,
+          last_task_id = excluded.last_task_id,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(SUBSCRIPTION_SCHEDULE_NAME)
+    .bind(schedule_key)
+    .bind(task_id)
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to upsert subscription dispatch state")?;
+    Ok(())
+}
+
+async fn record_skipped_subscription_run(state: &AppState, payload: Value) -> Result<EnqueuedTask> {
+    let schedule_key = payload
+        .get("schedule_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let task = start_inline_task(
+        state,
+        NewTask {
+            task_type: TASK_SYNC_SUBSCRIPTIONS.to_owned(),
+            payload,
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+    )
+    .await?;
+
+    append_task_event(
+        state,
+        &task.task_id,
+        "task.progress",
+        json!({
+            "task_id": task.task_id,
+            "stage": "skipped",
+            "schedule_key": schedule_key,
+            "skip_reason": "previous_run_active",
+        }),
+    )
+    .await?;
+    append_task_log_entry(
+        state,
+        &task.task_id,
+        json!({
+            "at": Utc::now().to_rfc3339(),
+            "level": "warning",
+            "stage": "scheduler",
+            "event_type": "run_skipped",
+            "task_id": task.task_id,
+            "schedule_key": schedule_key,
+            "message": "subscription sync run skipped because a previous run is still active",
+            "skip_reason": "previous_run_active"
+        }),
+    )
+    .await?;
+
+    complete_task(
+        state,
+        &task.task_id,
+        STATUS_SUCCEEDED,
+        Some(sync::skipped_subscription_result(
+            &schedule_key,
+            "previous_run_active",
+        )),
+        None,
+    )
+    .await?;
+    append_task_event(
+        state,
+        &task.task_id,
+        "task.completed",
+        json!({
+            "task_id": task.task_id,
+            "status": STATUS_SUCCEEDED,
+            "skipped": true,
+        }),
+    )
+    .await?;
+
+    Ok(task)
+}
+
+fn task_supports_log_file(task_type: &str) -> bool {
+    task_type == TASK_SYNC_SUBSCRIPTIONS
+}
+
+fn task_log_relative_path(task_type: &str, task_id: &str, now: DateTime<Utc>) -> PathBuf {
+    PathBuf::from(task_type.replace('.', "-"))
+        .join(now.format("%Y-%m-%d").to_string())
+        .join(format!("{task_id}.ndjson"))
+}
+
+fn build_task_log_path(state: &AppState, task_type: &str, task_id: &str) -> Result<Option<String>> {
+    if !task_supports_log_file(task_type) {
+        return Ok(None);
+    }
+
+    let relative_path = task_log_relative_path(task_type, task_id, Utc::now());
+    let full_path = state.config.task_log_dir.join(relative_path);
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create task log parent directory")?;
+    }
+    std::fs::File::create(&full_path).context("failed to create task log file")?;
+    Ok(Some(full_path.to_string_lossy().into_owned()))
+}
+
+pub async fn load_task_log_path(state: &AppState, task_id: &str) -> Result<Option<String>> {
+    let log_file_path = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT log_file_path
+        FROM job_tasks
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to query task log path")?;
+    Ok(log_file_path.flatten())
+}
+
+pub async fn append_task_log_entry(state: &AppState, task_id: &str, entry: Value) -> Result<()> {
+    let Some(log_file_path) = load_task_log_path(state, task_id).await? else {
+        return Ok(());
+    };
+    let line = serde_json::to_vec(&entry).context("serialize task log entry")?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .await
+        .with_context(|| format!("failed to open task log file {log_file_path}"))?;
+    file.write_all(&line)
+        .await
+        .with_context(|| format!("failed to write task log file {log_file_path}"))?;
+    file.write_all(b"\n")
+        .await
+        .with_context(|| format!("failed to write task log newline {log_file_path}"))?;
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush task log file {log_file_path}"))?;
+    Ok(())
+}
+
+async fn insert_task_record(
+    state: &AppState,
+    new_task: &NewTask,
+    status: &str,
+    started_at: Option<&str>,
+) -> Result<String> {
     let task_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
+    let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
 
     sqlx::query(
         r#"
         INSERT INTO job_tasks (
-          id, task_type, status, source, requested_by, parent_task_id,
-          payload_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id,
+          task_type,
+          status,
+          source,
+          requested_by,
+          parent_task_id,
+          payload_json,
+          log_file_path,
+          created_at,
+          started_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&task_id)
     .bind(&new_task.task_type)
-    .bind(STATUS_QUEUED)
+    .bind(status)
     .bind(&new_task.source)
     .bind(new_task.requested_by)
     .bind(new_task.parent_task_id.as_deref())
     .bind(payload_json)
+    .bind(log_file_path.as_deref())
     .bind(now.as_str())
+    .bind(started_at)
     .bind(now.as_str())
     .execute(&state.pool)
     .await
     .context("failed to insert job task")?;
+
+    Ok(task_id)
+}
+
+pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
+    let task_id = insert_task_record(state, &new_task, STATUS_QUEUED, None).await?;
 
     append_task_event(
         state,
@@ -192,7 +484,7 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
         json!({
             "task_id": task_id,
             "task_type": new_task.task_type,
-            "status": STATUS_RUNNING,
+            "status": STATUS_QUEUED,
             "source": new_task.source,
         }),
     )
@@ -206,31 +498,8 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
 }
 
 pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
-    let task_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO job_tasks (
-          id, task_type, status, source, requested_by, parent_task_id,
-          payload_json, created_at, started_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&task_id)
-    .bind(&new_task.task_type)
-    .bind(STATUS_RUNNING)
-    .bind(&new_task.source)
-    .bind(new_task.requested_by)
-    .bind(new_task.parent_task_id.as_deref())
-    .bind(payload_json)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to insert inline task")?;
+    let task_id = insert_task_record(state, &new_task, STATUS_RUNNING, Some(now.as_str())).await?;
 
     append_task_event(
         state,
@@ -662,11 +931,23 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         SELECT id
         FROM job_tasks
         WHERE status = ?
+          AND (
+            task_type != ?
+            OR NOT EXISTS (
+              SELECT 1
+              FROM job_tasks running
+              WHERE running.task_type = ?
+                AND running.status = ?
+            )
+          )
         ORDER BY created_at ASC
         LIMIT 1
         "#,
     )
     .bind(STATUS_QUEUED)
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(STATUS_RUNNING)
     .fetch_optional(&mut *tx)
     .await
     .context("select queued task")?;
@@ -852,6 +1133,10 @@ async fn execute_task(
                 "releases": releases,
                 "notifications": notifications,
             }))
+        }
+        TASK_SYNC_SUBSCRIPTIONS => {
+            let res = sync::sync_subscriptions(state, task_id, payload).await?;
+            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_BRIEF_GENERATE => {
             let user_id = payload_i64(payload, "user_id")?;
@@ -1144,4 +1429,207 @@ fn payload_i64_array(payload: &Value, key: &str) -> Result<Vec<i64>> {
 
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, STATUS_SUCCEEDED | STATUS_FAILED | STATUS_CANCELED)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::SocketAddr, sync::Arc};
+
+    use super::{
+        STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS,
+        claim_next_queued_task, current_subscription_schedule_key, is_scheduled_task_type,
+    };
+    use chrono::{TimeZone, Utc};
+    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use url::Url;
+
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        state::{AppState, build_oauth_client},
+    };
+
+    #[test]
+    fn current_subscription_schedule_key_uses_half_hour_buckets() {
+        let on_the_hour = Utc
+            .with_ymd_and_hms(2026, 3, 6, 14, 5, 12)
+            .single()
+            .expect("valid datetime");
+        let on_the_half_hour = Utc
+            .with_ymd_and_hms(2026, 3, 6, 14, 45, 59)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            current_subscription_schedule_key(on_the_hour),
+            "2026-03-06T14:00"
+        );
+        assert_eq!(
+            current_subscription_schedule_key(on_the_half_hour),
+            "2026-03-06T14:30"
+        );
+    }
+
+    #[test]
+    fn scheduled_task_types_include_subscription_sync() {
+        assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
+        assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
+        assert!(!is_scheduled_task_type("translate.release"));
+    }
+
+    #[tokio::test]
+    async fn claim_next_queued_task_defers_subscription_when_one_is_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "sync-running",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "sync-queued",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_QUEUED,
+            1,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "brief-queued",
+            TASK_BRIEF_DAILY_SLOT,
+            STATUS_QUEUED,
+            2,
+        )
+        .await;
+
+        let claimed = claim_next_queued_task(state.as_ref())
+            .await
+            .expect("claim queued task")
+            .expect("task claimed");
+        assert_eq!(claimed.id, "brief-queued");
+        assert_eq!(claimed.task_type, TASK_BRIEF_DAILY_SLOT);
+    }
+
+    #[tokio::test]
+    async fn claim_next_queued_task_allows_subscription_when_no_run_is_active() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "sync-queued",
+            TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_QUEUED,
+            0,
+        )
+        .await;
+
+        let claimed = claim_next_queued_task(state.as_ref())
+            .await
+            .expect("claim queued task")
+            .expect("task claimed");
+        assert_eq!(claimed.id, "sync-queued");
+        assert_eq!(claimed.task_type, TASK_SYNC_SUBSCRIPTIONS);
+    }
+
+    async fn setup_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn setup_state(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-jobs-tests"),
+            job_worker_concurrency: 4,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
+
+    async fn seed_task(
+        pool: &SqlitePool,
+        task_id: &str,
+        task_type: &str,
+        status: &str,
+        offset_seconds: i64,
+    ) {
+        let created_at = format!("2026-03-06T00:00:{offset_seconds:02}Z");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(task_type)
+        .bind(status)
+        .bind("test")
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(created_at.as_str())
+        .bind((status == STATUS_RUNNING).then_some(created_at.as_str()))
+        .bind(Option::<String>::None)
+        .bind(created_at.as_str())
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("seed task");
+    }
 }

@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub public_base_url: Url,
     pub database_url: String,
     pub static_dir: Option<PathBuf>,
+    pub task_log_dir: PathBuf,
+    pub job_worker_concurrency: usize,
     pub encryption_key: EncryptionKey,
     pub github: GitHubOAuthConfig,
     pub ai: Option<AiConfig>,
@@ -70,6 +72,8 @@ impl fmt::Debug for AppConfig {
             .field("public_base_url", &self.public_base_url)
             .field("database_url", &self.database_url)
             .field("static_dir", &self.static_dir)
+            .field("task_log_dir", &self.task_log_dir)
+            .field("job_worker_concurrency", &self.job_worker_concurrency)
             .field("github", &self.github)
             .field("ai", &self.ai)
             .field("ai_model_context_limit", &self.ai_model_context_limit)
@@ -98,6 +102,29 @@ impl AppConfig {
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./.data/octo-rill.db".to_owned());
+
+        let task_log_dir = env::var("OCTORILL_TASK_LOG_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|candidate| !candidate.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from(".data/task-logs"));
+
+        let job_worker_concurrency = env::var("OCTORILL_TASK_WORKERS")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .context("invalid OCTORILL_TASK_WORKERS (expected positive integer)")
+                    .and_then(|parsed| {
+                        if parsed == 0 {
+                            anyhow::bail!(
+                                "invalid OCTORILL_TASK_WORKERS (expected positive integer)"
+                            );
+                        }
+                        Ok(parsed)
+                    })
+            })
+            .transpose()?
+            .unwrap_or(4);
 
         let encryption_key = env::var("OCTORILL_ENCRYPTION_KEY_BASE64")
             .context("OCTORILL_ENCRYPTION_KEY_BASE64 is required")?;
@@ -173,6 +200,8 @@ impl AppConfig {
             public_base_url,
             database_url,
             static_dir,
+            task_log_dir,
+            job_worker_concurrency,
             encryption_key,
             github: GitHubOAuthConfig {
                 client_id: github_client_id,
