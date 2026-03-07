@@ -11,7 +11,7 @@ fi
 
 tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/octo-rill-worktree-test.XXXXXX")"
 tmp_root="$(cd "$tmp_root" && pwd -P)"
-fixture_repo="$tmp_root/repo"
+fixture_repo="$tmp_root/repo-with-\$dollar"
 worktree_default="$tmp_root/default-worktree"
 worktree_override="$tmp_root/override-worktree"
 override_source="$tmp_root/override-source"
@@ -130,7 +130,7 @@ if [[ "$hook_path" != /* ]]; then
   hook_path="$fixture_repo/$hook_path"
 fi
 hook_body="$(cat "$hook_path")"
-assert_output_contains "$hook_body" "LEFTHOOK_BIN=\""
+assert_output_contains "$hook_body" "LEFTHOOK_BIN="
 assert_output_contains "$hook_body" "$fixture_repo"
 if [[ "$hook_body" == *"$worktree_default"* ]]; then
   echo "hook installation must stay pinned to main worktree" >&2
@@ -154,7 +154,7 @@ if [[ ! -f "$post_merge_hook_path" ]]; then
   exit 1
 fi
 post_merge_hook_body="$(cat "$post_merge_hook_path")"
-assert_output_contains "$post_merge_hook_body" "LEFTHOOK_BIN=\""
+assert_output_contains "$post_merge_hook_body" "LEFTHOOK_BIN="
 assert_output_contains "$post_merge_hook_body" "$fixture_repo"
 if [[ "$post_merge_hook_body" == *"$worktree_default/node_modules"* ]]; then
   echo "dynamic hook installation must stay pinned to main worktree binary" >&2
@@ -242,7 +242,7 @@ if [[ "$separate_hook_path" != /* ]]; then
   separate_hook_path="$separate_repo/$separate_hook_path"
 fi
 separate_hook_body="$(cat "$separate_hook_path")"
-assert_output_contains "$separate_hook_body" "LEFTHOOK_BIN=\""
+assert_output_contains "$separate_hook_body" "LEFTHOOK_BIN="
 assert_output_contains "$separate_hook_body" "$separate_repo"
 if [[ "$separate_hook_body" == *"$separate_git_dir"* ]]; then
   echo "hook installation must not pin the shared git dir path" >&2

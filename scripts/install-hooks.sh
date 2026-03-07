@@ -129,7 +129,7 @@ pin_hook_binary() {
   hook_path=$1
   hook_bin=$2
   tmp_path="$hook_path.tmp"
-  escaped_bin=$(printf '%s' "$hook_bin" | sed 's/["\\]/\\&/g')
+  escaped_bin=$(printf '%s' "$hook_bin" | sed "s/'/'\\''/g")
 
   {
     IFS= read -r first_line || first_line='#!/bin/sh'
@@ -137,8 +137,8 @@ pin_hook_binary() {
     printf 'if [ -n "${LEFTHOOK_BIN:-}" ] && [ ! -x "${LEFTHOOK_BIN}" ]; then\n'
     printf '  unset LEFTHOOK_BIN\n'
     printf 'fi\n'
-    printf 'if [ -z "${LEFTHOOK_BIN:-}" ] && [ -x "%s" ]; then\n' "$escaped_bin"
-    printf '  LEFTHOOK_BIN="%s"\n' "$escaped_bin"
+    printf "if [ -z \"\${LEFTHOOK_BIN:-}\" ] && [ -x '%s' ]; then\n" "$escaped_bin"
+    printf "  LEFTHOOK_BIN='%s'\n" "$escaped_bin"
     printf '  export LEFTHOOK_BIN\n'
     printf 'fi\n\n'
     cat
