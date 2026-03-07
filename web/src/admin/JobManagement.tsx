@@ -1221,6 +1221,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	}, [activeTaskDetail]);
 
 	useEffect(() => {
+		activeTaskDrawerLlmCallIdRef.current = activeTaskDrawerLlmCallId;
 		llmDetailIdRef.current = activeTaskDrawerLlmCallId ?? llmDetail?.id ?? null;
 	}, [activeTaskDrawerLlmCallId, llmDetail]);
 
