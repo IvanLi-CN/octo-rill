@@ -22,6 +22,7 @@ bun install
 - 若你在 linked worktree 内执行 `bun install`，安装脚本会尝试复用主工作区解析出的 hook 安装入口与 `lefthook` 二进制；若主工作区尚未完成初始化，会提示你先回主工作区执行一次。
 - hooks 安装后会优先使用仓库内解析出的 `lefthook` 二进制，避免被全局 `lefthook` 抢占；若之前固定的二进制已不存在，hook 会自动回退到当前环境里的可用 `lefthook`。
 - 安装脚本会把主工作区根目录记录到共享 Git 配置里，因此 `git clone --separate-git-dir=...` 这类布局下，新 linked worktree 依然能回源复制本地资源。
+- 安装脚本也会把 repo-local `core.hooksPath` 指向共享 hook 目录，避免已有自定义 hooksPath 让 `bun install` 失败，或把 hooks 落到单个 worktree。
 - 当 `lefthook.yml`、`package.json` 或根目录依赖发生变化时，重新执行 `bun install` 或 `bun run hooks:install`。
 
 ### 1) 配置环境变量
