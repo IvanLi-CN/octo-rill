@@ -64,7 +64,7 @@
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
 | s8qkn | 全用户 Star / Release 半小时定时同步闭环 | 待实现 | `s8qkn-subscription-sync/SPEC.md` | 2026-03-06 | scheduler + sync.subscriptions + log download |
-| dynup | shadcn/ui 全量整改与组件收敛 | 部分完成（3/4） | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-06 | local validation green; visual evidence captured; pending push/PR/review-loop |
+| dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-07 | PR #25; shadcn/ui 全量收口 + Storybook/e2e/spec synced |
 | x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-03-03 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health |
 | 9vb46 | 管理员任务中心刷新闪烁修复 | 已完成 | `9vb46-admin-jobs-refresh-flicker-fix/SPEC.md` | 2026-03-07 | PR #23；手动刷新与 SSE 后台刷新保留已渲染内容；回归测试与本地浏览器复核已完成 |
 | vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-02-28 | task drawer route outlet + in-drawer LLM detail navigation |

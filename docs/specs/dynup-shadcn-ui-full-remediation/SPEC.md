@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-03-06
-- Last: 2026-03-06
+- Last: 2026-03-07
 
 ## 背景 / 问题陈述
 
@@ -154,7 +154,7 @@ None
 - [x] M1: 补齐 shadcn shared primitives、provider 接入与规格基线。
 - [x] M2: 完成 Dashboard 面组件收敛与 story 更新。
 - [x] M3: 完成 Admin Users / Admin Jobs 面组件收敛与测试更新。
-- [ ] M4: 完成 Storybook 视觉证据、质量门禁、PR 与 review-loop 收敛。
+- [x] M4: 完成 Storybook 视觉证据、质量门禁、PR 与 review-loop 收敛。
 
 ## 方案概述（Approach, high-level）
 
@@ -166,13 +166,14 @@ None
 - 风险：官方 CLI 生成文件与仓库路径/格式约定存在偏差，需要人工收口。
 - 风险：e2e 可能少量依赖旧 DOM，需要迁移到 role/name 断言。
 - 需要决策的问题：无。
-- 假设（需主人确认）：Storybook 截图将作为本次 PR 视觉证据主来源；截图提交与 PR 引用需在 push 前获主人明确许可。
+- 假设：无。
 
 ## 变更记录（Change log）
 
 - 2026-03-06: 新建规格，冻结 shadcn/ui 全量整改范围与验收口径。
 - 2026-03-06: 已补齐官方 shadcn primitives，完成 Dashboard / Admin Users / Admin Jobs 的页面级收敛，并更新 stories / e2e。
 - 2026-03-06: 已生成 Dashboard、Admin Users、Admin Jobs 的 Storybook 视觉证据并完成 `bun run lint`、`bun run build`、`bun run storybook:build`、`bun run e2e`。
+- 2026-03-07: 完成 rebase 收口、修复 Storybook autodocs 自动弹层与 Admin Jobs LLM detail 刷新串位问题，PR #25 全部 checks 转绿且无阻塞 review。
 
 ## 参考（References）
 
