@@ -137,6 +137,30 @@ if [[ "$hook_body" == *"$worktree_default"* ]]; then
   exit 1
 fi
 
+cat >> "$worktree_default/lefthook.yml" <<'POSTMERGE'
+
+post-merge:
+  commands:
+    smoke-post-merge:
+      run: echo smoke-post-merge
+POSTMERGE
+bun install --cwd "$worktree_default" --frozen-lockfile >/dev/null
+post_merge_hook_path="$(git -C "$fixture_repo" rev-parse --git-path hooks/post-merge)"
+if [[ "$post_merge_hook_path" != /* ]]; then
+  post_merge_hook_path="$fixture_repo/$post_merge_hook_path"
+fi
+if [[ ! -f "$post_merge_hook_path" ]]; then
+  echo "expected shared post-merge hook after linked worktree install" >&2
+  exit 1
+fi
+post_merge_hook_body="$(cat "$post_merge_hook_path")"
+assert_output_contains "$post_merge_hook_body" "LEFTHOOK_BIN=\""
+assert_output_contains "$post_merge_hook_body" "$fixture_repo"
+if [[ "$post_merge_hook_body" == *"$worktree_default/node_modules"* ]]; then
+  echo "dynamic hook installation must stay pinned to main worktree binary" >&2
+  exit 1
+fi
+
 printf 'custom-target\n' > "$worktree_default/.env.local"
 preserve_output="$(cd "$worktree_default" && WORKTREE_SYNC_FORCE=1 "$fixture_repo/scripts/sync-worktree-resources.sh" ignored ignored 1)"
 assert_output_contains "$preserve_output" "keep target exists: .env.local"

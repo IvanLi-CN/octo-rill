@@ -82,6 +82,20 @@ shared_hooks_dir() {
   printf '%s/hooks\n' "$common_dir"
 }
 
+list_configured_hooks() {
+  config_path=$1
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[^[:space:]][^:]*:[[:space:]]*$/ {
+      key=$1
+      sub(/:$/, "", key)
+      if (key != "assert_lefthook_installed" && key != "colors" && key != "extends" && key != "min_version" && key != "no_tty" && key != "output" && key != "rc" && key != "skip_output" && key != "skip_lfs" && key != "source_dir") {
+        print key
+      }
+    }
+  ' "$config_path"
+}
+
 native_lefthook_bin() {
   base_root=$1
   os_arch=$(uname | tr '[:upper:]' '[:lower:]')
@@ -173,17 +187,19 @@ hooks_dir=$(shared_hooks_dir)
 git -C "$main_root" config --local core.hooksPath "$hooks_dir"
 
 (
-  cd "$main_root"
+  cd "$current_root"
   "$main_bin" install --force
 )
 
-for hook_name in pre-commit commit-msg post-checkout; do
-  hook_path=$(git -C "$main_root" rev-parse --git-path "hooks/$hook_name")
-  case "$hook_path" in
-    /*) : ;;
-    *) hook_path="$main_root/$hook_path" ;;
-  esac
-  if [ -f "$hook_path" ]; then
-    pin_hook_binary "$hook_path" "$main_bin"
-  fi
-done
+if [ -f "$current_root/lefthook.yml" ]; then
+  list_configured_hooks "$current_root/lefthook.yml" | while IFS= read -r hook_name; do
+    hook_path=$(git rev-parse --git-path "hooks/$hook_name")
+    case "$hook_path" in
+      /*) : ;;
+      *) hook_path="$current_root/$hook_path" ;;
+    esac
+    if [ -f "$hook_path" ]; then
+      pin_hook_binary "$hook_path" "$main_bin"
+    fi
+  done
+fi
