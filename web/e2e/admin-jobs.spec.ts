@@ -894,7 +894,7 @@ test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
@@ -925,11 +925,12 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
-	await page.locator("select").last().selectOption("failed");
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
 
 	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
@@ -1010,10 +1011,11 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
-	await page.locator("select").last().selectOption("failed");
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
 
 	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
@@ -1033,7 +1035,7 @@ test("admin refresh keeps scheduled runs visible", async ({ page }) => {
 	});
 	await page.goto("/admin/jobs");
 
-	await page.getByRole("button", { name: "定时任务" }).click();
+	await page.getByRole("tab", { name: "定时任务" }).click();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
@@ -1066,7 +1068,7 @@ test("admin refresh keeps existing jobs and llm calls visible", async ({
 	await expect(page.getByText("任务列表更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
