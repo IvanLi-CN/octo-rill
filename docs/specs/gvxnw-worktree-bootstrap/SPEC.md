@@ -66,6 +66,7 @@
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
 - hook 安装脚本在共享 `.git/hooks` 中优先注入仓库内解析出的 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行；若该路径失效，则回退到 hook 自带的常规 `lefthook` 发现逻辑。
 - hook 安装脚本会把 repo-local `core.hooksPath` 重定向到共享 hook 目录，再执行 `lefthook install --force`，避免已有自定义 hooksPath 阻断安装或落到单个 worktree。
+- 当安装命令从 linked worktree 触发且该 worktree 的 `lefthook.yml` 增加了新的 hook 类型时，共享 wrappers 也必须按当前 worktree 的配置更新，同时继续复用主工作区的 repo-local `lefthook` 二进制。
 - `post-checkout` hook 必须在当前 revision 缺少同步脚本时安全跳过，避免切回历史提交或维护分支时因共享 hooks 报错。
 
 ### Edge cases / errors
@@ -117,6 +118,10 @@
 - Given 仓库本地已配置自定义 `core.hooksPath`  
   When 执行 `bun install` 安装 repo-local hooks  
   Then 安装必须成功完成，并把 repo-local `core.hooksPath` 收敛到共享 hook 目录，使后续 linked worktree 仍能复用同一套 hooks。
+
+- Given linked worktree 的 `lefthook.yml` 新增了主工作区尚未包含的 hook 类型  
+  When 在该 linked worktree 内执行 `bun install`  
+  Then 共享 hook 目录必须生成对应 wrapper，且 wrapper 继续固定到主工作区的 repo-local `lefthook` 二进制。
 
 - Given 仓库通过 `git clone --separate-git-dir=<dir>` 初始化，且主工作区已安装 repo-local hooks  
   When 再创建 linked worktree  
@@ -177,3 +182,4 @@
 - 2026-03-07：补充共享 `post-checkout` hook 的历史 revision 安全跳过逻辑，并收紧 README 对 linked worktree `bun install` 行为的表述。
 - 2026-03-07：补充共享 hook 对失效 `LEFTHOOK_BIN` 的自动回退，并在 README 中显式标注 `macOS/Linux` 支持边界。
 - 2026-03-07：补充对 repo-local `core.hooksPath` 的共享目录收敛，避免自定义 hooksPath 阻断安装或让 hooks 漏到单个 worktree。
+- 2026-03-07：补充 linked worktree 本地 `lefthook.yml` 新增 hook 类型时的共享 wrapper 更新与 pinning 覆盖。
