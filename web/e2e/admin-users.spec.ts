@@ -226,6 +226,15 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(page).toHaveURL(/\/admin$/);
 	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "搜索 login、name 或 email" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("combobox", { name: "按角色筛选" }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("combobox", { name: "按状态筛选" }),
+	).toBeVisible();
 	const revokeAdminButton = page
 		.getByRole("button", { name: "撤销管理员" })
 		.first();
@@ -239,12 +248,14 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(userRow).toContainText("最后活动：");
 	await expect(userRow).toContainText("普通用户");
 	await userRow.getByRole("button", { name: "详情" }).click();
-	await expect(page.getByRole("heading", { name: "用户详情" })).toBeVisible();
-	await expect(page.getByText("日报时间（本地时区）")).toBeVisible();
+	const profileSheet = page.getByRole("dialog", { name: "用户详情" });
+	await expect(profileSheet).toBeVisible();
+	await expect(profileSheet.getByText("日报时间（本地时区）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(profileSheet).toHaveCount(0);
 	await userRow.getByRole("button", { name: "设为管理员" }).click();
 	await expect(
-		page.getByRole("heading", { name: "确认管理员变更" }),
+		page.getByRole("alertdialog", { name: "确认管理员变更" }),
 	).toBeVisible();
 	await page.getByRole("button", { name: "确认更改" }).click();
 	await expect(userRow).toContainText("管理员");

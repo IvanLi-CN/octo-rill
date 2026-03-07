@@ -1,4 +1,4 @@
-import { ChevronDown } from "lucide-react";
+import { CircleHelp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
@@ -23,6 +23,7 @@ import {
 	apiOpenAdminJobsEventsStream,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -31,6 +32,27 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import {
+	Select,
+	SelectContent,
+	SelectItem,
+	SelectTrigger,
+	SelectValue,
+} from "@/components/ui/select";
+import {
+	Sheet,
+	SheetContent,
+	SheetDescription,
+	SheetHeader,
+	SheetTitle,
+} from "@/components/ui/sheet";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	hour: "2-digit",
@@ -89,6 +111,7 @@ type LlmConversationMessage = {
 	content: string;
 };
 type LlmConversationTimelineItem = {
+	key: string;
 	turn: number;
 	source: "input" | "output";
 	role: string;
@@ -232,6 +255,7 @@ function LlmCallDetailSection(props: {
 			const inputMessage = llmInputMessages[index];
 			if (inputMessage) {
 				timeline.push({
+					key: `input-${turn}-${inputMessage.role}`,
 					turn,
 					source: "input",
 					role: inputMessage.role,
@@ -241,6 +265,7 @@ function LlmCallDetailSection(props: {
 			const outputMessage = llmOutputMessages[index];
 			if (outputMessage) {
 				timeline.push({
+					key: `output-${turn}-${outputMessage.role}`,
 					turn,
 					source: "output",
 					role: outputMessage.role,
@@ -370,7 +395,7 @@ function LlmCallDetailSection(props: {
 									const tone = llmRoleTone(message.role, isAssistantOutput);
 									return (
 										<div
-											key={`timeline-${message.source}-${message.role}-${message.turn}`}
+											key={message.key}
 											className={`flex ${
 												isAssistantOutput
 													? "justify-end pl-5"
@@ -521,10 +546,129 @@ function taskStatusTone(status: string): TaskStatusTone {
 	}
 }
 
+type BadgeTone = Pick<TaskStatusTone, "badgeClass" | "dotClass">;
+
+const REALTIME_STATUS_FILTER_OPTIONS: Array<{
+	value: RealtimeStatusFilter;
+	label: string;
+}> = [
+	{ value: "all", label: "状态：全部" },
+	{ value: "queued", label: "状态：排队" },
+	{ value: "running", label: "状态：运行中" },
+	{ value: "failed", label: "状态：失败" },
+	{ value: "succeeded", label: "状态：成功" },
+	{ value: "canceled", label: "状态：取消" },
+];
+
+const LLM_STATUS_FILTER_OPTIONS: Array<{
+	value: LlmStatusFilter;
+	label: string;
+}> = [
+	{ value: "all", label: "状态：全部" },
+	{ value: "queued", label: "状态：排队" },
+	{ value: "running", label: "状态：运行中" },
+	{ value: "failed", label: "状态：失败" },
+	{ value: "succeeded", label: "状态：成功" },
+];
+
+function streamStatusTone(
+	status: "connecting" | "connected" | "reconnecting",
+): BadgeTone {
+	switch (status) {
+		case "connected":
+			return {
+				badgeClass:
+					"border-emerald-300 bg-emerald-100/80 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100",
+				dotClass: "bg-emerald-500",
+			};
+		case "reconnecting":
+			return {
+				badgeClass:
+					"border-amber-300 bg-amber-100/80 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100",
+				dotClass: "bg-amber-500",
+			};
+		default:
+			return {
+				badgeClass:
+					"border-sky-300 bg-sky-100/80 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100",
+				dotClass: "bg-sky-500",
+			};
+	}
+}
+
+function StatusBadge(props: {
+	label: string;
+	tone: BadgeTone;
+	className?: string;
+}) {
+	const { label, tone, className } = props;
+	return (
+		<Badge
+			variant="outline"
+			className={`gap-1.5 border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}${className ? ` ${className}` : ""}`}
+		>
+			<span className={`size-1.5 rounded-full ${tone.dotClass}`} />
+			{label}
+		</Badge>
+	);
+}
+
+function FlagBadge(props: { label: string; className: string }) {
+	const { label, className } = props;
+	return (
+		<Badge
+			variant="outline"
+			className={`border px-2 py-0.5 text-[11px] font-medium ${className}`}
+		>
+			{label}
+		</Badge>
+	);
+}
+
+function FilterSelect<T extends string>(props: {
+	value: T;
+	onValueChange: (value: T) => void;
+	options: Array<{ value: T; label: string }>;
+	placeholder: string;
+	ariaLabel: string;
+	className?: string;
+}) {
+	const { value, onValueChange, options, placeholder, ariaLabel, className } =
+		props;
+	return (
+		<Select
+			value={value}
+			onValueChange={(nextValue) => onValueChange(nextValue as T)}
+		>
+			<SelectTrigger className={className ?? "w-full"} aria-label={ariaLabel}>
+				<SelectValue placeholder={placeholder} />
+			</SelectTrigger>
+			<SelectContent>
+				{options.map((option) => (
+					<SelectItem key={option.value} value={option.value}>
+						{option.label}
+					</SelectItem>
+				))}
+			</SelectContent>
+		</Select>
+	);
+}
+
+function LoadingMessage(props: { children: string }) {
+	return (
+		<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
+			<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
+			{props.children}
+		</p>
+	);
+}
+
 function taskTypeLabel(taskType: string) {
 	switch (taskType) {
 		case "brief.daily_slot":
-			return "定时执行任务";
+			return "定时日报";
+		case "sync.subscriptions":
+			return "订阅同步";
 		case "brief.generate":
 			return "日报生成";
 		case "sync.all":
@@ -648,6 +792,58 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 							? `收集到 ${totalReleases} 条 Release 待处理。`
 							: "任务正在收集本轮执行对象。",
 				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "star_summary") {
+			const totalUsers = readNumber(payload, "total_users");
+			const succeededUsers = readNumber(payload, "succeeded_users");
+			const failedUsers = readNumber(payload, "failed_users");
+			return {
+				title: "Star 阶段完成",
+				description:
+					totalUsers !== null
+						? `用户 ${totalUsers} · 成功 ${succeededUsers ?? "-"} · 失败 ${failedUsers ?? "-"}`
+						: "Star 阶段已输出汇总。",
+				level: failedUsers !== null && failedUsers > 0 ? "warning" : "success",
+				payload,
+			};
+		}
+		if (stage === "repo_collect") {
+			const totalRepos = readNumber(payload, "total_repos");
+			return {
+				title: "聚合仓库队列",
+				description:
+					totalRepos !== null
+						? `本轮聚合出 ${totalRepos} 个待抓取 Release 的仓库。`
+						: "已完成仓库聚合。",
+				level: "normal",
+				payload,
+			};
+		}
+		if (stage === "release_summary") {
+			const totalRepos = readNumber(payload, "total_repos");
+			const succeededRepos = readNumber(payload, "succeeded_repos");
+			const failedRepos = readNumber(payload, "failed_repos");
+			const releasesWritten = readNumber(payload, "releases_written");
+			return {
+				title: "Release 阶段完成",
+				description:
+					totalRepos !== null
+						? `仓库 ${totalRepos} · 成功 ${succeededRepos ?? "-"} · 失败 ${failedRepos ?? "-"} · 写入 ${releasesWritten ?? "-"}`
+						: "Release 阶段已输出汇总。",
+				level: failedRepos !== null && failedRepos > 0 ? "warning" : "success",
+				payload,
+			};
+		}
+		if (stage === "skipped") {
+			const skipReason = readString(payload, "skip_reason");
+			return {
+				title: "本轮已跳过",
+				description: skipReason
+					? `定时任务未执行，原因：${skipReason}`
+					: "定时任务被跳过。",
+				level: "warning",
 				payload,
 			};
 		}
@@ -824,7 +1020,10 @@ type RealtimeStatusFilter =
 type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
 
 const TASK_PAGE_SIZE = 20;
-const SCHEDULED_TASK_TYPE = "brief.daily_slot";
+const SCHEDULED_TASK_TYPES = new Set([
+	"brief.daily_slot",
+	"sync.subscriptions",
+]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
 const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
@@ -865,17 +1064,34 @@ type JobManagementProps = {
 	currentUserId: number;
 };
 
+type LoadOptions = {
+	background?: boolean;
+};
+
+type ListLoadPhase = "idle" | "initial" | "refreshing";
+
+function resolveListLoadPhase(
+	hasLoadedOnce: boolean,
+	options?: LoadOptions,
+): ListLoadPhase {
+	if (!hasLoadedOnce || !options?.background) {
+		return "initial";
+	}
+	return "refreshing";
+}
+
 export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [tab, setTab] = useState<"realtime" | "scheduled" | "llm">("realtime");
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
+	const [overviewLoading, setOverviewLoading] = useState(false);
 
 	const [statusFilter, setStatusFilter] = useState<RealtimeStatusFilter>("all");
 	const [tasks, setTasks] = useState<AdminRealtimeTaskItem[]>([]);
 	const [taskTotal, setTaskTotal] = useState(0);
 	const [taskPage, setTaskPage] = useState(1);
-	const [tasksLoading, setTasksLoading] = useState(false);
+	const [tasksLoadPhase, setTasksLoadPhase] = useState<ListLoadPhase>("idle");
 	const [taskActionBusyId, setTaskActionBusyId] = useState<string | null>(null);
 
 	const [scheduledRunStatusFilter, setScheduledRunStatusFilter] =
@@ -885,10 +1101,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	);
 	const [scheduledRunTotal, setScheduledRunTotal] = useState(0);
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
-	const [scheduledRunsLoading, setScheduledRunsLoading] = useState(false);
+	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
+	const [llmStatusLoading, setLlmStatusLoading] = useState(false);
 	const [llmStatusFilter, setLlmStatusFilter] =
 		useState<LlmStatusFilter>("all");
 	const [llmSourceFilter, setLlmSourceFilter] = useState("");
@@ -898,7 +1116,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [llmCalls, setLlmCalls] = useState<AdminLlmCallItem[]>([]);
 	const [llmCallTotal, setLlmCallTotal] = useState(0);
 	const [llmCallPage, setLlmCallPage] = useState(1);
-	const [llmCallsLoading, setLlmCallsLoading] = useState(false);
+	const [llmCallsLoadPhase, setLlmCallsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 	const [llmDetail, setLlmDetail] = useState<AdminLlmCallDetailResponse | null>(
 		null,
 	);
@@ -921,8 +1140,24 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [error, setError] = useState<string | null>(null);
 	const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
 
+	const overviewLoadedOnceRef = useRef(false);
+	const overviewInitialRequestInFlightRef = useRef(false);
+	const overviewRequestIdRef = useRef(0);
+	const tasksLoadedOnceRef = useRef(false);
+	const tasksInitialRequestInFlightRef = useRef(false);
+	const tasksRequestIdRef = useRef(0);
+	const scheduledRunsLoadedOnceRef = useRef(false);
+	const scheduledRunsInitialRequestInFlightRef = useRef(false);
+	const scheduledRunsRequestIdRef = useRef(0);
+	const llmStatusLoadedOnceRef = useRef(false);
+	const llmStatusInitialRequestInFlightRef = useRef(false);
+	const llmStatusRequestIdRef = useRef(0);
+	const llmCallsLoadedOnceRef = useRef(false);
+	const llmCallsInitialRequestInFlightRef = useRef(false);
+	const llmCallsRequestIdRef = useRef(0);
 	const detailTaskIdRef = useRef<string | null>(null);
 	const llmDetailIdRef = useRef<string | null>(null);
+	const activeTaskDrawerLlmCallIdRef = useRef<string | null>(null);
 	const streamRefreshTimerRef = useRef<number | null>(null);
 	const streamRefreshInFlightRef = useRef(false);
 	const streamPendingFullRefreshRef = useRef(false);
@@ -966,14 +1201,33 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const detailBusinessOutcome =
 		activeTaskDetail?.diagnostics?.business_outcome ?? null;
 	const detailEventMeta = activeTaskDetail?.event_meta ?? null;
+	const tasksInitialLoading = tasksLoadPhase === "initial";
+	const tasksRefreshing = tasksLoadPhase === "refreshing";
+	const scheduledRunsInitialLoading = scheduledRunsLoadPhase === "initial";
+	const scheduledRunsRefreshing = scheduledRunsLoadPhase === "refreshing";
+	const llmCallsInitialLoading = llmCallsLoadPhase === "initial";
+	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
+	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
+	const llmRefreshing = llmStatusRefreshing || llmCallsRefreshing;
+	const isRefreshingData =
+		overviewLoading ||
+		tasksLoadPhase !== "idle" ||
+		scheduledRunsLoadPhase !== "idle" ||
+		llmStatusLoading ||
+		llmCallsLoadPhase !== "idle";
 
 	useEffect(() => {
 		detailTaskIdRef.current = activeTaskDetail?.task.id ?? null;
 	}, [activeTaskDetail]);
 
 	useEffect(() => {
+		activeTaskDrawerLlmCallIdRef.current = activeTaskDrawerLlmCallId;
 		llmDetailIdRef.current = activeTaskDrawerLlmCallId ?? llmDetail?.id ?? null;
 	}, [activeTaskDrawerLlmCallId, llmDetail]);
+
+	useEffect(() => {
+		activeTaskDrawerLlmCallIdRef.current = activeTaskDrawerLlmCallId;
+	}, [activeTaskDrawerLlmCallId]);
 
 	const navigateTaskDrawerRoute = useCallback(
 		(
@@ -1011,130 +1265,275 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		};
 	}, []);
 
-	const loadOverview = useCallback(async () => {
-		const res = await apiGetAdminJobsOverview();
-		setOverview(res);
-	}, []);
-
-	const loadRealtimeTasks = useCallback(async () => {
-		setTasksLoading(true);
-		try {
-			const params = new URLSearchParams();
-			params.set("status", statusFilter);
-			params.set("exclude_task_type", SCHEDULED_TASK_TYPE);
-			params.set("page", String(taskPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			const res = await apiGetAdminRealtimeTasks(params);
-			const realtimeOnlyItems = res.items.filter(
-				(task) => task.task_type !== SCHEDULED_TASK_TYPE,
-			);
-			// Fallback for older backend versions that ignore exclude_task_type.
-			const realtimeTotal =
-				realtimeOnlyItems.length === res.items.length
-					? res.total
-					: realtimeOnlyItems.length;
-			setTasks(realtimeOnlyItems);
-			setTaskTotal(realtimeTotal);
-		} finally {
-			setTasksLoading(false);
+	const loadOverview = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!overviewLoadedOnceRef.current &&
+			overviewInitialRequestInFlightRef.current
+		) {
+			return;
 		}
-	}, [statusFilter, taskPage]);
-
-	const loadScheduledRuns = useCallback(async () => {
-		setScheduledRunsLoading(true);
+		const requestId = overviewRequestIdRef.current + 1;
+		overviewRequestIdRef.current = requestId;
+		overviewInitialRequestInFlightRef.current = !overviewLoadedOnceRef.current;
+		setOverviewLoading(true);
 		try {
-			const params = new URLSearchParams();
-			params.set("status", scheduledRunStatusFilter);
-			params.set("task_type", SCHEDULED_TASK_TYPE);
-			params.set("page", String(scheduledRunPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			const res = await apiGetAdminRealtimeTasks(params);
-			setScheduledRuns(res.items);
-			setScheduledRunTotal(res.total);
-		} finally {
-			setScheduledRunsLoading(false);
-		}
-	}, [scheduledRunPage, scheduledRunStatusFilter]);
-
-	const loadLlmSchedulerStatus = useCallback(async () => {
-		const res = await apiGetAdminLlmSchedulerStatus();
-		setLlmStatus(res);
-	}, []);
-
-	const loadLlmCalls = useCallback(async () => {
-		setLlmCallsLoading(true);
-		try {
-			const params = new URLSearchParams();
-			params.set("status", llmStatusFilter);
-			params.set("page", String(llmCallPage));
-			params.set("page_size", String(TASK_PAGE_SIZE));
-			if (llmSourceFilter.trim()) {
-				params.set("source", llmSourceFilter.trim());
+			const res = await apiGetAdminJobsOverview();
+			if (requestId !== overviewRequestIdRef.current) {
+				return;
 			}
-			const requestedBy = Number(llmRequestedByFilter.trim());
-			if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
-				params.set("requested_by", String(requestedBy));
-			}
-			const startedFromUtc = localInputToUtc(llmStartedFromFilter);
-			if (startedFromUtc) {
-				params.set("started_from", startedFromUtc);
-			}
-			const startedToUtc = localInputToUtc(llmStartedToFilter);
-			if (startedToUtc) {
-				params.set("started_to", startedToUtc);
-			}
-			const res = await apiGetAdminLlmCalls(params);
-			setLlmCalls(res.items);
-			setLlmCallTotal(res.total);
-		} finally {
-			setLlmCallsLoading(false);
-		}
-	}, [
-		llmStatusFilter,
-		llmCallPage,
-		llmSourceFilter,
-		llmRequestedByFilter,
-		llmStartedFromFilter,
-		llmStartedToFilter,
-	]);
-
-	const loadAll = useCallback(async () => {
-		setError(null);
-		try {
-			await Promise.all([
-				loadOverview(),
-				loadRealtimeTasks(),
-				loadScheduledRuns(),
-				loadLlmSchedulerStatus(),
-				loadLlmCalls(),
-			]);
+			setOverview(res);
+			overviewLoadedOnceRef.current = true;
 		} catch (err) {
-			setError(normalizeErrorMessage(err));
+			if (requestId !== overviewRequestIdRef.current) {
+				return;
+			}
+			throw err;
+		} finally {
+			if (requestId === overviewRequestIdRef.current) {
+				setOverviewLoading(false);
+				overviewInitialRequestInFlightRef.current = false;
+			}
 		}
-	}, [
-		loadOverview,
-		loadRealtimeTasks,
-		loadScheduledRuns,
-		loadLlmSchedulerStatus,
-		loadLlmCalls,
-	]);
+	}, []);
+
+	const loadRealtimeTasks = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!tasksLoadedOnceRef.current &&
+				tasksInitialRequestInFlightRef.current
+			) {
+				return;
+			}
+			const requestId = tasksRequestIdRef.current + 1;
+			tasksRequestIdRef.current = requestId;
+			tasksInitialRequestInFlightRef.current = !tasksLoadedOnceRef.current;
+			setTasksLoadPhase(
+				resolveListLoadPhase(tasksLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", statusFilter);
+				params.set("task_group", "realtime");
+				params.set("page", String(taskPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				if (requestId !== tasksRequestIdRef.current) {
+					return;
+				}
+				const realtimeOnlyItems = res.items.filter(
+					(task) => !SCHEDULED_TASK_TYPES.has(task.task_type),
+				);
+				// Fallback for older backend versions that ignore task_group.
+				const realtimeTotal =
+					realtimeOnlyItems.length === res.items.length
+						? res.total
+						: realtimeOnlyItems.length;
+				setTasks(realtimeOnlyItems);
+				setTaskTotal(realtimeTotal);
+				tasksLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== tasksRequestIdRef.current) {
+					return;
+				}
+				throw err;
+			} finally {
+				if (requestId === tasksRequestIdRef.current) {
+					setTasksLoadPhase("idle");
+					tasksInitialRequestInFlightRef.current = false;
+				}
+			}
+		},
+		[statusFilter, taskPage],
+	);
+
+	const loadScheduledRuns = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!scheduledRunsLoadedOnceRef.current &&
+				scheduledRunsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
+			const requestId = scheduledRunsRequestIdRef.current + 1;
+			scheduledRunsRequestIdRef.current = requestId;
+			scheduledRunsInitialRequestInFlightRef.current =
+				!scheduledRunsLoadedOnceRef.current;
+			setScheduledRunsLoadPhase(
+				resolveListLoadPhase(scheduledRunsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", scheduledRunStatusFilter);
+				params.set("task_group", "scheduled");
+				params.set("page", String(scheduledRunPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				if (requestId !== scheduledRunsRequestIdRef.current) {
+					return;
+				}
+				const scheduledItems = res.items.filter((task) =>
+					SCHEDULED_TASK_TYPES.has(task.task_type),
+				);
+				const scheduledTotal =
+					scheduledItems.length === res.items.length
+						? res.total
+						: scheduledItems.length;
+				setScheduledRuns(scheduledItems);
+				setScheduledRunTotal(scheduledTotal);
+				scheduledRunsLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== scheduledRunsRequestIdRef.current) {
+					return;
+				}
+				throw err;
+			} finally {
+				if (requestId === scheduledRunsRequestIdRef.current) {
+					setScheduledRunsLoadPhase("idle");
+					scheduledRunsInitialRequestInFlightRef.current = false;
+				}
+			}
+		},
+		[scheduledRunPage, scheduledRunStatusFilter],
+	);
+
+	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!llmStatusLoadedOnceRef.current &&
+			llmStatusInitialRequestInFlightRef.current
+		) {
+			return;
+		}
+		const requestId = llmStatusRequestIdRef.current + 1;
+		llmStatusRequestIdRef.current = requestId;
+		llmStatusInitialRequestInFlightRef.current =
+			!llmStatusLoadedOnceRef.current;
+		setLlmStatusLoading(true);
+		try {
+			const res = await apiGetAdminLlmSchedulerStatus();
+			if (requestId !== llmStatusRequestIdRef.current) {
+				return;
+			}
+			setLlmStatus(res);
+			llmStatusLoadedOnceRef.current = true;
+		} catch (err) {
+			if (requestId !== llmStatusRequestIdRef.current) {
+				return;
+			}
+			throw err;
+		} finally {
+			if (requestId === llmStatusRequestIdRef.current) {
+				setLlmStatusLoading(false);
+				llmStatusInitialRequestInFlightRef.current = false;
+			}
+		}
+	}, []);
+
+	const loadLlmCalls = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!llmCallsLoadedOnceRef.current &&
+				llmCallsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
+			const requestId = llmCallsRequestIdRef.current + 1;
+			llmCallsRequestIdRef.current = requestId;
+			llmCallsInitialRequestInFlightRef.current =
+				!llmCallsLoadedOnceRef.current;
+			setLlmCallsLoadPhase(
+				resolveListLoadPhase(llmCallsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", llmStatusFilter);
+				params.set("page", String(llmCallPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				if (llmSourceFilter.trim()) {
+					params.set("source", llmSourceFilter.trim());
+				}
+				const requestedBy = Number(llmRequestedByFilter.trim());
+				if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
+					params.set("requested_by", String(requestedBy));
+				}
+				const startedFromUtc = localInputToUtc(llmStartedFromFilter);
+				if (startedFromUtc) {
+					params.set("started_from", startedFromUtc);
+				}
+				const startedToUtc = localInputToUtc(llmStartedToFilter);
+				if (startedToUtc) {
+					params.set("started_to", startedToUtc);
+				}
+				const res = await apiGetAdminLlmCalls(params);
+				if (requestId !== llmCallsRequestIdRef.current) {
+					return;
+				}
+				setLlmCalls(res.items);
+				setLlmCallTotal(res.total);
+				llmCallsLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== llmCallsRequestIdRef.current) {
+					return;
+				}
+				throw err;
+			} finally {
+				if (requestId === llmCallsRequestIdRef.current) {
+					setLlmCallsLoadPhase("idle");
+					llmCallsInitialRequestInFlightRef.current = false;
+				}
+			}
+		},
+		[
+			llmStatusFilter,
+			llmCallPage,
+			llmSourceFilter,
+			llmRequestedByFilter,
+			llmStartedFromFilter,
+			llmStartedToFilter,
+		],
+	);
+
+	const loadAll = useCallback(
+		async (options?: LoadOptions) => {
+			setError(null);
+			try {
+				await Promise.all([
+					loadOverview({ background: true }),
+					loadRealtimeTasks(options),
+					loadScheduledRuns(options),
+					loadLlmSchedulerStatus(options),
+					loadLlmCalls(options),
+				]);
+			} catch (err) {
+				setError(normalizeErrorMessage(err));
+			}
+		},
+		[
+			loadOverview,
+			loadRealtimeTasks,
+			loadScheduledRuns,
+			loadLlmSchedulerStatus,
+			loadLlmCalls,
+		],
+	);
 
 	const refreshTaskDetail = useCallback(async (taskId: string) => {
 		const detail = await apiGetAdminRealtimeTaskDetail(taskId);
 		setDetailTask(detail);
 	}, []);
 
-	const refreshLlmDetail = useCallback(
-		async (callId: string) => {
-			const detail = await apiGetAdminLlmCallDetail(callId);
-			if (activeTaskDrawerLlmCallId === callId) {
-				setTaskDrawerLlmDetail(detail);
-				return;
-			}
-			setLlmDetail(detail);
-		},
-		[activeTaskDrawerLlmCallId],
-	);
+	const refreshLlmDetail = useCallback(async (callId: string) => {
+		const detail = await apiGetAdminLlmCallDetail(callId);
+		if (activeTaskDrawerLlmCallIdRef.current === callId) {
+			setTaskDrawerLlmDetail(detail);
+			return;
+		}
+		setLlmDetail(detail);
+	}, []);
 
 	const loadTaskRelatedLlmCalls = useCallback(async (taskId: string) => {
 		const params = new URLSearchParams();
@@ -1168,11 +1567,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 			if (needFullRefresh) {
 				await Promise.all([
-					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
-					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
+					loadOverview({ background: true }),
+					loadRealtimeTasks({ background: true }),
+					loadScheduledRuns({ background: true }),
+					loadLlmSchedulerStatus({ background: true }),
+					loadLlmCalls({ background: true }),
 				]);
 				const activeDetailTaskId = detailTaskIdRef.current;
 				if (activeDetailTaskId) {
@@ -1186,7 +1585,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			}
 
 			if (needLlmRefresh) {
-				await Promise.all([loadLlmSchedulerStatus(), loadLlmCalls()]);
+				await Promise.all([
+					loadLlmSchedulerStatus({ background: true }),
+					loadLlmCalls({ background: true }),
+				]);
 			}
 
 			if (pendingDetailTaskId) {
@@ -1247,8 +1649,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	);
 
 	useEffect(() => {
-		void loadAll();
-	}, [loadAll]);
+		setError(null);
+		void loadOverview().catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadOverview]);
 
 	useEffect(() => {
 		setError(null);
@@ -1542,26 +1947,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiRetryAdminRealtimeTask(taskId);
-				await Promise.all([
-					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
-					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
-				]);
+				await loadAll({ background: true });
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[
-			loadOverview,
-			loadRealtimeTasks,
-			loadScheduledRuns,
-			loadLlmSchedulerStatus,
-			loadLlmCalls,
-		],
+		[loadAll],
 	);
 
 	const onCancelTask = useCallback(
@@ -1570,27 +1963,30 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setError(null);
 			try {
 				await apiCancelAdminRealtimeTask(taskId);
-				await Promise.all([
-					loadOverview(),
-					loadRealtimeTasks(),
-					loadScheduledRuns(),
-					loadLlmSchedulerStatus(),
-					loadLlmCalls(),
-				]);
+				await loadAll({ background: true });
 			} catch (err) {
 				setError(normalizeErrorMessage(err));
 			} finally {
 				setTaskActionBusyId(null);
 			}
 		},
-		[
-			loadOverview,
-			loadRealtimeTasks,
-			loadScheduledRuns,
-			loadLlmSchedulerStatus,
-			loadLlmCalls,
-		],
+		[loadAll],
 	);
+
+	const streamLabel =
+		streamStatus === "connected"
+			? "SSE 已连接"
+			: streamStatus === "reconnecting"
+				? "SSE 重连中..."
+				: "SSE 连接中...";
+	const streamTone = streamStatusTone(streamStatus);
+	const activeDetailTone = detailTaskTone ?? taskStatusTone("");
+	const activeTaskDrawerLlmTone = taskDrawerLlmDetail
+		? taskStatusTone(taskDrawerLlmDetail.status)
+		: null;
+	const openLlmDetailTone = llmDetail ? taskStatusTone(llmDetail.status) : null;
+	const cancelRequestedBadgeClass =
+		"border-amber-300 bg-amber-100 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
 
 	return (
 		<div className="space-y-4">
@@ -1624,278 +2020,248 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				</CardContent>
 			</Card>
 
-			<div className="flex flex-wrap items-center gap-2">
-				<Button
-					variant={tab === "realtime" ? "default" : "outline"}
-					size="sm"
-					className="font-mono text-xs"
-					onClick={() => setTab("realtime")}
-				>
-					实时异步任务
-				</Button>
-				<Button
-					variant={tab === "scheduled" ? "default" : "outline"}
-					size="sm"
-					className="font-mono text-xs"
-					onClick={() => setTab("scheduled")}
-				>
-					定时任务
-				</Button>
-				<Button
-					variant={tab === "llm" ? "default" : "outline"}
-					size="sm"
-					className="font-mono text-xs"
-					onClick={() => setTab("llm")}
-				>
-					LLM调度
-				</Button>
-				<Button
-					variant="secondary"
-					size="sm"
-					disabled={tasksLoading || scheduledRunsLoading || llmCallsLoading}
-					onClick={() => void loadAll()}
-				>
-					刷新
-				</Button>
-				<span
-					className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-xs font-medium ${
-						streamStatus === "connected"
-							? "border-emerald-300 bg-emerald-100/80 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
-							: streamStatus === "reconnecting"
-								? "border-amber-300 bg-amber-100/80 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100"
-								: "border-sky-300 bg-sky-100/80 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100"
-					}`}
-				>
-					<span
-						className={`size-1.5 rounded-full ${
-							streamStatus === "connected"
-								? "bg-emerald-500"
-								: streamStatus === "reconnecting"
-									? "bg-amber-500"
-									: "bg-sky-500"
-						}`}
-					/>
-					SSE
-					{streamStatus === "connected"
-						? " 已连接"
-						: streamStatus === "reconnecting"
-							? " 重连中..."
-							: " 连接中..."}
-				</span>
-			</div>
+			<Tabs
+				value={tab}
+				onValueChange={(nextValue) =>
+					setTab(nextValue as "realtime" | "scheduled" | "llm")
+				}
+				className="space-y-4"
+			>
+				<div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+					<TabsList className="grid w-full grid-cols-3 sm:inline-flex sm:w-auto">
+						<TabsTrigger value="realtime" className="font-mono text-xs">
+							实时异步任务
+						</TabsTrigger>
+						<TabsTrigger value="scheduled" className="font-mono text-xs">
+							定时任务
+						</TabsTrigger>
+						<TabsTrigger value="llm" className="font-mono text-xs">
+							LLM调度
+						</TabsTrigger>
+					</TabsList>
+					<div className="flex flex-wrap items-center gap-2">
+						<Button
+							variant="secondary"
+							size="sm"
+							disabled={isRefreshingData}
+							onClick={() => void loadAll({ background: true })}
+						>
+							刷新
+						</Button>
+						<StatusBadge label={streamLabel} tone={streamTone} />
+					</div>
+				</div>
 
-			{error ? <p className="text-destructive text-sm">{error}</p> : null}
+				{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
-			{tab === "realtime" ? (
-				<Card>
-					<CardHeader>
-						<div className="flex items-center gap-2">
-							<CardTitle>实时异步任务</CardTitle>
-							<div className="group relative">
-								<button
-									type="button"
-									aria-label="实时异步任务说明"
-									className="text-muted-foreground hover:text-foreground inline-flex size-5 items-center justify-center rounded-full border text-xs transition-colors"
-								>
-									?
-								</button>
-								<div
-									role="tooltip"
-									className="bg-foreground text-background pointer-events-none absolute top-full left-0 z-20 mt-2 w-60 rounded-md px-2 py-1.5 text-xs leading-relaxed opacity-0 shadow-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
-								>
-									监控系统内部任务，并支持重试与取消。
-								</div>
-							</div>
-						</div>
-					</CardHeader>
-					<CardContent className="space-y-4">
-						<div className="flex flex-wrap items-center gap-2">
-							<div className="relative w-full max-w-xs">
-								<select
-									value={statusFilter}
-									onChange={(e) => {
-										setTaskPage(1);
-										setStatusFilter(e.target.value as RealtimeStatusFilter);
-									}}
-									className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
-								>
-									<option value="all">状态：全部</option>
-									<option value="queued">状态：排队</option>
-									<option value="running">状态：运行中</option>
-									<option value="failed">状态：失败</option>
-									<option value="succeeded">状态：成功</option>
-									<option value="canceled">状态：取消</option>
-								</select>
-								<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
-							</div>
-							<span className="text-muted-foreground text-xs">
-								共 {formatCount(taskTotal)} 个任务 · 当前用户 #{currentUserId}
-							</span>
-						</div>
-
-						<div className="space-y-2">
-							{tasksLoading ? (
-								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
-									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
-									正在加载任务...
-								</p>
-							) : tasks.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无任务。</p>
-							) : (
-								tasks.map((task) => {
-									const busy = taskActionBusyId === task.id;
-									const tone = taskStatusTone(task.status);
-									return (
-										<div
-											key={task.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+				<TabsContent value="realtime">
+					<Card>
+						<CardHeader>
+							<div className="flex items-center gap-2">
+								<CardTitle>实时异步任务</CardTitle>
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<Button
+											type="button"
+											variant="ghost"
+											size="icon"
+											className="text-muted-foreground size-7 rounded-full"
 										>
-											<div className="min-w-0">
-												<div className="flex flex-wrap items-center gap-2">
-													<p className="font-medium text-sm">
-														{taskTypeLabel(task.task_type)}
-													</p>
-													<span
-														className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
-													>
-														<span
-															className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
+											<CircleHelp className="size-4" />
+											<span className="sr-only">实时异步任务说明</span>
+										</Button>
+									</TooltipTrigger>
+									<TooltipContent side="right" sideOffset={6}>
+										监控系统内部任务，并支持重试与取消。
+									</TooltipContent>
+								</Tooltip>
+							</div>
+							<CardDescription>
+								按状态查看实时任务队列，并保留当前用户上下文与详情入口。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<FilterSelect
+									value={statusFilter}
+									onValueChange={(nextValue) => {
+										setTaskPage(1);
+										setStatusFilter(nextValue);
+									}}
+									options={REALTIME_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="实时异步任务状态筛选"
+									className="w-full sm:w-[220px]"
+								/>
+								<span className="text-muted-foreground text-xs">
+									共 {formatCount(taskTotal)} 个任务 · 当前用户 #{currentUserId}
+								</span>
+							</div>
+
+							<div className="space-y-2">
+								{tasksRefreshing ? (
+									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+										<span className="size-2 rounded-full bg-amber-500/80" />
+										任务列表更新中...
+									</p>
+								) : null}
+								{tasksInitialLoading ? (
+									<LoadingMessage>正在加载任务...</LoadingMessage>
+								) : tasks.length === 0 ? (
+									<p className="text-muted-foreground text-sm">暂无任务。</p>
+								) : (
+									tasks.map((task) => {
+										const busy = taskActionBusyId === task.id;
+										const tone = taskStatusTone(task.status);
+										return (
+											<div
+												key={task.id}
+												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+											>
+												<div className="min-w-0">
+													<div className="flex flex-wrap items-center gap-2">
+														<p className="font-medium text-sm">
+															{taskTypeLabel(task.task_type)}
+														</p>
+														<StatusBadge
+															label={taskStatusLabel(task.status)}
+															tone={tone}
 														/>
-														{taskStatusLabel(task.status)}
-													</span>
-													{task.cancel_requested ? (
-														<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-															已请求取消
+														{task.cancel_requested ? (
+															<FlagBadge
+																label="已请求取消"
+																className={cancelRequestedBadgeClass}
+															/>
+														) : null}
+													</div>
+													<p className="text-muted-foreground mt-1 text-xs">
+														类型：
+														<span className="font-mono">{task.task_type}</span>
+													</p>
+													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+														ID: {task.id}
+													</p>
+													<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
+														<span className="bg-muted/60 rounded px-2 py-0.5">
+															创建 {formatLocalHm(task.created_at)}
 														</span>
+														<span className="bg-muted/60 rounded px-2 py-0.5">
+															开始 {formatLocalHm(task.started_at)}
+														</span>
+														<span className="bg-muted/60 rounded px-2 py-0.5">
+															完成 {formatLocalHm(task.finished_at)}
+														</span>
+													</div>
+													{task.error_message ? (
+														<p className="text-destructive mt-1 text-xs font-medium">
+															失败原因：{task.error_message}
+														</p>
 													) : null}
 												</div>
-												<p className="text-muted-foreground mt-1 text-xs">
-													类型：
-													<span className="font-mono">{task.task_type}</span>
-												</p>
-												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-													ID: {task.id}
-												</p>
-												<div className="mt-1 flex flex-wrap gap-1.5 text-xs">
-													<span className="bg-muted/60 rounded px-2 py-0.5">
-														创建 {formatLocalHm(task.created_at)}
-													</span>
-													<span className="bg-muted/60 rounded px-2 py-0.5">
-														完成 {formatLocalHm(task.finished_at)}
-													</span>
+												<div className="flex flex-wrap gap-2">
+													<Button
+														variant="outline"
+														disabled={detailLoading}
+														onClick={() => void onOpenTaskDetail(task.id)}
+													>
+														详情
+													</Button>
+													<Button
+														variant="outline"
+														disabled={
+															busy ||
+															task.status === "queued" ||
+															task.status === "running"
+														}
+														onClick={() => void onRetryTask(task.id)}
+													>
+														重试
+													</Button>
+													<Button
+														variant="destructive"
+														disabled={
+															busy ||
+															task.status === "succeeded" ||
+															task.status === "failed" ||
+															task.status === "canceled"
+														}
+														onClick={() => void onCancelTask(task.id)}
+													>
+														取消
+													</Button>
 												</div>
-												{task.error_message ? (
-													<p className="text-destructive mt-1 text-xs font-medium">
-														失败原因：{task.error_message}
-													</p>
-												) : null}
 											</div>
-											<div className="flex flex-wrap gap-2">
-												<Button
-													variant="outline"
-													disabled={detailLoading}
-													onClick={() => void onOpenTaskDetail(task.id)}
-												>
-													详情
-												</Button>
-												<Button
-													variant="outline"
-													disabled={
-														busy ||
-														task.status === "queued" ||
-														task.status === "running"
-													}
-													onClick={() => void onRetryTask(task.id)}
-												>
-													重试
-												</Button>
-												<Button
-													variant="destructive"
-													disabled={
-														busy ||
-														task.status === "succeeded" ||
-														task.status === "failed" ||
-														task.status === "canceled"
-													}
-													onClick={() => void onCancelTask(task.id)}
-												>
-													取消
-												</Button>
-											</div>
-										</div>
-									);
-								})
-							)}
-						</div>
-
-						<div className="flex items-center justify-between">
-							<p className="text-muted-foreground text-xs">
-								第 {taskPage}/{taskTotalPages} 页
-							</p>
-							<div className="flex gap-2">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={taskPage <= 1 || tasksLoading}
-									onClick={() => setTaskPage((prev) => Math.max(1, prev - 1))}
-								>
-									上一页
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={taskPage >= taskTotalPages || tasksLoading}
-									onClick={() =>
-										setTaskPage((prev) => Math.min(taskTotalPages, prev + 1))
-									}
-								>
-									下一页
-								</Button>
+										);
+									})
+								)}
 							</div>
-						</div>
-					</CardContent>
-				</Card>
-			) : null}
 
-			{tab === "scheduled" ? (
-				<Card>
-					<CardHeader>
-						<CardTitle>定时任务</CardTitle>
-					</CardHeader>
-					<CardContent className="space-y-4">
-						<div className="space-y-3">
-							<div className="flex flex-wrap items-center justify-between gap-2">
-								<h4 className="font-medium text-sm">运行记录</h4>
-								<div className="relative w-full max-w-xs">
-									<select
-										value={scheduledRunStatusFilter}
-										onChange={(e) => {
-											setScheduledRunPage(1);
-											setScheduledRunStatusFilter(
-												e.target.value as RealtimeStatusFilter,
-											);
-										}}
-										className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {taskPage}/{taskTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={taskPage <= 1 || tasksLoadPhase !== "idle"}
+										onClick={() => setTaskPage((prev) => Math.max(1, prev - 1))}
 									>
-										<option value="all">状态：全部</option>
-										<option value="queued">状态：排队</option>
-										<option value="running">状态：运行中</option>
-										<option value="failed">状态：失败</option>
-										<option value="succeeded">状态：成功</option>
-										<option value="canceled">状态：取消</option>
-									</select>
-									<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											taskPage >= taskTotalPages || tasksLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setTaskPage((prev) => Math.min(taskTotalPages, prev + 1))
+										}
+									>
+										下一页
+									</Button>
 								</div>
 							</div>
-							<p className="text-muted-foreground text-xs">
-								共 {formatCount(scheduledRunTotal)} 条
-							</p>
+						</CardContent>
+					</Card>
+				</TabsContent>
+
+				<TabsContent value="scheduled">
+					<Card>
+						<CardHeader>
+							<CardTitle>定时任务</CardTitle>
+							<CardDescription>
+								查看 `brief.daily_slot` 运行记录，并保留重试/取消与详情联动。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<FilterSelect
+									value={scheduledRunStatusFilter}
+									onValueChange={(nextValue) => {
+										setScheduledRunPage(1);
+										setScheduledRunStatusFilter(nextValue);
+									}}
+									options={REALTIME_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="定时任务状态筛选"
+									className="w-full sm:w-[220px]"
+								/>
+								<p className="text-muted-foreground text-xs">
+									共 {formatCount(scheduledRunTotal)} 条
+								</p>
+							</div>
+
 							<div className="space-y-2">
-								{scheduledRunsLoading ? (
-									<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
-										<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
-										正在加载运行记录...
+								{scheduledRunsRefreshing ? (
+									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+										<span className="size-2 rounded-full bg-amber-500/80" />
+										运行记录更新中...
 									</p>
+								) : null}
+								{scheduledRunsInitialLoading ? (
+									<LoadingMessage>正在加载运行记录...</LoadingMessage>
 								) : scheduledRuns.length === 0 ? (
 									<p className="text-muted-foreground text-sm">
 										暂无运行记录。
@@ -1914,18 +2280,15 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 														<p className="font-medium text-sm">
 															{taskTypeLabel(task.task_type)}
 														</p>
-														<span
-															className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
-														>
-															<span
-																className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
-															/>
-															{taskStatusLabel(task.status)}
-														</span>
+														<StatusBadge
+															label={taskStatusLabel(task.status)}
+															tone={tone}
+														/>
 														{task.cancel_requested ? (
-															<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-																已请求取消
-															</span>
+															<FlagBadge
+																label="已请求取消"
+																className={cancelRequestedBadgeClass}
+															/>
 														) : null}
 													</div>
 													<p className="text-muted-foreground mt-1 text-xs">
@@ -1986,6 +2349,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									})
 								)}
 							</div>
+
 							<div className="flex items-center justify-between">
 								<p className="text-muted-foreground text-xs">
 									第 {scheduledRunPage}/{scheduledRunTotalPages} 页
@@ -1994,7 +2358,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									<Button
 										variant="outline"
 										size="sm"
-										disabled={scheduledRunPage <= 1 || scheduledRunsLoading}
+										disabled={
+											scheduledRunPage <= 1 || scheduledRunsLoadPhase !== "idle"
+										}
 										onClick={() =>
 											setScheduledRunPage((prev) => Math.max(1, prev - 1))
 										}
@@ -2006,7 +2372,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										size="sm"
 										disabled={
 											scheduledRunPage >= scheduledRunTotalPages ||
-											scheduledRunsLoading
+											scheduledRunsLoadPhase !== "idle"
 										}
 										onClick={() =>
 											setScheduledRunPage((prev) =>
@@ -2018,447 +2384,449 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									</Button>
 								</div>
 							</div>
-						</div>
-					</CardContent>
-				</Card>
-			) : null}
+						</CardContent>
+					</Card>
+				</TabsContent>
 
-			{tab === "llm" ? (
-				<Card>
-					<CardHeader>
-						<CardTitle>LLM 调度</CardTitle>
-						<CardDescription>
-							查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
-						</CardDescription>
-					</CardHeader>
-					<CardContent className="space-y-4">
-						<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-							<div className="bg-card/70 rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">调度器状态</p>
-								<p className="mt-1 text-sm font-semibold">
-									{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									节流{" "}
-									{formatDurationMs(llmStatus?.request_interval_ms ?? null)}
-								</p>
+				<TabsContent value="llm">
+					<Card>
+						<CardHeader>
+							<CardTitle>LLM 调度</CardTitle>
+							<CardDescription>
+								查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+								<div className="bg-card/70 rounded-lg border p-3">
+									<p className="text-muted-foreground text-xs">调度器状态</p>
+									<p className="mt-1 text-sm font-semibold">
+										{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										节流{" "}
+										{formatDurationMs(llmStatus?.request_interval_ms ?? null)}
+									</p>
+								</div>
+								<div className="bg-card/70 rounded-lg border p-3">
+									<p className="text-muted-foreground text-xs">等待 / 进行中</p>
+									<p className="mt-1 text-sm font-semibold">
+										{formatCount(llmStatus?.waiting_calls)} /{" "}
+										{formatCount(llmStatus?.in_flight_calls)}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										下一个发放槽位{" "}
+										{formatDurationMs(llmStatus?.next_slot_in_ms ?? null)}
+									</p>
+								</div>
+								<div className="bg-card/70 rounded-lg border p-3">
+									<p className="text-muted-foreground text-xs">
+										近24h 调用 / 失败
+									</p>
+									<p className="mt-1 text-sm font-semibold">
+										{formatCount(llmStatus?.calls_24h)} /{" "}
+										{formatCount(llmStatus?.failed_24h)}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										平均等待{" "}
+										{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
+									</p>
+								</div>
 							</div>
-							<div className="bg-card/70 rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">等待 / 进行中</p>
-								<p className="mt-1 text-sm font-semibold">
-									{formatCount(llmStatus?.waiting_calls)} /{" "}
-									{formatCount(llmStatus?.in_flight_calls)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									下一个发放槽位{" "}
-									{formatDurationMs(llmStatus?.next_slot_in_ms ?? null)}
-								</p>
-							</div>
-							<div className="bg-card/70 rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									近24h 调用 / 失败
-								</p>
-								<p className="mt-1 text-sm font-semibold">
-									{formatCount(llmStatus?.calls_24h)} /{" "}
-									{formatCount(llmStatus?.failed_24h)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									平均等待{" "}
-									{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
-								</p>
-							</div>
-						</div>
 
-						<div className="grid gap-2 lg:grid-cols-4">
-							<div className="relative w-full">
-								<select
+							<div className="grid gap-2 lg:grid-cols-[minmax(0,220px)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.35fr)]">
+								<FilterSelect
 									value={llmStatusFilter}
-									onChange={(e) => {
+									onValueChange={(nextValue) => {
 										setLlmCallPage(1);
-										setLlmStatusFilter(e.target.value as LlmStatusFilter);
+										setLlmStatusFilter(nextValue);
 									}}
-									className="bg-background h-9 w-full appearance-none rounded-md border pl-3 pr-10 text-sm outline-none"
-								>
-									<option value="all">状态：全部</option>
-									<option value="queued">状态：排队</option>
-									<option value="running">状态：运行中</option>
-									<option value="failed">状态：失败</option>
-									<option value="succeeded">状态：成功</option>
-								</select>
-								<ChevronDown className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 size-4 -translate-y-1/2" />
-							</div>
-							<input
-								value={llmSourceFilter}
-								onChange={(e) => {
-									setLlmCallPage(1);
-									setLlmSourceFilter(e.target.value);
-								}}
-								placeholder="来源（source）"
-								className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
-							/>
-							<input
-								value={llmRequestedByFilter}
-								onChange={(e) => {
-									setLlmCallPage(1);
-									setLlmRequestedByFilter(e.target.value);
-								}}
-								placeholder="用户ID（requested_by）"
-								className="bg-background h-9 rounded-md border px-3 text-sm outline-none"
-							/>
-							<div className="grid grid-cols-2 gap-2">
-								<input
-									type="datetime-local"
-									value={llmStartedFromFilter}
-									onChange={(e) => {
-										setLlmCallPage(1);
-										setLlmStartedFromFilter(e.target.value);
-									}}
-									className="bg-background h-9 rounded-md border px-2 text-xs outline-none"
+									options={LLM_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="LLM 调用状态筛选"
 								/>
-								<input
-									type="datetime-local"
-									value={llmStartedToFilter}
-									onChange={(e) => {
+								<Input
+									value={llmSourceFilter}
+									onChange={(event) => {
 										setLlmCallPage(1);
-										setLlmStartedToFilter(e.target.value);
+										setLlmSourceFilter(event.target.value);
 									}}
-									className="bg-background h-9 rounded-md border px-2 text-xs outline-none"
+									placeholder="来源（source）"
+									aria-label="LLM 调用来源筛选"
 								/>
+								<Input
+									value={llmRequestedByFilter}
+									onChange={(event) => {
+										setLlmCallPage(1);
+										setLlmRequestedByFilter(event.target.value);
+									}}
+									placeholder="用户ID（requested_by）"
+									aria-label="LLM 调用用户筛选"
+									inputMode="numeric"
+								/>
+								<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+									<Input
+										type="datetime-local"
+										value={llmStartedFromFilter}
+										onChange={(event) => {
+											setLlmCallPage(1);
+											setLlmStartedFromFilter(event.target.value);
+										}}
+										aria-label="LLM 开始时间下限"
+										className="text-xs"
+									/>
+									<Input
+										type="datetime-local"
+										value={llmStartedToFilter}
+										onChange={(event) => {
+											setLlmCallPage(1);
+											setLlmStartedToFilter(event.target.value);
+										}}
+										aria-label="LLM 开始时间上限"
+										className="text-xs"
+									/>
+								</div>
 							</div>
-						</div>
 
-						<p className="text-muted-foreground text-xs">
-							共 {formatCount(llmCallTotal)} 条调用
-						</p>
-
-						<div className="space-y-2">
-							{llmCallsLoading ? (
-								<p className="text-muted-foreground inline-flex items-center gap-2 text-sm">
-									<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
-									正在加载调用记录...
-								</p>
-							) : llmCalls.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无调用记录。</p>
-							) : (
-								llmCalls.map((call) => {
-									const tone = taskStatusTone(call.status);
-									return (
-										<div
-											key={call.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
-										>
-											<div className="min-w-0">
-												<div className="flex flex-wrap items-center gap-2">
-													<p className="font-medium text-sm">{call.source}</p>
-													<span
-														className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${tone.badgeClass}`}
-													>
-														<span
-															className={`mr-1.5 size-1.5 rounded-full ${tone.dotClass}`}
-														/>
-														{taskStatusLabel(call.status)}
-													</span>
-												</div>
-												<p className="text-muted-foreground mt-1 text-xs">
-													模型：<span className="font-mono">{call.model}</span>
-												</p>
-												<p className="text-muted-foreground mt-1 text-xs">
-													用户：{call.requested_by ?? "-"} · 重试次数：
-													{formatCount(call.attempt_count)}
-												</p>
-												<p className="text-muted-foreground mt-1 text-xs">
-													等待 {formatDurationMs(call.scheduler_wait_ms)} · 首字{" "}
-													{formatDurationMs(call.first_token_wait_ms)} · 耗时{" "}
-													{formatDurationMs(call.duration_ms)}
-												</p>
-												<p className="text-muted-foreground mt-1 text-xs">
-													Token 输入/输出/缓存：{formatCount(call.input_tokens)}{" "}
-													/ {formatCount(call.output_tokens)} /{" "}
-													{formatCount(call.cached_input_tokens)}
-												</p>
-												<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
-													ID: {call.id}
-												</p>
-											</div>
-											<div className="flex flex-wrap gap-2">
-												<Button
-													variant="outline"
-													disabled={llmDetailLoading}
-													onClick={() => void onOpenLlmCallDetail(call.id)}
-												>
-													详情
-												</Button>
-											</div>
-										</div>
-									);
-								})
-							)}
-						</div>
-
-						<div className="flex items-center justify-between">
 							<p className="text-muted-foreground text-xs">
-								第 {llmCallPage}/{llmCallTotalPages} 页
+								共 {formatCount(llmCallTotal)} 条调用
 							</p>
-							<div className="flex gap-2">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={llmCallPage <= 1 || llmCallsLoading}
-									onClick={() =>
-										setLlmCallPage((prev) => Math.max(1, prev - 1))
-									}
-								>
-									上一页
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={llmCallPage >= llmCallTotalPages || llmCallsLoading}
-									onClick={() =>
-										setLlmCallPage((prev) =>
-											Math.min(llmCallTotalPages, prev + 1),
-										)
-									}
-								>
-									下一页
-								</Button>
-							</div>
-						</div>
-					</CardContent>
-				</Card>
-			) : null}
 
-			{isTaskDrawerOpen ? (
-				<div className="fixed inset-0 z-40 flex">
-					<button
-						type="button"
-						className="flex-1 bg-black/35"
-						aria-label="关闭任务详情"
-						onClick={onCloseTaskDrawer}
-					/>
-					<div className="bg-card relative h-full w-full max-w-4xl border-l p-5 shadow-2xl">
-						{activeTaskDetail ? (
-							<>
-								<div className="flex items-start justify-between gap-3">
-									<div className="min-w-0">
-										<h3 className="text-lg font-semibold tracking-tight">
-											{isTaskDrawerLlmRoute
-												? "任务详情 · LLM 调用详情"
-												: "任务详情"}
-										</h3>
-										<div className="mt-1 flex flex-wrap items-center gap-2">
+							<div className="space-y-2">
+								{llmRefreshing ? (
+									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+										<span className="size-2 rounded-full bg-amber-500/80" />
+										LLM 调度更新中...
+									</p>
+								) : null}
+								{llmCallsInitialLoading ? (
+									<LoadingMessage>正在加载调用记录...</LoadingMessage>
+								) : llmCalls.length === 0 ? (
+									<p className="text-muted-foreground text-sm">
+										暂无调用记录。
+									</p>
+								) : (
+									llmCalls.map((call) => {
+										const tone = taskStatusTone(call.status);
+										return (
+											<div
+												key={call.id}
+												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+											>
+												<div className="min-w-0">
+													<div className="flex flex-wrap items-center gap-2">
+														<p className="font-medium text-sm">{call.source}</p>
+														<StatusBadge
+															label={taskStatusLabel(call.status)}
+															tone={tone}
+														/>
+													</div>
+													<p className="text-muted-foreground mt-1 text-xs">
+														模型：
+														<span className="font-mono">{call.model}</span>
+													</p>
+													<p className="text-muted-foreground mt-1 text-xs">
+														用户：{call.requested_by ?? "-"} · 重试次数：
+														{formatCount(call.attempt_count)}
+													</p>
+													<p className="text-muted-foreground mt-1 text-xs">
+														等待 {formatDurationMs(call.scheduler_wait_ms)} ·
+														首字 {formatDurationMs(call.first_token_wait_ms)} ·
+														耗时 {formatDurationMs(call.duration_ms)}
+													</p>
+													<p className="text-muted-foreground mt-1 text-xs">
+														Token 输入/输出/缓存：
+														{formatCount(call.input_tokens)} /{" "}
+														{formatCount(call.output_tokens)} /{" "}
+														{formatCount(call.cached_input_tokens)}
+													</p>
+													<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+														ID: {call.id}
+													</p>
+												</div>
+												<div className="flex flex-wrap gap-2">
+													<Button
+														variant="outline"
+														disabled={llmDetailLoading}
+														onClick={() => void onOpenLlmCallDetail(call.id)}
+													>
+														详情
+													</Button>
+												</div>
+											</div>
+										);
+									})
+								)}
+							</div>
+
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {llmCallPage}/{llmCallTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={llmCallPage <= 1 || llmCallsLoadPhase !== "idle"}
+										onClick={() =>
+											setLlmCallPage((prev) => Math.max(1, prev - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											llmCallPage >= llmCallTotalPages ||
+											llmCallsLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setLlmCallPage((prev) =>
+												Math.min(llmCallTotalPages, prev + 1),
+											)
+										}
+									>
+										下一页
+									</Button>
+								</div>
+							</div>
+						</CardContent>
+					</Card>
+				</TabsContent>
+			</Tabs>
+
+			<Sheet
+				open={isTaskDrawerOpen}
+				onOpenChange={(open) => {
+					if (!open) {
+						onCloseTaskDrawer();
+					}
+				}}
+			>
+				<SheetContent
+					side="right"
+					showCloseButton={false}
+					className="w-full gap-0 overflow-y-auto p-0 sm:max-w-4xl"
+				>
+					<SheetHeader className="gap-3 border-b px-5 py-4 text-left">
+						<div className="flex items-start justify-between gap-3">
+							<div className="min-w-0 space-y-2">
+								<SheetTitle className="text-lg">
+									{isTaskDrawerLlmRoute
+										? "任务详情 · LLM 调用详情"
+										: "任务详情"}
+								</SheetTitle>
+								<SheetDescription>
+									{isTaskDrawerLlmRoute
+										? "保留任务路由上下文，查看单次 LLM 调用详情与原始对话。"
+										: "查看任务概览、类型详情、关联 LLM 调用与执行时间线。"}
+								</SheetDescription>
+								{activeTaskDetail ? (
+									<>
+										<div className="flex flex-wrap items-center gap-2">
 											<p className="text-muted-foreground text-sm">
 												{taskTypeLabel(activeTaskDetail.task.task_type)}
 											</p>
-											<span
-												className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${detailTaskTone?.badgeClass ?? ""}`}
-											>
-												<span
-													className={`mr-1.5 size-1.5 rounded-full ${detailTaskTone?.dotClass ?? "bg-muted-foreground"}`}
-												/>
-												{taskStatusLabel(activeTaskDetail.task.status)}
-											</span>
+											<StatusBadge
+												label={taskStatusLabel(activeTaskDetail.task.status)}
+												tone={activeDetailTone}
+											/>
 											{activeTaskDetail.task.cancel_requested ? (
-												<span className="rounded-full border border-amber-300 bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100">
-													已请求取消
-												</span>
+												<FlagBadge
+													label="已请求取消"
+													className={cancelRequestedBadgeClass}
+												/>
 											) : null}
 										</div>
-										<p className="text-muted-foreground mt-1 text-xs">
-											类型：
-											<span className="font-mono">
-												{activeTaskDetail.task.task_type}
-											</span>
-										</p>
-										<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
+										<p className="text-muted-foreground truncate font-mono text-xs">
 											{activeTaskDetail.task.id}
 										</p>
-									</div>
-									<Button variant="outline" onClick={onCloseTaskDrawer}>
-										关闭
-									</Button>
-								</div>
-
-								{isTaskDrawerLlmRoute ? (
-									<>
-										<div className="mt-4 border-t pt-4">
-											<div className="flex flex-wrap items-center justify-between gap-2">
-												<div className="min-w-0">
-													<p className="text-muted-foreground text-xs">
-														LLM 调用
-													</p>
-													<p className="mt-1 truncate font-mono text-sm">
-														{activeTaskDrawerLlmCallId}
-													</p>
-												</div>
-												<Button
-													variant="outline"
-													size="sm"
-													onClick={onBackToTaskDetail}
-												>
-													返回任务详情
-												</Button>
-											</div>
-										</div>
-										{taskDrawerLlmLoading && !taskDrawerLlmDetail ? (
-											<p className="text-muted-foreground mt-4 inline-flex items-center gap-2 text-sm">
-												<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
-												正在加载 LLM 调用详情...
-											</p>
-										) : taskDrawerLlmDetail ? (
-											<>
-												<p className="text-muted-foreground mt-3 text-sm">
-													来源：
-													<span className="font-mono">
-														{taskDrawerLlmDetail.source}
-													</span>
-												</p>
-												<LlmCallDetailSection
-													detail={taskDrawerLlmDetail}
-													onOpenParentTask={onOpenParentTaskFromLlm}
-												/>
-											</>
-										) : (
-											<p className="text-muted-foreground mt-4 text-sm">
-												未找到该 LLM 调用详情。
-											</p>
-										)}
 									</>
-								) : (
-									<>
-										<div className="mt-4 grid gap-2 md:grid-cols-2">
-											<div className="rounded-lg border p-3">
+								) : activeTaskDrawerTaskId ? (
+									<p className="text-muted-foreground truncate font-mono text-xs">
+										{activeTaskDrawerTaskId}
+									</p>
+								) : null}
+							</div>
+							<Button variant="outline" onClick={onCloseTaskDrawer}>
+								关闭
+							</Button>
+						</div>
+					</SheetHeader>
+					<div className="space-y-4 px-5 py-4">
+						{activeTaskDetail ? (
+							isTaskDrawerLlmRoute ? (
+								<>
+									<div className="rounded-lg border p-3">
+										<div className="flex flex-wrap items-center justify-between gap-2">
+											<div className="min-w-0">
 												<p className="text-muted-foreground text-xs">
-													任务状态
+													LLM 调用
 												</p>
-												<p className="mt-1 font-medium">
-													{taskStatusLabel(activeTaskDetail.task.status)}
+												<p className="mt-1 truncate font-mono text-sm">
+													{activeTaskDrawerLlmCallId}
 												</p>
+												{taskDrawerLlmDetail && activeTaskDrawerLlmTone ? (
+													<div className="mt-2">
+														<StatusBadge
+															label={taskStatusLabel(
+																taskDrawerLlmDetail.status,
+															)}
+															tone={activeTaskDrawerLlmTone}
+														/>
+													</div>
+												) : null}
 											</div>
-											<div className="rounded-lg border p-3">
-												<p className="text-muted-foreground text-xs">
-													触发来源
-												</p>
-												<p className="mt-1 font-medium">
-													{sourceLabel(activeTaskDetail.task.source)}
-												</p>
-											</div>
-											<div className="rounded-lg border p-3">
-												<p className="text-muted-foreground text-xs">
-													创建 / 开始 / 完成
-												</p>
-												<p className="mt-1 font-medium">
-													{formatLocalDateTime(
-														activeTaskDetail.task.created_at,
-													)}
-												</p>
-												<p className="text-muted-foreground mt-1 text-xs">
-													开始{" "}
-													{formatLocalDateTime(
-														activeTaskDetail.task.started_at,
-													)}{" "}
-													· 完成{" "}
-													{formatLocalDateTime(
-														activeTaskDetail.task.finished_at,
-													)}
-												</p>
-											</div>
-										</div>
-
-										<div className="mt-4 border-t pt-4">
-											<TaskTypeDetailSection
-												detail={activeTaskDetail}
-												relatedLlmCalls={taskRelatedLlmCalls}
-												relatedLlmCallsLoading={taskRelatedLlmLoading}
-												onOpenLlmCallDetail={onOpenTaskLlmDetail}
-											/>
-										</div>
-
-										{activeTaskDetail.task.status === "succeeded" &&
-										detailBusinessOutcome &&
-										detailBusinessOutcome.code !== "ok" ? (
-											<div
-												className={`mt-3 rounded-lg border p-3 ${businessOutcomeBannerClass(
-													detailBusinessOutcome.code,
-												)}`}
+											<Button
+												variant="outline"
+												size="sm"
+												onClick={onBackToTaskDetail}
 											>
-												<p className="text-xs font-semibold">
-													业务结果：{detailBusinessOutcome.label}
-												</p>
-												<p className="mt-1 text-xs opacity-90">
-													{detailBusinessOutcome.message}
-												</p>
-											</div>
-										) : null}
-
-										{activeTaskDetail.task.error_message ? (
-											<p className="text-destructive mt-3 text-sm">
-												失败原因：{activeTaskDetail.task.error_message}
+												返回任务详情
+											</Button>
+										</div>
+									</div>
+									{taskDrawerLlmLoading && !taskDrawerLlmDetail ? (
+										<LoadingMessage>正在加载 LLM 调用详情...</LoadingMessage>
+									) : taskDrawerLlmDetail ? (
+										<>
+											<p className="text-muted-foreground text-sm">
+												来源：
+												<span className="font-mono">
+													{taskDrawerLlmDetail.source}
+												</span>
 											</p>
-										) : null}
-
-										<div className="mt-4 border-t pt-4">
+											<LlmCallDetailSection
+												detail={taskDrawerLlmDetail}
+												onOpenParentTask={onOpenParentTaskFromLlm}
+											/>
+										</>
+									) : (
+										<p className="text-muted-foreground text-sm">
+											未找到该 LLM 调用详情。
+										</p>
+									)}
+								</>
+							) : (
+								<>
+									<div className="grid gap-2 md:grid-cols-2">
+										<div className="rounded-lg border p-3">
+											<p className="text-muted-foreground text-xs">任务状态</p>
+											<p className="mt-1 font-medium">
+												{taskStatusLabel(activeTaskDetail.task.status)}
+											</p>
+										</div>
+										<div className="rounded-lg border p-3">
+											<p className="text-muted-foreground text-xs">触发来源</p>
+											<p className="mt-1 font-medium">
+												{sourceLabel(activeTaskDetail.task.source)}
+											</p>
+										</div>
+										<div className="rounded-lg border p-3">
 											<p className="text-muted-foreground text-xs">
-												执行时间线
+												创建 / 开始 / 完成
 											</p>
-											{detailEventMeta?.truncated ? (
-												<p className="text-amber-700 mt-1 text-xs dark:text-amber-200">
-													仅展示最近 {detailEventMeta.limit} 条事件（已加载{" "}
-													{detailEventMeta.returned}/{detailEventMeta.total}）。
-												</p>
-											) : detailEventMeta ? (
-												<p className="text-muted-foreground mt-1 text-xs">
-													事件总数 {detailEventMeta.total}，当前已加载{" "}
-													{detailEventMeta.returned} 条。
-												</p>
-											) : null}
+											<p className="mt-1 font-medium">
+												{formatLocalDateTime(activeTaskDetail.task.created_at)}
+											</p>
+											<p className="text-muted-foreground mt-1 text-xs">
+												开始{" "}
+												{formatLocalDateTime(activeTaskDetail.task.started_at)}{" "}
+												· 完成{" "}
+												{formatLocalDateTime(activeTaskDetail.task.finished_at)}
+											</p>
 										</div>
-										<div className="mt-2 max-h-[52vh] space-y-2 overflow-auto pr-1">
-											{taskEvents.length === 0 ? (
-												<p className="text-muted-foreground text-sm">
-													暂无事件日志。
-												</p>
-											) : (
-												taskEvents
-													.slice()
-													.reverse()
-													.map(({ event, presentation }) => (
-														<div
-															key={event.id}
-															className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
-														>
-															<p className="font-medium text-sm">
-																{presentation.title}
-															</p>
-															<p className="text-muted-foreground mt-1 text-xs">
-																{presentation.description}
-															</p>
-															<p className="text-muted-foreground mt-1 font-mono text-[11px]">
-																{event.event_type} ·{" "}
-																{formatLocalDateTime(event.created_at)}
-															</p>
-															<details className="mt-2">
-																<summary className="text-muted-foreground cursor-pointer text-xs">
-																	查看原始事件
-																</summary>
-																<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
-																	{event.payload_json}
-																</pre>
-															</details>
-														</div>
-													))
-											)}
+									</div>
+
+									<div className="border-t pt-4">
+										<TaskTypeDetailSection
+											detail={activeTaskDetail}
+											relatedLlmCalls={taskRelatedLlmCalls}
+											relatedLlmCallsLoading={taskRelatedLlmLoading}
+											onOpenLlmCallDetail={onOpenTaskLlmDetail}
+										/>
+									</div>
+
+									{activeTaskDetail.task.status === "succeeded" &&
+									detailBusinessOutcome &&
+									detailBusinessOutcome.code !== "ok" ? (
+										<div
+											className={`rounded-lg border p-3 ${businessOutcomeBannerClass(
+												detailBusinessOutcome.code,
+											)}`}
+										>
+											<p className="text-xs font-semibold">
+												业务结果：{detailBusinessOutcome.label}
+											</p>
+											<p className="mt-1 text-xs opacity-90">
+												{detailBusinessOutcome.message}
+											</p>
 										</div>
-									</>
-								)}
-							</>
+									) : null}
+
+									{activeTaskDetail.task.error_message ? (
+										<p className="text-destructive text-sm">
+											失败原因：{activeTaskDetail.task.error_message}
+										</p>
+									) : null}
+
+									<div className="border-t pt-4">
+										<p className="text-muted-foreground text-xs">执行时间线</p>
+										{detailEventMeta?.truncated ? (
+											<p className="mt-1 text-xs text-amber-700 dark:text-amber-200">
+												仅展示最近 {detailEventMeta.limit} 条事件（已加载{" "}
+												{detailEventMeta.returned}/{detailEventMeta.total}）。
+											</p>
+										) : detailEventMeta ? (
+											<p className="text-muted-foreground mt-1 text-xs">
+												事件总数 {detailEventMeta.total}，当前已加载{" "}
+												{detailEventMeta.returned} 条。
+											</p>
+										) : null}
+									</div>
+									<div className="max-h-[52vh] space-y-2 overflow-auto pr-1">
+										{taskEvents.length === 0 ? (
+											<p className="text-muted-foreground text-sm">
+												暂无事件日志。
+											</p>
+										) : (
+											taskEvents
+												.slice()
+												.reverse()
+												.map(({ event, presentation }) => (
+													<div
+														key={event.id}
+														className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
+													>
+														<p className="font-medium text-sm">
+															{presentation.title}
+														</p>
+														<p className="text-muted-foreground mt-1 text-xs">
+															{presentation.description}
+														</p>
+														<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+															{event.event_type} ·{" "}
+															{formatLocalDateTime(event.created_at)}
+														</p>
+														<details className="mt-2">
+															<summary className="text-muted-foreground cursor-pointer text-xs">
+																查看原始事件
+															</summary>
+															<pre className="text-muted-foreground mt-1 overflow-x-auto whitespace-pre-wrap break-all text-[11px]">
+																{event.payload_json}
+															</pre>
+														</details>
+													</div>
+												))
+										)}
+									</div>
+								</>
+							)
 						) : detailLoading ? (
-							<p className="text-muted-foreground mt-4 inline-flex items-center gap-2 text-sm">
-								<span className="size-3 animate-spin rounded-full border-2 border-muted-foreground/35 border-t-muted-foreground" />
-								正在加载任务详情...
-							</p>
+							<LoadingMessage>正在加载任务详情...</LoadingMessage>
 						) : (
-							<div className="mt-4 space-y-3">
+							<div className="space-y-3">
 								<p className="text-muted-foreground text-sm">
 									任务详情加载失败，请刷新后重试。
 								</p>
@@ -2468,41 +2836,64 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</div>
 						)}
 					</div>
-				</div>
-			) : null}
+				</SheetContent>
+			</Sheet>
 
-			{llmDetail ? (
-				<div className="fixed inset-0 z-40 flex">
-					<button
-						type="button"
-						className="flex-1 bg-black/35"
-						aria-label="关闭 LLM 调用详情"
-						onClick={() => setLlmDetail(null)}
-					/>
-					<div className="bg-card relative h-full w-full max-w-3xl border-l p-5 shadow-2xl">
+			<Sheet
+				open={Boolean(llmDetail)}
+				onOpenChange={(open) => {
+					if (!open) {
+						setLlmDetail(null);
+					}
+				}}
+			>
+				<SheetContent
+					side="right"
+					showCloseButton={false}
+					className="w-full gap-0 overflow-y-auto p-0 sm:max-w-3xl"
+				>
+					<SheetHeader className="gap-3 border-b px-5 py-4 text-left">
 						<div className="flex items-start justify-between gap-3">
-							<div className="min-w-0">
-								<h3 className="text-lg font-semibold tracking-tight">
-									LLM 调用详情
-								</h3>
-								<p className="text-muted-foreground mt-1 text-sm">
-									来源：<span className="font-mono">{llmDetail.source}</span>
-								</p>
-								<p className="text-muted-foreground mt-1 truncate font-mono text-xs">
-									{llmDetail.id}
-								</p>
+							<div className="min-w-0 space-y-2">
+								<SheetTitle className="text-lg">LLM 调用详情</SheetTitle>
+								<SheetDescription>
+									查看单次 LLM 调用的 prompt、response、错误与等待耗时。
+								</SheetDescription>
+								{llmDetail ? (
+									<>
+										<div className="flex flex-wrap items-center gap-2">
+											<p className="text-muted-foreground text-sm">
+												来源：
+												<span className="font-mono">{llmDetail.source}</span>
+											</p>
+											{openLlmDetailTone ? (
+												<StatusBadge
+													label={taskStatusLabel(llmDetail.status)}
+													tone={openLlmDetailTone}
+												/>
+											) : null}
+										</div>
+										<p className="text-muted-foreground truncate font-mono text-xs">
+											{llmDetail.id}
+										</p>
+									</>
+								) : null}
 							</div>
 							<Button variant="outline" onClick={() => setLlmDetail(null)}>
 								关闭
 							</Button>
 						</div>
-						<LlmCallDetailSection
-							detail={llmDetail}
-							onOpenParentTask={onOpenParentTaskFromLlm}
-						/>
+					</SheetHeader>
+					<div className="px-5 py-4">
+						{llmDetail ? (
+							<LlmCallDetailSection
+								detail={llmDetail}
+								onOpenParentTask={onOpenParentTaskFromLlm}
+							/>
+						) : null}
 					</div>
-				</div>
-			) : null}
+				</SheetContent>
+			</Sheet>
 		</div>
 	);
 }

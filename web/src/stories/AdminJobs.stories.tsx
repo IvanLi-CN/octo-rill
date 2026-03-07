@@ -82,6 +82,20 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		finished_at: "2026-02-27T06:03:24Z",
 		updated_at: "2026-02-27T06:03:24Z",
 	},
+	{
+		id: "task-subscription-1430",
+		task_type: "sync.subscriptions",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:30:00Z",
+		started_at: "2026-02-27T14:30:02Z",
+		finished_at: "2026-02-27T14:37:18Z",
+		updated_at: "2026-02-27T14:37:18Z",
+	},
 ];
 
 const llmCallsSeed: AdminLlmCallDetailResponse[] = [
@@ -211,6 +225,143 @@ Summarize the following bullet points:
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
+	if (task.task_type === "sync.subscriptions") {
+		return {
+			task: {
+				...task,
+				payload_json: JSON.stringify({
+					trigger: "schedule",
+					schedule_key: "2026-02-27T14:30",
+				}),
+				result_json: JSON.stringify({
+					skipped: false,
+					skip_reason: null,
+					star: {
+						total_users: 12,
+						succeeded_users: 11,
+						failed_users: 1,
+						total_repos: 340,
+					},
+					release: {
+						total_repos: 128,
+						succeeded_repos: 123,
+						failed_repos: 5,
+						candidate_failures: 7,
+					},
+					releases_written: 1840,
+					critical_events: 6,
+				}),
+			},
+			events: [
+				{
+					id: 1001,
+					event_type: "task.created",
+					payload_json: JSON.stringify({ source: task.source }),
+					created_at: task.created_at,
+				},
+				{
+					id: 1002,
+					event_type: "task.running",
+					payload_json: JSON.stringify({}),
+					created_at: task.started_at ?? task.created_at,
+				},
+				{
+					id: 1003,
+					event_type: "task.progress",
+					payload_json: JSON.stringify({ stage: "collect", total_users: 12 }),
+					created_at: task.started_at ?? task.created_at,
+				},
+				{
+					id: 1004,
+					event_type: "task.progress",
+					payload_json: JSON.stringify({
+						stage: "star_summary",
+						total_users: 12,
+						succeeded_users: 11,
+						failed_users: 1,
+					}),
+					created_at: task.started_at ?? task.created_at,
+				},
+				{
+					id: 1005,
+					event_type: "task.progress",
+					payload_json: JSON.stringify({
+						stage: "repo_collect",
+						total_repos: 128,
+					}),
+					created_at: task.updated_at,
+				},
+				{
+					id: 1006,
+					event_type: "task.progress",
+					payload_json: JSON.stringify({
+						stage: "release_summary",
+						total_repos: 128,
+						succeeded_repos: 123,
+						failed_repos: 5,
+						releases_written: 1840,
+					}),
+					created_at: task.updated_at,
+				},
+				{
+					id: 1007,
+					event_type: "task.completed",
+					payload_json: JSON.stringify({
+						status: task.status,
+						error: task.error_message,
+					}),
+					created_at: task.finished_at ?? task.updated_at,
+				},
+			],
+			diagnostics: {
+				business_outcome: {
+					code: "partial",
+					label: "部分成功",
+					message: "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+				},
+				sync_subscriptions: {
+					trigger: "schedule",
+					schedule_key: "2026-02-27T14:30",
+					skipped: false,
+					skip_reason: null,
+					log_available: true,
+					log_download_path:
+						"/api/admin/jobs/realtime/task-subscription-1430/log",
+					star: {
+						total_users: 12,
+						succeeded_users: 11,
+						failed_users: 1,
+						total_repos: 340,
+					},
+					release: {
+						total_repos: 128,
+						succeeded_repos: 123,
+						failed_repos: 5,
+						candidate_failures: 7,
+					},
+					releases_written: 1840,
+					critical_events: 6,
+					recent_events: [
+						{
+							id: 9,
+							stage: "release",
+							event_type: "repo_inaccessible",
+							severity: "error",
+							recoverable: false,
+							attempt: 1,
+							user_id: 23,
+							repo_id: 9001,
+							repo_full_name: "octo/private-repo",
+							message:
+								"release sync candidate failed for octo/private-repo with user #23",
+							created_at: "2026-02-27T14:31:40Z",
+						},
+					],
+				},
+			},
+		};
+	}
+
 	return {
 		task: {
 			...task,
@@ -275,6 +426,8 @@ type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
 	autoOpenTaskDrawer?: boolean;
 	autoOpenTaskDrawerLlmRoute?: boolean;
+	initialTab?: "scheduled" | "llm";
+	llmSourceFilter?: string;
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -295,6 +448,8 @@ function AdminJobsPreview({
 	autoOpenConversation = false,
 	autoOpenTaskDrawer = false,
 	autoOpenTaskDrawerLlmRoute = false,
+	initialTab,
+	llmSourceFilter = "",
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -345,14 +500,26 @@ function AdminJobsPreview({
 			if (url.pathname === "/api/admin/jobs/realtime" && req.method === "GET") {
 				const taskType = url.searchParams.get("task_type");
 				const excludeTaskType = url.searchParams.get("exclude_task_type");
+				const taskGroup = url.searchParams.get("task_group");
 				const status = url.searchParams.get("status");
 				const page = url.searchParams.get("page");
 				const pageSize = url.searchParams.get("page_size");
 
-				let rows =
-					taskType === "brief.daily_slot"
-						? [...scheduledRuns]
-						: [...realtimeTasks, ...scheduledRuns];
+				let rows = [...realtimeTasks, ...scheduledRuns];
+				if (taskGroup === "scheduled") {
+					rows = rows.filter((item) =>
+						["brief.daily_slot", "sync.subscriptions"].includes(item.task_type),
+					);
+				} else if (taskGroup === "realtime") {
+					rows = rows.filter(
+						(item) =>
+							!["brief.daily_slot", "sync.subscriptions"].includes(
+								item.task_type,
+							),
+					);
+				} else if (taskType === "brief.daily_slot") {
+					rows = [...scheduledRuns];
+				}
 				if (excludeTaskType) {
 					rows = rows.filter((item) => item.task_type !== excludeTaskType);
 				}
@@ -373,8 +540,20 @@ function AdminJobsPreview({
 			}
 
 			if (
+				url.pathname.endsWith("/log") &&
 				url.pathname.startsWith("/api/admin/jobs/realtime/") &&
 				req.method === "GET"
+			) {
+				return new Response('{"line":1}\n{"line":2}\n', {
+					status: 200,
+					headers: { "content-type": "application/x-ndjson" },
+				});
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/jobs/realtime/") &&
+				req.method === "GET" &&
+				!url.pathname.endsWith("/log")
 			) {
 				const taskId = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
 				const task = [...realtimeTasks, ...scheduledRuns].find(
@@ -645,21 +824,44 @@ function AdminJobsPreview({
 	}, []);
 
 	useEffect(() => {
-		if (!ready || !autoOpenConversation || autoOpenedRef.current) {
+		const needsTabPrep = Boolean(initialTab) || Boolean(llmSourceFilter);
+		if (
+			!ready ||
+			autoOpenedRef.current ||
+			(!autoOpenConversation && !needsTabPrep)
+		) {
 			return;
 		}
 		autoOpenedRef.current = true;
 		const openTimer = window.setTimeout(() => {
-			const llmTab = Array.from(document.querySelectorAll("button")).find(
-				(node) => node.textContent?.trim() === "LLM调度",
+			const targetTabLabel =
+				initialTab === "scheduled"
+					? "定时任务"
+					: initialTab === "llm" || autoOpenConversation || llmSourceFilter
+						? "LLM调度"
+						: null;
+			if (!targetTabLabel) {
+				return;
+			}
+			const targetTab = Array.from(document.querySelectorAll("button")).find(
+				(node) => node.textContent?.trim() === targetTabLabel,
 			) as HTMLButtonElement | undefined;
-			llmTab?.click();
+			targetTab?.click();
+			if (targetTabLabel !== "LLM调度") {
+				return;
+			}
 			window.setTimeout(() => {
 				const sourceInput = document.querySelector(
 					'input[placeholder="来源（source）"]',
 				) as HTMLInputElement | null;
-				if (sourceInput) {
-					setInputValue(sourceInput, "job.api.translate_release");
+				if (sourceInput && (autoOpenConversation || llmSourceFilter)) {
+					setInputValue(
+						sourceInput,
+						llmSourceFilter || "job.api.translate_release",
+					);
+				}
+				if (!autoOpenConversation) {
+					return;
 				}
 				window.setTimeout(() => {
 					const detailButton = Array.from(
@@ -674,7 +876,7 @@ function AdminJobsPreview({
 		return () => {
 			window.clearTimeout(openTimer);
 		};
-	}, [ready, autoOpenConversation]);
+	}, [ready, autoOpenConversation, initialTab, llmSourceFilter]);
 
 	useEffect(() => {
 		if (
@@ -769,6 +971,19 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const ScheduledTab: Story = {
+	render: () => <AdminJobsPreview initialTab="scheduled" />,
+};
+
+export const LlmFilters: Story = {
+	render: () => (
+		<AdminJobsPreview
+			initialTab="llm"
+			llmSourceFilter="job.api.translate_release"
+		/>
+	),
+};
 
 export const LlmConversationDetail: Story = {
 	render: () => <AdminJobsPreview autoOpenConversation />,

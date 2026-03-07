@@ -1,6 +1,7 @@
 import { ArrowUpRight, Languages, RefreshCcw } from "lucide-react";
 
 import { Markdown } from "@/components/Markdown";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -101,14 +102,9 @@ export function FeedItemCard(props: {
 				<div className="flex items-start justify-between gap-3">
 					<div className="min-w-0">
 						<div className="flex flex-wrap items-center gap-2">
-							<span
-								className={cn(
-									"font-mono inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] tracking-wide",
-									"bg-primary text-primary-foreground border-primary/20",
-								)}
-							>
+							<Badge className="border-primary/20 bg-primary font-mono text-[11px] tracking-wide text-primary-foreground">
 								{kindLabel}
-							</span>
+							</Badge>
 
 							{item.unread ? (
 								<span className="inline-flex items-center gap-1 text-[11px] font-medium">
@@ -206,25 +202,27 @@ export function FeedItemCard(props: {
 								const active = reactions.viewer[reaction.content];
 								const count = reactions.counts[reaction.content];
 								return (
-									<button
+									<Button
 										key={reaction.content}
 										type="button"
-										onClick={() => onToggleReaction(reaction.content)}
+										variant={active ? "secondary" : "outline"}
+										size="sm"
 										className={cn(
-											"group inline-flex cursor-pointer items-center rounded-full border px-2 py-0.5 font-mono text-xs transition-all duration-200 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 focus-visible:ring-offset-1 hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
+											"group h-7 rounded-full px-2 font-mono text-xs transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
 											count > 0 && "gap-1",
-											active
-												? "border-primary bg-primary/10 text-primary"
-												: "text-muted-foreground hover:text-foreground border-border",
+											active &&
+												"border-primary bg-primary/10 text-primary hover:bg-primary/15",
 											isReactionBusy && "opacity-80",
 										)}
+										onClick={() => onToggleReaction(reaction.content)}
 										title={reaction.label}
+										aria-pressed={active}
 									>
 										<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
 											{reaction.emoji}
 										</span>
 										{count > 0 ? <span>{count}</span> : null}
-									</button>
+									</Button>
 								);
 							})
 						: null}
