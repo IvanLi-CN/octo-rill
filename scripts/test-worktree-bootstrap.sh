@@ -67,12 +67,12 @@ assert_output_not_contains() {
   fi
 }
 
-assert_checkout_succeeds_without_missing_script() {
+assert_checkout_succeeds_without_hook_exec_error() {
   local repo="$1"
-  local base_sha="$2"
+  local target_ref="$2"
   local checkout_output
 
-  checkout_output="$(git -C "$repo" checkout "$base_sha" 2>&1)"
+  checkout_output="$(git -C "$repo" checkout "$target_ref" 2>&1)"
   assert_output_not_contains "$checkout_output" "No such file or directory"
   assert_output_not_contains "$checkout_output" "exit status 127"
 }
@@ -227,7 +227,11 @@ cp "$repo_root/bun.lock" "$legacy_repo/bun.lock"
 cp -R "$repo_root/scripts" "$legacy_repo/scripts"
 git -C "$legacy_repo" add package.json bun.lock scripts
 git -C "$legacy_repo" commit -m 'test: add worktree bootstrap scripts' >/dev/null
+legacy_head_sha="$(git -C "$legacy_repo" rev-parse HEAD)"
 bun install --cwd "$legacy_repo" --frozen-lockfile >/dev/null
-assert_checkout_succeeds_without_missing_script "$legacy_repo" "$legacy_base_sha"
+assert_checkout_succeeds_without_hook_exec_error "$legacy_repo" "$legacy_base_sha"
+rm -rf "$legacy_repo/node_modules"
+assert_checkout_succeeds_without_hook_exec_error "$legacy_repo" "$legacy_head_sha"
+assert_checkout_succeeds_without_hook_exec_error "$legacy_repo" "$legacy_base_sha"
 
 echo "worktree bootstrap smoke test passed"

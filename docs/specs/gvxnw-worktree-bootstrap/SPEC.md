@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-03-06
-- Last: 2026-03-06
+- Last: 2026-03-07
 
 ## 背景 / 问题陈述
 
@@ -63,7 +63,7 @@
 - 开发者在主工作区根目录安装 repo-local hooks 后，任意 linked worktree 在首次 checkout 触发 `post-checkout`，同步脚本自动读取资源清单并执行“缺失时复制”。
 - 同步脚本默认优先读取共享 Git 配置中记录的主工作区根目录，并在标准布局下回退到 Git 元数据推导；若配置 `codex.worktree-sync.source-root`，则优先使用该 override。
 - README 将 `.env.local` 作为推荐的每人本地 secrets 文件，并说明 `scripts/worktree-sync.paths` 的扩展方式。
-- hook 安装脚本在共享 `.git/hooks` 中注入固定 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行。
+- hook 安装脚本在共享 `.git/hooks` 中优先注入仓库内解析出的 `LEFTHOOK_BIN`，避免本机全局 `lefthook` 抢占执行；若该路径失效，则回退到 hook 自带的常规 `lefthook` 发现逻辑。
 - `post-checkout` hook 必须在当前 revision 缺少同步脚本时安全跳过，避免切回历史提交或维护分支时因共享 hooks 报错。
 
 ### Edge cases / errors
@@ -72,6 +72,7 @@
 - 若目标已存在文件、目录或软链接：记录 `keep target exists`，不覆盖。
 - 若在主工作区执行脚本：直接记录 `skip main worktree` 并退出。
 - 若当前 checkout 缺少 `scripts/sync-worktree-resources.sh`：共享 `post-checkout` hook 必须直接 no-op，不得让 checkout 失败。
+- 若共享 hook 中记录的 `LEFTHOOK_BIN` 已不存在：hook 必须回退到当前环境可用的 `lefthook` 发现逻辑，不得因为陈旧绝对路径导致 checkout 失败。
 - 若启用 `WORKTREE_SYNC_DRY_RUN=1`：只输出将执行的动作，不落盘。
 
 ## 接口契约（Interfaces & Contracts）
@@ -105,6 +106,10 @@
 - Given 共享 hooks 已安装，随后 checkout 到仍保留 `lefthook.yml` 但缺少同步脚本的历史 revision  
   When Git 触发 `post-checkout`  
   Then hook 必须直接跳过，不得因为脚本不存在导致 checkout 失败。
+
+- Given 共享 hooks 已安装，随后旧 revision 重新安装依赖导致先前固定的 `LEFTHOOK_BIN` 丢失  
+  When Git 再次触发 `post-checkout`  
+  Then hook 必须回退到当前环境可用的 `lefthook` 发现逻辑，且 checkout 不得因陈旧绝对路径失败。
 
 - Given 仓库通过 `git clone --separate-git-dir=<dir>` 初始化，且主工作区已安装 repo-local hooks  
   When 再创建 linked worktree  
@@ -151,6 +156,7 @@
 
 - 风险：开发者若未在主工作区执行一次根目录 `bun install`，hooks 不会自动安装。
 - 风险：若主工作区被手工移动后未重新安装 hooks，记录在共享 Git 配置中的主工作区根目录可能过期，需要重新执行 `bun install` 或显式设置 override。
+- 风险：若开发者明确需要原生 PowerShell-only Windows 安装体验，当前 POSIX shell 入口仍需另行设计；本规格暂不覆盖。
 - 开放问题：无。
 - 假设：团队接受把 `.env.local` 作为推荐的 per-developer secrets 文件。
 
@@ -161,3 +167,4 @@
 - 2026-03-06：补充共享 hooks 的 `LEFTHOOK_BIN` 固定逻辑，避免全局 Lefthook 抢占。
 - 2026-03-06：补充共享 Git 配置里的主工作区根目录记录，并增加 `--separate-git-dir` smoke 覆盖。
 - 2026-03-07：补充共享 `post-checkout` hook 的历史 revision 安全跳过逻辑，并收紧 README 对 linked worktree `bun install` 行为的表述。
+- 2026-03-07：补充共享 hook 对失效 `LEFTHOOK_BIN` 的自动回退，并在 README 中显式标注 `macOS/Linux` 支持边界。
