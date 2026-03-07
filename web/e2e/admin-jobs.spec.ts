@@ -52,6 +52,20 @@ async function installAdminJobsMocks(page: Page) {
 			finished_at: "2026-02-26T01:10:40Z",
 			updated_at: "2026-02-26T01:10:40Z",
 		},
+		{
+			id: "task-subscriptions-1",
+			task_type: "sync.subscriptions",
+			status: "succeeded",
+			source: "scheduler",
+			requested_by: null,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-02-26T14:30:00Z",
+			started_at: "2026-02-26T14:30:04Z",
+			finished_at: "2026-02-26T14:38:10Z",
+			updated_at: "2026-02-26T14:38:10Z",
+		},
 	];
 
 	const llmCalls = [
@@ -162,10 +176,21 @@ async function installAdminJobsMocks(page: Page) {
 			const status = url.searchParams.get("status") ?? "all";
 			const taskType = url.searchParams.get("task_type") ?? "";
 			const excludeTaskType = url.searchParams.get("exclude_task_type") ?? "";
+			const taskGroup = url.searchParams.get("task_group") ?? "all";
 			const filtered = tasks.filter((task) => {
 				if (status !== "all" && task.status !== status) return false;
 				if (taskType && task.task_type !== taskType) return false;
 				if (excludeTaskType && task.task_type === excludeTaskType) return false;
+				if (taskGroup === "scheduled") {
+					return ["brief.daily_slot", "sync.subscriptions"].includes(
+						task.task_type,
+					);
+				}
+				if (taskGroup === "realtime") {
+					return !["brief.daily_slot", "sync.subscriptions"].includes(
+						task.task_type,
+					);
+				}
 				return true;
 			});
 			return json(route, {
@@ -227,7 +252,20 @@ async function installAdminJobsMocks(page: Page) {
 
 		if (
 			req.method() === "GET" &&
-			pathname.startsWith("/api/admin/jobs/realtime/")
+			pathname.startsWith("/api/admin/jobs/realtime/") &&
+			pathname.endsWith("/log")
+		) {
+			return route.fulfill({
+				status: 200,
+				contentType: "application/x-ndjson",
+				body: '{"line":1}\n{"line":2}\n',
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/jobs/realtime/") &&
+			!pathname.endsWith("/log")
 		) {
 			const taskId = pathname.split("/").at(-1) ?? "";
 			const task = tasks.find((item) => item.id === taskId);
@@ -318,6 +356,128 @@ async function installAdminJobsMocks(page: Page) {
 								status: "succeeded",
 							}),
 							created_at: "2026-02-26T01:10:40Z",
+						},
+					],
+				});
+			}
+
+			if (taskId === "task-subscriptions-1") {
+				return json(route, {
+					task: {
+						...task,
+						payload_json: JSON.stringify({
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:30",
+						}),
+						result_json: JSON.stringify({
+							skipped: false,
+							skip_reason: null,
+							star: {
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+								total_repos: 340,
+							},
+							release: {
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								candidate_failures: 7,
+							},
+							releases_written: 1840,
+							critical_events: 6,
+						}),
+					},
+					event_meta: {
+						returned: 4,
+						total: 4,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: {
+						business_outcome: {
+							code: "partial",
+							label: "部分成功",
+							message: "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+						},
+						sync_subscriptions: {
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:30",
+							skipped: false,
+							skip_reason: null,
+							log_available: true,
+							log_download_path:
+								"/api/admin/jobs/realtime/task-subscriptions-1/log",
+							star: {
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+								total_repos: 340,
+							},
+							release: {
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								candidate_failures: 7,
+							},
+							releases_written: 1840,
+							critical_events: 6,
+							recent_events: [
+								{
+									id: 42,
+									stage: "release",
+									event_type: "repo_inaccessible",
+									severity: "error",
+									recoverable: false,
+									attempt: 1,
+									user_id: 23,
+									repo_id: 9001,
+									repo_full_name: "octo/private-repo",
+									message:
+										"release sync candidate failed for octo/private-repo with user #23",
+									created_at: "2026-02-26T14:31:40Z",
+								},
+							],
+						},
+					},
+					events: [
+						{
+							id: 31,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "collect",
+								total_users: 12,
+							}),
+							created_at: "2026-02-26T14:30:05Z",
+						},
+						{
+							id: 32,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "star_summary",
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+							}),
+							created_at: "2026-02-26T14:31:02Z",
+						},
+						{
+							id: 33,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "release_summary",
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								releases_written: 1840,
+							}),
+							created_at: "2026-02-26T14:37:59Z",
+						},
+						{
+							id: 34,
+							event_type: "task.completed",
+							payload_json: JSON.stringify({ status: "succeeded" }),
+							created_at: "2026-02-26T14:38:10Z",
 						},
 					],
 				});
@@ -487,6 +647,7 @@ test("admin can manage jobs center", async ({ page }) => {
 
 	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
+	await expect(page.getByText("sync.subscriptions")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
 	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
@@ -529,7 +690,19 @@ test("admin can manage jobs center", async ({ page }) => {
 
 	await page.getByRole("button", { name: "定时任务" }).click();
 	await expect(page.getByText("运行记录")).toBeVisible();
-	await expect(page.getByText("定时执行任务")).toBeVisible();
+	await expect(page.getByText("sync.subscriptions")).toBeVisible();
+	await expect(page.getByText("brief.daily_slot")).toBeVisible();
+	const subscriptionTaskCard = page
+		.getByText("ID: task-subscriptions-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
+	await expect(
+		page.getByText("task-subscriptions-1", { exact: true }),
+	).toBeVisible();
+	await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
+	await expect(page.getByRole("link", { name: "下载日志" })).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 
 	await page.getByRole("button", { name: "LLM调度" }).click();
