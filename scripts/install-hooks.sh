@@ -77,6 +77,11 @@ discover_main_root() {
   return 1
 }
 
+shared_hooks_dir() {
+  common_dir=$(resolve_git_path --git-common-dir)
+  printf '%s/hooks\n' "$common_dir"
+}
+
 native_lefthook_bin() {
   base_root=$1
   os_arch=$(uname | tr '[:upper:]' '[:lower:]')
@@ -164,9 +169,12 @@ if [ -z "$main_bin" ]; then
   main_bin=$current_bin
 fi
 
+hooks_dir=$(shared_hooks_dir)
+git -C "$main_root" config --local core.hooksPath "$hooks_dir"
+
 (
   cd "$main_root"
-  "$main_bin" install
+  "$main_bin" install --force
 )
 
 for hook_name in pre-commit commit-msg post-checkout; do

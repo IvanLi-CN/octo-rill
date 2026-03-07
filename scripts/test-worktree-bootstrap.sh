@@ -22,6 +22,15 @@ legacy_repo="$tmp_root/legacy-repo"
 missing_absolute_source="$tmp_root/does-not-exist/deeper"
 mkdir -p "$fixture_repo" "$override_source"
 
+canonical_path() {
+  local target="$1"
+  local parent base
+
+  parent="$(dirname -- "$target")"
+  base="$(basename -- "$target")"
+  printf '%s/%s\n' "$(cd "$parent" && pwd -P)" "$base"
+}
+
 cleanup() {
   set +e
   git -C "$fixture_repo" worktree remove -f "$worktree_default" >/dev/null 2>&1
@@ -90,7 +99,14 @@ git -C "$fixture_repo" config user.email 'codex-test@example.com'
 git -C "$fixture_repo" add package.json bun.lock lefthook.yml scripts
 git -C "$fixture_repo" commit -m 'test: bootstrap fixture' >/dev/null
 
+fixture_hooks_dir="$(canonical_path "$fixture_repo/.git/hooks")"
+git -C "$fixture_repo" config --local core.hooksPath custom-hooks
 bun install --cwd "$fixture_repo" --frozen-lockfile >/dev/null
+fixture_hooks_path="$(git -C "$fixture_repo" config --local --get core.hooksPath || true)"
+if [[ "$fixture_hooks_path" != "$fixture_hooks_dir" ]]; then
+  echo "expected shared hooks path for fixture repo" >&2
+  exit 1
+fi
 fixture_main_root="$(git -C "$fixture_repo" config --local --get codex.worktree-sync.main-root || true)"
 if [[ "$fixture_main_root" != "$fixture_repo" ]]; then
   echo "expected shared main root config for fixture repo" >&2
@@ -145,12 +161,7 @@ cat > "$override_source/.env" <<'OVERRIDEENV'
 GITHUB_CLIENT_ID=override-env
 OVERRIDEENV
 
-override_relative="$(python3 - <<'PY' "$fixture_repo" "$override_source"
-import os
-import sys
-print(os.path.relpath(sys.argv[2], sys.argv[1]))
-PY
-)"
+override_relative="$(bun -e 'const path = require("node:path"); console.log(path.relative(process.argv[1], process.argv[2]));' "$fixture_repo" "$override_source")"
 git -C "$fixture_repo" config --local codex.worktree-sync.source-root "$override_relative"
 git -C "$fixture_repo" worktree add --detach "$worktree_override" HEAD >/dev/null
 assert_file_content "$worktree_override/.env.local" "OCTORILL_ENCRYPTION_KEY_BASE64=override-local"
