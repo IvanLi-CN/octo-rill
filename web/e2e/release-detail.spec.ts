@@ -34,7 +34,7 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
 				user: {
-					id: 1,
+					id: "2f4k7m9p3x6c8v2a",
 					github_user_id: 10,
 					login: "octo",
 					name: "Octo",

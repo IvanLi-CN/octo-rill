@@ -27,7 +27,7 @@ struct TokenRow {
 }
 
 impl AppState {
-    pub async fn load_access_token(&self, user_id: i64) -> Result<String> {
+    pub async fn load_access_token(&self, user_id: &str) -> Result<String> {
         let row = sqlx::query_as::<_, TokenRow>(
             r#"
             SELECT access_token_ciphertext, access_token_nonce

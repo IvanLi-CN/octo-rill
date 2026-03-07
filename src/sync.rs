@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
-use crate::{jobs, state::AppState};
+use crate::{jobs, local_id, state::AppState};
 
 const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
@@ -92,7 +92,7 @@ struct StarredRepoRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct EligibleUserRow {
-    id: i64,
+    id: String,
     last_active_at: Option<String>,
 }
 
@@ -221,7 +221,7 @@ struct NotificationRepo {
 
 #[derive(Debug, Clone)]
 struct RelatedUserRef {
-    user_id: i64,
+    user_id: String,
     last_active_at: Option<String>,
 }
 
@@ -235,7 +235,7 @@ struct AggregatedRepo {
 
 #[derive(Debug)]
 struct StarPhaseSuccess {
-    user_id: i64,
+    user_id: String,
     last_active_at: Option<String>,
     repos: Vec<StarredRepoSnapshot>,
 }
@@ -381,7 +381,7 @@ struct SubscriptionEventRecord<'a> {
     severity: &'a str,
     recoverable: bool,
     attempt: usize,
-    user_id: Option<i64>,
+    user_id: Option<&'a str>,
     repo_id: Option<i64>,
     repo_full_name: Option<&'a str>,
     payload: Value,
@@ -480,7 +480,7 @@ impl SyncRequestError {
     }
 }
 
-pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredResult> {
+pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarredResult> {
     let repos = fetch_starred_snapshot(state, user_id)
         .await
         .map_err(SyncRequestError::into_anyhow)?;
@@ -488,7 +488,7 @@ pub async fn sync_starred(state: &AppState, user_id: i64) -> Result<SyncStarredR
     Ok(SyncStarredResult { repos: repos.len() })
 }
 
-pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncReleasesResult> {
+pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
     let repos = sqlx::query_as::<_, StarredRepoRow>(
         r#"
         SELECT repo_id, full_name
@@ -508,7 +508,8 @@ pub async fn sync_releases(state: &AppState, user_id: i64) -> Result<SyncRelease
             .await
             .map_err(SyncRequestError::into_anyhow)?;
         total_releases += releases.len();
-        upsert_releases_for_users(state, repo.repo_id, &[user_id], &releases).await?;
+        let related_user_ids = vec![user_id.to_owned()];
+        upsert_releases_for_users(state, repo.repo_id, &related_user_ids, &releases).await?;
     }
 
     Ok(SyncReleasesResult {
@@ -770,7 +771,7 @@ async fn sync_starred_for_user(
         user,
         move |user_id| {
             let state = state.clone();
-            async move { fetch_starred_snapshot(state.as_ref(), user_id).await }
+            async move { fetch_starred_snapshot(state.as_ref(), &user_id).await }
         },
         |attempt| async move {
             tokio::time::sleep(subscription_retry_delay(attempt)).await;
@@ -786,7 +787,7 @@ async fn sync_starred_for_user_with_fetch<Fetch, FetchFut, Sleep, SleepFut>(
     mut sleep: Sleep,
 ) -> Result<Option<StarPhaseSuccess>>
 where
-    Fetch: FnMut(i64) -> FetchFut,
+    Fetch: FnMut(String) -> FetchFut,
     FetchFut: Future<Output = Result<Vec<StarredRepoSnapshot>, SyncRequestError>>,
     Sleep: FnMut(usize) -> SleepFut,
     SleepFut: Future<Output = ()>,
@@ -820,9 +821,9 @@ where
                 .await?;
             return Ok(None);
         }
-        match fetch(user.id).await {
+        match fetch(user.id.clone()).await {
             Ok(repos) => {
-                replace_starred_repos(context.state.as_ref(), user.id, &repos).await?;
+                replace_starred_repos(context.state.as_ref(), &user.id, &repos).await?;
                 context
                     .log(
                         "info",
@@ -837,8 +838,8 @@ where
                     )
                     .await?;
                 return Ok(Some(StarPhaseSuccess {
-                    user_id: user.id,
-                    last_active_at: user.last_active_at,
+                    user_id: user.id.clone(),
+                    last_active_at: user.last_active_at.clone(),
                     repos,
                 }));
             }
@@ -852,7 +853,7 @@ where
                             severity: "warning",
                             recoverable: true,
                             attempt,
-                            user_id: Some(user.id),
+                            user_id: Some(user.id.as_str()),
                             repo_id: None,
                             repo_full_name: None,
                             payload: json!({
@@ -887,7 +888,7 @@ where
                             severity: "error",
                             recoverable: false,
                             attempt,
-                            user_id: Some(user.id),
+                            user_id: Some(user.id.as_str()),
                             repo_id: None,
                             repo_full_name: None,
                             payload: json!({
@@ -921,7 +922,7 @@ fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
                 });
             entry.is_private = entry.is_private || repo.is_private;
             entry.related_users.push(RelatedUserRef {
-                user_id: user.user_id,
+                user_id: user.user_id.clone(),
                 last_active_at: user.last_active_at.clone(),
             });
         }
@@ -1067,7 +1068,7 @@ async fn sync_releases_for_repo(
                 "repo_id": repo.repo_id,
                 "repo_full_name": repo.full_name,
                 "is_private": repo.is_private,
-                "related_users": repo.related_users.iter().map(|item| item.user_id).collect::<Vec<_>>(),
+                "related_users": repo.related_users.iter().map(|item| item.user_id.clone()).collect::<Vec<_>>(),
             }),
         )
         .await?;
@@ -1075,7 +1076,7 @@ async fn sync_releases_for_repo(
     let related_user_ids = repo
         .related_users
         .iter()
-        .map(|item| item.user_id)
+        .map(|item| item.user_id.clone())
         .collect::<Vec<_>>();
     let mut candidate_failures = 0usize;
 
@@ -1104,7 +1105,7 @@ async fn sync_releases_for_repo(
             }
             match fetch_repo_releases_for_user(
                 context.state.as_ref(),
-                candidate.user_id,
+                &candidate.user_id,
                 &repo.full_name,
             )
             .await
@@ -1152,7 +1153,7 @@ async fn sync_releases_for_repo(
                                 severity: "warning",
                                 recoverable: true,
                                 attempt,
-                                user_id: Some(candidate.user_id),
+                                user_id: Some(candidate.user_id.as_str()),
                                 repo_id: Some(repo.repo_id),
                                 repo_full_name: Some(repo.full_name.as_str()),
                                 payload: json!({
@@ -1182,7 +1183,7 @@ async fn sync_releases_for_repo(
                                 severity: if err.retryable { "warning" } else { "error" },
                                 recoverable: err.retryable,
                                 attempt,
-                                user_id: Some(candidate.user_id),
+                                user_id: Some(candidate.user_id.as_str()),
                                 repo_id: Some(repo.repo_id),
                                 repo_full_name: Some(repo.full_name.as_str()),
                                 payload: json!({
@@ -1263,6 +1264,7 @@ async fn append_subscription_event(
     sqlx::query(
         r#"
         INSERT INTO sync_subscription_events (
+          id,
           task_id,
           stage,
           event_type,
@@ -1274,9 +1276,10 @@ async fn append_subscription_event(
           repo_full_name,
           payload_json,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(task_id)
     .bind(event.stage)
     .bind(event.event_type)
@@ -1389,7 +1392,7 @@ fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequ
 
 async fn load_access_token_or_classified(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<String, SyncRequestError> {
     state.load_access_token(user_id).await.map_err(|err| {
         let message = err.to_string();
@@ -1428,7 +1431,7 @@ async fn fetch_json_response<T: DeserializeOwned>(
 
 async fn fetch_starred_snapshot(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
     let token = load_access_token_or_classified(state, user_id).await?;
     let query = r#"
@@ -1520,7 +1523,7 @@ async fn fetch_starred_snapshot(
 
 async fn replace_starred_repos(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     repos: &[StarredRepoSnapshot],
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -1539,10 +1542,11 @@ async fn replace_starred_repos(
         sqlx::query(
             r#"
             INSERT INTO starred_repos (
-              user_id, repo_id, full_name, owner_login, name, description, html_url, stargazed_at, is_private, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, user_id, repo_id, full_name, owner_login, name, description, html_url, stargazed_at, is_private, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
+        .bind(local_id::generate_local_id())
         .bind(user_id)
         .bind(repo.repo_id)
         .bind(&repo.full_name)
@@ -1566,7 +1570,7 @@ async fn replace_starred_repos(
 
 async fn fetch_repo_releases_for_user(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     repo_full_name: &str,
 ) -> Result<Vec<GitHubRelease>, SyncRequestError> {
     let token = load_access_token_or_classified(state, user_id).await?;
@@ -1613,7 +1617,7 @@ async fn fetch_repo_releases_with_token(
 async fn upsert_releases_for_users(
     state: &AppState,
     repo_id: i64,
-    user_ids: &[i64],
+    user_ids: &[String],
     releases: &[GitHubRelease],
 ) -> Result<usize> {
     let now = chrono::Utc::now().to_rfc3339();
@@ -1622,10 +1626,10 @@ async fn upsert_releases_for_users(
             sqlx::query(
                 r#"
                 INSERT INTO releases (
-                  user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+                  id, user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
                   published_at, created_at, is_prerelease, is_draft, updated_at,
                   react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, release_id) DO UPDATE SET
                   node_id = excluded.node_id,
                   tag_name = excluded.tag_name,
@@ -1645,6 +1649,7 @@ async fn upsert_releases_for_users(
                   updated_at = excluded.updated_at
                 "#,
             )
+            .bind(local_id::generate_local_id())
             .bind(user_id)
             .bind(repo_id)
             .bind(release.id)
@@ -1713,7 +1718,10 @@ async fn upsert_releases_for_users(
     Ok(user_ids.len() * releases.len())
 }
 
-pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNotificationsResult> {
+pub async fn sync_notifications(
+    state: &AppState,
+    user_id: &str,
+) -> Result<SyncNotificationsResult> {
     let token = state.load_access_token(user_id).await?;
 
     let since_key = "notifications_since";
@@ -1753,9 +1761,9 @@ pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNo
         sqlx::query(
             r#"
             INSERT INTO notifications (
-              user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
               updated_at, unread, url, html_url, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, thread_id) DO UPDATE SET
               repo_full_name = excluded.repo_full_name,
               subject_title = excluded.subject_title,
@@ -1767,6 +1775,7 @@ pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNo
               html_url = excluded.html_url
             "#,
         )
+        .bind(local_id::generate_local_id())
         .bind(user_id)
         .bind(&n.id)
         .bind(n.repository.full_name.as_deref())
@@ -1785,13 +1794,14 @@ pub async fn sync_notifications(state: &AppState, user_id: i64) -> Result<SyncNo
 
     sqlx::query(
         r#"
-        INSERT INTO sync_state (user_id, key, value, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO sync_state (id, user_id, key, value, updated_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(user_id, key) DO UPDATE SET
           value = excluded.value,
           updated_at = excluded.updated_at
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(user_id)
     .bind(since_key)
     .bind(&now)
@@ -1833,6 +1843,10 @@ mod tests {
         state::{AppState, build_oauth_client},
     };
 
+    fn test_user_id(seed: &str) -> String {
+        crate::local_id::test_local_id(seed)
+    }
+
     #[test]
     fn cmp_last_active_desc_places_recent_users_first() {
         let recent = Some("2026-03-06T12:30:00Z");
@@ -1847,7 +1861,7 @@ mod tests {
     fn aggregate_repos_orders_by_related_users_then_name() {
         let users = vec![
             StarPhaseSuccess {
-                user_id: 2,
+                user_id: test_user_id("2"),
                 last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
                 repos: vec![
                     StarredRepoSnapshot {
@@ -1873,7 +1887,7 @@ mod tests {
                 ],
             },
             StarPhaseSuccess {
-                user_id: 1,
+                user_id: test_user_id("1"),
                 last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
                 repos: vec![StarredRepoSnapshot {
                     repo_id: 1,
@@ -1892,7 +1906,7 @@ mod tests {
         assert_eq!(repos.len(), 2);
         assert_eq!(repos[0].full_name, "octo/alpha");
         assert_eq!(repos[0].related_users.len(), 2);
-        assert_eq!(repos[0].related_users[0].user_id, 1);
+        assert_eq!(repos[0].related_users[0].user_id, test_user_id("1"));
         assert_eq!(repos[1].full_name, "octo/beta");
     }
 
@@ -1914,7 +1928,7 @@ mod tests {
     #[tokio::test]
     async fn sync_starred_for_user_retries_recoverable_errors_before_success() {
         let pool = setup_pool().await;
-        seed_user(&pool, 7).await;
+        seed_user(&pool, test_user_id("7").as_str()).await;
         let state = setup_state(pool.clone());
         seed_sync_task(&state, "task-star-retry-success").await;
         let context = SubscriptionRunContext::new(state.as_ref(), "task-star-retry-success")
@@ -1935,7 +1949,7 @@ mod tests {
         let result = sync_starred_for_user_with_fetch(
             context.clone(),
             EligibleUserRow {
-                id: 7,
+                id: test_user_id("7"),
                 last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
             },
             {
@@ -1972,7 +1986,7 @@ mod tests {
 
         let stored_repos =
             sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
-                .bind(7_i64)
+                .bind(test_user_id("7"))
                 .fetch_one(&pool)
                 .await
                 .expect("count starred repos");
@@ -1983,7 +1997,7 @@ mod tests {
             SELECT severity, event_type, attempt, recoverable
             FROM sync_subscription_events
             WHERE task_id = ?
-            ORDER BY id ASC
+            ORDER BY rowid ASC
             "#,
         )
         .bind("task-star-retry-success")
@@ -2004,7 +2018,7 @@ mod tests {
     #[tokio::test]
     async fn sync_starred_for_user_marks_exhausted_retry_as_critical_failure() {
         let pool = setup_pool().await;
-        seed_user(&pool, 8).await;
+        seed_user(&pool, test_user_id("8").as_str()).await;
         let state = setup_state(pool.clone());
         seed_sync_task(&state, "task-star-retry-failure").await;
         let context = SubscriptionRunContext::new(state.as_ref(), "task-star-retry-failure")
@@ -2015,7 +2029,7 @@ mod tests {
         let result = sync_starred_for_user_with_fetch(
             context.clone(),
             EligibleUserRow {
-                id: 8,
+                id: test_user_id("8"),
                 last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
             },
             {
@@ -2050,7 +2064,7 @@ mod tests {
             SELECT severity, attempt, recoverable
             FROM sync_subscription_events
             WHERE task_id = ?
-            ORDER BY id ASC
+            ORDER BY rowid ASC
             "#,
         )
         .bind("task-star-retry-failure")
@@ -2092,7 +2106,7 @@ mod tests {
         .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
         .bind(jobs::STATUS_RUNNING)
         .bind("test")
-        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind("{}")
         .bind("{}")
@@ -2155,7 +2169,7 @@ mod tests {
         })
     }
 
-    async fn seed_user(pool: &SqlitePool, user_id: i64) {
+    async fn seed_user(pool: &SqlitePool, user_id: &str) {
         let now = "2026-03-06T00:00:00Z";
         sqlx::query(
             r#"
@@ -2164,7 +2178,7 @@ mod tests {
             "#,
         )
         .bind(user_id)
-        .bind(30_215_105_i64 + user_id)
+        .bind(30_215_105_i64 + i64::from(user_id.bytes().map(i16::from).sum::<i16>()))
         .bind(format!("user-{user_id}"))
         .bind(now)
         .bind(now)

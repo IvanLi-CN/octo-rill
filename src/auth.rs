@@ -12,14 +12,14 @@ use sqlx::{Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
 
-use crate::{crypto::EncryptedSecret, error::ApiError, github, state::AppState};
+use crate::{crypto::EncryptedSecret, error::ApiError, github, local_id, state::AppState};
 
 const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
 const SESSION_KEY_USER_ID: &str = "user_id";
 
 async fn promote_first_admin(
     tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
+    user_id: &str,
     now: &str,
 ) -> Result<bool, ApiError> {
     let updated = sqlx::query(
@@ -123,10 +123,10 @@ pub async fn github_callback(
     sqlx::query(
         r#"
         INSERT INTO users (
-          github_user_id, login, name, avatar_url, email,
+          id, github_user_id, login, name, avatar_url, email,
           created_at, updated_at, last_active_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(github_user_id) DO UPDATE SET
           login = excluded.login,
           name = excluded.name,
@@ -136,6 +136,7 @@ pub async fn github_callback(
           last_active_at = excluded.last_active_at
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(user.id)
     .bind(&user.login)
     .bind(user.name.as_deref())
@@ -150,7 +151,7 @@ pub async fn github_callback(
 
     #[derive(Debug, sqlx::FromRow)]
     struct AuthUserRow {
-        id: i64,
+        id: String,
         is_admin: i64,
         is_disabled: i64,
     }
@@ -168,7 +169,7 @@ pub async fn github_callback(
     .map_err(ApiError::internal)?;
 
     if auth_user_row.is_admin == 0
-        && promote_first_admin(&mut tx, auth_user_row.id, now.as_str()).await?
+        && promote_first_admin(&mut tx, &auth_user_row.id, now.as_str()).await?
     {
         auth_user_row.is_admin = 1;
     }
@@ -183,7 +184,7 @@ pub async fn github_callback(
         ));
     }
 
-    let internal_user_id = auth_user_row.id;
+    let internal_user_id = auth_user_row.id.clone();
 
     let EncryptedSecret { ciphertext, nonce } = state
         .encryption_key
@@ -201,7 +202,7 @@ pub async fn github_callback(
           updated_at = excluded.updated_at
         "#,
     )
-    .bind(internal_user_id)
+    .bind(internal_user_id.as_str())
     .bind(ciphertext)
     .bind(nonce)
     .bind(&scopes)
@@ -213,7 +214,7 @@ pub async fn github_callback(
     tx.commit().await.map_err(ApiError::internal)?;
 
     session
-        .insert(SESSION_KEY_USER_ID, internal_user_id)
+        .insert(SESSION_KEY_USER_ID, internal_user_id.clone())
         .await
         .map_err(ApiError::internal)?;
 
@@ -257,7 +258,7 @@ mod tests {
             r#"
             INSERT INTO users (id, github_user_id, login, is_admin, is_disabled, created_at, updated_at)
             VALUES
-              (1, 101, 'first', 0, 0, '2026-02-25T10:00:00Z', '2026-02-25T10:00:00Z'),
+              ('user-first-id', 101, 'first', 0, 0, '2026-02-25T10:00:00Z', '2026-02-25T10:00:00Z'),
               (2, 102, 'second', 0, 0, '2026-02-25T11:00:00Z', '2026-02-25T11:00:00Z')
             "#,
         )
@@ -266,14 +267,14 @@ mod tests {
         .expect("seed users");
 
         let mut tx1 = pool.begin().await.expect("begin tx1");
-        let promoted = promote_first_admin(&mut tx1, 1, now)
+        let promoted = promote_first_admin(&mut tx1, "user-first-id", now)
             .await
             .expect("promote first user");
         tx1.commit().await.expect("commit tx1");
         assert!(promoted);
 
         let mut tx2 = pool.begin().await.expect("begin tx2");
-        let promoted_again = promote_first_admin(&mut tx2, 2, now)
+        let promoted_again = promote_first_admin(&mut tx2, "user-second-id", now)
             .await
             .expect("promote second user");
         tx2.commit().await.expect("commit tx2");
@@ -285,10 +286,11 @@ mod tests {
             .expect("count admins");
         assert_eq!(admins, 1);
 
-        let first_is_admin: i64 = sqlx::query_scalar(r#"SELECT is_admin FROM users WHERE id = 1"#)
-            .fetch_one(&pool)
-            .await
-            .expect("query first user admin status");
+        let first_is_admin: i64 =
+            sqlx::query_scalar(r#"SELECT is_admin FROM users WHERE id = 'user-first-id'"#)
+                .fetch_one(&pool)
+                .await
+                .expect("query first user admin status");
         assert_eq!(first_is_admin, 1);
     }
 }

@@ -18,6 +18,7 @@ import {
 	type AdminTranslationRequestDetailResponse,
 	type AdminTranslationRequestListItem,
 	type AdminTranslationStatusResponse,
+	type LocalUserId,
 	ApiError,
 	apiCancelAdminRealtimeTask,
 	apiGetAdminLlmCallDetail,
@@ -722,7 +723,11 @@ function asObject(payload: unknown): Record<string, unknown> | null {
 function readString(payload: Record<string, unknown> | null, key: string) {
 	if (!payload) return null;
 	const value = payload[key];
-	return typeof value === "string" ? value : null;
+	if (typeof value === "string") return value;
+	if (typeof value === "number" || typeof value === "boolean") {
+		return String(value);
+	}
+	return null;
 }
 
 function readNumber(payload: Record<string, unknown> | null, key: string) {
@@ -861,7 +866,7 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 		if (stage === "generate") {
 			const index = readNumber(payload, "index");
 			const total = readNumber(payload, "total");
-			const userId = readNumber(payload, "user_id");
+			const userId = readString(payload, "user_id");
 			return {
 				title: "串行执行中",
 				description:
@@ -894,7 +899,7 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 			};
 		}
 		if (stage === "user_succeeded") {
-			const userId = readNumber(payload, "user_id");
+			const userId = readString(payload, "user_id");
 			const keyDate = readString(payload, "key_date");
 			const contentLength = readNumber(payload, "content_length");
 			return {
@@ -910,7 +915,7 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 			};
 		}
 		if (stage === "user_failed") {
-			const userId = readNumber(payload, "user_id");
+			const userId = readString(payload, "user_id");
 			const error = readString(payload, "error");
 			return {
 				title: "单用户执行失败",
@@ -1072,7 +1077,7 @@ function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
 }
 
 type JobManagementProps = {
-	currentUserId: number;
+	currentUserId: LocalUserId;
 };
 
 type LoadOptions = {
@@ -1949,7 +1954,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const taskEvents = useMemo(() => {
 		if (!detailTask) return [];
 		return [...detailTask.events]
-			.sort((a, b) => a.id - b.id)
+			.sort(
+				(a, b) =>
+					a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+			)
 			.map((event) => ({
 				event,
 				presentation: formatEventPresentation(event),
@@ -2229,9 +2237,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (llmSourceFilter.trim()) {
 					params.set("source", llmSourceFilter.trim());
 				}
-				const requestedBy = Number(llmRequestedByFilter.trim());
-				if (!Number.isNaN(requestedBy) && llmRequestedByFilter.trim() !== "") {
-					params.set("requested_by", String(requestedBy));
+				const requestedBy = llmRequestedByFilter.trim();
+				if (requestedBy) {
+					params.set("requested_by", requestedBy);
 				}
 				const startedFromUtc = localInputToUtc(llmStartedFromFilter);
 				if (startedFromUtc) {
@@ -3294,9 +3302,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										setLlmCallPage(1);
 										setLlmRequestedByFilter(event.target.value);
 									}}
-									placeholder="用户ID（requested_by）"
+									placeholder="用户 NanoID（requested_by）"
 									aria-label="LLM 调用用户筛选"
-									inputMode="numeric"
 								/>
 								<div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
 									<Input

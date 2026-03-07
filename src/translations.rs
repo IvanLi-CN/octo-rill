@@ -132,8 +132,8 @@ pub struct AdminTranslationRequestListItem {
     pub id: String,
     pub status: String,
     pub source: String,
-    pub requested_by: Option<i64>,
-    pub scope_user_id: i64,
+    pub requested_by: Option<String>,
+    pub scope_user_id: String,
     pub item_count: i64,
     pub completed_item_count: i64,
     pub created_at: String,
@@ -200,7 +200,7 @@ pub struct AdminTranslationBatchDetailResponse {
 struct WorkItemRow {
     id: String,
     dedupe_key: String,
-    scope_user_id: i64,
+    scope_user_id: String,
     kind: String,
     variant: String,
     entity_id: String,
@@ -283,7 +283,7 @@ pub async fn submit_translation_request(
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
     let mode = normalize_mode(req.mode.trim())?;
     let items = normalize_request_items(&req.items)?;
-    let request_id = create_translation_request(state.as_ref(), user_id, mode, &items).await?;
+    let request_id = create_translation_request(state.as_ref(), &user_id, mode, &items).await?;
 
     match mode {
         "async" => {
@@ -296,11 +296,13 @@ pub async fn submit_translation_request(
             .into_response())
         }
         "wait" => {
-            let detail = wait_for_request_terminal(state.as_ref(), user_id, &request_id).await?;
+            let detail = wait_for_request_terminal(state.as_ref(), &user_id, &request_id).await?;
             Ok(Json(detail_to_public_response(detail)).into_response())
         }
         "stream" => Ok(stream_translation_request_response(
-            state, user_id, request_id,
+            state,
+            user_id.clone(),
+            request_id,
         )),
         _ => Err(ApiError::bad_request("unsupported mode")),
     }
@@ -312,7 +314,8 @@ pub async fn get_translation_request(
     Path(request_id): Path<String>,
 ) -> Result<Json<TranslationRequestResponse>, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    let detail = load_translation_request_detail(state.as_ref(), user_id, &request_id).await?;
+    let request_id = api::parse_local_id_param(request_id, "request_id")?;
+    let detail = load_translation_request_detail(state.as_ref(), &user_id, &request_id).await?;
     Ok(Json(detail_to_public_response(detail)))
 }
 
@@ -322,9 +325,12 @@ pub async fn stream_translation_request(
     Path(request_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
-    ensure_request_owner(state.as_ref(), user_id, &request_id).await?;
+    let request_id = api::parse_local_id_param(request_id, "request_id")?;
+    ensure_request_owner(state.as_ref(), &user_id, &request_id).await?;
     Ok(stream_translation_request_response(
-        state, user_id, request_id,
+        state,
+        user_id.clone(),
+        request_id,
     ))
 }
 
@@ -465,6 +471,7 @@ pub async fn admin_get_translation_request_detail(
     Path(request_id): Path<String>,
 ) -> Result<Json<AdminTranslationRequestDetailResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let request_id = api::parse_local_id_param(request_id, "request_id")?;
     let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
         r#"
         SELECT id, status, source, requested_by, scope_user_id, item_count, completed_item_count,
@@ -548,6 +555,7 @@ pub async fn admin_get_translation_batch_detail(
     Path(batch_id): Path<String>,
 ) -> Result<Json<AdminTranslationBatchDetailResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let batch_id = api::parse_local_id_param(batch_id, "batch_id")?;
     let batch = sqlx::query_as::<_, AdminTranslationBatchListItem>(
         r#"
         SELECT id, status, trigger_reason, item_count, estimated_input_tokens,
@@ -592,12 +600,12 @@ pub async fn admin_get_translation_batch_detail(
 
 async fn create_translation_request(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     mode: &str,
     items: &[TranslationRequestItemInput],
 ) -> Result<String, ApiError> {
     let now = Utc::now().to_rfc3339();
-    let request_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+    let request_id = crate::local_id::generate_local_id();
     let source = derive_request_source(items);
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
@@ -658,7 +666,7 @@ async fn create_translation_request(
 async fn insert_request_item(
     tx: &mut Transaction<'_, Sqlite>,
     request_id: &str,
-    user_id: i64,
+    user_id: &str,
     item: &TranslationRequestItemInput,
     now: &str,
 ) -> Result<bool, ApiError> {
@@ -667,14 +675,16 @@ async fn insert_request_item(
         serde_json::to_string(&item.source_blocks).map_err(ApiError::internal)?;
     let target_slots_json =
         serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
-    let request_item_id = sqlx::query(
+    let request_item_id = crate::local_id::generate_local_id();
+    sqlx::query(
         r#"
         INSERT INTO translation_request_items (
-          request_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms,
+          id, request_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms,
           source_hash, source_blocks_json, target_slots_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
+    .bind(request_item_id.as_str())
     .bind(request_id)
     .bind(item.producer_ref.as_str())
     .bind(item.kind.as_str())
@@ -689,11 +699,10 @@ async fn insert_request_item(
     .bind(now)
     .execute(&mut **tx)
     .await
-    .map_err(ApiError::internal)?
-    .last_insert_rowid();
+    .map_err(ApiError::internal)?;
 
     if let Some(cached) = load_cached_result(tx, user_id, item, &source_hash).await? {
-        apply_request_item_result(tx, request_item_id, None, &cached, now).await?;
+        apply_request_item_result(tx, request_item_id.as_str(), None, &cached, now).await?;
         return Ok(true);
     }
 
@@ -706,7 +715,7 @@ async fn insert_request_item(
             let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
             apply_request_item_result(
                 tx,
-                request_item_id,
+                request_item_id.as_str(),
                 Some(existing.id.as_str()),
                 &result,
                 now,
@@ -715,12 +724,14 @@ async fn insert_request_item(
             Ok(true)
         }
         Some(existing) => {
-            attach_request_item_to_work_item(tx, request_item_id, &existing.id, now).await?;
+            attach_request_item_to_work_item(tx, request_item_id.as_str(), &existing.id, now)
+                .await?;
             Ok(false)
         }
         None => {
             let work_item_id = create_work_item(tx, user_id, item, &source_hash, now).await?;
-            attach_request_item_to_work_item(tx, request_item_id, &work_item_id, now).await?;
+            attach_request_item_to_work_item(tx, request_item_id.as_str(), &work_item_id, now)
+                .await?;
             Ok(false)
         }
     }
@@ -728,7 +739,7 @@ async fn insert_request_item(
 
 async fn load_cached_result(
     tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
+    user_id: &str,
     item: &TranslationRequestItemInput,
     source_hash: &str,
 ) -> Result<Option<TranslationResultItem>, ApiError> {
@@ -787,7 +798,7 @@ async fn load_cached_result(
 
 async fn load_existing_work_item(
     tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
+    user_id: &str,
     item: &TranslationRequestItemInput,
     source_hash: &str,
 ) -> Result<Option<WorkItemRow>, ApiError> {
@@ -811,12 +822,12 @@ async fn load_existing_work_item(
 
 async fn create_work_item(
     tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
+    user_id: &str,
     item: &TranslationRequestItemInput,
     source_hash: &str,
     now: &str,
 ) -> Result<String, ApiError> {
-    let id = format!("work_{}", uuid::Uuid::new_v4().simple());
+    let id = crate::local_id::generate_local_id();
     let model_profile = current_model_profile();
     let token_estimate = estimate_item_tokens(item);
     let deadline_at =
@@ -861,7 +872,7 @@ async fn create_work_item(
 
 async fn attach_request_item_to_work_item(
     tx: &mut Transaction<'_, Sqlite>,
-    request_item_id: i64,
+    request_item_id: &str,
     work_item_id: &str,
     now: &str,
 ) -> Result<(), ApiError> {
@@ -881,10 +892,11 @@ async fn attach_request_item_to_work_item(
 
     sqlx::query(
         r#"
-        INSERT OR IGNORE INTO translation_work_watchers (work_item_id, request_item_id, created_at)
-        VALUES (?, ?, ?)
+        INSERT OR IGNORE INTO translation_work_watchers (id, work_item_id, request_item_id, created_at)
+        VALUES (?, ?, ?, ?)
         "#,
     )
+    .bind(crate::local_id::generate_local_id())
     .bind(work_item_id)
     .bind(request_item_id)
     .bind(now)
@@ -896,7 +908,7 @@ async fn attach_request_item_to_work_item(
 
 async fn apply_request_item_result(
     tx: &mut Transaction<'_, Sqlite>,
-    request_item_id: i64,
+    request_item_id: &str,
     work_item_id: Option<&str>,
     result: &TranslationResultItem,
     now: &str,
@@ -1004,7 +1016,7 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
         }
     }
     let trigger_reason = trigger_reason.unwrap_or("deadline").to_owned();
-    let batch_id = format!("batch_{}", uuid::Uuid::new_v4().simple());
+    let batch_id = crate::local_id::generate_local_id();
     let partition_key = format!(
         "{}:{}:{}",
         first.target_lang, first.protocol_version, first.model_profile
@@ -1056,11 +1068,12 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
         sqlx::query(
             r#"
             INSERT INTO translation_batch_items (
-              batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
               token_estimate, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
+        .bind(crate::local_id::generate_local_id())
         .bind(batch_id.as_str())
         .bind(item.id.as_str())
         .bind(i64::try_from(index).unwrap_or(i64::MAX))
@@ -1162,27 +1175,27 @@ async fn resolve_batch_results(
 
     let mut out = Vec::with_capacity(batch.items.len());
 
-    let mut release_groups: BTreeMap<i64, Vec<&WorkItemRow>> = BTreeMap::new();
-    let mut detail_groups: BTreeMap<i64, Vec<&WorkItemRow>> = BTreeMap::new();
-    let mut notification_groups: BTreeMap<i64, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut release_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut detail_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut notification_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
 
     for item in &batch.items {
         match item.kind.as_str() {
             "release_summary" => {
                 release_groups
-                    .entry(item.scope_user_id)
+                    .entry(item.scope_user_id.clone())
                     .or_default()
                     .push(item);
             }
             "release_detail" => {
                 detail_groups
-                    .entry(item.scope_user_id)
+                    .entry(item.scope_user_id.clone())
                     .or_default()
                     .push(item);
             }
             "notification" => {
                 notification_groups
-                    .entry(item.scope_user_id)
+                    .entry(item.scope_user_id.clone())
                     .or_default()
                     .push(item);
             }
@@ -1204,7 +1217,8 @@ async fn resolve_batch_results(
             .iter()
             .filter_map(|item| item.entity_id.parse::<i64>().ok())
             .collect::<Vec<_>>();
-        let response = api::translate_releases_batch_for_user(state, user_id, &release_ids).await?;
+        let response =
+            api::translate_releases_batch_for_user(state, user_id.as_str(), &release_ids).await?;
         let by_id = response
             .items
             .into_iter()
@@ -1231,7 +1245,7 @@ async fn resolve_batch_results(
         for item in items {
             let result = match api::translate_release_detail_for_user(
                 state,
-                item.scope_user_id,
+                item.scope_user_id.as_str(),
                 item.entity_id.as_str(),
             )
             .await
@@ -1262,7 +1276,7 @@ async fn resolve_batch_results(
         for item in items {
             let result = match api::translate_notification_for_user(
                 state,
-                item.scope_user_id,
+                item.scope_user_id.clone(),
                 item.entity_id.as_str(),
             )
             .await
@@ -1393,7 +1407,7 @@ async fn finalize_batch_success(
         .fetch_all(&mut *tx)
         .await?;
         for watcher in watchers {
-            let request_item_id: i64 = watcher.try_get("request_item_id")?;
+            let request_item_id: String = watcher.try_get("request_item_id")?;
             let request_id: String = watcher.try_get("request_id")?;
             let producer_ref: String = watcher.try_get("producer_ref")?;
             let entity_id: String = watcher.try_get("entity_id")?;
@@ -1414,7 +1428,7 @@ async fn finalize_batch_success(
             };
             apply_request_item_result(
                 &mut tx,
-                request_item_id,
+                request_item_id.as_str(),
                 Some(result.work_item_id.as_str()),
                 &item_result,
                 now.as_str(),
@@ -1431,7 +1445,7 @@ async fn finalize_batch_success(
         {
             upsert_cached_translation(
                 &mut tx,
-                work_item.scope_user_id,
+                &work_item.scope_user_id,
                 work_item.kind.as_str(),
                 work_item.entity_id.as_str(),
                 work_item.target_lang.as_str(),
@@ -1524,7 +1538,7 @@ async fn finalize_batch_failure(
         .fetch_all(&mut *tx)
         .await?;
         for watcher in watchers {
-            let request_item_id: i64 = watcher.try_get("request_item_id")?;
+            let request_item_id: String = watcher.try_get("request_item_id")?;
             let request_id: String = watcher.try_get("request_id")?;
             let producer_ref: String = watcher.try_get("producer_ref")?;
             let entity_id: String = watcher.try_get("entity_id")?;
@@ -1537,7 +1551,7 @@ async fn finalize_batch_failure(
             request_result.variant = variant;
             apply_request_item_result(
                 &mut tx,
-                request_item_id,
+                request_item_id.as_str(),
                 Some(item.id.as_str()),
                 &request_result,
                 now.as_str(),
@@ -1661,13 +1675,13 @@ async fn mark_requests_running_for_work_items(
 
 fn stream_translation_request_response(
     state: Arc<AppState>,
-    user_id: i64,
+    user_id: String,
     request_id: String,
 ) -> Response {
     let stream = async_stream::stream! {
         let mut last_phase = String::new();
         loop {
-            let snapshot = load_translation_request_detail(state.as_ref(), user_id, &request_id).await;
+            let snapshot = load_translation_request_detail(state.as_ref(), &user_id, &request_id).await;
             match snapshot {
                 Ok(detail) => {
                     let phase = derive_request_stream_phase(&detail);
@@ -1731,7 +1745,7 @@ struct LoadedRequestDetail {
 
 async fn wait_for_request_terminal(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     request_id: &str,
 ) -> Result<LoadedRequestDetail, ApiError> {
     loop {
@@ -1762,10 +1776,10 @@ async fn current_request_status(state: &AppState, request_id: &str) -> Result<St
 
 async fn ensure_request_owner(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     request_id: &str,
 ) -> Result<(), ApiError> {
-    let owner = sqlx::query_scalar::<_, i64>(
+    let owner = sqlx::query_scalar::<_, String>(
         r#"SELECT scope_user_id FROM translation_requests WHERE id = ? LIMIT 1"#,
     )
     .bind(request_id)
@@ -1791,7 +1805,7 @@ async fn ensure_request_owner(
 
 async fn load_translation_request_detail(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     request_id: &str,
 ) -> Result<LoadedRequestDetail, ApiError> {
     let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
@@ -1831,7 +1845,7 @@ async fn load_translation_result_items_by_request(
                (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
         FROM translation_request_items r
         WHERE request_id = ?
-        ORDER BY id ASC
+        ORDER BY created_at ASC, id ASC
         "#,
     )
     .bind(request_id)
@@ -2036,7 +2050,11 @@ fn build_source_hash(item: &TranslationRequestItemInput) -> String {
     ))
 }
 
-fn build_dedupe_key(user_id: i64, item: &TranslationRequestItemInput, source_hash: &str) -> String {
+fn build_dedupe_key(
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}",
         user_id,
@@ -2140,7 +2158,7 @@ fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
 #[allow(clippy::too_many_arguments)]
 async fn upsert_cached_translation(
     tx: &mut Transaction<'_, Sqlite>,
-    user_id: i64,
+    user_id: &str,
     kind: &str,
     entity_id: &str,
     target_lang: &str,
@@ -2154,8 +2172,8 @@ async fn upsert_cached_translation(
     };
     sqlx::query(
         r#"
-        INSERT INTO ai_translations (user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, entity_type, entity_id, lang)
         DO UPDATE SET source_hash = excluded.source_hash,
                       title = excluded.title,
@@ -2163,6 +2181,7 @@ async fn upsert_cached_translation(
                       updated_at = excluded.updated_at
         "#,
     )
+    .bind(crate::local_id::generate_local_id())
     .bind(user_id)
     .bind(entity_type)
     .bind(entity_id)
@@ -2237,10 +2256,10 @@ mod tests {
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
 
-        create_translation_request(state.as_ref(), 1, "async", std::slice::from_ref(&item))
+        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
             .await
             .expect("first request created");
-        create_translation_request(state.as_ref(), 1, "async", std::slice::from_ref(&item))
+        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
             .await
             .expect("second request created");
 
@@ -2271,7 +2290,7 @@ mod tests {
         item.max_wait_ms = 0;
 
         let request_id =
-            create_translation_request(state.as_ref(), 1, "wait", std::slice::from_ref(&item))
+            create_translation_request(state.as_ref(), "1", "wait", std::slice::from_ref(&item))
                 .await
                 .expect("request created");
 
@@ -2309,7 +2328,7 @@ mod tests {
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
         let request_id =
-            create_translation_request(state.as_ref(), 1, "async", std::slice::from_ref(&item))
+            create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
                 .await
                 .expect("request created");
         let now = Utc::now().to_rfc3339();
@@ -2348,8 +2367,8 @@ mod tests {
                 id: "req-1".to_owned(),
                 status: "running".to_owned(),
                 source: "feed.auto_translate".to_owned(),
-                requested_by: Some(1),
-                scope_user_id: 1,
+                requested_by: Some("1".to_owned()),
+                scope_user_id: "1".to_owned(),
                 item_count: 1,
                 completed_item_count: 0,
                 created_at: "2026-03-07T00:00:00Z".to_owned(),
@@ -2499,7 +2518,7 @@ mod tests {
             VALUES (?, ?, ?, ?, ?)
             "#,
         )
-        .bind(id)
+        .bind(id.to_string())
         .bind(30_000_000_i64 + id)
         .bind(login)
         .bind(now)
