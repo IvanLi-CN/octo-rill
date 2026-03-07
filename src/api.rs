@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
@@ -561,6 +561,7 @@ pub struct AdminRealtimeTasksQuery {
     status: Option<String>,
     task_type: Option<String>,
     exclude_task_type: Option<String>,
+    task_group: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
 }
@@ -593,6 +594,8 @@ pub struct AdminRealtimeTaskDetailItem {
     error_message: Option<String>,
     payload_json: String,
     result_json: Option<String>,
+    #[serde(skip_serializing)]
+    log_file_path: Option<String>,
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
@@ -620,6 +623,9 @@ pub async fn admin_list_realtime_tasks(
     let status = query.status.unwrap_or_else(|| "all".to_owned());
     let task_type = query.task_type.unwrap_or_default();
     let exclude_task_type = query.exclude_task_type.unwrap_or_default();
+    let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
+    let scheduled_daily_task = jobs::SCHEDULED_TASK_TYPES[0];
+    let scheduled_subscription_task = jobs::SCHEDULED_TASK_TYPES[1];
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"
@@ -628,6 +634,11 @@ pub async fn admin_list_realtime_tasks(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR task_type = ?)
           AND (? = '' OR task_type != ?)
+          AND (
+            ? = 'all'
+            OR (? = 'scheduled' AND task_type IN (?, ?))
+            OR (? = 'realtime' AND task_type NOT IN (?, ?))
+          )
         "#,
     )
     .bind(status.as_str())
@@ -636,6 +647,13 @@ pub async fn admin_list_realtime_tasks(
     .bind(task_type.as_str())
     .bind(exclude_task_type.as_str())
     .bind(exclude_task_type.as_str())
+    .bind(task_group.as_str())
+    .bind(task_group.as_str())
+    .bind(scheduled_daily_task)
+    .bind(scheduled_subscription_task)
+    .bind(task_group.as_str())
+    .bind(scheduled_daily_task)
+    .bind(scheduled_subscription_task)
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -659,6 +677,11 @@ pub async fn admin_list_realtime_tasks(
         WHERE (? = 'all' OR status = ?)
           AND (? = '' OR task_type = ?)
           AND (? = '' OR task_type != ?)
+          AND (
+            ? = 'all'
+            OR (? = 'scheduled' AND task_type IN (?, ?))
+            OR (? = 'realtime' AND task_type NOT IN (?, ?))
+          )
         ORDER BY created_at DESC, id DESC
         LIMIT ? OFFSET ?
         "#,
@@ -669,11 +692,27 @@ pub async fn admin_list_realtime_tasks(
     .bind(task_type.as_str())
     .bind(exclude_task_type.as_str())
     .bind(exclude_task_type.as_str())
+    .bind(task_group.as_str())
+    .bind(task_group.as_str())
+    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
+    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+    .bind(task_group.as_str())
+    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
+    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
+
+    let items = items
+        .into_iter()
+        .filter(|item| match task_group.as_str() {
+            "scheduled" => jobs::is_scheduled_task_type(&item.task_type),
+            "realtime" => !jobs::is_scheduled_task_type(&item.task_type),
+            _ => true,
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(AdminRealtimeTasksResponse {
         items,
@@ -692,6 +731,7 @@ pub struct AdminTaskEventItem {
 }
 
 const ADMIN_TASK_DETAIL_EVENT_LIMIT: i64 = 200;
+const ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT: i64 = 20;
 
 #[derive(Debug, Serialize)]
 pub struct AdminTaskEventMeta {
@@ -717,6 +757,8 @@ pub struct AdminTaskDiagnostics {
     brief_daily_slot: Option<AdminBriefDailySlotDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brief_generate: Option<AdminBriefGenerateDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync_subscriptions: Option<AdminSyncSubscriptionsDiagnostics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -781,6 +823,67 @@ pub struct AdminBriefGenerateDiagnostics {
     target_user_id: Option<i64>,
     content_length: Option<i64>,
     key_date: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionStarDiagnostics {
+    total_users: i64,
+    succeeded_users: i64,
+    failed_users: i64,
+    total_repos: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionReleaseDiagnostics {
+    total_repos: i64,
+    succeeded_repos: i64,
+    failed_repos: i64,
+    candidate_failures: i64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AdminSyncSubscriptionEventItem {
+    id: i64,
+    stage: String,
+    event_type: String,
+    severity: String,
+    recoverable: bool,
+    attempt: i64,
+    user_id: Option<i64>,
+    repo_id: Option<i64>,
+    repo_full_name: Option<String>,
+    message: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionsDiagnostics {
+    trigger: Option<String>,
+    schedule_key: Option<String>,
+    skipped: bool,
+    skip_reason: Option<String>,
+    log_available: bool,
+    log_download_path: Option<String>,
+    star: AdminSyncSubscriptionStarDiagnostics,
+    release: AdminSyncSubscriptionReleaseDiagnostics,
+    releases_written: i64,
+    critical_events: i64,
+    recent_events: Vec<AdminSyncSubscriptionEventItem>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminSyncSubscriptionEventRow {
+    id: i64,
+    stage: String,
+    event_type: String,
+    severity: String,
+    recoverable: bool,
+    attempt: i64,
+    user_id: Option<i64>,
+    repo_id: Option<i64>,
+    repo_full_name: Option<String>,
+    payload_json: Option<String>,
+    created_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -867,6 +970,22 @@ fn json_object_get_bool(
     object
         .and_then(|obj| obj.get(key))
         .and_then(json_value_to_bool)
+}
+
+fn json_object_get_object<'a>(
+    object: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    object
+        .and_then(|obj| obj.get(key))
+        .and_then(serde_json::Value::as_object)
+}
+
+fn sync_subscription_log_download_path(task_id: &str) -> String {
+    format!(
+        "/api/admin/jobs/realtime/{}/log",
+        urlencoding::encode(task_id)
+    )
 }
 
 fn business_outcome(code: &str, label: &str, message: impl Into<String>) -> AdminBusinessOutcome {
@@ -1252,9 +1371,144 @@ fn build_brief_generate_diagnostics(
     (outcome, diagnostics)
 }
 
+fn map_sync_subscription_event(
+    row: AdminSyncSubscriptionEventRow,
+) -> AdminSyncSubscriptionEventItem {
+    let payload_value = parse_json_value(row.payload_json.as_deref());
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+
+    AdminSyncSubscriptionEventItem {
+        id: row.id,
+        stage: row.stage,
+        event_type: row.event_type,
+        severity: row.severity,
+        recoverable: row.recoverable,
+        attempt: row.attempt,
+        user_id: row.user_id,
+        repo_id: row.repo_id,
+        repo_full_name: row.repo_full_name,
+        message: json_object_get_string(payload_object, "message"),
+        created_at: row.created_at,
+    }
+}
+
+fn build_sync_subscriptions_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    recent_events: &[AdminSyncSubscriptionEventItem],
+) -> (AdminBusinessOutcome, AdminSyncSubscriptionsDiagnostics) {
+    let payload_value = parse_json_value(Some(task.payload_json.as_str()));
+    let payload_object = payload_value
+        .as_ref()
+        .and_then(serde_json::Value::as_object);
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+    let star_object = json_object_get_object(result_object, "star");
+    let release_object = json_object_get_object(result_object, "release");
+
+    let skipped = json_object_get_bool(result_object, "skipped").unwrap_or(false);
+    let skip_reason = json_object_get_string(result_object, "skip_reason");
+    let trigger = json_object_get_string(payload_object, "trigger");
+    let schedule_key = json_object_get_string(payload_object, "schedule_key");
+    let star = AdminSyncSubscriptionStarDiagnostics {
+        total_users: json_object_get_i64(star_object, "total_users").unwrap_or(0),
+        succeeded_users: json_object_get_i64(star_object, "succeeded_users").unwrap_or(0),
+        failed_users: json_object_get_i64(star_object, "failed_users").unwrap_or(0),
+        total_repos: json_object_get_i64(star_object, "total_repos").unwrap_or(0),
+    };
+    let release = AdminSyncSubscriptionReleaseDiagnostics {
+        total_repos: json_object_get_i64(release_object, "total_repos").unwrap_or(0),
+        succeeded_repos: json_object_get_i64(release_object, "succeeded_repos").unwrap_or(0),
+        failed_repos: json_object_get_i64(release_object, "failed_repos").unwrap_or(0),
+        candidate_failures: json_object_get_i64(release_object, "candidate_failures").unwrap_or(0),
+    };
+    let releases_written = json_object_get_i64(result_object, "releases_written").unwrap_or(0);
+    let critical_events = json_object_get_i64(result_object, "critical_events").unwrap_or(0);
+    let log_available = task
+        .log_file_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::Path::new)
+        .is_some_and(std::path::Path::is_file);
+    let log_download_path = log_available.then(|| sync_subscription_log_download_path(&task.id));
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "订阅同步任务执行失败。".to_owned()),
+        )
+    } else if skipped {
+        business_outcome(
+            "disabled",
+            "已跳过",
+            match skip_reason.as_deref() {
+                Some("previous_run_active") => {
+                    "上一轮订阅同步仍在执行，本轮仅记录跳过结果。".to_owned()
+                }
+                Some(other) => format!("本轮任务已跳过：{other}"),
+                None => "本轮任务已跳过。".to_owned(),
+            },
+        )
+    } else if task.status == jobs::STATUS_CANCELED {
+        business_outcome("partial", "已取消", "任务在执行中被取消，结果可能不完整。")
+    } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
+        business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。")
+    } else if star.total_users == 0 {
+        business_outcome("ok", "无需执行", "当前没有可同步的启用用户。")
+    } else if star.succeeded_users == 0 && star.failed_users > 0 {
+        business_outcome(
+            "failed",
+            "业务失败",
+            "Star 阶段全部失败，未进入仓库抓取阶段。",
+        )
+    } else if release.total_repos > 0 && release.succeeded_repos == 0 && release.failed_repos > 0 {
+        business_outcome(
+            "failed",
+            "业务失败",
+            "Release 阶段全部失败，未能写入任何仓库结果。",
+        )
+    } else if star.failed_users > 0 || release.failed_repos > 0 || critical_events > 0 {
+        business_outcome(
+            "partial",
+            "部分成功",
+            "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+        )
+    } else if release.total_repos == 0 {
+        business_outcome(
+            "ok",
+            "业务成功",
+            "Star 阶段已完成，本轮没有需要抓取 Release 的仓库。",
+        )
+    } else {
+        business_outcome("ok", "业务成功", "订阅同步任务已完成。")
+    };
+
+    (
+        outcome,
+        AdminSyncSubscriptionsDiagnostics {
+            trigger,
+            schedule_key,
+            skipped,
+            skip_reason,
+            log_available,
+            log_download_path,
+            star,
+            release,
+            releases_written,
+            critical_events,
+            recent_events: recent_events.to_vec(),
+        },
+    )
+}
+
 fn build_task_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
+    subscription_events: &[AdminSyncSubscriptionEventItem],
 ) -> Option<AdminTaskDiagnostics> {
     match task.task_type.as_str() {
         jobs::TASK_TRANSLATE_RELEASE_BATCH => {
@@ -1265,6 +1519,7 @@ fn build_task_diagnostics(
                 translate_release_batch: Some(diagnostics),
                 brief_daily_slot: None,
                 brief_generate: None,
+                sync_subscriptions: None,
             })
         }
         jobs::TASK_BRIEF_DAILY_SLOT => {
@@ -1274,6 +1529,7 @@ fn build_task_diagnostics(
                 translate_release_batch: None,
                 brief_daily_slot: Some(diagnostics),
                 brief_generate: None,
+                sync_subscriptions: None,
             })
         }
         jobs::TASK_BRIEF_GENERATE => {
@@ -1283,6 +1539,18 @@ fn build_task_diagnostics(
                 translate_release_batch: None,
                 brief_daily_slot: None,
                 brief_generate: Some(diagnostics),
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_SYNC_SUBSCRIPTIONS => {
+            let (business_outcome, diagnostics) =
+                build_sync_subscriptions_diagnostics(task, subscription_events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                sync_subscriptions: Some(diagnostics),
             })
         }
         _ => None,
@@ -1309,6 +1577,7 @@ pub async fn admin_get_realtime_task_detail(
           error_message,
           payload_json,
           result_json,
+          log_file_path,
           created_at,
           started_at,
           finished_at,
@@ -1359,7 +1628,39 @@ pub async fn admin_get_realtime_task_detail(
         limit: ADMIN_TASK_DETAIL_EVENT_LIMIT,
         truncated: event_total > returned,
     };
-    let diagnostics = build_task_diagnostics(&task, &events);
+
+    let subscription_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
+        let rows = sqlx::query_as::<_, AdminSyncSubscriptionEventRow>(
+            r#"
+            SELECT
+              id,
+              stage,
+              event_type,
+              severity,
+              recoverable,
+              attempt,
+              user_id,
+              repo_id,
+              repo_full_name,
+              payload_json,
+              created_at
+            FROM sync_subscription_events
+            WHERE task_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        rows.into_iter().map(map_sync_subscription_event).collect()
+    } else {
+        Vec::new()
+    };
+
+    let diagnostics = build_task_diagnostics(&task, &events, &subscription_events);
 
     Ok(Json(AdminRealtimeTaskDetailResponse {
         task,
@@ -1367,6 +1668,57 @@ pub async fn admin_get_realtime_task_detail(
         event_meta,
         diagnostics,
     }))
+}
+
+pub async fn admin_download_realtime_task_log(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+
+    let log_file_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "task log not found"))?;
+
+    let file = tokio::fs::File::open(&log_file_path).await.map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ApiError::new(StatusCode::NOT_FOUND, "not_found", "task log not found")
+        } else {
+            ApiError::internal(err)
+        }
+    })?;
+
+    let stream = async_stream::stream! {
+        let mut file = file;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..read])),
+                Err(err) => {
+                    yield Err::<Bytes, std::io::Error>(err);
+                    break;
+                }
+            }
+        }
+    };
+
+    let filename = format!("{}.ndjson", task_id);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(r#"attachment; filename="{}""#, filename))
+            .map_err(ApiError::internal)?,
+    );
+
+    Ok(response)
 }
 
 #[derive(Debug, Serialize)]
@@ -6775,15 +7127,15 @@ async fn require_admin_user_id(state: &AppState, session: &Session) -> Result<i6
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminTaskEventItem, AdminUserPatchRequest,
-        AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError, TranslateBatchItem,
-        TranslationCacheRow, admin_get_llm_call_detail, admin_get_llm_scheduler_status,
-        admin_list_llm_calls, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
-        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
-        guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
-        markdown_structure_preserved, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem,
+        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
+        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
+        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_list_llm_calls,
+        admin_list_users, admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
+        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
+        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
+        has_repo_scope, looks_like_json_blob, map_job_action_error, markdown_structure_preserved,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
@@ -6791,7 +7143,7 @@ mod tests {
         release_excerpt, release_reactions_status, resolve_release_full_name,
         split_markdown_chunks, translate_response_from_batch_item,
     };
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -6801,7 +7153,10 @@ mod tests {
     };
     use axum::{
         Json,
+        body::to_bytes,
         extract::{Path, Query, State},
+        http::{StatusCode, header},
+        response::IntoResponse,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
@@ -6855,6 +7210,7 @@ mod tests {
             error_message: error_message.map(str::to_owned),
             payload_json: payload_json.to_owned(),
             result_json: result_json.map(str::to_owned),
+            log_file_path: None,
             created_at: "2026-02-27T00:00:00Z".to_owned(),
             started_at: Some("2026-02-27T00:00:01Z".to_owned()),
             finished_at: Some("2026-02-27T00:00:02Z".to_owned()),
@@ -6909,6 +7265,8 @@ mod tests {
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
             static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
+            job_worker_concurrency: 4,
             encryption_key: encryption_key.clone(),
             github: GitHubOAuthConfig {
                 client_id: "test-client-id".to_owned(),
@@ -7739,7 +8097,7 @@ mod tests {
             ),
         ];
 
-        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "failed");
         let translate_diag = diagnostics
             .translate_release_batch
@@ -7774,7 +8132,7 @@ mod tests {
             r#"{"stage":"collect","total_releases":1}"#,
         )];
 
-        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "unknown");
         assert_eq!(diagnostics.business_outcome.label, "处理中");
     }
@@ -7817,7 +8175,7 @@ mod tests {
             ),
         ];
 
-        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "partial");
         let slot_diag = diagnostics
             .brief_daily_slot
@@ -7849,9 +8207,210 @@ mod tests {
             r#"{"stage":"summary","total":4,"succeeded":1,"failed":1,"canceled":true}"#,
         )];
 
-        let diagnostics = build_task_diagnostics(&task, &events).expect("diagnostics");
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "partial");
         assert_eq!(diagnostics.business_outcome.label, "已取消");
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_warning_events_do_not_force_partial_outcome() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
+            Some(
+                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":8,"failed_repos":0,"candidate_failures":2},"releases_written":42,"critical_events":0}"#,
+            ),
+            None,
+        );
+        let subscription_events = vec![AdminSyncSubscriptionEventItem {
+            id: 1,
+            stage: "release".to_owned(),
+            event_type: "rate_limited".to_owned(),
+            severity: "warning".to_owned(),
+            recoverable: true,
+            attempt: 1,
+            user_id: Some(7),
+            repo_id: Some(9),
+            repo_full_name: Some("octo/alpha".to_owned()),
+            message: Some("retryable release sync error for octo/alpha with user #7".to_owned()),
+            created_at: "2026-03-06T14:30:01Z".to_owned(),
+        }];
+
+        let diagnostics =
+            build_task_diagnostics(&task, &[], &subscription_events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "ok");
+        assert_eq!(diagnostics.business_outcome.label, "业务成功");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.critical_events, 0);
+        assert_eq!(sync_diag.recent_events.len(), 1);
+        assert_eq!(sync_diag.recent_events[0].severity, "warning");
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_surfaces_recent_events_and_log_download() {
+        let log_dir = std::env::temp_dir().join(format!(
+            "octo-rill-sync-diagnostics-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("task-test.ndjson");
+        fs::write(
+            &log_path,
+            r#"{"event":"started"}
+"#,
+        )
+        .expect("write task log");
+
+        let mut task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
+            Some(
+                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":10,"failed_users":2,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":7,"failed_repos":1,"candidate_failures":3},"releases_written":42,"critical_events":2}"#,
+            ),
+            None,
+        );
+        task.log_file_path = Some(log_path.to_string_lossy().into_owned());
+        let subscription_events = vec![
+            AdminSyncSubscriptionEventItem {
+                id: 7,
+                stage: "release".to_owned(),
+                event_type: "repo_unreachable".to_owned(),
+                severity: "error".to_owned(),
+                recoverable: false,
+                attempt: 0,
+                user_id: None,
+                repo_id: Some(9001),
+                repo_full_name: Some("octo/private-repo".to_owned()),
+                message: Some("all candidates failed for octo/private-repo".to_owned()),
+                created_at: "2026-03-06T14:31:40Z".to_owned(),
+            },
+            AdminSyncSubscriptionEventItem {
+                id: 6,
+                stage: "star".to_owned(),
+                event_type: "network_error".to_owned(),
+                severity: "warning".to_owned(),
+                recoverable: true,
+                attempt: 1,
+                user_id: Some(23),
+                repo_id: None,
+                repo_full_name: None,
+                message: Some("failed to refresh starred repositories for user #23".to_owned()),
+                created_at: "2026-03-06T14:30:10Z".to_owned(),
+            },
+        ];
+
+        let diagnostics =
+            build_task_diagnostics(&task, &[], &subscription_events).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.trigger.as_deref(), Some("schedule"));
+        assert_eq!(sync_diag.schedule_key.as_deref(), Some("2026-03-06T14:30"));
+        assert!(sync_diag.log_available);
+        assert_eq!(
+            sync_diag.log_download_path.as_deref(),
+            Some("/api/admin/jobs/realtime/task-test/log")
+        );
+        assert_eq!(sync_diag.star.succeeded_users, 10);
+        assert_eq!(sync_diag.release.failed_repos, 1);
+        assert_eq!(sync_diag.releases_written, 42);
+        assert_eq!(sync_diag.critical_events, 2);
+        assert_eq!(sync_diag.recent_events.len(), 2);
+        assert_eq!(sync_diag.recent_events[0].event_type, "repo_unreachable");
+
+        fs::remove_file(&log_path).ok();
+        fs::remove_dir_all(&log_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn admin_download_realtime_task_log_returns_ndjson_attachment() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        fs::create_dir_all(&state.config.task_log_dir).expect("create task log dir");
+        let log_path = state
+            .config
+            .task_log_dir
+            .join(format!("{}.ndjson", uuid::Uuid::new_v4()));
+        let log_body = r#"{"event":"started"}
+{"event":"finished"}
+"#;
+        fs::write(&log_path, log_body).expect("write task log");
+
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("task-log-download")
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("scheduler")
+        .bind(2_i64)
+        .bind(Option::<String>::None)
+        .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(log_path.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        let response = admin_download_realtime_task_log(
+            State(state.clone()),
+            session,
+            Path("task-log-download".to_owned()),
+        )
+        .await
+        .expect("download task log")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("application/x-ndjson"))
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION),
+            Some(&header::HeaderValue::from_static(
+                r#"attachment; filename="task-log-download.ndjson""#
+            ))
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read task log body");
+        assert_eq!(std::str::from_utf8(&body).expect("body utf8"), log_body);
+
+        fs::remove_file(&log_path).ok();
     }
 
     #[test]
@@ -7864,7 +8423,7 @@ mod tests {
             None,
         );
 
-        let diagnostics = build_task_diagnostics(&task, &[]).expect("diagnostics");
+        let diagnostics = build_task_diagnostics(&task, &[], &[]).expect("diagnostics");
         assert_eq!(diagnostics.business_outcome.code, "partial");
         assert_eq!(diagnostics.business_outcome.label, "已取消");
         let brief_generate = diagnostics
