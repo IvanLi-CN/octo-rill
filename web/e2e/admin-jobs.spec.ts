@@ -831,9 +831,12 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByRole("combobox", { name: "定时任务状态筛选" }),
 	).toBeVisible();
 	await expect(page.getByText("运行记录")).toBeVisible();
-	await expect(page.getByText("定时执行任务")).toBeVisible();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("订阅同步")).toBeVisible();
 	await expect(page.getByText("sync.subscriptions")).toBeVisible();
-	await expect(page.getByText("brief.daily_slot")).toBeVisible();
+	await expect(
+		page.getByText("brief.daily_slot", { exact: true }),
+	).toBeVisible();
 	const subscriptionTaskCard = page
 		.getByText("ID: task-subscriptions-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
