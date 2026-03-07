@@ -426,6 +426,8 @@ type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
 	autoOpenTaskDrawer?: boolean;
 	autoOpenTaskDrawerLlmRoute?: boolean;
+	initialTab?: "scheduled" | "llm";
+	llmSourceFilter?: string;
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -446,6 +448,8 @@ function AdminJobsPreview({
 	autoOpenConversation = false,
 	autoOpenTaskDrawer = false,
 	autoOpenTaskDrawerLlmRoute = false,
+	initialTab,
+	llmSourceFilter = "",
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -820,21 +824,44 @@ function AdminJobsPreview({
 	}, []);
 
 	useEffect(() => {
-		if (!ready || !autoOpenConversation || autoOpenedRef.current) {
+		const needsTabPrep = Boolean(initialTab) || Boolean(llmSourceFilter);
+		if (
+			!ready ||
+			autoOpenedRef.current ||
+			(!autoOpenConversation && !needsTabPrep)
+		) {
 			return;
 		}
 		autoOpenedRef.current = true;
 		const openTimer = window.setTimeout(() => {
-			const llmTab = Array.from(document.querySelectorAll("button")).find(
-				(node) => node.textContent?.trim() === "LLM调度",
+			const targetTabLabel =
+				initialTab === "scheduled"
+					? "定时任务"
+					: initialTab === "llm" || autoOpenConversation || llmSourceFilter
+						? "LLM调度"
+						: null;
+			if (!targetTabLabel) {
+				return;
+			}
+			const targetTab = Array.from(document.querySelectorAll("button")).find(
+				(node) => node.textContent?.trim() === targetTabLabel,
 			) as HTMLButtonElement | undefined;
-			llmTab?.click();
+			targetTab?.click();
+			if (targetTabLabel !== "LLM调度") {
+				return;
+			}
 			window.setTimeout(() => {
 				const sourceInput = document.querySelector(
 					'input[placeholder="来源（source）"]',
 				) as HTMLInputElement | null;
-				if (sourceInput) {
-					setInputValue(sourceInput, "job.api.translate_release");
+				if (sourceInput && (autoOpenConversation || llmSourceFilter)) {
+					setInputValue(
+						sourceInput,
+						llmSourceFilter || "job.api.translate_release",
+					);
+				}
+				if (!autoOpenConversation) {
+					return;
 				}
 				window.setTimeout(() => {
 					const detailButton = Array.from(
@@ -849,7 +876,7 @@ function AdminJobsPreview({
 		return () => {
 			window.clearTimeout(openTimer);
 		};
-	}, [ready, autoOpenConversation]);
+	}, [ready, autoOpenConversation, initialTab, llmSourceFilter]);
 
 	useEffect(() => {
 		if (
@@ -944,6 +971,19 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const ScheduledTab: Story = {
+	render: () => <AdminJobsPreview initialTab="scheduled" />,
+};
+
+export const LlmFilters: Story = {
+	render: () => (
+		<AdminJobsPreview
+			initialTab="llm"
+			llmSourceFilter="job.api.translate_release"
+		/>
+	),
+};
 
 export const LlmConversationDetail: Story = {
 	render: () => <AdminJobsPreview autoOpenConversation />,

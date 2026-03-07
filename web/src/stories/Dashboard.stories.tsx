@@ -2,6 +2,17 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FeedList } from "@/feed/FeedList";
 import type { FeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
@@ -14,6 +25,8 @@ import {
 	type NotificationItem,
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
+
+type Tab = "all" | "releases" | "briefs" | "inbox";
 
 function makeMockFeed(): FeedItem[] {
 	return [
@@ -139,20 +152,46 @@ const mockNotifs: NotificationItem[] = [
 	},
 ];
 
-function DashboardPreview() {
+function DashboardPreview(props: {
+	initialTab?: Tab;
+	initialPatDialogOpen?: boolean;
+}) {
+	const { initialTab = "all", initialPatDialogOpen = false } = props;
 	const items = makeMockFeed();
 	const inFlightKeys = new Set<string>();
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) => it.translated?.status === "disabled",
 	);
-	type Tab = "all" | "releases" | "briefs" | "inbox";
-	const [tab, setTab] = useState<Tab>("all");
+	const [tab, setTab] = useState<Tab>(initialTab);
+	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
 	>({});
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		mockBriefs[0]?.date ?? null,
+	);
+
+	const feedPanel = (
+		<FeedList
+			items={items}
+			error={null}
+			loadingInitial={false}
+			loadingMore={false}
+			hasMore={false}
+			inFlightKeys={inFlightKeys}
+			registerItemRef={() => () => {}}
+			onLoadMore={() => {}}
+			showOriginalByKey={showOriginalByKey}
+			onToggleOriginal={(key) =>
+				setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
+			}
+			onTranslateNow={() => {}}
+			reactionBusyKeys={reactionBusyKeys}
+			reactionErrorByKey={{}}
+			onToggleReaction={() => {}}
+			onSyncReleases={() => {}}
+		/>
 	);
 
 	return (
@@ -176,101 +215,123 @@ function DashboardPreview() {
 			}
 			footer={<AppMetaFooter />}
 		>
-			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-				<div className="flex flex-wrap items-center gap-2">
-					<Button
-						variant={tab === "all" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => setTab("all")}
-					>
-						全部
-					</Button>
-					<Button
-						variant={tab === "releases" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => setTab("releases")}
-					>
-						Releases
-					</Button>
-					<Button
-						variant={tab === "briefs" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => setTab("briefs")}
-					>
-						日报
-					</Button>
-					<Button
-						variant={tab === "inbox" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => setTab("inbox")}
-					>
-						Inbox
-					</Button>
+			<Tabs
+				value={tab}
+				onValueChange={(nextTab) => setTab(nextTab as Tab)}
+				className="gap-6"
+			>
+				<div className="flex flex-wrap items-center justify-between gap-2">
+					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
+						<TabsTrigger value="all" className="font-mono text-xs">
+							全部
+						</TabsTrigger>
+						<TabsTrigger value="releases" className="font-mono text-xs">
+							Releases
+						</TabsTrigger>
+						<TabsTrigger value="briefs" className="font-mono text-xs">
+							日报
+						</TabsTrigger>
+						<TabsTrigger value="inbox" className="font-mono text-xs">
+							Inbox
+						</TabsTrigger>
+					</TabsList>
+					<div className="flex items-center gap-2">
+						<Button
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
+							onClick={() => setPatDialogOpen(true)}
+						>
+							打开 PAT 配置
+						</Button>
+						<Button
+							asChild
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
+						>
+							<a href="/admin">管理员面板</a>
+						</Button>
+					</div>
 				</div>
-				<Button
-					asChild
-					variant="outline"
-					size="sm"
-					className="font-mono text-xs"
-				>
-					<a href="/admin">管理员面板</a>
-				</Button>
-			</div>
 
-			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
-				<section className="min-w-0">
-					{tab === "all" || tab === "releases" ? (
-						<FeedList
-							items={items}
-							error={null}
-							loadingInitial={false}
-							loadingMore={false}
-							hasMore={false}
-							inFlightKeys={inFlightKeys}
-							registerItemRef={() => () => {}}
-							onLoadMore={() => {}}
-							showOriginalByKey={showOriginalByKey}
-							onToggleOriginal={(key) =>
-								setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
-							}
-							onTranslateNow={() => {}}
-							reactionBusyKeys={reactionBusyKeys}
-							reactionErrorByKey={{}}
-							onToggleReaction={() => {}}
-							onSyncReleases={() => {}}
-						/>
-					) : null}
+				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+					<section className="min-w-0">
+						<TabsContent value="all" className="mt-0 min-w-0">
+							{feedPanel}
+						</TabsContent>
+						<TabsContent value="releases" className="mt-0 min-w-0">
+							{feedPanel}
+						</TabsContent>
+						<TabsContent value="briefs" className="mt-0 min-w-0">
+							<div className="space-y-6">
+								<ReleaseDailyCard
+									briefs={mockBriefs}
+									selectedDate={selectedDate}
+									busy={false}
+									onGenerate={() => {}}
+									onOpenRelease={() => {}}
+								/>
+							</div>
+						</TabsContent>
+						<TabsContent value="inbox" className="mt-0 min-w-0">
+							<InboxList notifications={mockNotifs} />
+						</TabsContent>
+					</section>
 
-					{tab === "briefs" ? (
-						<div className="space-y-6">
-							<ReleaseDailyCard
+					<aside className="space-y-6">
+						{tab === "briefs" ? (
+							<BriefListCard
 								briefs={mockBriefs}
 								selectedDate={selectedDate}
-								busy={false}
-								onGenerate={() => {}}
-								onOpenRelease={() => {}}
+								onSelectDate={(d) => setSelectedDate(d)}
 							/>
-						</div>
-					) : null}
+						) : null}
+						<InboxQuickList notifications={mockNotifs} />
+					</aside>
+				</div>
+			</Tabs>
 
-					{tab === "inbox" ? <InboxList notifications={mockNotifs} /> : null}
-				</section>
-
-				<aside className="space-y-6">
-					{tab === "briefs" ? (
-						<BriefListCard
-							briefs={mockBriefs}
-							selectedDate={selectedDate}
-							onSelectDate={(d) => setSelectedDate(d)}
+			<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
+				<DialogContent
+					showCloseButton={false}
+					className="max-w-2xl"
+					onInteractOutside={(event) => event.preventDefault()}
+				>
+					<DialogHeader>
+						<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+						<DialogDescription>
+							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+						</DialogDescription>
+					</DialogHeader>
+					<div className="bg-muted/40 rounded-lg border p-3">
+						<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+						<p className="text-muted-foreground mt-1 font-mono text-xs">
+							Settings → Developer settings → Personal access tokens → Tokens
+							(classic)
+						</p>
+					</div>
+					<div className="space-y-2">
+						<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
+						<Input
+							id="storybook-reaction-pat"
+							type="password"
+							value="ghp_mock_dashboard_storybook_token"
+							readOnly
+							className="font-mono text-sm"
 						/>
-					) : null}
-					<InboxQuickList notifications={mockNotifs} />
-				</aside>
-			</div>
+					</div>
+					<p className="text-xs text-emerald-600">
+						Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
+					</p>
+					<DialogFooter>
+						<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
+							稍后再说
+						</Button>
+						<Button>保存并继续</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</AppShell>
 	);
 }
@@ -281,9 +342,26 @@ const meta = {
 	parameters: {
 		layout: "fullscreen",
 	},
+	args: {
+		initialTab: "all",
+		initialPatDialogOpen: false,
+	},
 } satisfies Meta<typeof DashboardPreview>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {};
+
+export const BriefsFocused: Story = {
+	args: {
+		initialTab: "briefs",
+	},
+};
+
+export const PatDialogOpen: Story = {
+	args: {
+		initialTab: "briefs",
+		initialPatDialogOpen: true,
+	},
+};

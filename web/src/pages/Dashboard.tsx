@@ -2,6 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, apiGet, apiPost, apiPostJson, apiPutJson } from "@/api";
 import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FeedList } from "@/feed/FeedList";
 import type {
 	FeedItem,
@@ -582,6 +593,24 @@ export function Dashboard(props: { me: MeResponse }) {
 		return Boolean(any);
 	}, [feed.items]);
 
+	const resetPatDialogState = useCallback(() => {
+		setPatDialogOpen(false);
+		setPatInput("");
+		setPatCheckState("idle");
+		setPatCheckMessage(null);
+	}, []);
+
+	const onPatDialogOpenChange = useCallback(
+		(open: boolean) => {
+			if (open) {
+				setPatDialogOpen(true);
+				return;
+			}
+			resetPatDialogState();
+		},
+		[resetPatDialogState],
+	);
+
 	const onSelectTab = useCallback((nextTab: Tab) => {
 		setTab(nextTab);
 		if (nextTab !== "briefs") {
@@ -597,6 +626,64 @@ export function Dashboard(props: { me: MeResponse }) {
 	const onCloseReleaseDetail = useCallback(() => {
 		setActiveReleaseId(null);
 	}, []);
+
+	const feedPanel = (
+		<>
+			{!feed.loadingInitial && feed.items.length === 0 ? (
+				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
+					<p className="text-muted-foreground mt-1 text-sm">
+						先同步 starred，再同步 releases；右侧是 Inbox 快捷入口。 或者直接点{" "}
+						<span className="font-mono">Sync all</span>。
+					</p>
+					<div className="mt-4 flex flex-wrap gap-2">
+						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+							Sync all
+						</Button>
+						<Button
+							variant="outline"
+							disabled={Boolean(busy)}
+							onClick={onSyncStarred}
+						>
+							Sync starred
+						</Button>
+						<Button
+							variant="outline"
+							disabled={Boolean(busy)}
+							onClick={onSyncReleases}
+						>
+							Sync releases
+						</Button>
+						<Button
+							variant="outline"
+							disabled={Boolean(busy)}
+							onClick={onSyncInbox}
+						>
+							Sync inbox
+						</Button>
+					</div>
+				</div>
+			) : null}
+
+			<FeedList
+				items={feed.items}
+				error={feed.error}
+				loadingInitial={feed.loadingInitial}
+				loadingMore={feed.loadingMore}
+				hasMore={feed.hasMore}
+				inFlightKeys={inFlightKeys}
+				registerItemRef={register}
+				onLoadMore={feed.loadMore}
+				showOriginalByKey={showOriginalByKey}
+				onToggleOriginal={onToggleOriginal}
+				onTranslateNow={onTranslateNow}
+				reactionBusyKeys={reactionBusyKeys}
+				reactionErrorByKey={reactionErrorByKey}
+				onToggleReaction={onToggleReaction}
+				onSyncReleases={onSyncReleases}
+			/>
+		</>
+	);
 
 	useEffect(() => {
 		const params = new URLSearchParams(window.location.search);
@@ -641,233 +728,157 @@ export function Dashboard(props: { me: MeResponse }) {
 				<p className="text-destructive mb-4 text-sm">{bootError}</p>
 			) : null}
 
-			<div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-				<div className="flex flex-wrap items-center gap-2">
-					<Button
-						variant={tab === "all" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => onSelectTab("all")}
-					>
-						全部
-					</Button>
-					<Button
-						variant={tab === "releases" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => onSelectTab("releases")}
-					>
-						Releases
-					</Button>
-					<Button
-						variant={tab === "briefs" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => onSelectTab("briefs")}
-					>
-						日报
-					</Button>
-					<Button
-						variant={tab === "inbox" ? "default" : "outline"}
-						size="sm"
-						className="font-mono text-xs"
-						onClick={() => onSelectTab("inbox")}
-					>
-						Inbox
-					</Button>
+			<Tabs
+				value={tab}
+				onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
+				className="gap-6"
+			>
+				<div className="flex flex-wrap items-center justify-between gap-2">
+					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
+						<TabsTrigger value="all" className="font-mono text-xs">
+							全部
+						</TabsTrigger>
+						<TabsTrigger value="releases" className="font-mono text-xs">
+							Releases
+						</TabsTrigger>
+						<TabsTrigger value="briefs" className="font-mono text-xs">
+							日报
+						</TabsTrigger>
+						<TabsTrigger value="inbox" className="font-mono text-xs">
+							Inbox
+						</TabsTrigger>
+					</TabsList>
+
+					<div className="flex items-center gap-2">
+						{busy ? (
+							<span className="text-muted-foreground font-mono text-xs">
+								{busy}…
+							</span>
+						) : null}
+						{isAdmin ? (
+							<Button
+								asChild
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+							>
+								<a href="/admin">管理员面板</a>
+							</Button>
+						) : null}
+					</div>
 				</div>
 
-				<div className="flex items-center gap-2">
-					{busy ? (
-						<span className="text-muted-foreground font-mono text-xs">
-							{busy}…
-						</span>
-					) : null}
-					{isAdmin ? (
-						<Button
-							asChild
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-						>
-							<a href="/admin">管理员面板</a>
-						</Button>
-					) : null}
-				</div>
-			</div>
+				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+					<section className="min-w-0">
+						<TabsContent value="all" className="mt-0 min-w-0">
+							{feedPanel}
+						</TabsContent>
+						<TabsContent value="releases" className="mt-0 min-w-0">
+							{feedPanel}
+						</TabsContent>
+						<TabsContent value="briefs" className="mt-0 min-w-0">
+							<div className="space-y-6">
+								<ReleaseDailyCard
+									briefs={briefs}
+									selectedDate={selectedBriefDate}
+									busy={busy === "Generate brief"}
+									onGenerate={onGenerateBrief}
+									onOpenRelease={onOpenReleaseDetail}
+								/>
+								<ReleaseDetailCard
+									releaseId={activeReleaseId}
+									onClose={onCloseReleaseDetail}
+								/>
+							</div>
+						</TabsContent>
+						<TabsContent value="inbox" className="mt-0 min-w-0">
+							<InboxList notifications={notifications} />
+						</TabsContent>
+					</section>
 
-			<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
-				<section className="min-w-0">
-					{tab === "all" || tab === "releases" ? (
-						<>
-							{!feed.loadingInitial && feed.items.length === 0 ? (
-								<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-									<h2 className="text-base font-semibold tracking-tight">
-										还没有内容
-									</h2>
-									<p className="text-muted-foreground mt-1 text-sm">
-										先同步 starred，再同步 releases；右侧是 Inbox 快捷入口。
-										或者直接点 <span className="font-mono">Sync all</span>。
-									</p>
-									<div className="mt-4 flex flex-wrap gap-2">
-										<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-											Sync all
-										</Button>
-										<Button
-											variant="outline"
-											disabled={Boolean(busy)}
-											onClick={onSyncStarred}
-										>
-											Sync starred
-										</Button>
-										<Button
-											variant="outline"
-											disabled={Boolean(busy)}
-											onClick={onSyncReleases}
-										>
-											Sync releases
-										</Button>
-										<Button
-											variant="outline"
-											disabled={Boolean(busy)}
-											onClick={onSyncInbox}
-										>
-											Sync inbox
-										</Button>
-									</div>
-								</div>
-							) : null}
-
-							<FeedList
-								items={feed.items}
-								error={feed.error}
-								loadingInitial={feed.loadingInitial}
-								loadingMore={feed.loadingMore}
-								hasMore={feed.hasMore}
-								inFlightKeys={inFlightKeys}
-								registerItemRef={register}
-								onLoadMore={feed.loadMore}
-								showOriginalByKey={showOriginalByKey}
-								onToggleOriginal={onToggleOriginal}
-								onTranslateNow={onTranslateNow}
-								reactionBusyKeys={reactionBusyKeys}
-								reactionErrorByKey={reactionErrorByKey}
-								onToggleReaction={onToggleReaction}
-								onSyncReleases={onSyncReleases}
-							/>
-						</>
-					) : null}
-
-					{tab === "briefs" ? (
-						<div className="space-y-6">
-							<ReleaseDailyCard
+					<aside className="space-y-6">
+						{tab === "briefs" ? (
+							<BriefListCard
 								briefs={briefs}
 								selectedDate={selectedBriefDate}
-								busy={busy === "Generate brief"}
-								onGenerate={onGenerateBrief}
-								onOpenRelease={onOpenReleaseDetail}
+								onSelectDate={(d) => setSelectedBriefDate(d)}
 							/>
-							<ReleaseDetailCard
-								releaseId={activeReleaseId}
-								onClose={onCloseReleaseDetail}
-							/>
-						</div>
-					) : null}
+						) : null}
+						<InboxQuickList notifications={notifications} />
+					</aside>
+				</div>
+			</Tabs>
 
-					{tab === "inbox" ? <InboxList notifications={notifications} /> : null}
-				</section>
-
-				<aside className="space-y-6">
-					{tab === "briefs" ? (
-						<BriefListCard
-							briefs={briefs}
-							selectedDate={selectedBriefDate}
-							onSelectDate={(d) => setSelectedBriefDate(d)}
-						/>
-					) : null}
-					<InboxQuickList notifications={notifications} />
-				</aside>
-			</div>
-
-			{patDialogOpen ? (
-				<div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
-					<div className="bg-card w-full max-w-2xl rounded-xl border p-5 shadow-2xl">
-						<h2 className="text-lg font-semibold tracking-tight">
-							配置 GitHub PAT 以启用反馈表情
-						</h2>
-						<p className="text-muted-foreground mt-1 text-sm">
+			<Dialog open={patDialogOpen} onOpenChange={onPatDialogOpenChange}>
+				<DialogContent
+					showCloseButton={false}
+					className="max-w-2xl"
+					onInteractOutside={(event) => event.preventDefault()}
+				>
+					<DialogHeader>
+						<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+						<DialogDescription>
 							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="bg-muted/40 rounded-lg border p-3">
+						<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+						<p className="text-muted-foreground mt-1 font-mono text-xs">
+							Settings → Developer settings → Personal access tokens → Tokens
+							(classic)
 						</p>
-
-						<div className="bg-muted/40 mt-4 rounded-lg border p-3">
-							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-							<p className="text-muted-foreground mt-1 font-mono text-xs">
-								Settings → Developer settings → Personal access tokens → Tokens
-								(classic)
-							</p>
+						<p className="text-muted-foreground mt-2 text-xs">
+							最小权限：公共仓库用{" "}
+							<span className="font-mono">public_repo</span>； 私有仓库用{" "}
+							<span className="font-mono">repo</span>。
+						</p>
+						{reactionTokenMasked ? (
 							<p className="text-muted-foreground mt-2 text-xs">
-								最小权限：公共仓库用{" "}
-								<span className="font-mono">public_repo</span>
-								；私有仓库用 <span className="font-mono">repo</span>。
+								当前已保存：
+								<span className="font-mono">{reactionTokenMasked}</span>
 							</p>
-							{reactionTokenMasked ? (
-								<p className="text-muted-foreground mt-2 text-xs">
-									当前已保存：
-									<span className="font-mono">{reactionTokenMasked}</span>
-								</p>
-							) : null}
-						</div>
+						) : null}
+					</div>
 
-						<label
-							htmlFor="reaction-pat"
-							className="mt-4 block font-medium text-sm"
-						>
-							GitHub PAT
-						</label>
-						<input
+					<div className="space-y-2">
+						<Label htmlFor="reaction-pat">GitHub PAT</Label>
+						<Input
 							id="reaction-pat"
 							type="password"
 							value={patInput}
-							onChange={(e) => setPatInput(e.target.value)}
+							onChange={(event) => setPatInput(event.target.value)}
 							placeholder="粘贴 PAT 后将自动校验（800ms 防抖）"
-							className="bg-background mt-1 w-full rounded-md border px-3 py-2 font-mono text-sm outline-none"
+							className="font-mono text-sm"
 						/>
-
-						<p
-							className={
-								patCheckState === "valid"
-									? "mt-2 text-xs text-emerald-600"
-									: patCheckState === "invalid"
-										? "mt-2 text-xs text-red-600"
-										: "text-muted-foreground mt-2 text-xs"
-							}
-						>
-							{patCheckMessage ??
-								"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
-						</p>
-
-						<div className="mt-5 flex items-center justify-end gap-2">
-							<Button
-								variant="outline"
-								onClick={() => {
-									setPatDialogOpen(false);
-									setPatInput("");
-									setPatCheckState("idle");
-									setPatCheckMessage(null);
-								}}
-							>
-								稍后再说
-							</Button>
-							<Button
-								onClick={onSavePat}
-								disabled={patSaving || patCheckState !== "valid"}
-							>
-								{patSaving ? "保存中…" : "保存并继续"}
-							</Button>
-						</div>
 					</div>
-				</div>
-			) : null}
+
+					<p
+						className={
+							patCheckState === "valid"
+								? "text-xs text-emerald-600"
+								: patCheckState === "invalid"
+									? "text-xs text-red-600"
+									: "text-muted-foreground text-xs"
+						}
+					>
+						{patCheckMessage ??
+							"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
+					</p>
+
+					<DialogFooter>
+						<Button variant="outline" onClick={resetPatDialogState}>
+							稍后再说
+						</Button>
+						<Button
+							onClick={onSavePat}
+							disabled={patSaving || patCheckState !== "valid"}
+						>
+							{patSaving ? "保存中…" : "保存并继续"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</AppShell>
 	);
 }
