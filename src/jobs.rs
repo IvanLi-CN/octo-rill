@@ -1026,6 +1026,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         requested_by: task.requested_by,
         parent_task_id: Some(task.id.clone()),
         parent_task_type: Some(task.task_type.clone()),
+        parent_translation_batch_id: None,
     };
     let result = ai::with_llm_call_context(
         context,
