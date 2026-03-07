@@ -355,6 +355,49 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
+		case "sync.subscriptions": {
+			const diagnostics = detail.diagnostics?.sync_subscriptions ?? null;
+			const skipped = diagnostics?.skipped ?? readBoolean(result, "skipped");
+			const skipReason =
+				diagnostics?.skip_reason ?? readString(result, "skip_reason");
+			return {
+				pageTitle: "订阅同步详情页",
+				pageSummary:
+					"展示半小时全用户订阅同步的 Star -> Release 两阶段结果、关键事件与日志入口。",
+				fields: buildFields(
+					field(
+						"触发方式",
+						diagnostics?.trigger ?? readString(payload, "trigger"),
+					),
+					field(
+						"调度键",
+						diagnostics?.schedule_key ?? readString(payload, "schedule_key"),
+					),
+					field("本轮状态", skipped === true ? "已跳过" : "已执行"),
+					field("跳过原因", skipReason),
+					field(
+						"Star 成功/总计",
+						diagnostics
+							? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
+							: null,
+					),
+					field(
+						"Release 成功/总计",
+						diagnostics
+							? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
+							: null,
+					),
+					field(
+						"写入 Release 数",
+						diagnostics ? `${diagnostics.releases_written}` : null,
+					),
+					field(
+						"关键事件数",
+						diagnostics ? `${diagnostics.critical_events}` : null,
+					),
+				),
+			};
+		}
 		case "translate.release": {
 			const releaseId = readString(payload, "release_id");
 			const status = readString(result, "status");
@@ -503,6 +546,43 @@ function dailyUserStateLabel(state: string) {
 	}
 }
 
+function syncSubscriptionStageLabel(stage: string) {
+	switch (stage) {
+		case "scheduler":
+			return "调度";
+		case "star":
+			return "Star";
+		case "release":
+			return "Release";
+		default:
+			return stage;
+	}
+}
+
+function syncSubscriptionSeverityLabel(severity: string) {
+	switch (severity) {
+		case "error":
+			return "错误";
+		case "warning":
+			return "告警";
+		case "info":
+			return "信息";
+		default:
+			return severity;
+	}
+}
+
+function syncSubscriptionSeverityClass(severity: string) {
+	switch (severity) {
+		case "error":
+			return "border-red-500/35 bg-red-500/5 text-red-700 dark:text-red-200";
+		case "warning":
+			return "border-amber-500/35 bg-amber-500/5 text-amber-700 dark:text-amber-200";
+		default:
+			return "border-border bg-muted/30 text-foreground";
+	}
+}
+
 function llmCallStatusLabel(status: string) {
 	switch (status) {
 		case "queued":
@@ -536,6 +616,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 	const payload = parseJsonRecord(props.detail.task.payload_json);
 	const result = parseJsonRecord(props.detail.task.result_json);
 	const diagnostics = props.detail.diagnostics ?? null;
+	const syncDiagnostics = diagnostics?.sync_subscriptions ?? null;
 	const eventMeta = props.detail.event_meta ?? null;
 	const isEventsTruncated = eventMeta?.truncated === true;
 	const detailCardClass = "rounded-lg border p-3";
@@ -544,6 +625,8 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 		diagnostics?.translate_release_batch?.items?.find((item) => item.item_error)
 			?.item_error ??
 		diagnostics?.brief_daily_slot?.users?.find((item) => item.error)?.error ??
+		syncDiagnostics?.recent_events?.find((item) => item.severity === "error")
+			?.message ??
 		null;
 	const showRelatedLlmCalls = shouldShowRelatedLlmCalls(
 		props.detail.task.task_type,
@@ -641,6 +724,100 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 								) : null}
 								<p className="text-muted-foreground mt-1 text-[11px]">
 									最后事件：{item.last_event_at}
+								</p>
+							</div>
+						))}
+					</div>
+				</div>
+			) : null}
+			{syncDiagnostics ? (
+				<div className="grid gap-2 md:grid-cols-3">
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">Star 阶段摘要</p>
+						<p className="mt-1 text-sm font-semibold">
+							{syncDiagnostics.star.succeeded_users}/
+							{syncDiagnostics.star.total_users}
+							位用户成功
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							失败 {syncDiagnostics.star.failed_users} · 仓库快照{" "}
+							{syncDiagnostics.star.total_repos}
+						</p>
+					</div>
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">
+							Release 阶段摘要
+						</p>
+						<p className="mt-1 text-sm font-semibold">
+							{syncDiagnostics.release.succeeded_repos}/
+							{syncDiagnostics.release.total_repos}
+							个仓库成功
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							失败 {syncDiagnostics.release.failed_repos} · 候选失败{" "}
+							{syncDiagnostics.release.candidate_failures}
+						</p>
+					</div>
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">附加信息</p>
+						<p className="mt-1 text-sm font-semibold">
+							写入 {syncDiagnostics.releases_written} 条 Release
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							关键事件 {syncDiagnostics.critical_events} · 本轮
+							{syncDiagnostics.skipped ? "已跳过" : "已执行"}
+						</p>
+						{syncDiagnostics.log_available &&
+						syncDiagnostics.log_download_path ? (
+							<Button
+								asChild
+								className="mt-3 w-full"
+								size="sm"
+								variant="outline"
+							>
+								<a download href={syncDiagnostics.log_download_path}>
+									下载日志
+								</a>
+							</Button>
+						) : (
+							<p className="text-muted-foreground mt-3 text-xs">
+								暂无可下载日志。
+							</p>
+						)}
+					</div>
+				</div>
+			) : null}
+			{syncDiagnostics?.recent_events?.length ? (
+				<div className={detailCardClass}>
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<p className="text-muted-foreground text-[11px]">最近关键事件</p>
+						<p className="text-muted-foreground text-[11px]">
+							仅展示最近 {syncDiagnostics.recent_events.length} 条
+						</p>
+					</div>
+					<div className="mt-2 space-y-2">
+						{syncDiagnostics.recent_events.map((item) => (
+							<div
+								key={item.id}
+								className={`rounded-md border p-2 ${syncSubscriptionSeverityClass(item.severity)}`}
+							>
+								<div className="flex flex-wrap items-center justify-between gap-2">
+									<p className="text-xs font-medium">
+										{syncSubscriptionStageLabel(item.stage)} · {item.event_type}
+									</p>
+									<span className="text-[11px] font-medium">
+										{syncSubscriptionSeverityLabel(item.severity)}
+									</span>
+								</div>
+								{item.message ? (
+									<p className="mt-1 text-sm font-medium">{item.message}</p>
+								) : null}
+								<p className="text-muted-foreground mt-1 text-[11px]">
+									{item.created_at}
+									{item.user_id !== null ? ` · 用户 #${item.user_id}` : ""}
+									{item.repo_full_name ? ` · ${item.repo_full_name}` : ""}
+									{item.attempt > 0 ? ` · attempt ${item.attempt}` : ""}
+									{item.recoverable ? " · 可恢复" : ""}
 								</p>
 							</div>
 						))}

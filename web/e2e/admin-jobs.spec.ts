@@ -1,5 +1,33 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+type MockRequestRule = {
+	pathname: string;
+	search?: string;
+	afterCount?: number;
+	times?: number;
+};
+
+type MockDelayRule = MockRequestRule & {
+	delayMs: number;
+};
+
+type MockFailureRule = MockRequestRule & {
+	status?: number;
+	message?: string;
+};
+
+type AdminJobsMockOptions = {
+	responseDelayMs?: number;
+	delayedPaths?: string[];
+	delayRules?: MockDelayRule[];
+	failureRules?: MockFailureRule[];
+	emitStreamEvents?: boolean;
+};
+
+function sleep(ms: number) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -8,7 +36,10 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function installAdminJobsMocks(page: Page) {
+async function installAdminJobsMocks(
+	page: Page,
+	options: AdminJobsMockOptions = {},
+) {
 	const tasks = [
 		{
 			id: "task-failed-1",
@@ -51,6 +82,20 @@ async function installAdminJobsMocks(page: Page) {
 			started_at: "2026-02-26T01:10:02Z",
 			finished_at: "2026-02-26T01:10:40Z",
 			updated_at: "2026-02-26T01:10:40Z",
+		},
+		{
+			id: "task-subscriptions-1",
+			task_type: "sync.subscriptions",
+			status: "succeeded",
+			source: "scheduler",
+			requested_by: null,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-02-26T14:30:00Z",
+			started_at: "2026-02-26T14:30:04Z",
+			finished_at: "2026-02-26T14:38:10Z",
+			updated_at: "2026-02-26T14:38:10Z",
 		},
 	];
 
@@ -128,10 +173,89 @@ async function installAdminJobsMocks(page: Page) {
 		updated_at: "2026-02-26T00:00:00Z",
 	}));
 
+	const delayedPathSet = new Set(options.delayedPaths ?? []);
+	const requestCounts = new Map<string, number>();
+	const delayRuleCounts = new Map<number, number>();
+	const failureRuleCounts = new Map<number, number>();
+	const emitStreamEvents = options.emitStreamEvents ?? true;
+
+	function matchesRule(rule: MockRequestRule, url: URL) {
+		if (rule.pathname !== url.pathname) {
+			return false;
+		}
+		if (!rule.search) {
+			return true;
+		}
+		return url.search.includes(rule.search);
+	}
+
+	function ruleApplies(
+		rule: MockRequestRule,
+		url: URL,
+		ruleCounts: Map<number, number>,
+		index: number,
+	) {
+		if (!matchesRule(rule, url)) {
+			return false;
+		}
+		const nextCount = (ruleCounts.get(index) ?? 0) + 1;
+		ruleCounts.set(index, nextCount);
+		const afterCount = rule.afterCount ?? 0;
+		const times = rule.times ?? Number.POSITIVE_INFINITY;
+		return nextCount > afterCount && nextCount <= afterCount + times;
+	}
+
+	async function maybeDelay(url: URL) {
+		const pathname = url.pathname;
+		const nextCount = (requestCounts.get(pathname) ?? 0) + 1;
+		requestCounts.set(pathname, nextCount);
+		if (
+			options.responseDelayMs &&
+			options.responseDelayMs > 0 &&
+			delayedPathSet.has(pathname) &&
+			nextCount > 1
+		) {
+			await sleep(options.responseDelayMs);
+		}
+
+		for (const [index, rule] of (options.delayRules ?? []).entries()) {
+			if (ruleApplies(rule, url, delayRuleCounts, index)) {
+				await sleep(rule.delayMs);
+			}
+		}
+	}
+
+	function nextFailure(url: URL) {
+		for (const [index, rule] of (options.failureRules ?? []).entries()) {
+			if (ruleApplies(rule, url, failureRuleCounts, index)) {
+				return {
+					status: rule.status ?? 500,
+					message: rule.message ?? `mock failure for ${url.pathname}`,
+				};
+			}
+		}
+		return null;
+	}
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
 		const { pathname } = url;
+
+		await maybeDelay(url);
+
+		const failure = nextFailure(url);
+		if (failure) {
+			return json(
+				route,
+				{
+					error: {
+						message: failure.message,
+					},
+				},
+				failure.status,
+			);
+		}
 
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
@@ -162,10 +286,21 @@ async function installAdminJobsMocks(page: Page) {
 			const status = url.searchParams.get("status") ?? "all";
 			const taskType = url.searchParams.get("task_type") ?? "";
 			const excludeTaskType = url.searchParams.get("exclude_task_type") ?? "";
+			const taskGroup = url.searchParams.get("task_group") ?? "all";
 			const filtered = tasks.filter((task) => {
 				if (status !== "all" && task.status !== status) return false;
 				if (taskType && task.task_type !== taskType) return false;
 				if (excludeTaskType && task.task_type === excludeTaskType) return false;
+				if (taskGroup === "scheduled") {
+					return ["brief.daily_slot", "sync.subscriptions"].includes(
+						task.task_type,
+					);
+				}
+				if (taskGroup === "realtime") {
+					return !["brief.daily_slot", "sync.subscriptions"].includes(
+						task.task_type,
+					);
+				}
 				return true;
 			});
 			return json(route, {
@@ -177,6 +312,14 @@ async function installAdminJobsMocks(page: Page) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/events") {
+			if (!emitStreamEvents) {
+				return route.fulfill({
+					status: 200,
+					contentType: "text/event-stream",
+					body: "",
+				});
+			}
+
 			const call = llmCalls.find((item) => item.id === "llm-call-2");
 			if (call && call.status === "running") {
 				call.status = "succeeded";
@@ -227,7 +370,20 @@ async function installAdminJobsMocks(page: Page) {
 
 		if (
 			req.method() === "GET" &&
-			pathname.startsWith("/api/admin/jobs/realtime/")
+			pathname.startsWith("/api/admin/jobs/realtime/") &&
+			pathname.endsWith("/log")
+		) {
+			return route.fulfill({
+				status: 200,
+				contentType: "application/x-ndjson",
+				body: '{"line":1}\n{"line":2}\n',
+			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/admin/jobs/realtime/") &&
+			!pathname.endsWith("/log")
 		) {
 			const taskId = pathname.split("/").at(-1) ?? "";
 			const task = tasks.find((item) => item.id === taskId);
@@ -318,6 +474,128 @@ async function installAdminJobsMocks(page: Page) {
 								status: "succeeded",
 							}),
 							created_at: "2026-02-26T01:10:40Z",
+						},
+					],
+				});
+			}
+
+			if (taskId === "task-subscriptions-1") {
+				return json(route, {
+					task: {
+						...task,
+						payload_json: JSON.stringify({
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:30",
+						}),
+						result_json: JSON.stringify({
+							skipped: false,
+							skip_reason: null,
+							star: {
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+								total_repos: 340,
+							},
+							release: {
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								candidate_failures: 7,
+							},
+							releases_written: 1840,
+							critical_events: 6,
+						}),
+					},
+					event_meta: {
+						returned: 4,
+						total: 4,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: {
+						business_outcome: {
+							code: "partial",
+							label: "部分成功",
+							message: "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+						},
+						sync_subscriptions: {
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:30",
+							skipped: false,
+							skip_reason: null,
+							log_available: true,
+							log_download_path:
+								"/api/admin/jobs/realtime/task-subscriptions-1/log",
+							star: {
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+								total_repos: 340,
+							},
+							release: {
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								candidate_failures: 7,
+							},
+							releases_written: 1840,
+							critical_events: 6,
+							recent_events: [
+								{
+									id: 42,
+									stage: "release",
+									event_type: "repo_inaccessible",
+									severity: "error",
+									recoverable: false,
+									attempt: 1,
+									user_id: 23,
+									repo_id: 9001,
+									repo_full_name: "octo/private-repo",
+									message:
+										"release sync candidate failed for octo/private-repo with user #23",
+									created_at: "2026-02-26T14:31:40Z",
+								},
+							],
+						},
+					},
+					events: [
+						{
+							id: 31,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "collect",
+								total_users: 12,
+							}),
+							created_at: "2026-02-26T14:30:05Z",
+						},
+						{
+							id: 32,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "star_summary",
+								total_users: 12,
+								succeeded_users: 11,
+								failed_users: 1,
+							}),
+							created_at: "2026-02-26T14:31:02Z",
+						},
+						{
+							id: 33,
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "release_summary",
+								total_repos: 128,
+								succeeded_repos: 123,
+								failed_repos: 5,
+								releases_written: 1840,
+							}),
+							created_at: "2026-02-26T14:37:59Z",
+						},
+						{
+							id: 34,
+							event_type: "task.completed",
+							payload_json: JSON.stringify({ status: "succeeded" }),
+							created_at: "2026-02-26T14:38:10Z",
 						},
 					],
 				});
@@ -481,22 +759,40 @@ test("admin can manage jobs center", async ({ page }) => {
 	await installAdminJobsMocks(page);
 	await page.goto("/admin/jobs");
 
+	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
+	const scheduledTab = page.getByRole("tab", { name: "定时任务" });
+	const llmTab = page.getByRole("tab", { name: "LLM调度" });
+
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
 	await expect(page.getByRole("heading", { name: "任务总览" })).toBeVisible();
+	await expect(realtimeTab).toHaveAttribute("aria-selected", "true");
+	await expect(
+		page.getByRole("combobox", { name: "实时异步任务状态筛选" }),
+	).toBeVisible();
+
+	const realtimeHelp = page.getByRole("button", { name: "实时异步任务说明" });
+	await realtimeHelp.hover();
+	await expect(page.getByRole("tooltip")).toContainText(
+		"监控系统内部任务，并支持重试与取消。",
+	);
 
 	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(page.getByText("brief.daily_slot")).toHaveCount(0);
+	await expect(page.getByText("sync.subscriptions")).toHaveCount(0);
 	await page.getByRole("button", { name: "详情" }).first().click();
+	const taskSheet = page.getByRole("dialog", { name: "任务详情" });
+	await expect(taskSheet).toBeVisible();
 	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
-	await expect(page.getByRole("heading", { name: "任务详情" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
 	const translateTaskCard = page
 		.getByText("ID: task-translate-batch-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
 	await translateTaskCard.getByRole("button", { name: "详情" }).click();
+	await expect(taskSheet).toBeVisible();
 	await expect(
 		page.getByText("task-translate-batch-1", { exact: true }),
 	).toBeVisible();
@@ -507,15 +803,15 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByText("Release #290978079 · error · translation failed"),
 	).toBeVisible();
-	await expect(
-		page.getByRole("button", { name: "查看 LLM 详情" }),
-	).toBeVisible();
-	const llmDetailButton = page.getByRole("button", { name: "查看 LLM 详情" });
-	await llmDetailButton.scrollIntoViewIfNeeded();
-	await llmDetailButton.evaluate((node: HTMLElement) => node.click());
-	await expect(
-		page.getByRole("heading", { name: "任务详情 · LLM 调用详情" }),
-	).toBeVisible();
+	const taskLlmDetailButton = page.getByRole("button", {
+		name: "查看 LLM 详情",
+	});
+	await taskLlmDetailButton.scrollIntoViewIfNeeded();
+	await taskLlmDetailButton.click();
+	const taskLlmSheet = page.getByRole("dialog", {
+		name: "任务详情 · LLM 调用详情",
+	});
+	await expect(taskLlmSheet).toBeVisible();
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/tasks\/task-translate-batch-1\/llm\/llm-call-2$/,
 	);
@@ -523,23 +819,60 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByText("来源：api.translate_releases_batch"),
 	).toBeVisible();
 	await page.getByRole("button", { name: "返回任务详情" }).click();
+	await expect(taskSheet).toBeVisible();
 	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-translate-batch-1$/);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
-	await page.getByRole("button", { name: "定时任务" }).click();
+	await scheduledTab.click();
+	await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
+	await expect(
+		page.getByRole("combobox", { name: "定时任务状态筛选" }),
+	).toBeVisible();
 	await expect(page.getByText("运行记录")).toBeVisible();
-	await expect(page.getByText("定时执行任务")).toBeVisible();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("订阅同步")).toBeVisible();
+	await expect(page.getByText("sync.subscriptions")).toBeVisible();
+	await expect(
+		page.getByText("brief.daily_slot", { exact: true }),
+	).toBeVisible();
+	const subscriptionTaskCard = page
+		.getByText("ID: task-subscriptions-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
+	await expect(
+		page.getByText("task-subscriptions-1", { exact: true }),
+	).toBeVisible();
+	await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
+	await expect(page.getByRole("link", { name: "下载日志" })).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 
-	await page.getByRole("button", { name: "LLM调度" }).click();
+	await llmTab.click();
+	await expect(llmTab).toHaveAttribute("aria-selected", "true");
 	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	await expect(page.getByText("Token 输入/输出/缓存").first()).toBeVisible();
-	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(
-		page.getByRole("heading", { name: "LLM 调用详情" }),
+		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
 	).toBeVisible();
+	await expect(
+		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
+	).toBeVisible();
+	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await page
+		.getByRole("textbox", { name: "LLM 调用来源筛选" })
+		.fill("job.api.translate_release");
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+
+	const llmCallCard = page
+		.getByText("ID: llm-call-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await llmCallCard.getByRole("button", { name: "详情" }).click();
+	const llmSheet = page.getByRole("dialog", { name: "LLM 调用详情" });
+	await expect(llmSheet).toBeVisible();
 	await expect(page.getByText("Conversation Timeline")).toBeVisible();
 	await expect(page.getByText("Input Messages")).toHaveCount(0);
 	await expect(page.getByText("耗时 / 重试")).toBeVisible();
@@ -549,4 +882,198 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(llmSheet).toHaveCount(0);
+});
+
+test("admin keeps llm calls visible during sse refresh", async ({ page }) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/llm/calls"],
+		emitStreamEvents: true,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+});
+
+test("admin keeps newest llm filter results after overlapping refreshes", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 2,
+				times: 2,
+				delayMs: 1200,
+			},
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=failed",
+				times: 1,
+				delayMs: 300,
+			},
+		],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
+
+	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(refreshButton).toBeEnabled();
+
+	await page.waitForTimeout(1300);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
+});
+
+test("admin keeps blocking loader before first realtime load completes", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "exclude_task_type=brief.daily_slot",
+				times: 1,
+				delayMs: 1200,
+			},
+		],
+		failureRules: [
+			{
+				pathname: "/api/admin/jobs/realtime",
+				search: "exclude_task_type=brief.daily_slot",
+				afterCount: 1,
+				times: 1,
+				message: "ignored background refresh failure",
+			},
+		],
+		emitStreamEvents: true,
+	});
+	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
+
+	await expect(page.getByText("正在加载任务...")).toBeVisible();
+	await expect(page.getByText(/^SSE (已连接|重连中\.\.\.)$/)).toBeVisible();
+	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
+	await expect(page.getByText("暂无任务。")).toHaveCount(0);
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(
+		page.getByText("ignored background refresh failure"),
+	).toHaveCount(0);
+});
+
+test("admin ignores stale llm refresh errors after filter change", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 1,
+				times: 1,
+				delayMs: 600,
+			},
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=failed",
+				times: 1,
+				delayMs: 300,
+			},
+		],
+		failureRules: [
+			{
+				pathname: "/api/admin/jobs/llm/calls",
+				search: "status=all",
+				afterCount: 1,
+				times: 1,
+				message: "stale llm refresh failed",
+			},
+		],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
+	await page.getByRole("option", { name: "状态：失败" }).click();
+
+	await expect(page.getByText("正在加载调用记录...")).toBeVisible();
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
+
+	await page.waitForTimeout(700);
+	await expect(page.getByText("job.api.translate_release")).toBeVisible();
+	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
+});
+
+test("admin refresh keeps scheduled runs visible", async ({ page }) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/realtime"],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await page.getByRole("tab", { name: "定时任务" }).click();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("定时日报")).toBeVisible();
+	await expect(page.getByText("运行记录更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载运行记录...")).toHaveCount(0);
+	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("运行记录更新中...")).toHaveCount(0);
+});
+
+test("admin refresh keeps existing jobs and llm calls visible", async ({
+	page,
+}) => {
+	test.slow();
+	await installAdminJobsMocks(page, {
+		responseDelayMs: 1200,
+		delayedPaths: ["/api/admin/jobs/realtime", "/api/admin/jobs/llm/calls"],
+		emitStreamEvents: false,
+	});
+	await page.goto("/admin/jobs");
+
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	const refreshButton = page.getByRole("button", { name: "刷新" });
+	await refreshButton.click();
+
+	await expect(refreshButton).toBeDisabled();
+	await expect(page.getByText("sync.releases")).toBeVisible();
+	await expect(page.getByText("任务列表更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
+
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
+	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
+
+	await expect(refreshButton).toBeEnabled();
+	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
+	await expect(page.getByText("LLM 调度更新中...")).toHaveCount(0);
 });

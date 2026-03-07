@@ -106,6 +106,173 @@ export const SyncAll: Story = {
 	},
 };
 
+export const SyncSubscriptions: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.subscriptions",
+			{ trigger: "schedule", schedule_key: "2026-03-06T14:30" },
+			{
+				skipped: false,
+				skip_reason: null,
+				star: {
+					total_users: 12,
+					succeeded_users: 11,
+					failed_users: 1,
+					total_repos: 340,
+				},
+				release: {
+					total_repos: 128,
+					succeeded_repos: 123,
+					failed_repos: 5,
+					candidate_failures: 7,
+				},
+				releases_written: 1840,
+				critical_events: 6,
+			},
+			[
+				{ stage: "collect", total_users: 12 },
+				{
+					stage: "star_summary",
+					total_users: 12,
+					succeeded_users: 11,
+					failed_users: 1,
+				},
+				{ stage: "repo_collect", total_repos: 128 },
+				{
+					stage: "release_summary",
+					total_repos: 128,
+					succeeded_repos: 123,
+					failed_repos: 5,
+					releases_written: 1840,
+				},
+			],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "partial",
+						label: "部分成功",
+						message: "任务已完成，但存在失败或关键告警，请查看最近关键事件。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-03-06T14:30",
+						skipped: false,
+						skip_reason: null,
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-sync.subscriptions/log",
+						star: {
+							total_users: 12,
+							succeeded_users: 11,
+							failed_users: 1,
+							total_repos: 340,
+						},
+						release: {
+							total_repos: 128,
+							succeeded_repos: 123,
+							failed_repos: 5,
+							candidate_failures: 7,
+						},
+						releases_written: 1840,
+						critical_events: 6,
+						recent_events: [
+							{
+								id: 9,
+								stage: "release",
+								event_type: "repo_inaccessible",
+								severity: "error",
+								recoverable: false,
+								attempt: 1,
+								user_id: 23,
+								repo_id: 9001,
+								repo_full_name: "octo/private-repo",
+								message:
+									"release sync candidate failed for octo/private-repo with user #23",
+								created_at: "2026-03-06T14:31:40Z",
+							},
+							{
+								id: 8,
+								stage: "release",
+								event_type: "rate_limited",
+								severity: "warning",
+								recoverable: true,
+								attempt: 2,
+								user_id: 19,
+								repo_id: 8128,
+								repo_full_name: "octo/public-repo",
+								message:
+									"retryable release sync error for octo/public-repo with user #19",
+								created_at: "2026-03-06T14:31:10Z",
+							},
+						],
+					},
+				},
+			},
+		),
+	},
+};
+
+export const SyncSubscriptionsSkipped: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.subscriptions",
+			{ trigger: "schedule", schedule_key: "2026-03-06T15:00" },
+			{
+				skipped: true,
+				skip_reason: "previous_run_active",
+				star: {
+					total_users: 0,
+					succeeded_users: 0,
+					failed_users: 0,
+					total_repos: 0,
+				},
+				release: {
+					total_repos: 0,
+					succeeded_repos: 0,
+					failed_repos: 0,
+					candidate_failures: 0,
+				},
+				releases_written: 0,
+				critical_events: 0,
+			},
+			[{ stage: "skipped", skip_reason: "previous_run_active" }],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "disabled",
+						label: "已跳过",
+						message: "上一轮订阅同步仍在执行，本轮仅记录跳过结果。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-03-06T15:00",
+						skipped: true,
+						skip_reason: "previous_run_active",
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-sync.subscriptions/log",
+						star: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							total_repos: 0,
+						},
+						release: {
+							total_repos: 0,
+							succeeded_repos: 0,
+							failed_repos: 0,
+							candidate_failures: 0,
+						},
+						releases_written: 0,
+						critical_events: 0,
+						recent_events: [],
+					},
+				},
+			},
+		),
+	},
+};
+
 export const BriefGenerate: Story = {
 	args: {
 		detail: buildDetail(
