@@ -6,10 +6,7 @@ description: 跳转到 OctoRill Storybook 静态站。
 import { useEffect } from "react";
 
 export default function StorybookRedirect() {
-  const storybookHref =
-    typeof window === "undefined"
-      ? "./storybook/"
-      : "./storybook/";
+  const storybookHref = "./storybook/";
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -19,9 +16,17 @@ export default function StorybookRedirect() {
   return (
     <>
       <h1>正在跳转到 Storybook...</h1>
+      <p>如果没有自动跳转，请点击下面的按钮手动进入 OctoRill Storybook。</p>
       <p>
-        如果没有自动跳转，请手动打开
-        <a href={storybookHref}> OctoRill Storybook</a>。
+        <button
+          type="button"
+          onClick={() => {
+            if (typeof window === "undefined") return;
+            window.location.assign(storybookHref);
+          }}
+        >
+          打开 OctoRill Storybook
+        </button>
       </p>
     </>
   );
