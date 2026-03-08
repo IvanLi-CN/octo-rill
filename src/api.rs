@@ -1638,7 +1638,7 @@ pub async fn admin_get_realtime_task_detail(
         SELECT id, event_type, payload_json, created_at
         FROM job_task_events
         WHERE task_id = ?
-        ORDER BY id DESC
+        ORDER BY rowid DESC
         LIMIT ?
         "#,
     )
@@ -1674,7 +1674,7 @@ pub async fn admin_get_realtime_task_detail(
               created_at
             FROM sync_subscription_events
             WHERE task_id = ?
-            ORDER BY id DESC
+            ORDER BY rowid DESC
             LIMIT ?
             "#,
         )
@@ -7193,15 +7193,17 @@ pub(crate) async fn require_admin_user_id(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem,
-        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
-        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
-        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_list_llm_calls,
-        admin_list_users, admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
-        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
-        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, looks_like_json_blob, map_job_action_error, markdown_structure_preserved,
-        normalize_translation_fields, parse_batch_notification_translation_payload,
+        ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallsQuery,
+        AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
+        TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
+        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
+        admin_list_llm_calls, admin_list_users, admin_patch_user, admin_users_offset,
+        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
+        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
+        guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, normalize_translation_fields,
+        parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
@@ -8437,6 +8439,243 @@ mod tests {
 
         fs::remove_file(&log_path).ok();
         fs::remove_dir_all(&log_dir).ok();
+    }
+
+    fn fixed_local_id(prefix: char, n: usize) -> String {
+        const ALPHABET: &[u8] = crate::local_id::LOCAL_ID_ALPHABET;
+        let mut value = n;
+        let mut suffix = ['2'; 15];
+        for idx in (0..15).rev() {
+            suffix[idx] = ALPHABET[value % ALPHABET.len()] as char;
+            value /= ALPHABET.len();
+        }
+        let mut id = String::with_capacity(16);
+        id.push(prefix);
+        for ch in suffix {
+            id.push(ch);
+        }
+        id
+    }
+
+    fn indexed_created_at(idx: usize) -> String {
+        let hours = 14 + (idx / 3600);
+        let minutes = (idx / 60) % 60;
+        let seconds = idx % 60;
+        format!("2026-03-06T{hours:02}:{minutes:02}:{seconds:02}Z")
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_uses_latest_task_events_window() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-events-window");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind(r#"{"user_id":"scope22222222222","release_ids":[1]}"#)
+        .bind(r#"{"total":1,"ready":1,"missing":0,"disabled":0,"error":0}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for idx in 0..ADMIN_TASK_DETAIL_EVENT_LIMIT {
+            let created_at = indexed_created_at(idx as usize);
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('z', idx as usize).as_str())
+            .bind(task_id.as_str())
+            .bind(format!(
+                r#"{{"stage":"release","release_id":"{idx}","item_status":"ready"}}"#
+            ))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert early event");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("2222222222222222")
+        .bind(task_id.as_str())
+        .bind(r#"{"stage":"release","release_id":"latest","item_status":"ready"}"#)
+        .bind("2026-03-06T14:31:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert latest event");
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id.clone()))
+            .await
+            .expect("task detail")
+            .0;
+
+        assert_eq!(response.event_meta.returned, ADMIN_TASK_DETAIL_EVENT_LIMIT);
+        assert!(response.event_meta.truncated);
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|event| event.payload_json.contains("latest"))
+        );
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let translate = diagnostics
+            .translate_release_batch
+            .expect("translate diagnostics");
+        assert!(
+            translate
+                .items
+                .iter()
+                .any(|item| item.release_id == "latest")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_uses_latest_subscription_events_window() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-subscription-window");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
+        .bind(r#"{"skipped":false,"star":{"total_users":1,"succeeded_users":1,"failed_users":0,"total_repos":1},"release":{"total_repos":1,"succeeded_repos":1,"failed_repos":0,"candidate_failures":0},"releases_written":1,"critical_events":1}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for idx in 0..ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT {
+            let created_at = indexed_created_at(idx as usize);
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('z', idx as usize).as_str())
+            .bind(task_id.as_str())
+            .bind(format!("event-{idx}"))
+            .bind(test_user_id(2))
+            .bind(9000_i64 + idx)
+            .bind(format!("octo/repo-{idx}"))
+            .bind(format!(r#"{{"message":"event-{idx}"}}"#))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert early subscription event");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, 'release', 'latest-event', 'error', 0, 0, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("2222222222222222")
+        .bind(task_id.as_str())
+        .bind(test_user_id(2))
+        .bind(9999_i64)
+        .bind("octo/latest")
+        .bind(r#"{"message":"latest-event"}"#)
+        .bind("2026-03-06T14:31:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert latest subscription event");
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let sync = diagnostics.sync_subscriptions.expect("sync diagnostics");
+        assert_eq!(
+            sync.recent_events.len(),
+            ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+        );
+        assert!(
+            sync.recent_events
+                .iter()
+                .any(|event| event.event_type == "latest-event")
+        );
     }
 
     #[tokio::test]
