@@ -2,6 +2,7 @@ import { Sparkles } from "lucide-react";
 
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
+import { formatIsoRangeLocal } from "@/lib/datetime";
 import {
 	Card,
 	CardContent,
@@ -19,8 +20,7 @@ export type BriefItem = {
 };
 
 function formatWindow(brief: BriefItem) {
-	if (!brief.window_start || !brief.window_end) return null;
-	return `${brief.window_start} → ${brief.window_end}`;
+	return formatIsoRangeLocal(brief.window_start, brief.window_end);
 }
 
 export function ReleaseDailyCard(props: {

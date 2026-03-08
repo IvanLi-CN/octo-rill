@@ -1,5 +1,6 @@
 import type { AdminLlmCallItem, AdminRealtimeTaskDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
+import { formatIsoShortLocal } from "@/lib/datetime";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -825,7 +826,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 									<p className="mt-1 text-sm font-medium">{item.message}</p>
 								) : null}
 								<p className="text-muted-foreground mt-1 text-[11px]">
-									{item.created_at}
+									{formatIsoShortLocal(item.created_at)}
 									{item.user_id !== null ? ` · 用户 #${item.user_id}` : ""}
 									{item.repo_full_name ? ` · ${item.repo_full_name}` : ""}
 									{item.attempt > 0 ? ` · attempt ${item.attempt}` : ""}

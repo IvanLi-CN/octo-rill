@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-03-06
-- Last: 2026-03-07
+- Last: 2026-03-08
 
 ## 背景 / 问题陈述
 
@@ -85,6 +85,10 @@ None
 - Given Dashboard 首页
   When 用户切换顶部内容页签
   Then 页面使用可访问 `Tabs` 语义，并保持原有 URL 同步与内容切换行为。
+
+- Given Dashboard 首页中的 release / brief / inbox 时间戳，以及日报卡片标题/Markdown 正文里的 RFC3339 时间
+  When 页面渲染这些 RFC3339 时间
+  Then 统一按浏览器当前时区显示本地 `YYYY-MM-DD HH:mm:ss`，不再直接去掉 `Z` 后原样展示，也不再把日报正文里的原始 UTC 字符串直接泄漏给用户。
 
 - Given Dashboard PAT 配置弹窗
   When 用户输入、校验、保存或取消
@@ -174,6 +178,9 @@ None
 - 2026-03-06: 已补齐官方 shadcn primitives，完成 Dashboard / Admin Users / Admin Jobs 的页面级收敛，并更新 stories / e2e。
 - 2026-03-06: 已生成 Dashboard、Admin Users、Admin Jobs 的 Storybook 视觉证据并完成 `bun run lint`、`bun run build`、`bun run storybook:build`、`bun run e2e`。
 - 2026-03-07: 完成 rebase 收口、修复 Storybook autodocs 自动弹层与 Admin Jobs LLM detail 刷新串位问题，PR #25 全部 checks 转绿且无阻塞 review。
+- 2026-03-08: 修复 Dashboard 前台 release / brief / inbox 列表与 release detail 中 RFC3339 UTC 时间被当成本地时间直出的回归，统一改为浏览器当前时区格式化并补充 Playwright 覆盖。
+- 2026-03-08: 继续收敛 brief 卡片标题与 Markdown 正文中的 RFC3339 时间，统一在浏览器渲染期做本地化，避免历史 UTC 字符串在日报正文中继续直出。
+- 2026-03-08: 对齐 dashboard / sidebar 相关 Playwright 断言与合并门禁证据，保持浏览器时区回归覆盖稳定。
 
 ## 参考（References）
 

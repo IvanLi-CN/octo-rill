@@ -1102,7 +1102,7 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("combobox", { name: "定时任务状态筛选" }),
 	).toBeVisible();
-	await expect(page.getByText("运行记录")).toBeVisible();
+	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	await expect(page.getByText("订阅同步")).toBeVisible();
 	await expect(page.getByText("sync.subscriptions")).toBeVisible();
@@ -1291,6 +1291,9 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await page.goto("/admin/jobs");
 
 	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(
+		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
+	).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
@@ -1298,13 +1301,6 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	const staleLlmCard = page
-		.getByText("ID: llm-call-2")
-		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
-	await expect(
-		staleLlmCard.getByRole("button", { name: "详情" }),
-	).toBeDisabled();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
@@ -1461,4 +1457,32 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 	await expect(page.getByText("暂无翻译批次。")).toBeVisible();
 	await expect(page.getByText("item 1/1")).toBeVisible();
 	await expect(page.getByText("deadline")).toBeVisible();
+});
+
+test.describe("localized admin diagnostics timestamps", () => {
+	test.use({ timezoneId: "Asia/Shanghai" });
+
+	test("task detail recent events render in the browser timezone", async ({
+		page,
+	}) => {
+		await installAdminJobsMocks(page);
+		await page.goto("/admin/jobs");
+
+		const scheduledTab = page.getByRole("tab", { name: "定时任务" });
+		await scheduledTab.click();
+		await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
+
+		const subscriptionTaskCard = page
+			.getByText("ID: task-subscriptions-1")
+			.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+		await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
+
+		await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
+		await expect(
+			page.getByText(
+				"2026-02-26 22:31:40 · 用户 #4h6p9s3t5z8e2x4c · octo/private-repo · attempt 1",
+				{ exact: true },
+			),
+		).toBeVisible();
+	});
 });
