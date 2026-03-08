@@ -8,16 +8,9 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
-
-function formatIsoShort(iso: string) {
-	// "2026-02-21T08:00:00Z" -> "2026-02-21 08:00:00"
-	// "2026-02-21T08:00:00.123Z" -> "2026-02-21 08:00:00"
-	const noZ = iso.replace("Z", "");
-	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
-	return noFrac.replace("T", " ");
-}
 
 export function BriefListCard(props: {
 	briefs: BriefItem[];
@@ -67,7 +60,7 @@ export function BriefListCard(props: {
 										#{b.date}
 									</span>
 									<span className="text-muted-foreground truncate text-[11px]">
-										{formatIsoShort(b.created_at)}
+										{formatIsoShortLocal(b.created_at)}
 									</span>
 								</Button>
 							);

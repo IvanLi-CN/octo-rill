@@ -1,6 +1,7 @@
 import { ArrowUpRight, Inbox } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { formatIsoShortLocal } from "@/lib/datetime";
 import {
 	Card,
 	CardContent,
@@ -19,13 +20,6 @@ export type NotificationItem = {
 	unread: number;
 	html_url: string | null;
 };
-
-function formatIsoShort(iso: string | null) {
-	if (!iso) return "";
-	const noZ = iso.replace("Z", "");
-	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
-	return noFrac.replace("T", " ");
-}
 
 function threadUrl(threadId: string) {
 	return `https://github.com/notifications/thread/${threadId}`;
@@ -97,7 +91,9 @@ export function InboxQuickList(props: { notifications: NotificationItem[] }) {
 										<div className="text-muted-foreground mt-1 font-mono text-[11px]">
 											{n.reason ? n.reason : "update"}
 											{n.subject_type ? ` · ${n.subject_type}` : ""}
-											{n.updated_at ? ` · ${formatIsoShort(n.updated_at)}` : ""}
+											{n.updated_at
+												? ` · ${formatIsoShortLocal(n.updated_at)}`
+												: ""}
 										</div>
 									</div>
 								</div>

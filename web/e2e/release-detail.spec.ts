@@ -5,6 +5,13 @@ type ApiOptions = {
 	detailTitle: string;
 	translatedTitle: string;
 	translatedSummary: string;
+	feedTimestamp: string;
+	detailPublishedAt: string;
+	briefDate: string;
+	briefWindowStart: string;
+	briefWindowEnd: string;
+	briefMarkdown: string;
+	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
 };
@@ -23,6 +30,13 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		detailTitle: "Release 123",
 		translatedTitle: "发布说明 123",
 		translatedSummary: "这是 release 123 的中文详情摘要。",
+		feedTimestamp: "2026-02-22T11:22:33Z",
+		detailPublishedAt: "2026-02-22T11:22:33Z",
+		briefDate: "2026-02-23",
+		briefWindowStart: "2026-02-22T00:00:00Z",
+		briefWindowEnd: "2026-02-23T00:00:00Z",
+		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
+		briefCreatedAt: "2026-02-23T08:00:00Z",
 		...options,
 	};
 
@@ -66,7 +80,7 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 					? [
 							{
 								kind: "release",
-								ts: "2026-02-22T11:22:33Z",
+								ts: cfg.feedTimestamp,
 								id: cfg.releaseId,
 								repo_full_name: "owner/repo",
 								title: cfg.detailTitle,
@@ -111,11 +125,11 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		if (req.method() === "GET" && pathname === "/api/briefs") {
 			return json(route, [
 				{
-					date: "2026-02-23",
-					window_start: "2026-02-22T00:00:00Z",
-					window_end: "2026-02-23T00:00:00Z",
-					content_markdown: `[repo/v1.2.3](/?tab=briefs&release=${cfg.releaseId})`,
-					created_at: "2026-02-23T08:00:00Z",
+					date: cfg.briefDate,
+					window_start: cfg.briefWindowStart,
+					window_end: cfg.briefWindowEnd,
+					content_markdown: cfg.briefMarkdown,
+					created_at: cfg.briefCreatedAt,
 				},
 			]);
 		}
@@ -143,7 +157,7 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 				name: cfg.detailTitle,
 				body: "- fix A\n- fix B",
 				html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
-				published_at: "2026-02-22T11:22:33Z",
+				published_at: cfg.detailPublishedAt,
 				is_prerelease: 0,
 				is_draft: 0,
 				translated: {
@@ -358,4 +372,95 @@ test("feed auto translate resolves from stream request", async ({ page }) => {
 	await expect(
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
+});
+
+test.describe("localized timestamps", () => {
+	test.describe("non-DST browser timezone", () => {
+		test.use({ timezoneId: "Asia/Shanghai" });
+
+		test("release feed cards render timestamps in the browser timezone", async ({
+			page,
+		}) => {
+			await installApiMocks(page, { withReactionFeed: true });
+
+			await page.goto("/?tab=releases");
+			await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+				"aria-selected",
+				"true",
+			);
+			await expect(
+				page.getByText("2026-02-22 19:22:33", { exact: true }),
+			).toBeVisible();
+		});
+
+		test("release detail cards render published_at in the browser timezone", async ({
+			page,
+		}) => {
+			await installApiMocks(page);
+
+			await page.goto("/?tab=briefs&release=123");
+			await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+			await expect(
+				page.getByText("#123 · 2026-02-22 19:22:33", { exact: true }),
+			).toBeVisible();
+		});
+
+		test("brief windows and markdown timestamps stay correct in a non-DST timezone", async ({
+			page,
+		}) => {
+			await installApiMocks(page, {
+				briefDate: "2026-07-23",
+				briefWindowStart: "2026-07-22T00:00:00Z",
+				briefWindowEnd: "2026-07-23T00:00:00Z",
+				briefMarkdown:
+					"## 概览\n\n- 时间窗口：2026-07-22T00:00:00Z → 2026-07-23T00:00:00Z\n\n## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)",
+				briefCreatedAt: "2026-07-23T08:00:00Z",
+			});
+
+			await page.goto("/?tab=briefs&release=123");
+			await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+			const briefPanel = page.getByRole("tabpanel", { name: "日报" });
+			await expect(
+				page.getByText(
+					"#2026-07-23 · 2026-07-22 08:00:00 → 2026-07-23 08:00:00",
+					{
+						exact: true,
+					},
+				),
+			).toBeVisible();
+			await expect(briefPanel).toContainText("2026-07-22 19:22:33");
+			await expect(briefPanel).not.toContainText("2026-07-22T11:22:33Z");
+		});
+	});
+
+	test.describe("DST browser timezone", () => {
+		test.use({ timezoneId: "America/New_York" });
+
+		test("brief windows and markdown timestamps use the browser DST offset", async ({
+			page,
+		}) => {
+			await installApiMocks(page, {
+				briefDate: "2026-07-23",
+				briefWindowStart: "2026-07-22T00:00:00Z",
+				briefWindowEnd: "2026-07-23T00:00:00Z",
+				briefMarkdown:
+					"## 概览\n\n- 时间窗口：2026-07-22T00:00:00Z → 2026-07-23T00:00:00Z\n\n## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)",
+				briefCreatedAt: "2026-07-23T08:00:00Z",
+			});
+
+			await page.goto("/?tab=briefs&release=123");
+			await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+			const briefPanel = page.getByRole("tabpanel", { name: "日报" });
+			await expect(
+				page.getByText(
+					"#2026-07-23 · 2026-07-21 20:00:00 → 2026-07-22 20:00:00",
+					{
+						exact: true,
+					},
+				),
+			).toBeVisible();
+			await expect(briefPanel).toContainText("2026-07-22 07:22:33");
+			await expect(briefPanel).not.toContainText("2026-07-22T11:22:33Z");
+		});
+	});
 });
