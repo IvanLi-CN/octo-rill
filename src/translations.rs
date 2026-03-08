@@ -984,7 +984,7 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
           AND target_lang = ?
           AND protocol_version = ?
           AND model_profile = ?
-        ORDER BY created_at ASC, id ASC
+        ORDER BY rowid ASC
         LIMIT 200
         "#,
     )
@@ -1845,7 +1845,7 @@ async fn load_translation_result_items_by_request(
                (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
         FROM translation_request_items r
         WHERE request_id = ?
-        ORDER BY created_at ASC, id ASC
+        ORDER BY rowid ASC
         "#,
     )
     .bind(request_id)
@@ -2392,6 +2392,64 @@ mod tests {
         };
 
         assert_eq!(derive_request_stream_phase(&detail), "running");
+    }
+
+    #[tokio::test]
+    async fn load_translation_result_items_by_request_preserves_insert_order() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let request_id = crate::local_id::test_local_id("request-order");
+        let now = "2026-03-07T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_requests (
+              id, mode, source, requested_by, scope_user_id, status, item_count,
+              completed_item_count, created_at, updated_at
+            ) VALUES (?, 'async', 'feed.auto_translate', ?, ?, 'queued', 2, 0, ?, ?)
+            "#,
+        )
+        .bind(request_id.as_str())
+        .bind("1")
+        .bind("1")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        for (id, producer_ref, entity_id) in [
+            ("zzzzzzzzzzzzzzza", "first", "101"),
+            ("2222222222222222", "second", "202"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO translation_request_items (
+                  id, request_id, producer_ref, kind, variant, entity_id, target_lang,
+                  max_wait_ms, source_hash, source_blocks_json, target_slots_json,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, 'release_summary', 'feed_card', ?, 'zh-CN', 1000, 'hash', '[]', '[]', ?, ?)
+                "#,
+            )
+            .bind(id)
+            .bind(request_id.as_str())
+            .bind(producer_ref)
+            .bind(entity_id)
+            .bind(now)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .expect("insert request item");
+        }
+
+        let items = load_translation_result_items_by_request(state.as_ref(), request_id.as_str())
+            .await
+            .expect("load request items");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].producer_ref, "first");
+        assert_eq!(items[1].producer_ref, "second");
     }
 
     #[tokio::test]
