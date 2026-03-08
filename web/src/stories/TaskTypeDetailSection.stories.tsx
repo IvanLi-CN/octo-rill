@@ -49,10 +49,16 @@ function buildDetail(
 }
 
 const meta = {
-	title: "Admin/TaskTypeDetailSection",
+	title: "Admin/Task Type Detail",
 	component: TaskTypeDetailSection,
 	parameters: {
 		layout: "padded",
+		docs: {
+			description: {
+				component:
+					"任务详情区块负责把不同 task type 的参数、结果摘要与关联 LLM 调用压平展示，是 Admin Jobs 抽屉里的核心复用视图。通过这组 stories 可以验证不同任务类型的字段映射是否完整。",
+			},
+		},
 	},
 	args: {
 		detail: buildDetail(
@@ -71,7 +77,15 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "通用任务详情基线，展示同步 Release 任务的默认参数与结果摘要。",
+			},
+		},
+	},
+};
 
 export const SyncStarred: Story = {
 	args: {

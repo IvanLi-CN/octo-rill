@@ -207,17 +207,32 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 }
 
 const meta = {
-	title: "Pages/AdminPanel",
+	title: "Admin/User Management",
 	component: AdminPanelPreview,
 	parameters: {
 		layout: "fullscreen",
+		docs: {
+			description: {
+				component:
+					"管理员用户面板，用来检查用户筛选、资料侧栏、管理员确认与禁用状态等管理操作。适合验证表格、筛选器与管理弹层在真实数据形态下的表现。",
+			},
+		},
 	},
 } satisfies Meta<typeof AdminPanelPreview>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"默认用户管理列表，展示管理员自身与普通用户、禁用用户并存时的基线状态。",
+			},
+		},
+	},
+};
 
 export const Filtered: Story = {
 	args: {
@@ -228,6 +243,14 @@ export const Filtered: Story = {
 			status: "enabled",
 		},
 	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"模拟筛选条件生效后的结果列表，用来验证搜索与角色/状态筛选组合。",
+			},
+		},
+	},
 };
 
 export const ProfileSheetOpen: Story = {
@@ -236,12 +259,26 @@ export const ProfileSheetOpen: Story = {
 			profileUserId: STANDARD_USER_ID,
 		},
 	},
+	parameters: {
+		docs: {
+			description: {
+				story: "直接打开用户资料侧栏，便于检查详情区块与管理操作的布局。",
+			},
+		},
+	},
 };
 
 export const AdminConfirmOpen: Story = {
 	args: {
 		storyState: {
 			pendingAdminConfirmUserId: STANDARD_USER_ID,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "聚焦管理员授权确认对话框，检查危险操作前的提示与确认路径。",
+			},
 		},
 	},
 };

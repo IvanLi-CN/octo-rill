@@ -9,6 +9,12 @@ const meta = {
 	},
 	parameters: {
 		layout: "centered",
+		docs: {
+			description: {
+				component:
+					"OctoRill 中最常用的交互按钮。这里集中验证不同 variant、尺寸与链接模式，确保基础 CTA 在业务页面里表现一致。",
+			},
+		},
 	},
 } satisfies Meta<typeof Button>;
 
@@ -53,5 +59,13 @@ export const AsLink: Story = {
 	),
 	args: {
 		variant: "link",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"展示 asChild + link variant 组合，验证按钮退化为文本链接时的样式。",
+			},
+		},
 	},
 };

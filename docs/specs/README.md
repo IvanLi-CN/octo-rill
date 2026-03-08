@@ -76,4 +76,5 @@
 | g4456 | LLM 批处理效率改造 | 部分完成（3/4） | `g4456-llm-batch-efficiency/SPEC.md` | 2026-02-25 | 已完成核心改造，待补前端依赖后复验 |
 | gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-03-08 | PR #28; browser-timezone daily brief DST clarification synced; admin jobs/users Playwright merge-gate evidence aligned |
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
+| sehqs | OctoRill 文档站点与 Storybook 文档整合 | 已完成 | `sehqs-octo-rill-docs-site/SPEC.md` | 2026-03-08 | docs-site + pages workflow + storybook docs |
 | erscd | 管理员任务中心：LLM 调度观测与调用排障 | 已完成 | `erscd-admin-llm-scheduler-observability/SPEC.md` | 2026-02-27 | local implementation completed |

@@ -1,0 +1,28 @@
+---
+title: Storybook
+description: 跳转到 OctoRill Storybook 静态站。
+---
+
+import { useEffect } from "react";
+
+export default function StorybookRedirect() {
+  const storybookHref =
+    typeof window === "undefined"
+      ? "./storybook/"
+      : "./storybook/";
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.location.replace(storybookHref);
+  }, [storybookHref]);
+
+  return (
+    <>
+      <h1>正在跳转到 Storybook...</h1>
+      <p>
+        如果没有自动跳转，请手动打开
+        <a href={storybookHref}> OctoRill Storybook</a>。
+      </p>
+    </>
+  );
+}

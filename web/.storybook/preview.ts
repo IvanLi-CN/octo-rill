@@ -52,11 +52,20 @@ const preview: Preview = {
 		},
 	],
 	parameters: {
+		docs: {
+			toc: true,
+		},
 		actions: { argTypesRegex: "^on[A-Z].*" },
 		controls: {
+			expanded: true,
 			matchers: {
 				color: /(background|color)$/i,
 				date: /Date$/i,
+			},
+		},
+		options: {
+			storySort: {
+				order: ["Pages", ["Landing", "Dashboard"], "Admin", "Layout", "UI"],
 			},
 		},
 		backgrounds: {
