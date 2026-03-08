@@ -67,6 +67,25 @@ bun run dev
 
 Then open `http://127.0.0.1:55174`.
 
+### 4) 启动 Storybook（可选）
+
+```bash
+cd web
+bun run storybook
+```
+
+Then open `http://127.0.0.1:55176`.
+
+### 5) 启动 docs-site（可选）
+
+```bash
+cd docs-site
+bun install
+bun run dev
+```
+
+Then open `http://127.0.0.1:50885`.
+
 ## Auth model
 
 - OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases）。
@@ -74,6 +93,13 @@ Then open `http://127.0.0.1:55174`.
 - Release 反馈（👍 😄 ❤️ 🎉 🚀 👀）写操作：要求用户额外提供 GitHub PAT（Personal Access Token）。
   - Fine-grained PAT：按 GitHub Reactions 文档可不额外申请 repository permissions，但 token 仍需覆盖目标仓库。
   - Classic PAT：公共仓库建议 `public_repo`，私有仓库需 `repo`。
+
+## Docs & Storybook
+
+- Public docs site source lives in `docs-site/` and is built with Rspress.
+- Storybook stays under `web/` and is published as a nested static site at `/storybook/`.
+- `Docs Pages` GitHub Actions workflow builds the docs site and Storybook separately, then assembles them into one GitHub Pages artifact.
+- For project Pages deployments, `DOCS_BASE` must be set to `/<repo>/`; the workflow computes this automatically.
 
 ## Notes
 

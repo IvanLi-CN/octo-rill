@@ -963,20 +963,41 @@ function AdminJobsPreview({
 }
 
 const meta = {
-	title: "Pages/AdminJobs",
+	title: "Admin/Jobs Center",
 	component: AdminJobsPreview,
 	parameters: {
 		layout: "fullscreen",
+		docs: {
+			description: {
+				component:
+					"后台任务中心，覆盖实时任务、计划任务、LLM 调用、任务抽屉与会话详情。适合验证可观测性页面在复杂状态下的切换、筛选与细节路由。",
+			},
+		},
 	},
 } satisfies Meta<typeof AdminJobsPreview>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "默认实时任务视图，包含运行中、成功与批量翻译任务的基线状态。",
+			},
+		},
+	},
+};
 
 export const ScheduledTab: Story = {
 	render: () => <AdminJobsPreview initialTab="scheduled" />,
+	parameters: {
+		docs: {
+			description: {
+				story: "切到计划任务页签，检查日报与订阅同步等调度任务的呈现。",
+			},
+		},
+	},
 };
 
 export const LlmFilters: Story = {
@@ -986,16 +1007,44 @@ export const LlmFilters: Story = {
 			llmSourceFilter="job.api.translate_release"
 		/>
 	),
+	parameters: {
+		docs: {
+			description: {
+				story: "聚焦 LLM 调用筛选器生效后的列表视图。",
+			},
+		},
+	},
 };
 
 export const LlmConversationDetail: Story = {
 	render: () => <AdminJobsPreview autoOpenConversation />,
+	parameters: {
+		docs: {
+			description: {
+				story: "直接展示 LLM 会话详情，检查 prompt/response 链路是否可读。",
+			},
+		},
+	},
 };
 
 export const TaskDrawerDetail: Story = {
 	render: () => <AdminJobsPreview autoOpenTaskDrawer />,
+	parameters: {
+		docs: {
+			description: {
+				story: "打开任务详情抽屉，验证任务元信息、参数与结果摘要布局。",
+			},
+		},
+	},
 };
 
 export const TaskDrawerLlmRoute: Story = {
 	render: () => <AdminJobsPreview autoOpenTaskDrawerLlmRoute />,
+	parameters: {
+		docs: {
+			description: {
+				story: "验证任务抽屉内继续钻取到 LLM 详情路由时的组合状态。",
+			},
+		},
+	},
 };

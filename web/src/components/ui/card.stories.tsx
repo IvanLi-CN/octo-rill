@@ -14,6 +14,12 @@ const meta = {
 	component: Card,
 	parameters: {
 		layout: "centered",
+		docs: {
+			description: {
+				component:
+					"Card 是 Dashboard 与侧栏区块最常见的容器。这里用最小内容和带操作的卡片来校验标题、描述、正文与 footer 的层级关系。",
+			},
+		},
 	},
 } satisfies Meta<typeof Card>;
 
@@ -37,6 +43,13 @@ export const Basic: Story = {
 };
 
 export const WithActions: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "补充带主次操作的卡片状态，模拟同步或处理动作入口。",
+			},
+		},
+	},
 	render: () => (
 		<Card className="w-[360px]">
 			<CardHeader>
