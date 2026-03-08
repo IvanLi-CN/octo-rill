@@ -225,7 +225,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     if let Some(static_dir) = config.static_dir.clone() {
         let index = static_dir.join("index.html");
+        let spa_shell = ServeFile::new(index.clone());
         app = app
+            .route_service("/", spa_shell.clone())
+            .route_service("/admin", spa_shell.clone())
+            .route_service("/admin/{*path}", spa_shell)
             .fallback_service(ServeDir::new(static_dir).not_found_service(ServeFile::new(index)));
     }
 
