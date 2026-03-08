@@ -12,6 +12,7 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import type { FeedItem, ReactionContent } from "@/feed/types";
+import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 
 const REACTION_ITEMS: Array<{
@@ -26,14 +27,6 @@ const REACTION_ITEMS: Array<{
 	{ content: "rocket", emoji: "🚀", label: "火箭" },
 	{ content: "eyes", emoji: "👀", label: "关注" },
 ];
-
-function formatIsoShort(iso: string) {
-	// "2026-02-21T08:00:00Z" -> "2026-02-21 08:00:00"
-	// "2026-02-21T08:00:00.123Z" -> "2026-02-21 08:00:00"
-	const noZ = iso.replace("Z", "");
-	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
-	return noFrac.replace("T", " ");
-}
 
 export function FeedItemCard(props: {
 	item: FeedItem;
@@ -124,7 +117,7 @@ export function FeedItemCard(props: {
 							{displayTitle}
 						</CardTitle>
 						<CardDescription className="mt-1 font-mono text-xs">
-							{formatIsoShort(item.ts)}
+							{formatIsoShortLocal(item.ts)}
 							{subtitle ? ` · ${subtitle}` : ""}
 						</CardDescription>
 					</div>

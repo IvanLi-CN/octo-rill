@@ -359,3 +359,34 @@ test("feed auto translate resolves from stream request", async ({ page }) => {
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
 });
+
+test.describe("localized timestamps", () => {
+	test.use({ timezoneId: "Asia/Shanghai" });
+
+	test("release feed cards render timestamps in the browser timezone", async ({
+		page,
+	}) => {
+		await installApiMocks(page, { withReactionFeed: true });
+
+		await page.goto("/?tab=releases");
+		await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+			"aria-selected",
+			"true",
+		);
+		await expect(
+			page.getByText("2026-02-22 19:22:33", { exact: true }),
+		).toBeVisible();
+	});
+
+	test("release detail cards render published_at in the browser timezone", async ({
+		page,
+	}) => {
+		await installApiMocks(page);
+
+		await page.goto("/?tab=briefs&release=123");
+		await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+		await expect(
+			page.getByText("#123 · 2026-02-22 19:22:33", { exact: true }),
+		).toBeVisible();
+	});
+});

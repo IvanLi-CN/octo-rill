@@ -15,14 +15,8 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { formatIsoShortLocal } from "@/lib/datetime";
 import { normalizeReleaseId } from "@/lib/releaseId";
-
-function formatIsoShort(iso: string | null) {
-	if (!iso) return null;
-	const noZ = iso.replace("Z", "");
-	const noFrac = noZ.includes(".") ? noZ.split(".")[0] : noZ;
-	return noFrac.replace("T", " ");
-}
 
 export function ReleaseDetailCard(props: {
 	releaseId: string | null;
@@ -156,7 +150,7 @@ export function ReleaseDetailCard(props: {
 						<CardDescription className="font-mono text-xs">
 							{loading ? "加载中…" : `#${normalizedReleaseId}`}
 							{activeDetail?.published_at
-								? ` · ${formatIsoShort(activeDetail.published_at)}`
+								? ` · ${formatIsoShortLocal(activeDetail.published_at)}`
 								: ""}
 						</CardDescription>
 					</div>
