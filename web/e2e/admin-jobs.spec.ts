@@ -16,6 +16,9 @@ type MockFailureRule = MockRequestRule & {
 	message?: string;
 };
 
+const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
+const RECENT_EVENT_USER_ID = "4h6p9s3t5z8e2x4c";
+
 type AdminJobsMockOptions = {
 	responseDelayMs?: number;
 	delayedPaths?: string[];
@@ -61,7 +64,7 @@ async function installAdminJobsMocks(
 			task_type: "sync.releases",
 			status: "running",
 			source: "api.sync_releases",
-			requested_by: 1,
+			requested_by: CURRENT_USER_ID,
 			parent_task_id: null,
 			cancel_requested: false,
 			error_message: null,
@@ -75,7 +78,7 @@ async function installAdminJobsMocks(
 			task_type: "translate.release.batch",
 			status: "succeeded",
 			source: "api.translate_releases_batch_stream",
-			requested_by: 1,
+			requested_by: CURRENT_USER_ID,
 			parent_task_id: null,
 			cancel_requested: false,
 			error_message: null,
@@ -106,7 +109,7 @@ async function installAdminJobsMocks(
 			status: "failed",
 			source: "job.api.translate_release",
 			model: "gpt-4o-mini",
-			requested_by: 1,
+			requested_by: CURRENT_USER_ID,
 			parent_task_id: "task-running-1",
 			parent_task_type: "sync.releases",
 			max_tokens: 900,
@@ -138,7 +141,7 @@ async function installAdminJobsMocks(
 			status: "running",
 			source: "api.translate_releases_batch",
 			model: "gpt-4o-mini",
-			requested_by: 1,
+			requested_by: CURRENT_USER_ID,
 			parent_task_id: "task-translate-batch-1",
 			parent_task_type: "translate.release.batch",
 			max_tokens: 900,
@@ -171,8 +174,8 @@ async function installAdminJobsMocks(
 		id: "req-translation-1",
 		status: "completed",
 		source: "feed.auto_translate",
-		requested_by: 1,
-		scope_user_id: 1,
+		requested_by: CURRENT_USER_ID,
+		scope_user_id: CURRENT_USER_ID,
 		item_count: 1,
 		completed_item_count: 1,
 		created_at: "2026-02-26T04:00:00Z",
@@ -407,7 +410,7 @@ async function installAdminJobsMocks(
 		if (req.method() === "GET" && pathname === "/api/me") {
 			return json(route, {
 				user: {
-					id: 1,
+					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "octo-admin",
 					name: "Octo Admin",
@@ -488,7 +491,7 @@ async function installAdminJobsMocks(
 			const streamBody = [
 				"event: job.event",
 				`data: ${JSON.stringify({
-					event_id: 9001,
+					event_id: "evt-stream-9001",
 					task_id: "task-running-1",
 					task_type: "sync.releases",
 					status: "running",
@@ -498,11 +501,11 @@ async function installAdminJobsMocks(
 				"",
 				"event: llm.call",
 				`data: ${JSON.stringify({
-					event_id: 9101,
+					event_id: "evt-stream-9101",
 					call_id: "llm-call-2",
 					status: "succeeded",
 					source: "api.translate_releases_batch",
-					requested_by: 1,
+					requested_by: CURRENT_USER_ID,
 					parent_task_id: null,
 					event_type: "llm.succeeded",
 					created_at: "2026-02-26T03:00:01Z",
@@ -579,8 +582,8 @@ async function installAdminJobsMocks(
 					task: {
 						...task,
 						payload_json: JSON.stringify({
-							user_id: 1,
-							release_ids: [290978079, 290980132],
+							user_id: CURRENT_USER_ID,
+							release_ids: ["290978079", "290980132"],
 						}),
 						result_json: JSON.stringify({
 							total: 2,
@@ -603,7 +606,7 @@ async function installAdminJobsMocks(
 							message: "任务运行完成，但全部翻译项失败。",
 						},
 						translate_release_batch: {
-							target_user_id: 1,
+							target_user_id: CURRENT_USER_ID,
 							release_total: 2,
 							summary: {
 								total: 2,
@@ -634,7 +637,7 @@ async function installAdminJobsMocks(
 					},
 					events: [
 						{
-							id: 20,
+							id: "evt-task-20",
 							event_type: "task.progress",
 							payload_json: JSON.stringify({
 								stage: "release",
@@ -645,7 +648,7 @@ async function installAdminJobsMocks(
 							created_at: "2026-02-26T01:10:30Z",
 						},
 						{
-							id: 21,
+							id: "evt-task-21",
 							event_type: "task.completed",
 							payload_json: JSON.stringify({
 								status: "succeeded",
@@ -719,17 +722,17 @@ async function installAdminJobsMocks(
 							critical_events: 6,
 							recent_events: [
 								{
-									id: 42,
+									id: "evt-sync-42",
 									stage: "release",
 									event_type: "repo_inaccessible",
 									severity: "error",
 									recoverable: false,
 									attempt: 1,
-									user_id: 23,
+									user_id: RECENT_EVENT_USER_ID,
 									repo_id: 9001,
 									repo_full_name: "octo/private-repo",
 									message:
-										"release sync candidate failed for octo/private-repo with user #23",
+										"release sync candidate failed for octo/private-repo with user #4h6p9s3t5z8e2x4c",
 									created_at: "2026-02-26T14:31:40Z",
 								},
 							],
@@ -737,7 +740,7 @@ async function installAdminJobsMocks(
 					},
 					events: [
 						{
-							id: 31,
+							id: "evt-task-31",
 							event_type: "task.progress",
 							payload_json: JSON.stringify({
 								stage: "collect",
@@ -746,7 +749,7 @@ async function installAdminJobsMocks(
 							created_at: "2026-02-26T14:30:05Z",
 						},
 						{
-							id: 32,
+							id: "evt-task-32",
 							event_type: "task.progress",
 							payload_json: JSON.stringify({
 								stage: "star_summary",
@@ -757,7 +760,7 @@ async function installAdminJobsMocks(
 							created_at: "2026-02-26T14:31:02Z",
 						},
 						{
-							id: 33,
+							id: "evt-task-33",
 							event_type: "task.progress",
 							payload_json: JSON.stringify({
 								stage: "release_summary",
@@ -769,7 +772,7 @@ async function installAdminJobsMocks(
 							created_at: "2026-02-26T14:37:59Z",
 						},
 						{
-							id: 34,
+							id: "evt-task-34",
 							event_type: "task.completed",
 							payload_json: JSON.stringify({ status: "succeeded" }),
 							created_at: "2026-02-26T14:38:10Z",
@@ -796,7 +799,7 @@ async function installAdminJobsMocks(
 				},
 				events: [
 					{
-						id: 1,
+						id: "evt-task-1",
 						event_type: "task.created",
 						payload_json: JSON.stringify({
 							task_id: task.id,

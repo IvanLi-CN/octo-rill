@@ -2,21 +2,10 @@ import {
 	UserManagement,
 	type UserManagementStoryState,
 } from "@/admin/UserManagement";
+import type { MeResponse } from "@/api";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
-
-type MeResponse = {
-	user: {
-		id: number;
-		github_user_id: number;
-		login: string;
-		name: string | null;
-		avatar_url: string | null;
-		email: string | null;
-		is_admin: boolean;
-	};
-};
 
 export function AdminPanel(props: {
 	me: MeResponse;

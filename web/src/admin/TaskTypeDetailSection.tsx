@@ -58,11 +58,20 @@ function readBoolean(payload: JsonRecord | null, key: string): boolean | null {
 	return null;
 }
 
-function readNumberArray(payload: JsonRecord | null, key: string): number[] {
+function readIdArray(payload: JsonRecord | null, key: string): string[] {
 	if (!payload) return [];
 	const value = payload[key];
 	if (!Array.isArray(value)) return [];
-	return value.filter((item): item is number => typeof item === "number");
+	return value.flatMap((item) => {
+		if (typeof item === "string") {
+			const trimmed = item.trim();
+			return trimmed ? [trimmed] : [];
+		}
+		if (typeof item === "number" || typeof item === "boolean") {
+			return [String(item)];
+		}
+		return [];
+	});
 }
 
 function readObject(
@@ -183,7 +192,10 @@ function summarizeTranslateBatchProgress(
 ) {
 	let processed = 0;
 	let lastStage: string | null = null;
-	const orderedEvents = [...detail.events].sort((a, b) => a.id - b.id);
+	const orderedEvents = [...detail.events].sort(
+		(a, b) =>
+			a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id),
+	);
 	for (const event of orderedEvents) {
 		if (event.event_type !== "task.progress") continue;
 		const payload = parseJsonRecord(event.payload_json);
@@ -413,7 +425,7 @@ function buildTaskDetailPageModel(
 		}
 		case "translate.release.batch": {
 			const diagnostics = detail.diagnostics?.translate_release_batch ?? null;
-			const releaseIds = readNumberArray(payload, "release_ids");
+			const releaseIds = readIdArray(payload, "release_ids");
 			const summary = summarizeTranslateBatchResult(result);
 			const progress = summarizeTranslateBatchProgress(detail);
 			const totalCount = diagnostics?.summary.total ?? summary.total;

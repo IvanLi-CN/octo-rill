@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { ApiError, apiGet, apiPost, apiPostJson, apiPutJson } from "@/api";
+import {
+	type MeResponse,
+	ApiError,
+	apiGet,
+	apiPost,
+	apiPostJson,
+	apiPutJson,
+} from "@/api";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -36,18 +43,6 @@ import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
-
-type MeResponse = {
-	user: {
-		id: number;
-		github_user_id: number;
-		login: string;
-		name: string | null;
-		avatar_url: string | null;
-		email: string | null;
-		is_admin: boolean;
-	};
-};
 
 type TaskAcceptedResponse = {
 	mode: "task_id";

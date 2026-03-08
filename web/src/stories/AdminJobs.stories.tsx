@@ -8,13 +8,16 @@ import type {
 } from "@/api";
 import { AdminJobs } from "@/pages/AdminJobs";
 
+const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
+const RECENT_EVENT_USER_ID = "4h6p9s3t5z8e2x4c";
+
 const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 	{
 		id: "task-sync-releases",
 		task_type: "sync.releases",
 		status: "running",
 		source: "manual",
-		requested_by: 1,
+		requested_by: CURRENT_USER_ID,
 		parent_task_id: null,
 		cancel_requested: false,
 		error_message: null,
@@ -28,7 +31,7 @@ const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 		task_type: "sync.starred",
 		status: "succeeded",
 		source: "manual",
-		requested_by: 1,
+		requested_by: CURRENT_USER_ID,
 		parent_task_id: null,
 		cancel_requested: false,
 		error_message: null,
@@ -42,7 +45,7 @@ const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 		task_type: "translate.release.batch",
 		status: "succeeded",
 		source: "api.translate_releases_batch_stream",
-		requested_by: 1,
+		requested_by: CURRENT_USER_ID,
 		parent_task_id: null,
 		cancel_requested: false,
 		error_message: null,
@@ -104,7 +107,7 @@ const llmCallsSeed: AdminLlmCallDetailResponse[] = [
 		status: "failed",
 		source: "job.api.translate_release",
 		model: "gpt-4o-mini",
-		requested_by: 1,
+		requested_by: CURRENT_USER_ID,
 		parent_task_id: "task-sync-releases",
 		parent_task_type: "sync.releases",
 		max_tokens: 900,
@@ -167,7 +170,7 @@ Notes:
 		status: "running",
 		source: "api.translate_releases_batch",
 		model: "gpt-4o-mini",
-		requested_by: 1,
+		requested_by: CURRENT_USER_ID,
 		parent_task_id: "task-translate-batch-story",
 		parent_task_type: "translate.release.batch",
 		max_tokens: 900,
@@ -254,25 +257,25 @@ function buildTaskDetail(
 			},
 			events: [
 				{
-					id: 1001,
+					id: "evt-task-1001",
 					event_type: "task.created",
 					payload_json: JSON.stringify({ source: task.source }),
 					created_at: task.created_at,
 				},
 				{
-					id: 1002,
+					id: "evt-task-1002",
 					event_type: "task.running",
 					payload_json: JSON.stringify({}),
 					created_at: task.started_at ?? task.created_at,
 				},
 				{
-					id: 1003,
+					id: "evt-task-1003",
 					event_type: "task.progress",
 					payload_json: JSON.stringify({ stage: "collect", total_users: 12 }),
 					created_at: task.started_at ?? task.created_at,
 				},
 				{
-					id: 1004,
+					id: "evt-task-1004",
 					event_type: "task.progress",
 					payload_json: JSON.stringify({
 						stage: "star_summary",
@@ -283,7 +286,7 @@ function buildTaskDetail(
 					created_at: task.started_at ?? task.created_at,
 				},
 				{
-					id: 1005,
+					id: "evt-task-1005",
 					event_type: "task.progress",
 					payload_json: JSON.stringify({
 						stage: "repo_collect",
@@ -292,7 +295,7 @@ function buildTaskDetail(
 					created_at: task.updated_at,
 				},
 				{
-					id: 1006,
+					id: "evt-task-1006",
 					event_type: "task.progress",
 					payload_json: JSON.stringify({
 						stage: "release_summary",
@@ -304,7 +307,7 @@ function buildTaskDetail(
 					created_at: task.updated_at,
 				},
 				{
-					id: 1007,
+					id: "evt-task-1007",
 					event_type: "task.completed",
 					payload_json: JSON.stringify({
 						status: task.status,
@@ -343,17 +346,17 @@ function buildTaskDetail(
 					critical_events: 6,
 					recent_events: [
 						{
-							id: 9,
+							id: "evt-sync-9",
 							stage: "release",
 							event_type: "repo_inaccessible",
 							severity: "error",
 							recoverable: false,
 							attempt: 1,
-							user_id: 23,
+							user_id: RECENT_EVENT_USER_ID,
 							repo_id: 9001,
 							repo_full_name: "octo/private-repo",
 							message:
-								"release sync candidate failed for octo/private-repo with user #23",
+								"release sync candidate failed for octo/private-repo with user #4h6p9s3t5z8e2x4c",
 							created_at: "2026-02-27T14:31:40Z",
 						},
 					],
@@ -378,19 +381,19 @@ function buildTaskDetail(
 		},
 		events: [
 			{
-				id: 1001,
+				id: "evt-task-1001",
 				event_type: "task.created",
 				payload_json: JSON.stringify({ source: task.source }),
 				created_at: task.created_at,
 			},
 			{
-				id: 1002,
+				id: "evt-task-1002",
 				event_type: "task.running",
 				payload_json: JSON.stringify({}),
 				created_at: task.started_at ?? task.created_at,
 			},
 			{
-				id: 1003,
+				id: "evt-task-1003",
 				event_type: "task.completed",
 				payload_json: JSON.stringify({
 					status: task.status,
@@ -768,7 +771,7 @@ function AdminJobsPreview({
 					target.finished_at = "2026-02-27T06:12:01Z";
 					target.updated_at = "2026-02-27T06:12:01Z";
 					this.emit("llm.call", {
-						event_id: 2001,
+						event_id: "evt-stream-2001",
 						call_id: "llm-call-2",
 						status: target.status,
 						source: target.source,
@@ -946,7 +949,7 @@ function AdminJobsPreview({
 		<AdminJobs
 			me={{
 				user: {
-					id: 1,
+					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "storybook-admin",
 					name: "Storybook Admin",

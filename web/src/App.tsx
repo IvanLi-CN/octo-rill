@@ -1,22 +1,10 @@
 import { useEffect, useState } from "react";
 
-import { ApiError, apiGet } from "@/api";
+import { type MeResponse, ApiError, apiGet } from "@/api";
 import { AdminJobs } from "@/pages/AdminJobs";
 import { AdminPanel } from "@/pages/AdminPanel";
 import { Dashboard } from "@/pages/Dashboard";
 import { Landing } from "@/pages/Landing";
-
-type MeResponse = {
-	user: {
-		id: number;
-		github_user_id: number;
-		login: string;
-		name: string | null;
-		avatar_url: string | null;
-		email: string | null;
-		is_admin: boolean;
-	};
-};
 
 function App() {
 	const [me, setMe] = useState<MeResponse | null>(null);
