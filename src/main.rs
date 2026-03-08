@@ -6,6 +6,7 @@ mod crypto;
 mod error;
 mod github;
 mod jobs;
+mod local_id;
 mod server;
 mod state;
 mod sync;

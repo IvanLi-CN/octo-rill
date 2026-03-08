@@ -1,19 +1,8 @@
 import { JobManagement } from "@/admin/JobManagement";
+import type { MeResponse } from "@/api";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
-
-type MeResponse = {
-	user: {
-		id: number;
-		github_user_id: number;
-		login: string;
-		name: string | null;
-		avatar_url: string | null;
-		email: string | null;
-		is_admin: boolean;
-	};
-};
 
 export function AdminJobs(props: { me: MeResponse }) {
 	const { me } = props;

@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
 
-use crate::{ai, jobs, sync};
+use crate::{ai, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
@@ -37,6 +37,11 @@ fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
 
+pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, ApiError> {
+    local_id::normalize_local_id(&raw)
+        .ok_or_else(|| ApiError::bad_request(format!("invalid {field}")))
+}
+
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     user: UserSummary,
@@ -44,7 +49,7 @@ pub struct MeResponse {
 
 #[derive(Debug, Serialize)]
 pub struct UserSummary {
-    id: i64,
+    id: String,
     github_user_id: i64,
     login: String,
     name: Option<String>,
@@ -55,7 +60,7 @@ pub struct UserSummary {
 
 #[derive(Debug, sqlx::FromRow)]
 struct UserRow {
-    id: i64,
+    id: String,
     github_user_id: i64,
     login: String,
     name: Option<String>,
@@ -77,7 +82,7 @@ pub async fn me(
         WHERE id = ?
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -106,7 +111,7 @@ pub async fn me(
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct AdminUserItem {
-    id: i64,
+    id: String,
     github_user_id: i64,
     login: String,
     name: Option<String>,
@@ -149,10 +154,10 @@ pub struct AdminUserPatchRequest {
     is_disabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AdminUserUpdateGuard {
-    acting_user_id: i64,
-    target_user_id: i64,
+    acting_user_id: String,
+    target_user_id: String,
     target_is_admin: bool,
     target_is_disabled: bool,
     next_is_admin: bool,
@@ -314,10 +319,11 @@ pub async fn admin_list_users(
 pub async fn admin_patch_user(
     State(state): State<Arc<AppState>>,
     session: Session,
-    Path(target_user_id): Path<i64>,
+    Path(target_user_id): Path<String>,
     Json(req): Json<AdminUserPatchRequest>,
 ) -> Result<Json<AdminUserItem>, ApiError> {
     let acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let target_user_id = parse_local_id_param(target_user_id, "user_id")?;
 
     if req.is_admin.is_none() && req.is_disabled.is_none() {
         return Err(ApiError::bad_request(
@@ -327,7 +333,7 @@ pub async fn admin_patch_user(
 
     #[derive(Debug, sqlx::FromRow)]
     struct AdminPatchTargetRow {
-        id: i64,
+        id: String,
         is_admin: i64,
         is_disabled: i64,
     }
@@ -340,7 +346,7 @@ pub async fn admin_patch_user(
         WHERE id = ?
         "#,
     )
-    .bind(target_user_id)
+    .bind(&target_user_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
@@ -403,7 +409,7 @@ pub async fn admin_patch_user(
     .bind(if next_is_admin { 1_i64 } else { 0_i64 })
     .bind(if next_is_disabled { 1_i64 } else { 0_i64 })
     .bind(now.as_str())
-    .bind(target_user_id)
+    .bind(&target_user_id)
     .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
@@ -426,7 +432,7 @@ pub async fn admin_patch_user(
         WHERE id = ?
         "#,
     )
-    .bind(target_user_id)
+    .bind(&target_user_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
@@ -437,7 +443,7 @@ pub async fn admin_patch_user(
 
 #[derive(Debug, Serialize)]
 pub struct AdminUserProfileResponse {
-    user_id: i64,
+    user_id: String,
     daily_brief_utc_time: String,
     last_active_at: Option<String>,
 }
@@ -445,9 +451,10 @@ pub struct AdminUserProfileResponse {
 pub async fn admin_get_user_profile(
     State(state): State<Arc<AppState>>,
     session: Session,
-    Path(user_id): Path<i64>,
+    Path(user_id): Path<String>,
 ) -> Result<Json<AdminUserProfileResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let user_id = parse_local_id_param(user_id, "user_id")?;
 
     let row = sqlx::query_as::<_, (String, Option<String>)>(
         r#"
@@ -457,7 +464,7 @@ pub async fn admin_get_user_profile(
         LIMIT 1
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -572,7 +579,7 @@ pub struct AdminRealtimeTaskItem {
     task_type: String,
     status: String,
     source: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     cancel_requested: bool,
     error_message: Option<String>,
@@ -588,7 +595,7 @@ pub struct AdminRealtimeTaskDetailItem {
     task_type: String,
     status: String,
     source: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     cancel_requested: bool,
     error_message: Option<String>,
@@ -724,7 +731,7 @@ pub async fn admin_list_realtime_tasks(
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct AdminTaskEventItem {
-    id: i64,
+    id: String,
     event_type: String,
     payload_json: String,
     created_at: String,
@@ -763,7 +770,7 @@ pub struct AdminTaskDiagnostics {
 
 #[derive(Debug, Serialize)]
 pub struct AdminTranslateReleaseBatchDiagnostics {
-    target_user_id: Option<i64>,
+    target_user_id: Option<String>,
     release_total: i64,
     summary: AdminTranslateReleaseBatchSummary,
     progress: AdminTranslateReleaseBatchProgress,
@@ -811,7 +818,7 @@ pub struct AdminBriefDailySlotSummary {
 
 #[derive(Debug, Serialize)]
 pub struct AdminBriefDailySlotUserDiagnostic {
-    user_id: i64,
+    user_id: String,
     key_date: Option<String>,
     state: String, // succeeded | failed | running
     error: Option<String>,
@@ -820,7 +827,7 @@ pub struct AdminBriefDailySlotUserDiagnostic {
 
 #[derive(Debug, Serialize)]
 pub struct AdminBriefGenerateDiagnostics {
-    target_user_id: Option<i64>,
+    target_user_id: Option<String>,
     content_length: Option<i64>,
     key_date: Option<String>,
 }
@@ -843,13 +850,13 @@ pub struct AdminSyncSubscriptionReleaseDiagnostics {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct AdminSyncSubscriptionEventItem {
-    id: i64,
+    id: String,
     stage: String,
     event_type: String,
     severity: String,
     recoverable: bool,
     attempt: i64,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     repo_id: Option<i64>,
     repo_full_name: Option<String>,
     message: Option<String>,
@@ -873,13 +880,13 @@ pub struct AdminSyncSubscriptionsDiagnostics {
 
 #[derive(Debug, sqlx::FromRow)]
 struct AdminSyncSubscriptionEventRow {
-    id: i64,
+    id: String,
     stage: String,
     event_type: String,
     severity: String,
     recoverable: bool,
     attempt: i64,
-    user_id: Option<i64>,
+    user_id: Option<String>,
     repo_id: Option<i64>,
     repo_full_name: Option<String>,
     payload_json: Option<String>,
@@ -963,6 +970,18 @@ fn json_object_get_string(
         .and_then(json_value_to_string)
 }
 
+fn json_object_get_local_id(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<String> {
+    object.and_then(|obj| obj.get(key)).and_then(|value| {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| value.as_i64().map(|id| id.to_string()))
+    })
+}
+
 fn json_object_get_bool(
     object: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
@@ -996,6 +1015,16 @@ fn business_outcome(code: &str, label: &str, message: impl Into<String>) -> Admi
     }
 }
 
+fn task_events_for_diagnostics(events: &[AdminTaskEventItem]) -> Vec<&AdminTaskEventItem> {
+    let mut ordered_events = events.iter().collect::<Vec<_>>();
+    ordered_events.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    ordered_events
+}
+
 fn build_translate_release_batch_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
@@ -1007,7 +1036,7 @@ fn build_translate_release_batch_diagnostics(
     let result_value = parse_json_value(task.result_json.as_deref());
     let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
 
-    let target_user_id = json_object_get_i64(payload_object, "user_id");
+    let target_user_id = json_object_get_local_id(payload_object, "user_id");
 
     let release_total_from_payload = payload_object
         .and_then(|obj| obj.get("release_ids"))
@@ -1027,8 +1056,7 @@ fn build_translate_release_batch_diagnostics(
         summary.total = release_total_from_payload;
     }
 
-    let mut ordered_events = events.iter().collect::<Vec<_>>();
-    ordered_events.sort_by_key(|event| event.id);
+    let ordered_events = task_events_for_diagnostics(events);
 
     let mut processed = 0_i64;
     let mut last_stage: Option<String> = None;
@@ -1132,8 +1160,8 @@ fn build_translate_release_batch_diagnostics(
 
 fn upsert_daily_slot_user_diag(
     users: &mut Vec<AdminBriefDailySlotUserDiagnostic>,
-    index: &mut HashMap<i64, usize>,
-    user_id: i64,
+    index: &mut HashMap<String, usize>,
+    user_id: String,
     event_created_at: &str,
 ) -> usize {
     if let Some(pos) = index.get(&user_id).copied() {
@@ -1142,7 +1170,7 @@ fn upsert_daily_slot_user_diag(
     }
     let pos = users.len();
     users.push(AdminBriefDailySlotUserDiagnostic {
-        user_id,
+        user_id: user_id.clone(),
         key_date: None,
         state: "running".to_owned(),
         error: None,
@@ -1174,9 +1202,8 @@ fn build_brief_daily_slot_diagnostics(
     let mut failed_from_events = 0_i64;
 
     let mut users: Vec<AdminBriefDailySlotUserDiagnostic> = Vec::new();
-    let mut user_index = HashMap::<i64, usize>::new();
-    let mut ordered_events = events.iter().collect::<Vec<_>>();
-    ordered_events.sort_by_key(|event| event.id);
+    let mut user_index = HashMap::<String, usize>::new();
+    let ordered_events = task_events_for_diagnostics(events);
     for event in ordered_events {
         if event.event_type != "task.progress" {
             continue;
@@ -1198,7 +1225,7 @@ fn build_brief_daily_slot_diagnostics(
                 if let Some(index_value) = json_object_get_i64(payload_object, "index") {
                     progressed_users = progressed_users.max(index_value);
                 }
-                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                if let Some(user_id) = json_object_get_local_id(payload_object, "user_id") {
                     let pos = upsert_daily_slot_user_diag(
                         &mut users,
                         &mut user_index,
@@ -1212,7 +1239,7 @@ fn build_brief_daily_slot_diagnostics(
             }
             "user_failed" => {
                 failed_from_events += 1;
-                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                if let Some(user_id) = json_object_get_local_id(payload_object, "user_id") {
                     let pos = upsert_daily_slot_user_diag(
                         &mut users,
                         &mut user_index,
@@ -1228,7 +1255,7 @@ fn build_brief_daily_slot_diagnostics(
             }
             "user_succeeded" => {
                 succeeded_from_events += 1;
-                if let Some(user_id) = json_object_get_i64(payload_object, "user_id") {
+                if let Some(user_id) = json_object_get_local_id(payload_object, "user_id") {
                     let pos = upsert_daily_slot_user_diag(
                         &mut users,
                         &mut user_index,
@@ -1273,7 +1300,7 @@ fn build_brief_daily_slot_diagnostics(
         canceled,
     };
 
-    users.sort_by_key(|item| item.user_id);
+    users.sort_by_key(|item| item.user_id.clone());
 
     let outcome = if task.status == jobs::STATUS_FAILED {
         business_outcome(
@@ -1339,7 +1366,7 @@ fn build_brief_generate_diagnostics(
 
     let content_length = json_object_get_i64(result_object, "content_length");
     let diagnostics = AdminBriefGenerateDiagnostics {
-        target_user_id: json_object_get_i64(payload_object, "user_id"),
+        target_user_id: json_object_get_local_id(payload_object, "user_id"),
         content_length,
         key_date: json_object_get_string(payload_object, "key_date"),
     };
@@ -1563,6 +1590,7 @@ pub async fn admin_get_realtime_task_detail(
     Path(task_id): Path<String>,
 ) -> Result<Json<AdminRealtimeTaskDetailResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = parse_local_id_param(task_id, "task_id")?;
 
     let task = sqlx::query_as::<_, AdminRealtimeTaskDetailItem>(
         r#"
@@ -1610,7 +1638,7 @@ pub async fn admin_get_realtime_task_detail(
         SELECT id, event_type, payload_json, created_at
         FROM job_task_events
         WHERE task_id = ?
-        ORDER BY id DESC
+        ORDER BY rowid DESC
         LIMIT ?
         "#,
     )
@@ -1646,7 +1674,7 @@ pub async fn admin_get_realtime_task_detail(
               created_at
             FROM sync_subscription_events
             WHERE task_id = ?
-            ORDER BY id DESC
+            ORDER BY rowid DESC
             LIMIT ?
             "#,
         )
@@ -1676,6 +1704,7 @@ pub async fn admin_download_realtime_task_log(
     Path(task_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = parse_local_id_param(task_id, "task_id")?;
 
     let log_file_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
         .await
@@ -1745,6 +1774,7 @@ pub async fn admin_retry_realtime_task(
     Path(task_id): Path<String>,
 ) -> Result<Json<AdminTaskActionResponse>, ApiError> {
     let acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = parse_local_id_param(task_id, "task_id")?;
     let task = jobs::retry_task(state.as_ref(), task_id.as_str(), acting_user_id)
         .await
         .map_err(map_job_action_error)?;
@@ -1761,6 +1791,7 @@ pub async fn admin_cancel_realtime_task(
     Path(task_id): Path<String>,
 ) -> Result<Json<AdminTaskActionResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let task_id = parse_local_id_param(task_id, "task_id")?;
     let status = jobs::cancel_task(state.as_ref(), task_id.as_str())
         .await
         .map_err(map_job_action_error)?;
@@ -1853,7 +1884,7 @@ pub struct AdminLlmCallItem {
     status: String,
     source: String,
     model: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     parent_task_type: Option<String>,
     max_tokens: i64,
@@ -1877,7 +1908,7 @@ pub struct AdminLlmCallDetailItem {
     status: String,
     source: String,
     model: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     parent_task_type: Option<String>,
     max_tokens: i64,
@@ -1927,7 +1958,7 @@ pub struct AdminLlmSchedulerStatusResponse {
 pub struct AdminLlmCallsQuery {
     status: Option<String>,
     source: Option<String>,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     started_from: Option<String>,
     started_to: Option<String>,
@@ -2031,6 +2062,7 @@ pub async fn admin_list_llm_calls(
     }
 
     let source = query.source.unwrap_or_default().trim().to_owned();
+    let requested_by = query.requested_by.clone();
     let parent_task_id = query.parent_task_id.unwrap_or_default().trim().to_owned();
     let started_from = parse_llm_calls_filter_timestamp(query.started_from, "started_from")?;
     let started_to = parse_llm_calls_filter_timestamp(query.started_to, "started_to")?;
@@ -2051,8 +2083,8 @@ pub async fn admin_list_llm_calls(
     .bind(status.as_str())
     .bind(source.as_str())
     .bind(source.as_str())
-    .bind(query.requested_by)
-    .bind(query.requested_by)
+    .bind(requested_by.as_deref())
+    .bind(requested_by.as_deref())
     .bind(parent_task_id.as_str())
     .bind(parent_task_id.as_str())
     .bind(started_from.as_deref())
@@ -2101,8 +2133,8 @@ pub async fn admin_list_llm_calls(
     .bind(status.as_str())
     .bind(source.as_str())
     .bind(source.as_str())
-    .bind(query.requested_by)
-    .bind(query.requested_by)
+    .bind(requested_by.as_deref())
+    .bind(requested_by.as_deref())
     .bind(parent_task_id.as_str())
     .bind(parent_task_id.as_str())
     .bind(started_from.as_deref())
@@ -2129,6 +2161,7 @@ pub async fn admin_get_llm_call_detail(
     Path(call_id): Path<String>,
 ) -> Result<Json<AdminLlmCallDetailItem>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let call_id = parse_local_id_param(call_id, "call_id")?;
 
     let item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
         r#"
@@ -2308,7 +2341,7 @@ pub async fn get_release_detail(
         LIMIT 1
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .bind(release_id)
     .fetch_optional(&state.pool)
     .await
@@ -2482,7 +2515,7 @@ pub struct ReturnModeQuery {
     return_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum ReturnMode {
     Sync,
     TaskId,
@@ -2538,7 +2571,7 @@ async fn enqueue_or_stream_task(
     }
 }
 
-async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<i64>, fut: F) -> T
+async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<String>, fut: F) -> T
 where
     F: Future<Output = T>,
 {
@@ -2564,7 +2597,7 @@ pub async fn sync_starred(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let res = sync::sync_starred(state.as_ref(), user_id)
+        let res = sync::sync_starred(state.as_ref(), user_id.as_str())
             .await
             .map_err(ApiError::internal)?;
         return Ok(Json(res).into_response());
@@ -2575,9 +2608,9 @@ pub async fn sync_starred(
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_STARRED.to_owned(),
-            payload: json!({ "user_id": user_id }),
+            payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_starred".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -2593,7 +2626,7 @@ pub async fn sync_releases(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let res = sync::sync_releases(state.as_ref(), user_id)
+        let res = sync::sync_releases(state.as_ref(), user_id.as_str())
             .await
             .map_err(ApiError::internal)?;
         return Ok(Json(res).into_response());
@@ -2604,9 +2637,9 @@ pub async fn sync_releases(
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_RELEASES.to_owned(),
-            payload: json!({ "user_id": user_id }),
+            payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_releases".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -2622,7 +2655,7 @@ pub async fn sync_notifications(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let res = sync::sync_notifications(state.as_ref(), user_id)
+        let res = sync::sync_notifications(state.as_ref(), user_id.as_str())
             .await
             .map_err(ApiError::internal)?;
         return Ok(Json(res).into_response());
@@ -2633,9 +2666,9 @@ pub async fn sync_notifications(
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_NOTIFICATIONS.to_owned(),
-            payload: json!({ "user_id": user_id }),
+            payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_notifications".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -2664,9 +2697,9 @@ pub async fn generate_brief(
             mode,
             jobs::NewTask {
                 task_type: jobs::TASK_BRIEF_GENERATE.to_owned(),
-                payload: json!({ "user_id": user_id }),
+                payload: json!({ "user_id": user_id.clone() }),
                 source: "api.generate_brief".to_owned(),
-                requested_by: Some(user_id),
+                requested_by: Some(user_id.clone()),
                 parent_task_id: None,
             },
         )
@@ -2675,8 +2708,8 @@ pub async fn generate_brief(
 
     let content = run_with_api_llm_context(
         "api.generate_brief.sync",
-        Some(user_id),
-        ai::generate_daily_brief(state.as_ref(), user_id),
+        Some(user_id.clone()),
+        ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
     )
     .await
     .map_err(ApiError::internal)?;
@@ -2851,7 +2884,7 @@ async fn check_reaction_pat_with_github(
 
 async fn load_reaction_pat_status_row(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<Option<ReactionTokenStatusRow>, ApiError> {
     sqlx::query_as::<_, ReactionTokenStatusRow>(
         r#"
@@ -2868,7 +2901,7 @@ async fn load_reaction_pat_status_row(
 
 async fn load_reaction_pat_token(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<Option<String>, ApiError> {
     let row = sqlx::query_as::<_, ReactionTokenSecretRow>(
         r#"
@@ -2899,7 +2932,7 @@ async fn load_reaction_pat_token(
 
 async fn persist_reaction_pat_check_result(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     check_state: &str,
     check_message: Option<&str>,
 ) -> Result<(), ApiError> {
@@ -2929,7 +2962,7 @@ pub async fn reaction_token_status(
     session: Session,
 ) -> Result<Json<ReactionTokenStatusResponse>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let row = load_reaction_pat_status_row(state.as_ref(), user_id).await?;
+    let row = load_reaction_pat_status_row(state.as_ref(), &user_id).await?;
     let Some(row) = row else {
         return Ok(Json(ReactionTokenStatusResponse {
             configured: false,
@@ -3490,7 +3523,7 @@ fn parse_release_cursor(cursor: &str) -> Result<Option<StreamCursor>, ApiError> 
 
 async fn fetch_feed_releases(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     cursor: Option<&StreamCursor>,
     limit: i64,
 ) -> Result<Vec<FeedRow>, ApiError> {
@@ -3807,7 +3840,7 @@ async fn fetch_live_release_reactions(
 
 async fn persist_release_reaction_counts(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_id: i64,
     counts: &ReleaseReactionCounts,
 ) -> Result<(), ApiError> {
@@ -3974,7 +4007,8 @@ pub async fn list_feed(
         None => None,
     };
 
-    let rows = fetch_feed_releases(state.as_ref(), user_id, release_cursor.as_ref(), limit).await?;
+    let rows =
+        fetch_feed_releases(state.as_ref(), &user_id, release_cursor.as_ref(), limit).await?;
     let ai_enabled = state.config.ai.is_some();
 
     let mut node_ids: Vec<String> = Vec::new();
@@ -3994,7 +4028,7 @@ pub async fn list_feed(
 
     let mut live_reactions_by_node =
         std::collections::HashMap::<String, LiveReleaseReactions>::new();
-    let reaction_pat = load_reaction_pat_token(state.as_ref(), user_id)
+    let reaction_pat = load_reaction_pat_token(state.as_ref(), &user_id)
         .await
         .ok()
         .flatten();
@@ -4006,7 +4040,7 @@ pub async fn list_feed(
             if let Some(release_id) = release_by_node.get(node_id) {
                 let _ = persist_release_reaction_counts(
                     state.as_ref(),
-                    user_id,
+                    &user_id,
                     *release_id,
                     &reaction.counts,
                 )
@@ -4252,7 +4286,7 @@ pub async fn toggle_release_reaction(
         return Err(ApiError::bad_request("invalid reaction content"));
     };
 
-    let token = match load_reaction_pat_token(state.as_ref(), user_id).await {
+    let token = match load_reaction_pat_token(state.as_ref(), &user_id).await {
         Ok(Some(token)) => token,
         Ok(None) => {
             return Err(ApiError::new(
@@ -4264,7 +4298,7 @@ pub async fn toggle_release_reaction(
         Err(err) if err.code() == "pat_invalid" => {
             let _ = persist_reaction_pat_check_result(
                 state.as_ref(),
-                user_id,
+                &user_id,
                 "invalid",
                 Some("PAT is invalid or expired"),
             )
@@ -4281,7 +4315,7 @@ pub async fn toggle_release_reaction(
         WHERE user_id = ? AND release_id = ?
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .bind(release_id)
     .fetch_optional(&state.pool)
     .await
@@ -4314,7 +4348,7 @@ pub async fn toggle_release_reaction(
             Err(err) if err.code() == "reauth_required" => {
                 let _ = persist_reaction_pat_check_result(
                     state.as_ref(),
-                    user_id,
+                    &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
@@ -4351,7 +4385,7 @@ pub async fn toggle_release_reaction(
             Err(err) if err.code() == "reauth_required" => {
                 let _ = persist_reaction_pat_check_result(
                     state.as_ref(),
-                    user_id,
+                    &user_id,
                     "invalid",
                     Some("PAT is invalid or expired"),
                 )
@@ -4365,9 +4399,9 @@ pub async fn toggle_release_reaction(
             Err(err) => return Err(err),
         };
     let _ =
-        persist_reaction_pat_check_result(state.as_ref(), user_id, "valid", Some("PAT is valid"))
+        persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
             .await;
-    persist_release_reaction_counts(state.as_ref(), user_id, row.release_id, &updated.counts)
+    persist_release_reaction_counts(state.as_ref(), &user_id, row.release_id, &updated.counts)
         .await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
@@ -5071,14 +5105,14 @@ struct TranslationUpsert<'a> {
 
 async fn upsert_translation(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO ai_translations (user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, entity_type, entity_id, lang) DO UPDATE SET
           source_hash = excluded.source_hash,
           title = excluded.title,
@@ -5086,6 +5120,7 @@ async fn upsert_translation(
           updated_at = excluded.updated_at
         "#,
     )
+    .bind(crate::local_id::generate_local_id())
     .bind(user_id)
     .bind(t.entity_type)
     .bind(t.entity_id)
@@ -5429,7 +5464,7 @@ struct PreparedReleaseBatch {
 
 async fn prepare_release_batch(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_ids: &[i64],
 ) -> Result<PreparedReleaseBatch, ApiError> {
     if state.config.ai.is_none() {
@@ -5609,7 +5644,7 @@ fn build_release_batch_item(
 
 async fn upsert_release_batch_translations(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     candidates: &[ReleaseBatchCandidate],
     translated: &HashMap<i64, (Option<String>, Option<String>)>,
 ) -> Result<(), ApiError> {
@@ -5635,7 +5670,7 @@ async fn upsert_release_batch_translations(
 
 async fn translate_releases_batch_internal(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_ids: &[i64],
 ) -> Result<Vec<TranslateBatchItem>, ApiError> {
     if state.config.ai.is_none() {
@@ -5671,7 +5706,7 @@ async fn translate_releases_batch_internal(
 
 pub async fn translate_releases_batch_for_user(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_ids: &[i64],
 ) -> Result<TranslateBatchResponse, ApiError> {
     let items = translate_releases_batch_internal(state, user_id, release_ids).await?;
@@ -5681,7 +5716,7 @@ pub async fn translate_releases_batch_for_user(
 #[allow(dead_code)]
 async fn translate_releases_batch_stream_worker(
     state: Arc<AppState>,
-    user_id: i64,
+    user_id: String,
     release_ids: Vec<i64>,
     task_id: String,
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
@@ -5693,7 +5728,7 @@ async fn translate_releases_batch_stream_worker(
 
     let context = ai::LlmCallContext {
         source: "api.translate_releases_batch_stream".to_owned(),
-        requested_by: Some(user_id),
+        requested_by: Some(user_id.clone()),
         parent_task_id: Some(task_id.clone()),
         parent_task_type: Some(jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned()),
         parent_translation_batch_id: None,
@@ -5773,7 +5808,7 @@ async fn translate_releases_batch_stream_worker(
             return Ok(());
         }
 
-        let mut prepared = prepare_release_batch(state.as_ref(), user_id, &release_ids).await?;
+        let mut prepared = prepare_release_batch(state.as_ref(), &user_id, &release_ids).await?;
         let pending_ids = prepared
             .pending
             .iter()
@@ -5861,7 +5896,7 @@ async fn translate_releases_batch_stream_worker(
                     if !batch_translated.is_empty() {
                         upsert_release_batch_translations(
                             state.as_ref(),
-                            user_id,
+                            &user_id,
                             &batch,
                             &batch_translated,
                         )
@@ -6008,8 +6043,8 @@ pub async fn translate_releases_batch(
     let release_ids = parse_unique_release_ids(&req.release_ids, 60)?;
     let items = run_with_api_llm_context(
         "api.translate_releases_batch",
-        Some(user_id),
-        translate_releases_batch_internal(state.as_ref(), user_id, &release_ids),
+        Some(user_id.clone()),
+        translate_releases_batch_internal(state.as_ref(), user_id.as_str(), &release_ids),
     )
     .await?;
     Ok(Json(TranslateBatchResponse { items }))
@@ -6028,11 +6063,11 @@ pub async fn translate_releases_batch_stream(
         jobs::NewTask {
             task_type: jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned(),
             payload: json!({
-                "user_id": user_id,
+                "user_id": user_id.clone(),
                 "release_ids": release_ids.clone(),
             }),
             source: "api.translate_releases_batch_stream".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -6070,7 +6105,7 @@ pub async fn translate_releases_batch_stream(
 
 pub async fn translate_release_for_user(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
     let release_id = parse_release_id_param(release_id_raw)?;
@@ -6095,8 +6130,8 @@ pub async fn translate_release(
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
             "api.translate_release.sync",
-            Some(user_id),
-            translate_release_for_user(state.as_ref(), user_id, release_id.as_str()),
+            Some(user_id.clone()),
+            translate_release_for_user(state.as_ref(), user_id.as_str(), release_id.as_str()),
         )
         .await?;
         return Ok(Json(translated).into_response());
@@ -6108,11 +6143,11 @@ pub async fn translate_release(
         jobs::NewTask {
             task_type: jobs::TASK_TRANSLATE_RELEASE.to_owned(),
             payload: json!({
-                "user_id": user_id,
+                "user_id": user_id.clone(),
                 "release_id": release_id,
             }),
             source: "api.translate_release".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -6322,7 +6357,7 @@ async fn translate_release_detail_chunks_batched(
 
 async fn translate_release_detail_internal(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_id: i64,
 ) -> Result<TranslateResponse, ApiError> {
     if state.config.ai.is_none() {
@@ -6489,8 +6524,12 @@ pub async fn translate_release_detail(
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
             "api.translate_release_detail.sync",
-            Some(user_id),
-            translate_release_detail_for_user(state.as_ref(), user_id, release_id.as_str()),
+            Some(user_id.clone()),
+            translate_release_detail_for_user(
+                state.as_ref(),
+                user_id.as_str(),
+                release_id.as_str(),
+            ),
         )
         .await?;
         return Ok(Json(translated).into_response());
@@ -6502,11 +6541,11 @@ pub async fn translate_release_detail(
         jobs::NewTask {
             task_type: jobs::TASK_TRANSLATE_RELEASE_DETAIL.to_owned(),
             payload: json!({
-                "user_id": user_id,
+                "user_id": user_id.clone(),
                 "release_id": release_id,
             }),
             source: "api.translate_release_detail".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -6515,7 +6554,7 @@ pub async fn translate_release_detail(
 
 pub async fn translate_release_detail_for_user(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
     let release_id = parse_release_id_param(release_id_raw)?;
@@ -6527,7 +6566,7 @@ pub async fn translate_release_detail_for_user(
 }
 async fn translate_release_detail_batch_internal(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     release_ids: &[i64],
 ) -> Result<Vec<TranslateBatchItem>, ApiError> {
     let mut items = Vec::with_capacity(release_ids.len());
@@ -6579,8 +6618,8 @@ pub async fn translate_release_detail_batch(
     let release_ids = parse_unique_release_ids(&req.release_ids, 20)?;
     let items = run_with_api_llm_context(
         "api.translate_release_detail_batch",
-        Some(user_id),
-        translate_release_detail_batch_internal(state.as_ref(), user_id, &release_ids),
+        Some(user_id.clone()),
+        translate_release_detail_batch_internal(state.as_ref(), user_id.as_str(), &release_ids),
     )
     .await?;
     Ok(Json(TranslateBatchResponse { items }))
@@ -6786,7 +6825,7 @@ struct NotificationBatchSourceRow {
 
 async fn translate_notifications_batch_internal(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     thread_ids: &[String],
 ) -> Result<Vec<TranslateBatchItem>, ApiError> {
     if state.config.ai.is_none() {
@@ -6987,8 +7026,8 @@ pub async fn translate_notifications_batch(
     let thread_ids = parse_unique_thread_ids(&req.thread_ids, 60)?;
     let items = run_with_api_llm_context(
         "api.translate_notifications_batch",
-        Some(user_id),
-        translate_notifications_batch_internal(state.as_ref(), user_id, &thread_ids),
+        Some(user_id.clone()),
+        translate_notifications_batch_internal(state.as_ref(), user_id.as_str(), &thread_ids),
     )
     .await?;
     Ok(Json(TranslateBatchResponse { items }))
@@ -7008,7 +7047,7 @@ pub async fn translate_notification(
     if matches!(mode, ReturnMode::Sync) {
         let translated = run_with_api_llm_context(
             "api.translate_notification.sync",
-            Some(user_id),
+            Some(user_id.clone()),
             translate_notification_for_user(state.as_ref(), user_id, thread_id.as_str()),
         )
         .await?;
@@ -7021,11 +7060,11 @@ pub async fn translate_notification(
         jobs::NewTask {
             task_type: jobs::TASK_TRANSLATE_NOTIFICATION.to_owned(),
             payload: json!({
-                "user_id": user_id,
+                "user_id": user_id.clone(),
                 "thread_id": thread_id,
             }),
             source: "api.translate_notification".to_owned(),
-            requested_by: Some(user_id),
+            requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
     )
@@ -7034,7 +7073,7 @@ pub async fn translate_notification(
 
 pub async fn translate_notification_for_user(
     state: &AppState,
-    user_id: i64,
+    user_id: String,
     thread_id_raw: &str,
 ) -> Result<TranslateResponse, ApiError> {
     let thread_id = thread_id_raw.trim().to_owned();
@@ -7043,7 +7082,7 @@ pub async fn translate_notification_for_user(
     }
 
     let mut items =
-        translate_notifications_batch_internal(state, user_id, std::slice::from_ref(&thread_id))
+        translate_notifications_batch_internal(state, &user_id, std::slice::from_ref(&thread_id))
             .await?;
     let Some(item) = items.pop() else {
         return Err(ApiError::internal("missing translation result"));
@@ -7051,9 +7090,9 @@ pub async fn translate_notification_for_user(
     translate_response_from_batch_item(item)
 }
 
-async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
+async fn require_user_id(session: &Session) -> Result<String, ApiError> {
     let Some(user_id) = session
-        .get::<i64>("user_id")
+        .get::<String>("user_id")
         .await
         .map_err(ApiError::internal)?
     else {
@@ -7063,7 +7102,7 @@ async fn require_user_id(session: &Session) -> Result<i64, ApiError> {
             "not logged in",
         ));
     };
-    Ok(user_id)
+    parse_local_id_param(user_id, "user_id")
 }
 
 fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
@@ -7085,7 +7124,7 @@ struct SessionAccessRow {
 pub(crate) async fn require_active_user_id(
     state: &AppState,
     session: &Session,
-) -> Result<i64, ApiError> {
+) -> Result<String, ApiError> {
     let user_id = require_user_id(session).await?;
     let row = sqlx::query_as::<_, SessionAccessRow>(
         r#"
@@ -7094,7 +7133,7 @@ pub(crate) async fn require_active_user_id(
         WHERE id = ?
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -7122,7 +7161,7 @@ pub(crate) async fn require_active_user_id(
         "#,
     )
     .bind(now.as_str())
-    .bind(user_id)
+    .bind(&user_id)
     .execute(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -7133,11 +7172,11 @@ pub(crate) async fn require_active_user_id(
 pub(crate) async fn require_admin_user_id(
     state: &AppState,
     session: &Session,
-) -> Result<i64, ApiError> {
+) -> Result<String, ApiError> {
     let user_id = require_active_user_id(state, session).await?;
     let is_admin =
         sqlx::query_scalar::<_, i64>(r#"SELECT is_admin FROM users WHERE id = ? LIMIT 1"#)
-            .bind(user_id)
+            .bind(&user_id)
             .fetch_one(&state.pool)
             .await
             .map_err(ApiError::internal)?;
@@ -7154,15 +7193,17 @@ pub(crate) async fn require_admin_user_id(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem,
-        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
-        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
-        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_list_llm_calls,
-        admin_list_users, admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
-        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
-        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, looks_like_json_blob, map_job_action_error, markdown_structure_preserved,
-        normalize_translation_fields, parse_batch_notification_translation_payload,
+        ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallsQuery,
+        AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
+        TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
+        admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
+        admin_list_llm_calls, admin_list_users, admin_patch_user, admin_users_offset,
+        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
+        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
+        guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, normalize_translation_fields,
+        parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
@@ -7189,6 +7230,10 @@ mod tests {
     use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
     use tower_sessions::{MemoryStore, Session};
     use url::Url;
+
+    fn test_user_id(id: i64) -> String {
+        crate::local_id::test_local_id(&format!("user-{id}"))
+    }
 
     fn test_feed_row(node_id: Option<&str>) -> FeedRow {
         FeedRow {
@@ -7231,7 +7276,7 @@ mod tests {
             task_type: task_type.to_owned(),
             status: status.to_owned(),
             source: "tests".to_owned(),
-            requested_by: Some(1),
+            requested_by: Some(test_user_id(1)),
             parent_task_id: None,
             cancel_requested: false,
             error_message: error_message.map(str::to_owned),
@@ -7247,7 +7292,7 @@ mod tests {
 
     fn test_task_event(id: i64, event_type: &str, payload_json: &str) -> AdminTaskEventItem {
         AdminTaskEventItem {
-            id,
+            id: id.to_string(),
             event_type: event_type.to_owned(),
             payload_json: payload_json.to_owned(),
             created_at: format!("2026-02-27T00:00:{:02}Z", (id % 60)),
@@ -7269,9 +7314,10 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO users (id, github_user_id, login, created_at, updated_at)
-            VALUES (1, 30215105, 'IvanLi-CN', ?, ?)
+            VALUES (?, 30215105, 'IvanLi-CN', ?, ?)
             "#,
         )
+        .bind(test_user_id(1))
         .bind(now)
         .bind(now)
         .execute(&pool)
@@ -7319,7 +7365,7 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let session = Session::new(None, store, None);
         session
-            .insert("user_id", user_id)
+            .insert("user_id", test_user_id(user_id))
             .await
             .expect("insert session user id");
         session
@@ -7327,13 +7373,14 @@ mod tests {
 
     async fn seed_user(pool: &SqlitePool, id: i64, login: &str, is_admin: i64, is_disabled: i64) {
         let created_at = format!("2026-02-23T00:00:{id:02}Z");
+        let local_id = test_user_id(id);
         sqlx::query(
             r#"
             INSERT INTO users (id, github_user_id, login, is_admin, is_disabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(id)
+        .bind(local_id)
         .bind(30000000_i64 + id)
         .bind(login)
         .bind(is_admin)
@@ -7350,13 +7397,14 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO releases (
-              user_id, repo_id, release_id, tag_name, name, body, html_url,
+              id, user_id, repo_id, release_id, tag_name, name, body, html_url,
               published_at, created_at, is_prerelease, is_draft, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
             "#,
         )
-        .bind(1_i64)
+        .bind(format!("release-{repo_id}-{release_id}"))
+        .bind(test_user_id(1))
         .bind(repo_id)
         .bind(release_id)
         .bind("v1.2.3")
@@ -7376,13 +7424,14 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO starred_repos (
-              user_id, repo_id, full_name, owner_login, name,
+              id, user_id, repo_id, full_name, owner_login, name,
               description, html_url, stargazed_at, is_private, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
             "#,
         )
-        .bind(1_i64)
+        .bind(format!("star-{repo_id}"))
+        .bind(test_user_id(1))
         .bind(repo_id)
         .bind("openai/codex")
         .bind("openai")
@@ -7401,7 +7450,7 @@ mod tests {
         call_id: &str,
         status: &str,
         source: &str,
-        requested_by: Option<i64>,
+        requested_by: Option<String>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
@@ -7473,8 +7522,8 @@ mod tests {
     #[test]
     fn guard_admin_user_update_rejects_disabling_self() {
         let err = guard_admin_user_update(AdminUserUpdateGuard {
-            acting_user_id: 7,
-            target_user_id: 7,
+            acting_user_id: test_user_id(7),
+            target_user_id: test_user_id(7),
             target_is_admin: true,
             target_is_disabled: false,
             next_is_admin: true,
@@ -7489,8 +7538,8 @@ mod tests {
     #[test]
     fn guard_admin_user_update_rejects_demoting_last_admin() {
         let err = guard_admin_user_update(AdminUserUpdateGuard {
-            acting_user_id: 1,
-            target_user_id: 2,
+            acting_user_id: test_user_id(1),
+            target_user_id: test_user_id(2),
             target_is_admin: true,
             target_is_disabled: false,
             next_is_admin: false,
@@ -7505,8 +7554,8 @@ mod tests {
     #[test]
     fn guard_admin_user_update_rejects_disabling_last_active_admin() {
         let err = guard_admin_user_update(AdminUserUpdateGuard {
-            acting_user_id: 1,
-            target_user_id: 2,
+            acting_user_id: test_user_id(1),
+            target_user_id: test_user_id(2),
             target_is_admin: true,
             target_is_disabled: false,
             next_is_admin: true,
@@ -7568,7 +7617,8 @@ mod tests {
     #[tokio::test]
     async fn admin_list_users_clears_session_for_disabled_user() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_disabled = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_disabled = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("disable seeded admin");
@@ -7592,7 +7642,7 @@ mod tests {
 
         assert_eq!(err.code(), "account_disabled");
         let remaining = probe
-            .get::<i64>("user_id")
+            .get::<String>("user_id")
             .await
             .expect("read session user id");
         assert!(remaining.is_none(), "disabled session should be cleared");
@@ -7601,7 +7651,8 @@ mod tests {
     #[tokio::test]
     async fn admin_patch_user_rejects_demoting_last_admin_via_handler() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
@@ -7611,7 +7662,7 @@ mod tests {
         let err = admin_patch_user(
             State(state),
             session,
-            Path(1_i64),
+            Path(test_user_id(1)),
             Json(AdminUserPatchRequest {
                 is_admin: Some(false),
                 is_disabled: None,
@@ -7653,7 +7704,8 @@ mod tests {
     #[tokio::test]
     async fn admin_list_llm_calls_filters_status_and_source() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
@@ -7662,7 +7714,7 @@ mod tests {
             "call-failed",
             "failed",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
         seed_llm_call(
@@ -7670,7 +7722,7 @@ mod tests {
             "call-ok",
             "succeeded",
             "api.translate_release",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
 
@@ -7683,7 +7735,7 @@ mod tests {
             Query(AdminLlmCallsQuery {
                 status: Some("failed".to_owned()),
                 source: Some("api.translate_releases_batch".to_owned()),
-                requested_by: Some(1),
+                requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
@@ -7704,7 +7756,8 @@ mod tests {
     #[tokio::test]
     async fn admin_list_llm_calls_accepts_zulu_started_filters() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
@@ -7713,7 +7766,7 @@ mod tests {
             "call-zulu",
             "succeeded",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
 
@@ -7730,7 +7783,7 @@ mod tests {
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
                 source: Some("api.translate_releases_batch".to_owned()),
-                requested_by: Some(1),
+                requested_by: Some(test_user_id(1)),
                 parent_task_id: None,
                 started_from: Some(started_from),
                 started_to: Some(started_to),
@@ -7750,7 +7803,8 @@ mod tests {
     #[tokio::test]
     async fn admin_list_llm_calls_filters_parent_task_id() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
@@ -7759,7 +7813,7 @@ mod tests {
             "call-parent-a",
             "succeeded",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
         seed_llm_call(
@@ -7767,11 +7821,13 @@ mod tests {
             "call-parent-b",
             "succeeded",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
         let now = chrono::Utc::now().to_rfc3339();
-        for task_id in ["task-123", "task-456"] {
+        let parent_task_a = crate::local_id::test_local_id("task-123");
+        let parent_task_b = crate::local_id::test_local_id("task-456");
+        for task_id in [&parent_task_a, &parent_task_b] {
             sqlx::query(
                 r#"
                 INSERT INTO job_tasks (
@@ -7790,10 +7846,11 @@ mod tests {
                   finished_at,
                   updated_at
                 )
-                VALUES (?, 'sync.releases', 'succeeded', 'tests', 1, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                VALUES (?, 'sync.releases', 'succeeded', 'tests', ?, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
                 "#,
             )
             .bind(task_id)
+            .bind(test_user_id(1))
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(now.as_str())
@@ -7809,7 +7866,7 @@ mod tests {
             WHERE id = ?
             "#,
         )
-        .bind("task-123")
+        .bind(&parent_task_a)
         .bind("translate.release.batch")
         .bind("call-parent-a")
         .execute(&pool)
@@ -7822,7 +7879,7 @@ mod tests {
             WHERE id = ?
             "#,
         )
-        .bind("task-456")
+        .bind(&parent_task_b)
         .bind("sync.releases")
         .bind("call-parent-b")
         .execute(&pool)
@@ -7838,8 +7895,8 @@ mod tests {
             Query(AdminLlmCallsQuery {
                 status: Some("all".to_owned()),
                 source: None,
-                requested_by: Some(1),
-                parent_task_id: Some("task-123".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: Some(parent_task_a.clone()),
                 started_from: None,
                 started_to: None,
                 page: Some(1),
@@ -7853,49 +7910,62 @@ mod tests {
         assert_eq!(resp.total, 1);
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-parent-a");
-        assert_eq!(resp.items[0].parent_task_id.as_deref(), Some("task-123"));
+        assert_eq!(
+            resp.items[0].parent_task_id.as_deref(),
+            Some(parent_task_a.as_str())
+        );
     }
 
     #[tokio::test]
     async fn admin_get_llm_call_detail_returns_not_found() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
         let state = setup_state(pool);
         let session = setup_session(1).await;
 
-        let err = admin_get_llm_call_detail(State(state), session, Path("missing".to_owned()))
-            .await
-            .expect_err("missing llm call should fail");
+        let err = admin_get_llm_call_detail(
+            State(state),
+            session,
+            Path(crate::local_id::test_local_id("missing-call")),
+        )
+        .await
+        .expect_err("missing llm call should fail");
         assert_eq!(err.code(), "not_found");
     }
 
     #[tokio::test]
     async fn admin_get_llm_call_detail_includes_tokens_and_messages() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
         seed_llm_call(
             &pool,
-            "call-detail",
+            &crate::local_id::test_local_id("call-detail"),
             "succeeded",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
 
         let state = setup_state(pool);
         let session = setup_session(1).await;
-        let resp = admin_get_llm_call_detail(State(state), session, Path("call-detail".to_owned()))
-            .await
-            .expect("llm call detail should pass")
-            .0;
+        let resp = admin_get_llm_call_detail(
+            State(state),
+            session,
+            Path(crate::local_id::test_local_id("call-detail")),
+        )
+        .await
+        .expect("llm call detail should pass")
+        .0;
 
-        assert_eq!(resp.id, "call-detail");
+        assert_eq!(resp.id, crate::local_id::test_local_id("call-detail"));
         assert_eq!(resp.first_token_wait_ms, Some(340));
         assert_eq!(resp.input_tokens, Some(120));
         assert_eq!(resp.output_tokens, Some(55));
@@ -7916,24 +7986,25 @@ mod tests {
     #[tokio::test]
     async fn admin_get_llm_scheduler_status_reads_aggregates() {
         let pool = setup_pool().await;
-        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = 1"#)
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
         seed_llm_call(
             &pool,
-            "call-1",
+            &crate::local_id::test_local_id("call-1"),
             "failed",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
         seed_llm_call(
             &pool,
-            "call-2",
+            &crate::local_id::test_local_id("call-2"),
             "succeeded",
             "api.translate_releases_batch",
-            Some(1),
+            Some(test_user_id(1)),
         )
         .await;
 
@@ -8097,6 +8168,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_local_id_param_accepts_trimmed_nanoid() {
+        let id = crate::local_id::test_local_id("api-parse-local-id");
+        assert_eq!(
+            super::parse_local_id_param(format!("  {id}  "), "task_id").expect("local id"),
+            id
+        );
+    }
+
+    #[test]
+    fn parse_local_id_param_rejects_malformed_value() {
+        let err = super::parse_local_id_param("bad-id".to_owned(), "task_id").expect_err("invalid");
+        assert_eq!(err.code(), "bad_request");
+        assert_eq!(err.to_string(), "invalid task_id");
+    }
+
+    #[test]
     fn task_diagnostics_translate_batch_surfaces_business_failure() {
         let task = test_task_detail_item(
             jobs::TASK_TRANSLATE_RELEASE_BATCH,
@@ -8212,9 +8299,9 @@ mod tests {
         assert_eq!(slot_diag.summary.succeeded_users, 1);
         assert_eq!(slot_diag.summary.failed_users, 1);
         assert_eq!(slot_diag.users.len(), 2);
-        assert_eq!(slot_diag.users[0].user_id, 1);
+        assert_eq!(slot_diag.users[0].user_id, "1");
         assert_eq!(slot_diag.users[0].state, "succeeded");
-        assert_eq!(slot_diag.users[1].user_id, 2);
+        assert_eq!(slot_diag.users[1].user_id, "2");
         assert_eq!(slot_diag.users[1].state, "failed");
         assert_eq!(slot_diag.users[1].error.as_deref(), Some("ai timeout"));
     }
@@ -8251,13 +8338,13 @@ mod tests {
             None,
         );
         let subscription_events = vec![AdminSyncSubscriptionEventItem {
-            id: 1,
+            id: "1".to_owned(),
             stage: "release".to_owned(),
             event_type: "rate_limited".to_owned(),
             severity: "warning".to_owned(),
             recoverable: true,
             attempt: 1,
-            user_id: Some(7),
+            user_id: Some("7".to_owned()),
             repo_id: Some(9),
             repo_full_name: Some("octo/alpha".to_owned()),
             message: Some("retryable release sync error for octo/alpha with user #7".to_owned()),
@@ -8280,7 +8367,7 @@ mod tests {
     fn task_diagnostics_sync_subscriptions_surfaces_recent_events_and_log_download() {
         let log_dir = std::env::temp_dir().join(format!(
             "octo-rill-sync-diagnostics-{}",
-            uuid::Uuid::new_v4()
+            crate::local_id::generate_local_id()
         ));
         fs::create_dir_all(&log_dir).expect("create log dir");
         let log_path = log_dir.join("task-test.ndjson");
@@ -8303,7 +8390,7 @@ mod tests {
         task.log_file_path = Some(log_path.to_string_lossy().into_owned());
         let subscription_events = vec![
             AdminSyncSubscriptionEventItem {
-                id: 7,
+                id: "7".to_owned(),
                 stage: "release".to_owned(),
                 event_type: "repo_unreachable".to_owned(),
                 severity: "error".to_owned(),
@@ -8316,13 +8403,13 @@ mod tests {
                 created_at: "2026-03-06T14:31:40Z".to_owned(),
             },
             AdminSyncSubscriptionEventItem {
-                id: 6,
+                id: "6".to_owned(),
                 stage: "star".to_owned(),
                 event_type: "network_error".to_owned(),
                 severity: "warning".to_owned(),
                 recoverable: true,
                 attempt: 1,
-                user_id: Some(23),
+                user_id: Some("23".to_owned()),
                 repo_id: None,
                 repo_full_name: None,
                 message: Some("failed to refresh starred repositories for user #23".to_owned()),
@@ -8354,6 +8441,243 @@ mod tests {
         fs::remove_dir_all(&log_dir).ok();
     }
 
+    fn fixed_local_id(prefix: char, n: usize) -> String {
+        const ALPHABET: &[u8] = crate::local_id::LOCAL_ID_ALPHABET;
+        let mut value = n;
+        let mut suffix = ['2'; 15];
+        for idx in (0..15).rev() {
+            suffix[idx] = ALPHABET[value % ALPHABET.len()] as char;
+            value /= ALPHABET.len();
+        }
+        let mut id = String::with_capacity(16);
+        id.push(prefix);
+        for ch in suffix {
+            id.push(ch);
+        }
+        id
+    }
+
+    fn indexed_created_at(idx: usize) -> String {
+        let hours = 14 + (idx / 3600);
+        let minutes = (idx / 60) % 60;
+        let seconds = idx % 60;
+        format!("2026-03-06T{hours:02}:{minutes:02}:{seconds:02}Z")
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_uses_latest_task_events_window() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-events-window");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind(r#"{"user_id":"scope22222222222","release_ids":[1]}"#)
+        .bind(r#"{"total":1,"ready":1,"missing":0,"disabled":0,"error":0}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for idx in 0..ADMIN_TASK_DETAIL_EVENT_LIMIT {
+            let created_at = indexed_created_at(idx as usize);
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('z', idx as usize).as_str())
+            .bind(task_id.as_str())
+            .bind(format!(
+                r#"{{"stage":"release","release_id":"{idx}","item_status":"ready"}}"#
+            ))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert early event");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+            VALUES (?, ?, 'task.progress', ?, ?)
+            "#,
+        )
+        .bind("2222222222222222")
+        .bind(task_id.as_str())
+        .bind(r#"{"stage":"release","release_id":"latest","item_status":"ready"}"#)
+        .bind("2026-03-06T14:31:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert latest event");
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id.clone()))
+            .await
+            .expect("task detail")
+            .0;
+
+        assert_eq!(response.event_meta.returned, ADMIN_TASK_DETAIL_EVENT_LIMIT);
+        assert!(response.event_meta.truncated);
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|event| event.payload_json.contains("latest"))
+        );
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let translate = diagnostics
+            .translate_release_batch
+            .expect("translate diagnostics");
+        assert!(
+            translate
+                .items
+                .iter()
+                .any(|item| item.release_id == "latest")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_uses_latest_subscription_events_window() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-subscription-window");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
+        .bind(r#"{"skipped":false,"star":{"total_users":1,"succeeded_users":1,"failed_users":0,"total_repos":1},"release":{"total_repos":1,"succeeded_repos":1,"failed_repos":0,"candidate_failures":0},"releases_written":1,"critical_events":1}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for idx in 0..ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT {
+            let created_at = indexed_created_at(idx as usize);
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id, task_id, stage, event_type, severity, recoverable, attempt,
+                  user_id, repo_id, repo_full_name, payload_json, created_at
+                ) VALUES (?, ?, 'release', ?, 'warning', 1, 1, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('z', idx as usize).as_str())
+            .bind(task_id.as_str())
+            .bind(format!("event-{idx}"))
+            .bind(test_user_id(2))
+            .bind(9000_i64 + idx)
+            .bind(format!("octo/repo-{idx}"))
+            .bind(format!(r#"{{"message":"event-{idx}"}}"#))
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert early subscription event");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, 'release', 'latest-event', 'error', 0, 0, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("2222222222222222")
+        .bind(task_id.as_str())
+        .bind(test_user_id(2))
+        .bind(9999_i64)
+        .bind("octo/latest")
+        .bind(r#"{"message":"latest-event"}"#)
+        .bind("2026-03-06T14:31:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert latest subscription event");
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let sync = diagnostics.sync_subscriptions.expect("sync diagnostics");
+        assert_eq!(
+            sync.recent_events.len(),
+            ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT as usize
+        );
+        assert!(
+            sync.recent_events
+                .iter()
+                .any(|event| event.event_type == "latest-event")
+        );
+    }
+
     #[tokio::test]
     async fn admin_download_realtime_task_log_returns_ndjson_attachment() {
         let pool = setup_pool().await;
@@ -8364,7 +8688,7 @@ mod tests {
         let log_path = state
             .config
             .task_log_dir
-            .join(format!("{}.ndjson", uuid::Uuid::new_v4()));
+            .join(format!("{}.ndjson", crate::local_id::generate_local_id()));
         let log_body = r#"{"event":"started"}
 {"event":"finished"}
 "#;
@@ -8392,11 +8716,11 @@ mod tests {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind("task-log-download")
+        .bind(crate::local_id::test_local_id("task-log-download"))
         .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
         .bind(jobs::STATUS_SUCCEEDED)
         .bind("scheduler")
-        .bind(2_i64)
+        .bind(test_user_id(2))
         .bind(Option::<String>::None)
         .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
         .bind(Option::<String>::None)
@@ -8414,7 +8738,7 @@ mod tests {
         let response = admin_download_realtime_task_log(
             State(state.clone()),
             session,
-            Path("task-log-download".to_owned()),
+            Path(crate::local_id::test_local_id("task-log-download")),
         )
         .await
         .expect("download task log")
@@ -8425,11 +8749,14 @@ mod tests {
             response.headers().get(header::CONTENT_TYPE),
             Some(&header::HeaderValue::from_static("application/x-ndjson"))
         );
+        let expected_disposition = header::HeaderValue::from_str(&format!(
+            r#"attachment; filename="{}.ndjson""#,
+            crate::local_id::test_local_id("task-log-download")
+        ))
+        .expect("content disposition header");
         assert_eq!(
             response.headers().get(header::CONTENT_DISPOSITION),
-            Some(&header::HeaderValue::from_static(
-                r#"attachment; filename="task-log-download.ndjson""#
-            ))
+            Some(&expected_disposition)
         );
 
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -8456,7 +8783,7 @@ mod tests {
         let brief_generate = diagnostics
             .brief_generate
             .expect("brief generate diagnostics");
-        assert_eq!(brief_generate.target_user_id, Some(7));
+        assert_eq!(brief_generate.target_user_id, Some("7".to_owned()));
         assert_eq!(brief_generate.content_length, Some(200));
     }
 
@@ -8525,7 +8852,7 @@ mod tests {
             LIMIT 1
             "#,
         )
-        .bind(1_i64)
+        .bind(test_user_id(1))
         .bind(120_i64)
         .fetch_optional(&pool)
         .await
@@ -8550,7 +8877,7 @@ mod tests {
             WHERE r.user_id = ?
             "#,
         )
-        .bind(1_i64)
+        .bind(test_user_id(1))
         .fetch_one(&pool)
         .await
         .expect("count releases without star");
@@ -8566,7 +8893,7 @@ mod tests {
             WHERE r.user_id = ?
             "#,
         )
-        .bind(1_i64)
+        .bind(test_user_id(1))
         .fetch_one(&pool)
         .await
         .expect("count releases with star");

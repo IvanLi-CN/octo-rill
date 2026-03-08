@@ -3,6 +3,13 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import type { AdminRealtimeTaskDetailResponse } from "@/api";
 
+const TARGET_USER_ID = "2f4k7m9p3x6c8v2a";
+const RELATED_USER_A = "4h6p9s3t5z8e2x4c";
+const RELATED_USER_B = "5j7r9v3x6b8d2f4h";
+const SLOT_USER_A = "6k8m2p4r7t9w3y5b";
+const SLOT_USER_B = "7n9q3s5v8x2c4f6h";
+const SLOT_USER_C = "8p2r4t6w9y3d5g7k";
+
 function buildDetail(
 	taskType: string,
 	payload: Record<string, unknown>,
@@ -19,7 +26,7 @@ function buildDetail(
 			task_type: taskType,
 			status: "succeeded",
 			source: "storybook.mock",
-			requested_by: 4,
+			requested_by: TARGET_USER_ID,
 			parent_task_id: null,
 			cancel_requested: false,
 			error_message: null,
@@ -31,7 +38,7 @@ function buildDetail(
 			result_json: result ? JSON.stringify(result) : null,
 		},
 		events: eventPayloads.map((item, idx) => ({
-			id: idx + 1,
+			id: `evt-task-${idx + 1}`,
 			event_type: "task.progress",
 			payload_json: JSON.stringify(item),
 			created_at: "2026-02-26T12:00:10Z",
@@ -50,7 +57,7 @@ const meta = {
 	args: {
 		detail: buildDetail(
 			"sync.releases",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{ repos: 3, releases: 42 },
 		),
 	},
@@ -68,7 +75,11 @@ export const Default: Story = {};
 
 export const SyncStarred: Story = {
 	args: {
-		detail: buildDetail("sync.starred", { user_id: 4 }, { repos: 18 }),
+		detail: buildDetail(
+			"sync.starred",
+			{ user_id: TARGET_USER_ID },
+			{ repos: 18 },
+		),
 	},
 };
 
@@ -76,7 +87,7 @@ export const SyncReleases: Story = {
 	args: {
 		detail: buildDetail(
 			"sync.releases",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{ repos: 9, releases: 278 },
 		),
 	},
@@ -86,7 +97,7 @@ export const SyncNotifications: Story = {
 	args: {
 		detail: buildDetail(
 			"sync.notifications",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{ notifications: 35, since: "2026-02-25T00:00:00Z" },
 		),
 	},
@@ -96,7 +107,7 @@ export const SyncAll: Story = {
 	args: {
 		detail: buildDetail(
 			"sync.all",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{
 				starred: { repos: 6 },
 				releases: { repos: 6, releases: 120 },
@@ -177,31 +188,31 @@ export const SyncSubscriptions: Story = {
 						critical_events: 6,
 						recent_events: [
 							{
-								id: 9,
+								id: "evt-sync-9",
 								stage: "release",
 								event_type: "repo_inaccessible",
 								severity: "error",
 								recoverable: false,
 								attempt: 1,
-								user_id: 23,
+								user_id: RELATED_USER_A,
 								repo_id: 9001,
 								repo_full_name: "octo/private-repo",
 								message:
-									"release sync candidate failed for octo/private-repo with user #23",
+									"release sync candidate failed for octo/private-repo with user #4h6p9s3t5z8e2x4c",
 								created_at: "2026-03-06T14:31:40Z",
 							},
 							{
-								id: 8,
+								id: "evt-sync-8",
 								stage: "release",
 								event_type: "rate_limited",
 								severity: "warning",
 								recoverable: true,
 								attempt: 2,
-								user_id: 19,
+								user_id: RELATED_USER_B,
 								repo_id: 8128,
 								repo_full_name: "octo/public-repo",
 								message:
-									"retryable release sync error for octo/public-repo with user #19",
+									"retryable release sync error for octo/public-repo with user #5j7r9v3x6b8d2f4h",
 								created_at: "2026-03-06T14:31:10Z",
 							},
 						],
@@ -277,7 +288,7 @@ export const BriefGenerate: Story = {
 	args: {
 		detail: buildDetail(
 			"brief.generate",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{ content_length: 3840 },
 		),
 	},
@@ -287,7 +298,7 @@ export const WithRelatedLlmCalls: Story = {
 	args: {
 		detail: buildDetail(
 			"sync.releases",
-			{ user_id: 4 },
+			{ user_id: TARGET_USER_ID },
 			{ repos: 9, releases: 278 },
 		),
 		relatedLlmCalls: [
@@ -296,7 +307,7 @@ export const WithRelatedLlmCalls: Story = {
 				status: "failed",
 				source: "job.api.translate_release",
 				model: "gpt-4o-mini",
-				requested_by: 4,
+				requested_by: TARGET_USER_ID,
 				parent_task_id: "task-sync.releases",
 				parent_task_type: "sync.releases",
 				max_tokens: 900,
@@ -325,16 +336,16 @@ export const BriefDailySlot: Story = {
 			{ hour_utc: 8, total: 24, succeeded: 21, failed: 3 },
 			[
 				{ stage: "collect", total_users: 24, hour_utc: 8 },
-				{ stage: "generate", index: 8, total: 24, user_id: 1008 },
+				{ stage: "generate", index: 8, total: 24, user_id: SLOT_USER_A },
 				{
 					stage: "user_succeeded",
-					user_id: 1008,
+					user_id: SLOT_USER_A,
 					key_date: "2026-02-26",
 					content_length: 1620,
 				},
-				{ stage: "generate", index: 16, total: 24, user_id: 1016 },
-				{ stage: "user_failed", user_id: 1017 },
-				{ stage: "generate", index: 24, total: 24, user_id: 1024 },
+				{ stage: "generate", index: 16, total: 24, user_id: SLOT_USER_B },
+				{ stage: "user_failed", user_id: SLOT_USER_C },
+				{ stage: "generate", index: 24, total: 24, user_id: SLOT_USER_B },
 				{
 					stage: "summary",
 					total: 24,
@@ -361,14 +372,14 @@ export const BriefDailySlot: Story = {
 						},
 						users: [
 							{
-								user_id: 1008,
+								user_id: SLOT_USER_A,
 								key_date: "2026-02-26",
 								state: "succeeded",
 								error: null,
 								last_event_at: "2026-02-26T12:00:25Z",
 							},
 							{
-								user_id: 1017,
+								user_id: SLOT_USER_C,
 								key_date: "2026-02-26",
 								state: "failed",
 								error: "ai timeout",
@@ -386,7 +397,7 @@ export const TranslateRelease: Story = {
 	args: {
 		detail: buildDetail(
 			"translate.release",
-			{ user_id: 4, release_id: "290836643" },
+			{ user_id: TARGET_USER_ID, release_id: "290836643" },
 			{ status: "ready" },
 		),
 	},
@@ -396,7 +407,10 @@ export const TranslateReleaseBatch: Story = {
 	args: {
 		detail: buildDetail(
 			"translate.release.batch",
-			{ user_id: 4, release_ids: [290836643, 290822914, 290757276] },
+			{
+				user_id: TARGET_USER_ID,
+				release_ids: ["290836643", "290822914", "290757276"],
+			},
 			{ total: 3, ready: 2, missing: 1, disabled: 0, error: 0 },
 			[
 				{ stage: "collect", total_releases: 3 },
@@ -423,7 +437,7 @@ export const TranslateReleaseBatch: Story = {
 						message: "部分 Release 翻译成功，部分失败或缺失。",
 					},
 					translate_release_batch: {
-						target_user_id: 4,
+						target_user_id: TARGET_USER_ID,
 						release_total: 3,
 						summary: {
 							total: 3,
@@ -467,7 +481,7 @@ export const TranslateReleaseDetail: Story = {
 	args: {
 		detail: buildDetail(
 			"translate.release_detail",
-			{ user_id: 4, release_id: "290836643" },
+			{ user_id: TARGET_USER_ID, release_id: "290836643" },
 			{ status: "ready" },
 		),
 	},
@@ -477,7 +491,7 @@ export const TranslateNotification: Story = {
 	args: {
 		detail: buildDetail(
 			"translate.notification",
-			{ user_id: 4, thread_id: "thread-1234" },
+			{ user_id: TARGET_USER_ID, thread_id: "thread-1234" },
 			{ status: "ready" },
 		),
 	},

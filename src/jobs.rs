@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ai, api, state::AppState, sync};
+use crate::{ai, api, local_id, state::AppState, sync};
 
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
@@ -38,7 +38,7 @@ pub struct NewTask {
     pub task_type: String,
     pub payload: Value,
     pub source: String,
-    pub requested_by: Option<i64>,
+    pub requested_by: Option<String>,
     pub parent_task_id: Option<String>,
 }
 
@@ -54,7 +54,7 @@ struct TaskRow {
     id: String,
     task_type: String,
     source: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     payload_json: String,
     cancel_requested: i64,
 }
@@ -434,7 +434,7 @@ async fn insert_task_record(
     status: &str,
     started_at: Option<&str>,
 ) -> Result<String> {
-    let task_id = uuid::Uuid::new_v4().to_string();
+    let task_id = crate::local_id::generate_local_id();
     let now = Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
     let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
@@ -460,7 +460,7 @@ async fn insert_task_record(
     .bind(&new_task.task_type)
     .bind(status)
     .bind(&new_task.source)
-    .bind(new_task.requested_by)
+    .bind(new_task.requested_by.as_deref())
     .bind(new_task.parent_task_id.as_deref())
     .bind(payload_json)
     .bind(log_file_path.as_deref())
@@ -544,7 +544,7 @@ pub async fn complete_task(
 pub async fn retry_task(
     state: &AppState,
     task_id: &str,
-    requested_by: i64,
+    requested_by: String,
 ) -> Result<EnqueuedTask> {
     #[derive(Debug, sqlx::FromRow)]
     struct RetrySourceRow {
@@ -664,10 +664,11 @@ pub async fn append_task_event(
 
     sqlx::query(
         r#"
-        INSERT INTO job_task_events (task_id, event_type, payload_json, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(task_id)
     .bind(event_type)
     .bind(payload_json)
@@ -681,34 +682,38 @@ pub async fn append_task_event(
 
 pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
     let events = stream! {
-        let mut last_id = 0_i64;
+        let mut last_event_seq = 0_i64;
         loop {
             #[derive(Debug, sqlx::FromRow)]
             struct EventRow {
-                id: i64,
+                seq: i64,
+                id: String,
                 event_type: String,
                 payload_json: String,
             }
 
             let rows = sqlx::query_as::<_, EventRow>(
                 r#"
-                SELECT id, event_type, payload_json
+                SELECT rowid AS seq, id, event_type, payload_json
                 FROM job_task_events
-                WHERE task_id = ? AND id > ?
-                ORDER BY id ASC
+                WHERE task_id = ? AND rowid > ?
+                ORDER BY rowid ASC
                 LIMIT 100
                 "#,
             )
             .bind(&task_id)
-            .bind(last_id)
+            .bind(last_event_seq)
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
 
             for row in rows {
-                last_id = row.id;
+                last_event_seq = row.seq;
                 yield Ok::<Event, Infallible>(
-                    Event::default().event(row.event_type).data(row.payload_json),
+                    Event::default()
+                        .id(row.id)
+                        .event(row.event_type)
+                        .data(row.payload_json),
                 );
             }
 
@@ -729,22 +734,25 @@ pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
                 tokio::time::sleep(Duration::from_millis(120)).await;
                 let rows = sqlx::query_as::<_, EventRow>(
                     r#"
-                    SELECT id, event_type, payload_json
+                    SELECT rowid AS seq, id, event_type, payload_json
                     FROM job_task_events
-                    WHERE task_id = ? AND id > ?
-                    ORDER BY id ASC
+                    WHERE task_id = ? AND rowid > ?
+                    ORDER BY rowid ASC
                     LIMIT 100
                     "#,
                 )
                 .bind(&task_id)
-                .bind(last_id)
+                .bind(last_event_seq)
                 .fetch_all(&state.pool)
                 .await
                 .unwrap_or_default();
 
                 for row in rows {
                     yield Ok::<Event, Infallible>(
-                        Event::default().event(row.event_type).data(row.payload_json),
+                        Event::default()
+                            .id(row.id)
+                            .event(row.event_type)
+                            .data(row.payload_json),
                     );
                 }
                 break;
@@ -765,7 +773,7 @@ pub fn task_sse_response(state: Arc<AppState>, task_id: String) -> Response {
 
 #[derive(Debug, Serialize)]
 struct AdminJobEventStreamItem {
-    event_id: i64,
+    event_id: String,
     task_id: String,
     task_type: String,
     status: String,
@@ -775,11 +783,11 @@ struct AdminJobEventStreamItem {
 
 #[derive(Debug, Serialize)]
 struct AdminLlmCallEventStreamItem {
-    event_id: i64,
+    event_id: String,
     call_id: String,
     status: String,
     source: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     event_type: String,
     created_at: String,
@@ -852,7 +860,8 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
     let events = stream! {
         #[derive(Debug, sqlx::FromRow)]
         struct EventRow {
-            id: i64,
+            seq: i64,
+            id: String,
             task_id: String,
             task_type: String,
             status: String,
@@ -862,24 +871,25 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 
         #[derive(Debug, sqlx::FromRow)]
         struct LlmEventRow {
-            id: i64,
+            seq: i64,
+            id: String,
             call_id: String,
             status: String,
             source: String,
-            requested_by: Option<i64>,
+            requested_by: Option<String>,
             parent_task_id: Option<String>,
             event_type: String,
             created_at: String,
         }
 
-        let mut last_job_event_id = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COALESCE(MAX(id), 0) FROM job_task_events"#,
+        let mut last_job_event_seq = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(rowid), 0) FROM job_task_events"#,
         )
         .fetch_one(&state.pool)
         .await
         .unwrap_or(0);
-        let mut last_llm_event_id = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COALESCE(MAX(id), 0) FROM llm_call_events"#,
+        let mut last_llm_event_seq = sqlx::query_scalar::<_, i64>(
+            r#"SELECT COALESCE(MAX(rowid), 0) FROM llm_call_events"#,
         )
         .fetch_one(&state.pool)
         .await
@@ -905,6 +915,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
             let job_rows = sqlx::query_as::<_, EventRow>(
                 r#"
                 SELECT
+                  e.rowid AS seq,
                   e.id,
                   e.task_id,
                   t.task_type,
@@ -913,20 +924,20 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                   e.created_at
                 FROM job_task_events e
                 JOIN job_tasks t ON t.id = e.task_id
-                WHERE e.id > ?
-                ORDER BY e.id ASC
+                WHERE e.rowid > ?
+                ORDER BY e.rowid ASC
                 LIMIT 200
                 "#,
             )
-            .bind(last_job_event_id)
+            .bind(last_job_event_seq)
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
 
             for row in job_rows {
-                last_job_event_id = row.id;
+                last_job_event_seq = row.seq;
                 let payload = AdminJobEventStreamItem {
-                    event_id: row.id,
+                    event_id: row.id.clone(),
                     task_id: row.task_id,
                     task_type: row.task_type,
                     status: row.status,
@@ -945,6 +956,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
             let llm_rows = sqlx::query_as::<_, LlmEventRow>(
                 r#"
                 SELECT
+                  rowid AS seq,
                   id,
                   call_id,
                   status,
@@ -954,20 +966,20 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                   event_type,
                   created_at
                 FROM llm_call_events
-                WHERE id > ?
-                ORDER BY id ASC
+                WHERE rowid > ?
+                ORDER BY rowid ASC
                 LIMIT 200
                 "#,
             )
-            .bind(last_llm_event_id)
+            .bind(last_llm_event_seq)
             .fetch_all(&state.pool)
             .await
             .unwrap_or_default();
 
             for row in llm_rows {
-                last_llm_event_id = row.id;
+                last_llm_event_seq = row.seq;
                 let payload = AdminLlmCallEventStreamItem {
-                    event_id: row.id,
+                    event_id: row.id.clone(),
                     call_id: row.call_id,
                     status: row.status,
                     source: row.source,
@@ -1235,37 +1247,37 @@ async fn execute_task(
 ) -> Result<Value> {
     match task_type {
         TASK_SYNC_STARRED => {
-            let user_id = payload_i64(payload, "user_id")?;
-            let res = sync::sync_starred(state, user_id).await?;
+            let user_id = payload_local_id(payload, "user_id")?;
+            let res = sync::sync_starred(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_SYNC_RELEASES => {
-            let user_id = payload_i64(payload, "user_id")?;
-            let res = sync::sync_releases(state, user_id).await?;
+            let user_id = payload_local_id(payload, "user_id")?;
+            let res = sync::sync_releases(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_SYNC_NOTIFICATIONS => {
-            let user_id = payload_i64(payload, "user_id")?;
-            let res = sync::sync_notifications(state, user_id).await?;
+            let user_id = payload_local_id(payload, "user_id")?;
+            let res = sync::sync_notifications(state, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_SYNC_ALL => {
-            let user_id = payload_i64(payload, "user_id")?;
-            let starred = sync::sync_starred(state, user_id).await?;
+            let user_id = payload_local_id(payload, "user_id")?;
+            let starred = sync::sync_starred(state, user_id.as_str()).await?;
             if is_task_cancel_requested(state, task_id)
                 .await
                 .unwrap_or(false)
             {
                 return Ok(json!({"canceled": true}));
             }
-            let releases = sync::sync_releases(state, user_id).await?;
+            let releases = sync::sync_releases(state, user_id.as_str()).await?;
             if is_task_cancel_requested(state, task_id)
                 .await
                 .unwrap_or(false)
             {
                 return Ok(json!({"canceled": true}));
             }
-            let notifications = sync::sync_notifications(state, user_id).await?;
+            let notifications = sync::sync_notifications(state, user_id.as_str()).await?;
             Ok(json!({
                 "starred": starred,
                 "releases": releases,
@@ -1277,37 +1289,37 @@ async fn execute_task(
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_BRIEF_GENERATE => {
-            let user_id = payload_i64(payload, "user_id")?;
-            let content = ai::generate_daily_brief(state, user_id).await?;
+            let user_id = payload_local_id(payload, "user_id")?;
+            let content = ai::generate_daily_brief(state, user_id.as_str()).await?;
             Ok(json!({"content_length": content.chars().count()}))
         }
         TASK_BRIEF_DAILY_SLOT => execute_daily_slot_task(state, task_id, payload).await,
         TASK_TRANSLATE_RELEASE => {
-            let user_id = payload_i64(payload, "user_id")?;
+            let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
-            let res = api::translate_release_for_user(state, user_id, &release_id)
+            let res = api::translate_release_for_user(state, user_id.as_str(), &release_id)
                 .await
                 .map_err(|err| anyhow!("translate_release failed: {}", err.code()))?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_TRANSLATE_RELEASE_BATCH => {
-            let user_id = payload_i64(payload, "user_id")?;
+            let user_id = payload_local_id(payload, "user_id")?;
             let release_ids = payload_i64_array(payload, "release_ids")?;
-            let res = api::translate_releases_batch_for_user(state, user_id, &release_ids)
+            let res = api::translate_releases_batch_for_user(state, user_id.as_str(), &release_ids)
                 .await
                 .map_err(|err| anyhow!("translate_releases_batch failed: {}", err.code()))?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_TRANSLATE_RELEASE_DETAIL => {
-            let user_id = payload_i64(payload, "user_id")?;
+            let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
-            let res = api::translate_release_detail_for_user(state, user_id, &release_id)
+            let res = api::translate_release_detail_for_user(state, user_id.as_str(), &release_id)
                 .await
                 .map_err(|err| anyhow!("translate_release_detail failed: {}", err.code()))?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_TRANSLATE_NOTIFICATION => {
-            let user_id = payload_i64(payload, "user_id")?;
+            let user_id = payload_local_id(payload, "user_id")?;
             let thread_id = payload_string(payload, "thread_id")?;
             let res = api::translate_notification_for_user(state, user_id, &thread_id)
                 .await
@@ -1325,7 +1337,7 @@ async fn execute_daily_slot_task(
 ) -> Result<Value> {
     #[derive(Debug, sqlx::FromRow)]
     struct UserSlotRow {
-        id: i64,
+        id: String,
         daily_brief_utc_time: String,
         last_active_at: Option<String>,
     }
@@ -1398,7 +1410,8 @@ async fn execute_daily_slot_task(
         )
         .await?;
 
-        match ai::generate_daily_brief_for_key_date_at(state, user.id, key_date, at).await {
+        match ai::generate_daily_brief_for_key_date_at(state, user.id.as_str(), key_date, at).await
+        {
             Ok(content) => {
                 succeeded += 1;
                 append_task_event(
@@ -1538,6 +1551,19 @@ fn payload_i64(payload: &Value, key: &str) -> Result<i64> {
         .get(key)
         .and_then(Value::as_i64)
         .ok_or_else(|| anyhow!("payload missing integer field: {key}"))
+}
+
+fn payload_local_id(payload: &Value, key: &str) -> Result<String> {
+    let value = payload
+        .get(key)
+        .ok_or_else(|| anyhow!("payload missing field: {key}"))?;
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| value.as_i64().map(|id| id.to_string()))
+        .ok_or_else(|| anyhow!("payload field {key} must be string"))
 }
 
 fn payload_string(payload: &Value, key: &str) -> Result<String> {
@@ -1771,7 +1797,7 @@ mod tests {
             VALUES (?, ?, ?, ?, ?)
             "#,
         )
-        .bind(id)
+        .bind(id.to_string())
         .bind(40_000_000_i64 + id)
         .bind(login)
         .bind(now)

@@ -79,6 +79,7 @@ Then open `http://127.0.0.1:55174`.
 
 - OAuth callback is handled by the backend (`/auth/github/callback`).
 - Local data (SQLite) lives under `./.data/`.
+- Local application primary keys now use 16-character NanoIDs; older SQLite files created before the NanoID cutover are not compatible and should be rebuilt (for the default path, remove `./.data/octo-rill.db` before restarting).
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
 - 模型输入上限会按内置目录解析，并固定每天同步外部目录（OpenRouter + LiteLLM）；若设置 `AI_MODEL_CONTEXT_LIMIT`，会以手动值优先。
 - Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
