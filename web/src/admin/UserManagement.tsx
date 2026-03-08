@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	type AdminUserProfileResponse,
+	type LocalUserId,
 	ApiError,
 	apiGet,
 	apiGetAdminUserProfile,
@@ -46,7 +47,7 @@ type AdminRole = "all" | "admin" | "user";
 type AdminStatus = "all" | "enabled" | "disabled";
 
 export type AdminUserItem = {
-	id: number;
+	id: LocalUserId;
 	github_user_id: number;
 	login: string;
 	name: string | null;
@@ -75,12 +76,12 @@ export type UserManagementStoryState = {
 	query?: string;
 	role?: AdminRole;
 	status?: AdminStatus;
-	profileUserId?: number;
-	pendingAdminConfirmUserId?: number;
+	profileUserId?: LocalUserId;
+	pendingAdminConfirmUserId?: LocalUserId;
 };
 
 type UserManagementProps = {
-	currentUserId: number;
+	currentUserId: LocalUserId;
 	storyState?: UserManagementStoryState;
 };
 
@@ -178,7 +179,9 @@ export function UserManagement({
 		admin_total: number;
 		active_admin_total: number;
 	}>(DEFAULT_GUARD);
-	const [actionBusyUserId, setActionBusyUserId] = useState<number | null>(null);
+	const [actionBusyUserId, setActionBusyUserId] = useState<LocalUserId | null>(
+		null,
+	);
 	const [pendingAdminConfirm, setPendingAdminConfirm] =
 		useState<PendingAdminConfirm | null>(null);
 	const [profileUser, setProfileUser] = useState<AdminUserItem | null>(null);
@@ -248,14 +251,14 @@ export function UserManagement({
 
 	const patchUser = useCallback(
 		async (
-			userId: number,
+			userId: LocalUserId,
 			payload: { is_admin?: boolean; is_disabled?: boolean },
 		) => {
 			setActionBusyUserId(userId);
 			setError(null);
 			try {
 				await apiPatchJson<AdminUserItem>(
-					`/api/admin/users/${userId}`,
+					`/api/admin/users/${encodeURIComponent(userId)}`,
 					payload,
 				);
 				await loadUsers();

@@ -11,7 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{config::AiConfig, state::AppState};
+use crate::{config::AiConfig, local_id, state::AppState};
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -62,7 +62,7 @@ tokio::task_local! {
 #[derive(Debug, Clone)]
 pub struct LlmCallContext {
     pub source: String,
-    pub requested_by: Option<i64>,
+    pub requested_by: Option<String>,
     pub parent_task_id: Option<String>,
     pub parent_task_type: Option<String>,
     pub parent_translation_batch_id: Option<String>,
@@ -847,7 +847,7 @@ async fn acquire_llm_scheduler_slot() -> (i64, SchedulerInFlightGuard) {
 struct LlmCallLogRecord {
     id: String,
     source: String,
-    requested_by: Option<i64>,
+    requested_by: Option<String>,
     parent_task_id: Option<String>,
     parent_task_type: Option<String>,
     parent_translation_batch_id: Option<String>,
@@ -856,12 +856,12 @@ struct LlmCallLogRecord {
 fn build_llm_call_log_record() -> LlmCallLogRecord {
     let context = current_llm_call_context();
     LlmCallLogRecord {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: crate::local_id::generate_local_id(),
         source: context
             .as_ref()
             .map(|ctx| ctx.source.clone())
             .unwrap_or_else(|| "ai.chat_completion".to_owned()),
-        requested_by: context.as_ref().and_then(|ctx| ctx.requested_by),
+        requested_by: context.as_ref().and_then(|ctx| ctx.requested_by.clone()),
         parent_task_id: context.as_ref().and_then(|ctx| ctx.parent_task_id.clone()),
         parent_task_type: context
             .as_ref()
@@ -903,7 +903,7 @@ async fn insert_llm_call(
     .bind(log.id.as_str())
     .bind(log.source.as_str())
     .bind(model)
-    .bind(log.requested_by)
+    .bind(log.requested_by.as_deref())
     .bind(log.parent_task_id.as_deref())
     .bind(log.parent_task_type.as_deref())
     .bind(log.parent_translation_batch_id.as_deref())
@@ -942,6 +942,7 @@ async fn append_llm_call_event(
     let inserted = sqlx::query(
         r#"
         INSERT INTO llm_call_events (
+          id,
           call_id,
           event_type,
           status,
@@ -952,6 +953,7 @@ async fn append_llm_call_event(
           created_at
         )
         SELECT
+          ?,
           id,
           ?,
           ?,
@@ -965,6 +967,7 @@ async fn append_llm_call_event(
         LIMIT 1
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(event_type)
     .bind(status)
     .bind(payload_json)
@@ -2231,7 +2234,7 @@ async fn polish_brief_markdown(
 async fn build_brief_content(
     state: &AppState,
     window: &DailyWindow,
-    user_id: i64,
+    user_id: &str,
 ) -> Result<String> {
     let start_utc = window.start_utc.to_rfc3339();
     let end_utc = window.end_utc.to_rfc3339();
@@ -2304,7 +2307,7 @@ fn resolve_daily_boundary(at: Option<NaiveTime>) -> NaiveTime {
 
 pub async fn generate_daily_brief_for_key_date(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     key_date: NaiveDate,
 ) -> Result<String> {
     let at = resolve_daily_boundary(state.config.ai_daily_at_local);
@@ -2313,7 +2316,7 @@ pub async fn generate_daily_brief_for_key_date(
 
 pub async fn generate_daily_brief_for_key_date_at(
     state: &AppState,
-    user_id: i64,
+    user_id: &str,
     key_date: NaiveDate,
     at: NaiveTime,
 ) -> Result<String> {
@@ -2327,13 +2330,14 @@ pub async fn generate_daily_brief_for_key_date_at(
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO briefs (user_id, date, content_markdown, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO briefs (id, user_id, date, content_markdown, created_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(user_id, date) DO UPDATE SET
           content_markdown = excluded.content_markdown,
           created_at = excluded.created_at
         "#,
     )
+    .bind(local_id::generate_local_id())
     .bind(user_id)
     .bind(key_date.to_string())
     .bind(&content)
@@ -2345,7 +2349,7 @@ pub async fn generate_daily_brief_for_key_date_at(
     Ok(content)
 }
 
-pub async fn generate_daily_brief(state: &AppState, user_id: i64) -> Result<String> {
+pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<String> {
     if state.config.ai.is_none() {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     }

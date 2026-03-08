@@ -5,9 +5,13 @@ import type { UserManagementStoryState } from "@/admin/UserManagement";
 import type { AdminUserItem } from "@/admin/UserManagement";
 import { AdminPanel } from "@/pages/AdminPanel";
 
+const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
+const STANDARD_USER_ID = "3g5n8q2r4y7d9w3b";
+const DISABLED_USER_ID = "4h6p9s3t5z8e2x4c";
+
 const mockAdminUsers: AdminUserItem[] = [
 	{
-		id: 1,
+		id: CURRENT_USER_ID,
 		github_user_id: 10,
 		login: "storybook-admin",
 		name: "Storybook Admin",
@@ -20,7 +24,7 @@ const mockAdminUsers: AdminUserItem[] = [
 		updated_at: "2026-02-25T08:00:00Z",
 	},
 	{
-		id: 2,
+		id: STANDARD_USER_ID,
 		github_user_id: 11,
 		login: "octo-user",
 		name: "Octo User",
@@ -33,7 +37,7 @@ const mockAdminUsers: AdminUserItem[] = [
 		updated_at: "2026-02-25T08:10:00Z",
 	},
 	{
-		id: 3,
+		id: DISABLED_USER_ID,
 		github_user_id: 12,
 		login: "disabled-user",
 		name: "Disabled User",
@@ -106,7 +110,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 				url.pathname.endsWith("/profile") &&
 				req.method === "GET"
 			) {
-				const id = Number(url.pathname.split("/").at(-2));
+				const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
 				const target = users.find((user) => user.id === id);
 				if (!target) {
 					return new Response(
@@ -137,7 +141,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 				url.pathname.startsWith("/api/admin/users/") &&
 				req.method === "PATCH"
 			) {
-				const id = Number(url.pathname.split("/").at(-1));
+				const id = decodeURIComponent(url.pathname.split("/").at(-1) ?? "");
 				const payload = (await req.json()) as {
 					is_admin?: boolean;
 					is_disabled?: boolean;
@@ -188,7 +192,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 		<AdminPanel
 			me={{
 				user: {
-					id: 1,
+					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "storybook-admin",
 					name: "Storybook Admin",
@@ -229,7 +233,7 @@ export const Filtered: Story = {
 export const ProfileSheetOpen: Story = {
 	args: {
 		storyState: {
-			profileUserId: 2,
+			profileUserId: STANDARD_USER_ID,
 		},
 	},
 };
@@ -237,7 +241,7 @@ export const ProfileSheetOpen: Story = {
 export const AdminConfirmOpen: Story = {
 	args: {
 		storyState: {
-			pendingAdminConfirmUserId: 2,
+			pendingAdminConfirmUserId: STANDARD_USER_ID,
 		},
 	},
 };
