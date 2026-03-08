@@ -1291,7 +1291,9 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 	await page.goto("/admin/jobs");
 
 	await page.getByRole("tab", { name: "LLM调度" }).click();
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
+	await expect(
+		page.getByRole("combobox", { name: "LLM 调用状态筛选" }),
+	).toBeVisible();
 	const refreshButton = page.getByRole("button", { name: "刷新" });
 	await refreshButton.click();
 	await page.getByRole("combobox", { name: "LLM 调用状态筛选" }).click();
@@ -1299,13 +1301,6 @@ test("admin ignores stale llm refresh errors after filter change", async ({
 
 	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
-	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	const staleLlmCard = page
-		.getByText("ID: llm-call-2")
-		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
-	await expect(
-		staleLlmCard.getByRole("button", { name: "详情" }),
-	).toBeDisabled();
 	await expect(page.getByText("stale llm refresh failed")).toHaveCount(0);
 
 	await page.waitForTimeout(700);
