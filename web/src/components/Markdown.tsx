@@ -1,4 +1,5 @@
 import { normalizeReleaseId } from "@/lib/releaseId";
+import { replaceIsoTimestampsWithLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -10,6 +11,12 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+
+type MarkdownNode = {
+	type?: string;
+	value?: string;
+	children?: MarkdownNode[];
+};
 
 function parseInternalReleaseLink(href: string | undefined): string | null {
 	if (!href) return null;
@@ -25,6 +32,21 @@ function parseInternalReleaseLink(href: string | undefined): string | null {
 	} catch {
 		return null;
 	}
+}
+
+function localizeTextNodes(node: MarkdownNode | null | undefined) {
+	if (!node) return;
+	if (node.type === "code" || node.type === "inlineCode") return;
+	if (node.type === "text" && typeof node.value === "string") {
+		node.value = replaceIsoTimestampsWithLocal(node.value);
+	}
+	node.children?.forEach(localizeTextNodes);
+}
+
+function remarkLocalizeIsoTimestamps() {
+	return (tree: MarkdownNode) => {
+		localizeTextNodes(tree);
+	};
 }
 
 function buildMarkdownComponents(
@@ -108,7 +130,7 @@ export function Markdown(props: {
 	return (
 		<div className={cn("space-y-3 text-sm leading-relaxed", className)}>
 			<ReactMarkdown
-				remarkPlugins={[remarkGfm]}
+				remarkPlugins={[remarkGfm, remarkLocalizeIsoTimestamps]}
 				skipHtml
 				components={buildMarkdownComponents(onInternalReleaseClick)}
 			>
