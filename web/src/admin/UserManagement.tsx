@@ -121,8 +121,22 @@ function formatUtcClockToLocalHm(utcClock: string | null | undefined) {
 	const [hourRaw, minuteRaw] = utcClock.split(":");
 	const hour = Number(hourRaw);
 	const minute = Number(minuteRaw ?? "0");
-	if (!Number.isInteger(hour) || !Number.isInteger(minute)) return "-";
-	const parsed = new Date(Date.UTC(1970, 0, 1, hour, minute, 0));
+	if (
+		!Number.isInteger(hour) ||
+		!Number.isInteger(minute) ||
+		hour < 0 ||
+		hour > 23 ||
+		minute < 0 ||
+		minute > 59
+	)
+		return "-";
+
+	// Anchor the UTC clock to the browser's current local date so DST-sensitive
+	// time zones display the current offset instead of the 1970 epoch offset.
+	const now = new Date();
+	const parsed = new Date(
+		Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0),
+	);
 	if (Number.isNaN(parsed.getTime())) return "-";
 	return HM_FORMATTER.format(parsed);
 }
@@ -553,7 +567,7 @@ export function UserManagement({
 						<div className="space-y-3 text-sm">
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">
-									最后活动（本地时区）
+									最后活动（浏览器当前时区）
 								</p>
 								<p className="mt-1 font-medium">
 									{formatLocalHm(
@@ -563,7 +577,7 @@ export function UserManagement({
 							</div>
 							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">
-									日报时间（本地时区）
+									日报时间（浏览器当前时区）
 								</p>
 								<p className="mt-1 font-medium">
 									{formatUtcClockToLocalHm(profile?.daily_brief_utc_time)}
