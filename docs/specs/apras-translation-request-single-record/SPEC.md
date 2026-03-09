@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-03-09
 - Last: 2026-03-09
 
@@ -97,13 +97,14 @@
 
 - 2026-03-09: 新增 follow-up spec，明确 request 层单条化、破坏式迁移与公开 API breaking changes；替代旧 spec 中 request-stage aggregation 的描述。
 - 2026-03-09: 实现与验证同步完成：后端迁移/调度逻辑切到单 request 直连 work item，前端与 fixtures 改为 singular result，并补跑 Rust、web build、Playwright 与 Storybook build。
+- 2026-03-09: 创建 PR #35，补上发布标签门禁与类型窄化修复；当前 checks 全绿、review-loop 无阻塞项，状态更新为 `已完成`。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
 - [x] M1: follow-up spec 与 breaking contracts 冻结。
 - [x] M2: 迁移与后端 request/work-item/batch 逻辑重建，移除 request-item/watcher 依赖。
 - [x] M3: 前端 API、feed 自动翻译与 admin 请求视图切换到单条 request 语义。
-- [ ] M4: 测试、快车道 PR、checks 与 review-loop 收敛。
+- [x] M4: 测试、快车道 PR、checks 与 review-loop 收敛。
 
 ## 风险与开放问题
 
