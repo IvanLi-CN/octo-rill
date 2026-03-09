@@ -100,6 +100,71 @@
 - [x] `cd web && bun run build`
 - [x] `cd web && bun run e2e -- admin-jobs.spec.ts`
 
+## 计划资产（Plan assets）
+
+- Directory: `docs/specs/nbz5z-translation-worker-board/assets/`
+- In-plan references: `![...](./assets/<file>.png)`
+- PR visual evidence source: maintain `## Visual Evidence (PR)` in this spec when PR screenshots are needed.
+- If an asset must be used in impl (runtime/test/official docs), list it in `资产晋升（Asset promotion）` and promote it to a stable project path during implementation.
+
+## Visual Evidence (PR)
+
+### 桌面端总览（工作者板 + 需求队列）
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `pages-adminjobs--translation-worker-board-busy`
+- state: `desktop-overview`
+- evidence_note: 验证桌面端翻译调度页采用紧凑工作者板，并且需求队列表格右侧操作列完整显示、无横向裁切。
+
+![桌面端翻译调度总览](./assets/translation-overview.png)
+
+### 工作者详情抽屉
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `pages-adminjobs--translation-worker-board-busy`
+- state: `worker-detail-drawer`
+- evidence_note: 验证工作者卡片可点击进入抽屉，并展示当前状态、负载、批次与批次跳转入口。
+
+![工作者详情抽屉](./assets/worker-drawer.png)
+
+### 任务记录 Tab
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `pages-adminjobs--translation-worker-board-busy`
+- state: `history-tab`
+- evidence_note: 验证任务记录以单行表格展示批次历史，并保留槽位、请求数与详情入口。
+
+![任务记录表格](./assets/history-tab.png)
+
+### 小屏需求队列列表态
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `pages-adminjobs--translation-worker-board-mobile`
+- state: `mobile-queue-list`
+- evidence_note: 验证小屏宽度下需求队列退化为单条列表项，并保持单行字段与详情入口。
+
+![小屏需求队列列表态](./assets/mobile-queue-list.png)
+
+## 资产晋升（Asset promotion）
+
+None
+
 ## 实现里程碑（Milestones / Delivery checklist）
 
 - [x] M1: follow-up spec、DB/runtime 契约与管理端接口增量冻结。
