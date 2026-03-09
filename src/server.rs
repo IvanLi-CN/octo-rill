@@ -63,6 +63,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("failed to build http client")?;
 
     let app_state = Arc::new(AppState {
+        llm_scheduler: Arc::new(ai::LlmScheduler::new(config.ai_max_concurrency)),
         config: config.clone(),
         pool: pool.clone(),
         http,

@@ -16,6 +16,22 @@ fn ensure_trailing_slash(mut url: Url) -> Url {
     url
 }
 
+fn parse_positive_usize_env(name: &str) -> Result<Option<usize>> {
+    env::var(name)
+        .ok()
+        .map(|raw| {
+            raw.parse::<usize>()
+                .with_context(|| format!("invalid {name} (expected positive integer)"))
+                .and_then(|parsed| {
+                    if parsed == 0 {
+                        anyhow::bail!("invalid {name} (expected positive integer)");
+                    }
+                    Ok(parsed)
+                })
+        })
+        .transpose()
+}
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
@@ -27,6 +43,7 @@ pub struct AppConfig {
     pub encryption_key: EncryptionKey,
     pub github: GitHubOAuthConfig,
     pub ai: Option<AiConfig>,
+    pub ai_max_concurrency: usize,
     pub ai_model_context_limit: Option<u32>,
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
 }
@@ -76,6 +93,7 @@ impl fmt::Debug for AppConfig {
             .field("job_worker_concurrency", &self.job_worker_concurrency)
             .field("github", &self.github)
             .field("ai", &self.ai)
+            .field("ai_max_concurrency", &self.ai_max_concurrency)
             .field("ai_model_context_limit", &self.ai_model_context_limit)
             .field("ai_daily_at_local", &self.ai_daily_at_local)
             .field("encryption_key", &"<redacted>")
@@ -109,22 +127,8 @@ impl AppConfig {
             .filter(|candidate| !candidate.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from(".data/task-logs"));
 
-        let job_worker_concurrency = env::var("OCTORILL_TASK_WORKERS")
-            .ok()
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .context("invalid OCTORILL_TASK_WORKERS (expected positive integer)")
-                    .and_then(|parsed| {
-                        if parsed == 0 {
-                            anyhow::bail!(
-                                "invalid OCTORILL_TASK_WORKERS (expected positive integer)"
-                            );
-                        }
-                        Ok(parsed)
-                    })
-            })
-            .transpose()?
-            .unwrap_or(4);
+        let job_worker_concurrency =
+            parse_positive_usize_env("OCTORILL_TASK_WORKERS")?.unwrap_or(4);
 
         let encryption_key = env::var("OCTORILL_ENCRYPTION_KEY_BASE64")
             .context("OCTORILL_ENCRYPTION_KEY_BASE64 is required")?;
@@ -159,6 +163,8 @@ impl AppConfig {
             })
         }
         .transpose()?;
+
+        let ai_max_concurrency = parse_positive_usize_env("AI_MAX_CONCURRENCY")?.unwrap_or(1);
 
         let ai_model_context_limit = env::var("AI_MODEL_CONTEXT_LIMIT")
             .ok()
@@ -209,8 +215,82 @@ impl AppConfig {
                 redirect_url: github_redirect_url,
             },
             ai,
+            ai_max_concurrency,
             ai_model_context_limit,
             ai_daily_at_local,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_required_env() {
+        unsafe {
+            env::set_var(
+                "OCTORILL_ENCRYPTION_KEY_BASE64",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            );
+            env::set_var("GITHUB_CLIENT_ID", "test-client-id");
+            env::set_var("GITHUB_CLIENT_SECRET", "test-client-secret");
+            env::set_var(
+                "GITHUB_OAUTH_REDIRECT_URL",
+                "http://127.0.0.1:58090/auth/callback",
+            );
+            env::remove_var("AI_API_KEY");
+            env::remove_var("AI_MAX_CONCURRENCY");
+            env::remove_var("OCTORILL_TASK_WORKERS");
+        }
+    }
+
+    #[test]
+    fn from_env_defaults_ai_max_concurrency_to_one() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.ai_max_concurrency, 1);
+    }
+
+    #[test]
+    fn from_env_rejects_zero_ai_max_concurrency() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("AI_MAX_CONCURRENCY", "0");
+        }
+
+        let err = AppConfig::from_env().expect_err("zero concurrency should fail");
+
+        assert!(
+            err.to_string()
+                .contains("invalid AI_MAX_CONCURRENCY (expected positive integer)"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_non_numeric_ai_max_concurrency() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("AI_MAX_CONCURRENCY", "abc");
+        }
+
+        let err = AppConfig::from_env().expect_err("non-numeric concurrency should fail");
+
+        assert!(
+            err.to_string()
+                .contains("invalid AI_MAX_CONCURRENCY (expected positive integer)"),
+            "unexpected error: {err:?}"
+        );
     }
 }
