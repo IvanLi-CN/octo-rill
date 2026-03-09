@@ -435,10 +435,19 @@ export type TranslationRequestItemInput = {
 	source_blocks: TranslationSourceBlock[];
 	target_slots: Array<"title_zh" | "summary_md" | "body_md">;
 };
-export type TranslationSubmitRequest = {
+export type TranslationSingleSubmitRequest = {
 	mode: "async" | "wait" | "stream";
-	items: TranslationRequestItemInput[];
+	item: TranslationRequestItemInput;
+	items?: never;
 };
+export type TranslationBatchSubmitRequest = {
+	mode: "async";
+	items: TranslationRequestItemInput[];
+	item?: never;
+};
+export type TranslationSubmitRequest =
+	| TranslationSingleSubmitRequest
+	| TranslationBatchSubmitRequest;
 export type TranslationResultItem = {
 	producer_ref: string;
 	entity_id: string;
@@ -455,14 +464,25 @@ export type TranslationResultItem = {
 export type TranslationRequestResponse = {
 	request_id: string;
 	status: "queued" | "running" | "completed" | "failed";
-	items?: TranslationResultItem[] | null;
+	result?: TranslationResultItem | null;
+};
+export type TranslationBatchSubmitItemResponse = {
+	request_id: string;
+	status: "queued" | "running" | "completed" | "failed";
+	producer_ref: string;
+	entity_id: string;
+	kind: string;
+	variant: string;
+};
+export type TranslationBatchSubmitResponse = {
+	requests: TranslationBatchSubmitItemResponse[];
 };
 export type TranslationRequestStreamEvent = {
 	event: "queued" | "batched" | "running" | "completed" | "failed";
 	request_id: string;
 	status: "queued" | "running" | "completed" | "failed";
-	batch_ids?: string[] | null;
-	items?: TranslationResultItem[] | null;
+	batch_id?: string | null;
+	result?: TranslationResultItem | null;
 	error?: string | null;
 };
 export type AdminTranslationWorkerStatus = {
@@ -502,8 +522,11 @@ export type AdminTranslationRequestListItem = {
 	request_origin: "user" | "system" | string;
 	requested_by: LocalUserId | null;
 	scope_user_id: LocalUserId;
-	item_count: number;
-	completed_item_count: number;
+	producer_ref: string;
+	kind: string;
+	variant: string;
+	entity_id: string;
+	batch_id: string | null;
 	created_at: string;
 	started_at: string | null;
 	finished_at: string | null;
@@ -517,7 +540,7 @@ export type AdminTranslationRequestsResponse = {
 };
 export type AdminTranslationRequestDetailResponse = {
 	request: AdminTranslationRequestListItem;
-	items: TranslationResultItem[];
+	result: TranslationResultItem;
 };
 export type AdminTranslationBatchListItem = {
 	id: string;
@@ -553,15 +576,20 @@ export type AdminTranslationBatchDetailResponse = {
 	llm_calls: AdminTranslationLinkedLlmCall[];
 };
 export async function apiSubmitTranslationRequest(
+	body: TranslationSingleSubmitRequest,
+): Promise<TranslationRequestResponse>;
+export async function apiSubmitTranslationRequest(
+	body: TranslationBatchSubmitRequest,
+): Promise<TranslationBatchSubmitResponse>;
+export async function apiSubmitTranslationRequest(
 	body: TranslationSubmitRequest,
-): Promise<TranslationRequestResponse> {
-	return apiPostJson<TranslationRequestResponse>(
-		"/api/translate/requests",
-		body,
-	);
+): Promise<TranslationRequestResponse | TranslationBatchSubmitResponse> {
+	return apiPostJson<
+		TranslationRequestResponse | TranslationBatchSubmitResponse
+	>("/api/translate/requests", body);
 }
 export async function apiOpenTranslationRequestStream(
-	body: TranslationSubmitRequest,
+	body: Extract<TranslationSingleSubmitRequest, { mode: "stream" }>,
 ): Promise<Response> {
 	const res = await fetch("/api/translate/requests", {
 		method: "POST",
@@ -629,20 +657,18 @@ export async function apiTranslateReleaseDetail(
 	];
 	const response = await apiSubmitTranslationRequest({
 		mode: "wait",
-		items: [
-			{
-				producer_ref: `release_detail:${detail.release_id}`,
-				kind: "release_detail",
-				variant: "detail_card",
-				entity_id: detail.release_id,
-				target_lang: "zh-CN",
-				max_wait_ms: 5_000,
-				source_blocks,
-				target_slots: ["title_zh", "body_md"],
-			},
-		],
+		item: {
+			producer_ref: `release_detail:${detail.release_id}`,
+			kind: "release_detail",
+			variant: "detail_card",
+			entity_id: detail.release_id,
+			target_lang: "zh-CN",
+			max_wait_ms: 5_000,
+			source_blocks,
+			target_slots: ["title_zh", "body_md"],
+		},
 	});
-	const translated = response.items?.[0];
+	const translated = response.result;
 	if (
 		!translated ||
 		(translated.status !== "ready" && translated.status !== "disabled")

@@ -172,9 +172,14 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		if (req.method() === "POST" && pathname === "/api/translate/requests") {
 			const body = req.postDataJSON() as {
 				mode?: string;
-				items?: Array<{ entity_id?: string; kind?: string; variant?: string }>;
+				item?: {
+					producer_ref?: string;
+					entity_id?: string;
+					kind?: string;
+					variant?: string;
+				};
 			};
-			const item = body.items?.[0];
+			const item = body.item;
 			if (!item || item.entity_id !== cfg.releaseId) {
 				return json(
 					route,
@@ -184,58 +189,31 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 			}
 			if (body.mode === "wait") {
 				return json(route, {
-					request_id: "req-release-detail-1",
+					request_id: `req-${item.kind ?? "translation"}-1`,
 					status: "completed",
-					items: [
-						{
-							producer_ref: cfg.releaseId,
-							entity_id: cfg.releaseId,
-							kind: "release_detail",
-							variant: "detail_card",
-							status: "ready",
-							title_zh: cfg.translatedTitle,
-							summary_md: null,
-							body_md: cfg.translatedSummary,
-							error: null,
-							work_item_id: "work-1",
-							batch_id: "batch-1",
-						},
-					],
-				});
-			}
-			if (body.mode === "stream") {
-				return route.fulfill({
-					status: 200,
-					contentType: "application/x-ndjson",
-					body: `${[
-						JSON.stringify({
-							event: "queued",
-							request_id: "req-feed-stream-1",
-							status: "queued",
-						}),
-						JSON.stringify({
-							event: "completed",
-							request_id: "req-feed-stream-1",
-							status: "completed",
-							batch_ids: ["batch-feed-1"],
-							items: [
-								{
-									producer_ref: cfg.releaseId,
-									entity_id: cfg.releaseId,
-									kind: "release_summary",
-									variant: "feed_card",
-									status: "ready",
-									title_zh: cfg.translatedTitle,
-									summary_md: cfg.translatedSummary,
-									body_md: null,
-									error: null,
-									work_item_id: "work-feed-1",
-									batch_id: "batch-feed-1",
-								},
-							],
-						}),
-					].join("\n")}
-`,
+					result: {
+						producer_ref:
+							item.producer_ref ??
+							(item.kind === "release_detail"
+								? `release_detail:${cfg.releaseId}`
+								: `feed.auto_translate:release:${cfg.releaseId}`),
+						entity_id: cfg.releaseId,
+						kind: item.kind ?? "release_summary",
+						variant: item.variant ?? "feed_card",
+						status: "ready",
+						title_zh: cfg.translatedTitle,
+						summary_md:
+							item.kind === "release_detail" ? null : cfg.translatedSummary,
+						body_md:
+							item.kind === "release_detail" ? cfg.translatedSummary : null,
+						error: null,
+						work_item_id:
+							item.kind === "release_detail" ? "work-detail-1" : "work-feed-1",
+						batch_id:
+							item.kind === "release_detail"
+								? "batch-detail-1"
+								: "batch-feed-1",
+					},
 				});
 			}
 			return json(
@@ -356,7 +334,7 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await expect(page.getByText("#123")).toBeVisible();
 });
 
-test("feed auto translate resolves from stream request", async ({ page }) => {
+test("feed auto translate resolves from wait request", async ({ page }) => {
 	await installApiMocks(page, {
 		withAutoTranslateFeed: true,
 	});

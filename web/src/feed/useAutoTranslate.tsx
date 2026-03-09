@@ -1,17 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-	apiOpenTranslationRequestStream,
 	apiSubmitTranslationRequest,
 	type TranslationRequestItemInput,
-	type TranslationRequestStreamEvent,
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
-const BATCH_SIZE = 8;
-const BATCH_FLUSH_DELAY_MS = 300;
-const STREAM_RECOVERY_MAX_RETRIES = 3;
+const QUEUE_FLUSH_DELAY_MS = 300;
+const WAIT_RECOVERY_MAX_RETRIES = 3;
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -74,7 +71,7 @@ export function useAutoTranslate(params: {
 	const queuedRef = useRef<string[]>([]);
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
-	const streamRetryCountRef = useRef(new Map<string, number>());
+	const waitRetryCountRef = useRef(new Map<string, number>());
 	const runningRef = useRef(0);
 	const flushTimerRef = useRef<number | null>(null);
 
@@ -89,89 +86,35 @@ export function useAutoTranslate(params: {
 		[enabled],
 	);
 
-	const translateBatch = useCallback(async (items: FeedItem[]) => {
-		return apiSubmitTranslationRequest({
+	const translateSingle = useCallback(async (item: FeedItem) => {
+		const response = await apiSubmitTranslationRequest({
 			mode: "wait",
-			items: items.map(buildReleaseSummaryRequestItem),
+			item: buildReleaseSummaryRequestItem(item),
 		});
+		const translated = response.result;
+		const mapped = translated
+			? mapTranslationItemToFeedResponse(translated)
+			: null;
+		if (!translated || !mapped) {
+			throw new Error(translated?.error ?? "translate failed");
+		}
+		return { translated, mapped };
 	}, []);
 
-	const translateBatchStream = useCallback(
-		async (
-			items: FeedItem[],
-			onItems: (
-				items: Array<{
-					id: string;
-					status: "ready" | "disabled" | "missing" | "error" | "queued";
-					title_zh: string | null;
-					summary_md: string | null;
-					error: string | null;
-				}>,
-			) => void,
-		): Promise<void> => {
-			const res = await apiOpenTranslationRequestStream({
-				mode: "stream",
-				items: items.map(buildReleaseSummaryRequestItem),
-			});
-
-			if (!res.body) {
-				throw new Error("translate stream missing response body");
-			}
-
-			const reader = res.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-			let terminalSeen = false;
-
-			const handleLine = (rawLine: string) => {
-				const line = rawLine.trim();
-				if (!line) return;
-				let evt: TranslationRequestStreamEvent;
-				try {
-					evt = JSON.parse(line) as TranslationRequestStreamEvent;
-				} catch {
-					return;
-				}
-				if (evt.items?.length) {
-					onItems(
-						evt.items.map((item) => ({
-							id: item.entity_id,
-							status: item.status,
-							title_zh: item.title_zh,
-							summary_md: item.summary_md,
-							error: item.error,
-						})),
-					);
-				}
-				if (evt.event === "completed" || evt.event === "failed") {
-					terminalSeen = true;
-				}
-			};
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				buffer += decoder.decode(value, { stream: true });
-				let newlineIdx = buffer.indexOf("\n");
-				while (newlineIdx >= 0) {
-					const line = buffer.slice(0, newlineIdx);
-					buffer = buffer.slice(newlineIdx + 1);
-					handleLine(line);
-					newlineIdx = buffer.indexOf("\n");
-				}
-			}
-
-			buffer += decoder.decode();
-			if (buffer.trim()) {
-				handleLine(buffer);
-			}
-
-			if (!terminalSeen) {
-				throw new Error("translate stream ended before terminal event");
-			}
-		},
-		[],
-	);
+	const requeueAfterFailure = useCallback((item: FeedItem) => {
+		const key = keyOf(item);
+		if (failedRef.current.has(key)) return;
+		const retries = waitRetryCountRef.current.get(key) ?? 0;
+		if (retries >= WAIT_RECOVERY_MAX_RETRIES) {
+			failedRef.current.add(key);
+			waitRetryCountRef.current.delete(key);
+			return;
+		}
+		waitRetryCountRef.current.set(key, retries + 1);
+		if (!queuedRef.current.includes(key) && !inFlightRef.current.has(key)) {
+			queuedRef.current.push(key);
+		}
+	}, []);
 
 	const pump = useCallback(() => {
 		if (!enabled) return;
@@ -179,89 +122,45 @@ export function useAutoTranslate(params: {
 			runningRef.current < MAX_CONCURRENT &&
 			queuedRef.current.length > 0
 		) {
-			const keys: string[] = [];
-			while (keys.length < BATCH_SIZE && queuedRef.current.length > 0) {
-				const key = queuedRef.current.shift();
-				if (!key) break;
-				if (inFlightRef.current.has(key)) continue;
-				keys.push(key);
+			const key = queuedRef.current.shift();
+			if (!key || inFlightRef.current.has(key)) {
+				continue;
 			}
-			if (keys.length === 0) continue;
 
-			const batchItems = keys
-				.map((key) => itemByKeyRef.current.get(key))
-				.filter((item): item is FeedItem =>
-					Boolean(item && shouldAutoTranslate(item)),
-				);
-			if (batchItems.length === 0) continue;
-
-			for (const item of batchItems) {
-				inFlightRef.current.add(keyOf(item));
+			const item = itemByKeyRef.current.get(key);
+			if (!item || !shouldAutoTranslate(item)) {
+				continue;
 			}
+
+			inFlightRef.current.add(key);
 			runningRef.current += 1;
 			forceRender((x) => x + 1);
 
-			const byId = new Map(batchItems.map((item) => [item.id, item]));
-			const handled = new Set<string>();
-			const requeueAfterStreamFailure = (item: FeedItem) => {
-				const key = keyOf(item);
-				if (handled.has(key)) return;
-				if (failedRef.current.has(key)) return;
-				const retries = streamRetryCountRef.current.get(key) ?? 0;
-				if (retries >= STREAM_RECOVERY_MAX_RETRIES) {
-					failedRef.current.add(key);
-					streamRetryCountRef.current.delete(key);
-					return;
-				}
-				streamRetryCountRef.current.set(key, retries + 1);
-				if (!queuedRef.current.includes(key) && !inFlightRef.current.has(key)) {
-					queuedRef.current.push(key);
-				}
-			};
-			let streamErrored = false;
-
-			void translateBatchStream(batchItems, (translatedItems) => {
-				for (const translated of translatedItems) {
-					const item = byId.get(translated.id);
-					if (!item) continue;
-					const key = keyOf(item);
-					if (handled.has(key)) continue;
-					handled.add(key);
-					streamRetryCountRef.current.delete(key);
-
-					inFlightRef.current.delete(key);
-					const mapped = mapTranslationItemToFeedResponse(translated);
-					if (mapped) {
-						onTranslated(item, mapped);
-						if (translated.status === "disabled") {
-							failedRef.current.add(key);
-						}
-					} else {
+			void translateSingle(item)
+				.then(({ translated, mapped }) => {
+					waitRetryCountRef.current.delete(key);
+					onTranslated(item, mapped);
+					if (translated.status === "disabled") {
 						failedRef.current.add(key);
 					}
-				}
-				forceRender((x) => x + 1);
-			})
+				})
 				.catch(() => {
-					streamErrored = true;
-					for (const item of batchItems) {
-						requeueAfterStreamFailure(item);
-					}
+					requeueAfterFailure(item);
 				})
 				.finally(() => {
-					for (const item of batchItems) {
-						const key = keyOf(item);
-						if (!handled.has(key) && !streamErrored) {
-							requeueAfterStreamFailure(item);
-						}
-						inFlightRef.current.delete(key);
-					}
+					inFlightRef.current.delete(key);
 					runningRef.current -= 1;
 					forceRender((x) => x + 1);
 					pump();
 				});
 		}
-	}, [enabled, onTranslated, shouldAutoTranslate, translateBatchStream]);
+	}, [
+		enabled,
+		onTranslated,
+		requeueAfterFailure,
+		shouldAutoTranslate,
+		translateSingle,
+	]);
 
 	const schedulePump = useCallback(() => {
 		if (!enabled) return;
@@ -269,7 +168,7 @@ export function useAutoTranslate(params: {
 		flushTimerRef.current = window.setTimeout(() => {
 			flushTimerRef.current = null;
 			pump();
-		}, BATCH_FLUSH_DELAY_MS);
+		}, QUEUE_FLUSH_DELAY_MS);
 	}, [enabled, pump]);
 
 	const enqueue = useCallback(
@@ -307,20 +206,20 @@ export function useAutoTranslate(params: {
 		async (item: FeedItem) => {
 			const key = keyOf(item);
 			failedRef.current.delete(key);
+			waitRetryCountRef.current.delete(key);
+			queuedRef.current = queuedRef.current.filter(
+				(queuedKey) => queuedKey !== key,
+			);
 			inFlightRef.current.add(key);
 			forceRender((x) => x + 1);
 
 			try {
-				const batch = await translateBatch([item]);
-				const translated = batch.items?.[0];
-				const res = translated
-					? mapTranslationItemToFeedResponse(translated)
-					: null;
-				if (!translated || !res) {
-					throw new Error(translated?.error ?? "translate failed");
+				const { translated, mapped } = await translateSingle(item);
+				onTranslated(item, mapped);
+				if (translated.status === "disabled") {
+					failedRef.current.add(key);
 				}
-				onTranslated(item, res);
-				return res;
+				return mapped;
 			} catch (err) {
 				failedRef.current.add(key);
 				throw err;
@@ -329,7 +228,7 @@ export function useAutoTranslate(params: {
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, translateBatch],
+		[onTranslated, translateSingle],
 	);
 
 	useEffect(() => {
