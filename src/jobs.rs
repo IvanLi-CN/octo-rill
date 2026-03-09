@@ -1,4 +1,4 @@
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use async_stream::stream;
@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ai, api, local_id, state::AppState, sync};
+use crate::{ai, api, local_id, state::AppState, sync, translations};
 
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
@@ -906,6 +906,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
         )
         .await
         .unwrap_or_default();
+        let mut last_translation_worker_updated_at = HashMap::<String, String>::new();
 
         // Emit one lightweight frame immediately so proxies/browsers can
         // complete SSE handshake and update client connection state promptly.
@@ -1049,6 +1050,34 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                     status: row.status,
                     event_type: "translation.batch.updated".to_owned(),
                     created_at: row.updated_at,
+                };
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(format!("translation-{}", event_id))
+                        .event("translation.event")
+                        .data(data),
+                );
+            }
+
+            for worker in translations::translation_worker_runtime_statuses().await {
+                let last_seen = last_translation_worker_updated_at
+                    .get(worker.worker_id.as_str())
+                    .cloned();
+                if last_seen.as_deref() == Some(worker.updated_at.as_str()) {
+                    continue;
+                }
+                last_translation_worker_updated_at
+                    .insert(worker.worker_id.clone(), worker.updated_at.clone());
+
+                let event_id = format!("worker:{}:{}", worker.updated_at, worker.worker_id);
+                let payload = AdminTranslationEventStreamItem {
+                    event_id: event_id.clone(),
+                    resource_type: "worker".to_owned(),
+                    resource_id: worker.worker_id,
+                    status: worker.status,
+                    event_type: "translation.worker.updated".to_owned(),
+                    created_at: worker.updated_at,
                 };
                 let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
                 yield Ok::<Event, Infallible>(
@@ -1826,14 +1855,15 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO translation_requests (
-              id, mode, source, requested_by, scope_user_id, status,
+              id, mode, source, request_origin, requested_by, scope_user_id, status,
               item_count, completed_item_count, created_at, started_at, finished_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(request_id)
         .bind("async")
         .bind("feed.auto_translate")
+        .bind("user")
         .bind(1_i64)
         .bind(1_i64)
         .bind(status)
