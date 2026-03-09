@@ -1,7 +1,7 @@
 # 可配置 LLM 并行调度（取消固定限流）（#gh3tz）
 
 ## 状态
-- 当前状态：部分完成（3/4）
+- 当前状态：已完成
 - Spec 目录：`docs/specs/gh3tz-llm-max-concurrency/`
 - 负责人：Codex
 
@@ -34,7 +34,7 @@
 ### Out of scope
 - 其它非 LLM 调度器（例如 translation worker board）的并发策略调整。
 - 新增管理员写操作去在线调整并发上限。
-- 改造上游供应商限流重试策略。
+- 新增独立 QPS / 节流配置，或做跨实例共享限流。
 
 ## 功能与行为规格（Functional / Behavior Spec）
 ### 配置与启动
@@ -79,15 +79,17 @@
 - [x] M1: `AI_MAX_CONCURRENCY` 配置解析与 runtime semaphore 落地
 - [x] M2: 管理员 LLM 状态 API / UI / mock / e2e 切换到并发语义
 - [x] M3: README / `.env.example` / docs-site 配置说明同步
-- [ ] M4: PR、checks、review-loop 与 spec-sync 收敛完成
+- [x] M4: PR、checks、review-loop 与 spec-sync 收敛完成
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 - 假设：主人明确接受“只保留最大并行数，不保留固定限流”。
 - 假设：默认值维持 `1`，以避免旧部署在未改配置时突然放大量。
-- 风险：取消固定节流后，上游供应商的真实速率限制更容易暴露；本规格只保留现有失败重试，不新增额外保护。
+- 风险：取消固定节流后，上游供应商的真实速率限制仍可能暴露；当前仅保留单次请求失败后的 `Retry-After` / 指数退避重试，不提供独立 QPS 保护。
 - 风险：管理员页面与 Storybook / e2e fixture 若未完全同步，会出现类型或断言漂移。
 
 ## 变更记录（Change log）
 - 2026-03-09: 新建规格，冻结 `AI_MAX_CONCURRENCY`、无固定限流、管理员并发状态改造范围与验收标准。
 - 2026-03-09: 完成后端 permit scheduler、管理员并发状态展示、README / docs-site / e2e 同步，并通过 `cargo test`、`bun run build`、`bun run e2e -- admin-jobs.spec.ts` 本地验证。
-- 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并增加 blank-value 回归测试。
+- 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
+- 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
+- 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。

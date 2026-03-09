@@ -16,22 +16,30 @@ fn ensure_trailing_slash(mut url: Url) -> Url {
     url
 }
 
-fn parse_positive_usize_env(name: &str) -> Result<Option<usize>> {
-    env::var(name)
-        .ok()
-        .map(|raw| raw.trim().to_owned())
-        .filter(|raw| !raw.is_empty())
-        .map(|raw| {
-            raw.parse::<usize>()
-                .with_context(|| format!("invalid {name} (expected positive integer)"))
-                .and_then(|parsed| {
-                    if parsed == 0 {
-                        anyhow::bail!("invalid {name} (expected positive integer)");
-                    }
-                    Ok(parsed)
-                })
-        })
-        .transpose()
+fn parse_positive_usize_env(name: &str, blank_is_unset: bool) -> Result<Option<usize>> {
+    let Some(raw) = env::var_os(name) else {
+        return Ok(None);
+    };
+
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid {name} (expected positive integer)"))?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        if blank_is_unset {
+            return Ok(None);
+        }
+        anyhow::bail!("invalid {name} (expected positive integer)");
+    }
+
+    let parsed = raw
+        .parse::<usize>()
+        .with_context(|| format!("invalid {name} (expected positive integer)"))?;
+    if parsed == 0 {
+        anyhow::bail!("invalid {name} (expected positive integer)");
+    }
+
+    Ok(Some(parsed))
 }
 
 #[derive(Clone)]
@@ -130,7 +138,7 @@ impl AppConfig {
             .unwrap_or_else(|| PathBuf::from(".data/task-logs"));
 
         let job_worker_concurrency =
-            parse_positive_usize_env("OCTORILL_TASK_WORKERS")?.unwrap_or(4);
+            parse_positive_usize_env("OCTORILL_TASK_WORKERS", false)?.unwrap_or(4);
 
         let encryption_key = env::var("OCTORILL_ENCRYPTION_KEY_BASE64")
             .context("OCTORILL_ENCRYPTION_KEY_BASE64 is required")?;
@@ -166,7 +174,7 @@ impl AppConfig {
         }
         .transpose()?;
 
-        let ai_max_concurrency = parse_positive_usize_env("AI_MAX_CONCURRENCY")?.unwrap_or(1);
+        let ai_max_concurrency = parse_positive_usize_env("AI_MAX_CONCURRENCY", true)?.unwrap_or(1);
 
         let ai_model_context_limit = env::var("AI_MODEL_CONTEXT_LIMIT")
             .ok()
@@ -305,6 +313,23 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("invalid AI_MAX_CONCURRENCY (expected positive integer)"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_blank_task_worker_concurrency() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("OCTORILL_TASK_WORKERS", "   ");
+        }
+
+        let err = AppConfig::from_env().expect_err("blank task worker concurrency should fail");
+
+        assert!(
+            err.to_string()
+                .contains("invalid OCTORILL_TASK_WORKERS (expected positive integer)"),
             "unexpected error: {err:?}"
         );
     }

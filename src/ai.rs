@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -27,6 +28,9 @@ const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
 const LLM_REQUEST_MAX_RETRIES: usize = 3;
+const LLM_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const LLM_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+const LLM_RETRY_BACKOFF_JITTER_MAX_MS: u64 = 250;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -817,6 +821,7 @@ pub fn recent_key_dates(
 struct ChatCompletionAttemptError {
     err: anyhow::Error,
     retryable: bool,
+    retry_after: Option<Duration>,
     first_token_wait_ms: Option<i64>,
 }
 
@@ -828,6 +833,49 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 
 fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(raw)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let delay = retry_at.signed_duration_since(chrono::Utc::now());
+    if delay <= chrono::Duration::zero() {
+        Some(Duration::ZERO)
+    } else {
+        delay.to_std().ok()
+    }
+}
+
+fn retry_backoff_floor(attempt: usize) -> Duration {
+    let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1_u32.checked_shl(shift.min(16)).unwrap_or(u32::MAX);
+    LLM_RETRY_BACKOFF_BASE
+        .checked_mul(multiplier)
+        .unwrap_or(LLM_RETRY_BACKOFF_CAP)
+        .min(LLM_RETRY_BACKOFF_CAP)
+}
+
+fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(delay) = retry_after {
+        return delay;
+    }
+
+    let jitter_ms = rand::rng().random_range(0..=LLM_RETRY_BACKOFF_JITTER_MAX_MS);
+    retry_backoff_floor(attempt) + Duration::from_millis(jitter_ms)
 }
 
 struct SchedulerInFlightGuard {
@@ -1141,6 +1189,7 @@ async fn chat_completion_once(
         .map_err(|err| ChatCompletionAttemptError {
             err,
             retryable: false,
+            retry_after: None,
             first_token_wait_ms: None,
         })?;
 
@@ -1173,6 +1222,7 @@ async fn chat_completion_once(
             ChatCompletionAttemptError {
                 err: anyhow!("AI request failed: {err}"),
                 retryable,
+                retry_after: None,
                 first_token_wait_ms: None,
             }
         })?;
@@ -1180,12 +1230,14 @@ async fn chat_completion_once(
         Some(i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
 
     let status = resp.status();
+    let retry_after = retry_after_delay(resp.headers());
     let body = resp
         .bytes()
         .await
         .map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI read response failed: {err}"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1194,6 +1246,7 @@ async fn chat_completion_once(
         return Err(ChatCompletionAttemptError {
             err: anyhow!("AI returned {status}: {msg}"),
             retryable: is_retryable_status(status),
+            retry_after,
             first_token_wait_ms,
         });
     }
@@ -1202,6 +1255,7 @@ async fn chat_completion_once(
         serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI response json decode failed: {err}"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1216,6 +1270,7 @@ async fn chat_completion_once(
         .ok_or_else(|| ChatCompletionAttemptError {
             err: anyhow!("AI response missing content"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1341,6 +1396,7 @@ pub async fn chat_completion(
             Err(attempt_err) => {
                 let ChatCompletionAttemptError {
                     retryable,
+                    retry_after,
                     err,
                     first_token_wait_ms,
                 } = attempt_err;
@@ -1373,14 +1429,19 @@ pub async fn chat_completion(
                     }
                     return Err(err);
                 }
+                let retry_delay = next_retry_delay(attempt, retry_after);
                 tracing::warn!(
                     attempt,
                     max_attempts,
                     retries_left = max_attempts.saturating_sub(attempt),
+                    retry_after_ms = retry_after
+                        .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)),
+                    retry_delay_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
                     ?err,
-                    "ai request failed; scheduler queued retry"
+                    "ai request failed; sleeping before retry"
                 );
                 last_err = Some(err);
+                tokio::time::sleep(retry_delay).await;
             }
         }
     }
@@ -2426,6 +2487,32 @@ mod tests {
         assert_eq!(final_status.available_slots, 1);
         assert_eq!(final_status.in_flight_calls, 0);
         assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[test]
+    fn retry_after_delay_parses_delta_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("7"),
+        );
+
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn retry_backoff_floor_grows_and_caps() {
+        assert_eq!(retry_backoff_floor(1), Duration::from_millis(500));
+        assert_eq!(retry_backoff_floor(2), Duration::from_secs(1));
+        assert_eq!(retry_backoff_floor(3), Duration::from_secs(2));
+        assert_eq!(retry_backoff_floor(8), LLM_RETRY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn next_retry_delay_honors_retry_after_without_jitter() {
+        let delay = Duration::from_secs(3);
+
+        assert_eq!(next_retry_delay(2, Some(delay)), delay);
     }
 
     #[test]
