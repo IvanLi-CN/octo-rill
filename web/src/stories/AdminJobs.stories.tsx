@@ -10,6 +10,11 @@ import { AdminJobs } from "@/pages/AdminJobs";
 
 const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
 const RECENT_EVENT_USER_ID = "4h6p9s3t5z8e2x4c";
+const STORYBOOK_NOW = Date.now();
+const RUNNING_WORKER_UPDATED_AT = new Date(
+	STORYBOOK_NOW - 75_000,
+).toISOString();
+const ERROR_WORKER_UPDATED_AT = new Date(STORYBOOK_NOW - 30_000).toISOString();
 
 const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 	{
@@ -225,6 +230,167 @@ Summarize the following bullet points:
 	},
 ];
 
+const translationCompletedWorkersSeed = [
+	{
+		worker_id: "translation-worker-1",
+		worker_slot: 1,
+		worker_kind: "general",
+		status: "idle",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: "2026-02-26T04:00:03Z",
+		error_text: null,
+	},
+	{
+		worker_id: "translation-worker-2",
+		worker_slot: 2,
+		worker_kind: "general",
+		status: "idle",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: "2026-02-26T04:00:03Z",
+		error_text: null,
+	},
+	{
+		worker_id: "translation-worker-3",
+		worker_slot: 3,
+		worker_kind: "general",
+		status: "idle",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: "2026-02-26T04:00:03Z",
+		error_text: null,
+	},
+	{
+		worker_id: "translation-worker-4",
+		worker_slot: 4,
+		worker_kind: "user_dedicated",
+		status: "idle",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: "2026-02-26T04:00:03Z",
+		error_text: null,
+	},
+];
+
+const translationBusyWorkersSeed = [
+	{
+		worker_id: "translation-worker-1",
+		worker_slot: 1,
+		worker_kind: "general",
+		status: "running",
+		current_batch_id: "batch-translation-story",
+		request_count: 2,
+		work_item_count: 3,
+		trigger_reason: "token_threshold",
+		updated_at: RUNNING_WORKER_UPDATED_AT,
+		error_text: null,
+	},
+	{
+		worker_id: "translation-worker-2",
+		worker_slot: 2,
+		worker_kind: "general",
+		status: "idle",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: "2026-02-26T04:00:02Z",
+		error_text: null,
+	},
+	{
+		worker_id: "translation-worker-3",
+		worker_slot: 3,
+		worker_kind: "general",
+		status: "error",
+		current_batch_id: null,
+		request_count: 0,
+		work_item_count: 0,
+		trigger_reason: null,
+		updated_at: ERROR_WORKER_UPDATED_AT,
+		error_text: "claim retry",
+	},
+	{
+		worker_id: "translation-worker-4",
+		worker_slot: 4,
+		worker_kind: "user_dedicated",
+		status: "running",
+		current_batch_id: "batch-translation-user-story",
+		request_count: 1,
+		work_item_count: 1,
+		trigger_reason: "deadline",
+		updated_at: RUNNING_WORKER_UPDATED_AT,
+		error_text: null,
+	},
+];
+
+const translationRequestSeed = {
+	id: "req-translation-story",
+	status: "completed",
+	source: "feed.auto_translate",
+	request_origin: "user",
+	requested_by: CURRENT_USER_ID,
+	scope_user_id: CURRENT_USER_ID,
+	item_count: 1,
+	completed_item_count: 1,
+	created_at: "2026-02-26T04:00:00Z",
+	started_at: "2026-02-26T04:00:01Z",
+	finished_at: "2026-02-26T04:00:03Z",
+	updated_at: "2026-02-26T04:00:03Z",
+};
+
+const translationRequestItemSeed = {
+	producer_ref: "290978079",
+	entity_id: "290978079",
+	kind: "release_summary",
+	variant: "feed_card",
+	status: "ready",
+	title_zh: "发布说明 290978079",
+	summary_md: "- 修复了调度窗口\n- 保持整组返回",
+	body_md: null,
+	error: null,
+	work_item_id: "work-translation-story",
+	batch_id: "batch-translation-story",
+};
+
+const translationBatchSeed = {
+	id: "batch-translation-story",
+	status: "completed",
+	trigger_reason: "deadline",
+	worker_slot: 4,
+	request_count: 1,
+	item_count: 1,
+	estimated_input_tokens: 512,
+	created_at: "2026-02-26T04:00:01Z",
+	started_at: "2026-02-26T04:00:01Z",
+	finished_at: "2026-02-26T04:00:03Z",
+	updated_at: "2026-02-26T04:00:03Z",
+};
+
+const translationBatchDetailSeed = {
+	batch: translationBatchSeed,
+	items: [translationRequestItemSeed],
+	llm_calls: [
+		{
+			id: "llm-translation-story",
+			status: "succeeded",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			scheduler_wait_ms: 240,
+			duration_ms: 820,
+			created_at: "2026-02-26T04:00:01Z",
+		},
+	],
+};
+
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
@@ -429,8 +595,9 @@ type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
 	autoOpenTaskDrawer?: boolean;
 	autoOpenTaskDrawerLlmRoute?: boolean;
-	initialTab?: "scheduled" | "llm";
+	initialTab?: "scheduled" | "llm" | "translations";
 	llmSourceFilter?: string;
+	translationState?: "default" | "busy";
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -453,6 +620,7 @@ function AdminJobsPreview({
 	autoOpenTaskDrawerLlmRoute = false,
 	initialTab,
 	llmSourceFilter = "",
+	translationState = "default",
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -463,6 +631,42 @@ function AdminJobsPreview({
 		const realtimeTasks = realtimeTasksSeed.map((item) => ({ ...item }));
 		const scheduledRuns = scheduledRunsSeed.map((item) => ({ ...item }));
 		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
+		const translationWorkers =
+			translationState === "busy"
+				? translationBusyWorkersSeed.map((item) => ({ ...item }))
+				: translationCompletedWorkersSeed.map((item) => ({ ...item }));
+		const translationRequests = [
+			{
+				...translationRequestSeed,
+				status: translationState === "busy" ? "running" : "completed",
+				completed_item_count: translationState === "busy" ? 0 : 1,
+				started_at:
+					translationState === "busy"
+						? "2026-02-26T04:00:01Z"
+						: translationRequestSeed.started_at,
+				finished_at:
+					translationState === "busy"
+						? null
+						: translationRequestSeed.finished_at,
+				updated_at:
+					translationState === "busy"
+						? "2026-02-26T04:00:02Z"
+						: translationRequestSeed.updated_at,
+			},
+		];
+		const translationBatches =
+			translationState === "busy"
+				? [
+						{
+							...translationBatchSeed,
+							id: "batch-translation-user-story",
+							status: "running",
+							trigger_reason: "deadline",
+							updated_at: "2026-02-26T04:00:02Z",
+							finished_at: null,
+						},
+					]
+				: [translationBatchSeed];
 
 		window.fetch = async (input, init) => {
 			const req =
@@ -719,6 +923,93 @@ function AdminJobsPreview({
 				});
 			}
 
+			if (
+				url.pathname === "/api/admin/jobs/translations/status" &&
+				req.method === "GET"
+			) {
+				const busyWorkers = translationWorkers.filter(
+					(worker) => worker.status === "running",
+				).length;
+				const idleWorkers = translationWorkers.filter(
+					(worker) => worker.status === "idle",
+				).length;
+				return new Response(
+					JSON.stringify({
+						scheduler_enabled: true,
+						llm_enabled: true,
+						scan_interval_ms: 250,
+						batch_token_threshold: 1800,
+						worker_concurrency: 4,
+						idle_workers: idleWorkers,
+						busy_workers: busyWorkers,
+						workers: translationWorkers,
+						queued_requests: translationState === "busy" ? 1 : 0,
+						queued_work_items: translationState === "busy" ? 1 : 0,
+						running_batches: translationState === "busy" ? 1 : 0,
+						requests_24h: 1,
+						completed_batches_24h: translationState === "busy" ? 0 : 1,
+						failed_batches_24h: 0,
+						avg_wait_ms_24h: translationState === "busy" ? null : 320,
+						last_batch_finished_at:
+							translationState === "busy" ? null : "2026-02-26T04:00:03Z",
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/translations/requests" &&
+				req.method === "GET"
+			) {
+				return new Response(
+					JSON.stringify({
+						items: translationRequests,
+						page: 1,
+						page_size: 20,
+						total: translationRequests.length,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/jobs/translations/requests/") &&
+				req.method === "GET"
+			) {
+				return new Response(
+					JSON.stringify({
+						request: translationRequests[0],
+						items: [translationRequestItemSeed],
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/translations/batches" &&
+				req.method === "GET"
+			) {
+				return new Response(
+					JSON.stringify({
+						items: translationBatches,
+						page: 1,
+						page_size: 20,
+						total: translationBatches.length,
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/jobs/translations/batches/") &&
+				req.method === "GET"
+			) {
+				return new Response(JSON.stringify(translationBatchDetailSeed), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
 			return originalFetch(input, init);
 		};
 
@@ -824,7 +1115,7 @@ function AdminJobsPreview({
 			window.fetch = originalFetch;
 			window.EventSource = originalEventSource;
 		};
-	}, []);
+	}, [translationState]);
 
 	useEffect(() => {
 		const needsTabPrep = Boolean(initialTab) || Boolean(llmSourceFilter);
@@ -840,9 +1131,11 @@ function AdminJobsPreview({
 			const targetTabLabel =
 				initialTab === "scheduled"
 					? "定时任务"
-					: initialTab === "llm" || autoOpenConversation || llmSourceFilter
-						? "LLM调度"
-						: null;
+					: initialTab === "translations"
+						? "翻译调度"
+						: initialTab === "llm" || autoOpenConversation || llmSourceFilter
+							? "LLM调度"
+							: null;
 			if (!targetTabLabel) {
 				return;
 			}
@@ -998,4 +1291,22 @@ export const TaskDrawerDetail: Story = {
 
 export const TaskDrawerLlmRoute: Story = {
 	render: () => <AdminJobsPreview autoOpenTaskDrawerLlmRoute />,
+};
+
+export const TranslationWorkerBoard: Story = {
+	render: () => <AdminJobsPreview initialTab="translations" />,
+};
+
+export const TranslationWorkerBoardBusy: Story = {
+	render: () => (
+		<AdminJobsPreview initialTab="translations" translationState="busy" />
+	),
+};
+
+export const TranslationWorkerBoardMobile: Story = {
+	render: () => (
+		<div className="mx-auto max-w-sm">
+			<AdminJobsPreview initialTab="translations" translationState="busy" />
+		</div>
+	),
 };

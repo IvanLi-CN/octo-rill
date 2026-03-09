@@ -2,6 +2,7 @@ import { CircleHelp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
+import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	type AdminLlmCallDetailResponse,
 	type AdminLlmCallItem,
@@ -60,6 +61,14 @@ import {
 	SheetTitle,
 } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/components/ui/table";
 import {
 	Tooltip,
 	TooltipContent,
@@ -1106,6 +1115,7 @@ type TranslationStatusFilter =
 type TranslationDrawerState =
 	| { kind: "request"; id: string }
 	| { kind: "batch"; id: string }
+	| { kind: "worker"; id: string }
 	| null;
 
 const TRANSLATION_STATUS_FILTER_OPTIONS: Array<{
@@ -1155,6 +1165,10 @@ function translationRunTone(status: string): TaskStatusTone {
 	switch (status) {
 		case "completed":
 			return taskStatusTone("succeeded");
+		case "error":
+			return taskStatusTone("failed");
+		case "idle":
+			return taskStatusTone("canceled");
 		default:
 			return taskStatusTone(status);
 	}
@@ -1177,6 +1191,34 @@ function translationItemTone(status: string): BadgeTone {
 	}
 }
 
+function translationRequestOriginLabel(origin: string) {
+	switch (origin) {
+		case "user":
+			return "用户";
+		case "system":
+			return "系统";
+		default:
+			return origin || "-";
+	}
+}
+
+function translationWorkerKindLabel(kind: string) {
+	switch (kind) {
+		case "general":
+			return "通用";
+		case "user_dedicated":
+			return "用户专用";
+		default:
+			return kind || "-";
+	}
+}
+
+function translationWorkerSlotLabel(workerSlot: number | null | undefined) {
+	if (typeof workerSlot !== "number") return "-";
+	if (workerSlot <= 0) return "历史";
+	return `W${workerSlot}`;
+}
+
 function TranslationSchedulerSection(props: {
 	refreshNonce: number;
 	onOpenLlmCallDetail: (callId: string) => void;
@@ -1186,6 +1228,7 @@ function TranslationSchedulerSection(props: {
 		null,
 	);
 	const [statusLoading, setStatusLoading] = useState(false);
+	const [viewTab, setViewTab] = useState<"queue" | "history">("queue");
 	const [requestStatusFilter, setRequestStatusFilter] =
 		useState<TranslationStatusFilter>("all");
 	const [requests, setRequests] = useState<AdminTranslationRequestListItem[]>(
@@ -1222,7 +1265,14 @@ function TranslationSchedulerSection(props: {
 	const requestsInitialLoading = requestLoadPhase === "initial";
 	const batchesRefreshing = batchLoadPhase === "refreshing";
 	const batchesInitialLoading = batchLoadPhase === "initial";
-
+	const selectedWorker = useMemo(() => {
+		if (drawer?.kind !== "worker") {
+			return null;
+		}
+		return (
+			status?.workers.find((worker) => worker.worker_id === drawer.id) ?? null
+		);
+	}, [drawer, status]);
 	const loadStatus = useCallback(async () => {
 		setStatusLoading(true);
 		try {
@@ -1306,6 +1356,14 @@ function TranslationSchedulerSection(props: {
 		}
 	}, []);
 
+	const openWorkerDetail = useCallback((workerId: string) => {
+		setDrawer({ kind: "worker", id: workerId });
+		setRequestDetail(null);
+		setBatchDetail(null);
+		setDrawerLoading(false);
+		setError(null);
+	}, []);
+
 	useEffect(() => {
 		if (refreshNonce < 0) return;
 		setError(null);
@@ -1331,6 +1389,12 @@ function TranslationSchedulerSection(props: {
 	useEffect(() => {
 		if (refreshNonce < 0) return;
 		if (!drawer) {
+			setRequestDetail(null);
+			setBatchDetail(null);
+			setDrawerLoading(false);
+			return;
+		}
+		if (drawer.kind === "worker") {
 			setRequestDetail(null);
 			setBatchDetail(null);
 			setDrawerLoading(false);
@@ -1376,10 +1440,10 @@ function TranslationSchedulerSection(props: {
 				<CardHeader>
 					<CardTitle>翻译调度</CardTitle>
 					<CardDescription>
-						统一查看翻译请求、组批结果与关联 LLM 调用。
+						统一查看真实工作者槽位、需求队列与任务记录，并保留现有详情抽屉链路。
 					</CardDescription>
 				</CardHeader>
-				<CardContent className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+				<CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">调度器 / LLM</p>
 						<p className="mt-1 text-sm font-semibold">
@@ -1422,229 +1486,397 @@ function TranslationSchedulerSection(props: {
 				</CardContent>
 			</Card>
 
-			{statusLoading && !status ? (
-				<LoadingMessage>正在加载翻译调度状态...</LoadingMessage>
-			) : null}
+			<TranslationWorkerBoard
+				workers={status?.workers ?? []}
+				loading={statusLoading && !status}
+				onWorkerClick={(worker) => openWorkerDetail(worker.worker_id)}
+			/>
 
-			<div className="grid gap-4 xl:grid-cols-2">
-				<Card>
-					<CardHeader>
-						<CardTitle>翻译请求</CardTitle>
-						<CardDescription>
-							从请求方视角查看谁发起、等了多久、拿到了什么结果。
-						</CardDescription>
-					</CardHeader>
-					<CardContent className="space-y-4">
-						<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-							<FilterSelect
-								value={requestStatusFilter}
-								onValueChange={(value) => {
-									setRequestPage(1);
-									setRequestStatusFilter(value);
-								}}
-								options={TRANSLATION_STATUS_FILTER_OPTIONS}
-								placeholder="状态筛选"
-								ariaLabel="翻译请求状态筛选"
-								className="w-full sm:w-[220px]"
-							/>
-							<span className="text-muted-foreground text-xs">
-								共 {formatCount(requestTotal)} 条
-							</span>
-						</div>
-						<div className="space-y-2">
+			<Tabs
+				value={viewTab}
+				onValueChange={(nextValue) =>
+					setViewTab(nextValue as "queue" | "history")
+				}
+				className="space-y-4"
+			>
+				<TabsList>
+					<TabsTrigger value="queue">需求队列</TabsTrigger>
+					<TabsTrigger value="history">任务记录</TabsTrigger>
+				</TabsList>
+
+				<TabsContent value="queue">
+					<Card>
+						<CardHeader>
+							<CardTitle>需求队列</CardTitle>
+							<CardDescription>
+								按请求对象查看全部翻译需求，默认按活跃优先排序。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<FilterSelect
+									value={requestStatusFilter}
+									onValueChange={(value) => {
+										setRequestPage(1);
+										setRequestStatusFilter(value);
+									}}
+									options={TRANSLATION_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="翻译请求状态筛选"
+									className="w-full sm:w-[220px]"
+								/>
+								<span className="text-muted-foreground text-xs">
+									共 {formatCount(requestTotal)} 条
+								</span>
+							</div>
 							{requestsRefreshing ? (
 								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
 									<span className="size-2 rounded-full bg-amber-500/80" />
-									翻译请求更新中...
+									需求队列更新中...
 								</p>
 							) : null}
 							{requestsInitialLoading ? (
-								<LoadingMessage>正在加载翻译请求...</LoadingMessage>
+								<LoadingMessage>正在加载需求队列...</LoadingMessage>
 							) : requests.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无翻译请求。</p>
+								<p className="text-muted-foreground text-sm">暂无需求。</p>
 							) : (
-								requests.map((request) => {
-									const tone = translationRunTone(request.status);
-									return (
-										<div
-											key={request.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+								<>
+									<div className="hidden md:block">
+										<Table
+											containerClassName="rounded-lg border"
+											className="w-full table-fixed text-sm"
 										>
-											<div className="flex flex-wrap items-center gap-2">
-												<p className="font-medium text-sm">{request.source}</p>
-												<StatusBadge
-													label={translationRunStatusLabel(request.status)}
-													tone={tone}
-												/>
+											<TableHeader>
+												<TableRow>
+													<TableHead className="w-[14%]">来源</TableHead>
+													<TableHead className="w-[6%]">类型</TableHead>
+													<TableHead className="w-[10%]">状态</TableHead>
+													<TableHead className="w-[17%]">请求ID</TableHead>
+													<TableHead className="w-[13%]">请求人</TableHead>
+													<TableHead className="w-[13%]">作用域</TableHead>
+													<TableHead className="w-[6%]">进度</TableHead>
+													<TableHead className="w-[10%]">更新时间</TableHead>
+													<TableHead className="w-[88px] text-right">
+														操作
+													</TableHead>
+												</TableRow>
+											</TableHeader>
+											<TableBody>
+												{requests.map((request) => (
+													<TableRow key={request.id}>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap">
+																{request.source}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															{translationRequestOriginLabel(
+																request.request_origin,
+															)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															<StatusBadge
+																label={translationRunStatusLabel(
+																	request.status,
+																)}
+																tone={translationRunTone(request.status)}
+															/>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{request.id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{request.requested_by ?? "-"}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																#{request.scope_user_id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(request.completed_item_count)}/
+															{formatCount(request.item_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+															{formatLocalDateTime(request.updated_at)}
+														</TableCell>
+														<TableCell className="px-3 py-3 text-right">
+															<Button
+																variant="outline"
+																size="sm"
+																onClick={() =>
+																	void openRequestDetail(request.id)
+																}
+															>
+																详情
+															</Button>
+														</TableCell>
+													</TableRow>
+												))}
+											</TableBody>
+										</Table>
+									</div>
+									<div className="space-y-2 md:hidden">
+										{requests.map((request) => (
+											<div key={request.id} className="rounded-lg border p-3">
+												<div className="flex items-center gap-2">
+													<p className="truncate whitespace-nowrap font-medium text-sm">
+														{request.source}
+													</p>
+													<StatusBadge
+														label={translationRunStatusLabel(request.status)}
+														tone={translationRunTone(request.status)}
+													/>
+												</div>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													{translationRequestOriginLabel(
+														request.request_origin,
+													)}{" "}
+													· ID {request.id}
+												</p>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													请求人 {request.requested_by ?? "-"} · scope #
+													{request.scope_user_id}
+												</p>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													进度 {formatCount(request.completed_item_count)}/
+													{formatCount(request.item_count)} · 更新{" "}
+													{formatLocalDateTime(request.updated_at)}
+												</p>
+												<div className="mt-2 flex justify-end">
+													<Button
+														variant="outline"
+														size="sm"
+														onClick={() => void openRequestDetail(request.id)}
+													>
+														详情
+													</Button>
+												</div>
 											</div>
-											<p className="text-muted-foreground truncate font-mono text-[11px]">
-												ID: {request.id}
-											</p>
-											<p className="text-muted-foreground text-xs">
-												请求人 {request.requested_by ?? "-"} · 作用域 #
-												{request.scope_user_id}
-											</p>
-											<p className="text-muted-foreground text-xs">
-												item {formatCount(request.completed_item_count)}/
-												{formatCount(request.item_count)} · 创建{" "}
-												{formatLocalHm(request.created_at)}
-											</p>
-											<div className="flex justify-end">
-												<Button
-													variant="outline"
-													size="sm"
-													onClick={() => void openRequestDetail(request.id)}
-												>
-													详情
-												</Button>
-											</div>
-										</div>
-									);
-								})
+										))}
+									</div>
+								</>
 							)}
-						</div>
-						<div className="flex items-center justify-between">
-							<p className="text-muted-foreground text-xs">
-								第 {requestPage}/{requestTotalPages} 页
-							</p>
-							<div className="flex gap-2">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={requestPage <= 1 || requestLoadPhase !== "idle"}
-									onClick={() =>
-										setRequestPage((prev) => Math.max(1, prev - 1))
-									}
-								>
-									上一页
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={
-										requestPage >= requestTotalPages ||
-										requestLoadPhase !== "idle"
-									}
-									onClick={() =>
-										setRequestPage((prev) =>
-											Math.min(requestTotalPages, prev + 1),
-										)
-									}
-								>
-									下一页
-								</Button>
-							</div>
-						</div>
-					</CardContent>
-				</Card>
 
-				<Card>
-					<CardHeader>
-						<CardTitle>翻译批次</CardTitle>
-						<CardDescription>
-							查看为何封批、混了哪些 kind、token 预算与执行结果。
-						</CardDescription>
-					</CardHeader>
-					<CardContent className="space-y-4">
-						<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-							<FilterSelect
-								value={batchStatusFilter}
-								onValueChange={(value) => {
-									setBatchPage(1);
-									setBatchStatusFilter(value);
-								}}
-								options={TRANSLATION_STATUS_FILTER_OPTIONS}
-								placeholder="状态筛选"
-								ariaLabel="翻译批次状态筛选"
-								className="w-full sm:w-[220px]"
-							/>
-							<span className="text-muted-foreground text-xs">
-								共 {formatCount(batchTotal)} 条
-							</span>
-						</div>
-						<div className="space-y-2">
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {requestPage}/{requestTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={requestPage <= 1 || requestLoadPhase !== "idle"}
+										onClick={() =>
+											setRequestPage((prev) => Math.max(1, prev - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											requestPage >= requestTotalPages ||
+											requestLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setRequestPage((prev) =>
+												Math.min(requestTotalPages, prev + 1),
+											)
+										}
+									>
+										下一页
+									</Button>
+								</div>
+							</div>
+						</CardContent>
+					</Card>
+				</TabsContent>
+
+				<TabsContent value="history">
+					<Card>
+						<CardHeader>
+							<CardTitle>任务记录</CardTitle>
+							<CardDescription>
+								按真实 translation batch 历史查看 worker 执行结果。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-4">
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<FilterSelect
+									value={batchStatusFilter}
+									onValueChange={(value) => {
+										setBatchPage(1);
+										setBatchStatusFilter(value);
+									}}
+									options={TRANSLATION_STATUS_FILTER_OPTIONS}
+									placeholder="状态筛选"
+									ariaLabel="翻译批次状态筛选"
+									className="w-full sm:w-[220px]"
+								/>
+								<span className="text-muted-foreground text-xs">
+									共 {formatCount(batchTotal)} 条
+								</span>
+							</div>
 							{batchesRefreshing ? (
 								<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
 									<span className="size-2 rounded-full bg-amber-500/80" />
-									翻译批次更新中...
+									任务记录更新中...
 								</p>
 							) : null}
 							{batchesInitialLoading ? (
-								<LoadingMessage>正在加载翻译批次...</LoadingMessage>
+								<LoadingMessage>正在加载任务记录...</LoadingMessage>
 							) : batches.length === 0 ? (
-								<p className="text-muted-foreground text-sm">暂无翻译批次。</p>
+								<p className="text-muted-foreground text-sm">暂无任务记录。</p>
 							) : (
-								batches.map((batch) => {
-									const tone = translationRunTone(batch.status);
-									return (
-										<div
-											key={batch.id}
-											className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+								<>
+									<div className="hidden md:block">
+										<Table
+											containerClassName="rounded-lg border"
+											className="w-full table-fixed text-sm"
 										>
-											<div className="flex flex-wrap items-center gap-2">
-												<p className="font-medium text-sm">
-													{batch.trigger_reason}
+											<TableHeader>
+												<TableRow>
+													<TableHead className="w-[11%]">触发原因</TableHead>
+													<TableHead className="w-[11%]">状态</TableHead>
+													<TableHead className="w-[7%]">槽位</TableHead>
+													<TableHead className="w-[7%]">请求数</TableHead>
+													<TableHead className="w-[7%]">Items</TableHead>
+													<TableHead className="w-[9%]">预算</TableHead>
+													<TableHead className="w-[20%]">批次ID</TableHead>
+													<TableHead className="w-[10%]">更新时间</TableHead>
+													<TableHead className="w-[88px] text-right">
+														操作
+													</TableHead>
+												</TableRow>
+											</TableHeader>
+											<TableBody>
+												{batches.map((batch) => (
+													<TableRow key={batch.id}>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap">
+																{batch.trigger_reason}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															<StatusBadge
+																label={translationRunStatusLabel(batch.status)}
+																tone={translationRunTone(batch.status)}
+															/>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															{translationWorkerSlotLabel(batch.worker_slot)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.request_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.item_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.estimated_input_tokens)}
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{batch.id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+															{formatLocalDateTime(batch.updated_at)}
+														</TableCell>
+														<TableCell className="px-3 py-3 text-right">
+															<Button
+																variant="outline"
+																size="sm"
+																onClick={() => void openBatchDetail(batch.id)}
+															>
+																详情
+															</Button>
+														</TableCell>
+													</TableRow>
+												))}
+											</TableBody>
+										</Table>
+									</div>
+									<div className="space-y-2 md:hidden">
+										{batches.map((batch) => (
+											<div key={batch.id} className="rounded-lg border p-3">
+												<div className="flex items-center gap-2">
+													<p className="truncate whitespace-nowrap font-medium text-sm">
+														{batch.trigger_reason}
+													</p>
+													<StatusBadge
+														label={translationRunStatusLabel(batch.status)}
+														tone={translationRunTone(batch.status)}
+													/>
+												</div>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													{translationWorkerSlotLabel(batch.worker_slot)} · 请求{" "}
+													{formatCount(batch.request_count)} · work items{" "}
+													{formatCount(batch.item_count)}
 												</p>
-												<StatusBadge
-													label={translationRunStatusLabel(batch.status)}
-													tone={tone}
-												/>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													预算 {formatCount(batch.estimated_input_tokens)}{" "}
+													tokens · 更新 {formatLocalDateTime(batch.updated_at)}
+												</p>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap font-mono text-[11px]">
+													{batch.id}
+												</p>
+												<div className="mt-2 flex justify-end">
+													<Button
+														variant="outline"
+														size="sm"
+														onClick={() => void openBatchDetail(batch.id)}
+													>
+														详情
+													</Button>
+												</div>
 											</div>
-											<p className="text-muted-foreground truncate font-mono text-[11px]">
-												ID: {batch.id}
-											</p>
-											<p className="text-muted-foreground text-xs">
-												items {formatCount(batch.item_count)} · 预算{" "}
-												{formatCount(batch.estimated_input_tokens)} tokens
-											</p>
-											<p className="text-muted-foreground text-xs">
-												创建 {formatLocalHm(batch.created_at)} · 完成{" "}
-												{formatLocalHm(batch.finished_at)}
-											</p>
-											<div className="flex justify-end">
-												<Button
-													variant="outline"
-													size="sm"
-													onClick={() => void openBatchDetail(batch.id)}
-												>
-													详情
-												</Button>
-											</div>
-										</div>
-									);
-								})
+										))}
+									</div>
+								</>
 							)}
-						</div>
-						<div className="flex items-center justify-between">
-							<p className="text-muted-foreground text-xs">
-								第 {batchPage}/{batchTotalPages} 页
-							</p>
-							<div className="flex gap-2">
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={batchPage <= 1 || batchLoadPhase !== "idle"}
-									onClick={() => setBatchPage((prev) => Math.max(1, prev - 1))}
-								>
-									上一页
-								</Button>
-								<Button
-									variant="outline"
-									size="sm"
-									disabled={
-										batchPage >= batchTotalPages || batchLoadPhase !== "idle"
-									}
-									onClick={() =>
-										setBatchPage((prev) => Math.min(batchTotalPages, prev + 1))
-									}
-								>
-									下一页
-								</Button>
+
+							<div className="flex items-center justify-between">
+								<p className="text-muted-foreground text-xs">
+									第 {batchPage}/{batchTotalPages} 页
+								</p>
+								<div className="flex gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={batchPage <= 1 || batchLoadPhase !== "idle"}
+										onClick={() =>
+											setBatchPage((prev) => Math.max(1, prev - 1))
+										}
+									>
+										上一页
+									</Button>
+									<Button
+										variant="outline"
+										size="sm"
+										disabled={
+											batchPage >= batchTotalPages || batchLoadPhase !== "idle"
+										}
+										onClick={() =>
+											setBatchPage((prev) =>
+												Math.min(batchTotalPages, prev + 1),
+											)
+										}
+									>
+										下一页
+									</Button>
+								</div>
 							</div>
-						</div>
-					</CardContent>
-				</Card>
-			</div>
+						</CardContent>
+					</Card>
+				</TabsContent>
+			</Tabs>
 
 			<Sheet
 				open={Boolean(drawer)}
@@ -1663,12 +1895,18 @@ function TranslationSchedulerSection(props: {
 						<div className="flex items-start justify-between gap-3">
 							<div className="min-w-0 space-y-2">
 								<SheetTitle className="text-lg">
-									{drawer?.kind === "batch" ? "翻译批次详情" : "翻译请求详情"}
+									{drawer?.kind === "batch"
+										? "翻译批次详情"
+										: drawer?.kind === "worker"
+											? "工作者详情"
+											: "翻译请求详情"}
 								</SheetTitle>
 								<SheetDescription>
 									{drawer?.kind === "batch"
-										? "查看批次 item、错误原因与关联 LLM 调用。"
-										: "查看请求内 item 结果与 fan-out 归属。"}
+										? "查看批次 item、工作者槽位、错误原因与关联 LLM 调用。"
+										: drawer?.kind === "worker"
+											? "查看当前槽位状态、负载与关联批次。"
+											: "查看请求内 item 结果与 fan-out 归属。"}
 								</SheetDescription>
 							</div>
 							<Button variant="outline" onClick={() => setDrawer(null)}>
@@ -1686,6 +1924,12 @@ function TranslationSchedulerSection(props: {
 										<p className="text-muted-foreground text-xs">请求状态</p>
 										<p className="mt-1 font-medium">
 											{translationRunStatusLabel(requestDetail.request.status)}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											来源类型{" "}
+											{translationRequestOriginLabel(
+												requestDetail.request.request_origin,
+											)}
 										</p>
 									</div>
 									<div className="rounded-lg border p-3">
@@ -1749,6 +1993,77 @@ function TranslationSchedulerSection(props: {
 									))}
 								</div>
 							</>
+						) : drawer?.kind === "worker" && selectedWorker ? (
+							<>
+								<div className="grid gap-2 md:grid-cols-2">
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">工作者</p>
+										<p className="mt-1 font-medium">
+											{translationWorkerSlotLabel(selectedWorker.worker_slot)} ·{" "}
+											{translationWorkerKindLabel(selectedWorker.worker_kind)}
+										</p>
+										<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+											{selectedWorker.worker_id}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前状态</p>
+										<div className="mt-1">
+											<StatusBadge
+												label={translationRunStatusLabel(selectedWorker.status)}
+												tone={translationRunTone(selectedWorker.status)}
+											/>
+										</div>
+										<p className="text-muted-foreground mt-1 text-xs">
+											最近更新 {formatLocalDateTime(selectedWorker.updated_at)}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前负载</p>
+										<p className="mt-1 font-medium">
+											{formatCount(selectedWorker.request_count)} requests ·{" "}
+											{formatCount(selectedWorker.work_item_count)} items
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											trigger {selectedWorker.trigger_reason ?? "-"}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前批次</p>
+										<p className="mt-1 font-medium">
+											{selectedWorker.current_batch_id ?? "-"}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											槽位{" "}
+											{translationWorkerSlotLabel(selectedWorker.worker_slot)}
+										</p>
+									</div>
+								</div>
+
+								<div className="rounded-lg border p-3">
+									<div className="flex flex-wrap items-center justify-between gap-2">
+										<div>
+											<p className="text-muted-foreground text-xs">
+												错误与跳转
+											</p>
+											<p className="mt-1 text-sm">
+												{selectedWorker.error_text ?? "当前没有错误信息。"}
+											</p>
+										</div>
+										{selectedWorker.current_batch_id ? (
+											<Button
+												variant="outline"
+												size="sm"
+												onClick={() =>
+													void openBatchDetail(selectedWorker.current_batch_id!)
+												}
+											>
+												查看当前批次
+											</Button>
+										) : null}
+									</div>
+								</div>
+							</>
 						) : drawer?.kind === "batch" && batchDetail ? (
 							<>
 								<div className="grid gap-2 md:grid-cols-2">
@@ -1762,13 +2077,19 @@ function TranslationSchedulerSection(props: {
 										</p>
 									</div>
 									<div className="rounded-lg border p-3">
-										<p className="text-muted-foreground text-xs">预算 / 数量</p>
+										<p className="text-muted-foreground text-xs">
+											槽位 / 请求数
+										</p>
 										<p className="mt-1 font-medium">
-											{formatCount(batchDetail.batch.estimated_input_tokens)}{" "}
-											tokens
+											{translationWorkerSlotLabel(
+												batchDetail.batch.worker_slot,
+											)}{" "}
+											· {formatCount(batchDetail.batch.request_count)} requests
 										</p>
 										<p className="text-muted-foreground mt-1 text-xs">
-											items {formatCount(batchDetail.batch.item_count)}
+											items {formatCount(batchDetail.batch.item_count)} ·{" "}
+											{formatCount(batchDetail.batch.estimated_input_tokens)}{" "}
+											tokens
 										</p>
 									</div>
 								</div>

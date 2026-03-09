@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| nbz5z | Translation worker board follow-up | 部分完成（3/4） | `nbz5z-translation-worker-board/SPEC.md` | 2026-03-09 | PR #32; checks green; review-loop pending; 3 general + 1 user_dedicated worker board |
 | 67n8t | 全库主键 NanoID 化与公开标识收口 | 已完成 | `67n8t-nanoid-primary-keys/SPEC.md` | 2026-03-08 | PR #29; checks green; review-loop clear; destructive SQLite rebuild |
 | 35r55 | 统一翻译调度器与独立管理界面改造 | 已实现 | `35r55-translation-scheduler/SPEC.md` | 2026-03-07 | ready for fast-flow delivery |
 | gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
