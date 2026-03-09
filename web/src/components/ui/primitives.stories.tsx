@@ -89,7 +89,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"这组故事用于集中检查 OctoRill UI 原语在真实业务组合里的外观：表单、筛选器、badge、tabs、table、dialog、sheet 与 alert dialog 都能在这里快速预览。",
+					"这组故事用于集中检查 OctoRill UI 原语在真实业务组合里的外观：表单、筛选器、badge、tabs、table、dialog、sheet 与 alert dialog 都能在这里快速预览。\n\n相关公开文档：[快速开始](../quick-start.html) · [Storybook 入口](../storybook.html)",
 			},
 		},
 	},

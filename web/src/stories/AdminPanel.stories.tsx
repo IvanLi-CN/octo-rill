@@ -207,14 +207,14 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 }
 
 const meta = {
-	title: "Admin/User Management",
+	title: "Admin/Admin Panel",
 	component: AdminPanelPreview,
 	parameters: {
 		layout: "fullscreen",
 		docs: {
 			description: {
 				component:
-					"管理员用户面板，用来检查用户筛选、资料侧栏、管理员确认与禁用状态等管理操作。适合验证表格、筛选器与管理弹层在真实数据形态下的表现。",
+					"管理员用户面板，用来检查用户筛选、资料侧栏、管理员确认与禁用状态等管理操作。适合验证表格、筛选器与管理弹层在真实数据形态下的表现。\n\n相关公开文档：[产品说明](../product.html) · [快速开始](../quick-start.html)",
 			},
 		},
 	},

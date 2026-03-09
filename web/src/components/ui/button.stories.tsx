@@ -12,7 +12,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"OctoRill 中最常用的交互按钮。这里集中验证不同 variant、尺寸与链接模式，确保基础 CTA 在业务页面里表现一致。",
+					"OctoRill 中最常用的交互按钮。这里集中验证不同 variant、尺寸与链接模式，确保基础 CTA 在业务页面里表现一致。\n\n相关公开文档：[快速开始](../quick-start.html) · [Storybook 入口](../storybook.html)",
 			},
 		},
 	},

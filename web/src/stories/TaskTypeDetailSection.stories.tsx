@@ -56,7 +56,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"任务详情区块负责把不同 task type 的参数、结果摘要与关联 LLM 调用压平展示，是 Admin Jobs 抽屉里的核心复用视图。通过这组 stories 可以验证不同任务类型的字段映射是否完整。",
+					"任务详情区块负责把不同 task type 的参数、结果摘要与关联 LLM 调用压平展示，是 Admin Jobs 抽屉里的核心复用视图。通过这组 stories 可以验证不同任务类型的字段映射是否完整。\n\n相关公开文档：[产品说明](../product.html) · [Storybook 入口](../storybook.html)",
 			},
 		},
 	},

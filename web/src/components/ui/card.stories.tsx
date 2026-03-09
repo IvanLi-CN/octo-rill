@@ -17,7 +17,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Card 是 Dashboard 与侧栏区块最常见的容器。这里用最小内容和带操作的卡片来校验标题、描述、正文与 footer 的层级关系。",
+					"Card 是 Dashboard 与侧栏区块最常见的容器。这里用最小内容和带操作的卡片来校验标题、描述、正文与 footer 的层级关系。\n\n相关公开文档：[产品说明](../product.html) · [Storybook 入口](../storybook.html)",
 			},
 		},
 	},

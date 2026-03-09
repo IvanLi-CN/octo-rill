@@ -83,6 +83,31 @@ jobs:
             echo "No web/ package; skipping"
           fi
 
+      - name: Docs site build (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f docs-site/package.json ]]; then
+            bun install --cwd docs-site --frozen-lockfile
+            cd docs-site
+            DOCS_BASE="/octo-rill/" bun run build
+          else
+            echo "No docs-site/ package; skipping"
+          fi
+
+      - name: Assemble public docs site smoke check (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -d docs-site/doc_build && -d web/storybook-static ]]; then
+            bash ./.github/scripts/assemble-pages-site.sh docs-site/doc_build web/storybook-static .tmp/pages-site
+            test -f .tmp/pages-site/index.html
+            test -f .tmp/pages-site/storybook/index.html
+            test -f .tmp/pages-site/storybook.html
+          else
+            echo "docs-site/doc_build or web/storybook-static missing; skipping"
+          fi
+
   unit-tests:
     name: Backend Tests
     runs-on: ubuntu-latest

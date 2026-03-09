@@ -344,7 +344,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。通过这组故事可以确认不同默认入口和操作弹窗是否符合预期。",
+					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。通过这组故事可以确认不同默认入口和操作弹窗是否符合预期。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
 			},
 		},
 	},
