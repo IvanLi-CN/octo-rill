@@ -36,7 +36,7 @@ Open `http://127.0.0.1:55176`.
 bun run storybook:build
 ```
 
-The static output is written to `web/storybook-static/` and is later assembled into the public docs site under `/storybook/`; the primary docs navigation links directly to `/storybook/index.html`, while `/storybook.html` remains available as a curated hub page.
+The static output is written to `web/storybook-static/` and is later assembled into the public docs site under `/storybook/`; the primary docs navigation goes through `/storybook.html` and immediately redirects to `/storybook/index.html`; the curated hub page lives at `/storybook-guide.html`.
 
 ## Storybook scope
 
