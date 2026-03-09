@@ -5,21 +5,30 @@ description: 跳转到 OctoRill Storybook 静态站点。
 
 import { useEffect, useMemo } from "react";
 
-export const LOCAL_DOCS_SITE_ORIGINS = new Set([
-  "http://127.0.0.1:50885",
-  "http://localhost:50885",
-]);
-export const LOCAL_STORYBOOK_ORIGIN = "http://127.0.0.1:55176";
+export const DEFAULT_LOCAL_STORYBOOK_DEV_ORIGIN = "http://127.0.0.1:55176";
+export const DOCS_ORIGIN_QUERY_KEY = "docsOrigin";
+
+export function isStandaloneDocsServer(currentUrl) {
+  return ["127.0.0.1", "localhost"].includes(currentUrl.hostname) && currentUrl.pathname === "/storybook.html";
+}
+
+export function getLocalStorybookDevOrigin(currentUrl) {
+  return import.meta.env.VITE_STORYBOOK_DEV_ORIGIN || `${currentUrl.protocol}//${currentUrl.hostname}:55176`;
+}
 
 export function buildStorybookTarget(currentHref) {
   const currentUrl = new URL(currentHref);
   const requestedPath = currentUrl.searchParams.get("path");
-  const target = LOCAL_DOCS_SITE_ORIGINS.has(currentUrl.origin)
-    ? new URL("/", LOCAL_STORYBOOK_ORIGIN)
+  const target = isStandaloneDocsServer(currentUrl)
+    ? new URL("/", getLocalStorybookDevOrigin(currentUrl))
     : new URL("./storybook/index.html", currentUrl);
 
   if (requestedPath) {
     target.searchParams.set("path", requestedPath);
+  }
+
+  if (isStandaloneDocsServer(currentUrl)) {
+    target.searchParams.set(DOCS_ORIGIN_QUERY_KEY, currentUrl.origin);
   }
 
   return target;

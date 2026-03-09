@@ -28,7 +28,7 @@ Preview runs on `http://127.0.0.1:55175`.
 bun run storybook
 ```
 
-Open `http://127.0.0.1:55176`. Links back to the docs site will target `http://127.0.0.1:50885` when the standalone docs server is running.
+Open `http://127.0.0.1:55176`. Links back to the docs site use the last docs-site origin that opened Storybook; you can also override it with `VITE_DOCS_SITE_ORIGIN`.
 
 ### Storybook static build
 

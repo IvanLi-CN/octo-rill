@@ -86,7 +86,7 @@ bun run dev
 
 Then open `http://127.0.0.1:50885`.
 
-`docs-site` 单独运行时只承载文档壳层；如果同机已经执行 `cd web && bun run storybook`，文档里的 Storybook 入口会自动跳到 `http://127.0.0.1:55176`。若要验证发布后的 `/storybook/` 子路径，请先构建 docs-site 与 Storybook，再执行 `.github/scripts/assemble-pages-site.sh` 进行装配预览。
+`docs-site` 单独运行时只承载文档壳层；如果同机已经执行 `cd web && bun run storybook`，文档里的 Storybook 入口会自动跳到本地 Storybook dev server。若你改过本地端口，可额外设置 `VITE_STORYBOOK_DEV_ORIGIN` 或 `VITE_DOCS_SITE_ORIGIN`。若要验证发布后的 `/storybook/` 子路径，请先构建 docs-site 与 Storybook，再执行 `.github/scripts/assemble-pages-site.sh` 进行装配预览。
 
 ## Auth model
 
