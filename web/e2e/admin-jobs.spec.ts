@@ -170,6 +170,10 @@ async function installAdminJobsMocks(
 		},
 	];
 
+	const recentRunningWorkerUpdatedAt = new Date(
+		Date.now() - 75_000,
+	).toISOString();
+
 	const completedTranslationRequest = {
 		id: "req-translation-1",
 		status: "completed",
@@ -282,7 +286,7 @@ async function installAdminJobsMocks(
 			request_count: 1,
 			work_item_count: 1,
 			trigger_reason: "deadline",
-			updated_at: "2026-02-26T04:00:01Z",
+			updated_at: recentRunningWorkerUpdatedAt,
 			error_text: null,
 		},
 	];
@@ -1526,15 +1530,23 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	await installAdminJobsMocks(page);
 
 	await page.goto("/admin/jobs");
-	await page.getByRole("tab", { name: "翻译调度" }).click();
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
 	await expect(page.getByRole("heading", { name: "翻译调度" })).toBeVisible();
 	await expect(page.getByText("工作者板")).toBeVisible();
-	await expect(page.getByText("用户专用", { exact: true })).toBeVisible();
+	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
+	await page.getByRole("button", { name: "打开 W4 · 用户专用 详情" }).click();
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toBeVisible();
+	await expect(page.getByText("translation-worker-4")).toBeVisible();
+	await page.getByRole("button", { name: "关闭" }).click();
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toHaveCount(
+		0,
+	);
 	await expect(page.getByRole("tab", { name: "需求队列" })).toBeVisible();
-	await expect(
-		page.getByRole("cell", { name: "feed.auto_translate" }),
-	).toBeVisible();
-	await page.getByRole("button", { name: "详情" }).first().click();
+	const translationRequestRow = page
+		.getByRole("cell", { name: "feed.auto_translate" })
+		.locator("xpath=ancestor::tr[1]");
+	await expect(translationRequestRow).toBeVisible();
+	await translationRequestRow.getByRole("button", { name: "详情" }).click();
 	await expect(
 		page.getByRole("heading", { name: "翻译请求详情" }),
 	).toBeVisible();
@@ -1580,11 +1592,14 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 	});
 
 	await page.goto("/admin/jobs");
-	await page.getByRole("tab", { name: "翻译调度" }).click();
-	await expect(page.getByText("用户专用", { exact: true })).toBeVisible();
-	await expect(page.getByText("1 忙 / 3 闲")).toBeVisible();
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
+	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
+	const dedicatedWorkerCard = page
+		.getByText("W4 · 用户专用")
+		.locator("xpath=ancestor::div[.//*[normalize-space()='已工作时长']][1]");
+	await expect(dedicatedWorkerCard.getByText("运行中")).toBeVisible();
 	await expect(page.getByRole("cell", { name: "1/1" })).toBeVisible();
-	await expect(page.getByText("0 忙 / 4 闲")).toBeVisible();
+	await expect(dedicatedWorkerCard.getByText("idle")).toBeVisible();
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByRole("cell", { name: "deadline" })).toBeVisible();
 	await expect(page.getByRole("cell", { name: "W4" }).last()).toBeVisible();
@@ -1597,7 +1612,7 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await installAdminJobsMocks(page);
 
 	await page.goto("/admin/jobs");
-	await page.getByRole("tab", { name: "翻译调度" }).click();
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
 	await expect(page.getByText("用户 · ID req-translation-1")).toBeVisible();

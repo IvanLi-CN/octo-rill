@@ -10,6 +10,11 @@ import { AdminJobs } from "@/pages/AdminJobs";
 
 const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
 const RECENT_EVENT_USER_ID = "4h6p9s3t5z8e2x4c";
+const STORYBOOK_NOW = Date.now();
+const RUNNING_WORKER_UPDATED_AT = new Date(
+	STORYBOOK_NOW - 75_000,
+).toISOString();
+const ERROR_WORKER_UPDATED_AT = new Date(STORYBOOK_NOW - 30_000).toISOString();
 
 const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 	{
@@ -286,7 +291,7 @@ const translationBusyWorkersSeed = [
 		request_count: 2,
 		work_item_count: 3,
 		trigger_reason: "token_threshold",
-		updated_at: "2026-02-26T04:00:02Z",
+		updated_at: RUNNING_WORKER_UPDATED_AT,
 		error_text: null,
 	},
 	{
@@ -310,7 +315,7 @@ const translationBusyWorkersSeed = [
 		request_count: 0,
 		work_item_count: 0,
 		trigger_reason: null,
-		updated_at: "2026-02-26T04:00:01Z",
+		updated_at: ERROR_WORKER_UPDATED_AT,
 		error_text: "claim retry",
 	},
 	{
@@ -322,7 +327,7 @@ const translationBusyWorkersSeed = [
 		request_count: 1,
 		work_item_count: 1,
 		trigger_reason: "deadline",
-		updated_at: "2026-02-26T04:00:03Z",
+		updated_at: RUNNING_WORKER_UPDATED_AT,
 		error_text: null,
 	},
 ];
