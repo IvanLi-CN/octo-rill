@@ -1268,6 +1268,7 @@ async fn run_translation_scheduler_once(
     worker: TranslationWorkerProfile,
 ) -> Result<()> {
     let Some(batch) = claim_next_batch(state, worker).await? else {
+        update_translation_worker_runtime(worker, "idle", None, 0, 0, None, None).await;
         return Ok(());
     };
     execute_claimed_batch(state, batch).await
@@ -2228,8 +2229,8 @@ async fn load_translation_request_detail(
 ) -> Result<LoadedRequestDetail, ApiError> {
     let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
         r#"
-        SELECT id, status, source, requested_by, scope_user_id, item_count, completed_item_count,
-               created_at, started_at, finished_at, updated_at
+        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count,
+               completed_item_count, created_at, started_at, finished_at, updated_at
         FROM translation_requests
         WHERE id = ? AND scope_user_id = ?
         LIMIT 1
@@ -2810,6 +2811,66 @@ mod tests {
                 .expect("load request origin");
 
         assert_eq!(request_origin, "system");
+    }
+
+    #[tokio::test]
+    async fn load_translation_request_detail_includes_request_origin() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("detail-origin");
+
+        let request_id = create_translation_request_with_origin(
+            state.as_ref(),
+            "1",
+            "async",
+            std::slice::from_ref(&item),
+            "system",
+        )
+        .await
+        .expect("system request created");
+
+        let detail = load_translation_request_detail(state.as_ref(), "1", request_id.as_str())
+            .await
+            .expect("load request detail");
+
+        assert_eq!(detail.request.request_origin, "system");
+    }
+
+    #[tokio::test]
+    async fn scheduler_clears_worker_error_after_successful_idle_scan() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests().await;
+        let worker = TranslationWorkerProfile {
+            worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
+            worker_kind: "user_dedicated",
+        };
+
+        update_translation_worker_runtime(
+            worker,
+            "error",
+            None,
+            0,
+            0,
+            None,
+            Some("temporary failure"),
+        )
+        .await;
+
+        run_translation_scheduler_once(state.as_ref(), worker)
+            .await
+            .expect("idle scan succeeds");
+
+        let workers = translation_worker_runtime_statuses().await;
+        let dedicated = workers
+            .iter()
+            .find(|entry| entry.worker_slot == TRANSLATION_USER_DEDICATED_WORKER_SLOT)
+            .expect("dedicated worker exists");
+
+        assert_eq!(dedicated.status, "idle");
+        assert_eq!(dedicated.error_text, None);
     }
 
     #[tokio::test]
