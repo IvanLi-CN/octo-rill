@@ -131,7 +131,7 @@ jobs:
           test -f .tmp/pages-site/index.html
           test -f .tmp/pages-site/storybook/index.html
           test -f .tmp/pages-site/storybook.html
-          grep -q '/storybook.html' .tmp/pages-site/index.html
+          grep -q '/storybook/index.html' .tmp/pages-site/index.html
           grep -q 'OctoRill Storybook' .tmp/pages-site/storybook.html
           grep -q '核心故事入口' .tmp/pages-site/storybook.html
           grep -q '/storybook/index.html?path=/docs/admin-admin-panel--docs' .tmp/pages-site/storybook.html
