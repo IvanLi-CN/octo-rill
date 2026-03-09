@@ -99,7 +99,7 @@ Then open `http://127.0.0.1:50885`.
 ## Docs & Storybook
 
 - Public docs site source lives in `docs-site/` and is built with Rspress.
-- Storybook stays under `web/` and is published as a nested static site at `/storybook/`; the primary docs navigation links directly to `/storybook/index.html`, while `/storybook.html` remains available as a curated hub page.
+- Storybook stays under `web/` and is published as a nested static site at `/storybook/`; the primary docs navigation goes through `/storybook.html` and immediately redirects to `/storybook/index.html`; the curated hub page lives at `/storybook-guide.html`.
 - `Docs Pages` GitHub Actions workflow builds the docs site and Storybook separately, then assembles them into one GitHub Pages artifact.
 - For project Pages deployments, `DOCS_BASE` must be set to `/<repo>/`; the workflow computes this automatically.
 - `CI Pipeline` also runs docs-site build plus the assembled-site smoke check, so base-path regressions can fail in PR before Pages deploy.

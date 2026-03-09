@@ -1,57 +1,24 @@
 ---
 title: Storybook
-description: OctoRill Storybook 总入口与核心故事深链。
+description: 跳转到 OctoRill Storybook 静态站点。
 ---
 
-# Storybook 入口
+import { useEffect } from "react";
 
-这里集中提供 OctoRill Storybook 的总入口，以及最常用的公开文档深链。
+export const StorybookRedirect = () => {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const target = new URL("./storybook/index.html", window.location.href);
+    window.location.replace(target.toString());
+  }, []);
 
-- 若你正在访问 GitHub Pages 或装配后的静态预览，请使用下方的“发布站点入口”。
-- 若你正在单独运行 `docs-site`（`bun run dev` / `bun run preview`），请先在 `web/` 启动 Storybook dev server，并使用“本地开发入口”。
+  return (
+    <>
+      <h1>正在跳转到 Storybook…</h1>
+      <p>如果没有自动跳转，请直接打开 <a href="./storybook/index.html">OctoRill Storybook</a>。</p>
+      <p>如需查看文档导览页，请打开 <a href="./storybook-guide.html">Storybook 导览</a>。</p>
+    </>
+  );
+};
 
-## 发布站点入口
-
-<ul>
-  <li><a href="./storybook/index.html">打开 OctoRill Storybook</a></li>
-  <li><a href="./storybook/index.html?path=/docs/pages-landing--docs">查看 Storybook Docs 首页</a></li>
-</ul>
-
-## 本地开发入口
-
-<ul>
-  <li><a href="http://127.0.0.1:55176">打开本地 Storybook dev server</a></li>
-  <li><a href="http://127.0.0.1:55176/?path=/docs/pages-landing--docs">查看本地 Storybook Docs 首页</a></li>
-</ul>
-
-## 核心故事入口（发布站点）
-
-### Pages
-
-<ul>
-  <li><a href="./storybook/index.html?path=/docs/pages-landing--docs">Landing</a></li>
-  <li><a href="./storybook/index.html?path=/docs/pages-dashboard--docs">Dashboard</a></li>
-</ul>
-
-### Admin
-
-<ul>
-  <li><a href="./storybook/index.html?path=/docs/admin-admin-panel--docs">Admin Panel</a></li>
-  <li><a href="./storybook/index.html?path=/docs/admin-admin-jobs--docs">Admin Jobs</a></li>
-  <li><a href="./storybook/index.html?path=/docs/admin-task-type-detail--docs">Task Type Detail</a></li>
-</ul>
-
-### Layout 与 UI
-
-<ul>
-  <li><a href="./storybook/index.html?path=/docs/layout-app-meta-footer--docs">App Meta Footer</a></li>
-  <li><a href="./storybook/index.html?path=/docs/ui-primitives--docs">UI Primitives</a></li>
-  <li><a href="./storybook/index.html?path=/docs/ui-button--docs">Button</a></li>
-  <li><a href="./storybook/index.html?path=/docs/ui-card--docs">Card</a></li>
-</ul>
-
-## 何时看 Storybook
-
-- 想核对页面状态与占位文案时，优先看 `Pages/*` 与 `Admin/*`。
-- 想确认组件密度、基础控件或版本信息回退时，优先看 `Layout/*` 与 `UI/*`。
-- 想回到公开文档上下文，可使用顶部导航返回“快速开始 / 配置参考 / 产品说明”。
+<StorybookRedirect />

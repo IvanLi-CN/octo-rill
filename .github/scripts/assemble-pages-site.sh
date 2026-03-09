@@ -49,12 +49,17 @@ if [[ ! -f "$output_dir/storybook.html" ]]; then
   exit 1
 fi
 
-if ! grep -q 'OctoRill Storybook' "$output_dir/storybook.html"; then
-  echo "storybook.html is missing the Storybook hub copy" >&2
+if ! grep -q '正在跳转到 Storybook' "$output_dir/storybook.html"; then
+  echo "storybook.html is missing the Storybook redirect copy" >&2
   exit 1
 fi
 
-if ! grep -q '核心故事入口' "$output_dir/storybook.html"; then
-  echo "storybook.html is missing the core story entry links" >&2
+if [[ ! -f "$output_dir/storybook-guide.html" ]]; then
+  echo "assembled site is missing storybook-guide.html" >&2
+  exit 1
+fi
+
+if ! grep -q '核心故事入口' "$output_dir/storybook-guide.html"; then
+  echo "storybook-guide.html is missing the core story entry links" >&2
   exit 1
 fi
