@@ -1942,10 +1942,10 @@ pub struct AdminLlmCallsResponse {
 #[derive(Debug, Serialize)]
 pub struct AdminLlmSchedulerStatusResponse {
     scheduler_enabled: bool,
-    request_interval_ms: i64,
+    max_concurrency: i64,
+    available_slots: i64,
     waiting_calls: i64,
     in_flight_calls: i64,
-    next_slot_in_ms: i64,
     calls_24h: i64,
     failed_24h: i64,
     avg_wait_ms_24h: Option<i64>,
@@ -1987,7 +1987,7 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let runtime = ai::llm_scheduler_runtime_status().await;
+    let runtime = state.llm_scheduler.runtime_status();
 
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let (calls_24h, failed_24h, avg_wait_raw, avg_duration_raw) =
@@ -2031,10 +2031,10 @@ pub async fn admin_get_llm_scheduler_status(
 
     Ok(Json(AdminLlmSchedulerStatusResponse {
         scheduler_enabled: state.config.ai.is_some(),
-        request_interval_ms: runtime.request_interval_ms,
+        max_concurrency: runtime.max_concurrency,
+        available_slots: runtime.available_slots,
         waiting_calls: runtime.waiting_calls,
         in_flight_calls: runtime.in_flight_calls,
-        next_slot_in_ms: runtime.next_slot_in_ms,
         calls_24h,
         failed_24h,
         avg_wait_ms_24h: avg_wait_raw.map(|value| value.round() as i64),
@@ -7348,11 +7348,13 @@ mod tests {
                     .expect("parse github redirect"),
             },
             ai: None,
+            ai_max_concurrency: 1,
             ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
+            llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             config,
             pool,
             http: reqwest::Client::new(),
@@ -8015,6 +8017,8 @@ mod tests {
             .expect("status should succeed")
             .0;
 
+        assert_eq!(resp.max_concurrency, 1);
+        assert_eq!(resp.available_slots, 1);
         assert_eq!(resp.calls_24h, 2);
         assert_eq!(resp.failed_24h, 1);
         assert!(resp.avg_wait_ms_24h.is_some());

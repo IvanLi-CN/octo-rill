@@ -941,10 +941,10 @@ async function installAdminJobsMocks(
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/status") {
 			return json(route, {
 				scheduler_enabled: true,
-				request_interval_ms: 1000,
+				max_concurrency: 2,
+				available_slots: 1,
 				waiting_calls: 1,
 				in_flight_calls: 1,
-				next_slot_in_ms: 420,
 				calls_24h: llmCalls.length,
 				failed_24h: llmCalls.filter((item) => item.status === "failed").length,
 				avg_wait_ms_24h: 640,
@@ -1259,6 +1259,8 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
 	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
+	await expect(page.getByText("最大并行 2")).toBeVisible();
+	await expect(page.getByText("可用槽位 1")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await page
 		.getByRole("textbox", { name: "LLM 调用来源筛选" })

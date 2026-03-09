@@ -26,7 +26,6 @@ const MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE: &str = "env_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
-const LLM_SCHEDULER_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const LLM_REQUEST_MAX_RETRIES: usize = 3;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -51,9 +50,6 @@ struct OpenRouterModelItem {
 
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
 static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
-static LLM_SCHEDULER_NEXT_ALLOWED_AT: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
-static LLM_SCHEDULER_WAITING_CALLS: AtomicUsize = AtomicUsize::new(0);
-static LLM_SCHEDULER_IN_FLIGHT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 tokio::task_local! {
     static LLM_CALL_CONTEXT: LlmCallContext;
@@ -70,10 +66,18 @@ pub struct LlmCallContext {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LlmSchedulerRuntimeStatus {
-    pub request_interval_ms: i64,
+    pub max_concurrency: i64,
+    pub available_slots: i64,
     pub waiting_calls: i64,
     pub in_flight_calls: i64,
-    pub next_slot_in_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct LlmScheduler {
+    max_concurrency: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    waiting_calls: AtomicUsize,
+    in_flight_calls: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,8 +91,48 @@ fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
     MODEL_LIMIT_CATALOG.get_or_init(|| tokio::sync::RwLock::new(ModelLimitCatalog::default()))
 }
 
-fn llm_scheduler() -> &'static tokio::sync::Mutex<Instant> {
-    LLM_SCHEDULER_NEXT_ALLOWED_AT.get_or_init(|| tokio::sync::Mutex::new(Instant::now()))
+impl LlmScheduler {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            max_concurrency: max_concurrency.max(1),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+            waiting_calls: AtomicUsize::new(0),
+            in_flight_calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
+        LlmSchedulerRuntimeStatus {
+            max_concurrency: i64::try_from(self.max_concurrency).unwrap_or(i64::MAX),
+            available_slots: i64::try_from(self.semaphore.available_permits()).unwrap_or(i64::MAX),
+            waiting_calls: i64::try_from(self.waiting_calls.load(Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+            in_flight_calls: i64::try_from(self.in_flight_calls.load(Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+        }
+    }
+
+    async fn acquire_slot(self: &Arc<Self>) -> (i64, SchedulerInFlightGuard) {
+        let queue_started_at = Instant::now();
+        let waiting_guard = SchedulerWaitingGuard::new(&self.waiting_calls);
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("llm scheduler semaphore should stay open");
+        drop(waiting_guard);
+
+        self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+        let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        (
+            wait_ms,
+            SchedulerInFlightGuard {
+                scheduler: Arc::clone(self),
+                _permit: permit,
+            },
+        )
+    }
 }
 
 pub async fn with_llm_call_context<F, T>(context: LlmCallContext, fut: F) -> T
@@ -100,26 +144,6 @@ where
 
 fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
-}
-
-pub async fn llm_scheduler_runtime_status() -> LlmSchedulerRuntimeStatus {
-    let now = Instant::now();
-    let next_allowed_at = *llm_scheduler().lock().await;
-    let next_slot_in_ms = if next_allowed_at > now {
-        i64::try_from((next_allowed_at - now).as_millis()).unwrap_or(i64::MAX)
-    } else {
-        0
-    };
-
-    LlmSchedulerRuntimeStatus {
-        request_interval_ms: i64::try_from(LLM_SCHEDULER_REQUEST_INTERVAL.as_millis())
-            .unwrap_or(i64::MAX),
-        waiting_calls: i64::try_from(LLM_SCHEDULER_WAITING_CALLS.load(Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-        in_flight_calls: i64::try_from(LLM_SCHEDULER_IN_FLIGHT_CALLS.load(Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-        next_slot_in_ms,
-    }
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -806,41 +830,34 @@ fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
 
-struct SchedulerInFlightGuard;
+struct SchedulerInFlightGuard {
+    scheduler: Arc<LlmScheduler>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
 
 impl Drop for SchedulerInFlightGuard {
     fn drop(&mut self) {
-        LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_sub(1, Ordering::Relaxed);
+        self.scheduler
+            .in_flight_calls
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-struct SchedulerWaitingGuard;
+struct SchedulerWaitingGuard<'a> {
+    waiting_calls: &'a AtomicUsize,
+}
 
-impl SchedulerWaitingGuard {
-    fn new() -> Self {
-        LLM_SCHEDULER_WAITING_CALLS.fetch_add(1, Ordering::Relaxed);
-        Self
+impl<'a> SchedulerWaitingGuard<'a> {
+    fn new(waiting_calls: &'a AtomicUsize) -> Self {
+        waiting_calls.fetch_add(1, Ordering::Relaxed);
+        Self { waiting_calls }
     }
 }
 
-impl Drop for SchedulerWaitingGuard {
+impl Drop for SchedulerWaitingGuard<'_> {
     fn drop(&mut self) {
-        LLM_SCHEDULER_WAITING_CALLS.fetch_sub(1, Ordering::Relaxed);
+        self.waiting_calls.fetch_sub(1, Ordering::Relaxed);
     }
-}
-
-async fn acquire_llm_scheduler_slot() -> (i64, SchedulerInFlightGuard) {
-    let queue_started_at = Instant::now();
-    let _waiting_guard = SchedulerWaitingGuard::new();
-    let mut next_allowed_at = llm_scheduler().lock().await;
-    let now = Instant::now();
-    if *next_allowed_at > now {
-        tokio::time::sleep(*next_allowed_at - now).await;
-    }
-    *next_allowed_at = Instant::now() + LLM_SCHEDULER_REQUEST_INTERVAL;
-    LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_add(1, Ordering::Relaxed);
-    let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
-    (wait_ms, SchedulerInFlightGuard)
 }
 
 #[derive(Debug)]
@@ -1272,8 +1289,7 @@ pub async fn chat_completion(
     let mut started_at: Option<Instant> = None;
     let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
     for attempt in 1..=max_attempts {
-        // Global in-process queue: always serialize request issuance and pace at 1 request/second.
-        let (wait_ms, in_flight_guard) = acquire_llm_scheduler_slot().await;
+        let (wait_ms, in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
 
         if started_at.is_none() {
@@ -2362,6 +2378,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn retryable_status_detects_429_and_5xx() {
@@ -2377,6 +2394,38 @@ mod tests {
         assert!(!ai_error_is_non_retryable(&anyhow::anyhow!(
             "ai returned 429: upstream rate limit"
         )));
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_limits_parallelism_and_reports_waiters() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, first_guard) = scheduler.acquire_slot().await;
+        let queued_scheduler = Arc::clone(&scheduler);
+        let queued = tokio::spawn(async move { queued_scheduler.acquire_slot().await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let status = scheduler.runtime_status();
+        assert_eq!(status.max_concurrency, 1);
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 1);
+        assert_eq!(status.waiting_calls, 1);
+
+        drop(first_guard);
+
+        let (queued_wait_ms, second_guard) = queued.await.expect("queued acquire should finish");
+        assert!(queued_wait_ms > 0);
+        let status = scheduler.runtime_status();
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 1);
+        assert_eq!(status.waiting_calls, 0);
+
+        drop(second_guard);
+
+        let final_status = scheduler.runtime_status();
+        assert_eq!(final_status.available_slots, 1);
+        assert_eq!(final_status.in_flight_calls, 0);
+        assert_eq!(final_status.waiting_calls, 0);
     }
 
     #[test]

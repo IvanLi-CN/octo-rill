@@ -831,10 +831,10 @@ function AdminJobsPreview({
 				return new Response(
 					JSON.stringify({
 						scheduler_enabled: true,
-						request_interval_ms: 1000,
+						max_concurrency: 2,
 						waiting_calls: 1,
 						in_flight_calls: 1,
-						next_slot_in_ms: 450,
+						available_slots: 1,
 						calls_24h: llmCalls.length,
 						failed_24h: llmCalls.filter((item) => item.status === "failed")
 							.length,

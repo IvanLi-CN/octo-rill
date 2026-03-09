@@ -3567,8 +3567,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
 									</p>
 									<p className="text-muted-foreground mt-1 text-xs">
-										节流{" "}
-										{formatDurationMs(llmStatus?.request_interval_ms ?? null)}
+										最大并行 {formatCount(llmStatus?.max_concurrency)}
 									</p>
 								</div>
 								<div className="bg-card/70 rounded-lg border p-3">
@@ -3578,8 +3577,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 										{formatCount(llmStatus?.in_flight_calls)}
 									</p>
 									<p className="text-muted-foreground mt-1 text-xs">
-										下一个发放槽位{" "}
-										{formatDurationMs(llmStatus?.next_slot_in_ms ?? null)}
+										可用槽位 {formatCount(llmStatus?.available_slots)}
 									</p>
 								</div>
 								<div className="bg-card/70 rounded-lg border p-3">
