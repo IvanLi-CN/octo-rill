@@ -19,6 +19,8 @@ fn ensure_trailing_slash(mut url: Url) -> Url {
 fn parse_positive_usize_env(name: &str) -> Result<Option<usize>> {
     env::var(name)
         .ok()
+        .map(|raw| raw.trim().to_owned())
+        .filter(|raw| !raw.is_empty())
         .map(|raw| {
             raw.parse::<usize>()
                 .with_context(|| format!("invalid {name} (expected positive integer)"))
@@ -256,6 +258,19 @@ mod tests {
         set_required_env();
 
         let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.ai_max_concurrency, 1);
+    }
+
+    #[test]
+    fn from_env_treats_blank_ai_max_concurrency_as_default() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("AI_MAX_CONCURRENCY", "   ");
+        }
+
+        let config = AppConfig::from_env().expect("blank concurrency should fall back");
 
         assert_eq!(config.ai_max_concurrency, 1);
     }
