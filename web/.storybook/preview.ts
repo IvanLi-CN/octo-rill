@@ -7,6 +7,7 @@ const STORYBOOK_HEALTH_VERSION = "0.1.0";
 
 declare global {
 	var __octoRillStorybookFetchPatched: boolean | undefined;
+	var __octoRillStorybookLinkGuardInstalled: boolean | undefined;
 }
 
 if (
@@ -38,6 +39,52 @@ if (
 	};
 
 	globalThis.__octoRillStorybookFetchPatched = true;
+}
+
+function isStorybookAppLink(url: URL): boolean {
+	if (url.origin !== window.location.origin) return false;
+	if (url.pathname === "/") return true;
+	if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+		return true;
+	}
+	return (
+		url.pathname === "/auth/github/login" || url.pathname === "/auth/logout"
+	);
+}
+
+if (
+	typeof document !== "undefined" &&
+	!globalThis.__octoRillStorybookLinkGuardInstalled
+) {
+	document.addEventListener(
+		"click",
+		(event) => {
+			if (
+				event.defaultPrevented ||
+				event.button !== 0 ||
+				event.metaKey ||
+				event.ctrlKey ||
+				event.altKey ||
+				event.shiftKey
+			) {
+				return;
+			}
+
+			const target = event.target;
+			if (!(target instanceof Element)) return;
+
+			const anchor = target.closest("a[href]");
+			if (!(anchor instanceof HTMLAnchorElement)) return;
+
+			const targetUrl = new URL(anchor.href, window.location.origin);
+			if (!isStorybookAppLink(targetUrl)) return;
+
+			event.preventDefault();
+		},
+		true,
+	);
+
+	globalThis.__octoRillStorybookLinkGuardInstalled = true;
 }
 
 const preview: Preview = {
