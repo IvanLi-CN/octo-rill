@@ -5,7 +5,7 @@ description: OctoRill 的页面结构、核心体验与数据边界。
 
 # 产品说明
 
-本文档整理自仓库内 `docs/product.md`，用于帮助协作者快速理解 OctoRill 的核心信息架构。
+本文档用于帮助协作者快速理解 OctoRill 的核心信息架构。
 
 ## 核心体验
 
