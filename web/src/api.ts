@@ -260,7 +260,7 @@ export type AdminLlmCallStreamEvent = {
 };
 export type AdminTranslationStreamEvent = {
 	event_id: string;
-	resource_type: "request" | "batch";
+	resource_type: "request" | "batch" | "worker";
 	resource_id: string;
 	status: string;
 	event_type: string;
@@ -465,11 +465,27 @@ export type TranslationRequestStreamEvent = {
 	items?: TranslationResultItem[] | null;
 	error?: string | null;
 };
+export type AdminTranslationWorkerStatus = {
+	worker_id: string;
+	worker_slot: number;
+	worker_kind: "general" | "user_dedicated";
+	status: "idle" | "running" | "error";
+	current_batch_id: string | null;
+	request_count: number;
+	work_item_count: number;
+	trigger_reason: string | null;
+	updated_at: string;
+	error_text: string | null;
+};
 export type AdminTranslationStatusResponse = {
 	scheduler_enabled: boolean;
 	llm_enabled: boolean;
 	scan_interval_ms: number;
 	batch_token_threshold: number;
+	worker_concurrency: number;
+	idle_workers: number;
+	busy_workers: number;
+	workers: AdminTranslationWorkerStatus[];
 	queued_requests: number;
 	queued_work_items: number;
 	running_batches: number;
@@ -483,6 +499,7 @@ export type AdminTranslationRequestListItem = {
 	id: string;
 	status: string;
 	source: string;
+	request_origin: "user" | "system" | string;
 	requested_by: LocalUserId | null;
 	scope_user_id: LocalUserId;
 	item_count: number;
@@ -506,6 +523,8 @@ export type AdminTranslationBatchListItem = {
 	id: string;
 	status: string;
 	trigger_reason: string;
+	worker_slot: number;
+	request_count: number;
 	item_count: number;
 	estimated_input_tokens: number;
 	created_at: string;

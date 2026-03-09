@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -31,6 +31,12 @@ const TRANSLATION_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSLATION_MAX_ITEMS_PER_REQUEST: usize = 60;
 const TRANSLATION_MIN_WAIT_MS: i64 = 0;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
+const TRANSLATION_WORKER_CONCURRENCY: i64 = 4;
+const TRANSLATION_USER_DEDICATED_WORKER_SLOT: i64 = 4;
+
+static TRANSLATION_WORKER_RUNTIME: OnceLock<
+    tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationSourceBlock {
@@ -117,6 +123,10 @@ pub struct AdminTranslationStatusResponse {
     pub llm_enabled: bool,
     pub scan_interval_ms: i64,
     pub batch_token_threshold: i64,
+    pub worker_concurrency: i64,
+    pub idle_workers: i64,
+    pub busy_workers: i64,
+    pub workers: Vec<AdminTranslationWorkerStatus>,
     pub queued_requests: i64,
     pub queued_work_items: i64,
     pub running_batches: i64,
@@ -132,6 +142,7 @@ pub struct AdminTranslationRequestListItem {
     pub id: String,
     pub status: String,
     pub source: String,
+    pub request_origin: String,
     pub requested_by: Option<String>,
     pub scope_user_id: String,
     pub item_count: i64,
@@ -161,6 +172,8 @@ pub struct AdminTranslationBatchListItem {
     pub id: String,
     pub status: String,
     pub trigger_reason: String,
+    pub worker_slot: i64,
+    pub request_count: i64,
     pub item_count: i64,
     pub estimated_input_tokens: i64,
     pub created_at: String,
@@ -195,6 +208,40 @@ pub struct AdminTranslationBatchDetailResponse {
     pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminTranslationWorkerStatus {
+    pub worker_id: String,
+    pub worker_slot: i64,
+    pub worker_kind: String,
+    pub status: String,
+    pub current_batch_id: Option<String>,
+    pub request_count: i64,
+    pub work_item_count: i64,
+    pub trigger_reason: Option<String>,
+    pub updated_at: String,
+    pub error_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TranslationWorkerRuntimeState {
+    worker_id: String,
+    worker_slot: i64,
+    worker_kind: String,
+    status: String,
+    current_batch_id: Option<String>,
+    request_count: i64,
+    work_item_count: i64,
+    trigger_reason: Option<String>,
+    updated_at: String,
+    error_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranslationWorkerProfile {
+    worker_slot: i64,
+    worker_kind: &'static str,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct WorkItemRow {
@@ -227,14 +274,48 @@ struct WorkItemRow {
 }
 
 #[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ClaimCandidateRow {
+    id: String,
+    dedupe_key: String,
+    scope_user_id: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+    protocol_version: String,
+    model_profile: String,
+    source_hash: String,
+    source_blocks_json: String,
+    target_slots_json: String,
+    token_estimate: i64,
+    deadline_at: String,
+    status: String,
+    batch_id: Option<String>,
+    result_status: Option<String>,
+    title_zh: Option<String>,
+    summary_md: Option<String>,
+    body_md: Option<String>,
+    error_text: Option<String>,
+    cache_hit: i64,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+    request_origin: String,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ClaimedBatch {
     id: String,
+    worker_slot: i64,
     partition_key: String,
     target_lang: String,
     protocol_version: String,
     model_profile: String,
     trigger_reason: String,
+    request_count: i64,
     estimated_input_tokens: i64,
     items: Vec<WorkItemRow>,
 }
@@ -249,16 +330,224 @@ struct TerminalWorkResult {
     error: Option<String>,
 }
 
-pub fn spawn_translation_scheduler(state: Arc<AppState>) -> tokio::task::AbortHandle {
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = run_translation_scheduler_once(state.as_ref()).await {
-                warn!(?err, "translation scheduler tick failed");
-            }
-            sleep(TRANSLATION_BATCH_SCAN_INTERVAL).await;
+impl ClaimCandidateRow {
+    fn into_work_item(self) -> WorkItemRow {
+        WorkItemRow {
+            id: self.id,
+            dedupe_key: self.dedupe_key,
+            scope_user_id: self.scope_user_id,
+            kind: self.kind,
+            variant: self.variant,
+            entity_id: self.entity_id,
+            target_lang: self.target_lang,
+            protocol_version: self.protocol_version,
+            model_profile: self.model_profile,
+            source_hash: self.source_hash,
+            source_blocks_json: self.source_blocks_json,
+            target_slots_json: self.target_slots_json,
+            token_estimate: self.token_estimate,
+            deadline_at: self.deadline_at,
+            status: self.status,
+            batch_id: self.batch_id,
+            result_status: self.result_status,
+            title_zh: self.title_zh,
+            summary_md: self.summary_md,
+            body_md: self.body_md,
+            error_text: self.error_text,
+            cache_hit: self.cache_hit,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            updated_at: self.updated_at,
         }
+    }
+}
+
+impl TranslationWorkerRuntimeState {
+    fn to_admin_status(&self) -> AdminTranslationWorkerStatus {
+        AdminTranslationWorkerStatus {
+            worker_id: self.worker_id.clone(),
+            worker_slot: self.worker_slot,
+            worker_kind: self.worker_kind.clone(),
+            status: self.status.clone(),
+            current_batch_id: self.current_batch_id.clone(),
+            request_count: self.request_count,
+            work_item_count: self.work_item_count,
+            trigger_reason: self.trigger_reason.clone(),
+            updated_at: self.updated_at.clone(),
+            error_text: self.error_text.clone(),
+        }
+    }
+}
+
+fn translation_worker_profiles() -> [TranslationWorkerProfile; 4] {
+    [
+        TranslationWorkerProfile {
+            worker_slot: 1,
+            worker_kind: "general",
+        },
+        TranslationWorkerProfile {
+            worker_slot: 2,
+            worker_kind: "general",
+        },
+        TranslationWorkerProfile {
+            worker_slot: 3,
+            worker_kind: "general",
+        },
+        TranslationWorkerProfile {
+            worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
+            worker_kind: "user_dedicated",
+        },
+    ]
+}
+
+fn translation_worker_runtime() -> &'static tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>
+{
+    TRANSLATION_WORKER_RUNTIME.get_or_init(|| {
+        let now = Utc::now().to_rfc3339();
+        tokio::sync::RwLock::new(
+            translation_worker_profiles()
+                .into_iter()
+                .map(|profile| TranslationWorkerRuntimeState {
+                    worker_id: translation_worker_id(profile.worker_slot),
+                    worker_slot: profile.worker_slot,
+                    worker_kind: profile.worker_kind.to_owned(),
+                    status: "idle".to_owned(),
+                    current_batch_id: None,
+                    request_count: 0,
+                    work_item_count: 0,
+                    trigger_reason: None,
+                    updated_at: now.clone(),
+                    error_text: None,
+                })
+                .collect(),
+        )
     })
-    .abort_handle()
+}
+
+fn translation_worker_id(worker_slot: i64) -> String {
+    format!("translation-worker-{worker_slot}")
+}
+
+async fn update_translation_worker_runtime(
+    profile: TranslationWorkerProfile,
+    status: &str,
+    current_batch_id: Option<&str>,
+    request_count: i64,
+    work_item_count: i64,
+    trigger_reason: Option<&str>,
+    error_text: Option<&str>,
+) {
+    let runtime = translation_worker_runtime();
+    let mut guard = runtime.write().await;
+    let Some(entry) = guard
+        .iter_mut()
+        .find(|entry| entry.worker_slot == profile.worker_slot)
+    else {
+        return;
+    };
+
+    let next_batch_id = current_batch_id.map(str::to_owned);
+    let next_trigger_reason = trigger_reason.map(str::to_owned);
+    let next_error_text = error_text.map(str::to_owned);
+    let changed = entry.status != status
+        || entry.current_batch_id != next_batch_id
+        || entry.request_count != request_count
+        || entry.work_item_count != work_item_count
+        || entry.trigger_reason != next_trigger_reason
+        || entry.error_text != next_error_text;
+    if !changed {
+        return;
+    }
+
+    entry.status = status.to_owned();
+    entry.current_batch_id = next_batch_id;
+    entry.request_count = request_count;
+    entry.work_item_count = work_item_count;
+    entry.trigger_reason = next_trigger_reason;
+    entry.error_text = next_error_text;
+    entry.updated_at = Utc::now().to_rfc3339();
+}
+
+pub async fn translation_worker_runtime_statuses() -> Vec<AdminTranslationWorkerStatus> {
+    translation_worker_runtime()
+        .read()
+        .await
+        .iter()
+        .map(TranslationWorkerRuntimeState::to_admin_status)
+        .collect()
+}
+
+#[cfg(test)]
+async fn reset_translation_worker_runtime_for_tests() {
+    let runtime = translation_worker_runtime();
+    let now = Utc::now().to_rfc3339();
+    let mut guard = runtime.write().await;
+    *guard = translation_worker_profiles()
+        .into_iter()
+        .map(|profile| TranslationWorkerRuntimeState {
+            worker_id: translation_worker_id(profile.worker_slot),
+            worker_slot: profile.worker_slot,
+            worker_kind: profile.worker_kind.to_owned(),
+            status: "idle".to_owned(),
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            updated_at: now.clone(),
+            error_text: None,
+        })
+        .collect();
+}
+
+fn claim_origin_case_sql() -> &'static str {
+    r#"
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM translation_work_watchers tw
+        JOIN translation_request_items tri ON tri.id = tw.request_item_id
+        JOIN translation_requests tr ON tr.id = tri.request_id
+        WHERE tw.work_item_id = w.id
+          AND tr.request_origin = 'user'
+      ) THEN 'user'
+      ELSE 'system'
+    END
+    "#
+}
+pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::AbortHandle> {
+    translation_worker_profiles()
+        .into_iter()
+        .map(|profile| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                update_translation_worker_runtime(profile, "idle", None, 0, 0, None, None).await;
+                loop {
+                    if let Err(err) = run_translation_scheduler_once(state.as_ref(), profile).await
+                    {
+                        warn!(
+                            ?err,
+                            worker_slot = profile.worker_slot,
+                            "translation scheduler tick failed"
+                        );
+                        let error_text = err.to_string();
+                        update_translation_worker_runtime(
+                            profile,
+                            "error",
+                            None,
+                            0,
+                            0,
+                            None,
+                            Some(error_text.as_str()),
+                        )
+                        .await;
+                    }
+                    sleep(TRANSLATION_BATCH_SCAN_INTERVAL).await;
+                }
+            })
+            .abort_handle()
+        })
+        .collect::<Vec<_>>()
 }
 
 pub async fn reject_legacy_translation_routes() -> Response {
@@ -341,6 +630,21 @@ pub async fn admin_get_translation_status(
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let _llm_runtime = ai::llm_scheduler_runtime_status().await;
     let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let workers = translation_worker_runtime_statuses().await;
+    let idle_workers = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.status == "idle")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let busy_workers = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.status == "running")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
 
     let queued_requests = scalar_i64(
         state.as_ref(),
@@ -404,6 +708,10 @@ pub async fn admin_get_translation_status(
         scan_interval_ms: i64::try_from(TRANSLATION_BATCH_SCAN_INTERVAL.as_millis())
             .unwrap_or(i64::MAX),
         batch_token_threshold: budget,
+        worker_concurrency: TRANSLATION_WORKER_CONCURRENCY,
+        idle_workers,
+        busy_workers,
+        workers,
         queued_requests,
         queued_work_items,
         running_batches,
@@ -441,11 +749,13 @@ pub async fn admin_list_translation_requests(
 
     let items = sqlx::query_as::<_, AdminTranslationRequestListItem>(
         r#"
-        SELECT id, status, source, requested_by, scope_user_id, item_count, completed_item_count,
+        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
                created_at, started_at, finished_at, updated_at
         FROM translation_requests
         WHERE (? = 'all' OR status = ?)
-        ORDER BY created_at DESC, id DESC
+        ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                 updated_at DESC,
+                 id DESC
         LIMIT ? OFFSET ?
         "#,
     )
@@ -474,7 +784,7 @@ pub async fn admin_get_translation_request_detail(
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
     let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
         r#"
-        SELECT id, status, source, requested_by, scope_user_id, item_count, completed_item_count,
+        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
                created_at, started_at, finished_at, updated_at
         FROM translation_requests
         WHERE id = ?
@@ -525,7 +835,7 @@ pub async fn admin_list_translation_batches(
 
     let items = sqlx::query_as::<_, AdminTranslationBatchListItem>(
         r#"
-        SELECT id, status, trigger_reason, item_count, estimated_input_tokens,
+        SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
                created_at, started_at, finished_at, updated_at
         FROM translation_batches
         WHERE (? = 'all' OR status = ?)
@@ -558,7 +868,7 @@ pub async fn admin_get_translation_batch_detail(
     let batch_id = api::parse_local_id_param(batch_id, "batch_id")?;
     let batch = sqlx::query_as::<_, AdminTranslationBatchListItem>(
         r#"
-        SELECT id, status, trigger_reason, item_count, estimated_input_tokens,
+        SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
                created_at, started_at, finished_at, updated_at
         FROM translation_batches
         WHERE id = ?
@@ -604,6 +914,16 @@ async fn create_translation_request(
     mode: &str,
     items: &[TranslationRequestItemInput],
 ) -> Result<String, ApiError> {
+    create_translation_request_with_origin(state, user_id, mode, items, "user").await
+}
+
+async fn create_translation_request_with_origin(
+    state: &AppState,
+    user_id: &str,
+    mode: &str,
+    items: &[TranslationRequestItemInput],
+    request_origin: &str,
+) -> Result<String, ApiError> {
     let now = Utc::now().to_rfc3339();
     let request_id = crate::local_id::generate_local_id();
     let source = derive_request_source(items);
@@ -612,14 +932,15 @@ async fn create_translation_request(
     sqlx::query(
         r#"
         INSERT INTO translation_requests (
-          id, mode, source, requested_by, scope_user_id, status, item_count, completed_item_count,
+          id, mode, source, request_origin, requested_by, scope_user_id, status, item_count, completed_item_count,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)
         "#,
     )
     .bind(request_id.as_str())
     .bind(mode)
     .bind(source.as_str())
+    .bind(request_origin)
     .bind(user_id)
     .bind(user_id)
     .bind(i64::try_from(items.len()).unwrap_or(i64::MAX))
@@ -942,28 +1263,56 @@ async fn apply_request_item_result(
     Ok(())
 }
 
-async fn run_translation_scheduler_once(state: &AppState) -> Result<()> {
-    let Some(batch) = claim_next_batch(state).await? else {
+async fn run_translation_scheduler_once(
+    state: &AppState,
+    worker: TranslationWorkerProfile,
+) -> Result<()> {
+    let Some(batch) = claim_next_batch(state, worker).await? else {
         return Ok(());
     };
     execute_claimed_batch(state, batch).await
 }
 
-async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
-    let first = sqlx::query_as::<_, WorkItemRow>(
-        r#"
-        SELECT id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
-               model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
-               deadline_at, status, batch_id, result_status, title_zh, summary_md, body_md,
-               error_text, cache_hit, created_at, started_at, finished_at, updated_at
-        FROM translation_work_items
-        WHERE status = 'queued'
-        ORDER BY deadline_at ASC, created_at ASC
-        LIMIT 1
-        "#,
-    )
-    .fetch_optional(&state.pool)
-    .await?;
+async fn claim_next_batch(
+    state: &AppState,
+    worker: TranslationWorkerProfile,
+) -> Result<Option<ClaimedBatch>> {
+    let claim_origin_case = claim_origin_case_sql();
+    let first_query = if worker.worker_kind == "user_dedicated" {
+        format!(
+            r#"
+            SELECT w.id, w.dedupe_key, w.scope_user_id, w.kind, w.variant, w.entity_id, w.target_lang,
+                   w.protocol_version, w.model_profile, w.source_hash, w.source_blocks_json,
+                   w.target_slots_json, w.token_estimate, w.deadline_at, w.status, w.batch_id,
+                   w.result_status, w.title_zh, w.summary_md, w.body_md, w.error_text, w.cache_hit,
+                   w.created_at, w.started_at, w.finished_at, w.updated_at,
+                   {claim_origin_case} AS request_origin
+            FROM translation_work_items w
+            WHERE w.status = 'queued'
+              AND {claim_origin_case} = 'user'
+            ORDER BY w.deadline_at ASC, w.created_at ASC
+            LIMIT 1
+            "#,
+        )
+    } else {
+        format!(
+            r#"
+            SELECT w.id, w.dedupe_key, w.scope_user_id, w.kind, w.variant, w.entity_id, w.target_lang,
+                   w.protocol_version, w.model_profile, w.source_hash, w.source_blocks_json,
+                   w.target_slots_json, w.token_estimate, w.deadline_at, w.status, w.batch_id,
+                   w.result_status, w.title_zh, w.summary_md, w.body_md, w.error_text, w.cache_hit,
+                   w.created_at, w.started_at, w.finished_at, w.updated_at,
+                   {claim_origin_case} AS request_origin
+            FROM translation_work_items w
+            WHERE w.status = 'queued'
+            ORDER BY w.deadline_at ASC, w.created_at ASC
+            LIMIT 1
+            "#,
+        )
+    };
+    let first = sqlx::query_as::<_, ClaimCandidateRow>(&first_query)
+        .fetch_optional(&state.pool)
+        .await?;
     let Some(first) = first else {
         return Ok(None);
     };
@@ -973,26 +1322,31 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
             .await
             .input_budget,
     );
-    let candidates = sqlx::query_as::<_, WorkItemRow>(
+    let candidates_query = format!(
         r#"
-        SELECT id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
-               model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
-               deadline_at, status, batch_id, result_status, title_zh, summary_md, body_md,
-               error_text, cache_hit, created_at, started_at, finished_at, updated_at
-        FROM translation_work_items
-        WHERE status = 'queued'
-          AND target_lang = ?
-          AND protocol_version = ?
-          AND model_profile = ?
-        ORDER BY rowid ASC
+        SELECT w.id, w.dedupe_key, w.scope_user_id, w.kind, w.variant, w.entity_id, w.target_lang,
+               w.protocol_version, w.model_profile, w.source_hash, w.source_blocks_json,
+               w.target_slots_json, w.token_estimate, w.deadline_at, w.status, w.batch_id,
+               w.result_status, w.title_zh, w.summary_md, w.body_md, w.error_text, w.cache_hit,
+               w.created_at, w.started_at, w.finished_at, w.updated_at,
+               {claim_origin_case} AS request_origin
+        FROM translation_work_items w
+        WHERE w.status = 'queued'
+          AND w.target_lang = ?
+          AND w.protocol_version = ?
+          AND w.model_profile = ?
+          AND {claim_origin_case} = ?
+        ORDER BY w.rowid ASC
         LIMIT 200
         "#,
-    )
-    .bind(first.target_lang.as_str())
-    .bind(first.protocol_version.as_str())
-    .bind(first.model_profile.as_str())
-    .fetch_all(&state.pool)
-    .await?;
+    );
+    let candidates = sqlx::query_as::<_, ClaimCandidateRow>(&candidates_query)
+        .bind(first.target_lang.as_str())
+        .bind(first.protocol_version.as_str())
+        .bind(first.model_profile.as_str())
+        .bind(first.request_origin.as_str())
+        .fetch_all(&state.pool)
+        .await?;
 
     let now = Utc::now();
     let earliest_deadline = parse_ts(first.deadline_at.as_str())?;
@@ -1023,12 +1377,29 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
     );
     let now_str = now.to_rfc3339();
     let mut tx = state.pool.begin().await?;
+    let mut request_ids = HashSet::new();
+    for item in &selected {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT tri.request_id
+            FROM translation_work_watchers tw
+            JOIN translation_request_items tri ON tri.id = tw.request_item_id
+            WHERE tw.work_item_id = ?
+            "#,
+        )
+        .bind(item.id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        request_ids.extend(rows);
+    }
+    let request_count = i64::try_from(request_ids.len()).unwrap_or(i64::MAX);
+
     sqlx::query(
         r#"
         INSERT INTO translation_batches (
           id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
-          item_count, estimated_input_tokens, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+          worker_slot, request_count, item_count, estimated_input_tokens, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
         "#,
     )
     .bind(batch_id.as_str())
@@ -1037,6 +1408,8 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
     .bind(first.model_profile.as_str())
     .bind(first.target_lang.as_str())
     .bind(trigger_reason.as_str())
+    .bind(worker.worker_slot)
+    .bind(request_count)
     .bind(i64::try_from(selected.len()).unwrap_or(i64::MAX))
     .bind(token_sum)
     .bind(now_str.as_str())
@@ -1052,7 +1425,7 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
         .fetch_one(&mut *tx)
         .await?;
 
-        sqlx::query(
+        let rows_affected = sqlx::query(
             r#"
             UPDATE translation_work_items
             SET status = 'batched', batch_id = ?, updated_at = ?
@@ -1063,7 +1436,11 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
         .bind(now_str.as_str())
         .bind(item.id.as_str())
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if rows_affected != 1 {
+            return Ok(None);
+        }
 
         sqlx::query(
             r#"
@@ -1096,18 +1473,31 @@ async fn claim_next_batch(state: &AppState) -> Result<Option<ClaimedBatch>> {
 
     Ok(Some(ClaimedBatch {
         id: batch_id,
+        worker_slot: worker.worker_slot,
         partition_key,
         target_lang: first.target_lang,
         protocol_version: first.protocol_version,
         model_profile: first.model_profile,
         trigger_reason,
+        request_count,
         estimated_input_tokens: token_sum,
-        items: selected,
+        items: selected
+            .into_iter()
+            .map(ClaimCandidateRow::into_work_item)
+            .collect(),
     }))
 }
 
 async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<()> {
     let now = Utc::now().to_rfc3339();
+    let worker = TranslationWorkerProfile {
+        worker_slot: batch.worker_slot,
+        worker_kind: if batch.worker_slot == TRANSLATION_USER_DEDICATED_WORKER_SLOT {
+            "user_dedicated"
+        } else {
+            "general"
+        },
+    };
     sqlx::query(
         r#"
         UPDATE translation_batches
@@ -1120,6 +1510,16 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     .bind(batch.id.as_str())
     .execute(&state.pool)
     .await?;
+    update_translation_worker_runtime(
+        worker,
+        "running",
+        Some(batch.id.as_str()),
+        batch.request_count,
+        i64::try_from(batch.items.len()).unwrap_or(i64::MAX),
+        Some(batch.trigger_reason.as_str()),
+        None,
+    )
+    .await;
     for item in &batch.items {
         sqlx::query(
             r#"
@@ -1149,8 +1549,26 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     .await;
 
     match result {
-        Ok(results) => finalize_batch_success(state, &batch, results).await,
-        Err(err) => finalize_batch_failure(state, &batch, err.into()).await,
+        Ok(results) => {
+            let res = finalize_batch_success(state, &batch, results).await;
+            update_translation_worker_runtime(worker, "idle", None, 0, 0, None, None).await;
+            res
+        }
+        Err(err) => {
+            let error = err.to_string();
+            let res = finalize_batch_failure(state, &batch, err.into()).await;
+            update_translation_worker_runtime(
+                worker,
+                "error",
+                None,
+                0,
+                0,
+                None,
+                Some(error.as_str()),
+            )
+            .await;
+            res
+        }
     }
 }
 
@@ -2294,9 +2712,15 @@ mod tests {
                 .await
                 .expect("request created");
 
-        run_translation_scheduler_once(state.as_ref())
-            .await
-            .expect("scheduler tick");
+        run_translation_scheduler_once(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("scheduler tick");
 
         let request_status: String =
             sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
@@ -2360,6 +2784,225 @@ mod tests {
         assert_eq!(request_status, "failed");
     }
 
+    #[tokio::test]
+    async fn create_translation_request_with_origin_persists_request_origin() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("123");
+
+        let request_id = create_translation_request_with_origin(
+            state.as_ref(),
+            "1",
+            "async",
+            std::slice::from_ref(&item),
+            "system",
+        )
+        .await
+        .expect("system request created");
+
+        let request_origin: String =
+            sqlx::query_scalar("SELECT request_origin FROM translation_requests WHERE id = ?")
+                .bind(request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request origin");
+
+        assert_eq!(request_origin, "system");
+    }
+
+    #[tokio::test]
+    async fn claim_next_batch_routes_user_dedicated_worker_only_to_user_requests() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut system_item = sample_release_item("111");
+        system_item.max_wait_ms = 0;
+        let mut user_item = sample_release_item("222");
+        user_item.max_wait_ms = 0;
+
+        create_translation_request_with_origin(
+            state.as_ref(),
+            "1",
+            "async",
+            std::slice::from_ref(&system_item),
+            "system",
+        )
+        .await
+        .expect("system request created");
+        create_translation_request_with_origin(
+            state.as_ref(),
+            "1",
+            "async",
+            std::slice::from_ref(&user_item),
+            "user",
+        )
+        .await
+        .expect("user request created");
+
+        let dedicated_batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
+                worker_kind: "user_dedicated",
+            },
+        )
+        .await
+        .expect("claim user batch")
+        .expect("user batch exists");
+
+        assert_eq!(
+            dedicated_batch.worker_slot,
+            TRANSLATION_USER_DEDICATED_WORKER_SLOT
+        );
+        assert_eq!(dedicated_batch.request_count, 1);
+        assert_eq!(dedicated_batch.items.len(), 1);
+        assert_eq!(dedicated_batch.items[0].entity_id, "222");
+
+        let general_batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim general batch")
+        .expect("general batch exists");
+
+        assert_eq!(general_batch.worker_slot, 1);
+        assert_eq!(general_batch.items[0].entity_id, "111");
+    }
+
+    #[tokio::test]
+    async fn scheduler_persists_batch_worker_slot_and_request_count() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("123");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
+            .await
+            .expect("request created");
+
+        run_translation_scheduler_once(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 2,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("scheduler tick");
+
+        let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+            r#"
+            SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
+                   created_at, started_at, finished_at, updated_at
+            FROM translation_batches
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load batch");
+
+        assert_eq!(row.worker_slot, 2);
+        assert_eq!(row.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn translation_worker_runtime_statuses_report_updates() {
+        reset_translation_worker_runtime_for_tests().await;
+        update_translation_worker_runtime(
+            TranslationWorkerProfile {
+                worker_slot: 4,
+                worker_kind: "user_dedicated",
+            },
+            "running",
+            Some("batch-1"),
+            2,
+            3,
+            Some("deadline"),
+            None,
+        )
+        .await;
+
+        let workers = translation_worker_runtime_statuses().await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_slot == 4)
+            .expect("dedicated worker exists");
+
+        assert_eq!(workers.len(), TRANSLATION_WORKER_CONCURRENCY as usize);
+        assert_eq!(dedicated.status, "running");
+        assert_eq!(dedicated.current_batch_id.as_deref(), Some("batch-1"));
+        assert_eq!(dedicated.request_count, 2);
+        assert_eq!(dedicated.work_item_count, 3);
+    }
+
+    #[tokio::test]
+    async fn admin_request_ordering_prioritizes_active_then_recent_updates() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        for (id, status, updated_at) in [
+            ("req-completed-newer", "completed", "2026-03-07T00:00:03Z"),
+            ("req-queued-older", "queued", "2026-03-07T00:00:01Z"),
+            ("req-running-newest", "running", "2026-03-07T00:00:04Z"),
+            ("req-failed-mid", "failed", "2026-03-07T00:00:02Z"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO translation_requests (
+                  id, mode, source, request_origin, requested_by, scope_user_id, status, item_count,
+                  completed_item_count, created_at, updated_at
+                ) VALUES (?, 'async', 'feed.auto_translate', 'user', ?, ?, ?, 1, 0, ?, ?)
+                "#,
+            )
+            .bind(id)
+            .bind("1")
+            .bind("1")
+            .bind(status)
+            .bind(updated_at)
+            .bind(updated_at)
+            .execute(&pool)
+            .await
+            .expect("insert request");
+        }
+
+        let rows = sqlx::query_as::<_, AdminTranslationRequestListItem>(
+            r#"
+            SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
+                   created_at, started_at, finished_at, updated_at
+            FROM translation_requests
+            ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                     updated_at DESC,
+                     id DESC
+            "#,
+        )
+        .fetch_all(&state.pool)
+        .await
+        .expect("load ordered requests");
+
+        let ids = rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "req-running-newest",
+                "req-queued-older",
+                "req-completed-newer",
+                "req-failed-mid",
+            ],
+        );
+    }
+
     #[test]
     fn derive_request_stream_phase_uses_running_request_status() {
         let detail = LoadedRequestDetail {
@@ -2367,6 +3010,7 @@ mod tests {
                 id: "req-1".to_owned(),
                 status: "running".to_owned(),
                 source: "feed.auto_translate".to_owned(),
+                request_origin: "user".to_owned(),
                 requested_by: Some("1".to_owned()),
                 scope_user_id: "1".to_owned(),
                 item_count: 1,
@@ -2405,9 +3049,9 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO translation_requests (
-              id, mode, source, requested_by, scope_user_id, status, item_count,
+              id, mode, source, request_origin, requested_by, scope_user_id, status, item_count,
               completed_item_count, created_at, updated_at
-            ) VALUES (?, 'async', 'feed.auto_translate', ?, ?, 'queued', 2, 0, ?, ?)
+            ) VALUES (?, 'async', 'feed.auto_translate', 'user', ?, ?, 'queued', 2, 0, ?, ?)
             "#,
         )
         .bind(request_id.as_str())
