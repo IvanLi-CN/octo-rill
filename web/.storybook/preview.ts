@@ -4,6 +4,19 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import "../src/index.css";
 
 const STORYBOOK_HEALTH_VERSION = "0.1.0";
+const LOCAL_STORYBOOK_DEV_ORIGINS = new Set([
+	"http://127.0.0.1:55176",
+	"http://localhost:55176",
+]);
+const LOCAL_DOCS_SITE_ORIGIN = "http://127.0.0.1:50885";
+const LOCAL_DOCS_SITE_PATHS = new Set([
+	"/index.html",
+	"/quick-start.html",
+	"/config.html",
+	"/product.html",
+	"/storybook.html",
+	"/storybook-guide.html",
+]);
 
 declare global {
 	var __octoRillStorybookFetchPatched: boolean | undefined;
@@ -52,6 +65,18 @@ function isStorybookAppLink(url: URL): boolean {
 	);
 }
 
+function resolveLocalDocsSiteLink(url: URL): URL | null {
+	if (!LOCAL_STORYBOOK_DEV_ORIGINS.has(window.location.origin)) {
+		return null;
+	}
+	if (url.origin !== window.location.origin) return null;
+	if (!LOCAL_DOCS_SITE_PATHS.has(url.pathname)) return null;
+	return new URL(
+		`${url.pathname}${url.search}${url.hash}`,
+		LOCAL_DOCS_SITE_ORIGIN,
+	);
+}
+
 if (
 	typeof document !== "undefined" &&
 	!globalThis.__octoRillStorybookLinkGuardInstalled
@@ -77,6 +102,12 @@ if (
 			if (!(anchor instanceof HTMLAnchorElement)) return;
 
 			const targetUrl = new URL(anchor.href, window.location.origin);
+			const localDocsSiteTarget = resolveLocalDocsSiteLink(targetUrl);
+			if (localDocsSiteTarget) {
+				event.preventDefault();
+				window.top?.location.assign(localDocsSiteTarget.toString());
+				return;
+			}
 			if (!isStorybookAppLink(targetUrl)) return;
 
 			event.preventDefault();
