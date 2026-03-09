@@ -17,9 +17,11 @@ const LOCAL_DOCS_SITE_PATHS = new Set([
 
 declare global {
 	var __octoRillStorybookFetchPatched: boolean | undefined;
-	var __octoRillStorybookLinkGuardInstalled: boolean | undefined;
 	var __octoRillStorybookDocsLinkSyncInstalled: boolean | undefined;
 }
+
+const observedDocsRoots = new WeakSet<Document | ShadowRoot>();
+const guardedStorybookDocuments = new WeakSet<Document>();
 
 if (
 	typeof globalThis.fetch === "function" &&
@@ -52,8 +54,11 @@ if (
 	globalThis.__octoRillStorybookFetchPatched = true;
 }
 
-function isStorybookAppLink(url: URL): boolean {
-	if (url.origin !== window.location.origin) return false;
+function isStorybookAppLink(
+	url: URL,
+	currentOrigin = window.location.origin,
+): boolean {
+	if (url.origin !== currentOrigin) return false;
 	if (url.pathname === "/") return true;
 	if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
 		return true;
@@ -96,82 +101,48 @@ function getLocalDocsSiteOrigin(): string {
 	);
 }
 
-function resolveLocalDocsSiteLink(url: URL): URL | null {
-	if (!import.meta.env.DEV || url.origin !== window.location.origin) {
-		return null;
+function isDocsSitePath(pathname: string): boolean {
+	for (const candidate of LOCAL_DOCS_SITE_PATHS) {
+		if (pathname === candidate || pathname.endsWith(candidate)) {
+			return true;
+		}
 	}
-	if (!LOCAL_DOCS_SITE_PATHS.has(url.pathname)) return null;
-	return new URL(
-		`${url.pathname}${url.search}${url.hash}`,
-		getLocalDocsSiteOrigin(),
-	);
+	return false;
 }
 
-function rewriteLocalDocsLinks(root: Document | ShadowRoot): void {
+function resolveDocsSiteLink(url: URL): URL | null {
+	if (url.origin !== window.location.origin) {
+		return null;
+	}
+	if (!isDocsSitePath(url.pathname)) return null;
+	if (import.meta.env.DEV && LOCAL_DOCS_SITE_PATHS.has(url.pathname)) {
+		return new URL(
+			`${url.pathname}${url.search}${url.hash}`,
+			getLocalDocsSiteOrigin(),
+		);
+	}
+	return url;
+}
+
+function rewriteDocsLinks(root: Document | ShadowRoot): void {
 	for (const anchor of root.querySelectorAll<HTMLAnchorElement>("a[href]")) {
-		const rewrittenTarget = resolveLocalDocsSiteLink(
+		const rewrittenTarget = resolveDocsSiteLink(
 			new URL(anchor.href, window.location.origin),
 		);
 		if (!rewrittenTarget) continue;
 		anchor.href = rewrittenTarget.toString();
 		anchor.target = "_top";
-		anchor.rel = anchor.rel
-			? `${anchor.rel} noopener noreferrer`.trim()
-			: "noopener noreferrer";
+		const relParts = new Set(anchor.rel.split(/\s+/).filter(Boolean));
+		relParts.add("noopener");
+		relParts.add("noreferrer");
+		anchor.rel = Array.from(relParts).join(" ");
 	}
 }
 
-function installLocalDocsLinkSync(): void {
-	if (
-		typeof document === "undefined" ||
-		globalThis.__octoRillStorybookDocsLinkSyncInstalled ||
-		!import.meta.env.DEV
-	) {
-		return;
-	}
+function installStorybookAppLinkGuard(targetDocument: Document): void {
+	if (guardedStorybookDocuments.has(targetDocument)) return;
 
-	const observeDocument = (targetDocument: Document) => {
-		const sync = () => rewriteLocalDocsLinks(targetDocument);
-		sync();
-		new MutationObserver(sync).observe(targetDocument, {
-			childList: true,
-			subtree: true,
-		});
-	};
-
-	observeDocument(document);
-
-	const syncPreviewIframe = () => {
-		const previewIframe = document.querySelector<HTMLIFrameElement>(
-			"#storybook-preview-iframe",
-		);
-		if (!previewIframe) return;
-		const previewDocument = previewIframe.contentDocument;
-		if (!previewDocument) return;
-		observeDocument(previewDocument);
-	};
-
-	document.addEventListener(
-		"DOMContentLoaded",
-		() => {
-			syncPreviewIframe();
-			const previewIframe = document.querySelector<HTMLIFrameElement>(
-				"#storybook-preview-iframe",
-			);
-			previewIframe?.addEventListener("load", syncPreviewIframe);
-		},
-		{ once: true },
-	);
-	syncPreviewIframe();
-
-	globalThis.__octoRillStorybookDocsLinkSyncInstalled = true;
-}
-
-if (
-	typeof document !== "undefined" &&
-	!globalThis.__octoRillStorybookLinkGuardInstalled
-) {
-	document.addEventListener(
+	targetDocument.addEventListener(
 		"click",
 		(event) => {
 			if (
@@ -191,18 +162,79 @@ if (
 			const anchor = target.closest("a[href]");
 			if (!(anchor instanceof HTMLAnchorElement)) return;
 
-			const targetUrl = new URL(anchor.href, window.location.origin);
-			if (!isStorybookAppLink(targetUrl)) return;
+			const targetUrl = new URL(
+				anchor.href,
+				targetDocument.location?.origin ?? window.location.origin,
+			);
+			if (!isStorybookAppLink(targetUrl, targetDocument.location.origin)) {
+				return;
+			}
 
 			event.preventDefault();
 		},
 		true,
 	);
 
-	globalThis.__octoRillStorybookLinkGuardInstalled = true;
+	guardedStorybookDocuments.add(targetDocument);
 }
 
-installLocalDocsLinkSync();
+function observeStorybookDocument(targetDocument: Document): void {
+	if (observedDocsRoots.has(targetDocument)) {
+		rewriteDocsLinks(targetDocument);
+		installStorybookAppLinkGuard(targetDocument);
+		return;
+	}
+
+	const sync = () => rewriteDocsLinks(targetDocument);
+	sync();
+	installStorybookAppLinkGuard(targetDocument);
+	new MutationObserver(sync).observe(targetDocument, {
+		childList: true,
+		subtree: true,
+	});
+	observedDocsRoots.add(targetDocument);
+}
+
+function installDocsLinkSync(): void {
+	if (
+		typeof document === "undefined" ||
+		globalThis.__octoRillStorybookDocsLinkSyncInstalled
+	) {
+		return;
+	}
+
+	observeStorybookDocument(document);
+
+	const syncPreviewIframe = () => {
+		const previewIframe = document.querySelector<HTMLIFrameElement>(
+			"#storybook-preview-iframe",
+		);
+		if (!previewIframe) return;
+		const previewDocument = previewIframe.contentDocument;
+		if (previewDocument) {
+			observeStorybookDocument(previewDocument);
+		}
+		if (previewIframe.dataset.octoRillDocsSyncBound !== "true") {
+			previewIframe.addEventListener("load", syncPreviewIframe);
+			previewIframe.dataset.octoRillDocsSyncBound = "true";
+		}
+	};
+
+	if (document.readyState === "loading") {
+		document.addEventListener(
+			"DOMContentLoaded",
+			() => {
+				syncPreviewIframe();
+			},
+			{ once: true },
+		);
+	}
+
+	syncPreviewIframe();
+	globalThis.__octoRillStorybookDocsLinkSyncInstalled = true;
+}
+
+installDocsLinkSync();
 
 const preview: Preview = {
 	tags: ["autodocs"],
@@ -211,7 +243,7 @@ const preview: Preview = {
 			if (typeof document !== "undefined") {
 				document.body.style.backgroundImage = "none";
 				document.body.style.backgroundColor = "#f7f4ed";
-				installLocalDocsLinkSync();
+				installDocsLinkSync();
 			}
 			return createElement(TooltipProvider, null, Story());
 		},
