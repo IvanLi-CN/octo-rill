@@ -86,6 +86,12 @@ const meta = {
 	title: "UI/Primitives",
 	parameters: {
 		layout: "centered",
+		docs: {
+			description: {
+				component:
+					"这组故事用于集中检查 OctoRill UI 原语在真实业务组合里的外观：表单、筛选器、badge、tabs、table、dialog、sheet 与 alert dialog 都能在这里快速预览。\n\n相关公开文档：[快速开始](../quick-start.html) · [Storybook 入口](../storybook.html)",
+			},
+		},
 	},
 } satisfies Meta;
 
@@ -97,6 +103,13 @@ function isDocsMode() {
 }
 
 export const FormControls: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "基础表单控件组合，用于验证输入框、标签与选择器的间距和对齐。",
+			},
+		},
+	},
 	render: () => (
 		<StoryPanel
 			title="基础表单控件"
@@ -126,6 +139,14 @@ export const FormControls: Story = {
 };
 
 export const FilterToolbarState: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"模拟管理后台的筛选工具条，便于查看多条件筛选时的密度与视觉层级。",
+			},
+		},
+	},
 	render: () => (
 		<StoryPanel
 			title="筛选条组合态"
@@ -374,6 +395,13 @@ export const TooltipOpen: Story = {
 };
 
 export const DialogOpen: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "打开的 dialog 状态，覆盖 PAT 等站内输入对话框的基础样式。",
+			},
+		},
+	},
 	render: () => (
 		<Dialog open={!isDocsMode()}>
 			<DialogContent
@@ -448,6 +476,14 @@ export const DialogInvalidState: Story = {
 };
 
 export const SheetOpen: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"右侧 sheet 展开状态，映射到用户资料或任务详情抽屉的基础容器表现。",
+			},
+		},
+	},
 	render: () => (
 		<Sheet open={!isDocsMode()}>
 			<SheetContent className="max-w-md">
