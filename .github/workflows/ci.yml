@@ -83,6 +83,22 @@ jobs:
             echo "No web/ package; skipping"
           fi
 
+      - name: Compute DOCS_BASE (optional)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f docs-site/package.json ]]; then
+            owner="${GITHUB_REPOSITORY%%/*}"
+            repo="${GITHUB_REPOSITORY##*/}"
+            if [[ "${repo}" == "${owner}.github.io" ]]; then
+              echo "DOCS_BASE=/" >> "$GITHUB_ENV"
+            else
+              echo "DOCS_BASE=/${repo}/" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "No docs-site/ package; skipping DOCS_BASE computation"
+          fi
+
       - name: Docs site build (optional)
         shell: bash
         run: |
@@ -90,7 +106,7 @@ jobs:
           if [[ -f docs-site/package.json ]]; then
             bun install --cwd docs-site --frozen-lockfile
             cd docs-site
-            DOCS_BASE="/octo-rill/" bun run build
+            DOCS_BASE="${DOCS_BASE:-/}" bun run build
           else
             echo "No docs-site/ package; skipping"
           fi
@@ -104,6 +120,7 @@ jobs:
             test -f .tmp/pages-site/index.html
             test -f .tmp/pages-site/storybook/index.html
             test -f .tmp/pages-site/storybook.html
+            grep -q "${DOCS_BASE:-/}storybook.html" .tmp/pages-site/index.html
           else
             echo "docs-site/doc_build or web/storybook-static missing; skipping"
           fi

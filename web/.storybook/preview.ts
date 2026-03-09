@@ -4,11 +4,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import "../src/index.css";
 
 const STORYBOOK_HEALTH_VERSION = "0.1.0";
-const LOCAL_STORYBOOK_DEV_ORIGINS = new Set([
-	"http://127.0.0.1:55176",
-	"http://localhost:55176",
-]);
-const LOCAL_DOCS_SITE_ORIGIN = "http://127.0.0.1:50885";
+const DEFAULT_LOCAL_DOCS_SITE_ORIGIN = "http://127.0.0.1:50885";
+const DOCS_ORIGIN_STORAGE_KEY = "octo-rill.docs-origin";
 const LOCAL_DOCS_SITE_PATHS = new Set([
 	"/index.html",
 	"/quick-start.html",
@@ -21,6 +18,7 @@ const LOCAL_DOCS_SITE_PATHS = new Set([
 declare global {
 	var __octoRillStorybookFetchPatched: boolean | undefined;
 	var __octoRillStorybookLinkGuardInstalled: boolean | undefined;
+	var __octoRillStorybookDocsLinkSyncInstalled: boolean | undefined;
 }
 
 if (
@@ -65,16 +63,108 @@ function isStorybookAppLink(url: URL): boolean {
 	);
 }
 
+function isValidOrigin(rawValue: string | null): rawValue is string {
+	if (!rawValue) return false;
+	try {
+		new URL(rawValue);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function getLocalDocsSiteOrigin(): string {
+	if (typeof window === "undefined") return DEFAULT_LOCAL_DOCS_SITE_ORIGIN;
+
+	const docsOriginFromUrl = new URLSearchParams(window.location.search).get(
+		"docsOrigin",
+	);
+	if (isValidOrigin(docsOriginFromUrl)) {
+		window.localStorage.setItem(DOCS_ORIGIN_STORAGE_KEY, docsOriginFromUrl);
+		return docsOriginFromUrl;
+	}
+
+	const docsOriginFromStorage = window.localStorage.getItem(
+		DOCS_ORIGIN_STORAGE_KEY,
+	);
+	if (isValidOrigin(docsOriginFromStorage)) {
+		return docsOriginFromStorage;
+	}
+
+	return (
+		import.meta.env.VITE_DOCS_SITE_ORIGIN || DEFAULT_LOCAL_DOCS_SITE_ORIGIN
+	);
+}
+
 function resolveLocalDocsSiteLink(url: URL): URL | null {
-	if (!LOCAL_STORYBOOK_DEV_ORIGINS.has(window.location.origin)) {
+	if (!import.meta.env.DEV || url.origin !== window.location.origin) {
 		return null;
 	}
-	if (url.origin !== window.location.origin) return null;
 	if (!LOCAL_DOCS_SITE_PATHS.has(url.pathname)) return null;
 	return new URL(
 		`${url.pathname}${url.search}${url.hash}`,
-		LOCAL_DOCS_SITE_ORIGIN,
+		getLocalDocsSiteOrigin(),
 	);
+}
+
+function rewriteLocalDocsLinks(root: Document | ShadowRoot): void {
+	for (const anchor of root.querySelectorAll<HTMLAnchorElement>("a[href]")) {
+		const rewrittenTarget = resolveLocalDocsSiteLink(
+			new URL(anchor.href, window.location.origin),
+		);
+		if (!rewrittenTarget) continue;
+		anchor.href = rewrittenTarget.toString();
+		anchor.target = "_top";
+		anchor.rel = anchor.rel
+			? `${anchor.rel} noopener noreferrer`.trim()
+			: "noopener noreferrer";
+	}
+}
+
+function installLocalDocsLinkSync(): void {
+	if (
+		typeof document === "undefined" ||
+		globalThis.__octoRillStorybookDocsLinkSyncInstalled ||
+		!import.meta.env.DEV
+	) {
+		return;
+	}
+
+	const observeDocument = (targetDocument: Document) => {
+		const sync = () => rewriteLocalDocsLinks(targetDocument);
+		sync();
+		new MutationObserver(sync).observe(targetDocument, {
+			childList: true,
+			subtree: true,
+		});
+	};
+
+	observeDocument(document);
+
+	const syncPreviewIframe = () => {
+		const previewIframe = document.querySelector<HTMLIFrameElement>(
+			"#storybook-preview-iframe",
+		);
+		if (!previewIframe) return;
+		const previewDocument = previewIframe.contentDocument;
+		if (!previewDocument) return;
+		observeDocument(previewDocument);
+	};
+
+	document.addEventListener(
+		"DOMContentLoaded",
+		() => {
+			syncPreviewIframe();
+			const previewIframe = document.querySelector<HTMLIFrameElement>(
+				"#storybook-preview-iframe",
+			);
+			previewIframe?.addEventListener("load", syncPreviewIframe);
+		},
+		{ once: true },
+	);
+	syncPreviewIframe();
+
+	globalThis.__octoRillStorybookDocsLinkSyncInstalled = true;
 }
 
 if (
@@ -102,12 +192,6 @@ if (
 			if (!(anchor instanceof HTMLAnchorElement)) return;
 
 			const targetUrl = new URL(anchor.href, window.location.origin);
-			const localDocsSiteTarget = resolveLocalDocsSiteLink(targetUrl);
-			if (localDocsSiteTarget) {
-				event.preventDefault();
-				window.top?.location.assign(localDocsSiteTarget.toString());
-				return;
-			}
 			if (!isStorybookAppLink(targetUrl)) return;
 
 			event.preventDefault();
@@ -118,6 +202,8 @@ if (
 	globalThis.__octoRillStorybookLinkGuardInstalled = true;
 }
 
+installLocalDocsLinkSync();
+
 const preview: Preview = {
 	tags: ["autodocs"],
 	decorators: [
@@ -125,6 +211,7 @@ const preview: Preview = {
 			if (typeof document !== "undefined") {
 				document.body.style.backgroundImage = "none";
 				document.body.style.backgroundColor = "#f7f4ed";
+				installLocalDocsLinkSync();
 			}
 			return createElement(TooltipProvider, null, Story());
 		},

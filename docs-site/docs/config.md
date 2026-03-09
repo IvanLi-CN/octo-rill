@@ -41,6 +41,8 @@ description: OctoRill 本地开发与部署时最常用的配置项。
 
 - `DOCS_PORT`：本地 docs-site dev/preview 端口，默认 `50885`。
 - `DOCS_BASE`：静态站部署基路径；GitHub Pages 项目页场景通常为 `/<repo>/`。
+- `VITE_STORYBOOK_DEV_ORIGIN`：可选，本地 docs-site 跳转到 Storybook dev server 时使用的完整 origin；默认 `http://127.0.0.1:55176`。
+- `VITE_DOCS_SITE_ORIGIN`：可选，单独运行 Storybook dev server 时，返回 docs-site 的完整 origin；默认 `http://127.0.0.1:50885`。若先从 docs-site 进入 Storybook，该值会自动记住当前 docs-site origin。
 
 ## Storybook 与前端端口
 
