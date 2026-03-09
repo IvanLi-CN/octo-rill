@@ -3,19 +3,43 @@ title: Storybook
 description: 跳转到 OctoRill Storybook 静态站点。
 ---
 
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
+
+export const LOCAL_DOCS_SITE_ORIGINS = new Set([
+  "http://127.0.0.1:50885",
+  "http://localhost:50885",
+]);
+export const LOCAL_STORYBOOK_ORIGIN = "http://127.0.0.1:55176";
+
+export function buildStorybookTarget(currentHref) {
+  const currentUrl = new URL(currentHref);
+  const requestedPath = currentUrl.searchParams.get("path");
+  const target = LOCAL_DOCS_SITE_ORIGINS.has(currentUrl.origin)
+    ? new URL("/", LOCAL_STORYBOOK_ORIGIN)
+    : new URL("./storybook/index.html", currentUrl);
+
+  if (requestedPath) {
+    target.searchParams.set("path", requestedPath);
+  }
+
+  return target;
+}
 
 export const StorybookRedirect = () => {
+  const fallbackHref = useMemo(() => {
+    if (typeof window === "undefined") return "./storybook/index.html";
+    return buildStorybookTarget(window.location.href).toString();
+  }, []);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const target = new URL("./storybook/index.html", window.location.href);
-    window.location.replace(target.toString());
+    window.location.replace(buildStorybookTarget(window.location.href).toString());
   }, []);
 
   return (
     <>
       <h1>正在跳转到 Storybook…</h1>
-      <p>如果没有自动跳转，请直接打开 <a href="./storybook/index.html">OctoRill Storybook</a>。</p>
+      <p>如果没有自动跳转，请直接打开 <a href={fallbackHref}>OctoRill Storybook</a>。</p>
       <p>如需查看文档导览页，请打开 <a href="./storybook-guide.html">Storybook 导览</a>。</p>
     </>
   );
