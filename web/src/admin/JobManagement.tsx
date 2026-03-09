@@ -2,6 +2,7 @@ import { CircleHelp } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
+import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	type AdminLlmCallDetailResponse,
 	type AdminLlmCallItem,
@@ -15,7 +16,6 @@ import {
 	type AdminTranslationBatchDetailResponse,
 	type AdminTranslationStreamEvent,
 	type AdminTranslationBatchListItem,
-	type AdminTranslationWorkerStatus,
 	type AdminTranslationRequestDetailResponse,
 	type AdminTranslationRequestListItem,
 	type AdminTranslationStatusResponse,
@@ -1115,6 +1115,7 @@ type TranslationStatusFilter =
 type TranslationDrawerState =
 	| { kind: "request"; id: string }
 	| { kind: "batch"; id: string }
+	| { kind: "worker"; id: string }
 	| null;
 
 const TRANSLATION_STATUS_FILTER_OPTIONS: Array<{
@@ -1164,6 +1165,10 @@ function translationRunTone(status: string): TaskStatusTone {
 	switch (status) {
 		case "completed":
 			return taskStatusTone("succeeded");
+		case "error":
+			return taskStatusTone("failed");
+		case "idle":
+			return taskStatusTone("canceled");
 		default:
 			return taskStatusTone(status);
 	}
@@ -1260,8 +1265,14 @@ function TranslationSchedulerSection(props: {
 	const requestsInitialLoading = requestLoadPhase === "initial";
 	const batchesRefreshing = batchLoadPhase === "refreshing";
 	const batchesInitialLoading = batchLoadPhase === "initial";
-	const workers: AdminTranslationWorkerStatus[] = status?.workers ?? [];
-
+	const selectedWorker = useMemo(() => {
+		if (drawer?.kind !== "worker") {
+			return null;
+		}
+		return (
+			status?.workers.find((worker) => worker.worker_id === drawer.id) ?? null
+		);
+	}, [drawer, status]);
 	const loadStatus = useCallback(async () => {
 		setStatusLoading(true);
 		try {
@@ -1345,6 +1356,14 @@ function TranslationSchedulerSection(props: {
 		}
 	}, []);
 
+	const openWorkerDetail = useCallback((workerId: string) => {
+		setDrawer({ kind: "worker", id: workerId });
+		setRequestDetail(null);
+		setBatchDetail(null);
+		setDrawerLoading(false);
+		setError(null);
+	}, []);
+
 	useEffect(() => {
 		if (refreshNonce < 0) return;
 		setError(null);
@@ -1370,6 +1389,12 @@ function TranslationSchedulerSection(props: {
 	useEffect(() => {
 		if (refreshNonce < 0) return;
 		if (!drawer) {
+			setRequestDetail(null);
+			setBatchDetail(null);
+			setDrawerLoading(false);
+			return;
+		}
+		if (drawer.kind === "worker") {
 			setRequestDetail(null);
 			setBatchDetail(null);
 			setDrawerLoading(false);
@@ -1418,7 +1443,7 @@ function TranslationSchedulerSection(props: {
 						统一查看真实工作者槽位、需求队列与任务记录，并保留现有详情抽屉链路。
 					</CardDescription>
 				</CardHeader>
-				<CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+				<CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">调度器 / LLM</p>
 						<p className="mt-1 text-sm font-semibold">
@@ -1427,16 +1452,6 @@ function TranslationSchedulerSection(props: {
 						</p>
 						<p className="text-muted-foreground mt-1 text-xs">
 							扫描 {formatDurationMs(status?.scan_interval_ms ?? null)}
-						</p>
-					</div>
-					<div className="bg-card/70 rounded-lg border p-3">
-						<p className="text-muted-foreground text-xs">工作者</p>
-						<p className="mt-1 text-sm font-semibold">
-							{formatCount(status?.busy_workers)} 忙 /{" "}
-							{formatCount(status?.idle_workers)} 闲
-						</p>
-						<p className="text-muted-foreground mt-1 text-xs">
-							总计 {formatCount(status?.worker_concurrency)} 个槽位
 						</p>
 					</div>
 					<div className="bg-card/70 rounded-lg border p-3">
@@ -1471,120 +1486,11 @@ function TranslationSchedulerSection(props: {
 				</CardContent>
 			</Card>
 
-			<Card>
-				<CardHeader>
-					<CardTitle>工作者板</CardTitle>
-					<CardDescription>
-						固定展示 3 个通用 worker 与 1 个用户专用 worker 的实时槽位状态。
-					</CardDescription>
-				</CardHeader>
-				<CardContent className="space-y-3">
-					{statusLoading && !status ? (
-						<LoadingMessage>正在加载翻译调度状态...</LoadingMessage>
-					) : null}
-					<div className="hidden md:block">
-						<div className="overflow-x-auto rounded-lg border">
-							<Table className="min-w-[1080px]">
-								<TableHeader>
-									<TableRow>
-										<TableHead>槽位</TableHead>
-										<TableHead>类型</TableHead>
-										<TableHead>状态</TableHead>
-										<TableHead>当前批次</TableHead>
-										<TableHead>请求数</TableHead>
-										<TableHead>Work items</TableHead>
-										<TableHead>触发原因</TableHead>
-										<TableHead>更新时间</TableHead>
-									</TableRow>
-								</TableHeader>
-								<TableBody>
-									{workers.length === 0 ? (
-										<TableRow>
-											<TableCell
-												colSpan={8}
-												className="text-muted-foreground text-center text-sm"
-											>
-												暂无工作者数据。
-											</TableCell>
-										</TableRow>
-									) : (
-										workers.map((worker) => (
-											<TableRow key={worker.worker_id}>
-												<TableCell className="whitespace-nowrap">
-													{translationWorkerSlotLabel(worker.worker_slot)}
-												</TableCell>
-												<TableCell className="max-w-[120px]">
-													<div className="truncate whitespace-nowrap">
-														{translationWorkerKindLabel(worker.worker_kind)}
-													</div>
-												</TableCell>
-												<TableCell className="whitespace-nowrap">
-													<StatusBadge
-														label={translationRunStatusLabel(worker.status)}
-														tone={translationRunTone(worker.status)}
-													/>
-												</TableCell>
-												<TableCell className="max-w-[180px]">
-													<div className="truncate whitespace-nowrap font-mono text-xs">
-														{worker.current_batch_id ?? "-"}
-													</div>
-												</TableCell>
-												<TableCell className="whitespace-nowrap">
-													{formatCount(worker.request_count)}
-												</TableCell>
-												<TableCell className="whitespace-nowrap">
-													{formatCount(worker.work_item_count)}
-												</TableCell>
-												<TableCell className="max-w-[180px]">
-													<div className="truncate whitespace-nowrap">
-														{worker.trigger_reason ?? worker.error_text ?? "-"}
-													</div>
-												</TableCell>
-												<TableCell className="whitespace-nowrap">
-													{formatLocalDateTime(worker.updated_at)}
-												</TableCell>
-											</TableRow>
-										))
-									)}
-								</TableBody>
-							</Table>
-						</div>
-					</div>
-					<div className="space-y-2 md:hidden">
-						{workers.length === 0 ? (
-							<p className="text-muted-foreground text-sm">暂无工作者数据。</p>
-						) : (
-							workers.map((worker) => (
-								<div key={worker.worker_id} className="rounded-lg border p-3">
-									<div className="flex items-center gap-2">
-										<p className="truncate whitespace-nowrap font-medium text-sm">
-											{translationWorkerSlotLabel(worker.worker_slot)} ·{" "}
-											{translationWorkerKindLabel(worker.worker_kind)}
-										</p>
-										<StatusBadge
-											label={translationRunStatusLabel(worker.status)}
-											tone={translationRunTone(worker.status)}
-										/>
-									</div>
-									<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-										当前批次 {worker.current_batch_id ?? "-"}
-									</p>
-									<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-										请求 {formatCount(worker.request_count)} · work items{" "}
-										{formatCount(worker.work_item_count)}
-									</p>
-									<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-										触发原因 {worker.trigger_reason ?? worker.error_text ?? "-"}
-									</p>
-									<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-										更新时间 {formatLocalDateTime(worker.updated_at)}
-									</p>
-								</div>
-							))
-						)}
-					</div>
-				</CardContent>
-			</Card>
+			<TranslationWorkerBoard
+				workers={status?.workers ?? []}
+				loading={statusLoading && !status}
+				onWorkerClick={(worker) => openWorkerDetail(worker.worker_id)}
+			/>
 
 			<Tabs
 				value={viewTab}
@@ -1636,80 +1542,83 @@ function TranslationSchedulerSection(props: {
 							) : (
 								<>
 									<div className="hidden md:block">
-										<div className="overflow-x-auto rounded-lg border">
-											<Table className="min-w-[1280px]">
-												<TableHeader>
-													<TableRow>
-														<TableHead>来源</TableHead>
-														<TableHead>类型</TableHead>
-														<TableHead>状态</TableHead>
-														<TableHead>请求ID</TableHead>
-														<TableHead>请求人</TableHead>
-														<TableHead>作用域</TableHead>
-														<TableHead>进度</TableHead>
-														<TableHead>更新时间</TableHead>
-														<TableHead className="text-right">操作</TableHead>
-													</TableRow>
-												</TableHeader>
-												<TableBody>
-													{requests.map((request) => (
-														<TableRow key={request.id}>
-															<TableCell className="max-w-[180px]">
-																<div className="truncate whitespace-nowrap">
-																	{request.source}
-																</div>
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{translationRequestOriginLabel(
-																	request.request_origin,
+										<Table
+											containerClassName="rounded-lg border"
+											className="w-full table-fixed text-sm"
+										>
+											<TableHeader>
+												<TableRow>
+													<TableHead className="w-[14%]">来源</TableHead>
+													<TableHead className="w-[6%]">类型</TableHead>
+													<TableHead className="w-[10%]">状态</TableHead>
+													<TableHead className="w-[17%]">请求ID</TableHead>
+													<TableHead className="w-[13%]">请求人</TableHead>
+													<TableHead className="w-[13%]">作用域</TableHead>
+													<TableHead className="w-[6%]">进度</TableHead>
+													<TableHead className="w-[10%]">更新时间</TableHead>
+													<TableHead className="w-[88px] text-right">
+														操作
+													</TableHead>
+												</TableRow>
+											</TableHeader>
+											<TableBody>
+												{requests.map((request) => (
+													<TableRow key={request.id}>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap">
+																{request.source}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															{translationRequestOriginLabel(
+																request.request_origin,
+															)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															<StatusBadge
+																label={translationRunStatusLabel(
+																	request.status,
 																)}
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																<StatusBadge
-																	label={translationRunStatusLabel(
-																		request.status,
-																	)}
-																	tone={translationRunTone(request.status)}
-																/>
-															</TableCell>
-															<TableCell className="max-w-[180px]">
-																<div className="truncate whitespace-nowrap font-mono text-xs">
-																	{request.id}
-																</div>
-															</TableCell>
-															<TableCell className="max-w-[140px]">
-																<div className="truncate whitespace-nowrap">
-																	{request.requested_by ?? "-"}
-																</div>
-															</TableCell>
-															<TableCell className="max-w-[120px]">
-																<div className="truncate whitespace-nowrap">
-																	#{request.scope_user_id}
-																</div>
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatCount(request.completed_item_count)}/
-																{formatCount(request.item_count)}
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatLocalDateTime(request.updated_at)}
-															</TableCell>
-															<TableCell className="text-right">
-																<Button
-																	variant="outline"
-																	size="sm"
-																	onClick={() =>
-																		void openRequestDetail(request.id)
-																	}
-																>
-																	详情
-																</Button>
-															</TableCell>
-														</TableRow>
-													))}
-												</TableBody>
-											</Table>
-										</div>
+																tone={translationRunTone(request.status)}
+															/>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{request.id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{request.requested_by ?? "-"}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																#{request.scope_user_id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(request.completed_item_count)}/
+															{formatCount(request.item_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+															{formatLocalDateTime(request.updated_at)}
+														</TableCell>
+														<TableCell className="px-3 py-3 text-right">
+															<Button
+																variant="outline"
+																size="sm"
+																onClick={() =>
+																	void openRequestDetail(request.id)
+																}
+															>
+																详情
+															</Button>
+														</TableCell>
+													</TableRow>
+												))}
+											</TableBody>
+										</Table>
 									</div>
 									<div className="space-y-2 md:hidden">
 										{requests.map((request) => (
@@ -1827,72 +1736,72 @@ function TranslationSchedulerSection(props: {
 							) : (
 								<>
 									<div className="hidden md:block">
-										<div className="overflow-x-auto rounded-lg border">
-											<Table className="min-w-[1240px]">
-												<TableHeader>
-													<TableRow>
-														<TableHead>触发原因</TableHead>
-														<TableHead>状态</TableHead>
-														<TableHead>槽位</TableHead>
-														<TableHead>请求数</TableHead>
-														<TableHead>Work items</TableHead>
-														<TableHead>预算</TableHead>
-														<TableHead>批次ID</TableHead>
-														<TableHead>更新时间</TableHead>
-														<TableHead className="text-right">操作</TableHead>
+										<Table
+											containerClassName="rounded-lg border"
+											className="w-full table-fixed text-sm"
+										>
+											<TableHeader>
+												<TableRow>
+													<TableHead className="w-[11%]">触发原因</TableHead>
+													<TableHead className="w-[11%]">状态</TableHead>
+													<TableHead className="w-[7%]">槽位</TableHead>
+													<TableHead className="w-[7%]">请求数</TableHead>
+													<TableHead className="w-[7%]">Items</TableHead>
+													<TableHead className="w-[9%]">预算</TableHead>
+													<TableHead className="w-[20%]">批次ID</TableHead>
+													<TableHead className="w-[10%]">更新时间</TableHead>
+													<TableHead className="w-[88px] text-right">
+														操作
+													</TableHead>
+												</TableRow>
+											</TableHeader>
+											<TableBody>
+												{batches.map((batch) => (
+													<TableRow key={batch.id}>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap">
+																{batch.trigger_reason}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															<StatusBadge
+																label={translationRunStatusLabel(batch.status)}
+																tone={translationRunTone(batch.status)}
+															/>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap">
+															{translationWorkerSlotLabel(batch.worker_slot)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.request_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.item_count)}
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
+															{formatCount(batch.estimated_input_tokens)}
+														</TableCell>
+														<TableCell className="px-3 py-3">
+															<div className="truncate whitespace-nowrap font-mono text-xs">
+																{batch.id}
+															</div>
+														</TableCell>
+														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
+															{formatLocalDateTime(batch.updated_at)}
+														</TableCell>
+														<TableCell className="px-3 py-3 text-right">
+															<Button
+																variant="outline"
+																size="sm"
+																onClick={() => void openBatchDetail(batch.id)}
+															>
+																详情
+															</Button>
+														</TableCell>
 													</TableRow>
-												</TableHeader>
-												<TableBody>
-													{batches.map((batch) => (
-														<TableRow key={batch.id}>
-															<TableCell className="max-w-[180px]">
-																<div className="truncate whitespace-nowrap">
-																	{batch.trigger_reason}
-																</div>
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																<StatusBadge
-																	label={translationRunStatusLabel(
-																		batch.status,
-																	)}
-																	tone={translationRunTone(batch.status)}
-																/>
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{translationWorkerSlotLabel(batch.worker_slot)}
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatCount(batch.request_count)}
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatCount(batch.item_count)}
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatCount(batch.estimated_input_tokens)}{" "}
-																tokens
-															</TableCell>
-															<TableCell className="max-w-[180px]">
-																<div className="truncate whitespace-nowrap font-mono text-xs">
-																	{batch.id}
-																</div>
-															</TableCell>
-															<TableCell className="whitespace-nowrap">
-																{formatLocalDateTime(batch.updated_at)}
-															</TableCell>
-															<TableCell className="text-right">
-																<Button
-																	variant="outline"
-																	size="sm"
-																	onClick={() => void openBatchDetail(batch.id)}
-																>
-																	详情
-																</Button>
-															</TableCell>
-														</TableRow>
-													))}
-												</TableBody>
-											</Table>
-										</div>
+												))}
+											</TableBody>
+										</Table>
 									</div>
 									<div className="space-y-2 md:hidden">
 										{batches.map((batch) => (
@@ -1986,12 +1895,18 @@ function TranslationSchedulerSection(props: {
 						<div className="flex items-start justify-between gap-3">
 							<div className="min-w-0 space-y-2">
 								<SheetTitle className="text-lg">
-									{drawer?.kind === "batch" ? "翻译批次详情" : "翻译请求详情"}
+									{drawer?.kind === "batch"
+										? "翻译批次详情"
+										: drawer?.kind === "worker"
+											? "工作者详情"
+											: "翻译请求详情"}
 								</SheetTitle>
 								<SheetDescription>
 									{drawer?.kind === "batch"
 										? "查看批次 item、工作者槽位、错误原因与关联 LLM 调用。"
-										: "查看请求内 item 结果与 fan-out 归属。"}
+										: drawer?.kind === "worker"
+											? "查看当前槽位状态、负载与关联批次。"
+											: "查看请求内 item 结果与 fan-out 归属。"}
 								</SheetDescription>
 							</div>
 							<Button variant="outline" onClick={() => setDrawer(null)}>
@@ -2076,6 +1991,77 @@ function TranslationSchedulerSection(props: {
 											</div>
 										</div>
 									))}
+								</div>
+							</>
+						) : drawer?.kind === "worker" && selectedWorker ? (
+							<>
+								<div className="grid gap-2 md:grid-cols-2">
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">工作者</p>
+										<p className="mt-1 font-medium">
+											{translationWorkerSlotLabel(selectedWorker.worker_slot)} ·{" "}
+											{translationWorkerKindLabel(selectedWorker.worker_kind)}
+										</p>
+										<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+											{selectedWorker.worker_id}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前状态</p>
+										<div className="mt-1">
+											<StatusBadge
+												label={translationRunStatusLabel(selectedWorker.status)}
+												tone={translationRunTone(selectedWorker.status)}
+											/>
+										</div>
+										<p className="text-muted-foreground mt-1 text-xs">
+											最近更新 {formatLocalDateTime(selectedWorker.updated_at)}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前负载</p>
+										<p className="mt-1 font-medium">
+											{formatCount(selectedWorker.request_count)} requests ·{" "}
+											{formatCount(selectedWorker.work_item_count)} items
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											trigger {selectedWorker.trigger_reason ?? "-"}
+										</p>
+									</div>
+									<div className="rounded-lg border p-3">
+										<p className="text-muted-foreground text-xs">当前批次</p>
+										<p className="mt-1 font-medium">
+											{selectedWorker.current_batch_id ?? "-"}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											槽位{" "}
+											{translationWorkerSlotLabel(selectedWorker.worker_slot)}
+										</p>
+									</div>
+								</div>
+
+								<div className="rounded-lg border p-3">
+									<div className="flex flex-wrap items-center justify-between gap-2">
+										<div>
+											<p className="text-muted-foreground text-xs">
+												错误与跳转
+											</p>
+											<p className="mt-1 text-sm">
+												{selectedWorker.error_text ?? "当前没有错误信息。"}
+											</p>
+										</div>
+										{selectedWorker.current_batch_id ? (
+											<Button
+												variant="outline"
+												size="sm"
+												onClick={() =>
+													void openBatchDetail(selectedWorker.current_batch_id!)
+												}
+											>
+												查看当前批次
+											</Button>
+										) : null}
+									</div>
 								</div>
 							</>
 						) : drawer?.kind === "batch" && batchDetail ? (
