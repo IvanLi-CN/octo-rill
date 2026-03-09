@@ -174,6 +174,7 @@ async function installAdminJobsMocks(
 		id: "req-translation-1",
 		status: "completed",
 		source: "feed.auto_translate",
+		request_origin: "user",
 		requested_by: CURRENT_USER_ID,
 		scope_user_id: CURRENT_USER_ID,
 		item_count: 1,
@@ -183,6 +184,108 @@ async function installAdminJobsMocks(
 		finished_at: "2026-02-26T04:00:03Z",
 		updated_at: "2026-02-26T04:00:03Z",
 	};
+
+	const completedTranslationWorkers = [
+		{
+			worker_id: "translation-worker-1",
+			worker_slot: 1,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:03Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-2",
+			worker_slot: 2,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:03Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-3",
+			worker_slot: 3,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:03Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-4",
+			worker_slot: 4,
+			worker_kind: "user_dedicated",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:03Z",
+			error_text: null,
+		},
+	];
+
+	const pendingTranslationWorkers = [
+		{
+			worker_id: "translation-worker-1",
+			worker_slot: 1,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:00Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-2",
+			worker_slot: 2,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:00Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-3",
+			worker_slot: 3,
+			worker_kind: "general",
+			status: "idle",
+			current_batch_id: null,
+			request_count: 0,
+			work_item_count: 0,
+			trigger_reason: null,
+			updated_at: "2026-02-26T04:00:00Z",
+			error_text: null,
+		},
+		{
+			worker_id: "translation-worker-4",
+			worker_slot: 4,
+			worker_kind: "user_dedicated",
+			status: "running",
+			current_batch_id: "batch-translation-1",
+			request_count: 1,
+			work_item_count: 1,
+			trigger_reason: "deadline",
+			updated_at: "2026-02-26T04:00:01Z",
+			error_text: null,
+		},
+	];
 
 	const completedTranslationRequestItem = {
 		producer_ref: "290978079",
@@ -202,6 +305,8 @@ async function installAdminJobsMocks(
 		id: "batch-translation-1",
 		status: "completed",
 		trigger_reason: "deadline",
+		worker_slot: 4,
+		request_count: 1,
 		item_count: 1,
 		estimated_input_tokens: 512,
 		created_at: "2026-02-26T04:00:01Z",
@@ -246,6 +351,10 @@ async function installAdminJobsMocks(
 				llm_enabled: true,
 				scan_interval_ms: 250,
 				batch_token_threshold: 1800,
+				worker_concurrency: 4,
+				idle_workers: 4,
+				busy_workers: 0,
+				workers: completedTranslationWorkers,
 				queued_requests: 0,
 				queued_work_items: 0,
 				running_batches: 0,
@@ -262,9 +371,13 @@ async function installAdminJobsMocks(
 			llm_enabled: true,
 			scan_interval_ms: 250,
 			batch_token_threshold: 1800,
+			worker_concurrency: 4,
+			idle_workers: 3,
+			busy_workers: 1,
+			workers: pendingTranslationWorkers,
 			queued_requests: 1,
 			queued_work_items: 1,
-			running_batches: 0,
+			running_batches: 1,
 			requests_24h: 1,
 			completed_batches_24h: 0,
 			failed_batches_24h: 0,
@@ -517,6 +630,16 @@ async function installAdminJobsMocks(
 				await sleep(200);
 				translationEventDelivered = true;
 				streamBody.push(
+					"event: translation.event",
+					`data: ${JSON.stringify({
+						event_id: "worker:2026-02-26T04:00:03Z:translation-worker-4",
+						resource_type: "worker",
+						resource_id: "translation-worker-4",
+						status: "idle",
+						event_type: "translation.worker.updated",
+						created_at: "2026-02-26T04:00:03Z",
+					})}`,
+					"",
 					"event: translation.event",
 					`data: ${JSON.stringify({
 						event_id: "request:2026-02-26T04:00:03Z:req-translation-1",
@@ -1405,7 +1528,12 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	await page.goto("/admin/jobs");
 	await page.getByRole("tab", { name: "翻译调度" }).click();
 	await expect(page.getByRole("heading", { name: "翻译调度" })).toBeVisible();
-	await expect(page.getByText("feed.auto_translate")).toBeVisible();
+	await expect(page.getByText("工作者板")).toBeVisible();
+	await expect(page.getByText("用户专用", { exact: true })).toBeVisible();
+	await expect(page.getByRole("tab", { name: "需求队列" })).toBeVisible();
+	await expect(
+		page.getByRole("cell", { name: "feed.auto_translate" }),
+	).toBeVisible();
 	await page.getByRole("button", { name: "详情" }).first().click();
 	await expect(
 		page.getByRole("heading", { name: "翻译请求详情" }),
@@ -1453,10 +1581,28 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 
 	await page.goto("/admin/jobs");
 	await page.getByRole("tab", { name: "翻译调度" }).click();
-	await expect(page.getByText("item 0/1")).toBeVisible();
-	await expect(page.getByText("暂无翻译批次。")).toBeVisible();
-	await expect(page.getByText("item 1/1")).toBeVisible();
-	await expect(page.getByText("deadline")).toBeVisible();
+	await expect(page.getByText("用户专用", { exact: true })).toBeVisible();
+	await expect(page.getByText("1 忙 / 3 闲")).toBeVisible();
+	await expect(page.getByRole("cell", { name: "1/1" })).toBeVisible();
+	await expect(page.getByText("0 忙 / 4 闲")).toBeVisible();
+	await page.getByRole("tab", { name: "任务记录" }).click();
+	await expect(page.getByRole("cell", { name: "deadline" })).toBeVisible();
+	await expect(page.getByRole("cell", { name: "W4" }).last()).toBeVisible();
+});
+
+test("admin translation scheduler falls back to single-line mobile lists", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await installAdminJobsMocks(page);
+
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click();
+	await expect(page.getByText("工作者板")).toBeVisible();
+	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
+	await expect(page.getByText("用户 · ID req-translation-1")).toBeVisible();
+	await page.getByRole("tab", { name: "任务记录" }).click();
+	await expect(page.getByText("W4 · 请求 1 · work items 1")).toBeVisible();
 });
 
 test.describe("localized admin diagnostics timestamps", () => {

@@ -78,7 +78,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .as_ref()
         .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
     let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
-    let translation_scheduler_abort_handle =
+    let translation_scheduler_abort_handles =
         translations::spawn_translation_scheduler(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
@@ -254,11 +254,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
-    let mut abort_handles = vec![
-        deletion_abort_handle,
-        llm_call_retention_abort_handle,
-        translation_scheduler_abort_handle,
-    ];
+    let mut abort_handles = vec![deletion_abort_handle, llm_call_retention_abort_handle];
+    abort_handles.extend(translation_scheduler_abort_handles);
     if let Some(handle) = model_catalog_abort_handle {
         abort_handles.push(handle);
     }
