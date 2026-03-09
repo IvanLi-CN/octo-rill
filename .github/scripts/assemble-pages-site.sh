@@ -18,6 +18,16 @@ docs_dir="$1"
 storybook_dir="$2"
 output_dir="$3"
 
+to_abs_path() {
+  python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
+}
+
+is_same_or_parent() {
+  local base="$1"
+  local candidate="$2"
+  [[ "$candidate" == "$base" || "$candidate" == "$base"/* ]]
+}
+
 if [[ ! -d "$docs_dir" ]]; then
   echo "docs_dir does not exist: $docs_dir" >&2
   exit 1
@@ -25,6 +35,25 @@ fi
 
 if [[ ! -d "$storybook_dir" ]]; then
   echo "storybook_dir does not exist: $storybook_dir" >&2
+  exit 1
+fi
+
+docs_dir_abs="$(to_abs_path "$docs_dir")"
+storybook_dir_abs="$(to_abs_path "$storybook_dir")"
+output_dir_abs="$(to_abs_path "$output_dir")"
+
+if [[ "$output_dir_abs" == "/" ]]; then
+  echo "refusing to use unsafe output_dir: $output_dir" >&2
+  exit 1
+fi
+
+if is_same_or_parent "$output_dir_abs" "$docs_dir_abs"; then
+  echo "refusing to let output_dir contain docs_dir: $output_dir" >&2
+  exit 1
+fi
+
+if is_same_or_parent "$output_dir_abs" "$storybook_dir_abs"; then
+  echo "refusing to let output_dir contain storybook_dir: $output_dir" >&2
   exit 1
 fi
 
