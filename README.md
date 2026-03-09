@@ -86,6 +86,8 @@ bun run dev
 
 Then open `http://127.0.0.1:50885`.
 
+`docs-site` 单独运行时只承载文档壳层；如需打开 Storybook，请另外执行 `cd web && bun run storybook` 并访问 `http://127.0.0.1:55176`。若要验证发布后的 `/storybook/` 子路径，请先构建 docs-site 与 Storybook，再执行 `.github/scripts/assemble-pages-site.sh` 进行装配预览。
+
 ## Auth model
 
 - OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases）。
