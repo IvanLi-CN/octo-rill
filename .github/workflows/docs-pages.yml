@@ -134,7 +134,7 @@ jobs:
           grep -q '/storybook.html' .tmp/pages-site/index.html
           grep -q 'OctoRill Storybook' .tmp/pages-site/storybook.html
           grep -q '核心故事入口' .tmp/pages-site/storybook.html
-          grep -q 'admin-admin-panel--docs' .tmp/pages-site/storybook.html
+          grep -q 'data-storybook-path="/docs/admin-admin-panel--docs"' .tmp/pages-site/storybook.html
           grep -q './sb-manager/runtime.js' .tmp/pages-site/storybook/index.html
           grep -q './sb-common-assets/nunito-sans-regular.woff2' .tmp/pages-site/storybook/index.html
 
@@ -147,7 +147,7 @@ jobs:
           if-no-files-found: error
 
   deploy:
-    if: ${{ github.event_name != 'pull_request' }}
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     needs: [assemble-pages]
     permissions:
