@@ -435,11 +435,25 @@ export type TranslationRequestItemInput = {
 	source_blocks: TranslationSourceBlock[];
 	target_slots: Array<"title_zh" | "summary_md" | "body_md">;
 };
-export type TranslationSingleSubmitRequest = {
-	mode: "async" | "wait" | "stream";
+export type TranslationAsyncSingleSubmitRequest = {
+	mode: "async";
 	item: TranslationRequestItemInput;
 	items?: never;
 };
+export type TranslationWaitSubmitRequest = {
+	mode: "wait";
+	item: TranslationRequestItemInput;
+	items?: never;
+};
+export type TranslationStreamSubmitRequest = {
+	mode: "stream";
+	item: TranslationRequestItemInput;
+	items?: never;
+};
+export type TranslationSingleSubmitRequest =
+	| TranslationAsyncSingleSubmitRequest
+	| TranslationWaitSubmitRequest
+	| TranslationStreamSubmitRequest;
 export type TranslationBatchSubmitRequest = {
 	mode: "async";
 	items: TranslationRequestItemInput[];
@@ -589,7 +603,7 @@ export async function apiSubmitTranslationRequest(
 	>("/api/translate/requests", body);
 }
 export async function apiOpenTranslationRequestStream(
-	body: Extract<TranslationSingleSubmitRequest, { mode: "stream" }>,
+	body: TranslationStreamSubmitRequest,
 ): Promise<Response> {
 	const res = await fetch("/api/translate/requests", {
 		method: "POST",
