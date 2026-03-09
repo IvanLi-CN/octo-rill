@@ -65,7 +65,16 @@ const preview: Preview = {
 		},
 		options: {
 			storySort: {
-				order: ["Pages", ["Landing", "Dashboard"], "Admin", "Layout", "UI"],
+				order: [
+					"Pages",
+					["Landing", "Dashboard"],
+					"Admin",
+					["Admin Panel", "Admin Jobs", "Task Type Detail"],
+					"Layout",
+					["App Meta Footer"],
+					"UI",
+					["Primitives", "Button", "Card"],
+				],
 			},
 		},
 		backgrounds: {

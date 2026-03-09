@@ -9,7 +9,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"OctoRill 的公开入口页，用来说明产品定位并承接 GitHub OAuth 登录。适合在这里确认未登录态的首屏文案、登录按钮与错误反馈。",
+					"OctoRill 的公开入口页，用来说明产品定位并承接 GitHub OAuth 登录。适合在这里确认未登录态的首屏文案、登录按钮与错误反馈。\n\n相关公开文档：[快速开始](../quick-start.html) · [产品说明](../product.html)",
 			},
 		},
 	},

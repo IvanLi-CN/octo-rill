@@ -963,14 +963,14 @@ function AdminJobsPreview({
 }
 
 const meta = {
-	title: "Admin/Jobs Center",
+	title: "Admin/Admin Jobs",
 	component: AdminJobsPreview,
 	parameters: {
 		layout: "fullscreen",
 		docs: {
 			description: {
 				component:
-					"后台任务中心，覆盖实时任务、计划任务、LLM 调用、任务抽屉与会话详情。适合验证可观测性页面在复杂状态下的切换、筛选与细节路由。",
+					"后台任务中心，覆盖实时任务、计划任务、LLM 调用、任务抽屉与会话详情。适合验证可观测性页面在复杂状态下的切换、筛选与细节路由。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
 			},
 		},
 	},

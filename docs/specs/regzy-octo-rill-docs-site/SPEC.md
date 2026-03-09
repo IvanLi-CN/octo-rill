@@ -1,8 +1,8 @@
-# OctoRill 文档站点与 Storybook 文档整合（#sehqs）
+# OctoRill 文档站点与 Storybook 文档快车道实施（#regzy）
 
 ## 状态
-- 当前状态：已完成
-- Spec 目录：`docs/specs/sehqs-octo-rill-docs-site/`
+- 当前状态：部分完成（4/5）
+- Spec 目录：`docs/specs/regzy-octo-rill-docs-site/`
 - 负责人：Codex
 
 ## 背景 / 问题陈述
@@ -51,7 +51,7 @@
 ### Storybook 文档体验
 - 核心组：Landing、Dashboard、Admin Panel、Admin Jobs、Task Type Detail、UI Primitives、App Meta Footer。
 - 每个核心组都要有可读的 docs 描述（组件用途、适用页面或关键交互）。
-- Storybook 分组命名要稳定、便于从公开文档站跳转定位。
+- Storybook 分组命名固定为 `Pages/Landing`、`Pages/Dashboard`、`Admin/Admin Panel`、`Admin/Admin Jobs`、`Admin/Task Type Detail`、`Layout/App Meta Footer`、`UI/Primitives`，并便于从公开文档站跳转定位。
 
 ## 接口契约（Interfaces & Contracts）
 ### 新增构建接口
@@ -69,12 +69,12 @@
 ## 验收标准（Acceptance Criteria）
 1. Given 在 `docs-site` 内执行 `bun run build`，When 设置 `DOCS_BASE=/octo-rill/`，Then 文档站能成功构建，且生成的站内链接与静态资源路径都指向 `/octo-rill/` 子路径。
 2. Given 在 `web` 内执行 `bun run storybook:build`，When 打开生成产物，Then 核心故事组均可在 docs 视图看到说明文字。
-3. Given 执行装配脚本，When 传入 docs 与 storybook 两个构建目录，Then 输出目录同时包含 `index.html`、`storybook/index.html` 与 `storybook.html`。
+3. Given 执行装配脚本，When 传入 docs 与 storybook 两个构建目录，Then 输出目录同时包含 `index.html`、`storybook/index.html` 与 `storybook.html`，且 `storybook.html` 提供 Storybook 总入口与核心故事深链。
 4. Given GitHub Actions 触发 `Docs Pages` 工作流，When 构建成功，Then 能上传 assembled pages artifact，并在非 PR 场景部署 GitHub Pages。
 5. Given 开发者阅读根 README 与 `web/README.md`，When 按说明启动文档站与 Storybook，Then 端口、命令与实际脚本一致。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
-- `cd docs-site && bun run build`
+- `cd docs-site && DOCS_BASE=/octo-rill/ bun run build`
 - `cd web && bun run lint`
 - `cd web && bun run storybook:build`
 - `bash ./.github/scripts/assemble-pages-site.sh <docs_build> <storybook_build> <output_dir>` smoke check
@@ -89,11 +89,13 @@
 - [x] M2: 中文最小文档内容与 Storybook 跳转页完成
 - [x] M3: Storybook docs 元数据与 README 说明同步
 - [x] M4: Pages workflow、装配脚本与验证通过
+- [ ] M5: PR、标签、checks 与 review-loop 收敛完成
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 - 假设：首版公开文档以中文为唯一语言，主人未要求英文镜像。
 - 假设：GitHub Pages 使用仓库默认 Pages 配置，无需额外自定义域名。
+- 风险：`CI Pipeline` 需要同步补上 docs-site build 与 assembled-site smoke check，否则 PR 阶段无法提前暴露公开站点路径问题。
 - 风险：Storybook 静态资源在子目录下可能需要额外 smoke check，避免相对路径失效。
 
 ## 变更记录（Change log）
-- 2026-03-08: 建立首版文档站与 Storybook 文档整合规格，按快车道执行。
+- 2026-03-09: 重建为 `regzy` 规格并按快车道继续推进，收口到新分支与新 PR。

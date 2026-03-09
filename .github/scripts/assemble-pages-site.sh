@@ -43,3 +43,18 @@ if [[ ! -f "$output_dir/storybook/index.html" ]]; then
   echo "assembled site is missing storybook/index.html" >&2
   exit 1
 fi
+
+if [[ ! -f "$output_dir/storybook.html" ]]; then
+  echo "assembled site is missing storybook.html" >&2
+  exit 1
+fi
+
+if ! grep -q 'OctoRill Storybook' "$output_dir/storybook.html"; then
+  echo "storybook.html is missing the Storybook hub copy" >&2
+  exit 1
+fi
+
+if ! grep -q '核心故事入口' "$output_dir/storybook.html"; then
+  echo "storybook.html is missing the core story entry links" >&2
+  exit 1
+fi
