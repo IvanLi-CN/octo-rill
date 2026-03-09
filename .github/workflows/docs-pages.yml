@@ -134,7 +134,7 @@ jobs:
           grep -q '/storybook.html' .tmp/pages-site/index.html
           grep -q 'OctoRill Storybook' .tmp/pages-site/storybook.html
           grep -q '核心故事入口' .tmp/pages-site/storybook.html
-          grep -q 'data-storybook-path="/docs/admin-admin-panel--docs"' .tmp/pages-site/storybook.html
+          grep -q '/storybook/index.html?path=/docs/admin-admin-panel--docs' .tmp/pages-site/storybook.html
           grep -q './sb-manager/runtime.js' .tmp/pages-site/storybook/index.html
           grep -q './sb-common-assets/nunito-sans-regular.woff2' .tmp/pages-site/storybook/index.html
 
