@@ -1,7 +1,7 @@
 # OctoRill 文档站点与 Storybook 文档快车道实施（#regzy）
 
 ## 状态
-- 当前状态：部分完成（4/5）
+- 当前状态：已完成
 - Spec 目录：`docs/specs/regzy-octo-rill-docs-site/`
 - 负责人：Codex
 
@@ -89,7 +89,7 @@
 - [x] M2: 中文最小文档内容与 Storybook 跳转页完成
 - [x] M3: Storybook docs 元数据与 README 说明同步
 - [x] M4: Pages workflow、装配脚本与验证通过
-- [ ] M5: PR、标签、checks 与 review-loop 收敛完成
+- [x] M5: PR、标签、checks 与 review-loop 收敛完成
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 - 假设：首版公开文档以中文为唯一语言，主人未要求英文镜像。
@@ -98,4 +98,4 @@
 - 风险：Storybook 静态资源在子目录下可能需要额外 smoke check，避免相对路径失效。
 
 ## 变更记录（Change log）
-- 2026-03-09: 重建为 `regzy` 规格并按快车道继续推进，收口到新分支与新 PR。
+- 2026-03-09: 重建为 `regzy` 规格并按快车道继续推进，PR #31 已创建，checks 与 review-loop 收敛完成。
