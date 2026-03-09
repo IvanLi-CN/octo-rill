@@ -3,45 +3,116 @@ title: Storybook
 description: OctoRill Storybook 总入口与核心故事深链。
 ---
 
-# Storybook 入口
+import { useEffect, useState } from "react";
 
-这里集中提供 OctoRill Storybook 的总入口，以及最常用的公开文档深链。若你只想直接预览完整 Storybook，请使用下面的主入口按钮。
+export default function StorybookHub() {
+  const [storybookBase, setStorybookBase] = useState("#storybook-hub");
 
-## 直接进入
+  useEffect(() => {
+    const host = window.location.hostname;
+    const isLocalPreview = ["127.0.0.1", "localhost"].includes(host);
 
-<ul>
-  <li><a href="./storybook/">打开 OctoRill Storybook</a></li>
-  <li><a href="./storybook/?path=/docs/pages-landing--docs">查看 Storybook Docs 首页</a></li>
-</ul>
+    if (isLocalPreview) {
+      setStorybookBase(`${window.location.protocol}//${host}:55176/`);
+      return;
+    }
 
-## 核心故事入口
+    setStorybookBase("./storybook/");
+  }, []);
 
-### Pages
+  const hrefFor = (path) => {
+    if (storybookBase === "#storybook-hub") {
+      return storybookBase;
+    }
 
-<ul>
-  <li><a href="./storybook/?path=/docs/pages-landing--docs">Landing</a></li>
-  <li><a href="./storybook/?path=/docs/pages-dashboard--docs">Dashboard</a></li>
-</ul>
+    return path ? `${storybookBase}?path=${path}` : storybookBase;
+  };
 
-### Admin
+  const storyLinks = {
+    landing: "/docs/pages-landing--docs",
+    dashboard: "/docs/pages-dashboard--docs",
+    adminPanel: "/docs/admin-admin-panel--docs",
+    adminJobs: "/docs/admin-admin-jobs--docs",
+    taskTypeDetail: "/docs/admin-task-type-detail--docs",
+    appMetaFooter: "/docs/layout-app-meta-footer--docs",
+    uiPrimitives: "/docs/ui-primitives--docs",
+    button: "/docs/ui-button--docs",
+    card: "/docs/ui-card--docs",
+  };
 
-<ul>
-  <li><a href="./storybook/?path=/docs/admin-admin-panel--docs">Admin Panel</a></li>
-  <li><a href="./storybook/?path=/docs/admin-admin-jobs--docs">Admin Jobs</a></li>
-  <li><a href="./storybook/?path=/docs/admin-task-type-detail--docs">Task Type Detail</a></li>
-</ul>
+  const StorybookAnchor = ({ path, children }) => (
+    <a href={hrefFor(path)} data-storybook-path={path ?? "root"}>
+      {children}
+    </a>
+  );
 
-### Layout 与 UI
+  return (
+    <>
+      <h1 id="storybook-hub">Storybook 入口</h1>
+      <p>
+        这里集中提供 OctoRill Storybook 的总入口，以及最常用的公开文档深链。
+        若你正在本地运行 docs-site，下面的链接会优先跳到
+        <code>127.0.0.1:55176</code>
+        的 Storybook dev server。
+      </p>
 
-<ul>
-  <li><a href="./storybook/?path=/docs/layout-app-meta-footer--docs">App Meta Footer</a></li>
-  <li><a href="./storybook/?path=/docs/ui-primitives--docs">UI Primitives</a></li>
-  <li><a href="./storybook/?path=/docs/ui-button--docs">Button</a></li>
-  <li><a href="./storybook/?path=/docs/ui-card--docs">Card</a></li>
-</ul>
+      <h2>直接进入</h2>
+      <ul>
+        <li>
+          <StorybookAnchor>打开 OctoRill Storybook</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.landing}>查看 Storybook Docs 首页</StorybookAnchor>
+        </li>
+      </ul>
 
-## 何时看 Storybook
+      <h2>核心故事入口</h2>
 
-- 想核对页面状态与占位文案时，优先看 `Pages/*` 与 `Admin/*`。
-- 想确认组件密度、基础控件或版本信息回退时，优先看 `Layout/*` 与 `UI/*`。
-- 想回到公开文档上下文，可使用顶部导航返回“快速开始 / 配置参考 / 产品说明”。
+      <h3>Pages</h3>
+      <ul>
+        <li>
+          <StorybookAnchor path={storyLinks.landing}>Landing</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.dashboard}>Dashboard</StorybookAnchor>
+        </li>
+      </ul>
+
+      <h3>Admin</h3>
+      <ul>
+        <li>
+          <StorybookAnchor path={storyLinks.adminPanel}>Admin Panel</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.adminJobs}>Admin Jobs</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.taskTypeDetail}>Task Type Detail</StorybookAnchor>
+        </li>
+      </ul>
+
+      <h3>Layout 与 UI</h3>
+      <ul>
+        <li>
+          <StorybookAnchor path={storyLinks.appMetaFooter}>App Meta Footer</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.uiPrimitives}>UI Primitives</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.button}>Button</StorybookAnchor>
+        </li>
+        <li>
+          <StorybookAnchor path={storyLinks.card}>Card</StorybookAnchor>
+        </li>
+      </ul>
+
+      <h2>何时看 Storybook</h2>
+      <ul>
+        <li>想核对页面状态与占位文案时，优先看 <code>Pages/*</code> 与 <code>Admin/*</code>。</li>
+        <li>想确认组件密度、基础控件或版本信息回退时，优先看 <code>Layout/*</code> 与 <code>UI/*</code>。</li>
+        <li>想回到公开文档上下文，可使用顶部导航返回“快速开始 / 配置参考 / 产品说明”。</li>
+      </ul>
+    </>
+  );
+}
