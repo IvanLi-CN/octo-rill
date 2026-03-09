@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 部分完成（3/4）
 - Created: 2026-03-09
 - Last: 2026-03-09
 
@@ -96,13 +96,13 @@
 
 ### Quality checks
 
-- [ ] `cargo test`
-- [ ] `cd web && bun run build`
-- [ ] `cd web && bun run e2e -- admin-jobs.spec.ts`
+- [x] `cargo test`
+- [x] `cd web && bun run build`
+- [x] `cd web && bun run e2e -- admin-jobs.spec.ts`
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
-- [ ] M1: follow-up spec、DB/runtime 契约与管理端接口增量冻结。
-- [ ] M2: 固定 4 槽位 translation worker runtime + `request_origin`/`worker_slot`/`request_count` 落地。
-- [ ] M3: 管理页重构为工作者板 + 需求队列/任务记录 tabs，并完成移动端退化。
+- [x] M1: follow-up spec、DB/runtime 契约与管理端接口增量冻结。
+- [x] M2: 固定 4 槽位 translation worker runtime + `request_origin`/`worker_slot`/`request_count` 落地。
+- [x] M3: 管理页重构为工作者板 + 需求队列/任务记录 tabs，并完成移动端退化。
 - [ ] M4: Storybook / Playwright / Rust 测试收口，快车道 PR 与 review-loop 收敛。
