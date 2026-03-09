@@ -341,6 +341,12 @@ const meta = {
 	component: DashboardPreview,
 	parameters: {
 		layout: "fullscreen",
+		docs: {
+			description: {
+				component:
+					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。通过这组故事可以确认不同默认入口和操作弹窗是否符合预期。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
+			},
+		},
 	},
 	args: {
 		initialTab: "all",
@@ -351,11 +357,26 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "主工作区默认入口，覆盖 Feed、侧栏摘要与页面骨架。",
+			},
+		},
+	},
+};
 
 export const BriefsFocused: Story = {
 	args: {
 		initialTab: "briefs",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "把初始焦点切到 Briefs，用来验证日报与摘要场景的可读性。",
+			},
+		},
 	},
 };
 
@@ -363,5 +384,12 @@ export const PatDialogOpen: Story = {
 	args: {
 		initialTab: "briefs",
 		initialPatDialogOpen: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
+			},
+		},
 	},
 };

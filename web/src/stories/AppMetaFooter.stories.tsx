@@ -87,10 +87,16 @@ function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
 }
 
 const meta = {
-	title: "Layout/AppMetaFooter",
+	title: "Layout/App Meta Footer",
 	component: FooterPreview,
 	parameters: {
 		layout: "fullscreen",
+		docs: {
+			description: {
+				component:
+					"Footer 负责展示版本号、构建来源与健康检查回退策略。适合在这里确认版本元信息在成功、回退与失败三种场景下的可见性。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
+			},
+		},
 	},
 	args: {
 		delayMs: 0,
@@ -114,7 +120,15 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-export const Default: Story = {};
+export const Default: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story: "正常从健康检查拿到版本信息时的默认展示。",
+			},
+		},
+	},
+};
 
 export const BuildMetadataVersion: Story = {
 	args: {
@@ -126,10 +140,24 @@ export const VersionEndpointFallback: Story = {
 	args: {
 		mockMode: "fallback",
 	},
+	parameters: {
+		docs: {
+			description: {
+				story: "模拟 `/api/version` 不可用时，Footer 回退到健康检查元信息。",
+			},
+		},
+	},
 };
 
 export const RequestFailed: Story = {
 	args: {
 		mockMode: "failure",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "模拟所有版本请求都失败时的降级文案与错误状态。",
+			},
+		},
 	},
 };
