@@ -6,9 +6,6 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
-      - 'README.md'
-      - 'docs/product.md'
-      - 'web/README.md'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   push:
@@ -16,9 +13,6 @@ on:
     paths:
       - 'docs-site/**'
       - 'web/**'
-      - 'README.md'
-      - 'docs/product.md'
-      - 'web/README.md'
       - '.github/workflows/docs-pages.yml'
       - '.github/scripts/assemble-pages-site.sh'
   workflow_dispatch:

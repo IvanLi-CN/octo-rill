@@ -8,10 +8,21 @@ function normalizeBase(base: string | undefined): string {
 }
 
 const docsBase = normalizeBase(process.env.DOCS_BASE);
+const localStorybookDevOrigin =
+	process.env.VITE_STORYBOOK_DEV_ORIGIN?.trim() ?? "";
 
 export default defineConfig({
 	root: "docs",
 	base: docsBase,
+	builderConfig: {
+		source: {
+			define: {
+				"process.env.RSPRESS_STORYBOOK_DEV_ORIGIN": JSON.stringify(
+					localStorybookDevOrigin,
+				),
+			},
+		},
+	},
 	title: "OctoRill 文档",
 	description: "OctoRill 的快速开始、配置参考、产品说明与 Storybook 入口。",
 	lang: "zh",
