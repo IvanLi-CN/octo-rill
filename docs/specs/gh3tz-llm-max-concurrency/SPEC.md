@@ -90,3 +90,4 @@
 ## 变更记录（Change log）
 - 2026-03-09: 新建规格，冻结 `AI_MAX_CONCURRENCY`、无固定限流、管理员并发状态改造范围与验收标准。
 - 2026-03-09: 完成后端 permit scheduler、管理员并发状态展示、README / docs-site / e2e 同步，并通过 `cargo test`、`bun run build`、`bun run e2e -- admin-jobs.spec.ts` 本地验证。
+- 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并增加 blank-value 回归测试。
