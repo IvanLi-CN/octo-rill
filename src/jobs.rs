@@ -1842,7 +1842,6 @@ mod tests {
         status: &str,
         updated_at: &str,
     ) {
-        let completed_item_count = i64::from(matches!(status, "completed" | "failed"));
         let started_at = match status {
             "queued" => None,
             _ => Some(updated_at),
@@ -1851,13 +1850,21 @@ mod tests {
             "completed" | "failed" => Some(updated_at),
             _ => None,
         };
+        let result_status = match status {
+            "completed" => Some("ready"),
+            "failed" => Some("error"),
+            _ => None,
+        };
+        let error_text = matches!(status, "failed").then_some("boom");
 
         sqlx::query(
             r#"
             INSERT INTO translation_requests (
-              id, mode, source, request_origin, requested_by, scope_user_id, status,
-              item_count, completed_item_count, created_at, started_at, finished_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind,
+              variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json,
+              target_slots_json, status, result_status, title_zh, summary_md, body_md, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(request_id)
@@ -1866,9 +1873,21 @@ mod tests {
         .bind("user")
         .bind(1_i64)
         .bind(1_i64)
+        .bind(format!("feed.auto_translate:release:{request_id}"))
+        .bind("release_summary")
+        .bind("feed_card")
+        .bind(request_id)
+        .bind("zh-CN")
+        .bind(1000_i64)
+        .bind("hash")
+        .bind("[]")
+        .bind("[]")
         .bind(status)
-        .bind(1_i64)
-        .bind(completed_item_count)
+        .bind(result_status)
+        .bind(matches!(status, "completed").then_some("标题"))
+        .bind(matches!(status, "completed").then_some("摘要"))
+        .bind(Option::<&str>::None)
+        .bind(error_text)
         .bind(updated_at)
         .bind(started_at)
         .bind(finished_at)

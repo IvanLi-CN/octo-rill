@@ -1548,14 +1548,13 @@ function TranslationSchedulerSection(props: {
 										>
 											<TableHeader>
 												<TableRow>
-													<TableHead className="w-[14%]">来源</TableHead>
-													<TableHead className="w-[6%]">类型</TableHead>
+													<TableHead className="w-[18%]">来源</TableHead>
+													<TableHead className="w-[16%]">请求</TableHead>
 													<TableHead className="w-[10%]">状态</TableHead>
 													<TableHead className="w-[17%]">请求ID</TableHead>
 													<TableHead className="w-[13%]">请求人</TableHead>
 													<TableHead className="w-[13%]">作用域</TableHead>
-													<TableHead className="w-[6%]">进度</TableHead>
-													<TableHead className="w-[10%]">更新时间</TableHead>
+													<TableHead className="w-[11%]">更新时间</TableHead>
 													<TableHead className="w-[88px] text-right">
 														操作
 													</TableHead>
@@ -1568,11 +1567,20 @@ function TranslationSchedulerSection(props: {
 															<div className="truncate whitespace-nowrap">
 																{request.source}
 															</div>
+															<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+																{request.producer_ref}
+															</p>
 														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap">
-															{translationRequestOriginLabel(
-																request.request_origin,
-															)}
+														<TableCell className="px-3 py-3">
+															<p className="truncate whitespace-nowrap">
+																{request.kind} · {request.variant}
+															</p>
+															<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+																entity {request.entity_id} ·{" "}
+																{translationRequestOriginLabel(
+																	request.request_origin,
+																)}
+															</p>
 														</TableCell>
 														<TableCell className="px-3 py-3 whitespace-nowrap">
 															<StatusBadge
@@ -1596,10 +1604,6 @@ function TranslationSchedulerSection(props: {
 															<div className="truncate whitespace-nowrap font-mono text-xs">
 																#{request.scope_user_id}
 															</div>
-														</TableCell>
-														<TableCell className="px-3 py-3 whitespace-nowrap text-sm">
-															{formatCount(request.completed_item_count)}/
-															{formatCount(request.item_count)}
 														</TableCell>
 														<TableCell className="px-3 py-3 whitespace-nowrap text-xs">
 															{formatLocalDateTime(request.updated_at)}
@@ -1633,19 +1637,24 @@ function TranslationSchedulerSection(props: {
 													/>
 												</div>
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
+													{request.kind} · {request.variant} · entity{" "}
+													{request.entity_id}
+												</p>
+												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
 													{translationRequestOriginLabel(
 														request.request_origin,
 													)}{" "}
-													· ID {request.id}
+													· requested_by {request.requested_by ?? "-"}
 												</p>
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													请求人 {request.requested_by ?? "-"} · scope #
-													{request.scope_user_id}
+													scope #{request.scope_user_id} · producer_ref{" "}
+													{request.producer_ref}
 												</p>
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
-													进度 {formatCount(request.completed_item_count)}/
-													{formatCount(request.item_count)} · 更新{" "}
-													{formatLocalDateTime(request.updated_at)}
+													{request.batch_id
+														? `batch ${request.batch_id} · `
+														: ""}
+													更新 {formatLocalDateTime(request.updated_at)}
 												</p>
 												<div className="mt-2 flex justify-end">
 													<Button
@@ -1906,7 +1915,7 @@ function TranslationSchedulerSection(props: {
 										? "查看批次 item、工作者槽位、错误原因与关联 LLM 调用。"
 										: drawer?.kind === "worker"
 											? "查看当前槽位状态、负载与关联批次。"
-											: "查看请求内 item 结果与 fan-out 归属。"}
+											: "查看单条请求结果与 fan-out 归属。"}
 								</SheetDescription>
 							</div>
 							<Button variant="outline" onClick={() => setDrawer(null)}>
@@ -1945,52 +1954,56 @@ function TranslationSchedulerSection(props: {
 										</p>
 									</div>
 								</div>
-								<div className="space-y-2">
-									{requestDetail.items.map((item) => (
-										<div
-											key={`${item.work_item_id ?? "request-item"}:${item.producer_ref}:${item.entity_id}:${item.kind}:${item.variant}`}
-											className="rounded-lg border p-3"
-										>
-											<div className="flex flex-wrap items-center gap-2">
-												<p className="font-medium text-sm">
-													{item.kind} · {item.variant}
-												</p>
-												<StatusBadge
-													label={translationItemStatusLabel(item.status)}
-													tone={translationItemTone(item.status)}
-												/>
-											</div>
-											<p className="text-muted-foreground mt-1 text-xs">
-												entity {item.entity_id} · producer_ref{" "}
-												{item.producer_ref}
-											</p>
-											{item.title_zh || item.summary_md || item.body_md ? (
-												<div className="text-muted-foreground mt-2 space-y-1 text-xs">
-													{item.title_zh ? <p>标题：{item.title_zh}</p> : null}
-													{item.summary_md ? (
-														<p>摘要：{item.summary_md}</p>
-													) : null}
-													{item.body_md ? <p>正文：{item.body_md}</p> : null}
-												</div>
+								<div className="rounded-lg border p-3">
+									<div className="flex flex-wrap items-center gap-2">
+										<p className="font-medium text-sm">
+											{requestDetail.result.kind} ·{" "}
+											{requestDetail.result.variant}
+										</p>
+										<StatusBadge
+											label={translationItemStatusLabel(
+												requestDetail.result.status,
+											)}
+											tone={translationItemTone(requestDetail.result.status)}
+										/>
+									</div>
+									<p className="text-muted-foreground mt-1 text-xs">
+										entity {requestDetail.result.entity_id} · producer_ref{" "}
+										{requestDetail.result.producer_ref}
+									</p>
+									{requestDetail.result.title_zh ||
+									requestDetail.result.summary_md ||
+									requestDetail.result.body_md ? (
+										<div className="text-muted-foreground mt-2 space-y-1 text-xs">
+											{requestDetail.result.title_zh ? (
+												<p>标题：{requestDetail.result.title_zh}</p>
 											) : null}
-											<div className="mt-2 flex flex-wrap items-center gap-2">
-												{item.batch_id ? (
-													<Button
-														variant="outline"
-														size="sm"
-														onClick={() => void openBatchDetail(item.batch_id!)}
-													>
-														查看批次
-													</Button>
-												) : null}
-												{item.error ? (
-													<span className="text-destructive text-xs">
-														{item.error}
-													</span>
-												) : null}
-											</div>
+											{requestDetail.result.summary_md ? (
+												<p>摘要：{requestDetail.result.summary_md}</p>
+											) : null}
+											{requestDetail.result.body_md ? (
+												<p>正文：{requestDetail.result.body_md}</p>
+											) : null}
 										</div>
-									))}
+									) : null}
+									<div className="mt-2 flex flex-wrap items-center gap-2">
+										{requestDetail.result.batch_id ? (
+											<Button
+												variant="outline"
+												size="sm"
+												onClick={() =>
+													void openBatchDetail(requestDetail.result.batch_id!)
+												}
+											>
+												查看批次
+											</Button>
+										) : null}
+										{requestDetail.result.error ? (
+											<span className="text-destructive text-xs">
+												{requestDetail.result.error}
+											</span>
+										) : null}
+									</div>
 								</div>
 							</>
 						) : drawer?.kind === "worker" && selectedWorker ? (
