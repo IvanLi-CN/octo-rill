@@ -1978,15 +1978,69 @@ fn llm_calls_status_rank(status: &str) -> i32 {
     }
 }
 
-fn apply_llm_call_status_overrides(
+fn apply_llm_call_admin_override(item: &mut AdminLlmCallItem, snapshot: &ai::LlmCallAdminOverride) {
+    item.status = snapshot.status.clone();
+    item.attempt_count = snapshot.attempt_count;
+    item.scheduler_wait_ms = snapshot.scheduler_wait_ms;
+    item.first_token_wait_ms = snapshot.first_token_wait_ms;
+    item.duration_ms = snapshot.duration_ms;
+    item.input_tokens = snapshot.input_tokens;
+    item.output_tokens = snapshot.output_tokens;
+    item.cached_input_tokens = snapshot.cached_input_tokens;
+    item.total_tokens = snapshot.total_tokens;
+    if let Some(started_at) = snapshot.started_at.clone() {
+        item.started_at = Some(started_at);
+    }
+    if let Some(finished_at) = snapshot.finished_at.clone() {
+        item.finished_at = Some(finished_at);
+    }
+    item.updated_at = snapshot.updated_at.clone();
+}
+
+fn apply_llm_call_detail_admin_override(
+    item: &mut AdminLlmCallDetailItem,
+    snapshot: &ai::LlmCallAdminOverride,
+) {
+    item.status = snapshot.status.clone();
+    item.attempt_count = snapshot.attempt_count;
+    item.scheduler_wait_ms = snapshot.scheduler_wait_ms;
+    item.first_token_wait_ms = snapshot.first_token_wait_ms;
+    item.duration_ms = snapshot.duration_ms;
+    item.input_tokens = snapshot.input_tokens;
+    item.output_tokens = snapshot.output_tokens;
+    item.cached_input_tokens = snapshot.cached_input_tokens;
+    item.total_tokens = snapshot.total_tokens;
+    if let Some(output_messages_json) = snapshot.output_messages_json.clone() {
+        item.output_messages_json = Some(output_messages_json);
+    }
+    if let Some(response_text) = snapshot.response_text.clone() {
+        item.response_text = Some(response_text);
+    }
+    if let Some(error_text) = snapshot.error_text.clone() {
+        item.error_text = Some(error_text);
+    }
+    if let Some(started_at) = snapshot.started_at.clone() {
+        item.started_at = Some(started_at);
+    }
+    if let Some(finished_at) = snapshot.finished_at.clone() {
+        item.finished_at = Some(finished_at);
+    }
+    item.updated_at = snapshot.updated_at.clone();
+}
+
+fn apply_llm_call_admin_overrides(
     items: &mut [AdminLlmCallItem],
-    overrides: &HashMap<String, String>,
+    overrides: &HashMap<String, ai::LlmCallAdminOverride>,
 ) {
     for item in items {
-        if let Some(status) = overrides.get(&item.id) {
-            item.status = status.clone();
+        if let Some(snapshot) = overrides.get(&item.id) {
+            apply_llm_call_admin_override(item, snapshot);
         }
     }
+}
+
+fn llm_call_matches_status_filter(item: &AdminLlmCallItem, status: &str) -> bool {
+    status == "all" || item.status == status
 }
 
 fn sort_admin_llm_calls(items: &mut [AdminLlmCallItem], sort: &str) {
@@ -2107,20 +2161,173 @@ pub async fn admin_list_llm_calls(
         return Err(ApiError::bad_request("invalid sort filter"));
     }
 
-    let total = sqlx::query_scalar::<_, i64>(
+    let overrides = state.llm_scheduler.admin_overrides().await;
+    if overrides.is_empty() {
+        let total = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM llm_calls
+            WHERE (? = 'all' OR status = ?)
+              AND (? = '' OR source = ?)
+              AND (? IS NULL OR requested_by = ?)
+              AND (? = '' OR parent_task_id = ?)
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+            "#,
+        )
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .bind(source.as_str())
+        .bind(source.as_str())
+        .bind(requested_by.as_deref())
+        .bind(requested_by.as_deref())
+        .bind(parent_task_id.as_str())
+        .bind(parent_task_id.as_str())
+        .bind(started_from.as_deref())
+        .bind(started_from.as_deref())
+        .bind(started_to.as_deref())
+        .bind(started_to.as_deref())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+        let items_query = match sort.as_str() {
+            "status_grouped" => {
+                r#"
+                SELECT
+                  id,
+                  status,
+                  source,
+                  model,
+                  requested_by,
+                  parent_task_id,
+                  parent_task_type,
+                  max_tokens,
+                  attempt_count,
+                  scheduler_wait_ms,
+                  first_token_wait_ms,
+                  duration_ms,
+                  input_tokens,
+                  output_tokens,
+                  cached_input_tokens,
+                  total_tokens,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                FROM llm_calls
+                WHERE (? = 'all' OR status = ?)
+                  AND (? = '' OR source = ?)
+                  AND (? IS NULL OR requested_by = ?)
+                  AND (? = '' OR parent_task_id = ?)
+                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+                ORDER BY
+                  CASE
+                    WHEN status = 'running' THEN 0
+                    WHEN status = 'queued' THEN 1
+                    ELSE 2
+                  END,
+                  created_at DESC,
+                  id DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+            _ => {
+                r#"
+                SELECT
+                  id,
+                  status,
+                  source,
+                  model,
+                  requested_by,
+                  parent_task_id,
+                  parent_task_type,
+                  max_tokens,
+                  attempt_count,
+                  scheduler_wait_ms,
+                  first_token_wait_ms,
+                  duration_ms,
+                  input_tokens,
+                  output_tokens,
+                  cached_input_tokens,
+                  total_tokens,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                FROM llm_calls
+                WHERE (? = 'all' OR status = ?)
+                  AND (? = '' OR source = ?)
+                  AND (? IS NULL OR requested_by = ?)
+                  AND (? = '' OR parent_task_id = ?)
+                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                "#
+            }
+        };
+
+        let items = sqlx::query_as::<_, AdminLlmCallItem>(items_query)
+            .bind(status.as_str())
+            .bind(status.as_str())
+            .bind(source.as_str())
+            .bind(source.as_str())
+            .bind(requested_by.as_deref())
+            .bind(requested_by.as_deref())
+            .bind(parent_task_id.as_str())
+            .bind(parent_task_id.as_str())
+            .bind(started_from.as_deref())
+            .bind(started_from.as_deref())
+            .bind(started_to.as_deref())
+            .bind(started_to.as_deref())
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+
+        return Ok(Json(AdminLlmCallsResponse {
+            items,
+            page,
+            page_size,
+            total,
+        }));
+    }
+
+    let mut items = sqlx::query_as::<_, AdminLlmCallItem>(
         r#"
-        SELECT COUNT(*)
+        SELECT
+          id,
+          status,
+          source,
+          model,
+          requested_by,
+          parent_task_id,
+          parent_task_type,
+          max_tokens,
+          attempt_count,
+          scheduler_wait_ms,
+          first_token_wait_ms,
+          duration_ms,
+          input_tokens,
+          output_tokens,
+          cached_input_tokens,
+          total_tokens,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
         FROM llm_calls
-        WHERE (? = 'all' OR status = ?)
-          AND (? = '' OR source = ?)
+        WHERE (? = '' OR source = ?)
           AND (? IS NULL OR requested_by = ?)
           AND (? = '' OR parent_task_id = ?)
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+        ORDER BY created_at DESC, id DESC
         "#,
     )
-    .bind(status.as_str())
-    .bind(status.as_str())
     .bind(source.as_str())
     .bind(source.as_str())
     .bind(requested_by.as_deref())
@@ -2131,110 +2338,18 @@ pub async fn admin_list_llm_calls(
     .bind(started_from.as_deref())
     .bind(started_to.as_deref())
     .bind(started_to.as_deref())
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
-    let items_query = match sort.as_str() {
-        "status_grouped" => {
-            r#"
-            SELECT
-              id,
-              status,
-              source,
-              model,
-              requested_by,
-              parent_task_id,
-              parent_task_type,
-              max_tokens,
-              attempt_count,
-              scheduler_wait_ms,
-              first_token_wait_ms,
-              duration_ms,
-              input_tokens,
-              output_tokens,
-              cached_input_tokens,
-              total_tokens,
-              created_at,
-              started_at,
-              finished_at,
-              updated_at
-            FROM llm_calls
-            WHERE (? = 'all' OR status = ?)
-              AND (? = '' OR source = ?)
-              AND (? IS NULL OR requested_by = ?)
-              AND (? = '' OR parent_task_id = ?)
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-            ORDER BY
-              CASE
-                WHEN status = 'running' THEN 0
-                WHEN status = 'queued' THEN 1
-                ELSE 2
-              END,
-              created_at DESC,
-              id DESC
-            LIMIT ? OFFSET ?
-            "#
-        }
-        _ => {
-            r#"
-            SELECT
-              id,
-              status,
-              source,
-              model,
-              requested_by,
-              parent_task_id,
-              parent_task_type,
-              max_tokens,
-              attempt_count,
-              scheduler_wait_ms,
-              first_token_wait_ms,
-              duration_ms,
-              input_tokens,
-              output_tokens,
-              cached_input_tokens,
-              total_tokens,
-              created_at,
-              started_at,
-              finished_at,
-              updated_at
-            FROM llm_calls
-            WHERE (? = 'all' OR status = ?)
-              AND (? = '' OR source = ?)
-              AND (? IS NULL OR requested_by = ?)
-              AND (? = '' OR parent_task_id = ?)
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-            ORDER BY created_at DESC, id DESC
-            LIMIT ? OFFSET ?
-            "#
-        }
-    };
-
-    let mut items = sqlx::query_as::<_, AdminLlmCallItem>(items_query)
-        .bind(status.as_str())
-        .bind(status.as_str())
-        .bind(source.as_str())
-        .bind(source.as_str())
-        .bind(requested_by.as_deref())
-        .bind(requested_by.as_deref())
-        .bind(parent_task_id.as_str())
-        .bind(parent_task_id.as_str())
-        .bind(started_from.as_deref())
-        .bind(started_from.as_deref())
-        .bind(started_to.as_deref())
-        .bind(started_to.as_deref())
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-
-    let overrides = state.llm_scheduler.status_overrides().await;
-    apply_llm_call_status_overrides(&mut items, &overrides);
+    apply_llm_call_admin_overrides(&mut items, &overrides);
+    items.retain(|item| llm_call_matches_status_filter(item, status.as_str()));
     sort_admin_llm_calls(&mut items, sort.as_str());
+
+    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let size = usize::try_from(page_size).unwrap_or(100);
+    let items = items.into_iter().skip(start).take(size).collect::<Vec<_>>();
 
     Ok(Json(AdminLlmCallsResponse {
         items,
@@ -2291,8 +2406,8 @@ pub async fn admin_get_llm_call_detail(
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "llm call not found"))?;
 
-    if let Some(status) = state.llm_scheduler.status_overrides().await.get(&item.id) {
-        item.status = status.clone();
+    if let Some(snapshot) = state.llm_scheduler.admin_overrides().await.get(&item.id) {
+        apply_llm_call_detail_admin_override(&mut item, snapshot);
     }
 
     Ok(Json(item))
@@ -8164,6 +8279,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_list_llm_calls_uses_override_snapshot_fields() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-running-snapshot",
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T02:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool);
+        state
+            .llm_scheduler
+            .set_admin_override(crate::ai::LlmCallAdminOverride {
+                id: "call-running-snapshot".to_owned(),
+                status: "succeeded".to_owned(),
+                attempt_count: 2,
+                scheduler_wait_ms: 180,
+                first_token_wait_ms: Some(95),
+                duration_ms: Some(450),
+                input_tokens: Some(220),
+                output_tokens: Some(88),
+                cached_input_tokens: Some(12),
+                total_tokens: Some(308),
+                output_messages_json: Some(
+                    r#"[{"role":"assistant","content":"override"}]"#.to_owned(),
+                ),
+                response_text: Some("override response".to_owned()),
+                error_text: None,
+                started_at: Some("2026-02-26T02:00:01Z".to_owned()),
+                finished_at: Some("2026-02-26T02:00:09Z".to_owned()),
+                updated_at: "2026-02-26T02:00:09Z".to_owned(),
+            })
+            .await;
+        let session = setup_session(1).await;
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should expose override snapshot fields")
+        .0;
+
+        let item = resp
+            .items
+            .into_iter()
+            .next()
+            .expect("list item should exist");
+        assert_eq!(item.status, "succeeded");
+        assert_eq!(item.attempt_count, 2);
+        assert_eq!(item.scheduler_wait_ms, 180);
+        assert_eq!(item.first_token_wait_ms, Some(95));
+        assert_eq!(item.duration_ms, Some(450));
+        assert_eq!(item.input_tokens, Some(220));
+        assert_eq!(item.output_tokens, Some(88));
+        assert_eq!(item.cached_input_tokens, Some(12));
+        assert_eq!(item.total_tokens, Some(308));
+        assert_eq!(item.started_at.as_deref(), Some("2026-02-26T02:00:01Z"));
+        assert_eq!(item.finished_at.as_deref(), Some("2026-02-26T02:00:09Z"));
+        assert_eq!(item.updated_at, "2026-02-26T02:00:09Z");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_uses_overrides_for_filter_sort_and_pagination() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-running-old",
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T02:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-queued-middle",
+            "queued",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T04:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-failed-newest",
+            "failed",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T06:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool);
+        state
+            .llm_scheduler
+            .set_admin_override(crate::ai::LlmCallAdminOverride {
+                id: "call-failed-newest".to_owned(),
+                status: "queued".to_owned(),
+                attempt_count: 3,
+                scheduler_wait_ms: 200,
+                first_token_wait_ms: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: None,
+                started_at: Some("2026-02-26T06:00:01Z".to_owned()),
+                finished_at: None,
+                updated_at: "2026-02-26T06:00:05Z".to_owned(),
+            })
+            .await;
+
+        let first_page = admin_list_llm_calls(
+            State(Arc::clone(&state)),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("queued".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: Some("status_grouped".to_owned()),
+                page: Some(1),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("page one should include override-backed queued call")
+        .0;
+        assert_eq!(first_page.total, 2);
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.items[0].id, "call-failed-newest");
+        assert_eq!(first_page.items[0].status, "queued");
+
+        let second_page = admin_list_llm_calls(
+            State(state),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("queued".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: Some("status_grouped".to_owned()),
+                page: Some(2),
+                page_size: Some(1),
+            }),
+        )
+        .await
+        .expect("page two should keep override-aware pagination stable")
+        .0;
+        assert_eq!(second_page.total, 2);
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, "call-queued-middle");
+    }
+
+    #[tokio::test]
     async fn admin_list_llm_calls_accepts_zulu_started_filters() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -8393,6 +8695,77 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("\"assistant\""))
         );
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_call_detail_uses_admin_override_snapshot() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let call_id = crate::local_id::test_local_id("call-detail-override");
+        seed_llm_call(
+            &pool,
+            &call_id,
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        state
+            .llm_scheduler
+            .set_admin_override(crate::ai::LlmCallAdminOverride {
+                id: call_id.clone(),
+                status: "succeeded".to_owned(),
+                attempt_count: 4,
+                scheduler_wait_ms: 260,
+                first_token_wait_ms: Some(75),
+                duration_ms: Some(910),
+                input_tokens: Some(300),
+                output_tokens: Some(120),
+                cached_input_tokens: Some(40),
+                total_tokens: Some(420),
+                output_messages_json: Some(
+                    r#"[{"role":"assistant","content":"override detail"}]"#.to_owned(),
+                ),
+                response_text: Some("override detail response".to_owned()),
+                error_text: None,
+                started_at: Some("2026-02-26T03:00:01Z".to_owned()),
+                finished_at: Some("2026-02-26T03:00:08Z".to_owned()),
+                updated_at: "2026-02-26T03:00:08Z".to_owned(),
+            })
+            .await;
+        let session = setup_session(1).await;
+
+        let resp = admin_get_llm_call_detail(State(state), session, Path(call_id))
+            .await
+            .expect("llm call detail should expose override snapshot")
+            .0;
+
+        assert_eq!(resp.status, "succeeded");
+        assert_eq!(resp.attempt_count, 4);
+        assert_eq!(resp.scheduler_wait_ms, 260);
+        assert_eq!(resp.first_token_wait_ms, Some(75));
+        assert_eq!(resp.duration_ms, Some(910));
+        assert_eq!(resp.input_tokens, Some(300));
+        assert_eq!(resp.output_tokens, Some(120));
+        assert_eq!(resp.cached_input_tokens, Some(40));
+        assert_eq!(resp.total_tokens, Some(420));
+        assert_eq!(
+            resp.output_messages_json.as_deref(),
+            Some(r#"[{"role":"assistant","content":"override detail"}]"#)
+        );
+        assert_eq!(
+            resp.response_text.as_deref(),
+            Some("override detail response")
+        );
+        assert_eq!(resp.started_at.as_deref(), Some("2026-02-26T03:00:01Z"));
+        assert_eq!(resp.finished_at.as_deref(), Some("2026-02-26T03:00:08Z"));
+        assert_eq!(resp.updated_at, "2026-02-26T03:00:08Z");
     }
 
     #[tokio::test]
