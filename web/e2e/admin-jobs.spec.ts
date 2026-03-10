@@ -131,10 +131,10 @@ async function installAdminJobsMocks(
 			prompt_text: "prompt 1",
 			response_text: null,
 			error_text: "mock llm failed",
-			created_at: "2026-02-26T02:00:00Z",
-			started_at: "2026-02-26T02:00:01Z",
-			finished_at: "2026-02-26T02:00:03Z",
-			updated_at: "2026-02-26T02:00:03Z",
+			created_at: "2026-02-26T05:00:00Z",
+			started_at: "2026-02-26T05:00:01Z",
+			finished_at: "2026-02-26T05:00:03Z",
+			updated_at: "2026-02-26T05:00:03Z",
 		},
 		{
 			id: "llm-call-2",
@@ -167,6 +167,36 @@ async function installAdminJobsMocks(
 			started_at: "2026-02-26T03:00:00Z",
 			finished_at: null,
 			updated_at: "2026-02-26T03:00:00Z",
+		},
+		{
+			id: "llm-call-3",
+			status: "queued",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			requested_by: null,
+			parent_task_id: null,
+			parent_task_type: null,
+			max_tokens: 900,
+			attempt_count: 0,
+			scheduler_wait_ms: 0,
+			first_token_wait_ms: null,
+			duration_ms: null,
+			input_tokens: null,
+			output_tokens: null,
+			cached_input_tokens: null,
+			total_tokens: null,
+			input_messages_json: JSON.stringify([
+				{ role: "system", content: "You are a queue placeholder." },
+				{ role: "user", content: "queued request" },
+			]),
+			output_messages_json: null,
+			prompt_text: "prompt 3",
+			response_text: null,
+			error_text: null,
+			created_at: "2026-02-26T04:00:00Z",
+			started_at: null,
+			finished_at: null,
+			updated_at: "2026-02-26T04:00:00Z",
 		},
 	];
 
@@ -1259,8 +1289,9 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByRole("textbox", { name: "LLM 调用来源筛选" }),
 	).toBeVisible();
 	await expect(page.getByLabel("LLM 开始时间下限")).toBeVisible();
-	await expect(page.getByText("最大并行 2")).toBeVisible();
-	await expect(page.getByText("可用槽位 1")).toBeVisible();
+	await expect(page.getByText("调度器状态")).toHaveCount(0);
+	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
+	await expect(page.getByText("近24h 调用 / 失败")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
 	await page
 		.getByRole("textbox", { name: "LLM 调用来源筛选" })
@@ -1284,6 +1315,28 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(llmSheet).toHaveCount(0);
+});
+
+test("admin llm calls are sorted by status group and created time", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, { emitStreamEvents: false });
+	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
+
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
+	await expect(page.getByText("调度器状态")).toHaveCount(0);
+	await expect(page.getByText("等待 / 进行中")).toHaveCount(0);
+
+	const llmCallIds = await page
+		.locator("p")
+		.filter({ hasText: /^ID: llm-call-/ })
+		.allTextContents();
+	expect(llmCallIds).toEqual([
+		"ID: llm-call-2",
+		"ID: llm-call-3",
+		"ID: llm-call-1",
+	]);
 });
 
 test("admin keeps llm calls visible during sse refresh", async ({ page }) => {

@@ -689,7 +689,15 @@ pub async fn admin_list_realtime_tasks(
             OR (? = 'scheduled' AND task_type IN (?, ?))
             OR (? = 'realtime' AND task_type NOT IN (?, ?))
           )
-        ORDER BY created_at DESC, id DESC
+        ORDER BY
+          CASE
+            WHEN status = 'running' THEN 0
+            WHEN status = 'queued' THEN 1
+            ELSE 2
+          END,
+          unixepoch(created_at) DESC,
+          created_at DESC,
+          id DESC
         LIMIT ? OFFSET ?
         "#,
     )
@@ -2125,7 +2133,15 @@ pub async fn admin_list_llm_calls(
           AND (? = '' OR parent_task_id = ?)
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
           AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-        ORDER BY created_at DESC, id DESC
+        ORDER BY
+          CASE
+            WHEN status = 'running' THEN 0
+            WHEN status = 'queued' THEN 1
+            ELSE 2
+          END,
+          unixepoch(created_at) DESC,
+          created_at DESC,
+          id DESC
         LIMIT ? OFFSET ?
         "#,
     )
@@ -7455,6 +7471,25 @@ mod tests {
         requested_by: Option<String>,
     ) {
         let now = chrono::Utc::now().to_rfc3339();
+        seed_llm_call_with_created_at(pool, call_id, status, source, requested_by, &now).await;
+    }
+
+    async fn seed_llm_call_with_created_at(
+        pool: &SqlitePool,
+        call_id: &str,
+        status: &str,
+        source: &str,
+        requested_by: Option<String>,
+        created_at: &str,
+    ) {
+        let started_at = match status {
+            "queued" => None,
+            _ => Some(created_at),
+        };
+        let finished_at = match status {
+            "queued" | "running" => None,
+            _ => Some(created_at),
+        };
         sqlx::query(
             r#"
             INSERT INTO llm_calls (
@@ -7491,10 +7526,10 @@ mod tests {
         .bind(status)
         .bind(source)
         .bind(requested_by)
-        .bind(now.as_str())
-        .bind(now.as_str())
-        .bind(now.as_str())
-        .bind(now.as_str())
+        .bind(created_at)
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(created_at)
         .execute(pool)
         .await
         .expect("seed llm call");
@@ -7753,6 +7788,88 @@ mod tests {
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-failed");
         assert_eq!(resp.items[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_orders_running_then_queued_then_terminal() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-running-old",
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T02:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-running-new",
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T03:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-queued",
+            "queued",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T05:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-failed",
+            "failed",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T06:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should sort by runtime priority")
+        .0;
+
+        let ids = resp
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "call-running-new",
+                "call-running-old",
+                "call-queued",
+                "call-failed",
+            ]
+        );
     }
 
     #[tokio::test]
