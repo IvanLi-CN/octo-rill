@@ -690,11 +690,6 @@ pub async fn admin_list_realtime_tasks(
             OR (? = 'realtime' AND task_type NOT IN (?, ?))
           )
         ORDER BY
-          CASE
-            WHEN status = 'running' THEN 0
-            WHEN status = 'queued' THEN 1
-            ELSE 2
-          END,
           unixepoch(created_at) DESC,
           created_at DESC,
           id DESC
@@ -7210,15 +7205,15 @@ pub(crate) async fn require_admin_user_id(
 mod tests {
     use super::{
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallsQuery,
-        AdminRealtimeTaskDetailItem, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
-        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
-        TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
+        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem,
+        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedRow,
+        GraphQlError, TranslateBatchItem, TranslationCacheRow, admin_download_realtime_task_log,
         admin_get_llm_call_detail, admin_get_llm_scheduler_status, admin_get_realtime_task_detail,
-        admin_list_llm_calls, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
-        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
-        guard_admin_user_update, has_repo_scope, looks_like_json_blob, map_job_action_error,
-        markdown_structure_preserved, normalize_translation_fields,
+        admin_list_llm_calls, admin_list_realtime_tasks, admin_list_users, admin_patch_user,
+        admin_users_offset, ai_error_is_non_retryable, build_task_diagnostics,
+        ensure_account_enabled, extract_translation_fields, github_graphql_errors_to_api_error,
+        github_graphql_http_error, guard_admin_user_update, has_repo_scope, looks_like_json_blob,
+        map_job_action_error, markdown_structure_preserved, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
@@ -7788,6 +7783,82 @@ mod tests {
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].id, "call-failed");
         assert_eq!(resp.items[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn admin_list_realtime_tasks_keeps_newest_created_first() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        for (task_id, status, created_at) in [
+            ("task-old-running", "running", "2026-02-26T01:00:00Z"),
+            ("task-new-failed", "failed", "2026-02-26T05:00:00Z"),
+            ("task-mid-succeeded", "succeeded", "2026-02-26T03:00:00Z"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id,
+                  task_type,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  payload_json,
+                  result_json,
+                  error_message,
+                  cancel_requested,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                )
+                VALUES (?, 'sync.releases', ?, 'tests', ?, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(task_id)
+            .bind(status)
+            .bind(test_user_id(1))
+            .bind(created_at)
+            .bind(created_at)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("seed realtime task");
+        }
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resp = admin_list_realtime_tasks(
+            State(state),
+            session,
+            Query(AdminRealtimeTasksQuery {
+                status: Some("all".to_owned()),
+                task_type: None,
+                exclude_task_type: None,
+                task_group: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin realtime task list should succeed")
+        .0;
+
+        let ids = resp
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec!["task-new-failed", "task-mid-succeeded", "task-old-running"]
+        );
     }
 
     #[tokio::test]
