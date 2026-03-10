@@ -113,7 +113,7 @@ export function useAutoTranslate(params: {
 			return;
 		}
 		waitRetryCountRef.current.set(key, retries + 1);
-		if (!queuedRef.current.includes(key) && !inFlightRef.current.has(key)) {
+		if (!queuedRef.current.includes(key)) {
 			queuedRef.current.push(key);
 		}
 	}, []);

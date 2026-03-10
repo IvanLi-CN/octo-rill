@@ -241,7 +241,7 @@ mod tests {
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
-        let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(database_url.as_str())

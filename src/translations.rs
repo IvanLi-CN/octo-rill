@@ -340,9 +340,6 @@ struct RequestRow {
     entity_id: String,
     target_lang: String,
     max_wait_ms: i64,
-    source_hash: String,
-    source_blocks_json: String,
-    target_slots_json: String,
     work_item_id: Option<String>,
     status: String,
     result_status: Option<String>,
@@ -653,8 +650,8 @@ fn request_row_select_sql() -> &'static str {
     r#"
     SELECT r.id, r.mode, r.source, r.request_origin, r.requested_by, r.scope_user_id,
            r.producer_ref, r.kind, r.variant, r.entity_id, r.target_lang, r.max_wait_ms,
-           r.source_hash, r.source_blocks_json, r.target_slots_json, r.work_item_id,
-           r.status, r.result_status, r.title_zh, r.summary_md, r.body_md, r.error_text,
+           r.work_item_id, r.status, r.result_status, r.title_zh, r.summary_md, r.body_md,
+           r.error_text,
            r.created_at, r.started_at, r.finished_at, r.updated_at,
            (SELECT status FROM translation_work_items w WHERE w.id = r.work_item_id) AS work_item_status,
            (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
@@ -3394,9 +3391,6 @@ mod tests {
                 entity_id: "123".to_owned(),
                 target_lang: "zh-CN".to_owned(),
                 max_wait_ms: 1500,
-                source_hash: "hash".to_owned(),
-                source_blocks_json: "[]".to_owned(),
-                target_slots_json: "[\"title_zh\"]".to_owned(),
                 work_item_id: Some("work-1".to_owned()),
                 status: "running".to_owned(),
                 result_status: None,
@@ -3458,9 +3452,6 @@ mod tests {
                 entity_id: "123".to_owned(),
                 target_lang: "zh-CN".to_owned(),
                 max_wait_ms: 1500,
-                source_hash: "hash".to_owned(),
-                source_blocks_json: "[]".to_owned(),
-                target_slots_json: "[\"title_zh\"]".to_owned(),
                 work_item_id: Some("work-1".to_owned()),
                 status: "running".to_owned(),
                 result_status: None,
@@ -3591,7 +3582,7 @@ mod tests {
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
-        let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(database_url.as_str())
