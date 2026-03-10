@@ -29,6 +29,23 @@ function toApiError(res: Response, body: unknown) {
 	}
 	return new ApiError(res.status, res.statusText);
 }
+
+const TRANSLATION_WAIT_TIMEOUT_BUFFER_MS = 1_500;
+
+function isAbortError(error: unknown) {
+	return error instanceof DOMException && error.name === "AbortError";
+}
+
+function createTimeoutAbortSignal(timeoutMs: number) {
+	const abortController = new AbortController();
+	const timeoutId = globalThis.setTimeout(() => {
+		abortController.abort();
+	}, timeoutMs);
+	return {
+		signal: abortController.signal,
+		dispose: () => globalThis.clearTimeout(timeoutId),
+	};
+}
 export async function apiGet<T>(path: string): Promise<T> {
 	const res = await fetch(path, { credentials: "include" });
 	if (!res.ok) {
@@ -40,11 +57,18 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiPost<T>(path: string): Promise<T> {
 	return apiPostJson<T>(path);
 }
-export async function apiPostJson<T>(path: string, body?: unknown): Promise<T> {
+export async function apiPostJson<T>(
+	path: string,
+	body?: unknown,
+	init?: RequestInit,
+): Promise<T> {
+	const headers = new Headers(init?.headers);
+	headers.set("content-type", "application/json");
 	const res = await fetch(path, {
+		...init,
 		method: "POST",
 		credentials: "include",
-		headers: { "content-type": "application/json" },
+		headers,
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
 	if (!res.ok) {
@@ -591,16 +615,19 @@ export type AdminTranslationBatchDetailResponse = {
 };
 export async function apiSubmitTranslationRequest(
 	body: TranslationSingleSubmitRequest,
+	init?: RequestInit,
 ): Promise<TranslationRequestResponse>;
 export async function apiSubmitTranslationRequest(
 	body: TranslationBatchSubmitRequest,
+	init?: RequestInit,
 ): Promise<TranslationBatchSubmitResponse>;
 export async function apiSubmitTranslationRequest(
 	body: TranslationSubmitRequest,
+	init?: RequestInit,
 ): Promise<TranslationRequestResponse | TranslationBatchSubmitResponse> {
 	return apiPostJson<
 		TranslationRequestResponse | TranslationBatchSubmitResponse
-	>("/api/translate/requests", body);
+	>("/api/translate/requests", body, init);
 }
 export async function apiOpenTranslationRequestStream(
 	body: TranslationStreamSubmitRequest,
@@ -669,20 +696,48 @@ export async function apiTranslateReleaseDetail(
 		...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
 		...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
 	];
-	const response = await apiSubmitTranslationRequest({
-		mode: "wait",
-		item: {
-			producer_ref: `release_detail:${detail.release_id}`,
-			kind: "release_detail",
-			variant: "detail_card",
-			entity_id: detail.release_id,
-			target_lang: "zh-CN",
-			max_wait_ms: 5_000,
-			source_blocks,
-			target_slots: ["title_zh", "body_md"],
-		},
-	});
+	const requestItem: TranslationRequestItemInput = {
+		producer_ref: `release_detail:${detail.release_id}`,
+		kind: "release_detail",
+		variant: "detail_card",
+		entity_id: detail.release_id,
+		target_lang: "zh-CN",
+		max_wait_ms: 5_000,
+		source_blocks,
+		target_slots: ["title_zh", "body_md"],
+	};
+	const timeout = createTimeoutAbortSignal(
+		requestItem.max_wait_ms + TRANSLATION_WAIT_TIMEOUT_BUFFER_MS,
+	);
+	let response: TranslationRequestResponse;
+	try {
+		response = await apiSubmitTranslationRequest(
+			{
+				mode: "wait",
+				item: requestItem,
+			},
+			{ signal: timeout.signal },
+		);
+	} catch (error) {
+		if (isAbortError(error)) {
+			throw new ApiError(
+				504,
+				"translation wait timeout",
+				"translation_wait_timeout",
+			);
+		}
+		throw error;
+	} finally {
+		timeout.dispose();
+	}
 	const translated = response.result;
+	if (translated.status === "queued" || translated.status === "running") {
+		throw new ApiError(
+			504,
+			"translation wait timeout",
+			"translation_wait_timeout",
+		);
+	}
 	if (translated.status !== "ready" && translated.status !== "disabled") {
 		throw new ApiError(
 			500,

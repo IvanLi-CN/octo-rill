@@ -437,6 +437,14 @@ fn request_status_from_result_status(result_status: &str) -> &'static str {
     }
 }
 
+fn request_status_from_work_item_status(work_item_status: &str) -> &'static str {
+    if work_item_status == "queued" {
+        "queued"
+    } else {
+        "running"
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ClaimedBatch {
@@ -1174,64 +1182,51 @@ async fn insert_translation_request(
         });
     }
 
-    let work_item = load_existing_work_item(tx, user_id, item, &source_hash).await?;
-    match work_item {
-        Some(existing)
-            if existing.result_status.is_some()
-                && matches!(existing.status.as_str(), "completed" | "failed") =>
-        {
-            let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
-            let status = request_status_from_result_status(result.status.as_str()).to_owned();
-            apply_request_result(
-                tx,
-                request_id.as_str(),
-                Some(existing.id.as_str()),
-                &result,
-                now,
-            )
-            .await?;
-            Ok(CreatedTranslationRequest {
-                request_id,
-                status,
-                result,
-            })
-        }
-        Some(existing) => {
-            let status = if existing.status == "queued" {
-                "queued"
-            } else {
-                "running"
-            }
-            .to_owned();
-            let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
-            attach_request_to_work_item(
-                tx,
-                request_id.as_str(),
-                &existing.id,
-                status.as_str(),
-                now,
-            )
-            .await?;
-            if let Some(batch_id) = existing.batch_id.as_deref() {
-                refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
-            }
-            Ok(CreatedTranslationRequest {
-                request_id,
-                status,
-                result,
-            })
-        }
-        None => {
-            let work_item_id = create_work_item(tx, user_id, item, &source_hash, now).await?;
-            attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now)
-                .await?;
-            Ok(CreatedTranslationRequest {
-                request_id,
-                status: "queued".to_owned(),
-                result: queued_request_result(item, Some(work_item_id)),
-            })
-        }
+    if let Some(work_item_id) = create_work_item(tx, user_id, item, &source_hash, now).await? {
+        attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: "queued".to_owned(),
+            result: queued_request_result(item, Some(work_item_id)),
+        });
     }
+
+    let existing = load_existing_work_item(tx, user_id, item, &source_hash)
+        .await?
+        .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
+
+    if existing.result_status.is_some()
+        && matches!(existing.status.as_str(), "completed" | "failed")
+    {
+        let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
+        let status = request_status_from_result_status(result.status.as_str()).to_owned();
+        apply_request_result(
+            tx,
+            request_id.as_str(),
+            Some(existing.id.as_str()),
+            &result,
+            now,
+        )
+        .await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status,
+            result,
+        });
+    }
+
+    let status = request_status_from_work_item_status(existing.status.as_str()).to_owned();
+    let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
+    attach_request_to_work_item(tx, request_id.as_str(), &existing.id, status.as_str(), now)
+        .await?;
+    if let Some(batch_id) = existing.batch_id.as_deref() {
+        refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+    }
+    Ok(CreatedTranslationRequest {
+        request_id,
+        status,
+        result,
+    })
 }
 
 async fn attach_request_to_work_item(
@@ -1456,7 +1451,7 @@ async fn create_work_item(
     item: &TranslationRequestItemInput,
     source_hash: &str,
     now: &str,
-) -> Result<String, ApiError> {
+) -> Result<Option<String>, ApiError> {
     let id = crate::local_id::generate_local_id();
     let model_profile = current_model_profile();
     let token_estimate = estimate_item_tokens(item);
@@ -1468,13 +1463,14 @@ async fn create_work_item(
         serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
     let dedupe_key = build_dedupe_key(user_id, item, source_hash);
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO translation_work_items (
           id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
           model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
           deadline_at, status, cache_hit, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+        ON CONFLICT(dedupe_key) DO NOTHING
         "#,
     )
     .bind(id.as_str())
@@ -1497,7 +1493,11 @@ async fn create_work_item(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(id)
+    if result.rows_affected() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(id))
+    }
 }
 
 async fn run_translation_scheduler_once(
@@ -2425,6 +2425,12 @@ async fn wait_for_request_terminal(
         if matches!(detail.request.status.as_str(), "completed" | "failed") {
             return Ok(detail);
         }
+        let created_at =
+            parse_ts(detail.request.created_at.as_str()).map_err(ApiError::internal)?;
+        let wait_budget = chrono::Duration::milliseconds(detail.request.max_wait_ms.max(0));
+        if Utc::now() >= created_at + wait_budget {
+            return Ok(detail);
+        }
         sleep(TRANSLATION_WAIT_POLL_INTERVAL).await;
     }
 }
@@ -3161,6 +3167,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_translation_request_dedupes_work_items_under_concurrency() {
+        let pool = setup_pool_with_max_connections(4).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("concurrent-123");
+
+        let first_state = state.clone();
+        let second_state = state.clone();
+        let first_item = item.clone();
+        let second_item = item.clone();
+
+        let (first, second) = tokio::join!(
+            create_translation_request(first_state.as_ref(), "1", "async", &first_item),
+            create_translation_request(second_state.as_ref(), "1", "async", &second_item),
+        );
+
+        let first = first.expect("first concurrent request created");
+        let second = second.expect("second concurrent request created");
+
+        let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+            .fetch_one(&pool)
+            .await
+            .expect("count work items");
+        let distinct_work_item_ids: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT work_item_id) FROM translation_requests WHERE id IN (?, ?)",
+        )
+        .bind(first.request_id.as_str())
+        .bind(second.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count distinct work item ids");
+
+        assert_eq!(work_items, 1);
+        assert_eq!(distinct_work_item_ids, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_request_terminal_returns_latest_snapshot_after_wait_budget() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("wait-budget");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "wait", &item)
+            .await
+            .expect("request created");
+
+        let detail = wait_for_request_terminal(state.as_ref(), "1", created.request_id.as_str())
+            .await
+            .expect("wait result loaded");
+
+        assert_eq!(detail.request.id, created.request_id);
+        assert_eq!(detail.request.status, "queued");
+        assert_eq!(detail.result.status, "queued");
+    }
+
+    #[tokio::test]
     async fn scheduler_finishes_disabled_requests_without_job_tasks() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -3761,6 +3825,10 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        setup_pool_with_max_connections(1).await
+    }
+
+    async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
@@ -3769,7 +3837,7 @@ mod tests {
             .filename(&database_path)
             .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
