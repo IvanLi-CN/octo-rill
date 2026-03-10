@@ -2134,6 +2134,175 @@ pub async fn admin_get_llm_scheduler_status(
     }))
 }
 
+struct AdminLlmCallListScope<'a> {
+    status: Option<&'a str>,
+    source: &'a str,
+    requested_by: Option<&'a str>,
+    parent_task_id: &'a str,
+    started_from: Option<&'a str>,
+    started_to: Option<&'a str>,
+}
+
+struct AdminLlmCallIdScope<'a> {
+    include_ids: Option<&'a [String]>,
+    exclude_ids: Option<&'a [String]>,
+}
+
+struct AdminLlmCallPage {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+fn push_llm_call_filters(
+    query: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    scope: &AdminLlmCallListScope<'_>,
+    ids: &AdminLlmCallIdScope<'_>,
+) {
+    query.push(" WHERE 1 = 1");
+
+    if let Some(status) = scope.status.filter(|value| *value != "all") {
+        query.push(" AND status = ");
+        query.push_bind(status.to_owned());
+    }
+    if !scope.source.is_empty() {
+        query.push(" AND source = ");
+        query.push_bind(scope.source.to_owned());
+    }
+    if let Some(requested_by) = scope.requested_by {
+        query.push(" AND requested_by = ");
+        query.push_bind(requested_by.to_owned());
+    }
+    if !scope.parent_task_id.is_empty() {
+        query.push(" AND parent_task_id = ");
+        query.push_bind(scope.parent_task_id.to_owned());
+    }
+    if let Some(started_from) = scope.started_from {
+        query.push(" AND unixepoch(COALESCE(started_at, created_at)) >= unixepoch(");
+        query.push_bind(started_from.to_owned());
+        query.push(")");
+    }
+    if let Some(started_to) = scope.started_to {
+        query.push(" AND unixepoch(COALESCE(started_at, created_at)) <= unixepoch(");
+        query.push_bind(started_to.to_owned());
+        query.push(")");
+    }
+    if let Some(include_ids) = ids.include_ids {
+        if include_ids.is_empty() {
+            query.push(" AND 1 = 0");
+        } else {
+            query.push(" AND id IN (");
+            {
+                let mut separated = query.separated(", ");
+                for id in include_ids {
+                    separated.push_bind(id.clone());
+                }
+            }
+            query.push(")");
+        }
+    }
+    if let Some(exclude_ids) = ids.exclude_ids.filter(|ids| !ids.is_empty()) {
+        query.push(" AND id NOT IN (");
+        {
+            let mut separated = query.separated(", ");
+            for id in exclude_ids {
+                separated.push_bind(id.clone());
+            }
+        }
+        query.push(")");
+    }
+}
+
+fn push_llm_call_order_by(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>, sort: &str) {
+    match sort {
+        "status_grouped" => {
+            query.push(
+                r#"
+                ORDER BY
+                  CASE
+                    WHEN status = 'running' THEN 0
+                    WHEN status = 'queued' THEN 1
+                    ELSE 2
+                  END,
+                  created_at DESC,
+                  id DESC
+                "#,
+            );
+        }
+        _ => {
+            query.push(" ORDER BY created_at DESC, id DESC");
+        }
+    }
+}
+
+async fn count_admin_llm_calls(
+    pool: &sqlx::SqlitePool,
+    scope: &AdminLlmCallListScope<'_>,
+    ids: &AdminLlmCallIdScope<'_>,
+) -> Result<i64, ApiError> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT COUNT(*)
+        FROM llm_calls
+        "#,
+    );
+    push_llm_call_filters(&mut query, scope, ids);
+    query
+        .build_query_scalar::<i64>()
+        .fetch_one(pool)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn load_admin_llm_call_items(
+    pool: &sqlx::SqlitePool,
+    scope: &AdminLlmCallListScope<'_>,
+    sort: &str,
+    ids: &AdminLlmCallIdScope<'_>,
+    page: AdminLlmCallPage,
+) -> Result<Vec<AdminLlmCallItem>, ApiError> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          id,
+          status,
+          source,
+          model,
+          requested_by,
+          parent_task_id,
+          parent_task_type,
+          max_tokens,
+          attempt_count,
+          scheduler_wait_ms,
+          first_token_wait_ms,
+          duration_ms,
+          input_tokens,
+          output_tokens,
+          cached_input_tokens,
+          total_tokens,
+          created_at,
+          started_at,
+          finished_at,
+          updated_at
+        FROM llm_calls
+        "#,
+    );
+    push_llm_call_filters(&mut query, scope, ids);
+    push_llm_call_order_by(&mut query, sort);
+    if let Some(limit) = page.limit {
+        query.push(" LIMIT ");
+        query.push_bind(limit);
+    }
+    if let Some(offset) = page.offset {
+        query.push(" OFFSET ");
+        query.push_bind(offset);
+    }
+    query
+        .build_query_as::<AdminLlmCallItem>()
+        .fetch_all(pool)
+        .await
+        .map_err(ApiError::internal)
+}
+
 pub async fn admin_list_llm_calls(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -2161,132 +2330,41 @@ pub async fn admin_list_llm_calls(
         return Err(ApiError::bad_request("invalid sort filter"));
     }
 
+    let base_scope = AdminLlmCallListScope {
+        status: Some(status.as_str()),
+        source: source.as_str(),
+        requested_by: requested_by.as_deref(),
+        parent_task_id: parent_task_id.as_str(),
+        started_from: started_from.as_deref(),
+        started_to: started_to.as_deref(),
+    };
+    let override_scope = AdminLlmCallListScope {
+        status: None,
+        source: source.as_str(),
+        requested_by: requested_by.as_deref(),
+        parent_task_id: parent_task_id.as_str(),
+        started_from: started_from.as_deref(),
+        started_to: started_to.as_deref(),
+    };
+    let no_ids = AdminLlmCallIdScope {
+        include_ids: None,
+        exclude_ids: None,
+    };
+
     let overrides = state.llm_scheduler.admin_overrides().await;
     if overrides.is_empty() {
-        let total = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)
-            FROM llm_calls
-            WHERE (? = 'all' OR status = ?)
-              AND (? = '' OR source = ?)
-              AND (? IS NULL OR requested_by = ?)
-              AND (? = '' OR parent_task_id = ?)
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-            "#,
+        let total = count_admin_llm_calls(&state.pool, &base_scope, &no_ids).await?;
+        let items = load_admin_llm_call_items(
+            &state.pool,
+            &base_scope,
+            sort.as_str(),
+            &no_ids,
+            AdminLlmCallPage {
+                limit: Some(page_size),
+                offset: Some(offset),
+            },
         )
-        .bind(status.as_str())
-        .bind(status.as_str())
-        .bind(source.as_str())
-        .bind(source.as_str())
-        .bind(requested_by.as_deref())
-        .bind(requested_by.as_deref())
-        .bind(parent_task_id.as_str())
-        .bind(parent_task_id.as_str())
-        .bind(started_from.as_deref())
-        .bind(started_from.as_deref())
-        .bind(started_to.as_deref())
-        .bind(started_to.as_deref())
-        .fetch_one(&state.pool)
-        .await
-        .map_err(ApiError::internal)?;
-
-        let items_query = match sort.as_str() {
-            "status_grouped" => {
-                r#"
-                SELECT
-                  id,
-                  status,
-                  source,
-                  model,
-                  requested_by,
-                  parent_task_id,
-                  parent_task_type,
-                  max_tokens,
-                  attempt_count,
-                  scheduler_wait_ms,
-                  first_token_wait_ms,
-                  duration_ms,
-                  input_tokens,
-                  output_tokens,
-                  cached_input_tokens,
-                  total_tokens,
-                  created_at,
-                  started_at,
-                  finished_at,
-                  updated_at
-                FROM llm_calls
-                WHERE (? = 'all' OR status = ?)
-                  AND (? = '' OR source = ?)
-                  AND (? IS NULL OR requested_by = ?)
-                  AND (? = '' OR parent_task_id = ?)
-                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-                ORDER BY
-                  CASE
-                    WHEN status = 'running' THEN 0
-                    WHEN status = 'queued' THEN 1
-                    ELSE 2
-                  END,
-                  created_at DESC,
-                  id DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-            _ => {
-                r#"
-                SELECT
-                  id,
-                  status,
-                  source,
-                  model,
-                  requested_by,
-                  parent_task_id,
-                  parent_task_type,
-                  max_tokens,
-                  attempt_count,
-                  scheduler_wait_ms,
-                  first_token_wait_ms,
-                  duration_ms,
-                  input_tokens,
-                  output_tokens,
-                  cached_input_tokens,
-                  total_tokens,
-                  created_at,
-                  started_at,
-                  finished_at,
-                  updated_at
-                FROM llm_calls
-                WHERE (? = 'all' OR status = ?)
-                  AND (? = '' OR source = ?)
-                  AND (? IS NULL OR requested_by = ?)
-                  AND (? = '' OR parent_task_id = ?)
-                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-                  AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-                ORDER BY created_at DESC, id DESC
-                LIMIT ? OFFSET ?
-                "#
-            }
-        };
-
-        let items = sqlx::query_as::<_, AdminLlmCallItem>(items_query)
-            .bind(status.as_str())
-            .bind(status.as_str())
-            .bind(source.as_str())
-            .bind(source.as_str())
-            .bind(requested_by.as_deref())
-            .bind(requested_by.as_deref())
-            .bind(parent_task_id.as_str())
-            .bind(parent_task_id.as_str())
-            .bind(started_from.as_deref())
-            .bind(started_from.as_deref())
-            .bind(started_to.as_deref())
-            .bind(started_to.as_deref())
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+        .await?;
 
         return Ok(Json(AdminLlmCallsResponse {
             items,
@@ -2296,57 +2374,48 @@ pub async fn admin_list_llm_calls(
         }));
     }
 
-    let mut items = sqlx::query_as::<_, AdminLlmCallItem>(
-        r#"
-        SELECT
-          id,
-          status,
-          source,
-          model,
-          requested_by,
-          parent_task_id,
-          parent_task_type,
-          max_tokens,
-          attempt_count,
-          scheduler_wait_ms,
-          first_token_wait_ms,
-          duration_ms,
-          input_tokens,
-          output_tokens,
-          cached_input_tokens,
-          total_tokens,
-          created_at,
-          started_at,
-          finished_at,
-          updated_at
-        FROM llm_calls
-        WHERE (? = '' OR source = ?)
-          AND (? IS NULL OR requested_by = ?)
-          AND (? = '' OR parent_task_id = ?)
-          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-        ORDER BY created_at DESC, id DESC
-        "#,
+    let override_ids = overrides.keys().cloned().collect::<Vec<_>>();
+    let include_override_ids = AdminLlmCallIdScope {
+        include_ids: Some(&override_ids),
+        exclude_ids: None,
+    };
+    let exclude_override_ids = AdminLlmCallIdScope {
+        include_ids: None,
+        exclude_ids: Some(&override_ids),
+    };
+    let mut override_items = load_admin_llm_call_items(
+        &state.pool,
+        &override_scope,
+        sort.as_str(),
+        &include_override_ids,
+        AdminLlmCallPage {
+            limit: None,
+            offset: None,
+        },
     )
-    .bind(source.as_str())
-    .bind(source.as_str())
-    .bind(requested_by.as_deref())
-    .bind(requested_by.as_deref())
-    .bind(parent_task_id.as_str())
-    .bind(parent_task_id.as_str())
-    .bind(started_from.as_deref())
-    .bind(started_from.as_deref())
-    .bind(started_to.as_deref())
-    .bind(started_to.as_deref())
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
+    apply_llm_call_admin_overrides(&mut override_items, &overrides);
+    override_items.retain(|item| llm_call_matches_status_filter(item, status.as_str()));
+    sort_admin_llm_calls(&mut override_items, sort.as_str());
 
-    apply_llm_call_admin_overrides(&mut items, &overrides);
-    items.retain(|item| llm_call_matches_status_filter(item, status.as_str()));
+    let base_total = count_admin_llm_calls(&state.pool, &base_scope, &exclude_override_ids).await?;
+    let total = base_total.saturating_add(i64::try_from(override_items.len()).unwrap_or(i64::MAX));
+
+    let fetch_limit = offset.saturating_add(page_size);
+    let mut items = load_admin_llm_call_items(
+        &state.pool,
+        &base_scope,
+        sort.as_str(),
+        &exclude_override_ids,
+        AdminLlmCallPage {
+            limit: Some(fetch_limit),
+            offset: Some(0),
+        },
+    )
+    .await?;
+    items.extend(override_items);
     sort_admin_llm_calls(&mut items, sort.as_str());
 
-    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
     let start = usize::try_from(offset).unwrap_or(usize::MAX);
     let size = usize::try_from(page_size).unwrap_or(100);
     let items = items.into_iter().skip(start).take(size).collect::<Vec<_>>();
