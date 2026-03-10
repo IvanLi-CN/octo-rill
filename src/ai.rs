@@ -80,6 +80,7 @@ pub struct LlmSchedulerRuntimeStatus {
 pub struct LlmScheduler {
     max_concurrency: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
+    admin_snapshot_gate: Arc<tokio::sync::RwLock<()>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
 }
@@ -100,9 +101,18 @@ impl LlmScheduler {
         Self {
             max_concurrency: max_concurrency.max(1),
             semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+            admin_snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
             waiting_calls: AtomicUsize::new(0),
             in_flight_calls: AtomicUsize::new(0),
         }
+    }
+
+    pub(crate) async fn admin_snapshot(self: &Arc<Self>) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.admin_snapshot_gate.clone().read_owned().await
+    }
+
+    async fn begin_admin_transition(self: &Arc<Self>) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.admin_snapshot_gate.clone().write_owned().await
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
@@ -133,7 +143,7 @@ impl LlmScheduler {
             wait_ms,
             SchedulerInFlightGuard {
                 scheduler: Arc::clone(self),
-                _permit: permit,
+                permit: Some(permit),
             },
         )
     }
@@ -881,7 +891,13 @@ fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
 
 struct SchedulerInFlightGuard {
     scheduler: Arc<LlmScheduler>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl SchedulerInFlightGuard {
+    fn release_permit(&mut self) {
+        self.permit.take();
+    }
 }
 
 impl Drop for SchedulerInFlightGuard {
@@ -1386,7 +1402,7 @@ pub async fn chat_completion(
     let mut started_at: Option<Instant> = None;
     let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
     for attempt in 1..=max_attempts {
-        let (wait_ms, in_flight_guard) = state.llm_scheduler.acquire_slot().await;
+        let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
 
         if started_at.is_none() {
@@ -1405,7 +1421,8 @@ pub async fn chat_completion(
         }
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
-        drop(in_flight_guard);
+        let admin_transition = state.llm_scheduler.begin_admin_transition().await;
+        in_flight_guard.release_permit();
         match attempt_result {
             Ok(output) => {
                 let duration_ms = started_at.map(|started| {
@@ -1433,6 +1450,8 @@ pub async fn chat_completion(
                 {
                     tracing::warn!(?err, "llm call log finalize success failed");
                 }
+                drop(in_flight_guard);
+                drop(admin_transition);
                 return Ok(output.content);
             }
             Err(attempt_err) => {
@@ -1469,6 +1488,8 @@ pub async fn chat_completion(
                     {
                         tracing::warn!(?log_err, "llm call log finalize failure failed");
                     }
+                    drop(in_flight_guard);
+                    drop(admin_transition);
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
@@ -1483,6 +1504,8 @@ pub async fn chat_completion(
                 {
                     tracing::warn!(?log_err, "llm call requeue update failed");
                 }
+                drop(in_flight_guard);
+                drop(admin_transition);
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -2595,6 +2618,30 @@ mod tests {
         assert_eq!(final_status.available_slots, 1);
         assert_eq!(final_status.in_flight_calls, 0);
         assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_admin_snapshot_waits_for_retry_transition() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, mut in_flight_guard) = scheduler.acquire_slot().await;
+        let admin_transition = scheduler.begin_admin_transition().await;
+        in_flight_guard.release_permit();
+
+        let snapshot_scheduler = Arc::clone(&scheduler);
+        let snapshot = tokio::spawn(async move {
+            let _snapshot = snapshot_scheduler.admin_snapshot().await;
+            snapshot_scheduler.runtime_status()
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!snapshot.is_finished());
+
+        drop(in_flight_guard);
+        drop(admin_transition);
+
+        let status = snapshot.await.expect("snapshot task join");
+        assert_eq!(status.available_slots, 1);
+        assert_eq!(status.in_flight_calls, 0);
     }
 
     #[tokio::test]
