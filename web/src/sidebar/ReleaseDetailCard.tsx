@@ -4,7 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
 	type ReleaseDetailResponse,
 	apiGetReleaseDetail,
+	apiGetTranslationRequest,
 	apiTranslateReleaseDetail,
+	isPendingTranslationResultStatus,
+	mapTranslationResultToReleaseDetailTranslated,
 } from "@/api";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
@@ -17,6 +20,14 @@ import {
 } from "@/components/ui/card";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { normalizeReleaseId } from "@/lib/releaseId";
+
+const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+
+function sleep(ms: number) {
+	return new Promise((resolve) => {
+		window.setTimeout(resolve, ms);
+	});
+}
 
 export function ReleaseDetailCard(props: {
 	releaseId: string | null;
@@ -82,15 +93,27 @@ export function ReleaseDetailCard(props: {
 		const requestReleaseId = activeDetail.release_id;
 		setTranslating(true);
 		setTranslateError(null);
-		void apiTranslateReleaseDetail(activeDetail)
-			.then((translated) => {
+		void (async () => {
+			let response = await apiTranslateReleaseDetail(activeDetail);
+			while (isPendingTranslationResultStatus(response.result.status)) {
 				if (translateRequestSeqRef.current !== requestSeq) return;
-				setDetail((prev) => {
-					if (!prev) return prev;
-					if (prev.release_id !== requestReleaseId) return prev;
-					return { ...prev, translated };
-				});
-			})
+				await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+				if (translateRequestSeqRef.current !== requestSeq) return;
+				response = await apiGetTranslationRequest(response.request_id);
+			}
+			if (translateRequestSeqRef.current !== requestSeq) return;
+			const translated = mapTranslationResultToReleaseDetailTranslated(
+				response.result,
+			);
+			if (!translated) {
+				throw new Error(response.result.error ?? "translate failed");
+			}
+			setDetail((prev) => {
+				if (!prev) return prev;
+				if (prev.release_id !== requestReleaseId) return prev;
+				return { ...prev, translated };
+			});
+		})()
 			.catch((err) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslateError(err instanceof Error ? err.message : String(err));

@@ -504,6 +504,26 @@ export type TranslationRequestResponse = {
 	status: "queued" | "running" | "completed" | "failed";
 	result: TranslationResultItem;
 };
+
+export function isPendingTranslationResultStatus(
+	status: TranslationResultItem["status"],
+) {
+	return status === "queued" || status === "running";
+}
+
+export function mapTranslationResultToReleaseDetailTranslated(
+	result: TranslationResultItem,
+): ReleaseDetailTranslated | null {
+	if (result.status !== "ready" && result.status !== "disabled") {
+		return null;
+	}
+	return {
+		lang: "zh-CN",
+		status: result.status === "disabled" ? "disabled" : "ready",
+		title: result.title_zh,
+		summary: result.body_md,
+	};
+}
 export type TranslationBatchSubmitItemResponse = {
 	request_id: string;
 	status: "queued" | "running" | "completed" | "failed";
@@ -685,7 +705,7 @@ export async function apiGetAdminTranslationBatchDetail(
 }
 export async function apiTranslateReleaseDetail(
 	detail: ReleaseDetailResponse,
-): Promise<ReleaseDetailTranslated> {
+): Promise<TranslationRequestResponse> {
 	const originalTitle = detail.name?.trim() || detail.tag_name;
 	const body = detail.body?.trim();
 	const metadata = [detail.repo_full_name, detail.published_at]
@@ -709,9 +729,8 @@ export async function apiTranslateReleaseDetail(
 	const timeout = createTimeoutAbortSignal(
 		requestItem.max_wait_ms + TRANSLATION_WAIT_TIMEOUT_BUFFER_MS,
 	);
-	let response: TranslationRequestResponse;
 	try {
-		response = await apiSubmitTranslationRequest(
+		return await apiSubmitTranslationRequest(
 			{
 				mode: "wait",
 				item: requestItem,
@@ -730,25 +749,4 @@ export async function apiTranslateReleaseDetail(
 	} finally {
 		timeout.dispose();
 	}
-	const translated = response.result;
-	if (translated.status === "queued" || translated.status === "running") {
-		throw new ApiError(
-			504,
-			"translation wait timeout",
-			"translation_wait_timeout",
-		);
-	}
-	if (translated.status !== "ready" && translated.status !== "disabled") {
-		throw new ApiError(
-			500,
-			translated.error ?? "translate failed",
-			"translate_failed",
-		);
-	}
-	return {
-		lang: "zh-CN",
-		status: translated.status === "disabled" ? "disabled" : "ready",
-		title: translated.title_zh,
-		summary: translated.body_md,
-	};
 }

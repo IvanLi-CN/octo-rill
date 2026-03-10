@@ -6,6 +6,7 @@ import {
 	type TranslationRequestItemInput,
 	type TranslationRequestResponse,
 	ApiError,
+	isPendingTranslationResultStatus,
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
@@ -60,21 +61,10 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
-function isPendingTranslationStatus(status: string) {
-	return status === "queued" || status === "running";
-}
-
 function sleep(ms: number) {
 	return new Promise((resolve) => {
 		window.setTimeout(resolve, ms);
 	});
-}
-
-class TranslationPendingError extends Error {
-	constructor(message = "translation is still processing") {
-		super(message);
-		this.name = "TranslationPendingError";
-	}
 }
 
 export function useAutoTranslate(params: {
@@ -113,7 +103,7 @@ export function useAutoTranslate(params: {
 	const loadActiveRequest = useCallback(async (requestId: string) => {
 		let latest = await apiGetTranslationRequest(requestId);
 		const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
-		while (isPendingTranslationStatus(latest.result.status)) {
+		while (isPendingTranslationResultStatus(latest.result.status)) {
 			if (Date.now() >= deadline) {
 				return { response: latest, terminal: false as const };
 			}
@@ -156,7 +146,7 @@ export function useAutoTranslate(params: {
 				} finally {
 					globalThis.clearTimeout(timeoutId);
 				}
-				if (isPendingTranslationStatus(response.result.status)) {
+				if (isPendingTranslationResultStatus(response.result.status)) {
 					activeRequestIdRef.current.set(key, response.request_id);
 					const active = await loadActiveRequest(response.request_id);
 					response = active.response;
@@ -187,20 +177,28 @@ export function useAutoTranslate(params: {
 		[loadActiveRequest],
 	);
 
-	const requeueAfterFailure = useCallback((item: FeedItem) => {
-		const key = keyOf(item);
-		if (failedRef.current.has(key)) return;
+	const requeueWithRetryBudget = useCallback((key: string) => {
+		if (failedRef.current.has(key)) return false;
 		const retries = waitRetryCountRef.current.get(key) ?? 0;
 		if (retries >= WAIT_RECOVERY_MAX_RETRIES) {
 			failedRef.current.add(key);
 			waitRetryCountRef.current.delete(key);
-			return;
+			activeRequestIdRef.current.delete(key);
+			return false;
 		}
 		waitRetryCountRef.current.set(key, retries + 1);
 		if (!queuedRef.current.includes(key)) {
 			queuedRef.current.push(key);
 		}
+		return true;
 	}, []);
+
+	const requeueAfterFailure = useCallback(
+		(item: FeedItem) => {
+			requeueWithRetryBudget(keyOf(item));
+		},
+		[requeueWithRetryBudget],
+	);
 
 	const pump = useCallback(() => {
 		if (!enabled) return;
@@ -225,9 +223,7 @@ export function useAutoTranslate(params: {
 			void translateSingle(item)
 				.then(({ translated, mapped, terminal }) => {
 					if (!terminal) {
-						if (!queuedRef.current.includes(key)) {
-							queuedRef.current.push(key);
-						}
+						requeueWithRetryBudget(key);
 						return;
 					}
 					waitRetryCountRef.current.delete(key);
@@ -252,6 +248,7 @@ export function useAutoTranslate(params: {
 		enabled,
 		onTranslated,
 		requeueAfterFailure,
+		requeueWithRetryBudget,
 		shouldAutoTranslate,
 		translateSingle,
 	]);
@@ -310,12 +307,13 @@ export function useAutoTranslate(params: {
 			try {
 				const { translated, mapped, terminal } = await translateSingle(item);
 				if (!terminal) {
-					if (!queuedRef.current.includes(key)) {
-						queuedRef.current.push(key);
+					if (!requeueWithRetryBudget(key)) {
+						throw new Error("translation request is still processing");
 					}
 					schedulePump();
-					throw new TranslationPendingError();
+					return null;
 				}
+				waitRetryCountRef.current.delete(key);
 				if (!mapped) {
 					failedRef.current.add(key);
 					throw new Error(translated.error ?? "translate failed");
@@ -326,16 +324,14 @@ export function useAutoTranslate(params: {
 				}
 				return mapped;
 			} catch (err) {
-				if (!(err instanceof TranslationPendingError)) {
-					failedRef.current.add(key);
-				}
+				failedRef.current.add(key);
 				throw err;
 			} finally {
 				inFlightRef.current.delete(key);
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, schedulePump, translateSingle],
+		[onTranslated, requeueWithRetryBudget, schedulePump, translateSingle],
 	);
 
 	useEffect(() => {
