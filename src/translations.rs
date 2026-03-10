@@ -405,8 +405,8 @@ impl RequestRow {
 
 fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'static str {
     match work_item_status {
-        Some("running") => "running",
-        _ => "queued",
+        Some("queued") | None => "queued",
+        _ => "running",
     }
 }
 
@@ -1197,10 +1197,10 @@ async fn insert_translation_request(
             })
         }
         Some(existing) => {
-            let status = if existing.status == "running" {
-                "running"
-            } else {
+            let status = if existing.status == "queued" {
                 "queued"
+            } else {
+                "running"
             }
             .to_owned();
             let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
@@ -1212,6 +1212,9 @@ async fn insert_translation_request(
                 now,
             )
             .await?;
+            if let Some(batch_id) = existing.batch_id.as_deref() {
+                refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+            }
             Ok(CreatedTranslationRequest {
                 request_id,
                 status,
@@ -1260,6 +1263,68 @@ async fn attach_request_to_work_item(
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn refresh_batch_request_counters(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    let producer_count = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM translation_requests WHERE work_item_id = ?"#,
+    )
+    .bind(work_item_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        UPDATE translation_batch_items
+        SET producer_count = ?, updated_at = ?
+        WHERE batch_id = ? AND work_item_id = ?
+        "#,
+    )
+    .bind(producer_count)
+    .bind(now)
+    .bind(batch_id)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let request_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM translation_requests
+        WHERE work_item_id IN (
+            SELECT work_item_id
+            FROM translation_batch_items
+            WHERE batch_id = ?
+        )
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET request_count = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(request_count)
+    .bind(now)
+    .bind(batch_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
     Ok(())
 }
 
@@ -2932,6 +2997,121 @@ mod tests {
         assert_eq!(detail.result.status, "running");
         assert_eq!(detail.result.batch_id.as_deref(), Some("batch-running-1"));
         assert_eq!(derive_request_stream_phase(&detail), "running");
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_batched_work_item_updates_batch_counters() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("batched-window");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            "#,
+        )
+        .bind("batch-queued-window")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-1")
+        .bind("batch-queued-window")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'batched', batch_id = 'batch-queued-window', updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item batched");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "running");
+        assert_eq!(second.result.status, "running");
+        assert_eq!(
+            second.result.batch_id.as_deref(),
+            Some("batch-queued-window")
+        );
+
+        let stored =
+            sqlx::query("SELECT status, started_at FROM translation_requests WHERE id = ?")
+                .bind(second.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load stored request state");
+        assert_eq!(stored.get::<String, _>("status"), "running");
+        assert!(stored.get::<Option<String>, _>("started_at").is_some());
+
+        let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
+            .bind("batch-queued-window")
+            .fetch_one(&pool)
+            .await
+            .expect("load batch counters");
+        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+
+        let batch_item = sqlx::query(
+            "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
+        )
+        .bind("batch-queued-window")
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load batch item counters");
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
     }
 
     #[tokio::test]
