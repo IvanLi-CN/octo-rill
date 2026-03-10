@@ -2043,15 +2043,25 @@ fn llm_call_matches_status_filter(item: &AdminLlmCallItem, status: &str) -> bool
     status == "all" || item.status == status
 }
 
+fn llm_call_created_at_sort_key(created_at: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|value| value.timestamp_millis())
+        .unwrap_or(i64::MIN)
+}
+
 fn sort_admin_llm_calls(items: &mut [AdminLlmCallItem], sort: &str) {
     items.sort_by(|left, right| match sort {
         "status_grouped" => llm_calls_status_rank(&left.status)
             .cmp(&llm_calls_status_rank(&right.status))
+            .then_with(|| {
+                llm_call_created_at_sort_key(&right.created_at)
+                    .cmp(&llm_call_created_at_sort_key(&left.created_at))
+            })
             .then_with(|| right.created_at.cmp(&left.created_at))
             .then_with(|| right.id.cmp(&left.id)),
-        _ => right
-            .created_at
-            .cmp(&left.created_at)
+        _ => llm_call_created_at_sort_key(&right.created_at)
+            .cmp(&llm_call_created_at_sort_key(&left.created_at))
+            .then_with(|| right.created_at.cmp(&left.created_at))
             .then_with(|| right.id.cmp(&left.id)),
     });
 }
@@ -2223,13 +2233,14 @@ fn push_llm_call_order_by(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>, sort: &s
                     WHEN status = 'queued' THEN 1
                     ELSE 2
                   END,
+                  julianday(created_at) DESC,
                   created_at DESC,
                   id DESC
                 "#,
             );
         }
         _ => {
-            query.push(" ORDER BY created_at DESC, id DESC");
+            query.push(" ORDER BY julianday(created_at) DESC, created_at DESC, id DESC");
         }
     }
 }
@@ -8152,6 +8163,7 @@ mod tests {
                 WHEN status = 'queued' THEN 1
                 ELSE 2
               END,
+              julianday(created_at) DESC,
               created_at DESC,
               id DESC
             LIMIT ? OFFSET ?
@@ -8532,6 +8544,87 @@ mod tests {
         assert_eq!(second_page.total, 2);
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, "call-queued-middle");
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_orders_mixed_rfc3339_by_true_created_time() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        for (call_id, created_at) in [
+            ("call-zulu", "2026-02-26T05:00:00Z"),
+            ("call-subsec", "2026-02-26T05:00:00.500+00:00"),
+            ("call-offset", "2026-02-26T05:00:00+00:00"),
+        ] {
+            seed_llm_call_with_created_at(
+                &pool,
+                call_id,
+                "failed",
+                "api.translate_releases_batch",
+                Some(test_user_id(1)),
+                created_at,
+            )
+            .await;
+        }
+
+        let state = setup_state(pool);
+        let default_resp = admin_list_llm_calls(
+            State(Arc::clone(&state)),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("default llm call list should sort by actual created_at time")
+        .0;
+        let grouped_resp = admin_list_llm_calls(
+            State(state),
+            setup_session(1).await,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: Some("status_grouped".to_owned()),
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("grouped llm call list should sort by actual created_at time")
+        .0;
+
+        let expected = vec!["call-subsec", "call-zulu", "call-offset"];
+        assert_eq!(
+            default_resp
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            grouped_resp
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[tokio::test]
