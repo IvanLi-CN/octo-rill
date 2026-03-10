@@ -666,6 +666,12 @@ fn request_row_select_sql() -> &'static str {
     FROM translation_requests r
     "#
 }
+
+fn request_effective_status_sql(status_column: &str, work_item_status_column: &str) -> String {
+    format!(
+        "CASE WHEN {status_column} = 'queued' AND {work_item_status_column} = 'running' THEN 'running' ELSE {status_column} END"
+    )
+}
 pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::AbortHandle> {
     translation_worker_profiles()
         .into_iter()
@@ -898,28 +904,35 @@ pub async fn admin_list_translation_requests(
     let offset = (page - 1) * page_size;
     let status = query.status.unwrap_or_else(|| "all".to_owned());
 
-    let total = sqlx::query_scalar::<_, i64>(
+    let effective_status_sql = request_effective_status_sql("status", "work_item_status");
+    let total_sql = format!(
         r#"
         SELECT COUNT(*)
-        FROM translation_requests
-        WHERE (? = 'all' OR status = ?)
+        FROM ({request_rows_base}) request_rows
+        WHERE (? = 'all' OR {effective_status_sql} = ?)
         "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+        request_rows_base = request_row_select_sql(),
+        effective_status_sql = effective_status_sql,
+    );
+    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
     let request_rows_sql = format!(
-        r#"{}
-        WHERE (? = 'all' OR r.status = ?)
-        ORDER BY CASE WHEN r.status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
-                 r.updated_at DESC,
-                 r.id DESC
+        r#"
+        SELECT *
+        FROM ({request_rows_base}) request_rows
+        WHERE (? = 'all' OR {effective_status_sql} = ?)
+        ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                 updated_at DESC,
+                 id DESC
         LIMIT ? OFFSET ?
         "#,
-        request_row_select_sql(),
+        request_rows_base = request_row_select_sql(),
+        effective_status_sql = effective_status_sql,
     );
     let items = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
         .bind(status.as_str())
@@ -3712,13 +3725,17 @@ mod tests {
             .expect("update request ordering fixture");
         }
 
+        let effective_status_sql = request_effective_status_sql("status", "work_item_status");
         let request_rows_sql = format!(
-            r#"{}
-            ORDER BY CASE WHEN r.status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
-                     r.updated_at DESC,
-                     r.id DESC
+            r#"
+            SELECT *
+            FROM ({request_rows_base}) request_rows
+            ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                     updated_at DESC,
+                     id DESC
             "#,
-            request_row_select_sql(),
+            request_rows_base = request_row_select_sql(),
+            effective_status_sql = effective_status_sql,
         );
         let rows = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
             .fetch_all(&state.pool)
@@ -3735,6 +3752,87 @@ mod tests {
                 failed.request_id.as_str(),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn admin_request_running_filter_uses_effective_status() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let promoted = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("promoted"),
+        )
+        .await
+        .expect("promoted request created");
+        let queued = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("plain-queued"),
+        )
+        .await
+        .expect("queued request created");
+
+        let promoted_work_item_id = promoted
+            .result
+            .work_item_id
+            .clone()
+            .expect("promoted request work item");
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running',
+                batch_id = 'batch-running-1',
+                started_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-07T00:00:03Z")
+        .bind("2026-03-07T00:00:03Z")
+        .bind(promoted_work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("promote work item to running");
+
+        sqlx::query("UPDATE translation_requests SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:03Z")
+            .bind(promoted.request_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("update promoted request timestamp");
+        sqlx::query("UPDATE translation_requests SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:02Z")
+            .bind(queued.request_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("update queued request timestamp");
+
+        let effective_status_sql = request_effective_status_sql("status", "work_item_status");
+        let request_rows_sql = format!(
+            r#"
+            SELECT *
+            FROM ({request_rows_base}) request_rows
+            WHERE {effective_status_sql} = 'running'
+            ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                     updated_at DESC,
+                     id DESC
+            "#,
+            request_rows_base = request_row_select_sql(),
+            effective_status_sql = effective_status_sql,
+        );
+        let rows = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
+            .fetch_all(&state.pool)
+            .await
+            .expect("load running-filter requests");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, promoted.request_id);
+        assert_eq!(rows[0].effective_status(), "running");
     }
 
     #[test]

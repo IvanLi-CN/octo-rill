@@ -14,6 +14,7 @@ type ApiOptions = {
 	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
+	releaseDetailPendingPolls?: number;
 };
 
 function json(route: Route, payload: unknown, status = 200) {
@@ -37,8 +38,10 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		briefWindowEnd: "2026-02-23T00:00:00Z",
 		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
 		briefCreatedAt: "2026-02-23T08:00:00Z",
+		releaseDetailPendingPolls: 0,
 		...options,
 	};
+	const translationRequestPolls = new Map<string, number>();
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -188,9 +191,12 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 				);
 			}
 			if (body.mode === "wait") {
+				const requestId = `req-${item.kind ?? "translation"}-1`;
+				const isPendingReleaseDetail =
+					item.kind === "release_detail" && cfg.releaseDetailPendingPolls > 0;
 				return json(route, {
-					request_id: `req-${item.kind ?? "translation"}-1`,
-					status: "completed",
+					request_id: requestId,
+					status: isPendingReleaseDetail ? "running" : "completed",
 					result: {
 						producer_ref:
 							item.producer_ref ??
@@ -200,12 +206,16 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 						entity_id: cfg.releaseId,
 						kind: item.kind ?? "release_summary",
 						variant: item.variant ?? "feed_card",
-						status: "ready",
-						title_zh: cfg.translatedTitle,
+						status: isPendingReleaseDetail ? "running" : "ready",
+						title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
 						summary_md:
-							item.kind === "release_detail" ? null : cfg.translatedSummary,
+							item.kind === "release_detail" || isPendingReleaseDetail
+								? null
+								: cfg.translatedSummary,
 						body_md:
-							item.kind === "release_detail" ? cfg.translatedSummary : null,
+							item.kind === "release_detail" && !isPendingReleaseDetail
+								? cfg.translatedSummary
+								: null,
 						error: null,
 						work_item_id:
 							item.kind === "release_detail" ? "work-detail-1" : "work-feed-1",
@@ -221,6 +231,38 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 				{ error: { message: "unsupported translation mode" } },
 				400,
 			);
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/translate/requests/")
+		) {
+			const requestId = pathname.split("/").at(-1);
+			if (!requestId) {
+				return json(route, { error: { message: "missing request id" } }, 400);
+			}
+			const polls = translationRequestPolls.get(requestId) ?? 0;
+			translationRequestPolls.set(requestId, polls + 1);
+			const isPendingReleaseDetail =
+				requestId === "req-release_detail-1" &&
+				polls < cfg.releaseDetailPendingPolls;
+			return json(route, {
+				request_id: requestId,
+				status: isPendingReleaseDetail ? "running" : "completed",
+				result: {
+					producer_ref: `release_detail:${cfg.releaseId}`,
+					entity_id: cfg.releaseId,
+					kind: "release_detail",
+					variant: "detail_card",
+					status: isPendingReleaseDetail ? "running" : "ready",
+					title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
+					summary_md: null,
+					body_md: isPendingReleaseDetail ? null : cfg.translatedSummary,
+					error: null,
+					work_item_id: "work-detail-1",
+					batch_id: "batch-detail-1",
+				},
+			});
 		}
 
 		return json(
@@ -286,6 +328,24 @@ test("detail translate button updates card content", async ({ page }) => {
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
+});
+
+test("detail translate keeps polling an in-flight request until the result is ready", async ({
+	page,
+}) => {
+	await installApiMocks(page, { releaseDetailPendingPolls: 2 });
+
+	await page.goto("/?tab=briefs&release=123");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect(
+		page.getByRole("heading", { name: "发布说明 123" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+	).toBeVisible();
+	await expect(page.getByText("translation wait timeout")).toHaveCount(0);
 });
 
 test("reaction fallback opens PAT dialog with accessible controls", async ({
