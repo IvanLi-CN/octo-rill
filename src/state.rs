@@ -4,9 +4,10 @@ use oauth2::{
     basic::BasicClient,
 };
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use url::Url;
 
-use crate::{config::AppConfig, crypto::EncryptionKey};
+use crate::{ai::LlmScheduler, config::AppConfig, crypto::EncryptionKey};
 
 pub type GitHubOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -18,6 +19,7 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub oauth: GitHubOAuthClient,
     pub encryption_key: EncryptionKey,
+    pub llm_scheduler: Arc<LlmScheduler>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
