@@ -92,11 +92,13 @@ export function useAutoTranslate(params: {
 			item: buildReleaseSummaryRequestItem(item),
 		});
 		const translated = response.result;
-		const mapped = translated
-			? mapTranslationItemToFeedResponse(translated)
-			: null;
-		if (!translated || !mapped) {
-			throw new Error(translated?.error ?? "translate failed");
+		const mapped = mapTranslationItemToFeedResponse(translated);
+		if (
+			!mapped &&
+			translated.status !== "missing" &&
+			translated.status !== "error"
+		) {
+			throw new Error(translated.error ?? "translate failed");
 		}
 		return { translated, mapped };
 	}, []);
@@ -139,8 +141,10 @@ export function useAutoTranslate(params: {
 			void translateSingle(item)
 				.then(({ translated, mapped }) => {
 					waitRetryCountRef.current.delete(key);
-					onTranslated(item, mapped);
-					if (translated.status === "disabled") {
+					if (mapped) {
+						onTranslated(item, mapped);
+					}
+					if (translated.status !== "ready") {
 						failedRef.current.add(key);
 					}
 				})
@@ -215,8 +219,12 @@ export function useAutoTranslate(params: {
 
 			try {
 				const { translated, mapped } = await translateSingle(item);
+				if (!mapped) {
+					failedRef.current.add(key);
+					throw new Error(translated.error ?? "translate failed");
+				}
 				onTranslated(item, mapped);
-				if (translated.status === "disabled") {
+				if (translated.status !== "ready") {
 					failedRef.current.add(key);
 				}
 				return mapped;

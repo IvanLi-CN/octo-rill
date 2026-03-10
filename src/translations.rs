@@ -84,8 +84,7 @@ pub struct TranslationResultItem {
 pub struct TranslationRequestResponse {
     pub request_id: String,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<TranslationResultItem>,
+    pub result: TranslationResultItem,
 }
 
 #[derive(Debug, Serialize)]
@@ -717,7 +716,7 @@ pub async fn submit_translation_request(
         NormalizedTranslationSubmit::Single(item) => {
             let created = create_translation_request(state.as_ref(), &user_id, mode, &item).await?;
             match mode {
-                "async" => Ok(Json(created.to_public_response(false)).into_response()),
+                "async" => Ok(Json(created.to_public_response()).into_response()),
                 "wait" => {
                     let detail =
                         wait_for_request_terminal(state.as_ref(), &user_id, &created.request_id)
@@ -2309,11 +2308,11 @@ struct CreatedTranslationRequest {
 }
 
 impl CreatedTranslationRequest {
-    fn to_public_response(&self, include_result: bool) -> TranslationRequestResponse {
+    fn to_public_response(&self) -> TranslationRequestResponse {
         TranslationRequestResponse {
             request_id: self.request_id.clone(),
             status: self.status.clone(),
-            result: include_result.then(|| self.result.clone()),
+            result: self.result.clone(),
         }
     }
 
@@ -2451,7 +2450,7 @@ fn detail_to_public_response(detail: LoadedRequestDetail) -> TranslationRequestR
     TranslationRequestResponse {
         request_id,
         status,
-        result: Some(detail.result),
+        result: detail.result,
     }
 }
 
@@ -2820,6 +2819,22 @@ mod tests {
             }
             NormalizedTranslationSubmit::Batch(_) => panic!("expected single-item payload"),
         }
+    }
+
+    #[tokio::test]
+    async fn created_request_public_response_always_includes_result() {
+        let item = sample_release_item("response-item");
+        let created = CreatedTranslationRequest {
+            request_id: "req-1".to_owned(),
+            status: "queued".to_owned(),
+            result: queued_request_result(&item, Some("work-1".to_owned())),
+        };
+
+        let response = created.to_public_response();
+        assert_eq!(response.request_id, "req-1");
+        assert_eq!(response.status, "queued");
+        assert_eq!(response.result.entity_id, item.entity_id);
+        assert_eq!(response.result.producer_ref, item.producer_ref);
     }
 
     #[tokio::test]
