@@ -393,10 +393,9 @@ impl RequestRow {
             entity_id: self.entity_id.clone(),
             kind: self.kind.clone(),
             variant: self.variant.clone(),
-            status: self
-                .result_status
-                .clone()
-                .unwrap_or_else(|| "queued".to_owned()),
+            status: self.result_status.clone().unwrap_or_else(|| {
+                pending_result_status_from_work_status(self.work_item_status.as_deref()).to_owned()
+            }),
             title_zh: self.title_zh.clone(),
             summary_md: self.summary_md.clone(),
             body_md: self.body_md.clone(),
@@ -404,6 +403,13 @@ impl RequestRow {
             work_item_id: self.work_item_id.clone(),
             batch_id: self.batch_id.clone(),
         }
+    }
+}
+
+fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'static str {
+    match work_item_status {
+        Some("running") => "running",
+        _ => "queued",
     }
 }
 
@@ -1200,16 +1206,25 @@ async fn insert_translation_request(
                 "queued"
             }
             .to_owned();
-            attach_request_to_work_item(tx, request_id.as_str(), &existing.id, now).await?;
+            let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
+            attach_request_to_work_item(
+                tx,
+                request_id.as_str(),
+                &existing.id,
+                status.as_str(),
+                now,
+            )
+            .await?;
             Ok(CreatedTranslationRequest {
                 request_id,
                 status,
-                result: queued_request_result(item, Some(existing.id)),
+                result,
             })
         }
         None => {
             let work_item_id = create_work_item(tx, user_id, item, &source_hash, now).await?;
-            attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, now).await?;
+            attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now)
+                .await?;
             Ok(CreatedTranslationRequest {
                 request_id,
                 status: "queued".to_owned(),
@@ -1223,16 +1238,26 @@ async fn attach_request_to_work_item(
     tx: &mut Transaction<'_, Sqlite>,
     request_id: &str,
     work_item_id: &str,
+    request_status: &str,
     now: &str,
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
         UPDATE translation_requests
-        SET work_item_id = ?, updated_at = ?
+        SET work_item_id = ?,
+            status = ?,
+            started_at = CASE
+                WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                ELSE started_at
+            END,
+            updated_at = ?
         WHERE id = ?
         "#,
     )
     .bind(work_item_id)
+    .bind(request_status)
+    .bind(request_status)
+    .bind(now)
     .bind(now)
     .bind(request_id)
     .execute(&mut **tx)
@@ -2663,6 +2688,22 @@ fn map_entity_type(kind: &str) -> Option<&'static str> {
     }
 }
 
+fn pending_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
+    TranslationResultItem {
+        producer_ref,
+        entity_id: row.entity_id.clone(),
+        kind: row.kind.clone(),
+        variant: row.variant.clone(),
+        status: pending_result_status_from_work_status(Some(row.status.as_str())).to_owned(),
+        title_zh: None,
+        summary_md: None,
+        body_md: None,
+        error: None,
+        work_item_id: Some(row.id.clone()),
+        batch_id: row.batch_id.clone(),
+    }
+}
+
 fn terminal_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
     TranslationResultItem {
         producer_ref,
@@ -2856,7 +2897,7 @@ mod tests {
         sqlx::query(
             r#"
             UPDATE translation_work_items
-            SET status = 'running', started_at = ?, updated_at = ?
+            SET status = 'running', batch_id = 'batch-running-1', started_at = ?, updated_at = ?
             WHERE id = ?
             "#,
         )
@@ -2871,6 +2912,16 @@ mod tests {
             .await
             .expect("second request created");
         assert_eq!(second.status, "running");
+        assert_eq!(second.result.status, "running");
+        assert_eq!(second.result.batch_id.as_deref(), Some("batch-running-1"));
+
+        let stored_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(second.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load stored request status");
+        assert_eq!(stored_status, "running");
 
         let detail =
             load_translation_request_detail(state.as_ref(), "1", second.request_id.as_str())
@@ -2881,6 +2932,8 @@ mod tests {
             detail.request.to_admin_request_list_item().status,
             "running"
         );
+        assert_eq!(detail.result.status, "running");
+        assert_eq!(detail.result.batch_id.as_deref(), Some("batch-running-1"));
         assert_eq!(derive_request_stream_phase(&detail), "running");
     }
 
@@ -3534,10 +3587,11 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
-        let database_url = format!(
-            "sqlite:file:{}?mode=memory&cache=shared",
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
-        );
+        ));
+        let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(database_url.as_str())

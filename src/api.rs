@@ -7300,10 +7300,11 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
-        let database_url = format!(
-            "sqlite:file:{}?mode=memory&cache=shared",
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
-        );
+        ));
+        let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(database_url.as_str())
@@ -8026,10 +8027,11 @@ mod tests {
 
     #[tokio::test]
     async fn migration_backfills_earliest_user_as_admin() {
-        let database_url = format!(
-            "sqlite:file:{}?mode=memory&cache=shared",
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
-        );
+        ));
+        let database_url = format!("sqlite:{}?mode=rwc", database_path.to_string_lossy());
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(database_url.as_str())

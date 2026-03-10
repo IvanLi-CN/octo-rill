@@ -467,7 +467,7 @@ export type TranslationResultItem = {
 	entity_id: string;
 	kind: string;
 	variant: string;
-	status: "queued" | "ready" | "disabled" | "missing" | "error";
+	status: "queued" | "running" | "ready" | "disabled" | "missing" | "error";
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md: string | null;

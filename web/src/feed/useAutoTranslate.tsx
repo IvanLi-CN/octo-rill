@@ -35,7 +35,7 @@ function buildReleaseSummaryRequestItem(
 }
 
 function mapTranslationItemToFeedResponse(item: {
-	status: "ready" | "disabled" | "missing" | "error" | "queued";
+	status: "ready" | "disabled" | "missing" | "error" | "queued" | "running";
 	title_zh: string | null;
 	summary_md: string | null;
 }): TranslateResponse | null {
