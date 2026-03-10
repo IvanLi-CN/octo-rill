@@ -1965,8 +1965,41 @@ pub struct AdminLlmCallsQuery {
     parent_task_id: Option<String>,
     started_from: Option<String>,
     started_to: Option<String>,
+    sort: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
+}
+
+fn llm_calls_status_rank(status: &str) -> i32 {
+    match status {
+        "running" => 0,
+        "queued" => 1,
+        _ => 2,
+    }
+}
+
+fn apply_llm_call_status_overrides(
+    items: &mut [AdminLlmCallItem],
+    overrides: &HashMap<String, String>,
+) {
+    for item in items {
+        if let Some(status) = overrides.get(&item.id) {
+            item.status = status.clone();
+        }
+    }
+}
+
+fn sort_admin_llm_calls(items: &mut [AdminLlmCallItem], sort: &str) {
+    items.sort_by(|left, right| match sort {
+        "status_grouped" => llm_calls_status_rank(&left.status)
+            .cmp(&llm_calls_status_rank(&right.status))
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| right.id.cmp(&left.id)),
+        _ => right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id)),
+    });
 }
 
 fn parse_llm_calls_filter_timestamp(
@@ -1990,7 +2023,6 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let runtime = state.llm_scheduler.runtime_status();
 
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
@@ -2054,7 +2086,6 @@ pub async fn admin_list_llm_calls(
     Query(query): Query<AdminLlmCallsQuery>,
 ) -> Result<Json<AdminLlmCallsResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
     let offset = admin_users_offset(page, page_size)?;
@@ -2071,6 +2102,10 @@ pub async fn admin_list_llm_calls(
     let parent_task_id = query.parent_task_id.unwrap_or_default().trim().to_owned();
     let started_from = parse_llm_calls_filter_timestamp(query.started_from, "started_from")?;
     let started_to = parse_llm_calls_filter_timestamp(query.started_to, "started_to")?;
+    let sort = query.sort.unwrap_or_else(|| "created_desc".to_owned());
+    if !matches!(sort.as_str(), "created_desc" | "status_grouped") {
+        return Err(ApiError::bad_request("invalid sort filter"));
+    }
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"
@@ -2100,64 +2135,106 @@ pub async fn admin_list_llm_calls(
     .await
     .map_err(ApiError::internal)?;
 
-    let items = sqlx::query_as::<_, AdminLlmCallItem>(
-        r#"
-        SELECT
-          id,
-          status,
-          source,
-          model,
-          requested_by,
-          parent_task_id,
-          parent_task_type,
-          max_tokens,
-          attempt_count,
-          scheduler_wait_ms,
-          first_token_wait_ms,
-          duration_ms,
-          input_tokens,
-          output_tokens,
-          cached_input_tokens,
-          total_tokens,
-          created_at,
-          started_at,
-          finished_at,
-          updated_at
-        FROM llm_calls
-        WHERE (? = 'all' OR status = ?)
-          AND (? = '' OR source = ?)
-          AND (? IS NULL OR requested_by = ?)
-          AND (? = '' OR parent_task_id = ?)
-          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
-          AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
-        ORDER BY
-          CASE
-            WHEN status = 'running' THEN 0
-            WHEN status = 'queued' THEN 1
-            ELSE 2
-          END,
-          created_at DESC,
-          id DESC
-        LIMIT ? OFFSET ?
-        "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .bind(source.as_str())
-    .bind(source.as_str())
-    .bind(requested_by.as_deref())
-    .bind(requested_by.as_deref())
-    .bind(parent_task_id.as_str())
-    .bind(parent_task_id.as_str())
-    .bind(started_from.as_deref())
-    .bind(started_from.as_deref())
-    .bind(started_to.as_deref())
-    .bind(started_to.as_deref())
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let items_query = match sort.as_str() {
+        "status_grouped" => {
+            r#"
+            SELECT
+              id,
+              status,
+              source,
+              model,
+              requested_by,
+              parent_task_id,
+              parent_task_type,
+              max_tokens,
+              attempt_count,
+              scheduler_wait_ms,
+              first_token_wait_ms,
+              duration_ms,
+              input_tokens,
+              output_tokens,
+              cached_input_tokens,
+              total_tokens,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            FROM llm_calls
+            WHERE (? = 'all' OR status = ?)
+              AND (? = '' OR source = ?)
+              AND (? IS NULL OR requested_by = ?)
+              AND (? = '' OR parent_task_id = ?)
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+            ORDER BY
+              CASE
+                WHEN status = 'running' THEN 0
+                WHEN status = 'queued' THEN 1
+                ELSE 2
+              END,
+              created_at DESC,
+              id DESC
+            LIMIT ? OFFSET ?
+            "#
+        }
+        _ => {
+            r#"
+            SELECT
+              id,
+              status,
+              source,
+              model,
+              requested_by,
+              parent_task_id,
+              parent_task_type,
+              max_tokens,
+              attempt_count,
+              scheduler_wait_ms,
+              first_token_wait_ms,
+              duration_ms,
+              input_tokens,
+              output_tokens,
+              cached_input_tokens,
+              total_tokens,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            FROM llm_calls
+            WHERE (? = 'all' OR status = ?)
+              AND (? = '' OR source = ?)
+              AND (? IS NULL OR requested_by = ?)
+              AND (? = '' OR parent_task_id = ?)
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+            ORDER BY created_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            "#
+        }
+    };
+
+    let mut items = sqlx::query_as::<_, AdminLlmCallItem>(items_query)
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .bind(source.as_str())
+        .bind(source.as_str())
+        .bind(requested_by.as_deref())
+        .bind(requested_by.as_deref())
+        .bind(parent_task_id.as_str())
+        .bind(parent_task_id.as_str())
+        .bind(started_from.as_deref())
+        .bind(started_from.as_deref())
+        .bind(started_to.as_deref())
+        .bind(started_to.as_deref())
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let overrides = state.llm_scheduler.status_overrides().await;
+    apply_llm_call_status_overrides(&mut items, &overrides);
+    sort_admin_llm_calls(&mut items, sort.as_str());
 
     Ok(Json(AdminLlmCallsResponse {
         items,
@@ -2173,10 +2250,9 @@ pub async fn admin_get_llm_call_detail(
     Path(call_id): Path<String>,
 ) -> Result<Json<AdminLlmCallDetailItem>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let call_id = parse_local_id_param(call_id, "call_id")?;
 
-    let item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
+    let mut item = sqlx::query_as::<_, AdminLlmCallDetailItem>(
         r#"
         SELECT
           id,
@@ -2214,6 +2290,10 @@ pub async fn admin_get_llm_call_detail(
     .await
     .map_err(ApiError::internal)?
     .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "llm call not found"))?;
+
+    if let Some(status) = state.llm_scheduler.status_overrides().await.get(&item.id) {
+        item.status = status.clone();
+    }
 
     Ok(Json(item))
 }
@@ -7725,6 +7805,7 @@ mod tests {
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                sort: None,
                 page: None,
                 page_size: None,
             }),
@@ -7773,6 +7854,7 @@ mod tests {
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
             }),
@@ -7983,6 +8065,7 @@ mod tests {
                 parent_task_id: None,
                 started_from: None,
                 started_to: None,
+                sort: Some("status_grouped".to_owned()),
                 page: Some(1),
                 page_size: Some(20),
             }),
@@ -8003,6 +8086,79 @@ mod tests {
                 "call-running-old",
                 "call-queued",
                 "call-failed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_defaults_to_created_desc() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-running-oldest",
+            "running",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T02:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-failed-newest",
+            "failed",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T06:00:00Z",
+        )
+        .await;
+        seed_llm_call_with_created_at(
+            &pool,
+            "call-queued-middle",
+            "queued",
+            "api.translate_releases_batch",
+            Some(test_user_id(1)),
+            "2026-02-26T04:00:00Z",
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let resp = admin_list_llm_calls(
+            State(state),
+            session,
+            Query(AdminLlmCallsQuery {
+                status: Some("all".to_owned()),
+                source: Some("api.translate_releases_batch".to_owned()),
+                requested_by: Some(test_user_id(1)),
+                parent_task_id: None,
+                started_from: None,
+                started_to: None,
+                sort: None,
+                page: Some(1),
+                page_size: Some(20),
+            }),
+        )
+        .await
+        .expect("admin llm call list should keep reverse chronological order by default")
+        .0;
+
+        let ids = resp
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "call-failed-newest",
+                "call-queued-middle",
+                "call-running-oldest",
             ]
         );
     }
@@ -8041,6 +8197,7 @@ mod tests {
                 parent_task_id: None,
                 started_from: Some(started_from),
                 started_to: Some(started_to),
+                sort: None,
                 page: Some(1),
                 page_size: Some(20),
             }),
@@ -8153,6 +8310,7 @@ mod tests {
                 parent_task_id: Some(parent_task_a.clone()),
                 started_from: None,
                 started_to: None,
+                sort: None,
                 page: Some(1),
                 page_size: Some(20),
             }),

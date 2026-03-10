@@ -80,7 +80,7 @@ pub struct LlmSchedulerRuntimeStatus {
 pub struct LlmScheduler {
     max_concurrency: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
-    admin_snapshot_gate: Arc<tokio::sync::RwLock<()>>,
+    status_overrides: tokio::sync::RwLock<HashMap<String, String>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
 }
@@ -101,18 +101,25 @@ impl LlmScheduler {
         Self {
             max_concurrency: max_concurrency.max(1),
             semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
-            admin_snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
+            status_overrides: tokio::sync::RwLock::new(HashMap::new()),
             waiting_calls: AtomicUsize::new(0),
             in_flight_calls: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) async fn admin_snapshot(self: &Arc<Self>) -> tokio::sync::OwnedRwLockReadGuard<()> {
-        self.admin_snapshot_gate.clone().read_owned().await
+    pub(crate) async fn status_overrides(&self) -> HashMap<String, String> {
+        self.status_overrides.read().await.clone()
     }
 
-    async fn begin_admin_transition(self: &Arc<Self>) -> tokio::sync::OwnedRwLockWriteGuard<()> {
-        self.admin_snapshot_gate.clone().write_owned().await
+    async fn set_status_override(&self, call_id: &str, status: &str) {
+        self.status_overrides
+            .write()
+            .await
+            .insert(call_id.to_owned(), status.to_owned());
+    }
+
+    async fn clear_status_override(&self, call_id: &str) {
+        self.status_overrides.write().await.remove(call_id);
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
@@ -1409,6 +1416,10 @@ pub async fn chat_completion(
             started_at = Some(Instant::now());
         }
 
+        state
+            .llm_scheduler
+            .set_status_override(log_record.id.as_str(), "running")
+            .await;
         if let Err(err) = update_llm_call_running(
             state,
             log_record.id.as_str(),
@@ -1418,16 +1429,25 @@ pub async fn chat_completion(
         .await
         {
             tracing::warn!(?err, "llm call log running update failed");
+        } else {
+            state
+                .llm_scheduler
+                .clear_status_override(log_record.id.as_str())
+                .await;
         }
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
-        let admin_transition = state.llm_scheduler.begin_admin_transition().await;
-        in_flight_guard.release_permit();
         match attempt_result {
             Ok(output) => {
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
+                state
+                    .llm_scheduler
+                    .set_status_override(log_record.id.as_str(), "succeeded")
+                    .await;
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
                 if let Err(err) = finalize_llm_call(
                     state,
                     log_record.id.as_str(),
@@ -1449,9 +1469,12 @@ pub async fn chat_completion(
                 .await
                 {
                     tracing::warn!(?err, "llm call log finalize success failed");
+                } else {
+                    state
+                        .llm_scheduler
+                        .clear_status_override(log_record.id.as_str())
+                        .await;
                 }
-                drop(in_flight_guard);
-                drop(admin_transition);
                 return Ok(output.content);
             }
             Err(attempt_err) => {
@@ -1466,6 +1489,12 @@ pub async fn chat_completion(
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                     });
                     let error_message = err.to_string();
+                    state
+                        .llm_scheduler
+                        .set_status_override(log_record.id.as_str(), "failed")
+                        .await;
+                    in_flight_guard.release_permit();
+                    drop(in_flight_guard);
                     if let Err(log_err) = finalize_llm_call(
                         state,
                         log_record.id.as_str(),
@@ -1487,12 +1516,21 @@ pub async fn chat_completion(
                     .await
                     {
                         tracing::warn!(?log_err, "llm call log finalize failure failed");
+                    } else {
+                        state
+                            .llm_scheduler
+                            .clear_status_override(log_record.id.as_str())
+                            .await;
                     }
-                    drop(in_flight_guard);
-                    drop(admin_transition);
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
+                state
+                    .llm_scheduler
+                    .set_status_override(log_record.id.as_str(), "queued")
+                    .await;
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
                 if let Err(log_err) = requeue_llm_call_for_retry(
                     state,
                     log_record.id.as_str(),
@@ -1503,9 +1541,12 @@ pub async fn chat_completion(
                 .await
                 {
                     tracing::warn!(?log_err, "llm call requeue update failed");
+                } else {
+                    state
+                        .llm_scheduler
+                        .clear_status_override(log_record.id.as_str())
+                        .await;
                 }
-                drop(in_flight_guard);
-                drop(admin_transition);
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -2621,27 +2662,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_scheduler_admin_snapshot_waits_for_retry_transition() {
+    async fn llm_scheduler_status_overrides_round_trip() {
         let scheduler = Arc::new(LlmScheduler::new(1));
-        let (_wait_ms, mut in_flight_guard) = scheduler.acquire_slot().await;
-        let admin_transition = scheduler.begin_admin_transition().await;
-        in_flight_guard.release_permit();
+        scheduler.set_status_override("call-1", "queued").await;
 
-        let snapshot_scheduler = Arc::clone(&scheduler);
-        let snapshot = tokio::spawn(async move {
-            let _snapshot = snapshot_scheduler.admin_snapshot().await;
-            snapshot_scheduler.runtime_status()
-        });
+        let overrides = scheduler.status_overrides().await;
+        assert_eq!(overrides.get("call-1").map(String::as_str), Some("queued"));
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert!(!snapshot.is_finished());
-
-        drop(in_flight_guard);
-        drop(admin_transition);
-
-        let status = snapshot.await.expect("snapshot task join");
-        assert_eq!(status.available_slots, 1);
-        assert_eq!(status.in_flight_calls, 0);
+        scheduler.clear_status_override("call-1").await;
+        assert!(scheduler.status_overrides().await.is_empty());
     }
 
     #[tokio::test]

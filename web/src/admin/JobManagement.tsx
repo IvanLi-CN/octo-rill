@@ -2583,6 +2583,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			try {
 				const params = new URLSearchParams();
 				params.set("status", llmStatusFilter);
+				params.set("sort", "status_grouped");
 				params.set("page", String(llmCallPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
 				if (llmSourceFilter.trim()) {
@@ -2670,6 +2671,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const loadTaskRelatedLlmCalls = useCallback(async (taskId: string) => {
 		const params = new URLSearchParams();
 		params.set("status", "all");
+		params.set("sort", "created_desc");
 		params.set("page", "1");
 		params.set("page_size", "50");
 		params.set("parent_task_id", taskId);
