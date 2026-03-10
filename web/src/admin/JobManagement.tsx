@@ -514,6 +514,36 @@ function taskStatusLabel(status: string) {
 	}
 }
 
+function llmCallStatusSortOrder(status: string) {
+	switch (status) {
+		case "running":
+			return 0;
+		case "queued":
+			return 1;
+		default:
+			return 2;
+	}
+}
+
+function sortLlmCallsForDisplay(calls: AdminLlmCallItem[]) {
+	return [...calls].sort((left, right) => {
+		const statusDiff =
+			llmCallStatusSortOrder(left.status) -
+			llmCallStatusSortOrder(right.status);
+		if (statusDiff !== 0) {
+			return statusDiff;
+		}
+
+		const createdDiff =
+			Date.parse(right.created_at) - Date.parse(left.created_at);
+		if (!Number.isNaN(createdDiff) && createdDiff !== 0) {
+			return createdDiff;
+		}
+
+		return right.id.localeCompare(left.id);
+	});
+}
+
 type TaskStatusTone = {
 	cardAccentClass: string;
 	badgeClass: string;
@@ -2574,7 +2604,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (requestId !== llmCallsRequestIdRef.current) {
 					return;
 				}
-				setLlmCalls(res.items);
+				setLlmCalls(sortLlmCallsForDisplay(res.items));
 				setLlmCallTotal(res.total);
 				llmCallsLoadedOnceRef.current = true;
 			} catch (err) {
@@ -3560,26 +3590,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-4">
-							<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-								<div className="bg-card/70 rounded-lg border p-3">
-									<p className="text-muted-foreground text-xs">调度器状态</p>
-									<p className="mt-1 text-sm font-semibold">
-										{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										最大并行 {formatCount(llmStatus?.max_concurrency)}
-									</p>
-								</div>
-								<div className="bg-card/70 rounded-lg border p-3">
-									<p className="text-muted-foreground text-xs">等待 / 进行中</p>
-									<p className="mt-1 text-sm font-semibold">
-										{formatCount(llmStatus?.waiting_calls)} /{" "}
-										{formatCount(llmStatus?.in_flight_calls)}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										可用槽位 {formatCount(llmStatus?.available_slots)}
-									</p>
-								</div>
+							<div className="max-w-sm">
 								<div className="bg-card/70 rounded-lg border p-3">
 									<p className="text-muted-foreground text-xs">
 										近24h 调用 / 失败
