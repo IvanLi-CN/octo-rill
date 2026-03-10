@@ -478,7 +478,7 @@ export type TranslationResultItem = {
 export type TranslationRequestResponse = {
 	request_id: string;
 	status: "queued" | "running" | "completed" | "failed";
-	result?: TranslationResultItem | null;
+	result: TranslationResultItem;
 };
 export type TranslationBatchSubmitItemResponse = {
 	request_id: string;
@@ -683,13 +683,10 @@ export async function apiTranslateReleaseDetail(
 		},
 	});
 	const translated = response.result;
-	if (
-		!translated ||
-		(translated.status !== "ready" && translated.status !== "disabled")
-	) {
+	if (translated.status !== "ready" && translated.status !== "disabled") {
 		throw new ApiError(
 			500,
-			translated?.error ?? "translate failed",
+			translated.error ?? "translate failed",
 			"translate_failed",
 		);
 	}
