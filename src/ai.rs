@@ -80,7 +80,7 @@ pub struct LlmSchedulerRuntimeStatus {
 pub struct LlmScheduler {
     max_concurrency: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
-    status_overrides: tokio::sync::RwLock<HashMap<String, String>>,
+    status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
 }
@@ -107,18 +107,18 @@ impl LlmScheduler {
         }
     }
 
-    pub(crate) async fn status_overrides(&self) -> HashMap<String, String> {
+    pub(crate) async fn admin_overrides(&self) -> HashMap<String, LlmCallAdminOverride> {
         self.status_overrides.read().await.clone()
     }
 
-    async fn set_status_override(&self, call_id: &str, status: &str) {
+    pub(crate) async fn set_admin_override(&self, snapshot: LlmCallAdminOverride) {
         self.status_overrides
             .write()
             .await
-            .insert(call_id.to_owned(), status.to_owned());
+            .insert(snapshot.id.clone(), snapshot);
     }
 
-    async fn clear_status_override(&self, call_id: &str) {
+    pub(crate) async fn clear_admin_override(&self, call_id: &str) {
         self.status_overrides.write().await.remove(call_id);
     }
 
@@ -932,6 +932,26 @@ impl Drop for SchedulerWaitingGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LlmCallAdminOverride {
+    pub id: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub scheduler_wait_ms: i64,
+    pub first_token_wait_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub output_messages_json: Option<String>,
+    pub response_text: Option<String>,
+    pub error_text: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
+}
+
 #[derive(Debug)]
 struct LlmCallLogRecord {
     id: String,
@@ -1416,10 +1436,6 @@ pub async fn chat_completion(
             started_at = Some(Instant::now());
         }
 
-        state
-            .llm_scheduler
-            .set_status_override(log_record.id.as_str(), "running")
-            .await;
         if let Err(err) = update_llm_call_running(
             state,
             log_record.id.as_str(),
@@ -1429,11 +1445,6 @@ pub async fn chat_completion(
         .await
         {
             tracing::warn!(?err, "llm call log running update failed");
-        } else {
-            state
-                .llm_scheduler
-                .clear_status_override(log_record.id.as_str())
-                .await;
         }
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
@@ -1442,9 +1453,27 @@ pub async fn chat_completion(
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
+                let finished_at = chrono::Utc::now().to_rfc3339();
                 state
                     .llm_scheduler
-                    .set_status_override(log_record.id.as_str(), "succeeded")
+                    .set_admin_override(LlmCallAdminOverride {
+                        id: log_record.id.clone(),
+                        status: "succeeded".to_owned(),
+                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                        scheduler_wait_ms: total_wait_ms,
+                        first_token_wait_ms: output.first_token_wait_ms,
+                        duration_ms,
+                        input_tokens: output.usage.input_tokens,
+                        output_tokens: output.usage.output_tokens,
+                        cached_input_tokens: output.usage.cached_input_tokens,
+                        total_tokens: output.usage.total_tokens,
+                        output_messages_json: Some(output.output_messages_json.clone()),
+                        response_text: Some(output.content.clone()),
+                        error_text: None,
+                        started_at: None,
+                        finished_at: Some(finished_at.clone()),
+                        updated_at: finished_at.clone(),
+                    })
                     .await;
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -1469,12 +1498,11 @@ pub async fn chat_completion(
                 .await
                 {
                     tracing::warn!(?err, "llm call log finalize success failed");
-                } else {
-                    state
-                        .llm_scheduler
-                        .clear_status_override(log_record.id.as_str())
-                        .await;
                 }
+                state
+                    .llm_scheduler
+                    .clear_admin_override(log_record.id.as_str())
+                    .await;
                 return Ok(output.content);
             }
             Err(attempt_err) => {
@@ -1489,9 +1517,27 @@ pub async fn chat_completion(
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                     });
                     let error_message = err.to_string();
+                    let finished_at = chrono::Utc::now().to_rfc3339();
                     state
                         .llm_scheduler
-                        .set_status_override(log_record.id.as_str(), "failed")
+                        .set_admin_override(LlmCallAdminOverride {
+                            id: log_record.id.clone(),
+                            status: "failed".to_owned(),
+                            attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                            scheduler_wait_ms: total_wait_ms,
+                            first_token_wait_ms,
+                            duration_ms,
+                            input_tokens: None,
+                            output_tokens: None,
+                            cached_input_tokens: None,
+                            total_tokens: None,
+                            output_messages_json: None,
+                            response_text: None,
+                            error_text: Some(error_message.clone()),
+                            started_at: None,
+                            finished_at: Some(finished_at.clone()),
+                            updated_at: finished_at.clone(),
+                        })
                         .await;
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
@@ -1516,18 +1562,35 @@ pub async fn chat_completion(
                     .await
                     {
                         tracing::warn!(?log_err, "llm call log finalize failure failed");
-                    } else {
-                        state
-                            .llm_scheduler
-                            .clear_status_override(log_record.id.as_str())
-                            .await;
                     }
+                    state
+                        .llm_scheduler
+                        .clear_admin_override(log_record.id.as_str())
+                        .await;
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
+                let requeued_at = chrono::Utc::now().to_rfc3339();
                 state
                     .llm_scheduler
-                    .set_status_override(log_record.id.as_str(), "queued")
+                    .set_admin_override(LlmCallAdminOverride {
+                        id: log_record.id.clone(),
+                        status: "queued".to_owned(),
+                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                        scheduler_wait_ms: total_wait_ms,
+                        first_token_wait_ms: None,
+                        duration_ms: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                        total_tokens: None,
+                        output_messages_json: None,
+                        response_text: None,
+                        error_text: None,
+                        started_at: None,
+                        finished_at: None,
+                        updated_at: requeued_at,
+                    })
                     .await;
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
@@ -1541,12 +1604,11 @@ pub async fn chat_completion(
                 .await
                 {
                     tracing::warn!(?log_err, "llm call requeue update failed");
-                } else {
-                    state
-                        .llm_scheduler
-                        .clear_status_override(log_record.id.as_str())
-                        .await;
                 }
+                state
+                    .llm_scheduler
+                    .clear_admin_override(log_record.id.as_str())
+                    .await;
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -2664,13 +2726,37 @@ mod tests {
     #[tokio::test]
     async fn llm_scheduler_status_overrides_round_trip() {
         let scheduler = Arc::new(LlmScheduler::new(1));
-        scheduler.set_status_override("call-1", "queued").await;
+        scheduler
+            .set_admin_override(LlmCallAdminOverride {
+                id: "call-1".to_owned(),
+                status: "queued".to_owned(),
+                attempt_count: 1,
+                scheduler_wait_ms: 120,
+                first_token_wait_ms: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+                updated_at: "2026-03-10T00:00:00Z".to_owned(),
+            })
+            .await;
 
-        let overrides = scheduler.status_overrides().await;
-        assert_eq!(overrides.get("call-1").map(String::as_str), Some("queued"));
+        let overrides = scheduler.admin_overrides().await;
+        assert_eq!(
+            overrides
+                .get("call-1")
+                .map(|snapshot| snapshot.status.as_str()),
+            Some("queued")
+        );
 
-        scheduler.clear_status_override("call-1").await;
-        assert!(scheduler.status_overrides().await.is_empty());
+        scheduler.clear_admin_override("call-1").await;
+        assert!(scheduler.admin_overrides().await.is_empty());
     }
 
     #[tokio::test]
