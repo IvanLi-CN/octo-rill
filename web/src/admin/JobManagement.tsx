@@ -1191,6 +1191,20 @@ function translationItemTone(status: string): BadgeTone {
 	}
 }
 
+function translationResultBadge(status: string, runStatus?: string) {
+	if (status === "queued" && runStatus === "running") {
+		return {
+			label: "处理中",
+			tone: taskStatusTone("running"),
+		};
+	}
+
+	return {
+		label: translationItemStatusLabel(status),
+		tone: translationItemTone(status),
+	};
+}
+
 function translationRequestOriginLabel(origin: string) {
 	switch (origin) {
 		case "user":
@@ -1961,10 +1975,18 @@ function TranslationSchedulerSection(props: {
 											{requestDetail.result.variant}
 										</p>
 										<StatusBadge
-											label={translationItemStatusLabel(
-												requestDetail.result.status,
-											)}
-											tone={translationItemTone(requestDetail.result.status)}
+											label={
+												translationResultBadge(
+													requestDetail.result.status,
+													requestDetail.request.status,
+												).label
+											}
+											tone={
+												translationResultBadge(
+													requestDetail.result.status,
+													requestDetail.request.status,
+												).tone
+											}
 										/>
 									</div>
 									<p className="text-muted-foreground mt-1 text-xs">
@@ -2118,8 +2140,18 @@ function TranslationSchedulerSection(props: {
 													{item.kind} · {item.variant}
 												</p>
 												<StatusBadge
-													label={translationItemStatusLabel(item.status)}
-													tone={translationItemTone(item.status)}
+													label={
+														translationResultBadge(
+															item.status,
+															batchDetail.batch.status,
+														).label
+													}
+													tone={
+														translationResultBadge(
+															item.status,
+															batchDetail.batch.status,
+														).tone
+													}
 												/>
 											</div>
 											<p className="text-muted-foreground mt-1 text-xs">
