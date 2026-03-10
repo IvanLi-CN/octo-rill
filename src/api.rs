@@ -7300,9 +7300,13 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        let database_url = format!(
+            "sqlite:file:{}?mode=memory&cache=shared",
+            crate::local_id::generate_local_id(),
+        );
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect(database_url.as_str())
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")
@@ -8022,9 +8026,13 @@ mod tests {
 
     #[tokio::test]
     async fn migration_backfills_earliest_user_as_admin() {
+        let database_url = format!(
+            "sqlite:file:{}?mode=memory&cache=shared",
+            crate::local_id::generate_local_id(),
+        );
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect(database_url.as_str())
             .await
             .expect("create sqlite memory db");
 
