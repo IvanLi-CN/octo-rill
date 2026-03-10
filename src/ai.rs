@@ -1244,6 +1244,25 @@ async fn finalize_llm_call(
     Ok(())
 }
 
+async fn reconcile_admin_override_after_persist(
+    state: &AppState,
+    call_id: &str,
+    persist_result: Result<()>,
+    failure_context: &'static str,
+) {
+    match persist_result {
+        Ok(()) => state.llm_scheduler.clear_admin_override(call_id).await,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                call_id,
+                context = failure_context,
+                "llm call persist update failed"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FinalizeLlmCallUpdate<'a> {
     status: &'a str,
@@ -1427,25 +1446,48 @@ pub async fn chat_completion(
     let mut last_err: Option<anyhow::Error> = None;
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
+    let mut started_at_timestamp: Option<String> = None;
     let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
     for attempt in 1..=max_attempts {
         let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
+        let attempt_count = i64::try_from(attempt).unwrap_or(i64::MAX);
 
         if started_at.is_none() {
             started_at = Some(Instant::now());
+            started_at_timestamp = Some(chrono::Utc::now().to_rfc3339());
         }
 
-        if let Err(err) = update_llm_call_running(
+        let running_updated_at = chrono::Utc::now().to_rfc3339();
+        state
+            .llm_scheduler
+            .set_admin_override(LlmCallAdminOverride {
+                id: log_record.id.clone(),
+                status: "running".to_owned(),
+                attempt_count,
+                scheduler_wait_ms: total_wait_ms,
+                first_token_wait_ms: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: None,
+                started_at: started_at_timestamp.clone(),
+                finished_at: None,
+                updated_at: running_updated_at,
+            })
+            .await;
+        reconcile_admin_override_after_persist(
             state,
             log_record.id.as_str(),
-            i64::try_from(attempt).unwrap_or(i64::MAX),
-            total_wait_ms,
+            update_llm_call_running(state, log_record.id.as_str(), attempt_count, total_wait_ms)
+                .await,
+            "llm call log running update failed",
         )
-        .await
-        {
-            tracing::warn!(?err, "llm call log running update failed");
-        }
+        .await;
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         match attempt_result {
@@ -1459,7 +1501,7 @@ pub async fn chat_completion(
                     .set_admin_override(LlmCallAdminOverride {
                         id: log_record.id.clone(),
                         status: "succeeded".to_owned(),
-                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                        attempt_count,
                         scheduler_wait_ms: total_wait_ms,
                         first_token_wait_ms: output.first_token_wait_ms,
                         duration_ms,
@@ -1470,39 +1512,38 @@ pub async fn chat_completion(
                         output_messages_json: Some(output.output_messages_json.clone()),
                         response_text: Some(output.content.clone()),
                         error_text: None,
-                        started_at: None,
+                        started_at: started_at_timestamp.clone(),
                         finished_at: Some(finished_at.clone()),
                         updated_at: finished_at.clone(),
                     })
                     .await;
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
-                if let Err(err) = finalize_llm_call(
+                reconcile_admin_override_after_persist(
                     state,
                     log_record.id.as_str(),
-                    FinalizeLlmCallUpdate {
-                        status: "succeeded",
-                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
-                        scheduler_wait_ms: total_wait_ms,
-                        first_token_wait_ms: output.first_token_wait_ms,
-                        duration_ms,
-                        output_messages_json: Some(output.output_messages_json.as_str()),
-                        response_text: Some(output.content.as_str()),
-                        error_text: None,
-                        input_tokens: output.usage.input_tokens,
-                        output_tokens: output.usage.output_tokens,
-                        cached_input_tokens: output.usage.cached_input_tokens,
-                        total_tokens: output.usage.total_tokens,
-                    },
+                    finalize_llm_call(
+                        state,
+                        log_record.id.as_str(),
+                        FinalizeLlmCallUpdate {
+                            status: "succeeded",
+                            attempt_count,
+                            scheduler_wait_ms: total_wait_ms,
+                            first_token_wait_ms: output.first_token_wait_ms,
+                            duration_ms,
+                            output_messages_json: Some(output.output_messages_json.as_str()),
+                            response_text: Some(output.content.as_str()),
+                            error_text: None,
+                            input_tokens: output.usage.input_tokens,
+                            output_tokens: output.usage.output_tokens,
+                            cached_input_tokens: output.usage.cached_input_tokens,
+                            total_tokens: output.usage.total_tokens,
+                        },
+                    )
+                    .await,
+                    "llm call log finalize success failed",
                 )
-                .await
-                {
-                    tracing::warn!(?err, "llm call log finalize success failed");
-                }
-                state
-                    .llm_scheduler
-                    .clear_admin_override(log_record.id.as_str())
-                    .await;
+                .await;
                 return Ok(output.content);
             }
             Err(attempt_err) => {
@@ -1523,7 +1564,7 @@ pub async fn chat_completion(
                         .set_admin_override(LlmCallAdminOverride {
                             id: log_record.id.clone(),
                             status: "failed".to_owned(),
-                            attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                            attempt_count,
                             scheduler_wait_ms: total_wait_ms,
                             first_token_wait_ms,
                             duration_ms,
@@ -1534,39 +1575,38 @@ pub async fn chat_completion(
                             output_messages_json: None,
                             response_text: None,
                             error_text: Some(error_message.clone()),
-                            started_at: None,
+                            started_at: started_at_timestamp.clone(),
                             finished_at: Some(finished_at.clone()),
                             updated_at: finished_at.clone(),
                         })
                         .await;
                     in_flight_guard.release_permit();
                     drop(in_flight_guard);
-                    if let Err(log_err) = finalize_llm_call(
+                    reconcile_admin_override_after_persist(
                         state,
                         log_record.id.as_str(),
-                        FinalizeLlmCallUpdate {
-                            status: "failed",
-                            attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
-                            scheduler_wait_ms: total_wait_ms,
-                            first_token_wait_ms,
-                            duration_ms,
-                            output_messages_json: None,
-                            response_text: None,
-                            error_text: Some(error_message.as_str()),
-                            input_tokens: None,
-                            output_tokens: None,
-                            cached_input_tokens: None,
-                            total_tokens: None,
-                        },
+                        finalize_llm_call(
+                            state,
+                            log_record.id.as_str(),
+                            FinalizeLlmCallUpdate {
+                                status: "failed",
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms,
+                                duration_ms,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: Some(error_message.as_str()),
+                                input_tokens: None,
+                                output_tokens: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                            },
+                        )
+                        .await,
+                        "llm call log finalize failure failed",
                     )
-                    .await
-                    {
-                        tracing::warn!(?log_err, "llm call log finalize failure failed");
-                    }
-                    state
-                        .llm_scheduler
-                        .clear_admin_override(log_record.id.as_str())
-                        .await;
+                    .await;
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
@@ -1576,7 +1616,7 @@ pub async fn chat_completion(
                     .set_admin_override(LlmCallAdminOverride {
                         id: log_record.id.clone(),
                         status: "queued".to_owned(),
-                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                        attempt_count,
                         scheduler_wait_ms: total_wait_ms,
                         first_token_wait_ms: None,
                         duration_ms: None,
@@ -1587,28 +1627,27 @@ pub async fn chat_completion(
                         output_messages_json: None,
                         response_text: None,
                         error_text: None,
-                        started_at: None,
+                        started_at: started_at_timestamp.clone(),
                         finished_at: None,
-                        updated_at: requeued_at,
+                        updated_at: requeued_at.clone(),
                     })
                     .await;
                 in_flight_guard.release_permit();
                 drop(in_flight_guard);
-                if let Err(log_err) = requeue_llm_call_for_retry(
+                reconcile_admin_override_after_persist(
                     state,
                     log_record.id.as_str(),
-                    i64::try_from(attempt).unwrap_or(i64::MAX),
-                    total_wait_ms,
-                    retry_delay,
+                    requeue_llm_call_for_retry(
+                        state,
+                        log_record.id.as_str(),
+                        attempt_count,
+                        total_wait_ms,
+                        retry_delay,
+                    )
+                    .await,
+                    "llm call requeue update failed",
                 )
-                .await
-                {
-                    tracing::warn!(?log_err, "llm call requeue update failed");
-                }
-                state
-                    .llm_scheduler
-                    .clear_admin_override(log_record.id.as_str())
-                    .await;
+                .await;
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -2757,6 +2796,60 @@ mod tests {
 
         scheduler.clear_admin_override("call-1").await;
         assert!(scheduler.admin_overrides().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_admin_override_after_persist_clears_only_on_success() {
+        let state = setup_llm_state().await;
+        let snapshot = LlmCallAdminOverride {
+            id: "call-override".to_owned(),
+            status: "queued".to_owned(),
+            attempt_count: 1,
+            scheduler_wait_ms: 120,
+            first_token_wait_ms: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+            output_messages_json: None,
+            response_text: None,
+            error_text: None,
+            started_at: Some("2026-03-10T00:00:00Z".to_owned()),
+            finished_at: None,
+            updated_at: "2026-03-10T00:00:00Z".to_owned(),
+        };
+
+        state
+            .llm_scheduler
+            .set_admin_override(snapshot.clone())
+            .await;
+        reconcile_admin_override_after_persist(
+            state.as_ref(),
+            "call-override",
+            Ok(()),
+            "test persist success",
+        )
+        .await;
+        assert!(state.llm_scheduler.admin_overrides().await.is_empty());
+
+        state.llm_scheduler.set_admin_override(snapshot).await;
+        reconcile_admin_override_after_persist(
+            state.as_ref(),
+            "call-override",
+            Err(anyhow!("persist failed")),
+            "test persist failure",
+        )
+        .await;
+        assert_eq!(
+            state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .get("call-override")
+                .map(|item| item.status.as_str()),
+            Some("queued")
+        );
     }
 
     #[tokio::test]
