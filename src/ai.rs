@@ -1088,6 +1088,47 @@ async fn update_llm_call_running(
     Ok(())
 }
 
+async fn requeue_llm_call_for_retry(
+    state: &AppState,
+    call_id: &str,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    retry_delay: Duration,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET status = 'queued',
+            attempt_count = ?,
+            scheduler_wait_ms = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(attempt_count)
+    .bind(scheduler_wait_ms)
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("requeue llm_call failed")?;
+    append_llm_call_event(
+        state,
+        call_id,
+        "llm.retry_queued",
+        "queued",
+        serde_json::json!({
+            "attempt_count": attempt_count,
+            "scheduler_wait_ms": scheduler_wait_ms,
+            "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        }),
+    )
+    .await
+    .context("append llm_call retry queued event failed")?;
+    Ok(())
+}
+
 async fn finalize_llm_call(
     state: &AppState,
     call_id: &str,
@@ -1430,6 +1471,17 @@ pub async fn chat_completion(
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
+                if let Err(log_err) = requeue_llm_call_for_retry(
+                    state,
+                    log_record.id.as_str(),
+                    i64::try_from(attempt).unwrap_or(i64::MAX),
+                    total_wait_ms,
+                    retry_delay,
+                )
+                .await
+                {
+                    tracing::warn!(?log_err, "llm call requeue update failed");
+                }
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -2439,7 +2491,62 @@ pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{net::SocketAddr, sync::Arc};
+
+    use sqlx::{Row, sqlite::SqlitePoolOptions};
+    use url::Url;
+
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        state::build_oauth_client,
+    };
+
+    async fn setup_llm_state() -> Arc<AppState> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-ai-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
 
     #[test]
     fn retryable_status_detects_429_and_5xx() {
@@ -2487,6 +2594,80 @@ mod tests {
         assert_eq!(final_status.available_slots, 1);
         assert_eq!(final_status.in_flight_calls, 0);
         assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn requeue_llm_call_for_retry_sets_status_back_to_queued() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-retry-queued".to_owned(),
+            source: "tests.llm.retry".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        insert_llm_call(
+            state.as_ref(),
+            &log,
+            "gpt-4o-mini",
+            512,
+            "prompt",
+            Some("[]"),
+        )
+        .await
+        .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 120)
+            .await
+            .expect("mark llm call running");
+        requeue_llm_call_for_retry(
+            state.as_ref(),
+            log.id.as_str(),
+            1,
+            120,
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("requeue llm call");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, attempt_count, scheduler_wait_ms, started_at
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(row.get::<String, _>("status"), "queued");
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+        assert_eq!(row.get::<i64, _>("scheduler_wait_ms"), 120);
+        assert!(row.get::<Option<String>, _>("started_at").is_some());
+
+        let event = sqlx::query(
+            r#"
+            SELECT event_type, status, payload_json
+            FROM llm_call_events
+            WHERE call_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call event");
+
+        assert_eq!(event.get::<String, _>("event_type"), "llm.retry_queued");
+        assert_eq!(event.get::<String, _>("status"), "queued");
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.get::<String, _>("payload_json"))
+                .expect("parse event payload");
+        assert_eq!(payload["retry_delay_ms"], serde_json::json!(3000));
     }
 
     #[test]

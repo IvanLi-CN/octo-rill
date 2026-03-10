@@ -46,6 +46,7 @@
 - `chat_completion` 在每次尝试真正发起上游请求前必须先获取 permit；permit 获取前的排队时间累计到 `scheduler_wait_ms`。
 - 任意时刻单进程内在途 LLM 请求数不得超过 `AI_MAX_CONCURRENCY`。
 - permit 在每次 attempt 完成后立即释放；重试 attempt 需要重新排队获取 permit。
+- 若某次 attempt 因 `429` / `5xx` 等 retryable 错误进入退避等待，调用状态必须在退避窗口回写为 `queued`，避免管理页把已释放 permit 的调用误显示为 `running`。
 - 取消固定 1 秒发放间隔后，不再维护“下一次槽位时间”概念。
 
 ### 管理员观测
@@ -62,7 +63,8 @@
 3. Given `AI_MAX_CONCURRENCY=0` 或 `AI_MAX_CONCURRENCY=abc`，When 应用启动，Then 启动失败且错误信息明确包含 `AI_MAX_CONCURRENCY`。
 4. Given 管理员打开 `/admin/jobs` 的 `LLM 调度` 标签，When 状态接口返回并发数据，Then 页面仅保留 24h 聚合摘要，不再出现 `request_interval_ms` / `next_slot_in_ms` 节流语义，也不再展示独立的并发状态卡片。
 5. Given LLM 调用列表同时包含进行中、排队中与终止态记录，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 列表按“进行中 -> 排队中 -> 终止态”排序，且每组内按 `created_at` 倒序排列。
-6. Given LLM 调用因 permit 等待后成功或失败，When 管理员查看调用详情，Then `scheduler_wait_ms` 仍记录排队耗时。
+6. Given LLM 调用某次 attempt 因 retryable 错误进入退避等待，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 该调用在退避窗口显示为 `queued`，且不计入实时 `in_flight_calls`。
+7. Given LLM 调用因 permit 等待后成功或失败，When 管理员查看调用详情，Then `scheduler_wait_ms` 仍记录排队耗时。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 - `cargo test`
@@ -92,6 +94,7 @@
 - 2026-03-09: 新建规格，冻结 `AI_MAX_CONCURRENCY`、无固定限流、管理员并发状态改造范围与验收标准。
 - 2026-03-09: 完成后端 permit scheduler、管理员并发状态 API、README / docs-site / e2e 同步，并通过 `cargo test`、`bun run build`、`bun run e2e -- admin-jobs.spec.ts` 本地验证。
 - 2026-03-10: 根据主人确认的最新 UI 口径，LLM 调度页移除独立并发状态卡片，仅保留 24h 聚合摘要，并把调用列表排序固定为“进行中 -> 排队中 -> 终止态 / 组内按创建时间倒序”。
+- 2026-03-10: 根据 review-loop 修正 retryable LLM 调用在退避窗口的状态回写，确保 permit 已释放后调用重新显示为 `queued`，且不影响实时任务列表原有的按创建时间倒序排序。
 - 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
 - 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
 - 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。
