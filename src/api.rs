@@ -1990,6 +1990,7 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let runtime = state.llm_scheduler.runtime_status();
 
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
@@ -2053,6 +2054,7 @@ pub async fn admin_list_llm_calls(
     Query(query): Query<AdminLlmCallsQuery>,
 ) -> Result<Json<AdminLlmCallsResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
     let offset = admin_users_offset(page, page_size)?;
@@ -2171,6 +2173,7 @@ pub async fn admin_get_llm_call_detail(
     Path(call_id): Path<String>,
 ) -> Result<Json<AdminLlmCallDetailItem>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let _snapshot = state.llm_scheduler.admin_snapshot().await;
     let call_id = parse_local_id_param(call_id, "call_id")?;
 
     let item = sqlx::query_as::<_, AdminLlmCallDetailItem>(

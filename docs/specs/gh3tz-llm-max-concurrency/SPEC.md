@@ -52,6 +52,7 @@
 
 ### 管理员观测
 - `GET /api/admin/jobs/llm/status` 改为返回并发语义字段：`max_concurrency`、`available_slots`、`waiting_calls`、`in_flight_calls`，并继续保留 24h 聚合指标。
+- 管理员 LLM 状态 / 列表 / 详情接口在 retry / finalize 状态切换期间不得暴露“permit 已释放但调用仍显示为 `running`”的半完成快照；管理端要么看到切换前，要么看到切换后。
 - `/admin/jobs` 的 LLM 调度页不再展示固定节流文案，也不再保留独立的并发状态卡片；并发字段仍由状态接口提供给管理端与测试契约。
 - 前端 mock / 测试 fixture / e2e 断言必须与新接口字段保持一致。
 
@@ -98,6 +99,7 @@
 - 2026-03-10: 根据 review-loop 修正 retryable LLM 调用在退避窗口的状态回写，确保 permit 已释放后调用重新显示为 `queued`，且不影响实时任务列表原有的按创建时间倒序排序。
 - 2026-03-10: 根据 review-loop 为 LLM 调用列表补齐专用排序索引，并为 `Retry-After` 增加最小退避下限，避免热路径整表排序与 0ms 重试抖动。
 - 2026-03-10: 根据 review-loop 为 `AI_MAX_CONCURRENCY` 增加 Tokio semaphore permits 上限校验，避免超大误配置触发启动期 panic，并补齐越界配置回归测试。
+- 2026-03-10: 根据 review-loop 为管理员 LLM 观测增加内部快照门闩，确保 permit 释放与 `running -> queued/terminal` 状态切换从管理接口视角原子可见。
 - 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
 - 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
 - 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。
