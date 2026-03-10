@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+	apiGetTranslationRequest,
 	apiSubmitTranslationRequest,
 	type TranslationRequestItemInput,
+	type TranslationRequestResponse,
+	ApiError,
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
@@ -10,6 +13,8 @@ const MAX_CONCURRENT = 2;
 const QUEUE_FLUSH_DELAY_MS = 300;
 const WAIT_RECOVERY_MAX_RETRIES = 3;
 const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 1_500;
+const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -55,6 +60,23 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+function isPendingTranslationStatus(status: string) {
+	return status === "queued" || status === "running";
+}
+
+function sleep(ms: number) {
+	return new Promise((resolve) => {
+		window.setTimeout(resolve, ms);
+	});
+}
+
+class TranslationPendingError extends Error {
+	constructor(message = "translation is still processing") {
+		super(message);
+		this.name = "TranslationPendingError";
+	}
+}
+
 export function useAutoTranslate(params: {
 	enabled: boolean;
 	onTranslated: (
@@ -72,6 +94,7 @@ export function useAutoTranslate(params: {
 	const queuedRef = useRef<string[]>([]);
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
+	const activeRequestIdRef = useRef(new Map<string, string>());
 	const waitRetryCountRef = useRef(new Map<string, number>());
 	const runningRef = useRef(0);
 	const flushTimerRef = useRef<number | null>(null);
@@ -87,38 +110,82 @@ export function useAutoTranslate(params: {
 		[enabled],
 	);
 
-	const translateSingle = useCallback(async (item: FeedItem) => {
-		const requestItem = buildReleaseSummaryRequestItem(item);
-		const abortController = new AbortController();
-		const timeoutId = globalThis.setTimeout(() => {
-			abortController.abort();
-		}, requestItem.max_wait_ms + WAIT_REQUEST_TIMEOUT_BUFFER_MS);
-		try {
-			const response = await apiSubmitTranslationRequest(
-				{
-					mode: "wait",
-					item: requestItem,
-				},
-				{ signal: abortController.signal },
-			);
+	const loadActiveRequest = useCallback(async (requestId: string) => {
+		let latest = await apiGetTranslationRequest(requestId);
+		const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+		while (isPendingTranslationStatus(latest.result.status)) {
+			if (Date.now() >= deadline) {
+				return { response: latest, terminal: false as const };
+			}
+			await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+			latest = await apiGetTranslationRequest(requestId);
+		}
+		return { response: latest, terminal: true as const };
+	}, []);
+
+	const translateSingle = useCallback(
+		async (item: FeedItem) => {
+			const key = keyOf(item);
+			const requestItem = buildReleaseSummaryRequestItem(item);
+			const existingRequestId = activeRequestIdRef.current.get(key);
+			let response: TranslationRequestResponse;
+			let terminal = true;
+
+			if (existingRequestId) {
+				const active = await loadActiveRequest(existingRequestId);
+				response = active.response;
+				terminal = active.terminal;
+			} else {
+				const abortController = new AbortController();
+				const timeoutId = globalThis.setTimeout(() => {
+					abortController.abort();
+				}, requestItem.max_wait_ms + WAIT_REQUEST_TIMEOUT_BUFFER_MS);
+				try {
+					response = await apiSubmitTranslationRequest(
+						{
+							mode: "wait",
+							item: requestItem,
+						},
+						{ signal: abortController.signal },
+					);
+				} catch (error) {
+					if (error instanceof DOMException && error.name === "AbortError") {
+						throw new Error("translate wait timeout");
+					}
+					throw error;
+				} finally {
+					globalThis.clearTimeout(timeoutId);
+				}
+				if (isPendingTranslationStatus(response.result.status)) {
+					activeRequestIdRef.current.set(key, response.request_id);
+					const active = await loadActiveRequest(response.request_id);
+					response = active.response;
+					terminal = active.terminal;
+				}
+			}
+
 			const translated = response.result;
+			if (!terminal) {
+				activeRequestIdRef.current.set(key, response.request_id);
+				return { translated, mapped: null, terminal: false as const };
+			}
+
+			activeRequestIdRef.current.delete(key);
 			const mapped = mapTranslationItemToFeedResponse(translated);
 			if (!mapped) {
 				if (translated.status === "missing" || translated.status === "error") {
-					return { translated, mapped };
+					return { translated, mapped, terminal: true as const };
 				}
-				throw new Error(translated.error ?? "translate wait timeout");
+				throw new ApiError(
+					504,
+					translated.error ?? "translate wait timeout",
+					"translation_wait_timeout",
+				);
 			}
-			return { translated, mapped };
-		} catch (error) {
-			if (error instanceof DOMException && error.name === "AbortError") {
-				throw new Error("translate wait timeout");
-			}
-			throw error;
-		} finally {
-			globalThis.clearTimeout(timeoutId);
-		}
-	}, []);
+			return { translated, mapped, terminal: true as const };
+		},
+		[loadActiveRequest],
+	);
 
 	const requeueAfterFailure = useCallback((item: FeedItem) => {
 		const key = keyOf(item);
@@ -156,7 +223,13 @@ export function useAutoTranslate(params: {
 			forceRender((x) => x + 1);
 
 			void translateSingle(item)
-				.then(({ translated, mapped }) => {
+				.then(({ translated, mapped, terminal }) => {
+					if (!terminal) {
+						if (!queuedRef.current.includes(key)) {
+							queuedRef.current.push(key);
+						}
+						return;
+					}
 					waitRetryCountRef.current.delete(key);
 					if (mapped) {
 						onTranslated(item, mapped);
@@ -235,7 +308,14 @@ export function useAutoTranslate(params: {
 			forceRender((x) => x + 1);
 
 			try {
-				const { translated, mapped } = await translateSingle(item);
+				const { translated, mapped, terminal } = await translateSingle(item);
+				if (!terminal) {
+					if (!queuedRef.current.includes(key)) {
+						queuedRef.current.push(key);
+					}
+					schedulePump();
+					throw new TranslationPendingError();
+				}
 				if (!mapped) {
 					failedRef.current.add(key);
 					throw new Error(translated.error ?? "translate failed");
@@ -246,14 +326,16 @@ export function useAutoTranslate(params: {
 				}
 				return mapped;
 			} catch (err) {
-				failedRef.current.add(key);
+				if (!(err instanceof TranslationPendingError)) {
+					failedRef.current.add(key);
+				}
 				throw err;
 			} finally {
 				inFlightRef.current.delete(key);
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, translateSingle],
+		[onTranslated, schedulePump, translateSingle],
 	);
 
 	useEffect(() => {

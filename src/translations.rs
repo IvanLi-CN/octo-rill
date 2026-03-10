@@ -1208,6 +1208,9 @@ async fn insert_translation_request(
             now,
         )
         .await?;
+        if let Some(batch_id) = existing.batch_id.as_deref() {
+            refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+        }
         return Ok(CreatedTranslationRequest {
             request_id,
             status,
@@ -3116,6 +3119,118 @@ mod tests {
             "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
         )
         .bind("batch-queued-window")
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load batch item counters");
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_terminal_batched_work_item_updates_batch_counters() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("batched-terminal-window");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+            "#,
+        )
+        .bind("batch-terminal-window")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-terminal-1")
+        .bind("batch-terminal-window")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                batch_id = 'batch-terminal-window',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "failed");
+        assert_eq!(second.result.status, "error");
+        assert_eq!(
+            second.result.batch_id.as_deref(),
+            Some("batch-terminal-window")
+        );
+
+        let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
+            .bind("batch-terminal-window")
+            .fetch_one(&pool)
+            .await
+            .expect("load batch counters");
+        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+
+        let batch_item = sqlx::query(
+            "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
+        )
+        .bind("batch-terminal-window")
         .bind(work_item_id.as_str())
         .fetch_one(&pool)
         .await
