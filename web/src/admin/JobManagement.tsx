@@ -1156,6 +1156,8 @@ function translationItemStatusLabel(status: string) {
 			return "错误";
 		case "queued":
 			return "排队中";
+		case "running":
+			return "处理中";
 		default:
 			return status;
 	}
@@ -1186,6 +1188,8 @@ function translationItemTone(status: string): BadgeTone {
 			return taskStatusTone("failed");
 		case "queued":
 			return taskStatusTone("queued");
+		case "running":
+			return taskStatusTone("running");
 		default:
 			return taskStatusTone(status);
 	}
