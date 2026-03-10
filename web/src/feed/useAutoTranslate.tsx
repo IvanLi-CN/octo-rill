@@ -9,6 +9,7 @@ import type { FeedItem, TranslateResponse } from "@/feed/types";
 const MAX_CONCURRENT = 2;
 const QUEUE_FLUSH_DELAY_MS = 300;
 const WAIT_RECOVERY_MAX_RETRIES = 3;
+const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 1_500;
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -87,20 +88,36 @@ export function useAutoTranslate(params: {
 	);
 
 	const translateSingle = useCallback(async (item: FeedItem) => {
-		const response = await apiSubmitTranslationRequest({
-			mode: "wait",
-			item: buildReleaseSummaryRequestItem(item),
-		});
-		const translated = response.result;
-		const mapped = mapTranslationItemToFeedResponse(translated);
-		if (
-			!mapped &&
-			translated.status !== "missing" &&
-			translated.status !== "error"
-		) {
-			throw new Error(translated.error ?? "translate failed");
+		const requestItem = buildReleaseSummaryRequestItem(item);
+		const abortController = new AbortController();
+		const timeoutId = globalThis.setTimeout(() => {
+			abortController.abort();
+		}, requestItem.max_wait_ms + WAIT_REQUEST_TIMEOUT_BUFFER_MS);
+		try {
+			const response = await apiSubmitTranslationRequest(
+				{
+					mode: "wait",
+					item: requestItem,
+				},
+				{ signal: abortController.signal },
+			);
+			const translated = response.result;
+			const mapped = mapTranslationItemToFeedResponse(translated);
+			if (!mapped) {
+				if (translated.status === "missing" || translated.status === "error") {
+					return { translated, mapped };
+				}
+				throw new Error(translated.error ?? "translate wait timeout");
+			}
+			return { translated, mapped };
+		} catch (error) {
+			if (error instanceof DOMException && error.name === "AbortError") {
+				throw new Error("translate wait timeout");
+			}
+			throw error;
+		} finally {
+			globalThis.clearTimeout(timeoutId);
 		}
-		return { translated, mapped };
 	}, []);
 
 	const requeueAfterFailure = useCallback((item: FeedItem) => {

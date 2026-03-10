@@ -87,6 +87,7 @@
 - `item` 与 `items` 互斥。
 - `wait` / `stream` 只接受 `item`。
 - `async` 可接受 `item` 或 `items`。
+- `wait` 最多阻塞到 `item.max_wait_ms`；若预算内未进入终态，则返回该 request 当前的单结果快照（`status` 可能仍为 `queued | running`）。
 - 旧的 `{ "mode": "wait", "items": [...] }` 与 `{ "mode": "stream", "items": [...] }` 直接返回 `400 bad_request`。
 
 ## `GET /api/translate/requests/{request_id}`
