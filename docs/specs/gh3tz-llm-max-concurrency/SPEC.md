@@ -15,7 +15,7 @@
 - 新增环境变量 `AI_MAX_CONCURRENCY`，以正整数控制单进程内 LLM 最大并行数，未配置时默认 `1`。
 - 移除固定 1Hz 发放节流，改为仅按 permit / semaphore 控制最大同时在途请求数。
 - 保留 `scheduler_wait_ms`、`waiting_calls`、`in_flight_calls` 观测能力，但语义改为“等待 permit 的排队耗时 / 数量”。
-- 管理员 `/admin/jobs` 中的 LLM 调度页切换到并发语义：保留 24h 聚合摘要，移除独立并发状态卡片，并确保调用列表按状态分组（进行中 / 排队中 / 终止态）与创建时间倒序展示。
+- 管理员 `/admin/jobs` 中的 LLM 调度页切换到并发语义：保留 24h 聚合摘要，移除独立并发状态卡片，并确保主 LLM 列表按状态分组（进行中 / 排队中 / 终止态）与创建时间倒序展示；任务详情里的关联 LLM 调用继续按创建时间倒序展示。
 - 同步更新 README、`.env.example`、docs-site 配置文档与前端 mock / e2e 契约。
 
 ### Non-goals
@@ -47,12 +47,14 @@
 - 任意时刻单进程内在途 LLM 请求数不得超过 `AI_MAX_CONCURRENCY`。
 - permit 在每次 attempt 完成后立即释放；重试 attempt 需要重新排队获取 permit。
 - 若某次 attempt 因 `429` / `5xx` 等 retryable 错误进入退避等待，调用状态必须在退避窗口回写为 `queued`，避免管理页把已释放 permit 的调用误显示为 `running`。
+- 已释放 permit 但数据库状态尚未落盘的瞬态必须通过短暂的观测状态覆盖来吸收，不能让管理页查询反向阻塞真实 LLM permit 释放。
 - LLM 调用列表的“进行中 / 排队中 / 终止态”排序必须保持可索引实现，避免管理页热路径退化为整表扫描。
 - 取消固定 1 秒发放间隔后，不再维护“下一次槽位时间”概念。
 
 ### 管理员观测
 - `GET /api/admin/jobs/llm/status` 改为返回并发语义字段：`max_concurrency`、`available_slots`、`waiting_calls`、`in_flight_calls`，并继续保留 24h 聚合指标。
-- 管理员 LLM 状态 / 列表 / 详情接口在 retry / finalize 状态切换期间不得暴露“permit 已释放但调用仍显示为 `running`”的半完成快照；管理端要么看到切换前，要么看到切换后。
+- 管理员 LLM 状态 / 列表 / 详情接口在 retry / finalize 状态切换期间不得暴露“permit 已释放但调用仍显示为 `running`”的半完成快照；管理端要么看到切换前，要么看到切换后，但这种一致性不能通过阻塞 permit 释放来换取。
+- `GET /api/admin/jobs/llm/calls` 默认按 `created_at DESC, id DESC` 返回；主 LLM 列表需要状态分组排序时必须显式声明排序模式，避免影响任务详情里的关联调用时序。
 - `/admin/jobs` 的 LLM 调度页不再展示固定节流文案，也不再保留独立的并发状态卡片；并发字段仍由状态接口提供给管理端与测试契约。
 - 前端 mock / 测试 fixture / e2e 断言必须与新接口字段保持一致。
 
@@ -64,9 +66,10 @@
 2. Given `AI_MAX_CONCURRENCY=3`，When 4 个 LLM 调用同时进入调度，Then 最多只有 3 个请求同时在途，剩余调用仅因 permit 不足而等待。
 3. Given `AI_MAX_CONCURRENCY=0`、`AI_MAX_CONCURRENCY=abc` 或 `AI_MAX_CONCURRENCY` 超过 Tokio semaphore permits 上限，When 应用启动，Then 启动失败且错误信息明确包含 `AI_MAX_CONCURRENCY`。
 4. Given 管理员打开 `/admin/jobs` 的 `LLM 调度` 标签，When 状态接口返回并发数据，Then 页面仅保留 24h 聚合摘要，不再出现 `request_interval_ms` / `next_slot_in_ms` 节流语义，也不再展示独立的并发状态卡片。
-5. Given LLM 调用列表同时包含进行中、排队中与终止态记录，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 列表按“进行中 -> 排队中 -> 终止态”排序，且每组内按 `created_at` 倒序排列。
+5. Given LLM 调用列表同时包含进行中、排队中与终止态记录，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 主 LLM 列表按“进行中 -> 排队中 -> 终止态”排序，且每组内按 `created_at` 倒序排列。
 6. Given LLM 调用某次 attempt 因 retryable 错误进入退避等待，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 该调用在退避窗口显示为 `queued`，且不计入实时 `in_flight_calls`。
 7. Given LLM 调用因 permit 等待后成功或失败，When 管理员查看调用详情，Then `scheduler_wait_ms` 仍记录排队耗时。
+8. Given 管理员从任务详情查看关联 LLM 调用，When 这些调用同时包含运行中与终止态记录，Then 关联调用列表仍按 `created_at DESC, id DESC` 展示，而不是被主 LLM 列表的状态分组排序改写。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 - `cargo test`
@@ -99,7 +102,8 @@
 - 2026-03-10: 根据 review-loop 修正 retryable LLM 调用在退避窗口的状态回写，确保 permit 已释放后调用重新显示为 `queued`，且不影响实时任务列表原有的按创建时间倒序排序。
 - 2026-03-10: 根据 review-loop 为 LLM 调用列表补齐专用排序索引，并为 `Retry-After` 增加最小退避下限，避免热路径整表排序与 0ms 重试抖动。
 - 2026-03-10: 根据 review-loop 为 `AI_MAX_CONCURRENCY` 增加 Tokio semaphore permits 上限校验，避免超大误配置触发启动期 panic，并补齐越界配置回归测试。
-- 2026-03-10: 根据 review-loop 为管理员 LLM 观测增加内部快照门闩，确保 permit 释放与 `running -> queued/terminal` 状态切换从管理接口视角原子可见。
+- 2026-03-10: 根据 review-loop 用轻量观测状态覆盖吸收 `running -> queued/terminal` 的短暂落盘窗口，既保证管理接口不会读到半完成快照，也避免管理页反向压低 LLM 吞吐。
+- 2026-03-10: 根据 review-loop 把 LLM 状态分组排序收敛为主列表显式排序模式；任务详情里的关联 LLM 调用恢复按创建时间倒序展示。
 - 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
 - 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
 - 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。

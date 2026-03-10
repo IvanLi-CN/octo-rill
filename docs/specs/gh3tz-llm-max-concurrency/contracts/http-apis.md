@@ -27,3 +27,22 @@
 - `waiting_calls` counts requests waiting for a permit before an upstream attempt starts.
 - `in_flight_calls` counts requests currently holding a permit and talking to the upstream model.
 - `scheduler_wait_ms` on call logs keeps the accumulated permit-queue wait time across attempts.
+
+
+## Changed: `GET /api/admin/jobs/llm/calls`
+
+### Query
+
+- `status`: `all | queued | running | succeeded | failed`
+- `source`: optional source filter
+- `requested_by`: optional user id filter
+- `parent_task_id`: optional parent task filter
+- `started_from` / `started_to`: optional RFC3339 timestamps
+- `sort`: optional; `created_desc` by default, or `status_grouped` for the main LLM tab
+- `page`, `page_size`: pagination
+
+### Notes
+
+- `sort=status_grouped` returns the main LLM list in `running -> queued -> terminal` groups, then `created_at DESC`.
+- Omitting `sort` keeps the response reverse-chronological (`created_at DESC, id DESC`), which is what task-detail related-call views use.
+- During retry / finalize transitions, the API may temporarily overlay the observable status in memory so readers do not see a released permit paired with a stale `running` row.
