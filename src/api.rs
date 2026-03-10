@@ -2134,7 +2134,6 @@ pub async fn admin_list_llm_calls(
             WHEN status = 'queued' THEN 1
             ELSE 2
           END,
-          unixepoch(created_at) DESC,
           created_at DESC,
           id DESC
         LIMIT ? OFFSET ?
@@ -7238,7 +7237,7 @@ mod tests {
         response::IntoResponse,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
     use tower_sessions::{MemoryStore, Session};
     use url::Url;
 
@@ -7858,6 +7857,68 @@ mod tests {
         assert_eq!(
             ids,
             vec!["task-new-failed", "task-mid-succeeded", "task-old-running"]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_list_llm_calls_sort_uses_admin_sort_index() {
+        let pool = setup_pool().await;
+        let plan_rows = sqlx::query(
+            r#"
+            EXPLAIN QUERY PLAN
+            SELECT
+              id,
+              status,
+              created_at
+            FROM llm_calls
+            WHERE (? = 'all' OR status = ?)
+              AND (? = '' OR source = ?)
+              AND (? IS NULL OR requested_by = ?)
+              AND (? = '' OR parent_task_id = ?)
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) >= unixepoch(?))
+              AND (? IS NULL OR unixepoch(COALESCE(started_at, created_at)) <= unixepoch(?))
+            ORDER BY
+              CASE
+                WHEN status = 'running' THEN 0
+                WHEN status = 'queued' THEN 1
+                ELSE 2
+              END,
+              created_at DESC,
+              id DESC
+            LIMIT ? OFFSET ?
+            "#,
+        )
+        .bind("all")
+        .bind("all")
+        .bind("")
+        .bind("")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("")
+        .bind("")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_llm_calls_admin_sort"))
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY"))
         );
     }
 

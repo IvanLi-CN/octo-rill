@@ -870,12 +870,13 @@ fn retry_backoff_floor(attempt: usize) -> Duration {
 }
 
 fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let floor = retry_backoff_floor(attempt);
     if let Some(delay) = retry_after {
-        return delay;
+        return delay.max(floor);
     }
 
     let jitter_ms = rand::rng().random_range(0..=LLM_RETRY_BACKOFF_JITTER_MAX_MS);
-    retry_backoff_floor(attempt) + Duration::from_millis(jitter_ms)
+    floor + Duration::from_millis(jitter_ms)
 }
 
 struct SchedulerInFlightGuard {
@@ -2694,6 +2695,14 @@ mod tests {
         let delay = Duration::from_secs(3);
 
         assert_eq!(next_retry_delay(2, Some(delay)), delay);
+    }
+
+    #[test]
+    fn next_retry_delay_clamps_zero_retry_after_to_backoff_floor() {
+        assert_eq!(
+            next_retry_delay(3, Some(Duration::ZERO)),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
