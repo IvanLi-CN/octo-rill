@@ -514,6 +514,12 @@ function taskStatusLabel(status: string) {
 	}
 }
 
+type TaskStatusTone = {
+	cardAccentClass: string;
+	badgeClass: string;
+	dotClass: string;
+};
+
 function llmCallStatusSortOrder(status: string) {
 	switch (status) {
 		case "running":
@@ -523,6 +529,11 @@ function llmCallStatusSortOrder(status: string) {
 		default:
 			return 2;
 	}
+}
+
+function llmCallCreatedAtSortKey(createdAt: string) {
+	const timestamp = Date.parse(createdAt);
+	return Number.isNaN(timestamp) ? Number.MIN_SAFE_INTEGER : timestamp;
 }
 
 function sortLlmCallsForDisplay(calls: AdminLlmCallItem[]) {
@@ -535,20 +546,20 @@ function sortLlmCallsForDisplay(calls: AdminLlmCallItem[]) {
 		}
 
 		const createdDiff =
-			Date.parse(right.created_at) - Date.parse(left.created_at);
-		if (!Number.isNaN(createdDiff) && createdDiff !== 0) {
+			llmCallCreatedAtSortKey(right.created_at) -
+			llmCallCreatedAtSortKey(left.created_at);
+		if (createdDiff !== 0) {
 			return createdDiff;
+		}
+
+		const createdAtDiff = right.created_at.localeCompare(left.created_at);
+		if (createdAtDiff !== 0) {
+			return createdAtDiff;
 		}
 
 		return right.id.localeCompare(left.id);
 	});
 }
-
-type TaskStatusTone = {
-	cardAccentClass: string;
-	badgeClass: string;
-	dotClass: string;
-};
 
 function taskStatusTone(status: string): TaskStatusTone {
 	switch (status) {

@@ -49,6 +49,7 @@
 - 若某次 attempt 因 `429` / `5xx` 等 retryable 错误进入退避等待，调用状态必须在退避窗口回写为 `queued`，避免管理页把已释放 permit 的调用误显示为 `running`。
 - 已释放 permit 但数据库状态尚未落盘的瞬态必须通过短暂的观测状态覆盖来吸收，不能让管理页查询反向阻塞真实 LLM permit 释放。
 - LLM 调用列表的“进行中 / 排队中 / 终止态”排序必须保持可索引实现，避免管理页热路径退化为整表扫描。
+- 覆盖中的 `started_at` / `status` 瞬态必须参与管理页筛选与总数计算，不能因为数据库尚未落盘而把运行中的调用从时间过滤结果里漏掉。
 - 取消固定 1 秒发放间隔后，不再维护“下一次槽位时间”概念。
 
 ### 管理员观测
@@ -104,6 +105,7 @@
 - 2026-03-10: 根据 review-loop 为 `AI_MAX_CONCURRENCY` 增加 Tokio semaphore permits 上限校验，避免超大误配置触发启动期 panic，并补齐越界配置回归测试。
 - 2026-03-10: 根据 review-loop 用轻量观测状态覆盖吸收 `running -> queued/terminal` 的短暂落盘窗口，既保证管理接口不会读到半完成快照，也避免管理页反向压低 LLM 吞吐。
 - 2026-03-10: 根据 review-loop 把 LLM 状态分组排序收敛为主列表显式排序模式；任务详情里的关联 LLM 调用恢复按创建时间倒序展示。
+- 2026-03-10: 根据最新 review-loop 补齐 source / requested_by / parent_task 过滤场景下的排序索引，并让 override 中的 `started_at` 参与主列表时间筛选与总数计算，同时移除前端对服务端分页结果的二次重排。
 - 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
 - 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
 - 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。
