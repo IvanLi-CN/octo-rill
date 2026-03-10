@@ -39,7 +39,7 @@
 ## 功能与行为规格（Functional / Behavior Spec）
 ### 配置与启动
 - `AI_MAX_CONCURRENCY` 必须解析为正整数；空值视为未配置并回退到默认值 `1`。
-- 若 `AI_MAX_CONCURRENCY` 为 `0`、负数或非整数，启动直接失败，错误信息必须明确指向该变量。
+- 若 `AI_MAX_CONCURRENCY` 为 `0`、负数、非整数或超过 Tokio semaphore 允许的最大 permits，启动直接失败，错误信息必须明确指向该变量。
 - 即使未配置 `AI_API_KEY`，配置解析也保持可预测：`AI_MAX_CONCURRENCY` 仍采用默认值 `1` 或在非法值时给出明确错误。
 
 ### 调度 runtime
@@ -61,7 +61,7 @@
 ## 验收标准（Acceptance Criteria）
 1. Given 未设置 `AI_MAX_CONCURRENCY`，When 应用启动并发起 LLM 请求，Then 单进程最大并行数按 `1` 生效。
 2. Given `AI_MAX_CONCURRENCY=3`，When 4 个 LLM 调用同时进入调度，Then 最多只有 3 个请求同时在途，剩余调用仅因 permit 不足而等待。
-3. Given `AI_MAX_CONCURRENCY=0` 或 `AI_MAX_CONCURRENCY=abc`，When 应用启动，Then 启动失败且错误信息明确包含 `AI_MAX_CONCURRENCY`。
+3. Given `AI_MAX_CONCURRENCY=0`、`AI_MAX_CONCURRENCY=abc` 或 `AI_MAX_CONCURRENCY` 超过 Tokio semaphore permits 上限，When 应用启动，Then 启动失败且错误信息明确包含 `AI_MAX_CONCURRENCY`。
 4. Given 管理员打开 `/admin/jobs` 的 `LLM 调度` 标签，When 状态接口返回并发数据，Then 页面仅保留 24h 聚合摘要，不再出现 `request_interval_ms` / `next_slot_in_ms` 节流语义，也不再展示独立的并发状态卡片。
 5. Given LLM 调用列表同时包含进行中、排队中与终止态记录，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 列表按“进行中 -> 排队中 -> 终止态”排序，且每组内按 `created_at` 倒序排列。
 6. Given LLM 调用某次 attempt 因 retryable 错误进入退避等待，When 管理员查看 `/admin/jobs` 的 `LLM 调度` 标签，Then 该调用在退避窗口显示为 `queued`，且不计入实时 `in_flight_calls`。
@@ -97,6 +97,7 @@
 - 2026-03-10: 根据主人确认的最新 UI 口径，LLM 调度页移除独立并发状态卡片，仅保留 24h 聚合摘要，并把调用列表排序固定为“进行中 -> 排队中 -> 终止态 / 组内按创建时间倒序”。
 - 2026-03-10: 根据 review-loop 修正 retryable LLM 调用在退避窗口的状态回写，确保 permit 已释放后调用重新显示为 `queued`，且不影响实时任务列表原有的按创建时间倒序排序。
 - 2026-03-10: 根据 review-loop 为 LLM 调用列表补齐专用排序索引，并为 `Retry-After` 增加最小退避下限，避免热路径整表排序与 0ms 重试抖动。
+- 2026-03-10: 根据 review-loop 为 `AI_MAX_CONCURRENCY` 增加 Tokio semaphore permits 上限校验，避免超大误配置触发启动期 panic，并补齐越界配置回归测试。
 - 2026-03-09: 根据 review-loop 补上 `AI_MAX_CONCURRENCY` 空字符串回退默认值 `1` 的配置兼容，并将 blank-value 容忍范围限制在该变量本身。
 - 2026-03-09: 根据 review-loop 恢复 retryable LLM 请求的 `Retry-After` / 指数退避，避免取消固定节流后出现重试风暴。
 - 2026-03-09: PR #34 已创建并更新到 `fd53622`，GitHub checks 全绿，review-loop 清零，spec-sync 收敛完成。

@@ -42,6 +42,20 @@ fn parse_positive_usize_env(name: &str, blank_is_unset: bool) -> Result<Option<u
     Ok(Some(parsed))
 }
 
+fn parse_bounded_positive_usize_env(
+    name: &str,
+    blank_is_unset: bool,
+    max: usize,
+) -> Result<Option<usize>> {
+    let parsed = parse_positive_usize_env(name, blank_is_unset)?;
+    if let Some(value) = parsed
+        && value > max
+    {
+        anyhow::bail!("invalid {name} (expected positive integer <= {max})");
+    }
+    Ok(parsed)
+}
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
@@ -174,7 +188,12 @@ impl AppConfig {
         }
         .transpose()?;
 
-        let ai_max_concurrency = parse_positive_usize_env("AI_MAX_CONCURRENCY", true)?.unwrap_or(1);
+        let ai_max_concurrency = parse_bounded_positive_usize_env(
+            "AI_MAX_CONCURRENCY",
+            true,
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )?
+        .unwrap_or(1);
 
         let ai_model_context_limit = env::var("AI_MODEL_CONTEXT_LIMIT")
             .ok()
@@ -313,6 +332,26 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("invalid AI_MAX_CONCURRENCY (expected positive integer)"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_ai_max_concurrency_above_semaphore_limit() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        let overflow = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        unsafe {
+            env::set_var("AI_MAX_CONCURRENCY", overflow.to_string());
+        }
+
+        let err = AppConfig::from_env().expect_err("out-of-range concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "invalid AI_MAX_CONCURRENCY (expected positive integer <= {})",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )),
             "unexpected error: {err:?}"
         );
     }
