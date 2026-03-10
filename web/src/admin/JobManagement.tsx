@@ -520,6 +520,47 @@ type TaskStatusTone = {
 	dotClass: string;
 };
 
+function llmCallStatusSortOrder(status: string) {
+	switch (status) {
+		case "running":
+			return 0;
+		case "queued":
+			return 1;
+		default:
+			return 2;
+	}
+}
+
+function llmCallCreatedAtSortKey(createdAt: string) {
+	const timestamp = Date.parse(createdAt);
+	return Number.isNaN(timestamp) ? Number.MIN_SAFE_INTEGER : timestamp;
+}
+
+function sortLlmCallsForDisplay(calls: AdminLlmCallItem[]) {
+	return [...calls].sort((left, right) => {
+		const statusDiff =
+			llmCallStatusSortOrder(left.status) -
+			llmCallStatusSortOrder(right.status);
+		if (statusDiff !== 0) {
+			return statusDiff;
+		}
+
+		const createdDiff =
+			llmCallCreatedAtSortKey(right.created_at) -
+			llmCallCreatedAtSortKey(left.created_at);
+		if (createdDiff !== 0) {
+			return createdDiff;
+		}
+
+		const createdAtDiff = right.created_at.localeCompare(left.created_at);
+		if (createdAtDiff !== 0) {
+			return createdAtDiff;
+		}
+
+		return right.id.localeCompare(left.id);
+	});
+}
+
 function taskStatusTone(status: string): TaskStatusTone {
 	switch (status) {
 		case "queued":
@@ -2553,6 +2594,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			try {
 				const params = new URLSearchParams();
 				params.set("status", llmStatusFilter);
+				params.set("sort", "status_grouped");
 				params.set("page", String(llmCallPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
 				if (llmSourceFilter.trim()) {
@@ -2574,7 +2616,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				if (requestId !== llmCallsRequestIdRef.current) {
 					return;
 				}
-				setLlmCalls(res.items);
+				setLlmCalls(sortLlmCallsForDisplay(res.items));
 				setLlmCallTotal(res.total);
 				llmCallsLoadedOnceRef.current = true;
 			} catch (err) {
@@ -2640,6 +2682,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const loadTaskRelatedLlmCalls = useCallback(async (taskId: string) => {
 		const params = new URLSearchParams();
 		params.set("status", "all");
+		params.set("sort", "created_desc");
 		params.set("page", "1");
 		params.set("page_size", "50");
 		params.set("parent_task_id", taskId);
@@ -3560,28 +3603,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 							</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-4">
-							<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-								<div className="bg-card/70 rounded-lg border p-3">
-									<p className="text-muted-foreground text-xs">调度器状态</p>
-									<p className="mt-1 text-sm font-semibold">
-										{llmStatus?.scheduler_enabled ? "已启用" : "未启用"}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										节流{" "}
-										{formatDurationMs(llmStatus?.request_interval_ms ?? null)}
-									</p>
-								</div>
-								<div className="bg-card/70 rounded-lg border p-3">
-									<p className="text-muted-foreground text-xs">等待 / 进行中</p>
-									<p className="mt-1 text-sm font-semibold">
-										{formatCount(llmStatus?.waiting_calls)} /{" "}
-										{formatCount(llmStatus?.in_flight_calls)}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										下一个发放槽位{" "}
-										{formatDurationMs(llmStatus?.next_slot_in_ms ?? null)}
-									</p>
-								</div>
+							<div className="max-w-sm">
 								<div className="bg-card/70 rounded-lg border p-3">
 									<p className="text-muted-foreground text-xs">
 										近24h 调用 / 失败

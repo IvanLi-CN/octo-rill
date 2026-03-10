@@ -48,6 +48,7 @@ cp .env.example .env.local
   - `AI_API_KEY`
   - `AI_BASE_URL`
   - `AI_MODEL`
+  - `AI_MAX_CONCURRENCY`（可选，单进程 LLM 最大并行数，默认 `1`）
   - `AI_MODEL_CONTEXT_LIMIT`（可选，手动覆盖模型输入上限）
   - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界；不配置时默认 `08:00`）
 
@@ -111,6 +112,7 @@ Then open `http://127.0.0.1:50885`.
 - Local application primary keys now use 16-character NanoIDs; older SQLite files created before the NanoID cutover are not compatible and should be rebuilt (for the default path, remove `./.data/octo-rill.db` before restarting).
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
 - 模型输入上限会按内置目录解析，并固定每天同步外部目录（OpenRouter + LiteLLM）；若设置 `AI_MODEL_CONTEXT_LIMIT`，会以手动值优先。
+- LLM 调度默认只允许单进程内 `1` 个上游请求并行；如需提速，可通过 `AI_MAX_CONCURRENCY` 提高 permit 并发上限。
 - Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
 - 日报落库前会做 `release_id` 内链完整性校验与补齐，按查询参数做精确匹配（避免 `12/123` 前缀误判）。
 
