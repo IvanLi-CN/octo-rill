@@ -1634,7 +1634,10 @@ mod tests {
         is_scheduled_task_type, load_translation_stream_cursor, load_translation_stream_rows,
     };
     use chrono::{TimeZone, Utc};
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
     use url::Url;
 
     use crate::{
@@ -1776,10 +1779,12 @@ mod tests {
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
-        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect(database_url.as_str())
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")

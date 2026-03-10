@@ -7227,7 +7227,10 @@ mod tests {
         response::IntoResponse,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
     use tower_sessions::{MemoryStore, Session};
     use url::Url;
 
@@ -7304,10 +7307,12 @@ mod tests {
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
-        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect(database_url.as_str())
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")
@@ -8031,10 +8036,12 @@ mod tests {
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
-        let database_url = format!("sqlite://{}?mode=rwc", database_path.to_string_lossy());
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect(database_url.as_str())
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
 
