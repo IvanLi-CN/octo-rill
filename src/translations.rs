@@ -355,14 +355,23 @@ struct RequestRow {
     started_at: Option<String>,
     finished_at: Option<String>,
     updated_at: String,
+    work_item_status: Option<String>,
     batch_id: Option<String>,
 }
 
 impl RequestRow {
+    fn effective_status(&self) -> &str {
+        if self.status == "queued" && self.work_item_status.as_deref() == Some("running") {
+            "running"
+        } else {
+            self.status.as_str()
+        }
+    }
+
     fn to_admin_request_list_item(&self) -> AdminTranslationRequestListItem {
         AdminTranslationRequestListItem {
             id: self.id.clone(),
-            status: self.status.clone(),
+            status: self.effective_status().to_owned(),
             source: self.source.clone(),
             request_origin: self.request_origin.clone(),
             requested_by: self.requested_by.clone(),
@@ -642,6 +651,7 @@ fn request_row_select_sql() -> &'static str {
            r.source_hash, r.source_blocks_json, r.target_slots_json, r.work_item_id,
            r.status, r.result_status, r.title_zh, r.summary_md, r.body_md, r.error_text,
            r.created_at, r.started_at, r.finished_at, r.updated_at,
+           (SELECT status FROM translation_work_items w WHERE w.id = r.work_item_id) AS work_item_status,
            (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
     FROM translation_requests r
     "#
@@ -1185,10 +1195,16 @@ async fn insert_translation_request(
             })
         }
         Some(existing) => {
+            let status = if existing.status == "running" {
+                "running"
+            } else {
+                "queued"
+            }
+            .to_owned();
             attach_request_to_work_item(tx, request_id.as_str(), &existing.id, now).await?;
             Ok(CreatedTranslationRequest {
                 request_id,
-                status: "queued".to_owned(),
+                status,
                 result: queued_request_result(item, Some(existing.id)),
             })
         }
@@ -2196,9 +2212,10 @@ fn stream_translation_request_response(
                         let event = TranslationRequestStreamEvent {
                             event: phase.clone(),
                             request_id: request_id.clone(),
-                            status: detail.request.status.clone(),
+                            status: detail.request.effective_status().to_owned(),
                             batch_id: detail.result.batch_id.clone(),
-                            result: Some(detail.result.clone()),
+                            result: matches!(phase.as_str(), "completed" | "failed")
+                                .then(|| detail.result.clone()),
                             error: if phase == "failed" {
                                 detail.result.error.clone()
                             } else {
@@ -2429,15 +2446,17 @@ async fn load_translation_result_items_by_batch(
 }
 
 fn detail_to_public_response(detail: LoadedRequestDetail) -> TranslationRequestResponse {
+    let request_id = detail.request.id.clone();
+    let status = detail.request.effective_status().to_owned();
     TranslationRequestResponse {
-        request_id: detail.request.id,
-        status: detail.request.status,
+        request_id,
+        status,
         result: Some(detail.result),
     }
 }
 
 fn derive_request_stream_phase(detail: &LoadedRequestDetail) -> String {
-    match detail.request.status.as_str() {
+    match detail.request.effective_status() {
         "completed" => "completed".to_owned(),
         "failed" => "failed".to_owned(),
         "running" => "running".to_owned(),
@@ -2801,6 +2820,53 @@ mod tests {
             }
             NormalizedTranslationSubmit::Batch(_) => panic!("expected single-item payload"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_running_work_item_status() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("123");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "running");
+
+        let detail =
+            load_translation_request_detail(state.as_ref(), "1", second.request_id.as_str())
+                .await
+                .expect("load request detail");
+
+        assert_eq!(
+            detail.request.to_admin_request_list_item().status,
+            "running"
+        );
+        assert_eq!(derive_request_stream_phase(&detail), "running");
     }
 
     #[tokio::test]
@@ -3245,6 +3311,70 @@ mod tests {
     }
 
     #[test]
+    fn stream_event_omits_result_until_terminal_phase() {
+        let detail = LoadedRequestDetail {
+            request: RequestRow {
+                id: "req-1".to_owned(),
+                mode: "stream".to_owned(),
+                source: "feed.auto_translate".to_owned(),
+                request_origin: "user".to_owned(),
+                requested_by: Some("1".to_owned()),
+                scope_user_id: "1".to_owned(),
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                entity_id: "123".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 1500,
+                source_hash: "hash".to_owned(),
+                source_blocks_json: "[]".to_owned(),
+                target_slots_json: "[\"title_zh\"]".to_owned(),
+                work_item_id: Some("work-1".to_owned()),
+                status: "running".to_owned(),
+                result_status: None,
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error_text: None,
+                created_at: "2026-03-07T00:00:00Z".to_owned(),
+                started_at: Some("2026-03-07T00:00:01Z".to_owned()),
+                finished_at: None,
+                updated_at: "2026-03-07T00:00:01Z".to_owned(),
+                work_item_status: Some("running".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
+            },
+            result: TranslationResultItem {
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                entity_id: "123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                status: "queued".to_owned(),
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error: None,
+                work_item_id: Some("work-1".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
+            },
+        };
+
+        let phase = derive_request_stream_phase(&detail);
+        let event = TranslationRequestStreamEvent {
+            event: phase.clone(),
+            request_id: detail.request.id.clone(),
+            status: detail.request.effective_status().to_owned(),
+            batch_id: detail.result.batch_id.clone(),
+            result: matches!(phase.as_str(), "completed" | "failed").then(|| detail.result.clone()),
+            error: None,
+        };
+
+        assert_eq!(phase, "running");
+        assert_eq!(event.status, "running");
+        assert!(event.result.is_none());
+        assert_eq!(event.batch_id.as_deref(), Some("batch-1"));
+    }
+
+    #[test]
     fn derive_request_stream_phase_uses_running_request_status() {
         let detail = LoadedRequestDetail {
             request: RequestRow {
@@ -3274,6 +3404,7 @@ mod tests {
                 started_at: Some("2026-03-07T00:00:01Z".to_owned()),
                 finished_at: None,
                 updated_at: "2026-03-07T00:00:01Z".to_owned(),
+                work_item_status: Some("running".to_owned()),
                 batch_id: Some("batch-1".to_owned()),
             },
             result: TranslationResultItem {
