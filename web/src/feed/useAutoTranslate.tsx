@@ -4,7 +4,6 @@ import {
 	apiGetTranslationRequest,
 	apiSubmitTranslationRequest,
 	type TranslationRequestItemInput,
-	type TranslationRequestResponse,
 	ApiError,
 	isPendingTranslationResultStatus,
 } from "@/api";
@@ -16,6 +15,7 @@ const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
+const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -66,6 +66,13 @@ type ActiveTranslationRequest = {
 	sourceKey: string;
 	resumeWindowCount: number;
 };
+
+function isMissingTranslationRequestError(error: unknown) {
+	return (
+		error instanceof ApiError &&
+		(error.status === 404 || error.code === REQUEST_NOT_FOUND_ERROR_CODE)
+	);
+}
 
 function buildRequestSourceKey(item: TranslationRequestItemInput) {
 	return JSON.stringify({
@@ -131,35 +138,75 @@ export function useAutoTranslate(params: {
 		return { response: latest, terminal: true as const };
 	}, []);
 
+	const clearTrackedRequest = useCallback((key: string) => {
+		activeRequestRef.current.delete(key);
+		waitRetryCountRef.current.delete(key);
+	}, []);
+
+	const resolveTrackedRequest = useCallback(
+		async (
+			key: string,
+			requestItem: TranslationRequestItemInput,
+			trackedRequest: ActiveTranslationRequest | undefined,
+		) => {
+			let requestId = trackedRequest?.requestId ?? null;
+			let resumeWindowCount = trackedRequest?.resumeWindowCount ?? 0;
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				try {
+					if (requestId) {
+						const active = await loadActiveRequest(requestId);
+						return {
+							response: active.response,
+							terminal: active.terminal,
+							resumeWindowCount,
+						};
+					}
+					let response = await apiSubmitTranslationRequest({
+						mode: "wait",
+						item: requestItem,
+					});
+					let terminal = true;
+					if (isPendingTranslationResultStatus(response.result.status)) {
+						const active = await loadActiveRequest(response.request_id);
+						response = active.response;
+						terminal = active.terminal;
+					}
+					return { response, terminal, resumeWindowCount: 0 };
+				} catch (error) {
+					if (!isMissingTranslationRequestError(error) || attempt === 1) {
+						throw error;
+					}
+					clearTrackedRequest(key);
+					requestId = null;
+					resumeWindowCount = 0;
+				}
+			}
+			throw new Error("translation request could not be recovered");
+		},
+		[clearTrackedRequest, loadActiveRequest],
+	);
+
 	const translateSingle = useCallback(
 		async (item: FeedItem) => {
 			const key = keyOf(item);
 			const requestItem = buildReleaseSummaryRequestItem(item);
 			const requestSourceKey = buildRequestSourceKey(requestItem);
-			const existingRequest = activeRequestRef.current.get(key);
-			let response: TranslationRequestResponse;
-			let terminal = true;
-
-			let resumeWindowCount = 0;
-
-			if (existingRequest?.sourceKey === requestSourceKey) {
-				const active = await loadActiveRequest(existingRequest.requestId);
-				response = active.response;
-				terminal = active.terminal;
-				resumeWindowCount = existingRequest.resumeWindowCount;
-			} else {
-				activeRequestRef.current.delete(key);
-				waitRetryCountRef.current.delete(key);
-				response = await apiSubmitTranslationRequest({
-					mode: "wait",
-					item: requestItem,
-				});
-				if (isPendingTranslationResultStatus(response.result.status)) {
-					const active = await loadActiveRequest(response.request_id);
-					response = active.response;
-					terminal = active.terminal;
-				}
+			const trackedRequest = activeRequestRef.current.get(key);
+			const requestToResume =
+				trackedRequest?.sourceKey === requestSourceKey
+					? trackedRequest
+					: undefined;
+			if (!requestToResume) {
+				clearTrackedRequest(key);
 			}
+			const resolved = await resolveTrackedRequest(
+				key,
+				requestItem,
+				requestToResume,
+			);
+			const { response, terminal } = resolved;
+
+			const resumeWindowCount = resolved.resumeWindowCount;
 
 			const translated = response.result;
 			if (!terminal) {
@@ -190,7 +237,7 @@ export function useAutoTranslate(params: {
 			}
 			return { translated, mapped, terminal: true as const };
 		},
-		[loadActiveRequest],
+		[clearTrackedRequest, resolveTrackedRequest],
 	);
 
 	const requeueRequest = useCallback((key: string, consumeBudget = true) => {
