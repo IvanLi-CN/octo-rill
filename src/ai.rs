@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,8 +27,10 @@ const MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE: &str = "env_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
-const LLM_SCHEDULER_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const LLM_REQUEST_MAX_RETRIES: usize = 3;
+const LLM_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const LLM_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
+const LLM_RETRY_BACKOFF_JITTER_MAX_MS: u64 = 250;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -51,9 +54,6 @@ struct OpenRouterModelItem {
 
 static MODEL_LIMIT_CATALOG: OnceLock<tokio::sync::RwLock<ModelLimitCatalog>> = OnceLock::new();
 static BUILTIN_MODEL_LIMITS: OnceLock<HashMap<String, u32>> = OnceLock::new();
-static LLM_SCHEDULER_NEXT_ALLOWED_AT: OnceLock<tokio::sync::Mutex<Instant>> = OnceLock::new();
-static LLM_SCHEDULER_WAITING_CALLS: AtomicUsize = AtomicUsize::new(0);
-static LLM_SCHEDULER_IN_FLIGHT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 tokio::task_local! {
     static LLM_CALL_CONTEXT: LlmCallContext;
@@ -70,10 +70,19 @@ pub struct LlmCallContext {
 
 #[derive(Debug, Clone, Copy)]
 pub struct LlmSchedulerRuntimeStatus {
-    pub request_interval_ms: i64,
+    pub max_concurrency: i64,
+    pub available_slots: i64,
     pub waiting_calls: i64,
     pub in_flight_calls: i64,
-    pub next_slot_in_ms: i64,
+}
+
+#[derive(Debug)]
+pub struct LlmScheduler {
+    max_concurrency: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
+    waiting_calls: AtomicUsize,
+    in_flight_calls: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,8 +96,64 @@ fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
     MODEL_LIMIT_CATALOG.get_or_init(|| tokio::sync::RwLock::new(ModelLimitCatalog::default()))
 }
 
-fn llm_scheduler() -> &'static tokio::sync::Mutex<Instant> {
-    LLM_SCHEDULER_NEXT_ALLOWED_AT.get_or_init(|| tokio::sync::Mutex::new(Instant::now()))
+impl LlmScheduler {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            max_concurrency: max_concurrency.max(1),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+            status_overrides: tokio::sync::RwLock::new(HashMap::new()),
+            waiting_calls: AtomicUsize::new(0),
+            in_flight_calls: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) async fn admin_overrides(&self) -> HashMap<String, LlmCallAdminOverride> {
+        self.status_overrides.read().await.clone()
+    }
+
+    pub(crate) async fn set_admin_override(&self, snapshot: LlmCallAdminOverride) {
+        self.status_overrides
+            .write()
+            .await
+            .insert(snapshot.id.clone(), snapshot);
+    }
+
+    pub(crate) async fn clear_admin_override(&self, call_id: &str) {
+        self.status_overrides.write().await.remove(call_id);
+    }
+
+    pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
+        LlmSchedulerRuntimeStatus {
+            max_concurrency: i64::try_from(self.max_concurrency).unwrap_or(i64::MAX),
+            available_slots: i64::try_from(self.semaphore.available_permits()).unwrap_or(i64::MAX),
+            waiting_calls: i64::try_from(self.waiting_calls.load(Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+            in_flight_calls: i64::try_from(self.in_flight_calls.load(Ordering::Relaxed))
+                .unwrap_or(i64::MAX),
+        }
+    }
+
+    async fn acquire_slot(self: &Arc<Self>) -> (i64, SchedulerInFlightGuard) {
+        let queue_started_at = Instant::now();
+        let waiting_guard = SchedulerWaitingGuard::new(&self.waiting_calls);
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("llm scheduler semaphore should stay open");
+        drop(waiting_guard);
+
+        self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+        let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+        (
+            wait_ms,
+            SchedulerInFlightGuard {
+                scheduler: Arc::clone(self),
+                permit: Some(permit),
+            },
+        )
+    }
 }
 
 pub async fn with_llm_call_context<F, T>(context: LlmCallContext, fut: F) -> T
@@ -100,26 +165,6 @@ where
 
 fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
-}
-
-pub async fn llm_scheduler_runtime_status() -> LlmSchedulerRuntimeStatus {
-    let now = Instant::now();
-    let next_allowed_at = *llm_scheduler().lock().await;
-    let next_slot_in_ms = if next_allowed_at > now {
-        i64::try_from((next_allowed_at - now).as_millis()).unwrap_or(i64::MAX)
-    } else {
-        0
-    };
-
-    LlmSchedulerRuntimeStatus {
-        request_interval_ms: i64::try_from(LLM_SCHEDULER_REQUEST_INTERVAL.as_millis())
-            .unwrap_or(i64::MAX),
-        waiting_calls: i64::try_from(LLM_SCHEDULER_WAITING_CALLS.load(Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-        in_flight_calls: i64::try_from(LLM_SCHEDULER_IN_FLIGHT_CALLS.load(Ordering::Relaxed))
-            .unwrap_or(i64::MAX),
-        next_slot_in_ms,
-    }
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -793,6 +838,7 @@ pub fn recent_key_dates(
 struct ChatCompletionAttemptError {
     err: anyhow::Error,
     retryable: bool,
+    retry_after: Option<Duration>,
     first_token_wait_ms: Option<i64>,
 }
 
@@ -806,41 +852,104 @@ fn is_retryable_transport_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
 
-struct SchedulerInFlightGuard;
+fn retry_after_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let raw = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(raw)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    let delay = retry_at.signed_duration_since(chrono::Utc::now());
+    if delay <= chrono::Duration::zero() {
+        Some(Duration::ZERO)
+    } else {
+        delay.to_std().ok()
+    }
+}
+
+fn retry_backoff_floor(attempt: usize) -> Duration {
+    let shift = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1_u32.checked_shl(shift.min(16)).unwrap_or(u32::MAX);
+    LLM_RETRY_BACKOFF_BASE
+        .checked_mul(multiplier)
+        .unwrap_or(LLM_RETRY_BACKOFF_CAP)
+        .min(LLM_RETRY_BACKOFF_CAP)
+}
+
+fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let floor = retry_backoff_floor(attempt);
+    if let Some(delay) = retry_after {
+        return delay.max(floor);
+    }
+
+    let jitter_ms = rand::rng().random_range(0..=LLM_RETRY_BACKOFF_JITTER_MAX_MS);
+    floor + Duration::from_millis(jitter_ms)
+}
+
+struct SchedulerInFlightGuard {
+    scheduler: Arc<LlmScheduler>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl SchedulerInFlightGuard {
+    fn release_permit(&mut self) {
+        self.permit.take();
+    }
+}
 
 impl Drop for SchedulerInFlightGuard {
     fn drop(&mut self) {
-        LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_sub(1, Ordering::Relaxed);
+        self.scheduler
+            .in_flight_calls
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-struct SchedulerWaitingGuard;
+struct SchedulerWaitingGuard<'a> {
+    waiting_calls: &'a AtomicUsize,
+}
 
-impl SchedulerWaitingGuard {
-    fn new() -> Self {
-        LLM_SCHEDULER_WAITING_CALLS.fetch_add(1, Ordering::Relaxed);
-        Self
+impl<'a> SchedulerWaitingGuard<'a> {
+    fn new(waiting_calls: &'a AtomicUsize) -> Self {
+        waiting_calls.fetch_add(1, Ordering::Relaxed);
+        Self { waiting_calls }
     }
 }
 
-impl Drop for SchedulerWaitingGuard {
+impl Drop for SchedulerWaitingGuard<'_> {
     fn drop(&mut self) {
-        LLM_SCHEDULER_WAITING_CALLS.fetch_sub(1, Ordering::Relaxed);
+        self.waiting_calls.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-async fn acquire_llm_scheduler_slot() -> (i64, SchedulerInFlightGuard) {
-    let queue_started_at = Instant::now();
-    let _waiting_guard = SchedulerWaitingGuard::new();
-    let mut next_allowed_at = llm_scheduler().lock().await;
-    let now = Instant::now();
-    if *next_allowed_at > now {
-        tokio::time::sleep(*next_allowed_at - now).await;
-    }
-    *next_allowed_at = Instant::now() + LLM_SCHEDULER_REQUEST_INTERVAL;
-    LLM_SCHEDULER_IN_FLIGHT_CALLS.fetch_add(1, Ordering::Relaxed);
-    let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
-    (wait_ms, SchedulerInFlightGuard)
+#[derive(Debug, Clone)]
+pub(crate) struct LlmCallAdminOverride {
+    pub id: String,
+    pub status: String,
+    pub attempt_count: i64,
+    pub scheduler_wait_ms: i64,
+    pub first_token_wait_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub output_messages_json: Option<String>,
+    pub response_text: Option<String>,
+    pub error_text: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Debug)]
@@ -1023,6 +1132,47 @@ async fn update_llm_call_running(
     Ok(())
 }
 
+async fn requeue_llm_call_for_retry(
+    state: &AppState,
+    call_id: &str,
+    attempt_count: i64,
+    scheduler_wait_ms: i64,
+    retry_delay: Duration,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET status = 'queued',
+            attempt_count = ?,
+            scheduler_wait_ms = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(attempt_count)
+    .bind(scheduler_wait_ms)
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("requeue llm_call failed")?;
+    append_llm_call_event(
+        state,
+        call_id,
+        "llm.retry_queued",
+        "queued",
+        serde_json::json!({
+            "attempt_count": attempt_count,
+            "scheduler_wait_ms": scheduler_wait_ms,
+            "retry_delay_ms": i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
+        }),
+    )
+    .await
+    .context("append llm_call retry queued event failed")?;
+    Ok(())
+}
+
 async fn finalize_llm_call(
     state: &AppState,
     call_id: &str,
@@ -1094,6 +1244,25 @@ async fn finalize_llm_call(
     Ok(())
 }
 
+async fn reconcile_admin_override_after_persist(
+    state: &AppState,
+    call_id: &str,
+    persist_result: Result<()>,
+    failure_context: &'static str,
+) {
+    match persist_result {
+        Ok(()) => state.llm_scheduler.clear_admin_override(call_id).await,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                call_id,
+                context = failure_context,
+                "llm call persist update failed"
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FinalizeLlmCallUpdate<'a> {
     status: &'a str,
@@ -1124,6 +1293,7 @@ async fn chat_completion_once(
         .map_err(|err| ChatCompletionAttemptError {
             err,
             retryable: false,
+            retry_after: None,
             first_token_wait_ms: None,
         })?;
 
@@ -1156,6 +1326,7 @@ async fn chat_completion_once(
             ChatCompletionAttemptError {
                 err: anyhow!("AI request failed: {err}"),
                 retryable,
+                retry_after: None,
                 first_token_wait_ms: None,
             }
         })?;
@@ -1163,12 +1334,14 @@ async fn chat_completion_once(
         Some(i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
 
     let status = resp.status();
+    let retry_after = retry_after_delay(resp.headers());
     let body = resp
         .bytes()
         .await
         .map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI read response failed: {err}"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1177,6 +1350,7 @@ async fn chat_completion_once(
         return Err(ChatCompletionAttemptError {
             err: anyhow!("AI returned {status}: {msg}"),
             retryable: is_retryable_status(status),
+            retry_after,
             first_token_wait_ms,
         });
     }
@@ -1185,6 +1359,7 @@ async fn chat_completion_once(
         serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
             err: anyhow!("AI response json decode failed: {err}"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1199,6 +1374,7 @@ async fn chat_completion_once(
         .ok_or_else(|| ChatCompletionAttemptError {
             err: anyhow!("AI response missing content"),
             retryable: true,
+            retry_after: None,
             first_token_wait_ms,
         })?;
 
@@ -1254,7 +1430,7 @@ pub async fn chat_completion(
         },
     ];
     let input_messages_json = build_llm_messages_json(&input_messages);
-    if let Err(err) = insert_llm_call(
+    let llm_call_persisted = match insert_llm_call(
         state,
         &log_record,
         &ai.model,
@@ -1264,67 +1440,131 @@ pub async fn chat_completion(
     )
     .await
     {
-        tracing::warn!(?err, "llm call log insert failed");
-    }
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(?err, "llm call log insert failed");
+            false
+        }
+    };
 
     let mut last_err: Option<anyhow::Error> = None;
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
+    let mut started_at_timestamp: Option<String> = None;
     let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
     for attempt in 1..=max_attempts {
-        // Global in-process queue: always serialize request issuance and pace at 1 request/second.
-        let (wait_ms, in_flight_guard) = acquire_llm_scheduler_slot().await;
+        let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
+        let attempt_count = i64::try_from(attempt).unwrap_or(i64::MAX);
 
         if started_at.is_none() {
             started_at = Some(Instant::now());
+            started_at_timestamp = Some(chrono::Utc::now().to_rfc3339());
         }
 
-        if let Err(err) = update_llm_call_running(
-            state,
-            log_record.id.as_str(),
-            i64::try_from(attempt).unwrap_or(i64::MAX),
-            total_wait_ms,
-        )
-        .await
-        {
-            tracing::warn!(?err, "llm call log running update failed");
+        if llm_call_persisted {
+            let running_updated_at = chrono::Utc::now().to_rfc3339();
+            state
+                .llm_scheduler
+                .set_admin_override(LlmCallAdminOverride {
+                    id: log_record.id.clone(),
+                    status: "running".to_owned(),
+                    attempt_count,
+                    scheduler_wait_ms: total_wait_ms,
+                    first_token_wait_ms: None,
+                    duration_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cached_input_tokens: None,
+                    total_tokens: None,
+                    output_messages_json: None,
+                    response_text: None,
+                    error_text: None,
+                    started_at: started_at_timestamp.clone(),
+                    finished_at: None,
+                    updated_at: running_updated_at,
+                })
+                .await;
+            reconcile_admin_override_after_persist(
+                state,
+                log_record.id.as_str(),
+                update_llm_call_running(
+                    state,
+                    log_record.id.as_str(),
+                    attempt_count,
+                    total_wait_ms,
+                )
+                .await,
+                "llm call log running update failed",
+            )
+            .await;
         }
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
-        drop(in_flight_guard);
         match attempt_result {
             Ok(output) => {
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
-                if let Err(err) = finalize_llm_call(
-                    state,
-                    log_record.id.as_str(),
-                    FinalizeLlmCallUpdate {
-                        status: "succeeded",
-                        attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
-                        scheduler_wait_ms: total_wait_ms,
-                        first_token_wait_ms: output.first_token_wait_ms,
-                        duration_ms,
-                        output_messages_json: Some(output.output_messages_json.as_str()),
-                        response_text: Some(output.content.as_str()),
-                        error_text: None,
-                        input_tokens: output.usage.input_tokens,
-                        output_tokens: output.usage.output_tokens,
-                        cached_input_tokens: output.usage.cached_input_tokens,
-                        total_tokens: output.usage.total_tokens,
-                    },
-                )
-                .await
-                {
-                    tracing::warn!(?err, "llm call log finalize success failed");
+                let finished_at = chrono::Utc::now().to_rfc3339();
+                if llm_call_persisted {
+                    state
+                        .llm_scheduler
+                        .set_admin_override(LlmCallAdminOverride {
+                            id: log_record.id.clone(),
+                            status: "succeeded".to_owned(),
+                            attempt_count,
+                            scheduler_wait_ms: total_wait_ms,
+                            first_token_wait_ms: output.first_token_wait_ms,
+                            duration_ms,
+                            input_tokens: output.usage.input_tokens,
+                            output_tokens: output.usage.output_tokens,
+                            cached_input_tokens: output.usage.cached_input_tokens,
+                            total_tokens: output.usage.total_tokens,
+                            output_messages_json: Some(output.output_messages_json.clone()),
+                            response_text: Some(output.content.clone()),
+                            error_text: None,
+                            started_at: started_at_timestamp.clone(),
+                            finished_at: Some(finished_at.clone()),
+                            updated_at: finished_at.clone(),
+                        })
+                        .await;
+                }
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                if llm_call_persisted {
+                    reconcile_admin_override_after_persist(
+                        state,
+                        log_record.id.as_str(),
+                        finalize_llm_call(
+                            state,
+                            log_record.id.as_str(),
+                            FinalizeLlmCallUpdate {
+                                status: "succeeded",
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms: output.first_token_wait_ms,
+                                duration_ms,
+                                output_messages_json: Some(output.output_messages_json.as_str()),
+                                response_text: Some(output.content.as_str()),
+                                error_text: None,
+                                input_tokens: output.usage.input_tokens,
+                                output_tokens: output.usage.output_tokens,
+                                cached_input_tokens: output.usage.cached_input_tokens,
+                                total_tokens: output.usage.total_tokens,
+                            },
+                        )
+                        .await,
+                        "llm call log finalize success failed",
+                    )
+                    .await;
                 }
                 return Ok(output.content);
             }
             Err(attempt_err) => {
                 let ChatCompletionAttemptError {
                     retryable,
+                    retry_after,
                     err,
                     first_token_wait_ms,
                 } = attempt_err;
@@ -1333,38 +1573,116 @@ pub async fn chat_completion(
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                     });
                     let error_message = err.to_string();
-                    if let Err(log_err) = finalize_llm_call(
-                        state,
-                        log_record.id.as_str(),
-                        FinalizeLlmCallUpdate {
-                            status: "failed",
-                            attempt_count: i64::try_from(attempt).unwrap_or(i64::MAX),
+                    let finished_at = chrono::Utc::now().to_rfc3339();
+                    if llm_call_persisted {
+                        state
+                            .llm_scheduler
+                            .set_admin_override(LlmCallAdminOverride {
+                                id: log_record.id.clone(),
+                                status: "failed".to_owned(),
+                                attempt_count,
+                                scheduler_wait_ms: total_wait_ms,
+                                first_token_wait_ms,
+                                duration_ms,
+                                input_tokens: None,
+                                output_tokens: None,
+                                cached_input_tokens: None,
+                                total_tokens: None,
+                                output_messages_json: None,
+                                response_text: None,
+                                error_text: Some(error_message.clone()),
+                                started_at: started_at_timestamp.clone(),
+                                finished_at: Some(finished_at.clone()),
+                                updated_at: finished_at.clone(),
+                            })
+                            .await;
+                    }
+                    in_flight_guard.release_permit();
+                    drop(in_flight_guard);
+                    if llm_call_persisted {
+                        reconcile_admin_override_after_persist(
+                            state,
+                            log_record.id.as_str(),
+                            finalize_llm_call(
+                                state,
+                                log_record.id.as_str(),
+                                FinalizeLlmCallUpdate {
+                                    status: "failed",
+                                    attempt_count,
+                                    scheduler_wait_ms: total_wait_ms,
+                                    first_token_wait_ms,
+                                    duration_ms,
+                                    output_messages_json: None,
+                                    response_text: None,
+                                    error_text: Some(error_message.as_str()),
+                                    input_tokens: None,
+                                    output_tokens: None,
+                                    cached_input_tokens: None,
+                                    total_tokens: None,
+                                },
+                            )
+                            .await,
+                            "llm call log finalize failure failed",
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+                let retry_delay = next_retry_delay(attempt, retry_after);
+                let requeued_at = chrono::Utc::now().to_rfc3339();
+                if llm_call_persisted {
+                    state
+                        .llm_scheduler
+                        .set_admin_override(LlmCallAdminOverride {
+                            id: log_record.id.clone(),
+                            status: "queued".to_owned(),
+                            attempt_count,
                             scheduler_wait_ms: total_wait_ms,
-                            first_token_wait_ms,
-                            duration_ms,
-                            output_messages_json: None,
-                            response_text: None,
-                            error_text: Some(error_message.as_str()),
+                            first_token_wait_ms: None,
+                            duration_ms: None,
                             input_tokens: None,
                             output_tokens: None,
                             cached_input_tokens: None,
                             total_tokens: None,
-                        },
+                            output_messages_json: None,
+                            response_text: None,
+                            error_text: None,
+                            started_at: started_at_timestamp.clone(),
+                            finished_at: None,
+                            updated_at: requeued_at.clone(),
+                        })
+                        .await;
+                }
+                in_flight_guard.release_permit();
+                drop(in_flight_guard);
+                if llm_call_persisted {
+                    reconcile_admin_override_after_persist(
+                        state,
+                        log_record.id.as_str(),
+                        requeue_llm_call_for_retry(
+                            state,
+                            log_record.id.as_str(),
+                            attempt_count,
+                            total_wait_ms,
+                            retry_delay,
+                        )
+                        .await,
+                        "llm call requeue update failed",
                     )
-                    .await
-                    {
-                        tracing::warn!(?log_err, "llm call log finalize failure failed");
-                    }
-                    return Err(err);
+                    .await;
                 }
                 tracing::warn!(
                     attempt,
                     max_attempts,
                     retries_left = max_attempts.saturating_sub(attempt),
+                    retry_after_ms = retry_after
+                        .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)),
+                    retry_delay_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
                     ?err,
-                    "ai request failed; scheduler queued retry"
+                    "ai request failed; sleeping before retry"
                 );
                 last_err = Some(err);
+                tokio::time::sleep(retry_delay).await;
             }
         }
     }
@@ -2362,6 +2680,62 @@ pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{net::SocketAddr, sync::Arc};
+
+    use sqlx::{Row, sqlite::SqlitePoolOptions};
+    use url::Url;
+
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+        state::build_oauth_client,
+    };
+
+    async fn setup_llm_state() -> Arc<AppState> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-ai-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+        })
+    }
 
     #[test]
     fn retryable_status_detects_429_and_5xx() {
@@ -2377,6 +2751,236 @@ mod tests {
         assert!(!ai_error_is_non_retryable(&anyhow::anyhow!(
             "ai returned 429: upstream rate limit"
         )));
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_limits_parallelism_and_reports_waiters() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, first_guard) = scheduler.acquire_slot().await;
+        let queued_scheduler = Arc::clone(&scheduler);
+        let queued = tokio::spawn(async move { queued_scheduler.acquire_slot().await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let status = scheduler.runtime_status();
+        assert_eq!(status.max_concurrency, 1);
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 1);
+        assert_eq!(status.waiting_calls, 1);
+
+        drop(first_guard);
+
+        let (queued_wait_ms, second_guard) = queued.await.expect("queued acquire should finish");
+        assert!(queued_wait_ms > 0);
+        let status = scheduler.runtime_status();
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 1);
+        assert_eq!(status.waiting_calls, 0);
+
+        drop(second_guard);
+
+        let final_status = scheduler.runtime_status();
+        assert_eq!(final_status.available_slots, 1);
+        assert_eq!(final_status.in_flight_calls, 0);
+        assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_status_overrides_round_trip() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        scheduler
+            .set_admin_override(LlmCallAdminOverride {
+                id: "call-1".to_owned(),
+                status: "queued".to_owned(),
+                attempt_count: 1,
+                scheduler_wait_ms: 120,
+                first_token_wait_ms: None,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: None,
+                output_messages_json: None,
+                response_text: None,
+                error_text: None,
+                started_at: None,
+                finished_at: None,
+                updated_at: "2026-03-10T00:00:00Z".to_owned(),
+            })
+            .await;
+
+        let overrides = scheduler.admin_overrides().await;
+        assert_eq!(
+            overrides
+                .get("call-1")
+                .map(|snapshot| snapshot.status.as_str()),
+            Some("queued")
+        );
+
+        scheduler.clear_admin_override("call-1").await;
+        assert!(scheduler.admin_overrides().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_admin_override_after_persist_clears_only_on_success() {
+        let state = setup_llm_state().await;
+        let snapshot = LlmCallAdminOverride {
+            id: "call-override".to_owned(),
+            status: "queued".to_owned(),
+            attempt_count: 1,
+            scheduler_wait_ms: 120,
+            first_token_wait_ms: None,
+            duration_ms: None,
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+            output_messages_json: None,
+            response_text: None,
+            error_text: None,
+            started_at: Some("2026-03-10T00:00:00Z".to_owned()),
+            finished_at: None,
+            updated_at: "2026-03-10T00:00:00Z".to_owned(),
+        };
+
+        state
+            .llm_scheduler
+            .set_admin_override(snapshot.clone())
+            .await;
+        reconcile_admin_override_after_persist(
+            state.as_ref(),
+            "call-override",
+            Ok(()),
+            "test persist success",
+        )
+        .await;
+        assert!(state.llm_scheduler.admin_overrides().await.is_empty());
+
+        state.llm_scheduler.set_admin_override(snapshot).await;
+        reconcile_admin_override_after_persist(
+            state.as_ref(),
+            "call-override",
+            Err(anyhow!("persist failed")),
+            "test persist failure",
+        )
+        .await;
+        assert_eq!(
+            state
+                .llm_scheduler
+                .admin_overrides()
+                .await
+                .get("call-override")
+                .map(|item| item.status.as_str()),
+            Some("queued")
+        );
+    }
+
+    #[tokio::test]
+    async fn requeue_llm_call_for_retry_sets_status_back_to_queued() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-retry-queued".to_owned(),
+            source: "tests.llm.retry".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        insert_llm_call(
+            state.as_ref(),
+            &log,
+            "gpt-4o-mini",
+            512,
+            "prompt",
+            Some("[]"),
+        )
+        .await
+        .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 120)
+            .await
+            .expect("mark llm call running");
+        requeue_llm_call_for_retry(
+            state.as_ref(),
+            log.id.as_str(),
+            1,
+            120,
+            Duration::from_secs(3),
+        )
+        .await
+        .expect("requeue llm call");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, attempt_count, scheduler_wait_ms, started_at
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(row.get::<String, _>("status"), "queued");
+        assert_eq!(row.get::<i64, _>("attempt_count"), 1);
+        assert_eq!(row.get::<i64, _>("scheduler_wait_ms"), 120);
+        assert!(row.get::<Option<String>, _>("started_at").is_some());
+
+        let event = sqlx::query(
+            r#"
+            SELECT event_type, status, payload_json
+            FROM llm_call_events
+            WHERE call_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call event");
+
+        assert_eq!(event.get::<String, _>("event_type"), "llm.retry_queued");
+        assert_eq!(event.get::<String, _>("status"), "queued");
+        let payload: serde_json::Value =
+            serde_json::from_str(&event.get::<String, _>("payload_json"))
+                .expect("parse event payload");
+        assert_eq!(payload["retry_delay_ms"], serde_json::json!(3000));
+    }
+
+    #[test]
+    fn retry_after_delay_parses_delta_seconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("7"),
+        );
+
+        assert_eq!(retry_after_delay(&headers), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn retry_backoff_floor_grows_and_caps() {
+        assert_eq!(retry_backoff_floor(1), Duration::from_millis(500));
+        assert_eq!(retry_backoff_floor(2), Duration::from_secs(1));
+        assert_eq!(retry_backoff_floor(3), Duration::from_secs(2));
+        assert_eq!(retry_backoff_floor(8), LLM_RETRY_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn next_retry_delay_honors_retry_after_without_jitter() {
+        let delay = Duration::from_secs(3);
+
+        assert_eq!(next_retry_delay(2, Some(delay)), delay);
+    }
+
+    #[test]
+    fn next_retry_delay_clamps_zero_retry_after_to_backoff_floor() {
+        assert_eq!(
+            next_retry_delay(3, Some(Duration::ZERO)),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
