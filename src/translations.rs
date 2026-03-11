@@ -256,6 +256,15 @@ struct TranslationWorkerRuntimeState {
     error_text: Option<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RunningBatchRuntimeRow {
+    id: String,
+    worker_slot: i64,
+    request_count: i64,
+    item_count: i64,
+    trigger_reason: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TranslationWorkerProfile {
     worker_slot: i64,
@@ -545,6 +554,12 @@ fn translation_worker_profiles() -> [TranslationWorkerProfile; 4] {
             worker_kind: "user_dedicated",
         },
     ]
+}
+
+fn translation_worker_profile_for_slot(worker_slot: i64) -> Option<TranslationWorkerProfile> {
+    translation_worker_profiles()
+        .into_iter()
+        .find(|profile| profile.worker_slot == worker_slot)
 }
 
 fn translation_worker_runtime() -> &'static tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>
@@ -1122,6 +1137,7 @@ async fn create_translation_request_with_origin(
         insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
             .await?;
     tx.commit().await.map_err(ApiError::internal)?;
+    refresh_live_batch_runtime_for_request(state, &created).await?;
     Ok(created)
 }
 
@@ -1142,6 +1158,9 @@ async fn create_translation_requests_batch_with_origin(
         );
     }
     tx.commit().await.map_err(ApiError::internal)?;
+    for created in &out {
+        refresh_live_batch_runtime_for_request(state, created).await?;
+    }
     Ok(out)
 }
 
@@ -1342,6 +1361,46 @@ async fn refresh_batch_request_counters(
     .await
     .map_err(ApiError::internal)?;
 
+    Ok(())
+}
+
+async fn refresh_live_batch_runtime_for_request(
+    state: &AppState,
+    created: &CreatedTranslationRequest,
+) -> Result<(), ApiError> {
+    if created.status != "running" {
+        return Ok(());
+    }
+    let Some(batch_id) = created.result.batch_id.as_deref() else {
+        return Ok(());
+    };
+    let row = sqlx::query_as::<_, RunningBatchRuntimeRow>(
+        r#"
+        SELECT id, worker_slot, request_count, item_count, trigger_reason
+        FROM translation_batches
+        WHERE id = ? AND status = 'running'
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let Some(profile) = translation_worker_profile_for_slot(row.worker_slot) else {
+        return Ok(());
+    };
+    update_translation_worker_runtime(
+        profile,
+        "running",
+        Some(row.id.as_str()),
+        row.request_count,
+        row.item_count,
+        Some(row.trigger_reason.as_str()),
+        None,
+    )
+    .await;
     Ok(())
 }
 
@@ -3618,6 +3677,106 @@ mod tests {
 
         assert_eq!(row.worker_slot, 2);
         assert_eq!(row.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_refreshes_running_batch_worker_runtime() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("runtime-refresh");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-refresh")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-item")
+        .bind("batch-runtime-refresh")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', batch_id = 'batch-runtime-refresh', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+
+        let workers = translation_worker_runtime_statuses().await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_slot == 2)
+            .expect("worker exists");
+
+        assert_eq!(worker.status, "running");
+        assert_eq!(
+            worker.current_batch_id.as_deref(),
+            Some("batch-runtime-refresh")
+        );
+        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.work_item_count, 1);
     }
 
     #[tokio::test]
