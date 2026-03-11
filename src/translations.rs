@@ -798,7 +798,7 @@ pub async fn admin_get_translation_status(
     session: Session,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
-    let _llm_runtime = ai::llm_scheduler_runtime_status().await;
+    let _llm_runtime = state.llm_scheduler.runtime_status();
     let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let workers = translation_worker_runtime_statuses().await;
     let idle_workers = i64::try_from(
@@ -4082,11 +4082,13 @@ mod tests {
                     .expect("parse github redirect"),
             },
             ai: None,
+            ai_max_concurrency: 1,
             ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
+            llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             config,
             pool,
             http: reqwest::Client::new(),

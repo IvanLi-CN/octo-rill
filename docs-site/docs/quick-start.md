@@ -33,6 +33,7 @@ cp .env.example .env.local
 - `AI_API_KEY`（可选，用于翻译与日报）
 - `AI_BASE_URL`（可选）
 - `AI_MODEL`（可选）
+- `AI_MAX_CONCURRENCY`（可选，默认 `1`）
 
 更多变量说明见 [配置参考](/config)。
 

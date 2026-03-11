@@ -301,10 +301,10 @@ export type AdminScheduledSlotsResponse = {
 };
 export type AdminLlmSchedulerStatusResponse = {
 	scheduler_enabled: boolean;
-	request_interval_ms: number;
+	max_concurrency: number;
+	available_slots: number;
 	waiting_calls: number;
 	in_flight_calls: number;
-	next_slot_in_ms: number;
 	calls_24h: number;
 	failed_24h: number;
 	avg_wait_ms_24h: number | null;
