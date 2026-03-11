@@ -30,22 +30,6 @@ function toApiError(res: Response, body: unknown) {
 	return new ApiError(res.status, res.statusText);
 }
 
-const TRANSLATION_WAIT_TIMEOUT_BUFFER_MS = 1_500;
-
-function isAbortError(error: unknown) {
-	return error instanceof DOMException && error.name === "AbortError";
-}
-
-function createTimeoutAbortSignal(timeoutMs: number) {
-	const abortController = new AbortController();
-	const timeoutId = globalThis.setTimeout(() => {
-		abortController.abort();
-	}, timeoutMs);
-	return {
-		signal: abortController.signal,
-		dispose: () => globalThis.clearTimeout(timeoutId),
-	};
-}
 export async function apiGet<T>(path: string): Promise<T> {
 	const res = await fetch(path, { credentials: "include" });
 	if (!res.ok) {
@@ -726,27 +710,8 @@ export async function apiTranslateReleaseDetail(
 		source_blocks,
 		target_slots: ["title_zh", "body_md"],
 	};
-	const timeout = createTimeoutAbortSignal(
-		requestItem.max_wait_ms + TRANSLATION_WAIT_TIMEOUT_BUFFER_MS,
-	);
-	try {
-		return await apiSubmitTranslationRequest(
-			{
-				mode: "wait",
-				item: requestItem,
-			},
-			{ signal: timeout.signal },
-		);
-	} catch (error) {
-		if (isAbortError(error)) {
-			throw new ApiError(
-				504,
-				"translation wait timeout",
-				"translation_wait_timeout",
-			);
-		}
-		throw error;
-	} finally {
-		timeout.dispose();
-	}
+	return apiSubmitTranslationRequest({
+		mode: "wait",
+		item: requestItem,
+	});
 }
