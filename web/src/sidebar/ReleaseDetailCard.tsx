@@ -22,6 +22,7 @@ import { formatIsoShortLocal } from "@/lib/datetime";
 import { normalizeReleaseId } from "@/lib/releaseId";
 
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 
 function sleep(ms: number) {
 	return new Promise((resolve) => {
@@ -95,7 +96,13 @@ export function ReleaseDetailCard(props: {
 		setTranslateError(null);
 		void (async () => {
 			let response = await apiTranslateReleaseDetail(activeDetail);
+			const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
 			while (isPendingTranslationResultStatus(response.result.status)) {
+				if (Date.now() >= deadline) {
+					throw new Error(
+						"translation is still processing; please try again shortly",
+					);
+				}
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
 				if (translateRequestSeqRef.current !== requestSeq) return;

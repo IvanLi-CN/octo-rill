@@ -12,7 +12,7 @@ import type { FeedItem, TranslateResponse } from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
 const QUEUE_FLUSH_DELAY_MS = 300;
-const WAIT_RECOVERY_MAX_RETRIES = 3;
+const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 1_500;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
@@ -177,16 +177,18 @@ export function useAutoTranslate(params: {
 		[loadActiveRequest],
 	);
 
-	const requeueWithRetryBudget = useCallback((key: string) => {
+	const requeueRequest = useCallback((key: string, consumeBudget = true) => {
 		if (failedRef.current.has(key)) return false;
-		const retries = waitRetryCountRef.current.get(key) ?? 0;
-		if (retries >= WAIT_RECOVERY_MAX_RETRIES) {
-			failedRef.current.add(key);
-			waitRetryCountRef.current.delete(key);
-			activeRequestIdRef.current.delete(key);
-			return false;
+		if (consumeBudget) {
+			const retries = waitRetryCountRef.current.get(key) ?? 0;
+			if (retries >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
+				failedRef.current.add(key);
+				waitRetryCountRef.current.delete(key);
+				activeRequestIdRef.current.delete(key);
+				return false;
+			}
+			waitRetryCountRef.current.set(key, retries + 1);
 		}
-		waitRetryCountRef.current.set(key, retries + 1);
 		if (!queuedRef.current.includes(key)) {
 			queuedRef.current.push(key);
 		}
@@ -195,9 +197,9 @@ export function useAutoTranslate(params: {
 
 	const requeueAfterFailure = useCallback(
 		(item: FeedItem) => {
-			requeueWithRetryBudget(keyOf(item));
+			requeueRequest(keyOf(item));
 		},
-		[requeueWithRetryBudget],
+		[requeueRequest],
 	);
 
 	const pump = useCallback(() => {
@@ -223,7 +225,7 @@ export function useAutoTranslate(params: {
 			void translateSingle(item)
 				.then(({ translated, mapped, terminal }) => {
 					if (!terminal) {
-						requeueWithRetryBudget(key);
+						requeueRequest(key, false);
 						return;
 					}
 					waitRetryCountRef.current.delete(key);
@@ -248,7 +250,7 @@ export function useAutoTranslate(params: {
 		enabled,
 		onTranslated,
 		requeueAfterFailure,
-		requeueWithRetryBudget,
+		requeueRequest,
 		shouldAutoTranslate,
 		translateSingle,
 	]);
@@ -307,9 +309,7 @@ export function useAutoTranslate(params: {
 			try {
 				const { translated, mapped, terminal } = await translateSingle(item);
 				if (!terminal) {
-					if (!requeueWithRetryBudget(key)) {
-						throw new Error("translation request is still processing");
-					}
+					requeueRequest(key, false);
 					schedulePump();
 					return null;
 				}
@@ -331,7 +331,7 @@ export function useAutoTranslate(params: {
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, requeueWithRetryBudget, schedulePump, translateSingle],
+		[onTranslated, requeueRequest, schedulePump, translateSingle],
 	);
 
 	useEffect(() => {
