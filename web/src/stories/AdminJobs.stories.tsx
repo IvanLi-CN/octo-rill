@@ -339,8 +339,11 @@ const translationRequestSeed = {
 	request_origin: "user",
 	requested_by: CURRENT_USER_ID,
 	scope_user_id: CURRENT_USER_ID,
-	item_count: 1,
-	completed_item_count: 1,
+	producer_ref: "feed.auto_translate:release:290978079",
+	kind: "release_summary",
+	variant: "feed_card",
+	entity_id: "290978079",
+	batch_id: "batch-translation-story",
 	created_at: "2026-02-26T04:00:00Z",
 	started_at: "2026-02-26T04:00:01Z",
 	finished_at: "2026-02-26T04:00:03Z",
@@ -348,13 +351,13 @@ const translationRequestSeed = {
 };
 
 const translationRequestItemSeed = {
-	producer_ref: "290978079",
+	producer_ref: "feed.auto_translate:release:290978079",
 	entity_id: "290978079",
 	kind: "release_summary",
 	variant: "feed_card",
 	status: "ready",
 	title_zh: "发布说明 290978079",
-	summary_md: "- 修复了调度窗口\n- 保持整组返回",
+	summary_md: "- 修复了调度窗口\n- 保持单请求语义",
 	body_md: null,
 	error: null,
 	work_item_id: "work-translation-story",
@@ -639,7 +642,6 @@ function AdminJobsPreview({
 			{
 				...translationRequestSeed,
 				status: translationState === "busy" ? "running" : "completed",
-				completed_item_count: translationState === "busy" ? 0 : 1,
 				started_at:
 					translationState === "busy"
 						? "2026-02-26T04:00:01Z"
@@ -979,7 +981,16 @@ function AdminJobsPreview({
 				return new Response(
 					JSON.stringify({
 						request: translationRequests[0],
-						items: [translationRequestItemSeed],
+						result:
+							translationState === "busy"
+								? {
+										...translationRequestItemSeed,
+										status: "queued",
+										title_zh: null,
+										summary_md: null,
+										batch_id: null,
+									}
+								: translationRequestItemSeed,
 					}),
 					{ status: 200, headers: { "content-type": "application/json" } },
 				);

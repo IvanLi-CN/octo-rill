@@ -59,7 +59,10 @@ pub struct TranslationRequestItemInput {
 #[derive(Debug, Deserialize)]
 pub struct TranslationSubmitRequest {
     pub mode: String,
-    pub items: Vec<TranslationRequestItemInput>,
+    #[serde(default)]
+    pub item: Option<TranslationRequestItemInput>,
+    #[serde(default)]
+    pub items: Option<Vec<TranslationRequestItemInput>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,8 +84,22 @@ pub struct TranslationResultItem {
 pub struct TranslationRequestResponse {
     pub request_id: String,
     pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub items: Option<Vec<TranslationResultItem>>,
+    pub result: TranslationResultItem,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranslationBatchSubmitItemResponse {
+    pub request_id: String,
+    pub status: String,
+    pub producer_ref: String,
+    pub entity_id: String,
+    pub kind: String,
+    pub variant: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranslationBatchSubmitResponse {
+    pub requests: Vec<TranslationBatchSubmitItemResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,9 +108,9 @@ struct TranslationRequestStreamEvent {
     request_id: String,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    batch_ids: Option<Vec<String>>,
+    batch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    items: Option<Vec<TranslationResultItem>>,
+    result: Option<TranslationResultItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -145,8 +162,11 @@ pub struct AdminTranslationRequestListItem {
     pub request_origin: String,
     pub requested_by: Option<String>,
     pub scope_user_id: String,
-    pub item_count: i64,
-    pub completed_item_count: i64,
+    pub producer_ref: String,
+    pub kind: String,
+    pub variant: String,
+    pub entity_id: String,
+    pub batch_id: Option<String>,
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -164,7 +184,7 @@ pub struct AdminTranslationRequestsResponse {
 #[derive(Debug, Serialize)]
 pub struct AdminTranslationRequestDetailResponse {
     pub request: AdminTranslationRequestListItem,
-    pub items: Vec<TranslationResultItem>,
+    pub result: TranslationResultItem,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -236,6 +256,15 @@ struct TranslationWorkerRuntimeState {
     error_text: Option<String>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RunningBatchRuntimeRow {
+    id: String,
+    worker_slot: i64,
+    request_count: i64,
+    item_count: i64,
+    trigger_reason: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TranslationWorkerProfile {
     worker_slot: i64,
@@ -303,6 +332,132 @@ struct ClaimCandidateRow {
     finished_at: Option<String>,
     updated_at: String,
     request_origin: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RequestRow {
+    id: String,
+    mode: String,
+    source: String,
+    request_origin: String,
+    requested_by: Option<String>,
+    scope_user_id: String,
+    producer_ref: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+    max_wait_ms: i64,
+    work_item_id: Option<String>,
+    status: String,
+    result_status: Option<String>,
+    title_zh: Option<String>,
+    summary_md: Option<String>,
+    body_md: Option<String>,
+    error_text: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+    work_item_status: Option<String>,
+    batch_id: Option<String>,
+}
+
+impl RequestRow {
+    fn effective_status(&self) -> &str {
+        if self.status == "queued"
+            && work_item_status_counts_as_running(self.work_item_status.as_deref())
+        {
+            "running"
+        } else {
+            self.status.as_str()
+        }
+    }
+
+    fn to_admin_request_list_item(&self) -> AdminTranslationRequestListItem {
+        AdminTranslationRequestListItem {
+            id: self.id.clone(),
+            status: self.effective_status().to_owned(),
+            source: self.source.clone(),
+            request_origin: self.request_origin.clone(),
+            requested_by: self.requested_by.clone(),
+            scope_user_id: self.scope_user_id.clone(),
+            producer_ref: self.producer_ref.clone(),
+            kind: self.kind.clone(),
+            variant: self.variant.clone(),
+            entity_id: self.entity_id.clone(),
+            batch_id: self.batch_id.clone(),
+            created_at: self.created_at.clone(),
+            started_at: self.started_at.clone(),
+            finished_at: self.finished_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+
+    fn to_result(&self) -> TranslationResultItem {
+        TranslationResultItem {
+            producer_ref: self.producer_ref.clone(),
+            entity_id: self.entity_id.clone(),
+            kind: self.kind.clone(),
+            variant: self.variant.clone(),
+            status: self.result_status.clone().unwrap_or_else(|| {
+                pending_result_status_from_work_status(self.work_item_status.as_deref()).to_owned()
+            }),
+            title_zh: self.title_zh.clone(),
+            summary_md: self.summary_md.clone(),
+            body_md: self.body_md.clone(),
+            error: self.error_text.clone(),
+            work_item_id: self.work_item_id.clone(),
+            batch_id: self.batch_id.clone(),
+        }
+    }
+}
+
+fn work_item_status_counts_as_running(work_item_status: Option<&str>) -> bool {
+    matches!(work_item_status, Some("running" | "batched"))
+}
+
+fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'static str {
+    match work_item_status {
+        Some("queued") | None => "queued",
+        _ => "running",
+    }
+}
+
+fn queued_request_result(
+    item: &TranslationRequestItemInput,
+    work_item_id: Option<String>,
+) -> TranslationResultItem {
+    TranslationResultItem {
+        producer_ref: item.producer_ref.clone(),
+        entity_id: item.entity_id.clone(),
+        kind: item.kind.clone(),
+        variant: item.variant.clone(),
+        status: "queued".to_owned(),
+        title_zh: None,
+        summary_md: None,
+        body_md: None,
+        error: None,
+        work_item_id,
+        batch_id: None,
+    }
+}
+
+fn request_status_from_result_status(result_status: &str) -> &'static str {
+    match result_status {
+        "ready" | "disabled" => "completed",
+        "missing" | "error" => "failed",
+        _ => "queued",
+    }
+}
+
+fn request_status_from_work_item_status(work_item_status: &str) -> &'static str {
+    if work_item_status == "queued" {
+        "queued"
+    } else {
+        "running"
+    }
 }
 
 #[allow(dead_code)]
@@ -399,6 +554,12 @@ fn translation_worker_profiles() -> [TranslationWorkerProfile; 4] {
             worker_kind: "user_dedicated",
         },
     ]
+}
+
+fn translation_worker_profile_for_slot(worker_slot: i64) -> Option<TranslationWorkerProfile> {
+    translation_worker_profiles()
+        .into_iter()
+        .find(|profile| profile.worker_slot == worker_slot)
 }
 
 fn translation_worker_runtime() -> &'static tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>
@@ -505,15 +666,32 @@ fn claim_origin_case_sql() -> &'static str {
     CASE
       WHEN EXISTS (
         SELECT 1
-        FROM translation_work_watchers tw
-        JOIN translation_request_items tri ON tri.id = tw.request_item_id
-        JOIN translation_requests tr ON tr.id = tri.request_id
-        WHERE tw.work_item_id = w.id
+        FROM translation_requests tr
+        WHERE tr.work_item_id = w.id
           AND tr.request_origin = 'user'
       ) THEN 'user'
       ELSE 'system'
     END
     "#
+}
+
+fn request_row_select_sql() -> &'static str {
+    r#"
+    SELECT r.id, r.mode, r.source, r.request_origin, r.requested_by, r.scope_user_id,
+           r.producer_ref, r.kind, r.variant, r.entity_id, r.target_lang, r.max_wait_ms,
+           r.work_item_id, r.status, r.result_status, r.title_zh, r.summary_md, r.body_md,
+           r.error_text,
+           r.created_at, r.started_at, r.finished_at, r.updated_at,
+           (SELECT status FROM translation_work_items w WHERE w.id = r.work_item_id) AS work_item_status,
+           (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
+    FROM translation_requests r
+    "#
+}
+
+fn request_effective_status_sql(status_column: &str, work_item_status_column: &str) -> String {
+    format!(
+        "CASE WHEN {status_column} = 'queued' AND {work_item_status_column} IN ('running', 'batched') THEN 'running' ELSE {status_column} END"
+    )
 }
 pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::AbortHandle> {
     translation_worker_profiles()
@@ -571,29 +749,42 @@ pub async fn submit_translation_request(
 ) -> Result<Response, ApiError> {
     let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
     let mode = normalize_mode(req.mode.trim())?;
-    let items = normalize_request_items(&req.items)?;
-    let request_id = create_translation_request(state.as_ref(), &user_id, mode, &items).await?;
 
-    match mode {
-        "async" => {
-            let status = current_request_status(state.as_ref(), &request_id).await?;
-            Ok(Json(TranslationRequestResponse {
-                request_id,
-                status,
-                items: None,
+    match normalize_submit_payload(mode, req)? {
+        NormalizedTranslationSubmit::Single(item) => {
+            let created = create_translation_request(state.as_ref(), &user_id, mode, &item).await?;
+            match mode {
+                "async" => Ok(Json(created.to_public_response()).into_response()),
+                "wait" => {
+                    let detail =
+                        wait_for_request_terminal(state.as_ref(), &user_id, &created.request_id)
+                            .await?;
+                    Ok(Json(detail_to_public_response(detail)).into_response())
+                }
+                "stream" => Ok(stream_translation_request_response(
+                    state,
+                    user_id.clone(),
+                    created.request_id,
+                )),
+                _ => Err(ApiError::bad_request("unsupported mode")),
+            }
+        }
+        NormalizedTranslationSubmit::Batch(items) => {
+            if mode != "async" {
+                return Err(ApiError::bad_request(
+                    "batch translation requests only support async mode",
+                ));
+            }
+            let created =
+                create_translation_requests_batch(state.as_ref(), &user_id, mode, &items).await?;
+            Ok(Json(TranslationBatchSubmitResponse {
+                requests: created
+                    .into_iter()
+                    .map(|request| request.to_batch_response())
+                    .collect(),
             })
             .into_response())
         }
-        "wait" => {
-            let detail = wait_for_request_terminal(state.as_ref(), &user_id, &request_id).await?;
-            Ok(Json(detail_to_public_response(detail)).into_response())
-        }
-        "stream" => Ok(stream_translation_request_response(
-            state,
-            user_id.clone(),
-            request_id,
-        )),
-        _ => Err(ApiError::bad_request("unsupported mode")),
     }
 }
 
@@ -734,38 +925,47 @@ pub async fn admin_list_translation_requests(
     let offset = (page - 1) * page_size;
     let status = query.status.unwrap_or_else(|| "all".to_owned());
 
-    let total = sqlx::query_scalar::<_, i64>(
+    let effective_status_sql = request_effective_status_sql("status", "work_item_status");
+    let total_sql = format!(
         r#"
         SELECT COUNT(*)
-        FROM translation_requests
-        WHERE (? = 'all' OR status = ?)
+        FROM ({request_rows_base}) request_rows
+        WHERE (? = 'all' OR {effective_status_sql} = ?)
         "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+        request_rows_base = request_row_select_sql(),
+        effective_status_sql = effective_status_sql,
+    );
+    let total = sqlx::query_scalar::<_, i64>(&total_sql)
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
-    let items = sqlx::query_as::<_, AdminTranslationRequestListItem>(
+    let request_rows_sql = format!(
         r#"
-        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
-               created_at, started_at, finished_at, updated_at
-        FROM translation_requests
-        WHERE (? = 'all' OR status = ?)
-        ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+        SELECT *
+        FROM ({request_rows_base}) request_rows
+        WHERE (? = 'all' OR {effective_status_sql} = ?)
+        ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
                  updated_at DESC,
                  id DESC
         LIMIT ? OFFSET ?
         "#,
-    )
-    .bind(status.as_str())
-    .bind(status.as_str())
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+        request_rows_base = request_row_select_sql(),
+        effective_status_sql = effective_status_sql,
+    );
+    let items = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
+        .bind(status.as_str())
+        .bind(status.as_str())
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(|row| row.to_admin_request_list_item())
+        .collect();
 
     Ok(Json(AdminTranslationRequestsResponse {
         items,
@@ -782,30 +982,28 @@ pub async fn admin_get_translation_request_detail(
 ) -> Result<Json<AdminTranslationRequestDetailResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let request_id = api::parse_local_id_param(request_id, "request_id")?;
-    let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
-        r#"
-        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
-               created_at, started_at, finished_at, updated_at
-        FROM translation_requests
-        WHERE id = ?
+    let request_row_sql = format!(
+        r#"{}
+        WHERE r.id = ?
         LIMIT 1
         "#,
-    )
-    .bind(request_id.as_str())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "translation request not found",
-        )
-    })?;
-    let items = load_translation_result_items_by_request(state.as_ref(), &request_id).await?;
+        request_row_select_sql(),
+    );
+    let request = sqlx::query_as::<_, RequestRow>(&request_row_sql)
+        .bind(request_id.as_str())
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "translation request not found",
+            )
+        })?;
     Ok(Json(AdminTranslationRequestDetailResponse {
-        request,
-        items,
+        request: request.to_admin_request_list_item(),
+        result: request.to_result(),
     }))
 }
 
@@ -912,29 +1110,83 @@ async fn create_translation_request(
     state: &AppState,
     user_id: &str,
     mode: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<CreatedTranslationRequest, ApiError> {
+    create_translation_request_with_origin(state, user_id, mode, item, "user").await
+}
+
+async fn create_translation_requests_batch(
+    state: &AppState,
+    user_id: &str,
+    mode: &str,
     items: &[TranslationRequestItemInput],
-) -> Result<String, ApiError> {
-    create_translation_request_with_origin(state, user_id, mode, items, "user").await
+) -> Result<Vec<CreatedTranslationRequest>, ApiError> {
+    create_translation_requests_batch_with_origin(state, user_id, mode, items, "user").await
 }
 
 async fn create_translation_request_with_origin(
     state: &AppState,
     user_id: &str,
     mode: &str,
+    item: &TranslationRequestItemInput,
+    request_origin: &str,
+) -> Result<CreatedTranslationRequest, ApiError> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let created =
+        insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
+            .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    refresh_live_batch_runtime_for_request(state, &created).await?;
+    Ok(created)
+}
+
+async fn create_translation_requests_batch_with_origin(
+    state: &AppState,
+    user_id: &str,
+    mode: &str,
     items: &[TranslationRequestItemInput],
     request_origin: &str,
-) -> Result<String, ApiError> {
+) -> Result<Vec<CreatedTranslationRequest>, ApiError> {
     let now = Utc::now().to_rfc3339();
-    let request_id = crate::local_id::generate_local_id();
-    let source = derive_request_source(items);
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(
+            insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
+                .await?,
+        );
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+    for created in &out {
+        refresh_live_batch_runtime_for_request(state, created).await?;
+    }
+    Ok(out)
+}
+
+async fn insert_translation_request(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    mode: &str,
+    item: &TranslationRequestItemInput,
+    request_origin: &str,
+    now: &str,
+) -> Result<CreatedTranslationRequest, ApiError> {
+    let request_id = crate::local_id::generate_local_id();
+    let source_hash = build_source_hash(item);
+    let source_blocks_json =
+        serde_json::to_string(&item.source_blocks).map_err(ApiError::internal)?;
+    let target_slots_json =
+        serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
+    let source = derive_request_source(std::slice::from_ref(item));
 
     sqlx::query(
         r#"
         INSERT INTO translation_requests (
-          id, mode, source, request_origin, requested_by, scope_user_id, status, item_count, completed_item_count,
-          created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)
+          id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind,
+          variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json,
+          target_slots_json, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
         "#,
     )
     .bind(request_id.as_str())
@@ -943,70 +1195,6 @@ async fn create_translation_request_with_origin(
     .bind(request_origin)
     .bind(user_id)
     .bind(user_id)
-    .bind(i64::try_from(items.len()).unwrap_or(i64::MAX))
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
-
-    let mut completed = 0_i64;
-    for item in items {
-        if insert_request_item(&mut tx, &request_id, user_id, item, &now).await? {
-            completed += 1;
-        }
-    }
-
-    let status = if completed == i64::try_from(items.len()).unwrap_or(i64::MAX) {
-        "completed"
-    } else {
-        "queued"
-    };
-    let finished_at = (status == "completed").then_some(now.clone());
-
-    sqlx::query(
-        r#"
-        UPDATE translation_requests
-        SET status = ?, completed_item_count = ?, finished_at = ?, updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(status)
-    .bind(completed)
-    .bind(finished_at.as_deref())
-    .bind(now.as_str())
-    .bind(request_id.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
-
-    tx.commit().await.map_err(ApiError::internal)?;
-    Ok(request_id)
-}
-
-async fn insert_request_item(
-    tx: &mut Transaction<'_, Sqlite>,
-    request_id: &str,
-    user_id: &str,
-    item: &TranslationRequestItemInput,
-    now: &str,
-) -> Result<bool, ApiError> {
-    let source_hash = build_source_hash(item);
-    let source_blocks_json =
-        serde_json::to_string(&item.source_blocks).map_err(ApiError::internal)?;
-    let target_slots_json =
-        serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
-    let request_item_id = crate::local_id::generate_local_id();
-    sqlx::query(
-        r#"
-        INSERT INTO translation_request_items (
-          id, request_id, producer_ref, kind, variant, entity_id, target_lang, max_wait_ms,
-          source_hash, source_blocks_json, target_slots_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(request_item_id.as_str())
-    .bind(request_id)
     .bind(item.producer_ref.as_str())
     .bind(item.kind.as_str())
     .bind(item.variant.as_str())
@@ -1023,39 +1211,236 @@ async fn insert_request_item(
     .map_err(ApiError::internal)?;
 
     if let Some(cached) = load_cached_result(tx, user_id, item, &source_hash).await? {
-        apply_request_item_result(tx, request_item_id.as_str(), None, &cached, now).await?;
-        return Ok(true);
+        let status = request_status_from_result_status(cached.status.as_str());
+        apply_request_result(tx, request_id.as_str(), None, &cached, now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: status.to_owned(),
+            result: cached,
+        });
     }
 
-    let work_item = load_existing_work_item(tx, user_id, item, &source_hash).await?;
-    match work_item {
-        Some(existing)
-            if existing.result_status.is_some()
-                && matches!(existing.status.as_str(), "completed" | "failed") =>
-        {
-            let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
-            apply_request_item_result(
-                tx,
-                request_item_id.as_str(),
-                Some(existing.id.as_str()),
-                &result,
-                now,
-            )
-            .await?;
-            Ok(true)
-        }
-        Some(existing) => {
-            attach_request_item_to_work_item(tx, request_item_id.as_str(), &existing.id, now)
-                .await?;
-            Ok(false)
-        }
-        None => {
-            let work_item_id = create_work_item(tx, user_id, item, &source_hash, now).await?;
-            attach_request_item_to_work_item(tx, request_item_id.as_str(), &work_item_id, now)
-                .await?;
-            Ok(false)
-        }
+    if let Some(work_item_id) = create_work_item(tx, user_id, item, &source_hash, now).await? {
+        attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: "queued".to_owned(),
+            result: queued_request_result(item, Some(work_item_id)),
+        });
     }
+
+    let existing = load_existing_work_item(tx, user_id, item, &source_hash)
+        .await?
+        .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
+
+    if existing.result_status.is_some()
+        && matches!(existing.status.as_str(), "completed" | "failed")
+    {
+        let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
+        let status = request_status_from_result_status(result.status.as_str()).to_owned();
+        apply_request_result(
+            tx,
+            request_id.as_str(),
+            Some(existing.id.as_str()),
+            &result,
+            now,
+        )
+        .await?;
+        if let Some(batch_id) = existing.batch_id.as_deref() {
+            refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+        }
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status,
+            result,
+        });
+    }
+
+    let status = request_status_from_work_item_status(existing.status.as_str()).to_owned();
+    let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
+    attach_request_to_work_item(tx, request_id.as_str(), &existing.id, status.as_str(), now)
+        .await?;
+    if let Some(batch_id) = existing.batch_id.as_deref() {
+        refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+    }
+    Ok(CreatedTranslationRequest {
+        request_id,
+        status,
+        result,
+    })
+}
+
+async fn attach_request_to_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    request_id: &str,
+    work_item_id: &str,
+    request_status: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_requests
+        SET work_item_id = ?,
+            status = ?,
+            started_at = CASE
+                WHEN ? = 'running' THEN COALESCE(started_at, ?)
+                ELSE started_at
+            END,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(work_item_id)
+    .bind(request_status)
+    .bind(request_status)
+    .bind(now)
+    .bind(now)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn refresh_batch_request_counters(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    let producer_count = sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM translation_requests WHERE work_item_id = ?"#,
+    )
+    .bind(work_item_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        UPDATE translation_batch_items
+        SET producer_count = ?, updated_at = ?
+        WHERE batch_id = ? AND work_item_id = ?
+        "#,
+    )
+    .bind(producer_count)
+    .bind(now)
+    .bind(batch_id)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let request_count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM translation_requests
+        WHERE work_item_id IN (
+            SELECT work_item_id
+            FROM translation_batch_items
+            WHERE batch_id = ?
+        )
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET request_count = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(request_count)
+    .bind(now)
+    .bind(batch_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(())
+}
+
+async fn refresh_live_batch_runtime_for_request(
+    state: &AppState,
+    created: &CreatedTranslationRequest,
+) -> Result<(), ApiError> {
+    if created.status != "running" {
+        return Ok(());
+    }
+    let Some(batch_id) = created.result.batch_id.as_deref() else {
+        return Ok(());
+    };
+    let row = sqlx::query_as::<_, RunningBatchRuntimeRow>(
+        r#"
+        SELECT id, worker_slot, request_count, item_count, trigger_reason
+        FROM translation_batches
+        WHERE id = ? AND status = 'running'
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let Some(profile) = translation_worker_profile_for_slot(row.worker_slot) else {
+        return Ok(());
+    };
+    update_translation_worker_runtime(
+        profile,
+        "running",
+        Some(row.id.as_str()),
+        row.request_count,
+        row.item_count,
+        Some(row.trigger_reason.as_str()),
+        None,
+    )
+    .await;
+    Ok(())
+}
+
+async fn apply_request_result(
+    tx: &mut Transaction<'_, Sqlite>,
+    request_id: &str,
+    work_item_id: Option<&str>,
+    result: &TranslationResultItem,
+    now: &str,
+) -> Result<(), ApiError> {
+    let status = request_status_from_result_status(result.status.as_str());
+    sqlx::query(
+        r#"
+        UPDATE translation_requests
+        SET work_item_id = COALESCE(?, work_item_id),
+            status = ?,
+            result_status = ?,
+            title_zh = ?,
+            summary_md = ?,
+            body_md = ?,
+            error_text = ?,
+            finished_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(work_item_id)
+    .bind(status)
+    .bind(result.status.as_str())
+    .bind(result.title_zh.as_deref())
+    .bind(result.summary_md.as_deref())
+    .bind(result.body_md.as_deref())
+    .bind(result.error.as_deref())
+    .bind(now)
+    .bind(now)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 async fn load_cached_result(
@@ -1147,7 +1532,7 @@ async fn create_work_item(
     item: &TranslationRequestItemInput,
     source_hash: &str,
     now: &str,
-) -> Result<String, ApiError> {
+) -> Result<Option<String>, ApiError> {
     let id = crate::local_id::generate_local_id();
     let model_profile = current_model_profile();
     let token_estimate = estimate_item_tokens(item);
@@ -1159,13 +1544,14 @@ async fn create_work_item(
         serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
     let dedupe_key = build_dedupe_key(user_id, item, source_hash);
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO translation_work_items (
           id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
           model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
           deadline_at, status, cache_hit, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)
+        ON CONFLICT(dedupe_key) DO NOTHING
         "#,
     )
     .bind(id.as_str())
@@ -1188,79 +1574,11 @@ async fn create_work_item(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(id)
-}
-
-async fn attach_request_item_to_work_item(
-    tx: &mut Transaction<'_, Sqlite>,
-    request_item_id: &str,
-    work_item_id: &str,
-    now: &str,
-) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE translation_request_items
-        SET work_item_id = ?, updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(work_item_id)
-    .bind(now)
-    .bind(request_item_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO translation_work_watchers (id, work_item_id, request_item_id, created_at)
-        VALUES (?, ?, ?, ?)
-        "#,
-    )
-    .bind(crate::local_id::generate_local_id())
-    .bind(work_item_id)
-    .bind(request_item_id)
-    .bind(now)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(())
-}
-
-async fn apply_request_item_result(
-    tx: &mut Transaction<'_, Sqlite>,
-    request_item_id: &str,
-    work_item_id: Option<&str>,
-    result: &TranslationResultItem,
-    now: &str,
-) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE translation_request_items
-        SET work_item_id = COALESCE(?, work_item_id),
-            result_status = ?,
-            title_zh = ?,
-            summary_md = ?,
-            body_md = ?,
-            error_text = ?,
-            finished_at = ?,
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(work_item_id)
-    .bind(result.status.as_str())
-    .bind(result.title_zh.as_deref())
-    .bind(result.summary_md.as_deref())
-    .bind(result.body_md.as_deref())
-    .bind(result.error.as_deref())
-    .bind(now)
-    .bind(now)
-    .bind(request_item_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(())
+    if result.rows_affected() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(id))
+    }
 }
 
 async fn run_translation_scheduler_once(
@@ -1382,10 +1700,9 @@ async fn claim_next_batch(
     for item in &selected {
         let rows = sqlx::query_scalar::<_, String>(
             r#"
-            SELECT DISTINCT tri.request_id
-            FROM translation_work_watchers tw
-            JOIN translation_request_items tri ON tri.id = tw.request_item_id
-            WHERE tw.work_item_id = ?
+            SELECT id
+            FROM translation_requests
+            WHERE work_item_id = ?
             "#,
         )
         .bind(item.id.as_str())
@@ -1420,7 +1737,7 @@ async fn claim_next_batch(
 
     for (index, item) in selected.iter().enumerate() {
         let producer_count = sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM translation_work_watchers WHERE work_item_id = ?"#,
+            r#"SELECT COUNT(*) FROM translation_requests WHERE work_item_id = ?"#,
         )
         .bind(item.id.as_str())
         .fetch_one(&mut *tx)
@@ -1465,12 +1782,13 @@ async fn claim_next_batch(
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
-    mark_requests_running_for_work_items(
-        state,
+    mark_requests_running_for_work_items_in_tx(
+        &mut tx,
         selected.iter().map(|item| item.id.as_str()).collect(),
+        now_str.as_str(),
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Some(ClaimedBatch {
         id: batch_id,
@@ -1772,7 +2090,6 @@ async fn finalize_batch_success(
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let mut tx = state.pool.begin().await?;
-    let mut request_ids = HashSet::new();
     for result in &results {
         sqlx::query(
             r#"
@@ -1814,25 +2131,23 @@ async fn finalize_batch_success(
         .execute(&mut *tx)
         .await?;
 
-        let watchers = sqlx::query(
+        let requests = sqlx::query(
             r#"
-            SELECT w.request_item_id, r.request_id, r.producer_ref, r.entity_id, r.kind, r.variant
-            FROM translation_work_watchers w
-            JOIN translation_request_items r ON r.id = w.request_item_id
-            WHERE w.work_item_id = ?
+            SELECT id, producer_ref, entity_id, kind, variant
+            FROM translation_requests
+            WHERE work_item_id = ?
             "#,
         )
         .bind(result.work_item_id.as_str())
         .fetch_all(&mut *tx)
         .await?;
-        for watcher in watchers {
-            let request_item_id: String = watcher.try_get("request_item_id")?;
-            let request_id: String = watcher.try_get("request_id")?;
-            let producer_ref: String = watcher.try_get("producer_ref")?;
-            let entity_id: String = watcher.try_get("entity_id")?;
-            let kind: String = watcher.try_get("kind")?;
-            let variant: String = watcher.try_get("variant")?;
-            let item_result = TranslationResultItem {
+        for request in requests {
+            let request_id: String = request.try_get("id")?;
+            let producer_ref: String = request.try_get("producer_ref")?;
+            let entity_id: String = request.try_get("entity_id")?;
+            let kind: String = request.try_get("kind")?;
+            let variant: String = request.try_get("variant")?;
+            let request_result = TranslationResultItem {
                 producer_ref,
                 entity_id,
                 kind,
@@ -1845,15 +2160,14 @@ async fn finalize_batch_success(
                 work_item_id: Some(result.work_item_id.clone()),
                 batch_id: Some(batch.id.clone()),
             };
-            apply_request_item_result(
+            apply_request_result(
                 &mut tx,
-                request_item_id.as_str(),
+                request_id.as_str(),
                 Some(result.work_item_id.as_str()),
-                &item_result,
+                &request_result,
                 now.as_str(),
             )
             .await?;
-            request_ids.insert(request_id);
         }
 
         if result.result_status == "ready"
@@ -1890,8 +2204,6 @@ async fn finalize_batch_success(
     .execute(&mut *tx)
     .await?;
 
-    refresh_requests_after_completion(&mut tx, request_ids.into_iter().collect(), now.as_str())
-        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1904,21 +2216,7 @@ async fn finalize_batch_failure(
     let now = Utc::now().to_rfc3339();
     let message = err.to_string();
     let mut tx = state.pool.begin().await?;
-    let mut request_ids = HashSet::new();
     for item in &batch.items {
-        let result = TranslationResultItem {
-            producer_ref: String::new(),
-            entity_id: item.entity_id.clone(),
-            kind: item.kind.clone(),
-            variant: item.variant.clone(),
-            status: "error".to_owned(),
-            title_zh: None,
-            summary_md: None,
-            body_md: None,
-            error: Some(message.clone()),
-            work_item_id: Some(item.id.clone()),
-            batch_id: Some(batch.id.clone()),
-        };
         sqlx::query(
             r#"
             UPDATE translation_work_items
@@ -1945,38 +2243,43 @@ async fn finalize_batch_failure(
         .bind(item.id.as_str())
         .execute(&mut *tx)
         .await?;
-        let watchers = sqlx::query(
+        let requests = sqlx::query(
             r#"
-            SELECT w.request_item_id, r.request_id, r.producer_ref, r.entity_id, r.kind, r.variant
-            FROM translation_work_watchers w
-            JOIN translation_request_items r ON r.id = w.request_item_id
-            WHERE w.work_item_id = ?
+            SELECT id, producer_ref, entity_id, kind, variant
+            FROM translation_requests
+            WHERE work_item_id = ?
             "#,
         )
         .bind(item.id.as_str())
         .fetch_all(&mut *tx)
         .await?;
-        for watcher in watchers {
-            let request_item_id: String = watcher.try_get("request_item_id")?;
-            let request_id: String = watcher.try_get("request_id")?;
-            let producer_ref: String = watcher.try_get("producer_ref")?;
-            let entity_id: String = watcher.try_get("entity_id")?;
-            let kind: String = watcher.try_get("kind")?;
-            let variant: String = watcher.try_get("variant")?;
-            let mut request_result = result.clone();
-            request_result.producer_ref = producer_ref;
-            request_result.entity_id = entity_id;
-            request_result.kind = kind;
-            request_result.variant = variant;
-            apply_request_item_result(
+        for request in requests {
+            let request_id: String = request.try_get("id")?;
+            let producer_ref: String = request.try_get("producer_ref")?;
+            let entity_id: String = request.try_get("entity_id")?;
+            let kind: String = request.try_get("kind")?;
+            let variant: String = request.try_get("variant")?;
+            let request_result = TranslationResultItem {
+                producer_ref,
+                entity_id,
+                kind,
+                variant,
+                status: "error".to_owned(),
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error: Some(message.clone()),
+                work_item_id: Some(item.id.clone()),
+                batch_id: Some(batch.id.clone()),
+            };
+            apply_request_result(
                 &mut tx,
-                request_item_id.as_str(),
+                request_id.as_str(),
                 Some(item.id.as_str()),
                 &request_result,
                 now.as_str(),
             )
             .await?;
-            request_ids.insert(request_id);
         }
     }
     sqlx::query(
@@ -1992,61 +2295,37 @@ async fn finalize_batch_failure(
     .bind(batch.id.as_str())
     .execute(&mut *tx)
     .await?;
-    refresh_requests_after_completion(&mut tx, request_ids.into_iter().collect(), now.as_str())
-        .await?;
     tx.commit().await?;
     Ok(())
 }
 
+#[cfg(test)]
 async fn refresh_requests_after_completion(
     tx: &mut Transaction<'_, Sqlite>,
     request_ids: Vec<String>,
     now: &str,
 ) -> Result<()> {
     for request_id in request_ids {
-        let counts = sqlx::query(
-            r#"
-            SELECT item_count, completed_item_count FROM translation_requests WHERE id = ? LIMIT 1
-            "#,
+        let result_status = sqlx::query_scalar::<_, Option<String>>(
+            r#"SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1"#,
         )
         .bind(request_id.as_str())
         .fetch_optional(&mut **tx)
         .await?;
-        if counts.is_none() {
+        let Some(result_status) = result_status.flatten() else {
             continue;
-        }
-        let (total, completed, failures): (i64, i64, i64) = sqlx::query_as(
-            r#"
-            SELECT
-              COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN result_status IS NOT NULL THEN 1 ELSE 0 END), 0) AS completed,
-              COALESCE(SUM(CASE WHEN result_status IN ('error', 'missing') THEN 1 ELSE 0 END), 0) AS failures
-            FROM translation_request_items
-            WHERE request_id = ?
-            "#,
-        )
-        .bind(request_id.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
-        let status = if completed < total {
-            "running"
-        } else if failures > 0 {
-            "failed"
-        } else {
-            "completed"
         };
+        let status = request_status_from_result_status(result_status.as_str());
         sqlx::query(
             r#"
             UPDATE translation_requests
             SET status = ?,
-                completed_item_count = ?,
                 finished_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE finished_at END,
                 updated_at = ?
             WHERE id = ?
             "#,
         )
         .bind(status)
-        .bind(completed)
         .bind(status)
         .bind(now)
         .bind(now)
@@ -2057,38 +2336,31 @@ async fn refresh_requests_after_completion(
     Ok(())
 }
 
-async fn mark_requests_running_for_work_items(
-    state: &AppState,
+async fn mark_requests_running_for_work_items_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     work_item_ids: Vec<&str>,
+    now: &str,
 ) -> Result<()> {
     if work_item_ids.is_empty() {
         return Ok(());
     }
-    let now = Utc::now().to_rfc3339();
     let mut query = sqlx::QueryBuilder::<Sqlite>::new(
         r#"
         UPDATE translation_requests
         SET status = 'running', started_at = COALESCE(started_at, "#,
     );
-    query.push_bind(now.as_str());
+    query.push_bind(now);
     query.push(r#"), updated_at = "#);
-    query.push_bind(now.as_str());
-    query.push(
-        r#"
-        WHERE status = 'queued' AND id IN (
-          SELECT DISTINCT r.request_id
-          FROM translation_request_items r
-          WHERE r.work_item_id IN (
-        "#,
-    );
+    query.push_bind(now);
+    query.push(r#" WHERE status = 'queued' AND work_item_id IN ("#);
     {
         let mut separated = query.separated(", ");
         for id in work_item_ids {
             separated.push_bind(id);
         }
     }
-    query.push(") )");
-    query.build().execute(&state.pool).await?;
+    query.push(")");
+    query.build().execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -2108,12 +2380,15 @@ fn stream_translation_request_response(
                         let event = TranslationRequestStreamEvent {
                             event: phase.clone(),
                             request_id: request_id.clone(),
-                            status: detail.request.status.clone(),
-                            batch_ids: Some(detail.items.iter().filter_map(|item| item.batch_id.clone()).collect::<HashSet<_>>().into_iter().collect()),
-                            items: if matches!(phase.as_str(), "completed" | "failed") { Some(detail.items.clone()) } else { None },
+                            status: detail.request.effective_status().to_owned(),
+                            batch_id: detail.result.batch_id.clone(),
+                            result: matches!(phase.as_str(), "completed" | "failed")
+                                .then(|| detail.result.clone()),
                             error: if phase == "failed" {
-                                detail.items.iter().find_map(|item| item.error.clone())
-                            } else { None },
+                                detail.result.error.clone()
+                            } else {
+                                None
+                            },
                         };
                         let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
                         payload.push('\n');
@@ -2129,8 +2404,8 @@ fn stream_translation_request_response(
                         event: "failed".to_owned(),
                         request_id: request_id.clone(),
                         status: "failed".to_owned(),
-                        batch_ids: None,
-                        items: None,
+                        batch_id: None,
+                        result: None,
                         error: Some(err.to_string()),
                     };
                     let mut payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned());
@@ -2158,8 +2433,68 @@ fn stream_translation_request_response(
 
 #[derive(Debug)]
 struct LoadedRequestDetail {
-    request: AdminTranslationRequestListItem,
-    items: Vec<TranslationResultItem>,
+    request: RequestRow,
+    result: TranslationResultItem,
+}
+
+#[derive(Debug)]
+enum NormalizedTranslationSubmit {
+    Single(TranslationRequestItemInput),
+    Batch(Vec<TranslationRequestItemInput>),
+}
+
+fn normalize_submit_payload(
+    mode: &str,
+    req: TranslationSubmitRequest,
+) -> Result<NormalizedTranslationSubmit, ApiError> {
+    match (req.item, req.items) {
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "item and items are mutually exclusive",
+        )),
+        (None, None) => Err(ApiError::bad_request("item or items is required")),
+        (Some(item), None) => {
+            let mut items = normalize_request_items(std::slice::from_ref(&item))?;
+            Ok(NormalizedTranslationSubmit::Single(items.remove(0)))
+        }
+        (None, Some(items)) => {
+            if mode != "async" {
+                return Err(ApiError::bad_request(
+                    "wait/stream supports only a single item; batch requests must use async",
+                ));
+            }
+            Ok(NormalizedTranslationSubmit::Batch(normalize_request_items(
+                &items,
+            )?))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CreatedTranslationRequest {
+    request_id: String,
+    status: String,
+    result: TranslationResultItem,
+}
+
+impl CreatedTranslationRequest {
+    fn to_public_response(&self) -> TranslationRequestResponse {
+        TranslationRequestResponse {
+            request_id: self.request_id.clone(),
+            status: self.status.clone(),
+            result: self.result.clone(),
+        }
+    }
+
+    fn to_batch_response(&self) -> TranslationBatchSubmitItemResponse {
+        TranslationBatchSubmitItemResponse {
+            request_id: self.request_id.clone(),
+            status: self.status.clone(),
+            producer_ref: self.result.producer_ref.clone(),
+            entity_id: self.result.entity_id.clone(),
+            kind: self.result.kind.clone(),
+            variant: self.result.variant.clone(),
+        }
+    }
 }
 
 async fn wait_for_request_terminal(
@@ -2172,25 +2507,14 @@ async fn wait_for_request_terminal(
         if matches!(detail.request.status.as_str(), "completed" | "failed") {
             return Ok(detail);
         }
+        let created_at =
+            parse_ts(detail.request.created_at.as_str()).map_err(ApiError::internal)?;
+        let wait_budget = chrono::Duration::milliseconds(detail.request.max_wait_ms.max(0));
+        if Utc::now() >= created_at + wait_budget {
+            return Ok(detail);
+        }
         sleep(TRANSLATION_WAIT_POLL_INTERVAL).await;
     }
-}
-
-async fn current_request_status(state: &AppState, request_id: &str) -> Result<String, ApiError> {
-    sqlx::query_scalar::<_, String>(
-        r#"SELECT status FROM translation_requests WHERE id = ? LIMIT 1"#,
-    )
-    .bind(request_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "translation request not found",
-        )
-    })
 }
 
 async fn ensure_request_owner(
@@ -2227,66 +2551,28 @@ async fn load_translation_request_detail(
     user_id: &str,
     request_id: &str,
 ) -> Result<LoadedRequestDetail, ApiError> {
-    let request = sqlx::query_as::<_, AdminTranslationRequestListItem>(
-        r#"
-        SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count,
-               completed_item_count, created_at, started_at, finished_at, updated_at
-        FROM translation_requests
-        WHERE id = ? AND scope_user_id = ?
+    let request_row_sql = format!(
+        r#"{}
+        WHERE r.id = ? AND r.scope_user_id = ?
         LIMIT 1
         "#,
-    )
-    .bind(request_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "translation request not found",
-        )
-    })?;
-    let items = load_translation_result_items_by_request(state, request_id).await?;
-    Ok(LoadedRequestDetail { request, items })
-}
-
-async fn load_translation_result_items_by_request(
-    state: &AppState,
-    request_id: &str,
-) -> Result<Vec<TranslationResultItem>, ApiError> {
-    let rows = sqlx::query(
-        r#"
-        SELECT producer_ref, entity_id, kind, variant,
-               COALESCE(result_status, 'queued') AS result_status,
-               title_zh, summary_md, body_md, error_text, work_item_id,
-               (SELECT batch_id FROM translation_work_items w WHERE w.id = r.work_item_id) AS batch_id
-        FROM translation_request_items r
-        WHERE request_id = ?
-        ORDER BY rowid ASC
-        "#,
-    )
-    .bind(request_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(rows
-        .into_iter()
-        .map(|row| TranslationResultItem {
-            producer_ref: row.get("producer_ref"),
-            entity_id: row.get("entity_id"),
-            kind: row.get("kind"),
-            variant: row.get("variant"),
-            status: row.get("result_status"),
-            title_zh: row.get("title_zh"),
-            summary_md: row.get("summary_md"),
-            body_md: row.get("body_md"),
-            error: row.get("error_text"),
-            work_item_id: row.get("work_item_id"),
-            batch_id: row.get("batch_id"),
-        })
-        .collect())
+        request_row_select_sql(),
+    );
+    let request = sqlx::query_as::<_, RequestRow>(&request_row_sql)
+        .bind(request_id)
+        .bind(user_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "translation request not found",
+            )
+        })?;
+    let result = request.to_result();
+    Ok(LoadedRequestDetail { request, result })
 }
 
 async fn load_translation_result_items_by_batch(
@@ -2295,16 +2581,15 @@ async fn load_translation_result_items_by_batch(
 ) -> Result<Vec<TranslationResultItem>, ApiError> {
     let rows = sqlx::query(
         r#"
-        SELECT w.id AS work_item_id, b.work_item_id AS batch_work_item_id, b.entity_id, b.kind, b.variant,
+        SELECT w.id AS work_item_id, b.entity_id, b.kind, b.variant,
                COALESCE(b.result_status, w.result_status, 'queued') AS result_status,
                w.title_zh, w.summary_md, w.body_md, COALESCE(b.error_text, w.error_text) AS error_text,
                MIN(r.producer_ref) AS producer_ref
         FROM translation_batch_items b
         JOIN translation_work_items w ON w.id = b.work_item_id
-        LEFT JOIN translation_work_watchers watcher ON watcher.work_item_id = w.id
-        LEFT JOIN translation_request_items r ON r.id = watcher.request_item_id
+        LEFT JOIN translation_requests r ON r.work_item_id = w.id
         WHERE b.batch_id = ?
-        GROUP BY w.id, b.work_item_id, b.entity_id, b.kind, b.variant, b.result_status, w.result_status,
+        GROUP BY w.id, b.entity_id, b.kind, b.variant, b.result_status, w.result_status,
                  w.title_zh, w.summary_md, w.body_md, b.error_text, w.error_text
         ORDER BY b.item_index ASC, w.id ASC
         "#,
@@ -2335,19 +2620,21 @@ async fn load_translation_result_items_by_batch(
 }
 
 fn detail_to_public_response(detail: LoadedRequestDetail) -> TranslationRequestResponse {
+    let request_id = detail.request.id.clone();
+    let status = detail.request.effective_status().to_owned();
     TranslationRequestResponse {
-        request_id: detail.request.id,
-        status: detail.request.status,
-        items: Some(detail.items),
+        request_id,
+        status,
+        result: detail.result,
     }
 }
 
 fn derive_request_stream_phase(detail: &LoadedRequestDetail) -> String {
-    match detail.request.status.as_str() {
+    match detail.request.effective_status() {
         "completed" => "completed".to_owned(),
         "failed" => "failed".to_owned(),
         "running" => "running".to_owned(),
-        _ if detail.items.iter().any(|item| item.batch_id.is_some()) => "batched".to_owned(),
+        _ if detail.result.batch_id.is_some() => "batched".to_owned(),
         _ => "queued".to_owned(),
     }
 }
@@ -2551,6 +2838,22 @@ fn map_entity_type(kind: &str) -> Option<&'static str> {
     }
 }
 
+fn pending_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
+    TranslationResultItem {
+        producer_ref,
+        entity_id: row.entity_id.clone(),
+        kind: row.kind.clone(),
+        variant: row.variant.clone(),
+        status: pending_result_status_from_work_status(Some(row.status.as_str())).to_owned(),
+        title_zh: None,
+        summary_md: None,
+        body_md: None,
+        error: None,
+        work_item_id: Some(row.id.clone()),
+        batch_id: row.batch_id.clone(),
+    }
+}
+
 fn terminal_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
     TranslationResultItem {
         producer_ref,
@@ -2639,7 +2942,10 @@ async fn load_last_batch_finished_at(state: &AppState) -> Result<Option<String>,
 mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
     use url::Url;
 
     use super::*;
@@ -2668,6 +2974,349 @@ mod tests {
         assert_eq!(err.code(), "bad_request");
     }
 
+    #[test]
+    fn normalize_submit_payload_rejects_wait_mode_batch_items() {
+        let err = normalize_submit_payload(
+            "wait",
+            TranslationSubmitRequest {
+                mode: "wait".to_owned(),
+                item: None,
+                items: Some(vec![sample_release_item("123")]),
+            },
+        )
+        .expect_err("wait mode batch payload should fail");
+
+        assert_eq!(err.code(), "bad_request");
+        assert_eq!(
+            err.to_string(),
+            "wait/stream supports only a single item; batch requests must use async"
+        );
+    }
+
+    #[test]
+    fn normalize_submit_payload_accepts_single_item_contract() {
+        let item = sample_release_item("123");
+        let normalized = normalize_submit_payload(
+            "stream",
+            TranslationSubmitRequest {
+                mode: "stream".to_owned(),
+                item: Some(item.clone()),
+                items: None,
+            },
+        )
+        .expect("single item should normalize");
+
+        match normalized {
+            NormalizedTranslationSubmit::Single(normalized_item) => {
+                assert_eq!(normalized_item.entity_id, item.entity_id);
+                assert_eq!(normalized_item.producer_ref, item.producer_ref);
+            }
+            NormalizedTranslationSubmit::Batch(_) => panic!("expected single-item payload"),
+        }
+    }
+
+    #[tokio::test]
+    async fn created_request_public_response_always_includes_result() {
+        let item = sample_release_item("response-item");
+        let created = CreatedTranslationRequest {
+            request_id: "req-1".to_owned(),
+            status: "queued".to_owned(),
+            result: queued_request_result(&item, Some("work-1".to_owned())),
+        };
+
+        let response = created.to_public_response();
+        assert_eq!(response.request_id, "req-1");
+        assert_eq!(response.status, "queued");
+        assert_eq!(response.result.entity_id, item.entity_id);
+        assert_eq!(response.result.producer_ref, item.producer_ref);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_running_work_item_status() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("123");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', batch_id = 'batch-running-1', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "running");
+        assert_eq!(second.result.status, "running");
+        assert_eq!(second.result.batch_id.as_deref(), Some("batch-running-1"));
+
+        let stored_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
+                .bind(second.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load stored request status");
+        assert_eq!(stored_status, "running");
+
+        let detail =
+            load_translation_request_detail(state.as_ref(), "1", second.request_id.as_str())
+                .await
+                .expect("load request detail");
+
+        assert_eq!(
+            detail.request.to_admin_request_list_item().status,
+            "running"
+        );
+        assert_eq!(detail.result.status, "running");
+        assert_eq!(detail.result.batch_id.as_deref(), Some("batch-running-1"));
+        assert_eq!(derive_request_stream_phase(&detail), "running");
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_batched_work_item_updates_batch_counters() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("batched-window");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+            "#,
+        )
+        .bind("batch-queued-window")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-1")
+        .bind("batch-queued-window")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'batched', batch_id = 'batch-queued-window', updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item batched");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "running");
+        assert_eq!(second.result.status, "running");
+        assert_eq!(
+            second.result.batch_id.as_deref(),
+            Some("batch-queued-window")
+        );
+
+        let stored =
+            sqlx::query("SELECT status, started_at FROM translation_requests WHERE id = ?")
+                .bind(second.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load stored request state");
+        assert_eq!(stored.get::<String, _>("status"), "running");
+        assert!(stored.get::<Option<String>, _>("started_at").is_some());
+
+        let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
+            .bind("batch-queued-window")
+            .fetch_one(&pool)
+            .await
+            .expect("load batch counters");
+        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+
+        let batch_item = sqlx::query(
+            "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
+        )
+        .bind("batch-queued-window")
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load batch item counters");
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_terminal_batched_work_item_updates_batch_counters() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("batched-terminal-window");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+            "#,
+        )
+        .bind("batch-terminal-window")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-terminal-1")
+        .bind("batch-terminal-window")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                batch_id = 'batch-terminal-window',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+        assert_eq!(second.status, "failed");
+        assert_eq!(second.result.status, "error");
+        assert_eq!(
+            second.result.batch_id.as_deref(),
+            Some("batch-terminal-window")
+        );
+
+        let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
+            .bind("batch-terminal-window")
+            .fetch_one(&pool)
+            .await
+            .expect("load batch counters");
+        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+
+        let batch_item = sqlx::query(
+            "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
+        )
+        .bind("batch-terminal-window")
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load batch item counters");
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+    }
+
     #[tokio::test]
     async fn create_translation_request_dedupes_work_items() {
         let pool = setup_pool().await;
@@ -2675,10 +3324,10 @@ mod tests {
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
 
-        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("first request created");
-        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
+        let second = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("second request created");
 
@@ -2686,18 +3335,87 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count work items");
-        let watchers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_watchers")
-            .fetch_one(&pool)
-            .await
-            .expect("count watchers");
         let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
             .fetch_one(&pool)
             .await
             .expect("count requests");
+        let attached_requests: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM translation_requests WHERE work_item_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count attached requests");
+        let distinct_work_item_ids: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT work_item_id) FROM translation_requests WHERE id IN (?, ?)",
+        )
+        .bind(first.request_id.as_str())
+        .bind(second.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count distinct work item ids");
 
         assert_eq!(requests, 2);
         assert_eq!(work_items, 1);
-        assert_eq!(watchers, 2);
+        assert_eq!(attached_requests, 2);
+        assert_eq!(distinct_work_item_ids, 1);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_dedupes_work_items_under_concurrency() {
+        let pool = setup_pool_with_max_connections(4).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("concurrent-123");
+
+        let first_state = state.clone();
+        let second_state = state.clone();
+        let first_item = item.clone();
+        let second_item = item.clone();
+
+        let (first, second) = tokio::join!(
+            create_translation_request(first_state.as_ref(), "1", "async", &first_item),
+            create_translation_request(second_state.as_ref(), "1", "async", &second_item),
+        );
+
+        let first = first.expect("first concurrent request created");
+        let second = second.expect("second concurrent request created");
+
+        let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+            .fetch_one(&pool)
+            .await
+            .expect("count work items");
+        let distinct_work_item_ids: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT work_item_id) FROM translation_requests WHERE id IN (?, ?)",
+        )
+        .bind(first.request_id.as_str())
+        .bind(second.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count distinct work item ids");
+
+        assert_eq!(work_items, 1);
+        assert_eq!(distinct_work_item_ids, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_request_terminal_returns_latest_snapshot_after_wait_budget() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("wait-budget");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "wait", &item)
+            .await
+            .expect("request created");
+
+        let detail = wait_for_request_terminal(state.as_ref(), "1", created.request_id.as_str())
+            .await
+            .expect("wait result loaded");
+
+        assert_eq!(detail.request.id, created.request_id);
+        assert_eq!(detail.request.status, "queued");
+        assert_eq!(detail.result.status, "queued");
     }
 
     #[tokio::test]
@@ -2708,10 +3426,9 @@ mod tests {
         let mut item = sample_release_item("123");
         item.max_wait_ms = 0;
 
-        let request_id =
-            create_translation_request(state.as_ref(), "1", "wait", std::slice::from_ref(&item))
-                .await
-                .expect("request created");
+        let created = create_translation_request(state.as_ref(), "1", "wait", &item)
+            .await
+            .expect("request created");
 
         run_translation_scheduler_once(
             state.as_ref(),
@@ -2725,24 +3442,24 @@ mod tests {
 
         let request_status: String =
             sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
-                .bind(request_id.as_str())
+                .bind(created.request_id.as_str())
                 .fetch_one(&pool)
                 .await
                 .expect("load request status");
-        let item_status: String = sqlx::query_scalar(
-            "SELECT COALESCE(result_status, '') FROM translation_request_items WHERE request_id = ? LIMIT 1",
+        let result_status: String = sqlx::query_scalar(
+            "SELECT COALESCE(result_status, '') FROM translation_requests WHERE id = ? LIMIT 1",
         )
-        .bind(request_id.as_str())
+        .bind(created.request_id.as_str())
         .fetch_one(&pool)
         .await
-        .expect("load item status");
+        .expect("load request result status");
         let task_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_tasks")
             .fetch_one(&pool)
             .await
             .expect("count job tasks");
 
         assert_eq!(request_status, "completed");
-        assert_eq!(item_status, "disabled");
+        assert_eq!(result_status, "disabled");
         assert_eq!(task_count, 0);
     }
 
@@ -2752,32 +3469,31 @@ mod tests {
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
-        let request_id =
-            create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
-                .await
-                .expect("request created");
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
         let now = Utc::now().to_rfc3339();
         let mut tx = pool.begin().await.expect("begin tx");
         sqlx::query(
             r#"
-            UPDATE translation_request_items
+            UPDATE translation_requests
             SET result_status = 'error', error_text = 'boom', updated_at = ?
-            WHERE request_id = ?
+            WHERE id = ?
             "#,
         )
         .bind(now.as_str())
-        .bind(request_id.as_str())
+        .bind(created.request_id.as_str())
         .execute(&mut *tx)
         .await
-        .expect("mark request item failed");
-        refresh_requests_after_completion(&mut tx, vec![request_id.clone()], now.as_str())
+        .expect("mark request failed");
+        refresh_requests_after_completion(&mut tx, vec![created.request_id.clone()], now.as_str())
             .await
             .expect("refresh request status");
         tx.commit().await.expect("commit tx");
 
         let request_status: String =
             sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
-                .bind(request_id.as_str())
+                .bind(created.request_id.as_str())
                 .fetch_one(&pool)
                 .await
                 .expect("load request status");
@@ -2793,19 +3509,14 @@ mod tests {
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
 
-        let request_id = create_translation_request_with_origin(
-            state.as_ref(),
-            "1",
-            "async",
-            std::slice::from_ref(&item),
-            "system",
-        )
-        .await
-        .expect("system request created");
+        let created =
+            create_translation_request_with_origin(state.as_ref(), "1", "async", &item, "system")
+                .await
+                .expect("system request created");
 
         let request_origin: String =
             sqlx::query_scalar("SELECT request_origin FROM translation_requests WHERE id = ?")
-                .bind(request_id.as_str())
+                .bind(created.request_id.as_str())
                 .fetch_one(&pool)
                 .await
                 .expect("load request origin");
@@ -2821,21 +3532,18 @@ mod tests {
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("detail-origin");
 
-        let request_id = create_translation_request_with_origin(
-            state.as_ref(),
-            "1",
-            "async",
-            std::slice::from_ref(&item),
-            "system",
-        )
-        .await
-        .expect("system request created");
+        let created =
+            create_translation_request_with_origin(state.as_ref(), "1", "async", &item, "system")
+                .await
+                .expect("system request created");
 
-        let detail = load_translation_request_detail(state.as_ref(), "1", request_id.as_str())
-            .await
-            .expect("load request detail");
+        let detail =
+            load_translation_request_detail(state.as_ref(), "1", created.request_id.as_str())
+                .await
+                .expect("load request detail");
 
         assert_eq!(detail.request.request_origin, "system");
+        assert_eq!(detail.result.producer_ref, item.producer_ref);
     }
 
     #[tokio::test]
@@ -2889,20 +3597,14 @@ mod tests {
             state.as_ref(),
             "1",
             "async",
-            std::slice::from_ref(&system_item),
+            &system_item,
             "system",
         )
         .await
         .expect("system request created");
-        create_translation_request_with_origin(
-            state.as_ref(),
-            "1",
-            "async",
-            std::slice::from_ref(&user_item),
-            "user",
-        )
-        .await
-        .expect("user request created");
+        create_translation_request_with_origin(state.as_ref(), "1", "async", &user_item, "user")
+            .await
+            .expect("user request created");
 
         let dedicated_batch = claim_next_batch(
             state.as_ref(),
@@ -2947,7 +3649,7 @@ mod tests {
 
         let mut item = sample_release_item("123");
         item.max_wait_ms = 0;
-        create_translation_request(state.as_ref(), "1", "async", std::slice::from_ref(&item))
+        create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
 
@@ -2975,6 +3677,106 @@ mod tests {
 
         assert_eq!(row.worker_slot, 2);
         assert_eq!(row.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_refreshes_running_batch_worker_runtime() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("runtime-refresh");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-refresh")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-item")
+        .bind("batch-runtime-refresh")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', batch_id = 'batch-runtime-refresh', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+
+        let workers = translation_worker_runtime_statuses().await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_slot == 2)
+            .expect("worker exists");
+
+        assert_eq!(worker.status, "running");
+        assert_eq!(
+            worker.current_batch_id.as_deref(),
+            Some("batch-runtime-refresh")
+        );
+        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.work_item_count, 1);
     }
 
     #[tokio::test]
@@ -3013,75 +3815,223 @@ mod tests {
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
 
-        for (id, status, updated_at) in [
-            ("req-completed-newer", "completed", "2026-03-07T00:00:03Z"),
-            ("req-queued-older", "queued", "2026-03-07T00:00:01Z"),
-            ("req-running-newest", "running", "2026-03-07T00:00:04Z"),
-            ("req-failed-mid", "failed", "2026-03-07T00:00:02Z"),
+        let completed = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("completed"),
+        )
+        .await
+        .expect("completed request created");
+        let queued = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("queued"),
+        )
+        .await
+        .expect("queued request created");
+        let running = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("running"),
+        )
+        .await
+        .expect("running request created");
+        let failed = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("failed"),
+        )
+        .await
+        .expect("failed request created");
+
+        for (created, status, result_status, updated_at) in [
+            (
+                &completed,
+                "completed",
+                Some("ready"),
+                "2026-03-07T00:00:03Z",
+            ),
+            (&queued, "queued", None, "2026-03-07T00:00:01Z"),
+            (&running, "running", None, "2026-03-07T00:00:04Z"),
+            (&failed, "failed", Some("error"), "2026-03-07T00:00:02Z"),
         ] {
+            let started_at = if status == "queued" {
+                None
+            } else {
+                Some(updated_at)
+            };
+            let finished_at = if matches!(status, "completed" | "failed") {
+                Some(updated_at)
+            } else {
+                None
+            };
             sqlx::query(
                 r#"
-                INSERT INTO translation_requests (
-                  id, mode, source, request_origin, requested_by, scope_user_id, status, item_count,
-                  completed_item_count, created_at, updated_at
-                ) VALUES (?, 'async', 'feed.auto_translate', 'user', ?, ?, ?, 1, 0, ?, ?)
+                UPDATE translation_requests
+                SET status = ?,
+                    result_status = ?,
+                    started_at = ?,
+                    finished_at = ?,
+                    updated_at = ?
+                WHERE id = ?
                 "#,
             )
-            .bind(id)
-            .bind("1")
-            .bind("1")
             .bind(status)
+            .bind(result_status)
+            .bind(started_at)
+            .bind(finished_at)
             .bind(updated_at)
-            .bind(updated_at)
+            .bind(created.request_id.as_str())
             .execute(&pool)
             .await
-            .expect("insert request");
+            .expect("update request ordering fixture");
         }
 
-        let rows = sqlx::query_as::<_, AdminTranslationRequestListItem>(
+        let effective_status_sql = request_effective_status_sql("status", "work_item_status");
+        let request_rows_sql = format!(
             r#"
-            SELECT id, status, source, request_origin, requested_by, scope_user_id, item_count, completed_item_count,
-                   created_at, started_at, finished_at, updated_at
-            FROM translation_requests
-            ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+            SELECT *
+            FROM ({request_rows_base}) request_rows
+            ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
                      updated_at DESC,
                      id DESC
             "#,
-        )
-        .fetch_all(&state.pool)
-        .await
-        .expect("load ordered requests");
+            request_rows_base = request_row_select_sql(),
+            effective_status_sql = effective_status_sql,
+        );
+        let rows = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
+            .fetch_all(&state.pool)
+            .await
+            .expect("load ordered requests");
 
         let ids = rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>();
         assert_eq!(
             ids,
             vec![
-                "req-running-newest",
-                "req-queued-older",
-                "req-completed-newer",
-                "req-failed-mid",
+                running.request_id.as_str(),
+                queued.request_id.as_str(),
+                completed.request_id.as_str(),
+                failed.request_id.as_str(),
             ],
         );
     }
 
+    #[tokio::test]
+    async fn admin_request_running_filter_uses_effective_status() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let promoted = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("promoted"),
+        )
+        .await
+        .expect("promoted request created");
+        let queued = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("plain-queued"),
+        )
+        .await
+        .expect("queued request created");
+
+        let promoted_work_item_id = promoted
+            .result
+            .work_item_id
+            .clone()
+            .expect("promoted request work item");
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'batched',
+                batch_id = 'batch-running-1',
+                started_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-07T00:00:03Z")
+        .bind("2026-03-07T00:00:03Z")
+        .bind(promoted_work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("promote work item to batched");
+
+        sqlx::query("UPDATE translation_requests SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:03Z")
+            .bind(promoted.request_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("update promoted request timestamp");
+        sqlx::query("UPDATE translation_requests SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-07T00:00:02Z")
+            .bind(queued.request_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("update queued request timestamp");
+
+        let effective_status_sql = request_effective_status_sql("status", "work_item_status");
+        let request_rows_sql = format!(
+            r#"
+            SELECT *
+            FROM ({request_rows_base}) request_rows
+            WHERE {effective_status_sql} = 'running'
+            ORDER BY CASE WHEN {effective_status_sql} IN ('queued', 'running') THEN 0 ELSE 1 END ASC,
+                     updated_at DESC,
+                     id DESC
+            "#,
+            request_rows_base = request_row_select_sql(),
+            effective_status_sql = effective_status_sql,
+        );
+        let rows = sqlx::query_as::<_, RequestRow>(&request_rows_sql)
+            .fetch_all(&state.pool)
+            .await
+            .expect("load running-filter requests");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, promoted.request_id);
+        assert_eq!(rows[0].effective_status(), "running");
+    }
+
     #[test]
-    fn derive_request_stream_phase_uses_running_request_status() {
+    fn stream_event_omits_result_until_terminal_phase() {
         let detail = LoadedRequestDetail {
-            request: AdminTranslationRequestListItem {
+            request: RequestRow {
                 id: "req-1".to_owned(),
-                status: "running".to_owned(),
+                mode: "stream".to_owned(),
                 source: "feed.auto_translate".to_owned(),
                 request_origin: "user".to_owned(),
                 requested_by: Some("1".to_owned()),
                 scope_user_id: "1".to_owned(),
-                item_count: 1,
-                completed_item_count: 0,
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                entity_id: "123".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 1500,
+                work_item_id: Some("work-1".to_owned()),
+                status: "running".to_owned(),
+                result_status: None,
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error_text: None,
                 created_at: "2026-03-07T00:00:00Z".to_owned(),
                 started_at: Some("2026-03-07T00:00:01Z".to_owned()),
                 finished_at: None,
                 updated_at: "2026-03-07T00:00:01Z".to_owned(),
+                work_item_status: Some("running".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
             },
-            items: vec![TranslationResultItem {
+            result: TranslationResultItem {
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
                 entity_id: "123".to_owned(),
                 kind: "release_summary".to_owned(),
@@ -3093,68 +4043,95 @@ mod tests {
                 error: None,
                 work_item_id: Some("work-1".to_owned()),
                 batch_id: Some("batch-1".to_owned()),
-            }],
+            },
+        };
+
+        let phase = derive_request_stream_phase(&detail);
+        let event = TranslationRequestStreamEvent {
+            event: phase.clone(),
+            request_id: detail.request.id.clone(),
+            status: detail.request.effective_status().to_owned(),
+            batch_id: detail.result.batch_id.clone(),
+            result: matches!(phase.as_str(), "completed" | "failed").then(|| detail.result.clone()),
+            error: None,
+        };
+
+        assert_eq!(phase, "running");
+        assert_eq!(event.status, "running");
+        assert!(event.result.is_none());
+        assert_eq!(event.batch_id.as_deref(), Some("batch-1"));
+    }
+
+    #[test]
+    fn derive_request_stream_phase_uses_running_request_status() {
+        let detail = LoadedRequestDetail {
+            request: RequestRow {
+                id: "req-1".to_owned(),
+                mode: "stream".to_owned(),
+                source: "feed.auto_translate".to_owned(),
+                request_origin: "user".to_owned(),
+                requested_by: Some("1".to_owned()),
+                scope_user_id: "1".to_owned(),
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                entity_id: "123".to_owned(),
+                target_lang: "zh-CN".to_owned(),
+                max_wait_ms: 1500,
+                work_item_id: Some("work-1".to_owned()),
+                status: "running".to_owned(),
+                result_status: None,
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error_text: None,
+                created_at: "2026-03-07T00:00:00Z".to_owned(),
+                started_at: Some("2026-03-07T00:00:01Z".to_owned()),
+                finished_at: None,
+                updated_at: "2026-03-07T00:00:01Z".to_owned(),
+                work_item_status: Some("running".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
+            },
+            result: TranslationResultItem {
+                producer_ref: "feed.auto_translate:release:123".to_owned(),
+                entity_id: "123".to_owned(),
+                kind: "release_summary".to_owned(),
+                variant: "feed_card".to_owned(),
+                status: "queued".to_owned(),
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error: None,
+                work_item_id: Some("work-1".to_owned()),
+                batch_id: Some("batch-1".to_owned()),
+            },
         };
 
         assert_eq!(derive_request_stream_phase(&detail), "running");
     }
 
     #[tokio::test]
-    async fn load_translation_result_items_by_request_preserves_insert_order() {
+    async fn load_translation_request_detail_returns_single_result() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let request_id = crate::local_id::test_local_id("request-order");
-        let now = "2026-03-07T00:00:00Z";
+        let item = sample_release_item("request-single");
 
-        sqlx::query(
-            r#"
-            INSERT INTO translation_requests (
-              id, mode, source, request_origin, requested_by, scope_user_id, status, item_count,
-              completed_item_count, created_at, updated_at
-            ) VALUES (?, 'async', 'feed.auto_translate', 'user', ?, ?, 'queued', 2, 0, ?, ?)
-            "#,
-        )
-        .bind(request_id.as_str())
-        .bind("1")
-        .bind("1")
-        .bind(now)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert request");
-
-        for (id, producer_ref, entity_id) in [
-            ("zzzzzzzzzzzzzzza", "first", "101"),
-            ("2222222222222222", "second", "202"),
-        ] {
-            sqlx::query(
-                r#"
-                INSERT INTO translation_request_items (
-                  id, request_id, producer_ref, kind, variant, entity_id, target_lang,
-                  max_wait_ms, source_hash, source_blocks_json, target_slots_json,
-                  created_at, updated_at
-                ) VALUES (?, ?, ?, 'release_summary', 'feed_card', ?, 'zh-CN', 1000, 'hash', '[]', '[]', ?, ?)
-                "#,
-            )
-            .bind(id)
-            .bind(request_id.as_str())
-            .bind(producer_ref)
-            .bind(entity_id)
-            .bind(now)
-            .bind(now)
-            .execute(&pool)
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
-            .expect("insert request item");
-        }
+            .expect("request created");
 
-        let items = load_translation_result_items_by_request(state.as_ref(), request_id.as_str())
-            .await
-            .expect("load request items");
+        let detail =
+            load_translation_request_detail(state.as_ref(), "1", created.request_id.as_str())
+                .await
+                .expect("load request detail");
 
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].producer_ref, "first");
-        assert_eq!(items[1].producer_ref, "second");
+        assert_eq!(detail.request.id, created.request_id);
+        assert_eq!(detail.result.producer_ref, item.producer_ref);
+        assert_eq!(detail.result.entity_id, item.entity_id);
+        assert_eq!(detail.result.kind, item.kind);
+        assert_eq!(detail.result.variant, item.variant);
+        assert_eq!(detail.result.status, "queued");
     }
 
     #[tokio::test]
@@ -3227,9 +4204,20 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        setup_pool_with_max_connections(1).await
+    }
+
+    async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
+            .max_connections(max_connections)
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")

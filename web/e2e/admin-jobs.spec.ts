@@ -211,8 +211,11 @@ async function installAdminJobsMocks(
 		request_origin: "user",
 		requested_by: CURRENT_USER_ID,
 		scope_user_id: CURRENT_USER_ID,
-		item_count: 1,
-		completed_item_count: 1,
+		producer_ref: "feed.auto_translate:release:290978079",
+		kind: "release_summary",
+		variant: "feed_card",
+		entity_id: "290978079",
+		batch_id: "batch-translation-1",
 		created_at: "2026-02-26T04:00:00Z",
 		started_at: "2026-02-26T04:00:01Z",
 		finished_at: "2026-02-26T04:00:03Z",
@@ -322,13 +325,13 @@ async function installAdminJobsMocks(
 	];
 
 	const completedTranslationRequestItem = {
-		producer_ref: "290978079",
+		producer_ref: "feed.auto_translate:release:290978079",
 		entity_id: "290978079",
 		kind: "release_summary",
 		variant: "feed_card",
 		status: "ready",
 		title_zh: "发布说明 290978079",
-		summary_md: "- 修复了调度窗口\n- 保持整组返回",
+		summary_md: "- 修复了调度窗口\n- 保持单请求语义",
 		body_md: null,
 		error: null,
 		work_item_id: "work-translation-1",
@@ -429,7 +432,7 @@ async function installAdminJobsMocks(
 			{
 				...completedTranslationRequest,
 				status: "queued",
-				completed_item_count: 0,
+				batch_id: null,
 				started_at: null,
 				finished_at: null,
 				updated_at: "2026-02-26T04:00:00Z",
@@ -441,17 +444,15 @@ async function installAdminJobsMocks(
 		const [request] = buildTranslationRequests(completed);
 		return {
 			request,
-			items: [
-				completed
-					? completedTranslationRequestItem
-					: {
-							...completedTranslationRequestItem,
-							status: "queued",
-							title_zh: null,
-							summary_md: null,
-							batch_id: null,
-						},
-			],
+			result: completed
+				? completedTranslationRequestItem
+				: {
+						...completedTranslationRequestItem,
+						status: "queued",
+						title_zh: null,
+						summary_md: null,
+						batch_id: null,
+					},
 		};
 	}
 
@@ -1598,14 +1599,22 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	);
 	await expect(page.getByRole("tab", { name: "需求队列" })).toBeVisible();
 	const translationRequestRow = page
-		.getByRole("cell", { name: "feed.auto_translate" })
+		.getByText("feed.auto_translate:release:290978079")
 		.locator("xpath=ancestor::tr[1]");
 	await expect(translationRequestRow).toBeVisible();
 	await translationRequestRow.getByRole("button", { name: "详情" }).click();
 	await expect(
 		page.getByRole("heading", { name: "翻译请求详情" }),
 	).toBeVisible();
-	await expect(page.getByText("release_summary · feed_card")).toBeVisible();
+	const requestDialog = page.getByLabel("翻译请求详情");
+	await expect(
+		requestDialog.getByText("release_summary · feed_card", { exact: true }),
+	).toBeVisible();
+	await expect(
+		requestDialog.getByText(
+			"entity 290978079 · producer_ref feed.auto_translate:release:290978079",
+		),
+	).toBeVisible();
 	await page.getByRole("button", { name: "查看批次" }).click();
 	await expect(
 		page.getByRole("heading", { name: "翻译批次详情" }),
@@ -1653,7 +1662,11 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 		.getByText("W4 · 用户专用")
 		.locator("xpath=ancestor::div[.//*[normalize-space()='已工作时长']][1]");
 	await expect(dedicatedWorkerCard.getByText("运行中")).toBeVisible();
-	await expect(page.getByRole("cell", { name: "1/1" })).toBeVisible();
+	const queuedRequestRow = page
+		.getByText("feed.auto_translate:release:290978079")
+		.locator("xpath=ancestor::tr[1]");
+	await expect(queuedRequestRow.getByText("排队中")).toBeVisible();
+	await expect(queuedRequestRow.getByText("已完成")).toBeVisible();
 	await expect(dedicatedWorkerCard.getByText("idle")).toBeVisible();
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByRole("cell", { name: "deadline" })).toBeVisible();
@@ -1670,7 +1683,9 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
-	await expect(page.getByText("用户 · ID req-translation-1")).toBeVisible();
+	await expect(
+		page.getByText("release_summary · feed_card · entity 290978079"),
+	).toBeVisible();
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByText("W4 · 请求 1 · work items 1")).toBeVisible();
 });

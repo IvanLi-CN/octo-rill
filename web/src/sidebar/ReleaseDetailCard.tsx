@@ -3,8 +3,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
 	type ReleaseDetailResponse,
+	type TranslationRequestResponse,
+	ApiError,
 	apiGetReleaseDetail,
+	apiGetTranslationRequest,
 	apiTranslateReleaseDetail,
+	isPendingTranslationResultStatus,
+	mapTranslationResultToReleaseDetailTranslated,
 } from "@/api";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
@@ -17,6 +22,23 @@ import {
 } from "@/components/ui/card";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { normalizeReleaseId } from "@/lib/releaseId";
+
+const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
+const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
+
+function sleep(ms: number) {
+	return new Promise((resolve) => {
+		window.setTimeout(resolve, ms);
+	});
+}
+
+function isMissingTranslationRequestError(error: unknown) {
+	return (
+		error instanceof ApiError &&
+		(error.status === 404 || error.code === REQUEST_NOT_FOUND_ERROR_CODE)
+	);
+}
 
 export function ReleaseDetailCard(props: {
 	releaseId: string | null;
@@ -34,17 +56,23 @@ export function ReleaseDetailCard(props: {
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const translateRequestSeqRef = useRef(0);
+	const pendingTranslationRequestRef = useRef<{
+		releaseId: string;
+		requestId: string;
+	} | null>(null);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
 		setTranslating(false);
 		if (!normalizedReleaseId) {
+			pendingTranslationRequestRef.current = null;
 			setDetail(null);
 			setLoadError(null);
 			setTranslateError(null);
 			return;
 		}
 		let active = true;
+		pendingTranslationRequestRef.current = null;
 		setDetail(null);
 		setLoading(true);
 		setLoadError(null);
@@ -82,15 +110,59 @@ export function ReleaseDetailCard(props: {
 		const requestReleaseId = activeDetail.release_id;
 		setTranslating(true);
 		setTranslateError(null);
-		void apiTranslateReleaseDetail(activeDetail)
-			.then((translated) => {
-				if (translateRequestSeqRef.current !== requestSeq) return;
-				setDetail((prev) => {
-					if (!prev) return prev;
-					if (prev.release_id !== requestReleaseId) return prev;
-					return { ...prev, translated };
-				});
-			})
+		void (async () => {
+			let requestId =
+				pendingTranslationRequestRef.current?.releaseId === requestReleaseId
+					? pendingTranslationRequestRef.current.requestId
+					: null;
+			let response: TranslationRequestResponse | null = null;
+			for (let attempt = 0; attempt < 2; attempt += 1) {
+				try {
+					response = requestId
+						? await apiGetTranslationRequest(requestId)
+						: await apiTranslateReleaseDetail(activeDetail);
+					const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+					while (isPendingTranslationResultStatus(response.result.status)) {
+						pendingTranslationRequestRef.current = {
+							releaseId: requestReleaseId,
+							requestId: response.request_id,
+						};
+						if (Date.now() >= deadline) {
+							throw new Error(
+								"translation is still processing; please try again shortly",
+							);
+						}
+						if (translateRequestSeqRef.current !== requestSeq) return;
+						await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+						if (translateRequestSeqRef.current !== requestSeq) return;
+						response = await apiGetTranslationRequest(response.request_id);
+					}
+					break;
+				} catch (error) {
+					if (!isMissingTranslationRequestError(error) || attempt === 1) {
+						throw error;
+					}
+					pendingTranslationRequestRef.current = null;
+					requestId = null;
+				}
+			}
+			if (!response) {
+				throw new Error("translation request could not be recovered");
+			}
+			pendingTranslationRequestRef.current = null;
+			if (translateRequestSeqRef.current !== requestSeq) return;
+			const translated = mapTranslationResultToReleaseDetailTranslated(
+				response.result,
+			);
+			if (!translated) {
+				throw new Error(response.result.error ?? "translate failed");
+			}
+			setDetail((prev) => {
+				if (!prev) return prev;
+				if (prev.release_id !== requestReleaseId) return prev;
+				return { ...prev, translated };
+			});
+		})()
 			.catch((err) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslateError(err instanceof Error ? err.message : String(err));
