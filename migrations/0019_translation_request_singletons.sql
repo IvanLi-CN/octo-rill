@@ -1,3 +1,4 @@
+-- Intentionally rebuild the translation scheduler tables from scratch; runtime history is discarded.
 PRAGMA foreign_keys = OFF;
 
 DROP TABLE IF EXISTS translation_batch_items;

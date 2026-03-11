@@ -46,17 +46,23 @@ export function ReleaseDetailCard(props: {
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const translateRequestSeqRef = useRef(0);
+	const pendingTranslationRequestRef = useRef<{
+		releaseId: string;
+		requestId: string;
+	} | null>(null);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
 		setTranslating(false);
 		if (!normalizedReleaseId) {
+			pendingTranslationRequestRef.current = null;
 			setDetail(null);
 			setLoadError(null);
 			setTranslateError(null);
 			return;
 		}
 		let active = true;
+		pendingTranslationRequestRef.current = null;
 		setDetail(null);
 		setLoading(true);
 		setLoadError(null);
@@ -95,9 +101,17 @@ export function ReleaseDetailCard(props: {
 		setTranslating(true);
 		setTranslateError(null);
 		void (async () => {
-			let response = await apiTranslateReleaseDetail(activeDetail);
+			const pendingRequest = pendingTranslationRequestRef.current;
+			let response =
+				pendingRequest?.releaseId === requestReleaseId
+					? await apiGetTranslationRequest(pendingRequest.requestId)
+					: await apiTranslateReleaseDetail(activeDetail);
 			const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
 			while (isPendingTranslationResultStatus(response.result.status)) {
+				pendingTranslationRequestRef.current = {
+					releaseId: requestReleaseId,
+					requestId: response.request_id,
+				};
 				if (Date.now() >= deadline) {
 					throw new Error(
 						"translation is still processing; please try again shortly",
@@ -108,6 +122,7 @@ export function ReleaseDetailCard(props: {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				response = await apiGetTranslationRequest(response.request_id);
 			}
+			pendingTranslationRequestRef.current = null;
 			if (translateRequestSeqRef.current !== requestSeq) return;
 			const translated = mapTranslationResultToReleaseDetailTranslated(
 				response.result,
