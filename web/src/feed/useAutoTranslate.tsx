@@ -13,7 +13,6 @@ import type { FeedItem, TranslateResponse } from "@/feed/types";
 const MAX_CONCURRENT = 2;
 const QUEUE_FLUSH_DELAY_MS = 300;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
-const WAIT_REQUEST_TIMEOUT_BUFFER_MS = 1_500;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 
@@ -126,26 +125,10 @@ export function useAutoTranslate(params: {
 				response = active.response;
 				terminal = active.terminal;
 			} else {
-				const abortController = new AbortController();
-				const timeoutId = globalThis.setTimeout(() => {
-					abortController.abort();
-				}, requestItem.max_wait_ms + WAIT_REQUEST_TIMEOUT_BUFFER_MS);
-				try {
-					response = await apiSubmitTranslationRequest(
-						{
-							mode: "wait",
-							item: requestItem,
-						},
-						{ signal: abortController.signal },
-					);
-				} catch (error) {
-					if (error instanceof DOMException && error.name === "AbortError") {
-						throw new Error("translate wait timeout");
-					}
-					throw error;
-				} finally {
-					globalThis.clearTimeout(timeoutId);
-				}
+				response = await apiSubmitTranslationRequest({
+					mode: "wait",
+					item: requestItem,
+				});
 				if (isPendingTranslationResultStatus(response.result.status)) {
 					activeRequestIdRef.current.set(key, response.request_id);
 					const active = await loadActiveRequest(response.request_id);

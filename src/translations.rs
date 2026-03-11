@@ -357,7 +357,9 @@ struct RequestRow {
 
 impl RequestRow {
     fn effective_status(&self) -> &str {
-        if self.status == "queued" && self.work_item_status.as_deref() == Some("running") {
+        if self.status == "queued"
+            && work_item_status_counts_as_running(self.work_item_status.as_deref())
+        {
             "running"
         } else {
             self.status.as_str()
@@ -401,6 +403,10 @@ impl RequestRow {
             batch_id: self.batch_id.clone(),
         }
     }
+}
+
+fn work_item_status_counts_as_running(work_item_status: Option<&str>) -> bool {
+    matches!(work_item_status, Some("running" | "batched"))
 }
 
 fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'static str {
@@ -669,7 +675,7 @@ fn request_row_select_sql() -> &'static str {
 
 fn request_effective_status_sql(status_column: &str, work_item_status_column: &str) -> String {
     format!(
-        "CASE WHEN {status_column} = 'queued' AND {work_item_status_column} = 'running' THEN 'running' ELSE {status_column} END"
+        "CASE WHEN {status_column} = 'queued' AND {work_item_status_column} IN ('running', 'batched') THEN 'running' ELSE {status_column} END"
     )
 }
 pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::AbortHandle> {
@@ -1717,12 +1723,13 @@ async fn claim_next_batch(
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
-    mark_requests_running_for_work_items(
-        state,
+    mark_requests_running_for_work_items_in_tx(
+        &mut tx,
         selected.iter().map(|item| item.id.as_str()).collect(),
+        now_str.as_str(),
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Some(ClaimedBatch {
         id: batch_id,
@@ -2270,22 +2277,22 @@ async fn refresh_requests_after_completion(
     Ok(())
 }
 
-async fn mark_requests_running_for_work_items(
-    state: &AppState,
+async fn mark_requests_running_for_work_items_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
     work_item_ids: Vec<&str>,
+    now: &str,
 ) -> Result<()> {
     if work_item_ids.is_empty() {
         return Ok(());
     }
-    let now = Utc::now().to_rfc3339();
     let mut query = sqlx::QueryBuilder::<Sqlite>::new(
         r#"
         UPDATE translation_requests
         SET status = 'running', started_at = COALESCE(started_at, "#,
     );
-    query.push_bind(now.as_str());
+    query.push_bind(now);
     query.push(r#"), updated_at = "#);
-    query.push_bind(now.as_str());
+    query.push_bind(now);
     query.push(r#" WHERE status = 'queued' AND work_item_id IN ("#);
     {
         let mut separated = query.separated(", ");
@@ -2294,7 +2301,7 @@ async fn mark_requests_running_for_work_items(
         }
     }
     query.push(")");
-    query.build().execute(&state.pool).await?;
+    query.build().execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -3785,7 +3792,7 @@ mod tests {
         sqlx::query(
             r#"
             UPDATE translation_work_items
-            SET status = 'running',
+            SET status = 'batched',
                 batch_id = 'batch-running-1',
                 started_at = ?,
                 updated_at = ?
@@ -3797,7 +3804,7 @@ mod tests {
         .bind(promoted_work_item_id.as_str())
         .execute(&pool)
         .await
-        .expect("promote work item to running");
+        .expect("promote work item to batched");
 
         sqlx::query("UPDATE translation_requests SET updated_at = ? WHERE id = ?")
             .bind("2026-03-07T00:00:03Z")
