@@ -15,6 +15,7 @@ const QUEUE_FLUSH_DELAY_MS = 300;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
+const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -60,6 +61,24 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+type ActiveTranslationRequest = {
+	requestId: string;
+	sourceKey: string;
+	resumeWindowCount: number;
+};
+
+function buildRequestSourceKey(item: TranslationRequestItemInput) {
+	return JSON.stringify({
+		producer_ref: item.producer_ref,
+		kind: item.kind,
+		variant: item.variant,
+		entity_id: item.entity_id,
+		target_lang: item.target_lang,
+		source_blocks: item.source_blocks,
+		target_slots: item.target_slots,
+	});
+}
+
 function sleep(ms: number) {
 	return new Promise((resolve) => {
 		window.setTimeout(resolve, ms);
@@ -83,7 +102,7 @@ export function useAutoTranslate(params: {
 	const queuedRef = useRef<string[]>([]);
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
-	const activeRequestIdRef = useRef(new Map<string, string>());
+	const activeRequestRef = useRef(new Map<string, ActiveTranslationRequest>());
 	const waitRetryCountRef = useRef(new Map<string, number>());
 	const runningRef = useRef(0);
 	const flushTimerRef = useRef<number | null>(null);
@@ -116,21 +135,26 @@ export function useAutoTranslate(params: {
 		async (item: FeedItem) => {
 			const key = keyOf(item);
 			const requestItem = buildReleaseSummaryRequestItem(item);
-			const existingRequestId = activeRequestIdRef.current.get(key);
+			const requestSourceKey = buildRequestSourceKey(requestItem);
+			const existingRequest = activeRequestRef.current.get(key);
 			let response: TranslationRequestResponse;
 			let terminal = true;
 
-			if (existingRequestId) {
-				const active = await loadActiveRequest(existingRequestId);
+			let resumeWindowCount = 0;
+
+			if (existingRequest?.sourceKey === requestSourceKey) {
+				const active = await loadActiveRequest(existingRequest.requestId);
 				response = active.response;
 				terminal = active.terminal;
+				resumeWindowCount = existingRequest.resumeWindowCount;
 			} else {
+				activeRequestRef.current.delete(key);
+				waitRetryCountRef.current.delete(key);
 				response = await apiSubmitTranslationRequest({
 					mode: "wait",
 					item: requestItem,
 				});
 				if (isPendingTranslationResultStatus(response.result.status)) {
-					activeRequestIdRef.current.set(key, response.request_id);
 					const active = await loadActiveRequest(response.request_id);
 					response = active.response;
 					terminal = active.terminal;
@@ -139,11 +163,20 @@ export function useAutoTranslate(params: {
 
 			const translated = response.result;
 			if (!terminal) {
-				activeRequestIdRef.current.set(key, response.request_id);
+				const nextResumeWindowCount = resumeWindowCount + 1;
+				if (nextResumeWindowCount >= REQUEST_RESUME_WINDOW_MAX_RETRIES) {
+					activeRequestRef.current.delete(key);
+					throw new Error("translation request exceeded resume window");
+				}
+				activeRequestRef.current.set(key, {
+					requestId: response.request_id,
+					sourceKey: requestSourceKey,
+					resumeWindowCount: nextResumeWindowCount,
+				});
 				return { translated, mapped: null, terminal: false as const };
 			}
 
-			activeRequestIdRef.current.delete(key);
+			activeRequestRef.current.delete(key);
 			const mapped = mapTranslationItemToFeedResponse(translated);
 			if (!mapped) {
 				if (translated.status === "missing" || translated.status === "error") {
@@ -167,7 +200,7 @@ export function useAutoTranslate(params: {
 			if (retries >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
 				failedRef.current.add(key);
 				waitRetryCountRef.current.delete(key);
-				activeRequestIdRef.current.delete(key);
+				activeRequestRef.current.delete(key);
 				return false;
 			}
 			waitRetryCountRef.current.set(key, retries + 1);
