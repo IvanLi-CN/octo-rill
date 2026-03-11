@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-	apiOpenTranslationRequestStream,
+	apiGetTranslationRequest,
 	apiSubmitTranslationRequest,
 	type TranslationRequestItemInput,
-	type TranslationRequestStreamEvent,
+	ApiError,
+	isPendingTranslationResultStatus,
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
 const MAX_CONCURRENT = 2;
-const BATCH_SIZE = 8;
-const BATCH_FLUSH_DELAY_MS = 300;
-const STREAM_RECOVERY_MAX_RETRIES = 3;
+const QUEUE_FLUSH_DELAY_MS = 300;
+const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
+const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
+const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
+const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -38,7 +42,7 @@ function buildReleaseSummaryRequestItem(
 }
 
 function mapTranslationItemToFeedResponse(item: {
-	status: "ready" | "disabled" | "missing" | "error" | "queued";
+	status: "ready" | "disabled" | "missing" | "error" | "queued" | "running";
 	title_zh: string | null;
 	summary_md: string | null;
 }): TranslateResponse | null {
@@ -55,6 +59,37 @@ function mapTranslationItemToFeedResponse(item: {
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+type ActiveTranslationRequest = {
+	requestId: string;
+	sourceKey: string;
+	resumeWindowCount: number;
+};
+
+function isMissingTranslationRequestError(error: unknown) {
+	return (
+		error instanceof ApiError &&
+		(error.status === 404 || error.code === REQUEST_NOT_FOUND_ERROR_CODE)
+	);
+}
+
+function buildRequestSourceKey(item: TranslationRequestItemInput) {
+	return JSON.stringify({
+		producer_ref: item.producer_ref,
+		kind: item.kind,
+		variant: item.variant,
+		entity_id: item.entity_id,
+		target_lang: item.target_lang,
+		source_blocks: item.source_blocks,
+		target_slots: item.target_slots,
+	});
+}
+
+function sleep(ms: number) {
+	return new Promise((resolve) => {
+		window.setTimeout(resolve, ms);
+	});
 }
 
 export function useAutoTranslate(params: {
@@ -74,7 +109,8 @@ export function useAutoTranslate(params: {
 	const queuedRef = useRef<string[]>([]);
 	const inFlightRef = useRef(new Set<string>());
 	const failedRef = useRef(new Set<string>());
-	const streamRetryCountRef = useRef(new Map<string, number>());
+	const activeRequestRef = useRef(new Map<string, ActiveTranslationRequest>());
+	const waitRetryCountRef = useRef(new Map<string, number>());
 	const runningRef = useRef(0);
 	const flushTimerRef = useRef<number | null>(null);
 
@@ -89,88 +125,144 @@ export function useAutoTranslate(params: {
 		[enabled],
 	);
 
-	const translateBatch = useCallback(async (items: FeedItem[]) => {
-		return apiSubmitTranslationRequest({
-			mode: "wait",
-			items: items.map(buildReleaseSummaryRequestItem),
-		});
+	const loadActiveRequest = useCallback(async (requestId: string) => {
+		let latest = await apiGetTranslationRequest(requestId);
+		const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+		while (isPendingTranslationResultStatus(latest.result.status)) {
+			if (Date.now() >= deadline) {
+				return { response: latest, terminal: false as const };
+			}
+			await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+			latest = await apiGetTranslationRequest(requestId);
+		}
+		return { response: latest, terminal: true as const };
 	}, []);
 
-	const translateBatchStream = useCallback(
+	const clearTrackedRequest = useCallback((key: string) => {
+		activeRequestRef.current.delete(key);
+		waitRetryCountRef.current.delete(key);
+	}, []);
+
+	const resolveTrackedRequest = useCallback(
 		async (
-			items: FeedItem[],
-			onItems: (
-				items: Array<{
-					id: string;
-					status: "ready" | "disabled" | "missing" | "error" | "queued";
-					title_zh: string | null;
-					summary_md: string | null;
-					error: string | null;
-				}>,
-			) => void,
-		): Promise<void> => {
-			const res = await apiOpenTranslationRequestStream({
-				mode: "stream",
-				items: items.map(buildReleaseSummaryRequestItem),
-			});
-
-			if (!res.body) {
-				throw new Error("translate stream missing response body");
-			}
-
-			const reader = res.body.getReader();
-			const decoder = new TextDecoder();
-			let buffer = "";
-			let terminalSeen = false;
-
-			const handleLine = (rawLine: string) => {
-				const line = rawLine.trim();
-				if (!line) return;
-				let evt: TranslationRequestStreamEvent;
+			key: string,
+			requestItem: TranslationRequestItemInput,
+			trackedRequest: ActiveTranslationRequest | undefined,
+		) => {
+			let requestId = trackedRequest?.requestId ?? null;
+			let resumeWindowCount = trackedRequest?.resumeWindowCount ?? 0;
+			for (let attempt = 0; attempt < 2; attempt += 1) {
 				try {
-					evt = JSON.parse(line) as TranslationRequestStreamEvent;
-				} catch {
-					return;
-				}
-				if (evt.items?.length) {
-					onItems(
-						evt.items.map((item) => ({
-							id: item.entity_id,
-							status: item.status,
-							title_zh: item.title_zh,
-							summary_md: item.summary_md,
-							error: item.error,
-						})),
-					);
-				}
-				if (evt.event === "completed" || evt.event === "failed") {
-					terminalSeen = true;
-				}
-			};
-
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				buffer += decoder.decode(value, { stream: true });
-				let newlineIdx = buffer.indexOf("\n");
-				while (newlineIdx >= 0) {
-					const line = buffer.slice(0, newlineIdx);
-					buffer = buffer.slice(newlineIdx + 1);
-					handleLine(line);
-					newlineIdx = buffer.indexOf("\n");
+					if (requestId) {
+						const active = await loadActiveRequest(requestId);
+						return {
+							response: active.response,
+							terminal: active.terminal,
+							resumeWindowCount,
+						};
+					}
+					let response = await apiSubmitTranslationRequest({
+						mode: "wait",
+						item: requestItem,
+					});
+					let terminal = true;
+					if (isPendingTranslationResultStatus(response.result.status)) {
+						const active = await loadActiveRequest(response.request_id);
+						response = active.response;
+						terminal = active.terminal;
+					}
+					return { response, terminal, resumeWindowCount: 0 };
+				} catch (error) {
+					if (!isMissingTranslationRequestError(error) || attempt === 1) {
+						throw error;
+					}
+					clearTrackedRequest(key);
+					requestId = null;
+					resumeWindowCount = 0;
 				}
 			}
-
-			buffer += decoder.decode();
-			if (buffer.trim()) {
-				handleLine(buffer);
-			}
-
-			if (!terminalSeen) {
-				throw new Error("translate stream ended before terminal event");
-			}
+			throw new Error("translation request could not be recovered");
 		},
-		[],
+		[clearTrackedRequest, loadActiveRequest],
+	);
+
+	const translateSingle = useCallback(
+		async (item: FeedItem) => {
+			const key = keyOf(item);
+			const requestItem = buildReleaseSummaryRequestItem(item);
+			const requestSourceKey = buildRequestSourceKey(requestItem);
+			const trackedRequest = activeRequestRef.current.get(key);
+			const requestToResume =
+				trackedRequest?.sourceKey === requestSourceKey
+					? trackedRequest
+					: undefined;
+			if (!requestToResume) {
+				clearTrackedRequest(key);
+			}
+			const resolved = await resolveTrackedRequest(
+				key,
+				requestItem,
+				requestToResume,
+			);
+			const { response, terminal } = resolved;
+
+			const resumeWindowCount = resolved.resumeWindowCount;
+
+			const translated = response.result;
+			if (!terminal) {
+				const nextResumeWindowCount = resumeWindowCount + 1;
+				if (nextResumeWindowCount >= REQUEST_RESUME_WINDOW_MAX_RETRIES) {
+					activeRequestRef.current.delete(key);
+					throw new Error("translation request exceeded resume window");
+				}
+				activeRequestRef.current.set(key, {
+					requestId: response.request_id,
+					sourceKey: requestSourceKey,
+					resumeWindowCount: nextResumeWindowCount,
+				});
+				return { translated, mapped: null, terminal: false as const };
+			}
+
+			activeRequestRef.current.delete(key);
+			const mapped = mapTranslationItemToFeedResponse(translated);
+			if (!mapped) {
+				if (translated.status === "missing" || translated.status === "error") {
+					return { translated, mapped, terminal: true as const };
+				}
+				throw new ApiError(
+					504,
+					translated.error ?? "translate wait timeout",
+					"translation_wait_timeout",
+				);
+			}
+			return { translated, mapped, terminal: true as const };
+		},
+		[clearTrackedRequest, resolveTrackedRequest],
+	);
+
+	const requeueRequest = useCallback((key: string, consumeBudget = true) => {
+		if (failedRef.current.has(key)) return false;
+		if (consumeBudget) {
+			const retries = waitRetryCountRef.current.get(key) ?? 0;
+			if (retries >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
+				failedRef.current.add(key);
+				waitRetryCountRef.current.delete(key);
+				activeRequestRef.current.delete(key);
+				return false;
+			}
+			waitRetryCountRef.current.set(key, retries + 1);
+		}
+		if (!queuedRef.current.includes(key)) {
+			queuedRef.current.push(key);
+		}
+		return true;
+	}, []);
+
+	const requeueAfterFailure = useCallback(
+		(item: FeedItem) => {
+			requeueRequest(keyOf(item));
+		},
+		[requeueRequest],
 	);
 
 	const pump = useCallback(() => {
@@ -179,89 +271,52 @@ export function useAutoTranslate(params: {
 			runningRef.current < MAX_CONCURRENT &&
 			queuedRef.current.length > 0
 		) {
-			const keys: string[] = [];
-			while (keys.length < BATCH_SIZE && queuedRef.current.length > 0) {
-				const key = queuedRef.current.shift();
-				if (!key) break;
-				if (inFlightRef.current.has(key)) continue;
-				keys.push(key);
+			const key = queuedRef.current.shift();
+			if (!key || inFlightRef.current.has(key)) {
+				continue;
 			}
-			if (keys.length === 0) continue;
 
-			const batchItems = keys
-				.map((key) => itemByKeyRef.current.get(key))
-				.filter((item): item is FeedItem =>
-					Boolean(item && shouldAutoTranslate(item)),
-				);
-			if (batchItems.length === 0) continue;
-
-			for (const item of batchItems) {
-				inFlightRef.current.add(keyOf(item));
+			const item = itemByKeyRef.current.get(key);
+			if (!item || !shouldAutoTranslate(item)) {
+				continue;
 			}
+
+			inFlightRef.current.add(key);
 			runningRef.current += 1;
 			forceRender((x) => x + 1);
 
-			const byId = new Map(batchItems.map((item) => [item.id, item]));
-			const handled = new Set<string>();
-			const requeueAfterStreamFailure = (item: FeedItem) => {
-				const key = keyOf(item);
-				if (handled.has(key)) return;
-				if (failedRef.current.has(key)) return;
-				const retries = streamRetryCountRef.current.get(key) ?? 0;
-				if (retries >= STREAM_RECOVERY_MAX_RETRIES) {
-					failedRef.current.add(key);
-					streamRetryCountRef.current.delete(key);
-					return;
-				}
-				streamRetryCountRef.current.set(key, retries + 1);
-				if (!queuedRef.current.includes(key) && !inFlightRef.current.has(key)) {
-					queuedRef.current.push(key);
-				}
-			};
-			let streamErrored = false;
-
-			void translateBatchStream(batchItems, (translatedItems) => {
-				for (const translated of translatedItems) {
-					const item = byId.get(translated.id);
-					if (!item) continue;
-					const key = keyOf(item);
-					if (handled.has(key)) continue;
-					handled.add(key);
-					streamRetryCountRef.current.delete(key);
-
-					inFlightRef.current.delete(key);
-					const mapped = mapTranslationItemToFeedResponse(translated);
+			void translateSingle(item)
+				.then(({ translated, mapped, terminal }) => {
+					if (!terminal) {
+						requeueRequest(key, false);
+						return;
+					}
+					waitRetryCountRef.current.delete(key);
 					if (mapped) {
 						onTranslated(item, mapped);
-						if (translated.status === "disabled") {
-							failedRef.current.add(key);
-						}
-					} else {
+					}
+					if (translated.status !== "ready") {
 						failedRef.current.add(key);
 					}
-				}
-				forceRender((x) => x + 1);
-			})
+				})
 				.catch(() => {
-					streamErrored = true;
-					for (const item of batchItems) {
-						requeueAfterStreamFailure(item);
-					}
+					requeueAfterFailure(item);
 				})
 				.finally(() => {
-					for (const item of batchItems) {
-						const key = keyOf(item);
-						if (!handled.has(key) && !streamErrored) {
-							requeueAfterStreamFailure(item);
-						}
-						inFlightRef.current.delete(key);
-					}
+					inFlightRef.current.delete(key);
 					runningRef.current -= 1;
 					forceRender((x) => x + 1);
 					pump();
 				});
 		}
-	}, [enabled, onTranslated, shouldAutoTranslate, translateBatchStream]);
+	}, [
+		enabled,
+		onTranslated,
+		requeueAfterFailure,
+		requeueRequest,
+		shouldAutoTranslate,
+		translateSingle,
+	]);
 
 	const schedulePump = useCallback(() => {
 		if (!enabled) return;
@@ -269,7 +324,7 @@ export function useAutoTranslate(params: {
 		flushTimerRef.current = window.setTimeout(() => {
 			flushTimerRef.current = null;
 			pump();
-		}, BATCH_FLUSH_DELAY_MS);
+		}, QUEUE_FLUSH_DELAY_MS);
 	}, [enabled, pump]);
 
 	const enqueue = useCallback(
@@ -307,20 +362,30 @@ export function useAutoTranslate(params: {
 		async (item: FeedItem) => {
 			const key = keyOf(item);
 			failedRef.current.delete(key);
+			waitRetryCountRef.current.delete(key);
+			queuedRef.current = queuedRef.current.filter(
+				(queuedKey) => queuedKey !== key,
+			);
 			inFlightRef.current.add(key);
 			forceRender((x) => x + 1);
 
 			try {
-				const batch = await translateBatch([item]);
-				const translated = batch.items?.[0];
-				const res = translated
-					? mapTranslationItemToFeedResponse(translated)
-					: null;
-				if (!translated || !res) {
-					throw new Error(translated?.error ?? "translate failed");
+				const { translated, mapped, terminal } = await translateSingle(item);
+				if (!terminal) {
+					requeueRequest(key, false);
+					schedulePump();
+					return null;
 				}
-				onTranslated(item, res);
-				return res;
+				waitRetryCountRef.current.delete(key);
+				if (!mapped) {
+					failedRef.current.add(key);
+					throw new Error(translated.error ?? "translate failed");
+				}
+				onTranslated(item, mapped);
+				if (translated.status !== "ready") {
+					failedRef.current.add(key);
+				}
+				return mapped;
 			} catch (err) {
 				failedRef.current.add(key);
 				throw err;
@@ -329,7 +394,7 @@ export function useAutoTranslate(params: {
 				forceRender((x) => x + 1);
 			}
 		},
-		[onTranslated, translateBatch],
+		[onTranslated, requeueRequest, schedulePump, translateSingle],
 	);
 
 	useEffect(() => {

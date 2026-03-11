@@ -1827,7 +1827,10 @@ mod tests {
         },
     };
 
-    use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
     use url::Url;
 
     use super::{
@@ -2123,9 +2126,16 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")

@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| apras | 翻译请求单条记录制重建 | 已完成 | `apras-translation-request-single-record/SPEC.md` | 2026-03-09 | PR #35; checks green; review-loop clear; single-request contract live |
 | nbz5z | Translation worker board follow-up | 部分完成（3/4） | `nbz5z-translation-worker-board/SPEC.md` | 2026-03-09 | PR #32; checks green; review-loop pending; 3 general + 1 user_dedicated worker board |
 | gh3tz | 可配置 LLM 并行调度（取消固定限流） | 已完成 | `gh3tz-llm-max-concurrency/SPEC.md` | 2026-03-10 | PR #34; 24h summary-only UI; retry backoff requeues as queued with floor; main-list-only status grouping; non-blocking observable overrides |
 | 67n8t | 全库主键 NanoID 化与公开标识收口 | 已完成 | `67n8t-nanoid-primary-keys/SPEC.md` | 2026-03-08 | PR #29; checks green; review-loop clear; destructive SQLite rebuild |

@@ -7554,7 +7554,10 @@ mod tests {
         response::IntoResponse,
     };
     use reqwest::header::{HeaderMap, HeaderValue};
-    use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        Row, SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
     use tower_sessions::{MemoryStore, Session};
     use url::Url;
 
@@ -7627,9 +7630,16 @@ mod tests {
     }
 
     async fn setup_pool() -> SqlitePool {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
         sqlx::migrate!("./migrations")
@@ -9136,9 +9146,16 @@ mod tests {
 
     #[tokio::test]
     async fn migration_backfills_earliest_user_as_admin() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect("sqlite::memory:")
+            .connect_with(options)
             .await
             .expect("create sqlite memory db");
 

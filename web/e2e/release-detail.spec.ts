@@ -14,6 +14,7 @@ type ApiOptions = {
 	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
+	releaseDetailPendingPolls?: number;
 };
 
 function json(route: Route, payload: unknown, status = 200) {
@@ -37,8 +38,10 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		briefWindowEnd: "2026-02-23T00:00:00Z",
 		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
 		briefCreatedAt: "2026-02-23T08:00:00Z",
+		releaseDetailPendingPolls: 0,
 		...options,
 	};
+	const translationRequestPolls = new Map<string, number>();
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -172,9 +175,14 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		if (req.method() === "POST" && pathname === "/api/translate/requests") {
 			const body = req.postDataJSON() as {
 				mode?: string;
-				items?: Array<{ entity_id?: string; kind?: string; variant?: string }>;
+				item?: {
+					producer_ref?: string;
+					entity_id?: string;
+					kind?: string;
+					variant?: string;
+				};
 			};
-			const item = body.items?.[0];
+			const item = body.item;
 			if (!item || item.entity_id !== cfg.releaseId) {
 				return json(
 					route,
@@ -183,59 +191,39 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 				);
 			}
 			if (body.mode === "wait") {
+				const requestId = `req-${item.kind ?? "translation"}-1`;
+				const isPendingReleaseDetail =
+					item.kind === "release_detail" && cfg.releaseDetailPendingPolls > 0;
 				return json(route, {
-					request_id: "req-release-detail-1",
-					status: "completed",
-					items: [
-						{
-							producer_ref: cfg.releaseId,
-							entity_id: cfg.releaseId,
-							kind: "release_detail",
-							variant: "detail_card",
-							status: "ready",
-							title_zh: cfg.translatedTitle,
-							summary_md: null,
-							body_md: cfg.translatedSummary,
-							error: null,
-							work_item_id: "work-1",
-							batch_id: "batch-1",
-						},
-					],
-				});
-			}
-			if (body.mode === "stream") {
-				return route.fulfill({
-					status: 200,
-					contentType: "application/x-ndjson",
-					body: `${[
-						JSON.stringify({
-							event: "queued",
-							request_id: "req-feed-stream-1",
-							status: "queued",
-						}),
-						JSON.stringify({
-							event: "completed",
-							request_id: "req-feed-stream-1",
-							status: "completed",
-							batch_ids: ["batch-feed-1"],
-							items: [
-								{
-									producer_ref: cfg.releaseId,
-									entity_id: cfg.releaseId,
-									kind: "release_summary",
-									variant: "feed_card",
-									status: "ready",
-									title_zh: cfg.translatedTitle,
-									summary_md: cfg.translatedSummary,
-									body_md: null,
-									error: null,
-									work_item_id: "work-feed-1",
-									batch_id: "batch-feed-1",
-								},
-							],
-						}),
-					].join("\n")}
-`,
+					request_id: requestId,
+					status: isPendingReleaseDetail ? "running" : "completed",
+					result: {
+						producer_ref:
+							item.producer_ref ??
+							(item.kind === "release_detail"
+								? `release_detail:${cfg.releaseId}`
+								: `feed.auto_translate:release:${cfg.releaseId}`),
+						entity_id: cfg.releaseId,
+						kind: item.kind ?? "release_summary",
+						variant: item.variant ?? "feed_card",
+						status: isPendingReleaseDetail ? "running" : "ready",
+						title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
+						summary_md:
+							item.kind === "release_detail" || isPendingReleaseDetail
+								? null
+								: cfg.translatedSummary,
+						body_md:
+							item.kind === "release_detail" && !isPendingReleaseDetail
+								? cfg.translatedSummary
+								: null,
+						error: null,
+						work_item_id:
+							item.kind === "release_detail" ? "work-detail-1" : "work-feed-1",
+						batch_id:
+							item.kind === "release_detail"
+								? "batch-detail-1"
+								: "batch-feed-1",
+					},
 				});
 			}
 			return json(
@@ -243,6 +231,38 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 				{ error: { message: "unsupported translation mode" } },
 				400,
 			);
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/translate/requests/")
+		) {
+			const requestId = pathname.split("/").at(-1);
+			if (!requestId) {
+				return json(route, { error: { message: "missing request id" } }, 400);
+			}
+			const polls = translationRequestPolls.get(requestId) ?? 0;
+			translationRequestPolls.set(requestId, polls + 1);
+			const isPendingReleaseDetail =
+				requestId === "req-release_detail-1" &&
+				polls < cfg.releaseDetailPendingPolls;
+			return json(route, {
+				request_id: requestId,
+				status: isPendingReleaseDetail ? "running" : "completed",
+				result: {
+					producer_ref: `release_detail:${cfg.releaseId}`,
+					entity_id: cfg.releaseId,
+					kind: "release_detail",
+					variant: "detail_card",
+					status: isPendingReleaseDetail ? "running" : "ready",
+					title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
+					summary_md: null,
+					body_md: isPendingReleaseDetail ? null : cfg.translatedSummary,
+					error: null,
+					work_item_id: "work-detail-1",
+					batch_id: "batch-detail-1",
+				},
+			});
 		}
 
 		return json(
@@ -310,6 +330,24 @@ test("detail translate button updates card content", async ({ page }) => {
 	).toBeVisible();
 });
 
+test("detail translate keeps polling an in-flight request until the result is ready", async ({
+	page,
+}) => {
+	await installApiMocks(page, { releaseDetailPendingPolls: 2 });
+
+	await page.goto("/?tab=briefs&release=123");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect(
+		page.getByRole("heading", { name: "发布说明 123" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+	).toBeVisible();
+	await expect(page.getByText("translation wait timeout")).toHaveCount(0);
+});
+
 test("reaction fallback opens PAT dialog with accessible controls", async ({
 	page,
 }) => {
@@ -356,7 +394,7 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await expect(page.getByText("#123")).toBeVisible();
 });
 
-test("feed auto translate resolves from stream request", async ({ page }) => {
+test("feed auto translate resolves from wait request", async ({ page }) => {
 	await installApiMocks(page, {
 		withAutoTranslateFeed: true,
 	});
