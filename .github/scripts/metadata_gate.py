@@ -104,12 +104,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_optional_int(value: str) -> int | None:
-    if not value:
+def parse_optional_int(value: Any) -> int | None:
+    if value is None:
         return None
-    try:
-        parsed = int(value)
-    except ValueError:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if not value:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+    else:
         return None
     return parsed if parsed > 0 else None
 
@@ -144,6 +153,8 @@ def build_context(args: argparse.Namespace) -> GateContext:
     if manual_pull_number is None:
         manual_pull_number = parse_optional_int(os.environ.get("INPUT_PULL_NUMBER", ""))
     payload = load_event_payload(args.event_path)
+    if manual_pull_number is None:
+        manual_pull_number = parse_optional_int(get_payload_value(payload, "inputs", "pull_number"))
     return GateContext(
         gate=args.gate,
         owner=owner,
