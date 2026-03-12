@@ -117,7 +117,7 @@ def make_context(gate: str, event_name: str, pull_number: int) -> object:
     return module.GateContext(
         gate=gate,
         owner="IvanLi-CN",
-        repo="codex-vibe-monitor",
+        repo="octo-rill",
         api_root="https://api.github.com",
         token="",
         event_name=event_name,
@@ -187,6 +187,45 @@ exit_code, summary = run_with_summary(
 )
 assert exit_code == 0, f"expected approval to survive a later comment, got {exit_code}"
 assert "Approval satisfied by @reviewer (write)." in summary
+
+workflow_dispatch_context = module.build_context(
+    module.argparse.Namespace(
+        gate="review",
+        repo="IvanLi-CN/octo-rill",
+        api_root="https://api.github.com",
+        token="",
+        event_name="workflow_dispatch",
+        event_path="",
+        pull_number=None,
+    )
+)
+assert workflow_dispatch_context.manual_pull_number is None
+
+with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+    handle.write('{"inputs":{"pull_number":"57"}}')
+    workflow_dispatch_event_path = handle.name
+try:
+    workflow_dispatch_context = module.build_context(
+        module.argparse.Namespace(
+            gate="review",
+            repo="IvanLi-CN/octo-rill",
+            api_root="https://api.github.com",
+            token="",
+            event_name="workflow_dispatch",
+            event_path=workflow_dispatch_event_path,
+            pull_number=None,
+        )
+    )
+    assert workflow_dispatch_context.manual_pull_number == 57
+    exit_code, summary = run_with_summary(
+        module.run_review_gate,
+        workflow_dispatch_context,
+        client,
+    )
+    assert exit_code == 0, f"expected workflow_dispatch review gate success, got {exit_code}"
+    assert "Approval satisfied by @reviewer (write)." in summary
+finally:
+    Path(workflow_dispatch_event_path).unlink(missing_ok=True)
 
 print("test-inline-metadata-workflows: all checks passed")
 PY
