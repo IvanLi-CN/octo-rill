@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "implementation_profile": "bootstrap",
   "policy": {
     "baseline_policy": "explicit-waiver-required",
     "require_signed_commits": true,
@@ -8,7 +9,25 @@
         "main"
       ],
       "require_pull_request": true,
-      "disallow_direct_pushes": true
+      "disallow_direct_pushes": true,
+      "disallow_branch_deletions": true,
+      "disallow_force_pushes": true,
+      "allow_merge_commits": true,
+      "require_merge_queue": false,
+      "required_reviewers": [],
+      "required_status_checks": {
+        "strict": true,
+        "integrations": {
+          "Release intent label gate": 15368,
+          "Lint & Checks": 15368,
+          "Backend Tests": 15368,
+          "Frontend E2E": 15368,
+          "Worktree Bootstrap Smoke (ubuntu-latest)": 15368,
+          "Worktree Bootstrap Smoke (macos-latest)": 15368,
+          "Build (Release)": 15368,
+          "Review Policy Gate": 15368
+        }
+      }
     },
     "review_policy": {
       "mode": "conditional-required",
