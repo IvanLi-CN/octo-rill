@@ -10,6 +10,8 @@
 - `translation_batches`
   - add `worker_slot INTEGER NOT NULL`
   - add `request_count INTEGER NOT NULL`
+  - add `runtime_owner_id TEXT NULL`
+  - add `lease_heartbeat_at TEXT NULL`
 
 ## Runtime semantics
 
@@ -18,3 +20,4 @@
   - `4` => `user_dedicated`
 - `system` requests can only be claimed by `general` workers.
 - `user` requests can be claimed by any worker, but the dedicated worker only claims `user` requests.
+- Running batch leases heartbeat every 10s; rows without a live owner or with heartbeat older than 90s are reclaimed as `failed(runtime_lease_expired)`.

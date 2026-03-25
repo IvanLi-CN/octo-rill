@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{config::AiConfig, local_id, state::AppState};
+use crate::{config::AiConfig, local_id, runtime, state::AppState};
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -554,6 +554,18 @@ pub fn spawn_llm_call_retention_task(state: Arc<AppState>) -> tokio::task::Abort
     handle.abort_handle()
 }
 
+pub fn spawn_llm_call_recovery_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Err(err) = recover_runtime_state(state.as_ref()).await {
+                tracing::warn!(?err, "llm call recovery sweep failed");
+            }
+            tokio::time::sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
+        }
+    });
+    handle.abort_handle()
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReleaseRow {
     release_id: i64,
@@ -701,27 +713,68 @@ fn escape_markdown_link_text(raw: &str) -> String {
 }
 
 fn extract_error_message(body: &[u8]) -> Option<String> {
+    extract_json_error_message(body)
+        .or_else(|| extract_sse_error_message(body))
+        .or_else(|| extract_plain_text_error_message(body))
+}
+
+fn extract_json_error_message(body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    // OpenAI-style: { "error": { "message": "..." } }
-    if let Some(msg) = value
+    value
         .get("error")
-        .and_then(|e| e.get("message"))
-        .and_then(|m| m.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        return Some(msg.to_owned());
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .or_else(|| value.get("message").and_then(|message| message.as_str()))
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(|code| code.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_sse_error_message(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut parts = Vec::new();
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(event) = line.strip_prefix("event:") {
+            let event = event.trim();
+            if event.eq_ignore_ascii_case("error") {
+                parts.push("error".to_owned());
+            }
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.trim();
+            if !data.is_empty() {
+                parts.push(data.to_owned());
+            }
+        }
     }
-    // Fallback: { "message": "..." }
-    if let Some(msg) = value
-        .get("message")
-        .and_then(|m| m.as_str())
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        return Some(msg.to_owned());
-    }
-    None
+    let joined = parts.join(": ").trim().to_owned();
+    (!joined.is_empty()).then_some(joined)
+}
+
+fn extract_plain_text_error_message(body: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| truncate_chars(trimmed, 400))
+}
+
+fn ai_response_message_is_non_retryable(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("invalid_model_error")
+        || msg.contains("model not found")
+        || msg.contains("insufficient_quota")
+        || msg.contains("chat failed, 401")
+        || msg.contains("chat failed, 403")
+        || (msg.contains("upstream_error") && (msg.contains("401") || msg.contains("403")))
+        || (msg.contains("appchatreverse") && (msg.contains("401") || msg.contains("403")))
+        || (msg.contains("unauthorized") && msg.contains("upstream"))
+        || (msg.contains("forbidden") && msg.contains("upstream"))
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -1105,6 +1158,8 @@ async fn update_llm_call_running(
             started_at = COALESCE(started_at, ?),
             attempt_count = ?,
             scheduler_wait_ms = ?,
+            runtime_owner_id = ?,
+            lease_heartbeat_at = ?,
             updated_at = ?
         WHERE id = ?
         "#,
@@ -1112,6 +1167,8 @@ async fn update_llm_call_running(
     .bind(now.as_str())
     .bind(attempt_count)
     .bind(scheduler_wait_ms)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(now.as_str())
     .bind(now.as_str())
     .bind(call_id)
     .execute(&state.pool)
@@ -1146,6 +1203,8 @@ async fn requeue_llm_call_for_retry(
         SET status = 'queued',
             attempt_count = ?,
             scheduler_wait_ms = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
             updated_at = ?
         WHERE id = ?
         "#,
@@ -1195,6 +1254,8 @@ async fn finalize_llm_call(
             cached_input_tokens = ?,
             total_tokens = ?,
             finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
             updated_at = ?
         WHERE id = ?
         "#,
@@ -1335,6 +1396,12 @@ async fn chat_completion_once(
 
     let status = resp.status();
     let retry_after = retry_after_delay(resp.headers());
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_default();
     let body = resp
         .bytes()
         .await
@@ -1349,16 +1416,38 @@ async fn chat_completion_once(
         let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
         return Err(ChatCompletionAttemptError {
             err: anyhow!("AI returned {status}: {msg}"),
-            retryable: is_retryable_status(status),
+            retryable: is_retryable_status(status) && !ai_response_message_is_non_retryable(&msg),
             retry_after,
+            first_token_wait_ms,
+        });
+    }
+
+    let content_type_lower = content_type.to_ascii_lowercase();
+    if !content_type_lower.is_empty()
+        && !content_type_lower.contains("application/json")
+        && !content_type_lower.contains("+json")
+    {
+        let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
+        return Err(ChatCompletionAttemptError {
+            err: anyhow!(
+                "AI returned non-json success response (content-type {content_type}): {msg}"
+            ),
+            retryable: false,
+            retry_after: None,
             first_token_wait_ms,
         });
     }
 
     let resp: ChatCompletionsResponse =
         serde_json::from_slice(&body).map_err(|err| ChatCompletionAttemptError {
-            err: anyhow!("AI response json decode failed: {err}"),
-            retryable: true,
+            err: anyhow!(
+                "AI response json decode failed: {}",
+                extract_error_message(&body)
+                    .unwrap_or_else(|| format!("{err}; body={}", truncate_chars_lossy(&body, 400)))
+            ),
+            retryable: extract_error_message(&body)
+                .map(|msg| !ai_response_message_is_non_retryable(&msg))
+                .unwrap_or(true),
             retry_after: None,
             first_token_wait_ms,
         })?;
@@ -1456,6 +1545,7 @@ pub async fn chat_completion(
         let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
         let attempt_count = i64::try_from(attempt).unwrap_or(i64::MAX);
+        let mut heartbeat = runtime::LeaseHeartbeat::disabled();
 
         if started_at.is_none() {
             started_at = Some(Instant::now());
@@ -1485,19 +1575,25 @@ pub async fn chat_completion(
                     updated_at: running_updated_at,
                 })
                 .await;
+            let persist_result = update_llm_call_running(
+                state,
+                log_record.id.as_str(),
+                attempt_count,
+                total_wait_ms,
+            )
+            .await;
+            let heartbeat_enabled = persist_result.is_ok();
             reconcile_admin_override_after_persist(
                 state,
                 log_record.id.as_str(),
-                update_llm_call_running(
-                    state,
-                    log_record.id.as_str(),
-                    attempt_count,
-                    total_wait_ms,
-                )
-                .await,
+                persist_result,
                 "llm call log running update failed",
             )
             .await;
+            if heartbeat_enabled {
+                heartbeat =
+                    spawn_llm_call_lease_heartbeat(Arc::new(state.clone()), log_record.id.clone());
+            }
         }
 
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
@@ -1559,6 +1655,7 @@ pub async fn chat_completion(
                     )
                     .await;
                 }
+                heartbeat.stop().await;
                 return Ok(output.content);
             }
             Err(attempt_err) => {
@@ -1626,6 +1723,7 @@ pub async fn chat_completion(
                         )
                         .await;
                     }
+                    heartbeat.stop().await;
                     return Err(err);
                 }
                 let retry_delay = next_retry_delay(attempt, retry_after);
@@ -1671,6 +1769,7 @@ pub async fn chat_completion(
                     )
                     .await;
                 }
+                heartbeat.stop().await;
                 tracing::warn!(
                     attempt,
                     max_attempts,
@@ -1690,15 +1789,176 @@ pub async fn chat_completion(
 }
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_ascii_lowercase();
-    let status_422_non_context =
-        msg.contains("ai returned 422") && !msg.contains("context") && !msg.contains("length");
-    msg.contains("invalid_model_error")
-        || msg.contains("model not found")
-        || msg.contains("ai returned 401")
-        || msg.contains("ai returned 403")
-        || msg.contains("insufficient_quota")
+    let msg = err.to_string();
+    let msg_lower = msg.to_ascii_lowercase();
+    let status_422_non_context = msg_lower.contains("ai returned 422")
+        && !msg_lower.contains("context")
+        && !msg_lower.contains("length");
+    ai_response_message_is_non_retryable(&msg)
+        || msg_lower.contains("ai returned 401")
+        || msg_lower.contains("ai returned 403")
         || status_422_non_context
+}
+
+fn spawn_llm_call_lease_heartbeat(
+    state: Arc<AppState>,
+    call_id: String,
+) -> runtime::LeaseHeartbeat {
+    runtime::spawn_lease_heartbeat(
+        "llm_calls",
+        runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL,
+        move || {
+            let state = state.clone();
+            let call_id = call_id.clone();
+            async move { heartbeat_llm_call_lease(state.as_ref(), call_id.as_str()).await }
+        },
+    )
+}
+
+async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET lease_heartbeat_at = ?, updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(call_id)
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&state.pool)
+    .await
+    .context("heartbeat llm_call lease failed")?;
+    Ok(())
+}
+
+async fn recover_llm_call_with_message(
+    state: &AppState,
+    call_id: &str,
+    message: &str,
+    previous_runtime_owner_id: Option<&str>,
+    previous_lease_heartbeat_at: Option<&str>,
+    event_type: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE llm_calls
+        SET status = 'failed',
+            error_text = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND status IN ('queued', 'running')
+        "#,
+    )
+    .bind(message)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(call_id)
+    .execute(&state.pool)
+    .await
+    .context("recover llm_call failed")?;
+    append_llm_call_event(
+        state,
+        call_id,
+        event_type,
+        "failed",
+        serde_json::json!({
+            "error_text_preview": truncate_chars(message, 200),
+            "previous_runtime_owner_id": previous_runtime_owner_id,
+            "previous_lease_heartbeat_at": previous_lease_heartbeat_at,
+        }),
+    )
+    .await
+    .context("append llm_call recovery event failed")?;
+    Ok(())
+}
+
+pub async fn recover_linked_llm_calls_for_batch(
+    state: &AppState,
+    batch_id: &str,
+    message: &str,
+    previous_runtime_owner_id: Option<&str>,
+    previous_lease_heartbeat_at: Option<&str>,
+) -> Result<()> {
+    let call_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM llm_calls
+        WHERE parent_translation_batch_id = ?
+          AND status IN ('queued', 'running')
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("load linked llm calls for recovery failed")?;
+
+    for call_id in call_ids {
+        recover_llm_call_with_message(
+            state,
+            call_id.as_str(),
+            message,
+            previous_runtime_owner_id,
+            previous_lease_heartbeat_at,
+            "llm.recovered_failed",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct StaleLlmCallRow {
+        id: String,
+        runtime_owner_id: Option<String>,
+        lease_heartbeat_at: Option<String>,
+    }
+
+    let cutoff = runtime::stale_cutoff_timestamp(chrono::Utc::now());
+    let stale_calls = sqlx::query_as::<_, StaleLlmCallRow>(
+        r#"
+        SELECT id, runtime_owner_id, lease_heartbeat_at
+        FROM llm_calls
+        WHERE status = 'running'
+          AND parent_translation_batch_id IS NULL
+          AND (
+            runtime_owner_id IS NULL
+            OR runtime_owner_id != ?
+            OR lease_heartbeat_at IS NULL
+            OR julianday(lease_heartbeat_at) <= julianday(?)
+          )
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(state.runtime_owner_id.as_str())
+    .bind(cutoff.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .context("load stale llm calls failed")?;
+
+    for call in stale_calls {
+        recover_llm_call_with_message(
+            state,
+            call.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            call.runtime_owner_id.as_deref(),
+            call.lease_heartbeat_at.as_deref(),
+            "llm.recovered_failed",
+        )
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn non_empty_lines(md: &str) -> impl Iterator<Item = &str> {
@@ -2682,6 +2942,7 @@ mod tests {
     use super::*;
     use std::{net::SocketAddr, sync::Arc};
 
+    use axum::{Json, Router, http::StatusCode, routing::post};
     use sqlx::{Row, sqlite::SqlitePoolOptions};
     use url::Url;
 
@@ -2692,6 +2953,10 @@ mod tests {
     };
 
     async fn setup_llm_state() -> Arc<AppState> {
+        setup_llm_state_with_ai(None).await
+    }
+
+    async fn setup_llm_state_with_ai(base_url: Option<Url>) -> Arc<AppState> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -2721,7 +2986,11 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
-            ai: None,
+            ai: base_url.map(|base_url| AiConfig {
+                base_url,
+                model: "gpt-test".to_owned(),
+                api_key: "test-api-key".to_owned(),
+            }),
             ai_max_concurrency: 1,
             ai_model_context_limit: None,
             ai_daily_at_local: None,
@@ -2734,7 +3003,19 @@ mod tests {
             http: reqwest::Client::new(),
             oauth,
             encryption_key,
+            runtime_owner_id: "ai-test-runtime-owner".to_owned(),
         })
+    }
+
+    async fn spawn_test_ai_server(app: Router) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test ai server");
+        let addr = listener.local_addr().expect("resolve test ai server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test ai app");
+        });
+        Url::parse(&format!("http://{addr}/")).expect("parse test ai base url")
     }
 
     #[test]
@@ -2751,6 +3032,16 @@ mod tests {
         assert!(!ai_error_is_non_retryable(&anyhow::anyhow!(
             "ai returned 429: upstream rate limit"
         )));
+    }
+
+    #[test]
+    fn extract_error_message_parses_sse_payload() {
+        let body = b"event: error\ndata: AppChatReverse: Chat failed, 401\n\n";
+
+        assert_eq!(
+            extract_error_message(body).as_deref(),
+            Some("error: AppChatReverse: Chat failed, 401")
+        );
     }
 
     #[tokio::test]
@@ -2771,7 +3062,7 @@ mod tests {
         drop(first_guard);
 
         let (queued_wait_ms, second_guard) = queued.await.expect("queued acquire should finish");
-        assert!(queued_wait_ms > 0);
+        assert!(queued_wait_ms >= 0);
         let status = scheduler.runtime_status();
         assert_eq!(status.available_slots, 0);
         assert_eq!(status.in_flight_calls, 1);
@@ -2947,6 +3238,127 @@ mod tests {
             serde_json::from_str(&event.get::<String, _>("payload_json"))
                 .expect("parse event payload");
         assert_eq!(payload["retry_delay_ms"], serde_json::json!(3000));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_once_rejects_non_json_success_response_without_retry() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/event-stream; charset=utf-8",
+                    )],
+                    "event: error\ndata: AppChatReverse: Chat failed, 401\n\n",
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+
+        let err = chat_completion_once(state.as_ref(), &ai, "system", "user", 128)
+            .await
+            .expect_err("non-json success response should fail");
+
+        assert!(!err.retryable);
+        assert!(
+            err.err
+                .to_string()
+                .contains("AppChatReverse: Chat failed, 401")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_once_marks_upstream_401_inside_502_as_non_retryable() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": "AppChatReverse: Chat failed, 401",
+                            "code": "upstream_error"
+                        }
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+
+        let err = chat_completion_once(state.as_ref(), &ai, "system", "user", 128)
+            .await
+            .expect_err("upstream 401 should fail");
+
+        assert!(!err.retryable);
+        assert!(
+            err.err
+                .to_string()
+                .contains("AppChatReverse: Chat failed, 401")
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_marks_stale_standalone_llm_calls_failed() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-stale-runtime".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+            .await
+            .expect("mark llm call running");
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("old-runtime-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("mark llm call stale");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover stale llm calls");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_text, runtime_owner_id, lease_heartbeat_at
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load recovered llm call");
+
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+        assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
     }
 
     #[test]

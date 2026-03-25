@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 已完成
+- Status: 已实现（待合并收口）
 - Created: 2026-02-25
-- Last: 2026-03-08
+- Last: 2026-03-25
 
 ## 背景 / 问题陈述
 
@@ -34,6 +34,7 @@
 
 - DB migration：`users.daily_brief_utc_time`、`users.last_active_at`、`job_tasks`、`job_task_events`、`daily_brief_hour_slots`。
 - 后端任务运行时：队列消费、任务状态流转、重试/取消、SSE 事件流。
+- 后端任务运行时 lease：`job_tasks.running` 持有 `runtime_owner_id + lease_heartbeat_at`，启动恢复与周期 sweep 会把孤儿运行态统一收口为失败。
 - 调度器改造：每小时轮询，命中 `hour_utc` 槽位后入队日报任务。
 - 管理员 API：任务总览、实时任务列表/详情、重试、取消、定时槽位查询与启停。
 - 前端 `/admin/jobs` 页面与用户管理字段展示补齐；任务详情区按 `task_type` 渲染专属信息卡片与说明。
@@ -113,6 +114,10 @@
 - Given Storybook 打开 `Admin/TaskTypeDetailPage`
   When 查看故事列表
   Then 各任务类型均有独立 story，覆盖任务详情页的专属展示分支。
+
+- Given 管理员任务中心数据库中残留孤儿 `job_tasks.running`
+  When 服务重启并完成启动前 recovery pass
+  Then 这些任务会自动转为 `failed(runtime_lease_expired)` 并追加 recovery event，避免管理页长期显示假运行态。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 

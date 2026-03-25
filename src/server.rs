@@ -7,7 +7,10 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use serde_json::json;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 use tokio::task::AbortHandle;
 use tower_http::{
     cors::CorsLayer,
@@ -21,6 +24,7 @@ use tower_sessions_sqlx_store::SqliteStore;
 use tracing::info;
 
 use crate::config::AppConfig;
+use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::state::AppState;
 use crate::{ai, api, auth, jobs, state, translations, version};
 
@@ -28,9 +32,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
     ensure_dir_exists(&config.task_log_dir)?;
 
-    let connect_opts = SqliteConnectOptions::from_str(&config.database_url)
-        .context("invalid DATABASE_URL for sqlite")?
-        .create_if_missing(true);
+    let connect_opts = build_sqlite_connect_options(&config.database_url)?;
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -42,6 +44,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .run(&pool)
         .await
         .context("failed to apply database migrations")?;
+
+    let pragmas = read_sqlite_runtime_pragmas(&pool).await?;
+    info!(
+        journal_mode = %pragmas.journal_mode,
+        busy_timeout_ms = pragmas.busy_timeout_ms,
+        synchronous = pragmas.synchronous,
+        "sqlite runtime pragmas active"
+    );
 
     let session_store = SqliteStore::new(pool.clone());
     session_store
@@ -69,9 +79,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         http,
         oauth,
         encryption_key: config.encryption_key.clone(),
+        runtime_owner_id: crate::local_id::generate_local_id(),
     });
 
+    jobs::recover_runtime_state(app_state.as_ref()).await?;
+    translations::recover_runtime_state(app_state.as_ref()).await?;
+    ai::recover_runtime_state(app_state.as_ref()).await?;
+
     jobs::spawn_task_workers(app_state.clone(), config.job_worker_concurrency);
+    let task_recovery_abort_handle = jobs::spawn_task_recovery_worker(app_state.clone());
     jobs::spawn_hourly_scheduler(app_state.clone());
     jobs::spawn_subscription_scheduler(app_state.clone());
     let model_catalog_abort_handle = config
@@ -79,8 +95,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .as_ref()
         .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
     let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
+    let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
     let translation_scheduler_abort_handles =
         translations::spawn_translation_scheduler(app_state.clone());
+    let translation_recovery_abort_handle =
+        translations::spawn_translation_recovery_task(app_state.clone());
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
     let session_cookie_name = build_session_cookie_name(&config);
@@ -255,7 +274,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     info!(%addr, "listening");
 
-    let mut abort_handles = vec![deletion_abort_handle, llm_call_retention_abort_handle];
+    let mut abort_handles = vec![
+        deletion_abort_handle,
+        llm_call_retention_abort_handle,
+        llm_call_recovery_abort_handle,
+        task_recovery_abort_handle,
+        translation_recovery_abort_handle,
+    ];
     abort_handles.extend(translation_scheduler_abort_handles);
     if let Some(handle) = model_catalog_abort_handle {
         abort_handles.push(handle);
@@ -302,6 +327,49 @@ fn ensure_sqlite_dir(database_url: &str) -> Result<()> {
 
     std::fs::create_dir_all(parent).context("failed to create sqlite parent directory")?;
     Ok(())
+}
+
+fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptions> {
+    let mut connect_opts = SqliteConnectOptions::from_str(database_url)
+        .context("invalid DATABASE_URL for sqlite")?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .synchronous(SqliteSynchronous::Normal);
+
+    if database_url != "sqlite::memory:" {
+        connect_opts = connect_opts.journal_mode(SqliteJournalMode::Wal);
+    }
+
+    Ok(connect_opts)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SqliteRuntimePragmas {
+    journal_mode: String,
+    busy_timeout_ms: i64,
+    synchronous: i64,
+}
+
+async fn read_sqlite_runtime_pragmas(pool: &SqlitePool) -> Result<SqliteRuntimePragmas> {
+    let journal_mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .context("read sqlite journal_mode failed")?;
+    let busy_timeout_ms = sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+        .fetch_one(pool)
+        .await
+        .context("read sqlite busy_timeout failed")?;
+    let synchronous = sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+        .fetch_one(pool)
+        .await
+        .context("read sqlite synchronous failed")?;
+
+    Ok(SqliteRuntimePragmas {
+        journal_mode,
+        busy_timeout_ms,
+        synchronous,
+    })
 }
 
 async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
@@ -371,7 +439,10 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{api_health, api_version};
+    use super::{
+        api_health, api_version, build_sqlite_connect_options, read_sqlite_runtime_pragmas,
+    };
+    use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
     async fn api_version_reports_non_empty_version_and_source() {
@@ -405,5 +476,29 @@ mod tests {
             version_payload.get("version"),
             "health/version endpoints should agree on effective version"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_runtime_pragmas_enable_wal_and_busy_timeout() {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-server-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let database_url = format!("sqlite:{}", database_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                build_sqlite_connect_options(&database_url).expect("build sqlite connect options"),
+            )
+            .await
+            .expect("connect sqlite pool");
+
+        let pragmas = read_sqlite_runtime_pragmas(&pool)
+            .await
+            .expect("read sqlite pragmas");
+
+        assert_eq!(pragmas.journal_mode, "wal");
+        assert_eq!(pragmas.busy_timeout_ms, 5000);
+        assert_eq!(pragmas.synchronous, 1);
     }
 }

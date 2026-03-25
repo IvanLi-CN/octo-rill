@@ -28,12 +28,21 @@ Key columns:
 - `result_json TEXT NULL`
 - `error_message TEXT NULL`
 - `cancel_requested INTEGER NOT NULL DEFAULT 0`
+- `runtime_owner_id TEXT NULL`
+- `lease_heartbeat_at TEXT NULL`
 - `created_at / started_at / finished_at / updated_at`
 
 Indexes:
 
 - `idx_job_tasks_status_created_at`
 - `idx_job_tasks_task_type_created_at`
+- `idx_job_tasks_running_runtime_lease` (partial, `status='running'`)
+
+Runtime semantics:
+
+- `runtime_owner_id + lease_heartbeat_at` represent the active process lease for `running` tasks.
+- Service startup and periodic sweep reclaim orphaned `running` rows as `failed(runtime_lease_expired)`.
+- Reclaimed tasks append a recovery event to `job_task_events`.
 
 ## `job_task_events` (new)
 

@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ai, api, local_id, state::AppState, sync, translations};
+use crate::{ai, api, local_id, runtime, state::AppState, sync, translations};
 
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
@@ -80,6 +80,18 @@ pub fn spawn_task_workers(state: Arc<AppState>, count: usize) {
     for _ in 0..count.max(1) {
         spawn_task_worker(state.clone());
     }
+}
+
+pub fn spawn_task_recovery_worker(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = recover_runtime_state(state.as_ref()).await {
+                tracing::warn!(?err, "task worker: recover stale runtime tasks failed");
+            }
+            tokio::time::sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
+        }
+    })
+    .abort_handle()
 }
 
 pub fn spawn_task_worker(state: Arc<AppState>) {
@@ -433,6 +445,8 @@ async fn insert_task_record(
     new_task: &NewTask,
     status: &str,
     started_at: Option<&str>,
+    runtime_owner_id: Option<&str>,
+    lease_heartbeat_at: Option<&str>,
 ) -> Result<String> {
     let task_id = crate::local_id::generate_local_id();
     let now = Utc::now().to_rfc3339();
@@ -452,8 +466,10 @@ async fn insert_task_record(
           log_file_path,
           created_at,
           started_at,
+          runtime_owner_id,
+          lease_heartbeat_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&task_id)
@@ -466,6 +482,8 @@ async fn insert_task_record(
     .bind(log_file_path.as_deref())
     .bind(now.as_str())
     .bind(started_at)
+    .bind(runtime_owner_id)
+    .bind(lease_heartbeat_at)
     .bind(now.as_str())
     .execute(&state.pool)
     .await
@@ -475,7 +493,7 @@ async fn insert_task_record(
 }
 
 pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
-    let task_id = insert_task_record(state, &new_task, STATUS_QUEUED, None).await?;
+    let task_id = insert_task_record(state, &new_task, STATUS_QUEUED, None, None, None).await?;
 
     append_task_event(
         state,
@@ -499,7 +517,15 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
 
 pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
     let now = Utc::now().to_rfc3339();
-    let task_id = insert_task_record(state, &new_task, STATUS_RUNNING, Some(now.as_str())).await?;
+    let task_id = insert_task_record(
+        state,
+        &new_task,
+        STATUS_RUNNING,
+        Some(now.as_str()),
+        Some(state.runtime_owner_id.as_str()),
+        Some(now.as_str()),
+    )
+    .await?;
 
     append_task_event(
         state,
@@ -529,6 +555,21 @@ pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<En
         task_type: new_task.task_type,
         status: STATUS_RUNNING.to_owned(),
     })
+}
+
+pub fn spawn_task_lease_heartbeat(
+    state: Arc<AppState>,
+    task_id: String,
+) -> runtime::LeaseHeartbeat {
+    runtime::spawn_lease_heartbeat(
+        "job_tasks",
+        runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL,
+        move || {
+            let state = state.clone();
+            let task_id = task_id.clone();
+            async move { heartbeat_task_lease(state.as_ref(), task_id.as_str()).await }
+        },
+    )
 }
 
 pub async fn complete_task(
@@ -1139,11 +1180,13 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     let updated = sqlx::query(
         r#"
         UPDATE job_tasks
-        SET status = ?, started_at = ?, updated_at = ?
+        SET status = ?, started_at = ?, runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
         WHERE id = ? AND status = ?
         "#,
     )
     .bind(STATUS_RUNNING)
+    .bind(now.as_str())
+    .bind(state.runtime_owner_id.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(&task_id)
@@ -1206,6 +1249,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         parent_task_type: Some(task.task_type.clone()),
         parent_translation_batch_id: None,
     };
+    let heartbeat = spawn_task_lease_heartbeat(state.clone(), task.id.clone());
     let result = ai::with_llm_call_context(
         context,
         execute_task(state.as_ref(), &task.id, &task.task_type, &payload),
@@ -1217,6 +1261,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
         .unwrap_or(false)
     {
         finalize_task(state.as_ref(), &task.id, STATUS_CANCELED, None, None).await?;
+        heartbeat.stop().await;
         append_task_event(
             state.as_ref(),
             &task.id,
@@ -1237,6 +1282,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 None,
             )
             .await?;
+            heartbeat.stop().await;
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -1255,6 +1301,7 @@ async fn process_task(state: Arc<AppState>, task: TaskRow) -> Result<()> {
                 Some(message.clone()),
             )
             .await?;
+            heartbeat.stop().await;
             append_task_event(
                 state.as_ref(),
                 &task.id,
@@ -1541,7 +1588,13 @@ async fn finalize_task(
     sqlx::query(
         r#"
         UPDATE job_tasks
-        SET status = ?, result_json = ?, error_message = ?, finished_at = ?, updated_at = ?
+        SET status = ?,
+            result_json = ?,
+            error_message = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
         WHERE id = ?
         "#,
     )
@@ -1554,6 +1607,86 @@ async fn finalize_task(
     .execute(&state.pool)
     .await
     .context("failed to finalize task")?;
+
+    Ok(())
+}
+
+async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE job_tasks
+        SET lease_heartbeat_at = ?, updated_at = ?
+        WHERE id = ?
+          AND status = ?
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(task_id)
+    .bind(STATUS_RUNNING)
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to heartbeat task lease")?;
+    Ok(())
+}
+
+pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct StaleTaskRow {
+        id: String,
+        runtime_owner_id: Option<String>,
+        lease_heartbeat_at: Option<String>,
+    }
+
+    let now = Utc::now();
+    let cutoff = runtime::stale_cutoff_timestamp(now);
+    let stale_tasks = sqlx::query_as::<_, StaleTaskRow>(
+        r#"
+        SELECT id, runtime_owner_id, lease_heartbeat_at
+        FROM job_tasks
+        WHERE status = ?
+          AND (
+            runtime_owner_id IS NULL
+            OR runtime_owner_id != ?
+            OR lease_heartbeat_at IS NULL
+            OR julianday(lease_heartbeat_at) <= julianday(?)
+          )
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(STATUS_RUNNING)
+    .bind(state.runtime_owner_id.as_str())
+    .bind(cutoff.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load stale runtime tasks")?;
+
+    for task in stale_tasks {
+        finalize_task(
+            state,
+            task.id.as_str(),
+            STATUS_FAILED,
+            None,
+            Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR.to_owned()),
+        )
+        .await?;
+        append_task_event(
+            state,
+            task.id.as_str(),
+            "task.recovered_failed",
+            json!({
+                "task_id": task.id,
+                "status": STATUS_FAILED,
+                "error": runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+                "previous_runtime_owner_id": task.runtime_owner_id,
+                "previous_lease_heartbeat_at": task.lease_heartbeat_at,
+            }),
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -1629,13 +1762,14 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS,
-        TranslationStreamCursor, claim_next_queued_task, current_subscription_schedule_key,
-        is_scheduled_task_type, load_translation_stream_cursor, load_translation_stream_rows,
+        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_RELEASES,
+        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
+        current_subscription_schedule_key, is_scheduled_task_type, load_translation_stream_cursor,
+        load_translation_stream_rows, recover_runtime_state,
     };
     use chrono::{TimeZone, Utc};
     use sqlx::{
-        SqlitePool,
+        Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
     use url::Url;
@@ -1735,6 +1869,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recover_runtime_state_marks_stale_running_tasks_failed() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(&pool, "stale-task", TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("old-runtime-owner")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("stale-task")
+        .execute(&pool)
+        .await
+        .expect("mark task stale");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_message, runtime_owner_id, lease_heartbeat_at
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind("stale-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered task");
+
+        assert_eq!(row.get::<String, _>("status"), STATUS_FAILED);
+        assert_eq!(
+            row.get::<Option<String>, _>("error_message").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+        assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+
+        let event_type = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT event_type
+            FROM job_task_events
+            WHERE task_id = ?
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind("stale-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovery event");
+        assert_eq!(event_type, "task.recovered_failed");
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_current_owner_tasks_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(&pool, "live-task", TASK_SYNC_RELEASES, STATUS_RUNNING, 0).await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("live-task")
+        .execute(&pool)
+        .await
+        .expect("mark task live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let status =
+            sqlx::query_scalar::<_, String>(r#"SELECT status FROM job_tasks WHERE id = ?"#)
+                .bind("live-task")
+                .fetch_one(&pool)
+                .await
+                .expect("load live task status");
+        assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
     async fn translation_stream_cursor_defaults_for_empty_tables() {
         let pool = setup_pool().await;
 
@@ -1827,6 +2057,7 @@ mod tests {
             http: reqwest::Client::new(),
             oauth,
             encryption_key,
+            runtime_owner_id: "jobs-test-runtime-owner".to_owned(),
         })
     }
 
