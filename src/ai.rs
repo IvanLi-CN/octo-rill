@@ -1933,14 +1933,12 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
           AND parent_translation_batch_id IS NULL
           AND (
             runtime_owner_id IS NULL
-            OR runtime_owner_id != ?
             OR lease_heartbeat_at IS NULL
             OR julianday(lease_heartbeat_at) <= julianday(?)
           )
         ORDER BY created_at ASC, id ASC
         "#,
     )
-    .bind(state.runtime_owner_id.as_str())
     .bind(cutoff.as_str())
     .fetch_all(&state.pool)
     .await
@@ -2943,6 +2941,7 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use axum::{Json, Router, http::StatusCode, routing::post};
+    use chrono::Utc;
     use sqlx::{Row, sqlite::SqlitePoolOptions};
     use url::Url;
 
@@ -3359,6 +3358,68 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_foreign_owner_llm_calls_running() {
+        let state = setup_llm_state().await;
+        let log = LlmCallLogRecord {
+            id: "call-live-foreign-runtime".to_owned(),
+            source: "tests.llm.recovery".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        insert_llm_call(state.as_ref(), &log, "gpt-test", 512, "prompt", Some("[]"))
+            .await
+            .expect("seed llm call");
+        update_llm_call_running(state.as_ref(), log.id.as_str(), 1, 10)
+            .await
+            .expect("mark llm call running");
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(log.id.as_str())
+        .execute(&state.pool)
+        .await
+        .expect("mark llm call foreign-owner live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover live llm calls");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind(log.id.as_str())
+        .fetch_one(&state.pool)
+        .await
+        .expect("load foreign-owner llm call");
+
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
     }
 
     #[test]

@@ -1650,7 +1650,6 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
         WHERE status = ?
           AND (
             runtime_owner_id IS NULL
-            OR runtime_owner_id != ?
             OR lease_heartbeat_at IS NULL
             OR julianday(lease_heartbeat_at) <= julianday(?)
           )
@@ -1658,7 +1657,6 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
         "#,
     )
     .bind(STATUS_RUNNING)
-    .bind(state.runtime_owner_id.as_str())
     .bind(cutoff.as_str())
     .fetch_all(&state.pool)
     .await
@@ -1962,6 +1960,63 @@ mod tests {
                 .await
                 .expect("load live task status");
         assert_eq!(status, STATUS_RUNNING);
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_foreign_owner_tasks_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "foreign-live-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("foreign-live-task")
+        .execute(&pool)
+        .await
+        .expect("mark foreign-owner task live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind("foreign-live-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load foreign-owner task status");
+
+        assert_eq!(row.get::<String, _>("status"), STATUS_RUNNING);
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
     }
 
     #[tokio::test]

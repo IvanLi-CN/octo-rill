@@ -2434,14 +2434,12 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
         WHERE status = 'running'
           AND (
             runtime_owner_id IS NULL
-            OR runtime_owner_id != ?
             OR lease_heartbeat_at IS NULL
             OR julianday(lease_heartbeat_at) <= julianday(?)
           )
         ORDER BY created_at ASC, id ASC
         "#,
     )
-    .bind(state.runtime_owner_id.as_str())
     .bind(cutoff.as_str())
     .fetch_all(&state.pool)
     .await?;
@@ -4066,6 +4064,78 @@ mod tests {
         .await
         .expect("load live batch status");
         assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_foreign_owner_batches_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-foreign-live-batch");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark foreign-owner batch live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load foreign-owner batch");
+
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
     }
 
     #[tokio::test]
