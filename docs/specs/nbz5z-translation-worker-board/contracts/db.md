@@ -20,4 +20,6 @@
   - `4` => `user_dedicated`
 - `system` requests can only be claimed by `general` workers.
 - `user` requests can be claimed by any worker, but the dedicated worker only claims `user` requests.
-- Running batch leases heartbeat every 10s; rows without a live owner or with heartbeat older than 90s are reclaimed as `failed(runtime_lease_expired)`.
+- Running batch leases heartbeat every 10s.
+- Startup recovery immediately reclaims batches owned by a previous runtime as `failed(runtime_lease_expired)`.
+- Periodic sweep only reclaims rows with missing heartbeat or heartbeat older than 90s.

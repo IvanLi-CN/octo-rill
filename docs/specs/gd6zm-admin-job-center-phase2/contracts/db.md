@@ -41,7 +41,8 @@ Indexes:
 Runtime semantics:
 
 - `runtime_owner_id + lease_heartbeat_at` represent the active process lease for `running` tasks.
-- Service startup and periodic sweep reclaim orphaned `running` rows as `failed(runtime_lease_expired)`.
+- Service startup immediately reclaims rows still owned by a previous runtime as `failed(runtime_lease_expired)`.
+- Periodic sweep only reclaims rows with missing heartbeat or heartbeat older than 90s.
 - Reclaimed tasks append a recovery event to `job_task_events`.
 
 ## `job_task_events` (new)

@@ -82,9 +82,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         runtime_owner_id: crate::local_id::generate_local_id(),
     });
 
-    jobs::recover_runtime_state(app_state.as_ref()).await?;
-    translations::recover_runtime_state(app_state.as_ref()).await?;
-    ai::recover_runtime_state(app_state.as_ref()).await?;
+    jobs::recover_runtime_state_on_startup(app_state.as_ref()).await?;
+    translations::recover_runtime_state_on_startup(app_state.as_ref()).await?;
+    ai::recover_runtime_state_on_startup(app_state.as_ref()).await?;
 
     jobs::spawn_task_workers(app_state.clone(), config.job_worker_concurrency);
     let task_recovery_abort_handle = jobs::spawn_task_recovery_worker(app_state.clone());

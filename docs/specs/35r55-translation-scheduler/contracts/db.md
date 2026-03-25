@@ -21,7 +21,8 @@
   - add `runtime_owner_id TEXT NULL`
   - add `lease_heartbeat_at TEXT NULL`
   - `running` batch rows are owned by the current process and refreshed every 10s
-  - stale or owner-mismatched `running` rows are failed as `runtime_lease_expired`
+  - startup recovery fails `running` rows owned by a previous process immediately
+  - periodic sweep only reclaims rows with missing heartbeat or heartbeat older than 90s
 
 - `llm_calls`
   - add `parent_translation_batch_id`
@@ -31,6 +32,6 @@
 
 ## Runtime recovery semantics
 
-- Boot-time recovery runs before workers/schedulers start.
+- Boot-time recovery runs before workers/schedulers start and immediately reclaims rows owned by a previous runtime.
 - Periodic runtime sweep reclaims orphaned `running` work after 90s without heartbeat.
 - Translation request/work-item rows do not own leases directly; they are failed by batch-level recovery.

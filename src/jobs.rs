@@ -94,6 +94,10 @@ pub fn spawn_task_recovery_worker(state: Arc<AppState>) -> tokio::task::AbortHan
     .abort_handle()
 }
 
+pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Startup).await
+}
+
 pub fn spawn_task_worker(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
@@ -1634,6 +1638,13 @@ async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
 }
 
 pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Sweep).await
+}
+
+async fn recover_runtime_state_with_mode(
+    state: &AppState,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<()> {
     #[derive(Debug, sqlx::FromRow)]
     struct StaleTaskRow {
         id: String,
@@ -1643,23 +1654,48 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
 
     let now = Utc::now();
     let cutoff = runtime::stale_cutoff_timestamp(now);
-    let stale_tasks = sqlx::query_as::<_, StaleTaskRow>(
-        r#"
-        SELECT id, runtime_owner_id, lease_heartbeat_at
-        FROM job_tasks
-        WHERE status = ?
-          AND (
-            runtime_owner_id IS NULL
-            OR lease_heartbeat_at IS NULL
-            OR julianday(lease_heartbeat_at) <= julianday(?)
-          )
-        ORDER BY created_at ASC, id ASC
-        "#,
-    )
-    .bind(STATUS_RUNNING)
-    .bind(cutoff.as_str())
-    .fetch_all(&state.pool)
-    .await
+    let stale_tasks = match mode {
+        runtime::RuntimeRecoveryMode::Startup => {
+            sqlx::query_as::<_, StaleTaskRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM job_tasks
+                WHERE status = ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR runtime_owner_id != ?
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await
+        }
+        runtime::RuntimeRecoveryMode::Sweep => {
+            sqlx::query_as::<_, StaleTaskRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM job_tasks
+                WHERE status = ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(STATUS_RUNNING)
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await
+        }
+    }
     .context("failed to load stale runtime tasks")?;
 
     for task in stale_tasks {
@@ -1763,7 +1799,7 @@ mod tests {
         STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_RELEASES,
         TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
         current_subscription_schedule_key, is_scheduled_task_type, load_translation_stream_cursor,
-        load_translation_stream_rows, recover_runtime_state,
+        load_translation_stream_rows, recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
     use sqlx::{
@@ -2017,6 +2053,60 @@ mod tests {
                 .as_deref(),
             Some(now.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_reclaims_live_foreign_owner_tasks() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "startup-foreign-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("startup-foreign-task")
+        .execute(&pool)
+        .await
+        .expect("mark startup foreign-owner task live");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_message, runtime_owner_id, lease_heartbeat_at
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind("startup-foreign-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup task");
+
+        assert_eq!(row.get::<String, _>("status"), STATUS_FAILED);
+        assert_eq!(
+            row.get::<Option<String>, _>("error_message").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+        assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
     }
 
     #[tokio::test]

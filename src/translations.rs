@@ -740,6 +740,10 @@ pub fn spawn_translation_recovery_task(state: Arc<AppState>) -> tokio::task::Abo
     .abort_handle()
 }
 
+pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Startup).await
+}
+
 pub async fn reject_legacy_translation_routes() -> Response {
     (
         StatusCode::GONE,
@@ -2418,6 +2422,13 @@ async fn fail_batch_with_message(
 }
 
 pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Sweep).await
+}
+
+async fn recover_runtime_state_with_mode(
+    state: &AppState,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<()> {
     #[derive(Debug, sqlx::FromRow)]
     struct StaleBatchRow {
         id: String,
@@ -2427,22 +2438,46 @@ pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
 
     let now = Utc::now();
     let cutoff = runtime::stale_cutoff_timestamp(now);
-    let stale_batches = sqlx::query_as::<_, StaleBatchRow>(
-        r#"
-        SELECT id, runtime_owner_id, lease_heartbeat_at
-        FROM translation_batches
-        WHERE status = 'running'
-          AND (
-            runtime_owner_id IS NULL
-            OR lease_heartbeat_at IS NULL
-            OR julianday(lease_heartbeat_at) <= julianday(?)
-          )
-        ORDER BY created_at ASC, id ASC
-        "#,
-    )
-    .bind(cutoff.as_str())
-    .fetch_all(&state.pool)
-    .await?;
+    let stale_batches = match mode {
+        runtime::RuntimeRecoveryMode::Startup => {
+            sqlx::query_as::<_, StaleBatchRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM translation_batches
+                WHERE status = 'running'
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR runtime_owner_id != ?
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(state.runtime_owner_id.as_str())
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await?
+        }
+        runtime::RuntimeRecoveryMode::Sweep => {
+            sqlx::query_as::<_, StaleBatchRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM translation_batches
+                WHERE status = 'running'
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await?
+        }
+    };
 
     for batch in stale_batches {
         ai::recover_linked_llm_calls_for_batch(
@@ -4135,6 +4170,156 @@ mod tests {
             row.get::<Option<String>, _>("lease_heartbeat_at")
                 .as_deref(),
             Some(now.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_reclaims_live_foreign_owner_batches() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-startup-foreign-batch");
+        item.max_wait_ms = 0;
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let work_item_id = batch.items[0].id.clone();
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark startup foreign-owner batch live");
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id, status, source, model, requested_by, parent_task_id, parent_task_type,
+              parent_translation_batch_id, max_tokens, attempt_count, scheduler_wait_ms,
+              duration_ms, prompt_text, response_text, error_text, created_at, started_at,
+              finished_at, updated_at, input_messages_json, output_messages_json, input_tokens,
+              output_tokens, cached_input_tokens, total_tokens, first_token_wait_ms,
+              runtime_owner_id, lease_heartbeat_at
+            ) VALUES (?, 'running', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, ?, '[]', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind("linked-llm-startup-recover")
+        .bind("translation.scheduler.deadline")
+        .bind(current_model_profile())
+        .bind(batch.id.as_str())
+        .bind(512_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("prompt")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert linked llm call");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT status, error_text, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            batch_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT status, result_status, error_text
+            FROM translation_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup request");
+        assert_eq!(request_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("error_text")
+                .as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+
+        let llm_row = sqlx::query(
+            r#"
+            SELECT status, error_text
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind("linked-llm-startup-recover")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup llm call");
+        assert_eq!(llm_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            llm_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
         );
     }
 

@@ -13,6 +13,12 @@ pub const RUNTIME_LEASE_STALE_AFTER: Duration = Duration::from_secs(90);
 pub const RUNTIME_LEASE_EXPIRED_ERROR: &str = "runtime_lease_expired";
 pub const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeRecoveryMode {
+    Startup,
+    Sweep,
+}
+
 pub struct LeaseHeartbeat {
     stop_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
