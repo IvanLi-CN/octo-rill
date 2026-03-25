@@ -13,6 +13,10 @@
   - add `runtime_owner_id TEXT NULL`
   - add `lease_heartbeat_at TEXT NULL`
 
+- `runtime_owners`
+  - runtime-level owner lease registry keyed by `runtime_owner_id`
+  - startup recovery only reclaims foreign-owner batches when the owner lease is missing or stale
+
 ## Runtime semantics
 
 - Worker slots are fixed:
@@ -21,5 +25,5 @@
 - `system` requests can only be claimed by `general` workers.
 - `user` requests can be claimed by any worker, but the dedicated worker only claims `user` requests.
 - Running batch leases heartbeat every 10s.
-- Startup recovery immediately reclaims batches owned by a previous runtime as `failed(runtime_lease_expired)`.
+- Startup recovery immediately reclaims batches whose owner lease is missing or stale as `failed(runtime_lease_expired)`.
 - Periodic sweep only reclaims rows with missing heartbeat or heartbeat older than 90s.

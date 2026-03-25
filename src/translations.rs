@@ -2447,13 +2447,22 @@ async fn recover_runtime_state_with_mode(
                 WHERE status = 'running'
                   AND (
                     runtime_owner_id IS NULL
-                    OR runtime_owner_id != ?
                     OR lease_heartbeat_at IS NULL
                     OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = translation_batches.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
                   )
                 ORDER BY created_at ASC, id ASC
                 "#,
             )
+            .bind(cutoff.as_str())
             .bind(state.runtime_owner_id.as_str())
             .bind(cutoff.as_str())
             .fetch_all(&state.pool)
@@ -4174,7 +4183,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_runtime_state_on_startup_reclaims_live_foreign_owner_batches() {
+    async fn recover_runtime_state_on_startup_reclaims_foreign_owner_batches_without_live_owner_lease()
+     {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         reset_translation_worker_runtime_for_tests().await;
@@ -4320,6 +4330,85 @@ mod tests {
         assert_eq!(
             llm_row.get::<Option<String>, _>("error_text").as_deref(),
             Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_keeps_live_foreign_owner_batches_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-startup-live-foreign-batch");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark startup live foreign-owner batch");
+        crate::runtime::upsert_runtime_owner_for_tests(
+            state.as_ref(),
+            "other-runtime-owner",
+            now.as_str(),
+        )
+        .await
+        .expect("upsert runtime owner");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load startup live foreign-owner batch");
+
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
         );
     }
 

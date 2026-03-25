@@ -1663,14 +1663,23 @@ async fn recover_runtime_state_with_mode(
                 WHERE status = ?
                   AND (
                     runtime_owner_id IS NULL
-                    OR runtime_owner_id != ?
                     OR lease_heartbeat_at IS NULL
                     OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = job_tasks.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
                   )
                 ORDER BY created_at ASC, id ASC
                 "#,
             )
             .bind(STATUS_RUNNING)
+            .bind(cutoff.as_str())
             .bind(state.runtime_owner_id.as_str())
             .bind(cutoff.as_str())
             .fetch_all(&state.pool)
@@ -2056,7 +2065,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_runtime_state_on_startup_reclaims_live_foreign_owner_tasks() {
+    async fn recover_runtime_state_on_startup_reclaims_foreign_owner_tasks_without_live_owner_lease()
+     {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
@@ -2107,6 +2117,70 @@ mod tests {
         );
         assert_eq!(row.get::<Option<String>, _>("runtime_owner_id"), None);
         assert_eq!(row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_keeps_live_foreign_owner_tasks_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "startup-live-foreign-task",
+            TASK_SYNC_RELEASES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET runtime_owner_id = ?, lease_heartbeat_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("startup-live-foreign-task")
+        .execute(&pool)
+        .await
+        .expect("mark startup foreign-owner task live");
+        crate::runtime::upsert_runtime_owner_for_tests(
+            state.as_ref(),
+            "other-runtime-owner",
+            now.as_str(),
+        )
+        .await
+        .expect("upsert runtime owner");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind("startup-live-foreign-task")
+        .fetch_one(&pool)
+        .await
+        .expect("load startup live foreign task");
+
+        assert_eq!(row.get::<String, _>("status"), STATUS_RUNNING);
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
     }
 
     #[tokio::test]
