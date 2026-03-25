@@ -58,7 +58,11 @@ jobs:
 
           for path in "${paths[@]}"; do
             mkdir -p "$trusted_root/$(dirname "$path")"
-            git show "${source_ref}:${path}" > "$trusted_root/$path"
+            if [ "$source_ref" = "HEAD" ]; then
+              cp "$path" "$trusted_root/$path"
+            else
+              git show "${source_ref}:${path}" > "$trusted_root/$path"
+            fi
           done
 
           {
