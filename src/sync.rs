@@ -2178,6 +2178,7 @@ mod tests {
             http: reqwest::Client::new(),
             oauth,
             encryption_key,
+            runtime_owner_id: "sync-test-runtime-owner".to_owned(),
         })
     }
 

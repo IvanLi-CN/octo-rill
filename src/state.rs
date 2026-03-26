@@ -20,6 +20,7 @@ pub struct AppState {
     pub oauth: GitHubOAuthClient,
     pub encryption_key: EncryptionKey,
     pub llm_scheduler: Arc<LlmScheduler>,
+    pub runtime_owner_id: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]

@@ -7,6 +7,7 @@ mod error;
 mod github;
 mod jobs;
 mod local_id;
+mod runtime;
 mod server;
 mod state;
 mod sync;

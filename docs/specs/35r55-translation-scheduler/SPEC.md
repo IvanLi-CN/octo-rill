@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 已实现（待交付收口）
+- Status: 已完成
 - Created: 2026-03-07
-- Last: 2026-03-07
+- Last: 2026-03-27
 
 ## 背景 / 问题陈述
 
@@ -41,6 +41,7 @@
 - 新生产者入口已切到 `POST/GET /api/translate/requests*`，旧翻译接口统一返回 `410 Gone`，避免新旧双轨并存。
 - Feed 自动翻译改为 `stream` 请求，Release Detail 改为 `wait` 请求，管理员在 `/admin/jobs` 可查看“翻译调度”标签页与批次/LLM 追链。
 - 当前批次执行层仍按 `kind + entity_id + scope_user_id` 复用既有翻译核心函数；`source_blocks` / `target_slots` 已作为统一协议、去重哈希与管理端展示输入。
+- `translation_batches` 与关联 `llm_calls` 现在持有运行期 lease；服务启动前先回收孤儿 `running` 记录，运行中按固定心跳/过期阈值做 sweep，避免请求、work item、batch、LLM 调用卡死在 `running`。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -85,6 +86,10 @@
 - Given 新翻译工作由统一调度器处理
   When 管理员查看旧的实时任务列表
   Then 不会再出现新的 `translate.release*` / `translate.notification` 任务记录；历史记录仍可只读查看。
+
+- Given 服务重启前存在孤儿 `translation_batches.running`、`translation_work_items.running`、`translation_requests.running` 或关联 `llm_calls.running`
+  When 新进程完成启动前 recovery pass
+  Then 它们统一收口到终态 `failed`，并使用 `runtime_lease_expired` 作为错误原因，而不是继续停留在 `running`。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 
