@@ -1,4 +1,10 @@
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use async_stream::stream;
@@ -71,9 +77,14 @@ struct DispatchStateRow {
 }
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
+static TASK_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 pub fn is_scheduled_task_type(task_type: &str) -> bool {
     SCHEDULED_TASK_TYPES.contains(&task_type)
+}
+
+fn task_claim_lock() -> &'static tokio::sync::Mutex<()> {
+    TASK_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 pub fn spawn_task_workers(state: Arc<AppState>, count: usize) {
@@ -1147,6 +1158,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 }
 
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
+    let _claim_guard = task_claim_lock().lock().await;
     let mut tx = state.pool.begin().await.context("begin task claim tx")?;
 
     let task_id = sqlx::query_scalar::<_, String>(

@@ -616,6 +616,7 @@ struct ChatCompletionsRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     temperature: f32,
     max_tokens: u32,
+    stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -637,6 +638,22 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ChoiceMessage {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsStreamChunk {
+    choices: Vec<ChatCompletionsStreamChoice>,
+    usage: Option<ChatCompletionsUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsStreamChoice {
+    delta: ChatCompletionsStreamDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsStreamDelta {
     content: Option<String>,
 }
 
@@ -699,6 +716,24 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 fn safe_i64_from_u64(value: Option<u64>) -> Option<i64> {
     value.and_then(|raw| i64::try_from(raw).ok())
+}
+
+fn llm_token_usage_from_chat_usage(usage: Option<ChatCompletionsUsage>) -> LlmTokenUsage {
+    usage
+        .map(|raw| LlmTokenUsage {
+            input_tokens: safe_i64_from_u64(raw.prompt_tokens),
+            output_tokens: safe_i64_from_u64(raw.completion_tokens),
+            cached_input_tokens: raw
+                .prompt_tokens_details
+                .and_then(|details| safe_i64_from_u64(details.cached_tokens)),
+            total_tokens: safe_i64_from_u64(raw.total_tokens),
+        })
+        .unwrap_or(LlmTokenUsage {
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: None,
+        })
 }
 
 fn build_llm_messages_json(messages: &[ChatMessage<'_>]) -> Option<String> {
@@ -779,6 +814,155 @@ fn ai_response_message_is_non_retryable(message: &str) -> bool {
         || (msg.contains("appchatreverse") && (msg.contains("401") || msg.contains("403")))
         || (msg.contains("unauthorized") && msg.contains("upstream"))
         || (msg.contains("forbidden") && msg.contains("upstream"))
+}
+
+fn parse_chat_completion_sse_output(
+    body: &[u8],
+    content_type: &str,
+    first_token_wait_ms: Option<i64>,
+) -> std::result::Result<ChatCompletionOutput, ChatCompletionAttemptError> {
+    fn build_assistant_output(
+        content: String,
+        usage: Option<ChatCompletionsUsage>,
+        first_token_wait_ms: Option<i64>,
+    ) -> ChatCompletionOutput {
+        let output_messages_json = serde_json::to_string(&[ChatMessage {
+            role: "assistant",
+            content: content.as_str(),
+        }])
+        .unwrap_or_else(|_| "[]".to_owned());
+
+        ChatCompletionOutput {
+            content,
+            output_messages_json,
+            first_token_wait_ms,
+            usage: llm_token_usage_from_chat_usage(usage),
+        }
+    }
+
+    fn parse_event_data(
+        data: &str,
+        content: &mut String,
+        usage: &mut Option<ChatCompletionsUsage>,
+        saw_done: &mut bool,
+    ) -> Result<()> {
+        let trimmed = data.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if trimmed == "[DONE]" {
+            *saw_done = true;
+            return Ok(());
+        }
+
+        let chunk: ChatCompletionsStreamChunk =
+            serde_json::from_str(trimmed).context("decode chat completion SSE chunk failed")?;
+        for choice in chunk.choices {
+            if let Some(fragment) = choice.delta.content {
+                content.push_str(&fragment);
+            }
+        }
+        if chunk.usage.is_some() {
+            *usage = chunk.usage;
+        }
+        Ok(())
+    }
+
+    let raw = std::str::from_utf8(body).map_err(|err| ChatCompletionAttemptError {
+        err: anyhow!(
+            "AI returned invalid SSE success response (content-type {content_type}): {err}"
+        ),
+        retryable: false,
+        retry_after: None,
+        first_token_wait_ms,
+    })?;
+
+    let mut event_name: Option<String> = None;
+    let mut event_data = Vec::new();
+    let mut content = String::new();
+    let mut usage = None;
+    let mut saw_done = false;
+
+    let mut flush_event =
+        |event_name: &mut Option<String>, event_data: &mut Vec<String>| -> Result<()> {
+            if event_data.is_empty() {
+                event_name.take();
+                return Ok(());
+            }
+
+            let payload = event_data.join("\n");
+            let is_error_event = event_name
+                .as_deref()
+                .map(|value| value.eq_ignore_ascii_case("error"))
+                .unwrap_or(false);
+            event_name.take();
+            event_data.clear();
+
+            if is_error_event {
+                anyhow::bail!(payload.trim().to_owned());
+            }
+
+            parse_event_data(payload.as_str(), &mut content, &mut usage, &mut saw_done)
+        };
+
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            flush_event(&mut event_name, &mut event_data).map_err(|err| {
+                let message = err.to_string();
+                ChatCompletionAttemptError {
+                    err: anyhow!(
+                        "AI returned event-stream success response error (content-type {content_type}): {message}"
+                    ),
+                    retryable: !ai_response_message_is_non_retryable(&message),
+                    retry_after: None,
+                    first_token_wait_ms,
+                }
+            })?;
+            continue;
+        }
+
+        if let Some(name) = trimmed.strip_prefix("event:") {
+            event_name = Some(name.trim().to_owned());
+            continue;
+        }
+
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            event_data.push(data.trim().to_owned());
+        }
+    }
+
+    flush_event(&mut event_name, &mut event_data).map_err(|err| {
+        let message = err.to_string();
+        ChatCompletionAttemptError {
+            err: anyhow!(
+                "AI returned event-stream success response error (content-type {content_type}): {message}"
+            ),
+            retryable: !ai_response_message_is_non_retryable(&message),
+            retry_after: None,
+            first_token_wait_ms,
+        }
+    })?;
+
+    let content = content.trim().to_owned();
+    if !content.is_empty() {
+        return Ok(build_assistant_output(content, usage, first_token_wait_ms));
+    }
+
+    let message = if saw_done {
+        "AI event-stream response completed without assistant content".to_owned()
+    } else {
+        extract_error_message(body)
+            .unwrap_or_else(|| "AI event-stream response ended before [DONE]".to_owned())
+    };
+    Err(ChatCompletionAttemptError {
+        err: anyhow!(
+            "AI returned invalid event-stream success response (content-type {content_type}): {message}"
+        ),
+        retryable: !ai_response_message_is_non_retryable(&message),
+        retry_after: None,
+        first_token_wait_ms,
+    })
 }
 
 pub fn sha256_hex(input: &str) -> String {
@@ -1376,6 +1560,7 @@ async fn chat_completion_once(
         ],
         temperature: 0.2,
         max_tokens,
+        stream: false,
     };
 
     let response_wait_started_at = Instant::now();
@@ -1427,6 +1612,9 @@ async fn chat_completion_once(
     }
 
     let content_type_lower = content_type.to_ascii_lowercase();
+    if content_type_lower.contains("text/event-stream") {
+        return parse_chat_completion_sse_output(&body, content_type.as_str(), first_token_wait_ms);
+    }
     if !content_type_lower.is_empty()
         && !content_type_lower.contains("application/json")
         && !content_type_lower.contains("+json")
@@ -1476,21 +1664,7 @@ async fn chat_completion_once(
         content: content.as_str(),
     }])
     .unwrap_or_else(|_| "[]".to_owned());
-    let usage = usage
-        .map(|raw| LlmTokenUsage {
-            input_tokens: safe_i64_from_u64(raw.prompt_tokens),
-            output_tokens: safe_i64_from_u64(raw.completion_tokens),
-            cached_input_tokens: raw
-                .prompt_tokens_details
-                .and_then(|details| safe_i64_from_u64(details.cached_tokens)),
-            total_tokens: safe_i64_from_u64(raw.total_tokens),
-        })
-        .unwrap_or(LlmTokenUsage {
-            input_tokens: None,
-            output_tokens: None,
-            cached_input_tokens: None,
-            total_tokens: None,
-        });
+    let usage = llm_token_usage_from_chat_usage(usage);
 
     Ok(ChatCompletionOutput {
         content,
@@ -3313,6 +3487,59 @@ mod tests {
                 .to_string()
                 .contains("AppChatReverse: Chat failed, 401")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_once_sends_stream_false_and_parses_successful_sse() {
+        let seen_payload = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let route_payload = Arc::clone(&seen_payload);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_payload = Arc::clone(&route_payload);
+                async move {
+                    *route_payload.lock().await = Some(payload);
+                    (
+                        StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/event-stream; charset=utf-8",
+                        )],
+                        concat!(
+                            "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+                            "\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+                            "\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"chunk-3\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+                            "\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+                            "\"usage\":{\"prompt_tokens\":14,\"completion_tokens\":1,\"total_tokens\":15,",
+                            "\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+
+        let output = chat_completion_once(state.as_ref(), &ai, "system", "user", 128)
+            .await
+            .expect("successful SSE response should be parsed");
+
+        assert_eq!(output.content, "ok");
+        assert_eq!(output.usage.input_tokens, Some(14));
+        assert_eq!(output.usage.output_tokens, Some(1));
+        assert_eq!(output.usage.total_tokens, Some(15));
+
+        let payload = seen_payload
+            .lock()
+            .await
+            .clone()
+            .expect("request payload should be captured");
+        assert_eq!(payload["stream"], serde_json::json!(false));
+        assert_eq!(payload["model"], serde_json::json!("gpt-test"));
     }
 
     #[tokio::test]

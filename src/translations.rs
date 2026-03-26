@@ -37,6 +37,7 @@ const TRANSLATION_USER_DEDICATED_WORKER_SLOT: i64 = 4;
 static TRANSLATION_WORKER_RUNTIME: OnceLock<
     tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
 > = OnceLock::new();
+static TRANSLATION_BATCH_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationSourceBlock {
@@ -588,6 +589,10 @@ fn translation_worker_runtime() -> &'static tokio::sync::RwLock<Vec<TranslationW
 
 fn translation_worker_id(worker_slot: i64) -> String {
     format!("translation-worker-{worker_slot}")
+}
+
+fn translation_batch_claim_lock() -> &'static tokio::sync::Mutex<()> {
+    TRANSLATION_BATCH_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 async fn update_translation_worker_runtime(
@@ -1249,6 +1254,18 @@ async fn insert_translation_request(
         .await?
         .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
 
+    if existing.result_status.as_deref() == Some("error")
+        && matches!(existing.status.as_str(), "completed" | "failed")
+    {
+        reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
+        attach_request_to_work_item(tx, request_id.as_str(), &existing.id, "queued", now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: "queued".to_owned(),
+            result: queued_request_result(item, Some(existing.id.clone())),
+        });
+    }
+
     if existing.result_status.is_some()
         && matches!(existing.status.as_str(), "completed" | "failed")
     {
@@ -1597,6 +1614,35 @@ async fn create_work_item(
     }
 }
 
+async fn reset_retryable_terminal_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'queued',
+            batch_id = NULL,
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 async fn run_translation_scheduler_once(
     state: &AppState,
     worker: TranslationWorkerProfile,
@@ -1612,6 +1658,7 @@ async fn claim_next_batch(
     state: &AppState,
     worker: TranslationWorkerProfile,
 ) -> Result<Option<ClaimedBatch>> {
+    let _claim_guard = translation_batch_claim_lock().lock().await;
     let claim_origin_case = claim_origin_case_sql();
     let first_query = if worker.worker_kind == "user_dedicated" {
         format!(
@@ -3422,7 +3469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_translation_request_reuses_terminal_batched_work_item_updates_batch_counters() {
+    async fn create_translation_request_retries_terminal_error_work_item() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -3508,11 +3555,12 @@ mod tests {
         let second = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("second request created");
-        assert_eq!(second.status, "failed");
-        assert_eq!(second.result.status, "error");
+        assert_eq!(second.status, "queued");
+        assert_eq!(second.result.status, "queued");
+        assert_eq!(second.result.batch_id, None);
         assert_eq!(
-            second.result.batch_id.as_deref(),
-            Some("batch-terminal-window")
+            second.result.work_item_id.as_deref(),
+            Some(work_item_id.as_str())
         );
 
         let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
@@ -3520,7 +3568,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("load batch counters");
-        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+        assert_eq!(batch.get::<i64, _>("request_count"), 1);
 
         let batch_item = sqlx::query(
             "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
@@ -3530,7 +3578,65 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load batch item counters");
-        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 1);
+
+        let stored_request = sqlx::query(
+            "SELECT status, result_status, work_item_id FROM translation_requests WHERE id = ?",
+        )
+        .bind(second.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load retried request");
+        assert_eq!(stored_request.get::<String, _>("status"), "queued");
+        assert!(
+            stored_request
+                .get::<Option<String>, _>("result_status")
+                .is_none()
+        );
+        assert_eq!(
+            stored_request
+                .get::<Option<String>, _>("work_item_id")
+                .as_deref(),
+            Some(work_item_id.as_str())
+        );
+
+        let refreshed_work_item = sqlx::query(
+            r#"
+            SELECT status, batch_id, result_status, error_text, started_at, finished_at
+            FROM translation_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed work item");
+        assert_eq!(refreshed_work_item.get::<String, _>("status"), "queued");
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("batch_id")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("result_status")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("error_text")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("started_at")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("finished_at")
+                .is_none()
+        );
     }
 
     #[tokio::test]
