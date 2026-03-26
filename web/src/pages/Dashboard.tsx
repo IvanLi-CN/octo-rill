@@ -73,6 +73,8 @@ type ReactionTokenCheckResponse = {
 	message: string;
 };
 
+const SYNC_ALL_LABEL = "同步";
+
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -541,35 +543,8 @@ export function Dashboard(props: { me: MeResponse }) {
 		});
 	}, [refreshSidebar, run]);
 
-	const onSyncStarred = useCallback(() => {
-		void run("Sync starred", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/starred?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
-	const onSyncReleases = useCallback(() => {
-		void run("Sync releases", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/releases?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
-	const onSyncInbox = useCallback(() => {
-		void run("Sync inbox", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/notifications?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
 	const onSyncAll = useCallback(() => {
-		void run("Sync all", async () => {
+		void run(SYNC_ALL_LABEL, async () => {
 			await apiPost<TaskAcceptedResponse>(
 				"/api/sync/starred?return_mode=task_id",
 			);
@@ -582,6 +557,7 @@ export function Dashboard(props: { me: MeResponse }) {
 			await refreshAll();
 		});
 	}, [refreshAll, run]);
+	const syncingAll = busy === SYNC_ALL_LABEL;
 
 	const aiDisabledHint = useMemo(() => {
 		const any = feed.items.find((it) => it.translated?.status === "disabled");
@@ -628,33 +604,12 @@ export function Dashboard(props: { me: MeResponse }) {
 				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
 					<p className="text-muted-foreground mt-1 text-sm">
-						先同步 starred，再同步 releases；右侧是 Inbox 快捷入口。 或者直接点{" "}
-						<span className="font-mono">Sync all</span>。
+						点击顶部的 <span className="font-mono">同步</span>，会先刷新
+						starred， 再同步 releases 和 Inbox。
 					</p>
 					<div className="mt-4 flex flex-wrap gap-2">
 						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-							Sync all
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncStarred}
-						>
-							Sync starred
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncReleases}
-						>
-							Sync releases
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncInbox}
-						>
-							Sync inbox
+							同步
 						</Button>
 					</div>
 				</div>
@@ -675,7 +630,6 @@ export function Dashboard(props: { me: MeResponse }) {
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={reactionErrorByKey}
 				onToggleReaction={onToggleReaction}
-				onSyncReleases={onSyncReleases}
 			/>
 		</>
 	);
@@ -710,11 +664,9 @@ export function Dashboard(props: { me: MeResponse }) {
 					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
+					syncingAll={syncingAll}
 					onRefresh={() => void refreshAll()}
 					onSyncAll={onSyncAll}
-					onSyncStarred={onSyncStarred}
-					onSyncReleases={onSyncReleases}
-					onSyncInbox={onSyncInbox}
 				/>
 			}
 			footer={<AppMetaFooter />}

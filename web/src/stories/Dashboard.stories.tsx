@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
+import { expect, within } from "storybook/test";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -27,6 +28,7 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
+const SYNC_ALL_LABEL = "同步";
 
 function makeMockFeed(): FeedItem[] {
 	return [
@@ -155,9 +157,19 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
+	syncingAll?: boolean;
+	showEmptyFeed?: boolean;
+	showEmptyInbox?: boolean;
 }) {
-	const { initialTab = "all", initialPatDialogOpen = false } = props;
-	const items = makeMockFeed();
+	const {
+		initialTab = "all",
+		initialPatDialogOpen = false,
+		syncingAll = false,
+		showEmptyFeed = false,
+		showEmptyInbox = false,
+	} = props;
+	const items = showEmptyFeed ? [] : makeMockFeed();
+	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const inFlightKeys = new Set<string>();
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
@@ -173,25 +185,38 @@ function DashboardPreview(props: {
 	);
 
 	const feedPanel = (
-		<FeedList
-			items={items}
-			error={null}
-			loadingInitial={false}
-			loadingMore={false}
-			hasMore={false}
-			inFlightKeys={inFlightKeys}
-			registerItemRef={() => () => {}}
-			onLoadMore={() => {}}
-			showOriginalByKey={showOriginalByKey}
-			onToggleOriginal={(key) =>
-				setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
-			}
-			onTranslateNow={() => {}}
-			reactionBusyKeys={reactionBusyKeys}
-			reactionErrorByKey={{}}
-			onToggleReaction={() => {}}
-			onSyncReleases={() => {}}
-		/>
+		<>
+			{showEmptyFeed ? (
+				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
+					<p className="text-muted-foreground mt-1 text-sm">
+						点击顶部的 <span className="font-mono">{SYNC_ALL_LABEL}</span>
+						，会先刷新 starred，再同步 releases 和 Inbox。
+					</p>
+					<div className="mt-4 flex flex-wrap gap-2">
+						<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
+					</div>
+				</div>
+			) : null}
+			<FeedList
+				items={items}
+				error={null}
+				loadingInitial={false}
+				loadingMore={false}
+				hasMore={false}
+				inFlightKeys={inFlightKeys}
+				registerItemRef={() => () => {}}
+				onLoadMore={() => {}}
+				showOriginalByKey={showOriginalByKey}
+				onToggleOriginal={(key) =>
+					setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
+				}
+				onTranslateNow={() => {}}
+				reactionBusyKeys={reactionBusyKeys}
+				reactionErrorByKey={{}}
+				onToggleReaction={() => {}}
+			/>
+		</>
 	);
 
 	return (
@@ -199,17 +224,15 @@ function DashboardPreview(props: {
 			header={
 				<DashboardHeader
 					feedCount={items.length}
-					inboxCount={mockNotifs.length}
+					inboxCount={notifications.length}
 					briefCount={mockBriefs.length}
 					login="storybook-user"
 					isAdmin
 					aiDisabledHint={aiDisabledHint}
-					busy={false}
+					busy={syncingAll}
+					syncingAll={syncingAll}
 					onRefresh={() => {}}
 					onSyncAll={() => {}}
-					onSyncStarred={() => {}}
-					onSyncReleases={() => {}}
-					onSyncInbox={() => {}}
 					logoutHref="#"
 				/>
 			}
@@ -275,7 +298,7 @@ function DashboardPreview(props: {
 							</div>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList notifications={mockNotifs} />
+							<InboxList notifications={notifications} />
 						</TabsContent>
 					</section>
 
@@ -287,7 +310,7 @@ function DashboardPreview(props: {
 								onSelectDate={(d) => setSelectedDate(d)}
 							/>
 						) : null}
-						<InboxQuickList notifications={mockNotifs} />
+						<InboxQuickList notifications={notifications} />
 					</aside>
 				</div>
 			</Tabs>
@@ -339,18 +362,22 @@ function DashboardPreview(props: {
 const meta = {
 	title: "Pages/Dashboard",
 	component: DashboardPreview,
+	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
 		docs: {
 			description: {
 				component:
-					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。通过这组故事可以确认不同默认入口和操作弹窗是否符合预期。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
+					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。当前同步入口统一收敛为一个顶部主按钮，这组 stories 用来确认默认、同步中与空态文案是否保持一致。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
 			},
 		},
 	},
 	args: {
 		initialTab: "all",
 		initialPatDialogOpen: false,
+		syncingAll: false,
+		showEmptyFeed: false,
+		showEmptyInbox: false,
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -361,9 +388,25 @@ export const Default: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "主工作区默认入口，覆盖 Feed、侧栏摘要与页面骨架。",
+				story:
+					"主工作区默认入口，验证顶部只保留一个主同步按钮，Feed 与侧栏维持正常内容态。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: "Sync starred" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("button", { name: "Sync releases" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("button", { name: "Sync inbox" }),
+		).not.toBeInTheDocument();
 	},
 };
 
@@ -375,6 +418,65 @@ export const BriefsFocused: Story = {
 		docs: {
 			description: {
 				story: "把初始焦点切到 Briefs，用来验证日报与摘要场景的可读性。",
+			},
+		},
+	},
+};
+
+export const Syncing: Story = {
+	args: {
+		syncingAll: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"同步进行中：顶部主按钮禁用，左侧刷新 icon 旋转，其他同步入口保持收敛。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const syncButton = canvas.getByRole("button", { name: SYNC_ALL_LABEL });
+		await expect(syncButton).toBeDisabled();
+		const icon = syncButton.querySelector("svg");
+		expect(icon).not.toBeNull();
+		expect(icon?.classList.contains("animate-spin")).toBe(true);
+	},
+};
+
+export const EmptyFeed: Story = {
+	args: {
+		showEmptyFeed: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Feed 空态只保留一个页面内同步 CTA，并明确提示实际顺序是 starred → releases → Inbox。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText(/会先刷新 starred，再同步 releases 和 Inbox/),
+		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
+		).toHaveLength(2);
+	},
+};
+
+export const InboxEmpty: Story = {
+	args: {
+		initialTab: "inbox",
+		showEmptyInbox: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "Inbox 空态不再提供局部同步按钮，只提示回到顶部主同步入口。",
 			},
 		},
 	},
