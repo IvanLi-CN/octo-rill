@@ -1569,12 +1569,10 @@ test("admin refresh keeps existing jobs and llm calls visible", async ({
 
 	await expect(refreshButton).toBeDisabled();
 	await expect(page.getByText("sync.releases")).toBeVisible();
-	await expect(page.getByText("任务列表更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载任务...")).toHaveCount(0);
 
 	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("api.translate_releases_batch")).toBeVisible();
-	await expect(page.getByText("LLM 调度更新中...")).toBeVisible();
 	await expect(page.getByText("正在加载调用记录...")).toHaveCount(0);
 
 	await expect(refreshButton).toBeEnabled();

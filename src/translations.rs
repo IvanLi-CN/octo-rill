@@ -20,7 +20,7 @@ use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
 
-use crate::{ai, api, error::ApiError, state::AppState};
+use crate::{ai, api, error::ApiError, runtime, state::AppState};
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
 const TRANSLATION_MODEL_PROFILE_DISABLED: &str = "ai-disabled";
@@ -37,6 +37,7 @@ const TRANSLATION_USER_DEDICATED_WORKER_SLOT: i64 = 4;
 static TRANSLATION_WORKER_RUNTIME: OnceLock<
     tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
 > = OnceLock::new();
+static TRANSLATION_BATCH_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationSourceBlock {
@@ -590,6 +591,10 @@ fn translation_worker_id(worker_slot: i64) -> String {
     format!("translation-worker-{worker_slot}")
 }
 
+fn translation_batch_claim_lock() -> &'static tokio::sync::Mutex<()> {
+    TRANSLATION_BATCH_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn update_translation_worker_runtime(
     profile: TranslationWorkerProfile,
     status: &str,
@@ -726,6 +731,22 @@ pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::Abo
             .abort_handle()
         })
         .collect::<Vec<_>>()
+}
+
+pub fn spawn_translation_recovery_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = recover_runtime_state(state.as_ref()).await {
+                warn!(?err, "translation recovery sweep failed");
+            }
+            sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
+        }
+    })
+    .abort_handle()
+}
+
+pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Startup).await
 }
 
 pub async fn reject_legacy_translation_routes() -> Response {
@@ -1233,6 +1254,18 @@ async fn insert_translation_request(
         .await?
         .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
 
+    if existing.result_status.as_deref() == Some("error")
+        && matches!(existing.status.as_str(), "completed" | "failed")
+    {
+        reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
+        attach_request_to_work_item(tx, request_id.as_str(), &existing.id, "queued", now).await?;
+        return Ok(CreatedTranslationRequest {
+            request_id,
+            status: "queued".to_owned(),
+            result: queued_request_result(item, Some(existing.id.clone())),
+        });
+    }
+
     if existing.result_status.is_some()
         && matches!(existing.status.as_str(), "completed" | "failed")
     {
@@ -1581,6 +1614,35 @@ async fn create_work_item(
     }
 }
 
+async fn reset_retryable_terminal_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'queued',
+            batch_id = NULL,
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 async fn run_translation_scheduler_once(
     state: &AppState,
     worker: TranslationWorkerProfile,
@@ -1596,6 +1658,7 @@ async fn claim_next_batch(
     state: &AppState,
     worker: TranslationWorkerProfile,
 ) -> Result<Option<ClaimedBatch>> {
+    let _claim_guard = translation_batch_claim_lock().lock().await;
     let claim_origin_case = claim_origin_case_sql();
     let first_query = if worker.worker_kind == "user_dedicated" {
         format!(
@@ -1820,10 +1883,16 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     sqlx::query(
         r#"
         UPDATE translation_batches
-        SET status = 'running', started_at = ?, updated_at = ?
+        SET status = 'running',
+            started_at = ?,
+            runtime_owner_id = ?,
+            lease_heartbeat_at = ?,
+            updated_at = ?
         WHERE id = ?
         "#,
     )
+    .bind(now.as_str())
+    .bind(state.runtime_owner_id.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(batch.id.as_str())
@@ -1853,6 +1922,8 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         .execute(&state.pool)
         .await?;
     }
+    let heartbeat =
+        spawn_translation_batch_lease_heartbeat(Arc::new(state.clone()), batch.id.clone());
 
     let context = ai::LlmCallContext {
         source: format!("translation.scheduler.{}", batch.trigger_reason),
@@ -1870,12 +1941,14 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     match result {
         Ok(results) => {
             let res = finalize_batch_success(state, &batch, results).await;
+            heartbeat.stop().await;
             update_translation_worker_runtime(worker, "idle", None, 0, 0, None, None).await;
             res
         }
         Err(err) => {
             let error = err.to_string();
             let res = finalize_batch_failure(state, &batch, err.into()).await;
+            heartbeat.stop().await;
             update_translation_worker_runtime(
                 worker,
                 "error",
@@ -1889,6 +1962,21 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
             res
         }
     }
+}
+
+fn spawn_translation_batch_lease_heartbeat(
+    state: Arc<AppState>,
+    batch_id: String,
+) -> runtime::LeaseHeartbeat {
+    runtime::spawn_lease_heartbeat(
+        "translation_batches",
+        runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL,
+        move || {
+            let state = state.clone();
+            let batch_id = batch_id.clone();
+            async move { heartbeat_translation_batch_lease(state.as_ref(), batch_id.as_str()).await }
+        },
+    )
 }
 
 async fn resolve_batch_results(
@@ -2194,7 +2282,11 @@ async fn finalize_batch_success(
     sqlx::query(
         r#"
         UPDATE translation_batches
-        SET status = 'completed', finished_at = ?, updated_at = ?
+        SET status = 'completed',
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
         WHERE id = ?
         "#,
     )
@@ -2216,20 +2308,88 @@ async fn finalize_batch_failure(
     let now = Utc::now().to_rfc3339();
     let message = err.to_string();
     let mut tx = state.pool.begin().await?;
-    for item in &batch.items {
+    fail_batch_with_message(
+        &mut tx,
+        batch.id.as_str(),
+        &batch.items,
+        message.as_str(),
+        now.as_str(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE translation_batches
+        SET lease_heartbeat_at = ?, updated_at = ?
+        WHERE id = ?
+          AND status = 'running'
+          AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(batch_id)
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+async fn load_batch_work_items(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+) -> Result<Vec<WorkItemRow>, ApiError> {
+    sqlx::query_as::<_, WorkItemRow>(
+        r#"
+        SELECT
+          w.id, w.dedupe_key, w.scope_user_id, w.kind, w.variant, w.entity_id, w.target_lang,
+          w.protocol_version, w.model_profile, w.source_hash, w.source_blocks_json,
+          w.target_slots_json, w.token_estimate, w.deadline_at, w.status, w.batch_id,
+          w.result_status, w.title_zh, w.summary_md, w.body_md, w.error_text, w.cache_hit,
+          w.created_at, w.started_at, w.finished_at, w.updated_at
+        FROM translation_batch_items bi
+        JOIN translation_work_items w ON w.id = bi.work_item_id
+        WHERE bi.batch_id = ?
+        ORDER BY bi.item_index ASC
+        "#,
+    )
+    .bind(batch_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn fail_batch_with_message(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch_id: &str,
+    items: &[WorkItemRow],
+    message: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    for item in items {
         sqlx::query(
             r#"
             UPDATE translation_work_items
-            SET status = 'failed', result_status = 'error', error_text = ?, finished_at = ?, updated_at = ?
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = ?,
+                finished_at = ?,
+                updated_at = ?
             WHERE id = ?
             "#,
         )
-        .bind(message.as_str())
-        .bind(now.as_str())
-        .bind(now.as_str())
+        .bind(message)
+        .bind(now)
+        .bind(now)
         .bind(item.id.as_str())
-        .execute(&mut *tx)
-        .await?;
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
         sqlx::query(
             r#"
             UPDATE translation_batch_items
@@ -2237,12 +2397,13 @@ async fn finalize_batch_failure(
             WHERE batch_id = ? AND work_item_id = ?
             "#,
         )
-        .bind(message.as_str())
-        .bind(now.as_str())
-        .bind(batch.id.as_str())
+        .bind(message)
+        .bind(now)
+        .bind(batch_id)
         .bind(item.id.as_str())
-        .execute(&mut *tx)
-        .await?;
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
         let requests = sqlx::query(
             r#"
             SELECT id, producer_ref, entity_id, kind, variant
@@ -2251,14 +2412,17 @@ async fn finalize_batch_failure(
             "#,
         )
         .bind(item.id.as_str())
-        .fetch_all(&mut *tx)
-        .await?;
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
         for request in requests {
-            let request_id: String = request.try_get("id")?;
-            let producer_ref: String = request.try_get("producer_ref")?;
-            let entity_id: String = request.try_get("entity_id")?;
-            let kind: String = request.try_get("kind")?;
-            let variant: String = request.try_get("variant")?;
+            let request_id: String = request.try_get("id").map_err(ApiError::internal)?;
+            let producer_ref: String = request
+                .try_get("producer_ref")
+                .map_err(ApiError::internal)?;
+            let entity_id: String = request.try_get("entity_id").map_err(ApiError::internal)?;
+            let kind: String = request.try_get("kind").map_err(ApiError::internal)?;
+            let variant: String = request.try_get("variant").map_err(ApiError::internal)?;
             let request_result = TranslationResultItem {
                 producer_ref,
                 entity_id,
@@ -2268,16 +2432,16 @@ async fn finalize_batch_failure(
                 title_zh: None,
                 summary_md: None,
                 body_md: None,
-                error: Some(message.clone()),
+                error: Some(message.to_owned()),
                 work_item_id: Some(item.id.clone()),
-                batch_id: Some(batch.id.clone()),
+                batch_id: Some(batch_id.to_owned()),
             };
             apply_request_result(
-                &mut tx,
+                tx,
                 request_id.as_str(),
                 Some(item.id.as_str()),
                 &request_result,
-                now.as_str(),
+                now,
             )
             .await?;
         }
@@ -2285,17 +2449,116 @@ async fn finalize_batch_failure(
     sqlx::query(
         r#"
         UPDATE translation_batches
-        SET status = 'failed', error_text = ?, finished_at = ?, updated_at = ?
+        SET status = 'failed',
+            error_text = ?,
+            finished_at = ?,
+            runtime_owner_id = NULL,
+            lease_heartbeat_at = NULL,
+            updated_at = ?
         WHERE id = ?
         "#,
     )
-    .bind(message.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(batch.id.as_str())
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
+    .bind(message)
+    .bind(now)
+    .bind(now)
+    .bind(batch_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+pub async fn recover_runtime_state(state: &AppState) -> Result<()> {
+    recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Sweep).await
+}
+
+async fn recover_runtime_state_with_mode(
+    state: &AppState,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<()> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct StaleBatchRow {
+        id: String,
+        runtime_owner_id: Option<String>,
+        lease_heartbeat_at: Option<String>,
+    }
+
+    let now = Utc::now();
+    let cutoff = runtime::stale_cutoff_timestamp(now);
+    let stale_batches = match mode {
+        runtime::RuntimeRecoveryMode::Startup => {
+            sqlx::query_as::<_, StaleBatchRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM translation_batches
+                WHERE status = 'running'
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = translation_batches.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(cutoff.as_str())
+            .bind(state.runtime_owner_id.as_str())
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await?
+        }
+        runtime::RuntimeRecoveryMode::Sweep => {
+            sqlx::query_as::<_, StaleBatchRow>(
+                r#"
+                SELECT id, runtime_owner_id, lease_heartbeat_at
+                FROM translation_batches
+                WHERE status = 'running'
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await?
+        }
+    };
+
+    for batch in stale_batches {
+        ai::recover_linked_llm_calls_for_batch(
+            state,
+            batch.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            batch.runtime_owner_id.as_deref(),
+            batch.lease_heartbeat_at.as_deref(),
+        )
+        .await?;
+
+        let mut tx = state.pool.begin().await?;
+        let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
+        let now = Utc::now().to_rfc3339();
+        fail_batch_with_message(
+            &mut tx,
+            batch.id.as_str(),
+            &items,
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            now.as_str(),
+        )
+        .await?;
+        tx.commit().await?;
+    }
+
     Ok(())
 }
 
@@ -3206,7 +3469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_translation_request_reuses_terminal_batched_work_item_updates_batch_counters() {
+    async fn create_translation_request_retries_terminal_error_work_item() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -3292,11 +3555,12 @@ mod tests {
         let second = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("second request created");
-        assert_eq!(second.status, "failed");
-        assert_eq!(second.result.status, "error");
+        assert_eq!(second.status, "queued");
+        assert_eq!(second.result.status, "queued");
+        assert_eq!(second.result.batch_id, None);
         assert_eq!(
-            second.result.batch_id.as_deref(),
-            Some("batch-terminal-window")
+            second.result.work_item_id.as_deref(),
+            Some(work_item_id.as_str())
         );
 
         let batch = sqlx::query("SELECT request_count FROM translation_batches WHERE id = ?")
@@ -3304,7 +3568,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("load batch counters");
-        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+        assert_eq!(batch.get::<i64, _>("request_count"), 1);
 
         let batch_item = sqlx::query(
             "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
@@ -3314,7 +3578,65 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load batch item counters");
-        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 1);
+
+        let stored_request = sqlx::query(
+            "SELECT status, result_status, work_item_id FROM translation_requests WHERE id = ?",
+        )
+        .bind(second.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load retried request");
+        assert_eq!(stored_request.get::<String, _>("status"), "queued");
+        assert!(
+            stored_request
+                .get::<Option<String>, _>("result_status")
+                .is_none()
+        );
+        assert_eq!(
+            stored_request
+                .get::<Option<String>, _>("work_item_id")
+                .as_deref(),
+            Some(work_item_id.as_str())
+        );
+
+        let refreshed_work_item = sqlx::query(
+            r#"
+            SELECT status, batch_id, result_status, error_text, started_at, finished_at
+            FROM translation_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed work item");
+        assert_eq!(refreshed_work_item.get::<String, _>("status"), "queued");
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("batch_id")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("result_status")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("error_text")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("started_at")
+                .is_none()
+        );
+        assert!(
+            refreshed_work_item
+                .get::<Option<String>, _>("finished_at")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3677,6 +3999,523 @@ mod tests {
 
         assert_eq!(row.worker_slot, 2);
         assert_eq!(row.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_marks_stale_batches_requests_and_linked_llm_calls_failed() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-stale-batch");
+        item.max_wait_ms = 0;
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let work_item_id = batch.items[0].id.clone();
+        let stale_at = "2026-03-06T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(stale_at)
+        .bind("old-runtime-owner")
+        .bind(stale_at)
+        .bind(stale_at)
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch stale");
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(stale_at)
+        .bind(stale_at)
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id, status, source, model, requested_by, parent_task_id, parent_task_type,
+              parent_translation_batch_id, max_tokens, attempt_count, scheduler_wait_ms,
+              duration_ms, prompt_text, response_text, error_text, created_at, started_at,
+              finished_at, updated_at, input_messages_json, output_messages_json, input_tokens,
+              output_tokens, cached_input_tokens, total_tokens, first_token_wait_ms,
+              runtime_owner_id, lease_heartbeat_at
+            ) VALUES (?, 'running', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, ?, '[]', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind("linked-llm-recover")
+        .bind("translation.scheduler.deadline")
+        .bind(current_model_profile())
+        .bind(batch.id.as_str())
+        .bind(512_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("prompt")
+        .bind(stale_at)
+        .bind(stale_at)
+        .bind(stale_at)
+        .bind("old-runtime-owner")
+        .bind(stale_at)
+        .execute(&pool)
+        .await
+        .expect("insert linked llm call");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT status, error_text, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            batch_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+        assert_eq!(batch_row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(
+            batch_row.get::<Option<String>, _>("lease_heartbeat_at"),
+            None
+        );
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT status, result_status, error_text
+            FROM translation_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered request");
+        assert_eq!(request_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("error_text")
+                .as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+
+        let llm_row = sqlx::query(
+            r#"
+            SELECT status, error_text, runtime_owner_id, lease_heartbeat_at
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind("linked-llm-recover")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered llm call");
+        assert_eq!(llm_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            llm_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+        assert_eq!(llm_row.get::<Option<String>, _>("runtime_owner_id"), None);
+        assert_eq!(llm_row.get::<Option<String>, _>("lease_heartbeat_at"), None);
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_current_owner_batches_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-live-batch");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(state.runtime_owner_id.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark batch live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let status = sqlx::query_scalar::<_, String>(
+            r#"SELECT status FROM translation_batches WHERE id = ?"#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load live batch status");
+        assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_keeps_live_foreign_owner_batches_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-foreign-live-batch");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark foreign-owner batch live");
+
+        recover_runtime_state(state.as_ref())
+            .await
+            .expect("recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load foreign-owner batch");
+
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_reclaims_foreign_owner_batches_without_live_owner_lease()
+     {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-startup-foreign-batch");
+        item.max_wait_ms = 0;
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let work_item_id = batch.items[0].id.clone();
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark startup foreign-owner batch live");
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id, status, source, model, requested_by, parent_task_id, parent_task_type,
+              parent_translation_batch_id, max_tokens, attempt_count, scheduler_wait_ms,
+              duration_ms, prompt_text, response_text, error_text, created_at, started_at,
+              finished_at, updated_at, input_messages_json, output_messages_json, input_tokens,
+              output_tokens, cached_input_tokens, total_tokens, first_token_wait_ms,
+              runtime_owner_id, lease_heartbeat_at
+            ) VALUES (?, 'running', ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, NULL, ?, NULL, NULL, ?, ?, NULL, ?, '[]', NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind("linked-llm-startup-recover")
+        .bind("translation.scheduler.deadline")
+        .bind(current_model_profile())
+        .bind(batch.id.as_str())
+        .bind(512_i64)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind("prompt")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert linked llm call");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT status, error_text, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            batch_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT status, result_status, error_text
+            FROM translation_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup request");
+        assert_eq!(request_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("error")
+        );
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("error_text")
+                .as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+
+        let llm_row = sqlx::query(
+            r#"
+            SELECT status, error_text
+            FROM llm_calls
+            WHERE id = ?
+            "#,
+        )
+        .bind("linked-llm-startup-recover")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered startup llm call");
+        assert_eq!(llm_row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            llm_row.get::<Option<String>, _>("error_text").as_deref(),
+            Some(crate::runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_runtime_state_on_startup_keeps_live_foreign_owner_batches_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests().await;
+        seed_user(&pool, 1, "octo").await;
+
+        let mut item = sample_release_item("recover-startup-live-foreign-batch");
+        item.max_wait_ms = 0;
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(
+            state.as_ref(),
+            TranslationWorkerProfile {
+                worker_slot: 1,
+                worker_kind: "general",
+            },
+        )
+        .await
+        .expect("claim batch")
+        .expect("batch exists");
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                started_at = ?,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind("other-runtime-owner")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark startup live foreign-owner batch");
+        crate::runtime::upsert_runtime_owner_for_tests(
+            state.as_ref(),
+            "other-runtime-owner",
+            now.as_str(),
+        )
+        .await
+        .expect("upsert runtime owner");
+
+        recover_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("startup recover runtime state");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, runtime_owner_id, lease_heartbeat_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load startup live foreign-owner batch");
+
+        assert_eq!(row.get::<String, _>("status"), "running");
+        assert_eq!(
+            row.get::<Option<String>, _>("runtime_owner_id").as_deref(),
+            Some("other-runtime-owner")
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("lease_heartbeat_at")
+                .as_deref(),
+            Some(now.as_str())
+        );
     }
 
     #[tokio::test]
@@ -4260,6 +5099,7 @@ mod tests {
             http: reqwest::Client::new(),
             oauth,
             encryption_key,
+            runtime_owner_id: "translation-test-runtime-owner".to_owned(),
         })
     }
 

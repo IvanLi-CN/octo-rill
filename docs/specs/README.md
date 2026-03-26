@@ -64,10 +64,10 @@
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
 | apras | 翻译请求单条记录制重建 | 已完成 | `apras-translation-request-single-record/SPEC.md` | 2026-03-09 | PR #35; checks green; review-loop clear; single-request contract live |
-| nbz5z | Translation worker board follow-up | 部分完成（3/4） | `nbz5z-translation-worker-board/SPEC.md` | 2026-03-09 | PR #32; checks green; review-loop pending; 3 general + 1 user_dedicated worker board |
+| nbz5z | Translation worker board follow-up | 已完成 | `nbz5z-translation-worker-board/SPEC.md` | 2026-03-27 | PR #32, PR #38; 3 general + 1 user_dedicated worker board + runtime lease recovery |
 | gh3tz | 可配置 LLM 并行调度（取消固定限流） | 已完成 | `gh3tz-llm-max-concurrency/SPEC.md` | 2026-03-10 | PR #34; 24h summary-only UI; retry backoff requeues as queued with floor; main-list-only status grouping; non-blocking observable overrides |
 | 67n8t | 全库主键 NanoID 化与公开标识收口 | 已完成 | `67n8t-nanoid-primary-keys/SPEC.md` | 2026-03-08 | PR #29; checks green; review-loop clear; destructive SQLite rebuild |
-| 35r55 | 统一翻译调度器与独立管理界面改造 | 已实现 | `35r55-translation-scheduler/SPEC.md` | 2026-03-07 | ready for fast-flow delivery |
+| 35r55 | 统一翻译调度器与独立管理界面改造 | 已完成 | `35r55-translation-scheduler/SPEC.md` | 2026-03-27 | PR #38; unified request scheduler + stale runtime recovery completed |
 | gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
 | s8qkn | 全用户 Star / Release 半小时定时同步闭环 | 待实现 | `s8qkn-subscription-sync/SPEC.md` | 2026-03-06 | scheduler + sync.subscriptions + log download |
 | dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-08 | PR #25; dashboard/browser-timezone timestamp follow-up synced; Playwright merge-gate evidence aligned |
@@ -77,7 +77,7 @@
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
 | g4456 | LLM 批处理效率改造 | 部分完成（3/4） | `g4456-llm-batch-efficiency/SPEC.md` | 2026-02-25 | 已完成核心改造，待补前端依赖后复验 |
-| gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-03-08 | PR #28; browser-timezone daily brief DST clarification synced; admin jobs/users Playwright merge-gate evidence aligned |
+| gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-03-27 | PR #28, PR #38; admin jobs runtime recovery + stale running cleanup aligned |
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
 | regzy | OctoRill 文档站点与 Storybook 文档快车道实施 | 已完成 | `regzy-octo-rill-docs-site/SPEC.md` | 2026-03-09 | PR #31; docs-site + pages workflow + storybook docs; checks green; review-loop clear |
 | erscd | 管理员任务中心：LLM 调度观测与调用排障 | 已完成 | `erscd-admin-llm-scheduler-observability/SPEC.md` | 2026-02-27 | local implementation completed |

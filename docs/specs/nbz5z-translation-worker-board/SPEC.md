@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-03-09
-- Last: 2026-03-09
+- Last: 2026-03-27
 
 ## 背景 / 问题陈述
 
@@ -37,9 +37,9 @@
 ## 当前实现说明
 
 - 统一翻译调度器、管理员翻译调度 tab、请求/批次详情抽屉与 LLM 详情链路已经存在。
-- 当前 scheduler 为单循环 claim/execute，`translation_batches` 尚无 `worker_slot` 与 `request_count`。
-- 当前 `translation_requests` 仅记录 `source` 与 `requested_by`，没有显式 `request_origin`。
-- 当前管理页桌面端仍以双列卡片展示请求/批次，不满足“常驻工作者板 + tabs + 单行表格/列表退化”的交互目标。
+- 固定 `3 general + 1 user_dedicated` worker runtime、`request_origin`、`worker_slot` 与 `request_count` 已落地。
+- `translation_batches` 现在额外持有运行期 lease 元数据；worker 在执行时持续心跳，启动恢复与周期 sweep 会把过期批次级联关闭到 request/work item/linked llm call 终态。
+- 管理页工作者板、队列/历史 tabs 与详情跳转链路已能反映上述真实运行态。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -85,6 +85,10 @@
 - Given 浏览器收到 `translation.event`
   When `resource_type` 为 `worker` / `request` / `batch`
   Then 前端能刷新对应数据并保持工作者板、请求列表、批次列表一致。
+
+- Given 某个 worker 持有的 batch 失去 owner 或心跳超过 90 秒
+  When runtime recovery sweep 触发
+  Then 该 batch、其 work items、关联 requests 与 linked llm calls 都会被标记为 `failed(runtime_lease_expired)`，工作者板不再长期显示虚假的运行中批次。
 
 ## 非功能性验收 / 质量门槛（Quality Gates）
 

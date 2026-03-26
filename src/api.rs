@@ -6046,6 +6046,7 @@ async fn translate_releases_batch_stream_worker(
     task_id: String,
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
+    let heartbeat = jobs::spawn_task_lease_heartbeat(state.clone(), task_id.clone());
     let mut ready_count = 0usize;
     let mut disabled_count = 0usize;
     let mut missing_count = 0usize;
@@ -6312,6 +6313,7 @@ async fn translate_releases_batch_stream_worker(
                 None,
             )
             .await;
+            heartbeat.stop().await;
             let _ = jobs::append_task_event(
                 state.as_ref(),
                 task_id.as_str(),
@@ -6345,6 +6347,7 @@ async fn translate_releases_batch_stream_worker(
                 }),
             )
             .await;
+            heartbeat.stop().await;
             let _ = send_batch_stream_event(
                 &tx,
                 TranslateBatchStreamEvent {
@@ -7697,6 +7700,7 @@ mod tests {
             http: reqwest::Client::new(),
             oauth,
             encryption_key,
+            runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })
     }
 
