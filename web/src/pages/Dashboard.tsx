@@ -5,6 +5,7 @@ import {
 	ApiError,
 	apiGet,
 	apiPost,
+	apiPostTaskSse,
 	apiPostJson,
 	apiPutJson,
 } from "@/api";
@@ -43,13 +44,6 @@ import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
-
-type TaskAcceptedResponse = {
-	mode: "task_id";
-	task_id: string;
-	task_type: string;
-	status: string;
-};
 
 type BriefGenerateResponse = {
 	date: string;
@@ -545,15 +539,9 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const onSyncAll = useCallback(() => {
 		void run(SYNC_ALL_LABEL, async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/starred?return_mode=task_id",
-			);
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/releases?return_mode=task_id",
-			);
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/notifications?return_mode=task_id",
-			);
+			await apiPostTaskSse("/api/sync/starred?return_mode=sse");
+			await apiPostTaskSse("/api/sync/releases?return_mode=sse");
+			await apiPostTaskSse("/api/sync/notifications?return_mode=sse");
 			await refreshAll();
 		});
 	}, [refreshAll, run]);

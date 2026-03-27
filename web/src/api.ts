@@ -60,6 +60,93 @@ export async function apiPostJson<T>(
 	}
 	return (await res.json()) as T;
 }
+type TaskSseTerminalEvent = {
+	task_id: string;
+	status: string;
+	error?: string;
+};
+
+function parseSseEventBlock(block: string) {
+	let eventType = "message";
+	const dataLines: string[] = [];
+	for (const rawLine of block.split(/\r?\n/)) {
+		const line = rawLine.trimEnd();
+		if (!line || line.startsWith(":")) continue;
+		if (line.startsWith("event:")) {
+			eventType = line.slice("event:".length).trim();
+			continue;
+		}
+		if (line.startsWith("data:")) {
+			dataLines.push(line.slice("data:".length).trimStart());
+		}
+	}
+	return {
+		eventType,
+		data: dataLines.join("\n"),
+	};
+}
+
+export async function apiPostTaskSse(
+	path: string,
+	body?: unknown,
+	init?: RequestInit,
+): Promise<TaskSseTerminalEvent> {
+	const headers = new Headers(init?.headers);
+	headers.set("content-type", "application/json");
+	const res = await fetch(path, {
+		...init,
+		method: "POST",
+		credentials: "include",
+		headers,
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw toApiError(res, await parseJson(res));
+	}
+	if (!res.body) {
+		throw new ApiError(500, "任务流响应为空", "task_stream_missing");
+	}
+
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+
+	const consumeBlocks = () => {
+		const parts = buffer.split(/\r?\n\r?\n/);
+		buffer = parts.pop() ?? "";
+		return parts;
+	};
+
+	try {
+		while (true) {
+			const { value, done } = await reader.read();
+			buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+
+			for (const block of consumeBlocks()) {
+				const event = parseSseEventBlock(block);
+				if (event.eventType !== "task.completed" || !event.data) continue;
+				const payload = JSON.parse(event.data) as TaskSseTerminalEvent;
+				if (payload.status === "succeeded") return payload;
+				throw new ApiError(
+					500,
+					payload.error ??
+						(payload.status === "canceled" ? "同步任务已取消" : "同步任务失败"),
+					"task_stream_failed",
+				);
+			}
+
+			if (done) break;
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	throw new ApiError(
+		500,
+		"同步任务未返回完成事件，请稍后重试。",
+		"task_stream_incomplete",
+	);
+}
 export async function apiPutJson<T>(path: string, body?: unknown): Promise<T> {
 	const res = await fetch(path, {
 		method: "PUT",
