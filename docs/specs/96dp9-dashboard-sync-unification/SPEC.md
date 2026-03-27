@@ -19,7 +19,7 @@
 - 将 Dashboard 头部操作收敛为 `同步` 与 `Logout`，不再保留单独的 `Refresh`。
 - 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转。
 - 保证客户端全量同步顺序固定为 `starred -> releases -> notifications -> refreshAll`。
-- 更新 Storybook 与视觉证据，覆盖默认态、同步中与空态提示。
+- 更新 Storybook 审阅入口，并保留一张默认态视觉证据。
 
 ### Non-goals
 
@@ -118,7 +118,7 @@
 
 ### Visual verification
 
-- 使用 Storybook 产出 Dashboard 默认态与同步中的视觉证据。
+- 使用 Storybook 产出一张 Dashboard 默认态视觉证据。
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 
 ## 文档更新（Docs to Update）
@@ -134,10 +134,6 @@
 
 ![Dashboard default sync entry](./assets/dashboard-default.png)
 
-![Dashboard syncing state](./assets/dashboard-syncing.png)
-
-![Dashboard empty feed state](./assets/dashboard-empty-feed.png)
-
 ## 实现里程碑（Milestones / Delivery checklist）
 
 - [x] M1: 新建 spec 并写入 `docs/specs/README.md`。
@@ -148,7 +144,7 @@
 
 - 仅保留一个顶部主同步入口，并将全量同步渲染态与业务顺序解耦成明确状态。
 - 页面内所有局部同步入口统一改成引导文案，避免行为分叉。
-- 通过 Dashboard Storybook stories 同时呈现默认态、同步中和空态，作为后续视觉证据源。
+- 通过 Dashboard Storybook stories 呈现默认态、同步中和空态，其中默认态作为最终视觉证据源。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
@@ -162,6 +158,7 @@
 - 2026-03-27: 完成 Dashboard 同步入口、空态文案与 reaction 提示收敛，并更新 Dashboard Storybook stories。
 - 2026-03-27: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并补入 Storybook 视觉证据，状态更新为 `部分完成（2/3）`。
 - 2026-03-27: 根据最新产品口径移除顶部 `Refresh`，保持头部只剩 `同步` 与 `Logout`，并完成视觉证据刷新。
+- 2026-03-27: 将最终保留的视觉证据收敛为一张默认态截图，移除多余截图资产。
 
 ## 参考（References）
 
