@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef, useState } from "react";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type {
 	AdminLlmCallDetailResponse,
@@ -595,10 +596,8 @@ function paginate<T>(
 }
 
 type AdminJobsPreviewProps = {
+	routeUrl?: string;
 	autoOpenConversation?: boolean;
-	autoOpenTaskDrawer?: boolean;
-	autoOpenTaskDrawerLlmRoute?: boolean;
-	initialTab?: "scheduled" | "llm" | "translations";
 	llmSourceFilter?: string;
 	translationState?: "default" | "busy";
 };
@@ -617,11 +616,23 @@ function setInputValue(element: HTMLInputElement, value: string) {
 	element.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
+function buildStorybookRouteUrl(routeUrl: string) {
+	const currentUrl = new URL(window.location.href);
+	const nextRoute = new URL(routeUrl, currentUrl.origin);
+	const nextSearch = new URLSearchParams(currentUrl.search);
+	nextSearch.delete("from");
+	nextSearch.delete("view");
+	for (const [key, value] of nextRoute.searchParams.entries()) {
+		nextSearch.set(key, value);
+	}
+	return `${nextRoute.pathname}${
+		nextSearch.toString() ? `?${nextSearch.toString()}` : ""
+	}${currentUrl.hash}`;
+}
+
 function AdminJobsPreview({
+	routeUrl = "/admin/jobs",
 	autoOpenConversation = false,
-	autoOpenTaskDrawer = false,
-	autoOpenTaskDrawerLlmRoute = false,
-	initialTab,
 	llmSourceFilter = "",
 	translationState = "default",
 }: AdminJobsPreviewProps) {
@@ -631,6 +642,7 @@ function AdminJobsPreview({
 	useEffect(() => {
 		const originalFetch = window.fetch.bind(window);
 		const originalEventSource = window.EventSource;
+		const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 		const realtimeTasks = realtimeTasksSeed.map((item) => ({ ...item }));
 		const scheduledRuns = scheduledRunsSeed.map((item) => ({ ...item }));
 		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
@@ -1120,41 +1132,27 @@ function AdminJobsPreview({
 		}
 
 		window.EventSource = MockEventSource as unknown as typeof EventSource;
+		window.history.replaceState({}, "", buildStorybookRouteUrl(routeUrl));
 		setReady(true);
 
 		return () => {
+			window.history.replaceState({}, "", originalUrl);
 			window.fetch = originalFetch;
 			window.EventSource = originalEventSource;
 		};
-	}, [translationState]);
+	}, [routeUrl, translationState]);
 
 	useEffect(() => {
-		const needsTabPrep = Boolean(initialTab) || Boolean(llmSourceFilter);
 		if (
 			!ready ||
 			autoOpenedRef.current ||
-			(!autoOpenConversation && !needsTabPrep)
+			(!autoOpenConversation && !llmSourceFilter)
 		) {
 			return;
 		}
 		autoOpenedRef.current = true;
 		const openTimer = window.setTimeout(() => {
-			const targetTabLabel =
-				initialTab === "scheduled"
-					? "定时任务"
-					: initialTab === "translations"
-						? "翻译调度"
-						: initialTab === "llm" || autoOpenConversation || llmSourceFilter
-							? "LLM调度"
-							: null;
-			if (!targetTabLabel) {
-				return;
-			}
-			const targetTab = Array.from(document.querySelectorAll("button")).find(
-				(node) => node.textContent?.trim() === targetTabLabel,
-			) as HTMLButtonElement | undefined;
-			targetTab?.click();
-			if (targetTabLabel !== "LLM调度") {
+			if (window.location.pathname !== "/admin/jobs/llm") {
 				return;
 			}
 			window.setTimeout(() => {
@@ -1183,69 +1181,7 @@ function AdminJobsPreview({
 		return () => {
 			window.clearTimeout(openTimer);
 		};
-	}, [ready, autoOpenConversation, initialTab, llmSourceFilter]);
-
-	useEffect(() => {
-		if (
-			!ready ||
-			(!autoOpenTaskDrawer && !autoOpenTaskDrawerLlmRoute) ||
-			autoOpenedRef.current
-		) {
-			return;
-		}
-		autoOpenedRef.current = true;
-		let llmDetailPollTimer: number | null = null;
-		const openTimer = window.setTimeout(() => {
-			const targetTask = Array.from(document.querySelectorAll("p")).find(
-				(node) => node.textContent?.includes("ID: task-translate-batch-story"),
-			);
-			let taskCard: HTMLElement | null =
-				targetTask instanceof HTMLElement ? targetTask : null;
-			while (taskCard) {
-				const hasDetailButton = Array.from(
-					taskCard.querySelectorAll("button"),
-				).some((node) => node.textContent?.trim() === "详情");
-				if (hasDetailButton) {
-					break;
-				}
-				taskCard = taskCard.parentElement;
-			}
-			const detailButton = Array.from(
-				taskCard?.querySelectorAll("button") ?? [],
-			).find((node) => node.textContent?.trim() === "详情");
-			detailButton?.click();
-			if (!autoOpenTaskDrawerLlmRoute) {
-				return;
-			}
-			let attempts = 0;
-			llmDetailPollTimer = window.setInterval(() => {
-				const llmDetailButton = Array.from(
-					document.querySelectorAll("button"),
-				).find((node) => node.textContent?.trim() === "查看 LLM 详情") as
-					| HTMLButtonElement
-					| undefined;
-				if (llmDetailButton) {
-					llmDetailButton.click();
-					if (llmDetailPollTimer !== null) {
-						window.clearInterval(llmDetailPollTimer);
-						llmDetailPollTimer = null;
-					}
-					return;
-				}
-				attempts += 1;
-				if (attempts >= 30 && llmDetailPollTimer !== null) {
-					window.clearInterval(llmDetailPollTimer);
-					llmDetailPollTimer = null;
-				}
-			}, 120);
-		}, 120);
-		return () => {
-			window.clearTimeout(openTimer);
-			if (llmDetailPollTimer !== null) {
-				window.clearInterval(llmDetailPollTimer);
-			}
-		};
-	}, [ready, autoOpenTaskDrawer, autoOpenTaskDrawerLlmRoute]);
+	}, [ready, autoOpenConversation, llmSourceFilter]);
 
 	if (!ready) return null;
 
@@ -1284,6 +1220,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs" />,
 	parameters: {
 		docs: {
 			description: {
@@ -1294,20 +1231,32 @@ export const Default: Story = {
 };
 
 export const ScheduledTab: Story = {
-	render: () => <AdminJobsPreview initialTab="scheduled" />,
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/scheduled" />,
 	parameters: {
 		docs: {
 			description: {
-				story: "切到计划任务页签，检查日报与订阅同步等调度任务的呈现。",
+				story:
+					"通过 `/admin/jobs/scheduled` 直接进入计划任务页签，检查深链首载是否稳定。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "定时任务" }),
+		).toBeVisible();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/scheduled",
+			),
+		);
 	},
 };
 
 export const LlmFilters: Story = {
 	render: () => (
 		<AdminJobsPreview
-			initialTab="llm"
+			routeUrl="/admin/jobs/llm"
 			llmSourceFilter="job.api.translate_release"
 		/>
 	),
@@ -1321,7 +1270,9 @@ export const LlmFilters: Story = {
 };
 
 export const LlmConversationDetail: Story = {
-	render: () => <AdminJobsPreview autoOpenConversation />,
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/llm" autoOpenConversation />
+	),
 	parameters: {
 		docs: {
 			description: {
@@ -1332,7 +1283,9 @@ export const LlmConversationDetail: Story = {
 };
 
 export const TaskDrawerDetail: Story = {
-	render: () => <AdminJobsPreview autoOpenTaskDrawer />,
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/tasks/task-translate-batch-story" />
+	),
 	parameters: {
 		docs: {
 			description: {
@@ -1343,7 +1296,9 @@ export const TaskDrawerDetail: Story = {
 };
 
 export const TaskDrawerLlmRoute: Story = {
-	render: () => <AdminJobsPreview autoOpenTaskDrawerLlmRoute />,
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/tasks/task-translate-batch-story/llm/llm-call-2" />
+	),
 	parameters: {
 		docs: {
 			description: {
@@ -1354,19 +1309,77 @@ export const TaskDrawerLlmRoute: Story = {
 };
 
 export const TranslationWorkerBoard: Story = {
-	render: () => <AdminJobsPreview initialTab="translations" />,
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/translations?view=queue" />
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "需求队列" }),
+		).toBeVisible();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/translations",
+			),
+		);
+		await waitFor(() =>
+			expect(
+				canvasElement.ownerDocument.defaultView?.location.search,
+			).toContain("view=queue"),
+		);
+		await userEvent.click(canvas.getByRole("tab", { name: "任务记录" }));
+		await expect(
+			canvas.getByRole("heading", { name: "任务记录" }),
+		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				canvasElement.ownerDocument.defaultView?.location.search,
+			).toContain("view=history"),
+		);
+	},
+};
+
+export const TranslationHistoryRoute: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/translations?view=history" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"通过 `/admin/jobs/translations?view=history` 直接进入翻译任务记录子视图。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "任务记录" }),
+		).toBeVisible();
+		await waitFor(() =>
+			expect(
+				canvasElement.ownerDocument.defaultView?.location.search,
+			).toContain("view=history"),
+		);
+	},
 };
 
 export const TranslationWorkerBoardBusy: Story = {
 	render: () => (
-		<AdminJobsPreview initialTab="translations" translationState="busy" />
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/translations?view=queue"
+			translationState="busy"
+		/>
 	),
 };
 
 export const TranslationWorkerBoardMobile: Story = {
 	render: () => (
 		<div className="mx-auto max-w-sm">
-			<AdminJobsPreview initialTab="translations" translationState="busy" />
+			<AdminJobsPreview
+				routeUrl="/admin/jobs/translations?view=queue"
+				translationState="busy"
+			/>
 		</div>
 	),
 };
