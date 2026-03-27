@@ -81,3 +81,4 @@
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
 | regzy | OctoRill 文档站点与 Storybook 文档快车道实施 | 已完成 | `regzy-octo-rill-docs-site/SPEC.md` | 2026-03-09 | PR #31; docs-site + pages workflow + storybook docs; checks green; review-loop clear |
 | erscd | 管理员任务中心：LLM 调度观测与调用排障 | 已完成 | `erscd-admin-llm-scheduler-observability/SPEC.md` | 2026-02-27 | local implementation completed |
+| 96dp9 | Dashboard 同步入口收敛与顺序固定 | 已完成 | `96dp9-dashboard-sync-unification/SPEC.md` | 2026-03-27 | PR #39; single sync entry shipped with one retained visual evidence asset |
