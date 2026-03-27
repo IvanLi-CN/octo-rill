@@ -1084,6 +1084,8 @@ type RealtimeStatusFilter =
 	| "canceled";
 
 type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
+type AdminJobsPrimaryTab = "realtime" | "scheduled" | "llm" | "translations";
+type TranslationViewTab = "queue" | "history";
 
 const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPES = new Set([
@@ -1093,6 +1095,10 @@ const SCHEDULED_TASK_TYPES = new Set([
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
 const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
+const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
+const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
+const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
+const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 
@@ -1101,9 +1107,43 @@ type TaskDrawerRoute = {
 	taskId: string;
 	llmCallId: string | null;
 };
+type AdminJobsRouteState = {
+	primaryTab: AdminJobsPrimaryTab;
+	translationView: TranslationViewTab;
+	taskDrawerRoute: TaskDrawerRoute | null;
+	drawerFromTab: AdminJobsPrimaryTab | null;
+};
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
+}
+
+function isPrimaryTab(value: string | null): value is AdminJobsPrimaryTab {
+	return (
+		value === "realtime" ||
+		value === "scheduled" ||
+		value === "llm" ||
+		value === "translations"
+	);
+}
+
+function parseTranslationView(
+	searchParams: URLSearchParams,
+): TranslationViewTab {
+	return searchParams.get("view") === "history" ? "history" : "queue";
+}
+
+function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
+	switch (primaryTab) {
+		case "scheduled":
+			return ADMIN_JOBS_SCHEDULED_PATH;
+		case "llm":
+			return ADMIN_JOBS_LLM_PATH;
+		case "translations":
+			return ADMIN_JOBS_TRANSLATIONS_PATH;
+		default:
+			return ADMIN_JOBS_BASE_PATH;
+	}
 }
 
 function buildTaskDrawerPath(taskId: string, llmCallId?: string | null) {
@@ -1124,6 +1164,76 @@ function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
 	} catch {
 		return null;
 	}
+}
+
+function parseAdminJobsRoute(
+	pathname: string,
+	search: string,
+): AdminJobsRouteState {
+	const searchParams = new URLSearchParams(search);
+	const translationView = parseTranslationView(searchParams);
+	const rawDrawerFromTab = searchParams.get("from");
+	const drawerFromTab = isPrimaryTab(rawDrawerFromTab)
+		? rawDrawerFromTab
+		: null;
+	const taskDrawerRoute = parseTaskDrawerRoute(pathname);
+
+	if (taskDrawerRoute) {
+		return {
+			primaryTab: drawerFromTab ?? "realtime",
+			translationView,
+			taskDrawerRoute,
+			drawerFromTab,
+		};
+	}
+
+	const normalizedPath = normalizePathname(pathname);
+	let primaryTab: AdminJobsPrimaryTab = "realtime";
+	if (normalizedPath === ADMIN_JOBS_SCHEDULED_PATH) {
+		primaryTab = "scheduled";
+	} else if (normalizedPath === ADMIN_JOBS_LLM_PATH) {
+		primaryTab = "llm";
+	} else if (normalizedPath === ADMIN_JOBS_TRANSLATIONS_PATH) {
+		primaryTab = "translations";
+	}
+
+	return {
+		primaryTab,
+		translationView,
+		taskDrawerRoute: null,
+		drawerFromTab: null,
+	};
+}
+
+function buildAdminJobsRouteUrl(
+	route: AdminJobsRouteState,
+	currentSearch = "",
+) {
+	const searchParams = new URLSearchParams(currentSearch);
+	const pathname = route.taskDrawerRoute
+		? buildTaskDrawerPath(
+				route.taskDrawerRoute.taskId,
+				route.taskDrawerRoute.llmCallId,
+			)
+		: buildAdminJobsBasePath(route.primaryTab);
+
+	for (const key of ADMIN_JOBS_ROUTE_QUERY_KEYS) {
+		searchParams.delete(key);
+	}
+
+	if (route.taskDrawerRoute) {
+		if (route.drawerFromTab) {
+			searchParams.set("from", route.drawerFromTab);
+			if (route.drawerFromTab === "translations") {
+				searchParams.set("view", route.translationView);
+			}
+		}
+	} else if (route.primaryTab === "translations") {
+		searchParams.set("view", route.translationView);
+	}
+
+	const query = searchParams.toString();
+	return `${pathname}${query ? `?${query}` : ""}`;
 }
 
 type JobManagementProps = {
@@ -1279,15 +1389,16 @@ function translationWorkerSlotLabel(workerSlot: number | null | undefined) {
 }
 
 function TranslationSchedulerSection(props: {
+	viewTab: TranslationViewTab;
+	onViewTabChange: (nextValue: TranslationViewTab) => void;
 	refreshNonce: number;
 	onOpenLlmCallDetail: (callId: string) => void;
 }) {
-	const { refreshNonce, onOpenLlmCallDetail } = props;
+	const { refreshNonce, onOpenLlmCallDetail, onViewTabChange, viewTab } = props;
 	const [status, setStatus] = useState<AdminTranslationStatusResponse | null>(
 		null,
 	);
 	const [statusLoading, setStatusLoading] = useState(false);
-	const [viewTab, setViewTab] = useState<"queue" | "history">("queue");
 	const [requestStatusFilter, setRequestStatusFilter] =
 		useState<TranslationStatusFilter>("all");
 	const [requests, setRequests] = useState<AdminTranslationRequestListItem[]>(
@@ -1554,7 +1665,7 @@ function TranslationSchedulerSection(props: {
 			<Tabs
 				value={viewTab}
 				onValueChange={(nextValue) =>
-					setViewTab(nextValue as "queue" | "history")
+					onViewTabChange(nextValue as TranslationViewTab)
 				}
 				className="space-y-4"
 			>
@@ -2262,9 +2373,9 @@ function TranslationSchedulerSection(props: {
 }
 
 export function JobManagement({ currentUserId }: JobManagementProps) {
-	const [tab, setTab] = useState<
-		"realtime" | "scheduled" | "llm" | "translations"
-	>("realtime");
+	const [routeState, setRouteState] = useState<AdminJobsRouteState>(() =>
+		parseAdminJobsRoute(window.location.pathname, window.location.search),
+	);
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -2305,10 +2416,6 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		null,
 	);
 	const [llmDetailLoading, setLlmDetailLoading] = useState(false);
-	const [taskDrawerRoute, setTaskDrawerRoute] =
-		useState<TaskDrawerRoute | null>(() =>
-			parseTaskDrawerRoute(window.location.pathname),
-		);
 	const [taskDrawerLlmDetail, setTaskDrawerLlmDetail] =
 		useState<AdminLlmCallDetailResponse | null>(null);
 	const [taskDrawerLlmLoading, setTaskDrawerLlmLoading] = useState(false);
@@ -2378,6 +2485,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		() => (detailTask ? taskStatusTone(detailTask.task.status) : null),
 		[detailTask],
 	);
+	const tab = routeState.primaryTab;
+	const translationView = routeState.translationView;
+	const taskDrawerRoute = routeState.taskDrawerRoute;
+	const taskDrawerFromTab = routeState.drawerFromTab;
 	const activeTaskDrawerTaskId = taskDrawerRoute?.taskId ?? null;
 	const activeTaskDrawerLlmCallId = taskDrawerRoute?.llmCallId ?? null;
 	const isTaskDrawerOpen = activeTaskDrawerTaskId !== null;
@@ -2421,35 +2532,52 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		activeTaskDrawerLlmCallIdRef.current = activeTaskDrawerLlmCallId;
 	}, [activeTaskDrawerLlmCallId]);
 
-	const navigateTaskDrawerRoute = useCallback(
+	const navigateAdminJobsRoute = useCallback(
 		(
-			nextRoute: TaskDrawerRoute | null,
+			nextRoute: AdminJobsRouteState,
 			options?: {
 				replace?: boolean;
 			},
 		) => {
-			const nextPath = nextRoute
-				? buildTaskDrawerPath(nextRoute.taskId, nextRoute.llmCallId)
-				: ADMIN_JOBS_BASE_PATH;
-			const currentPath = normalizePathname(window.location.pathname);
+			const currentSearch = window.location.search;
+			const nextUrl = buildAdminJobsRouteUrl(nextRoute, currentSearch);
+			const currentUrl = `${normalizePathname(window.location.pathname)}${currentSearch}`;
 			const allowPathSync =
-				currentPath === ADMIN_JOBS_BASE_PATH ||
-				currentPath.startsWith(`${ADMIN_JOBS_BASE_PATH}/`);
-			if (allowPathSync && normalizePathname(nextPath) !== currentPath) {
+				normalizePathname(window.location.pathname) === ADMIN_JOBS_BASE_PATH ||
+				normalizePathname(window.location.pathname).startsWith(
+					`${ADMIN_JOBS_BASE_PATH}/`,
+				);
+			if (allowPathSync && nextUrl !== currentUrl) {
 				if (options?.replace) {
-					window.history.replaceState({}, "", nextPath);
+					window.history.replaceState({}, "", nextUrl);
 				} else {
-					window.history.pushState({}, "", nextPath);
+					window.history.pushState({}, "", nextUrl);
 				}
 			}
-			setTaskDrawerRoute(nextRoute);
+			setRouteState(nextRoute);
 		},
 		[],
 	);
 
 	useEffect(() => {
+		const syncRouteFromWindow = (replace = false) => {
+			const nextRoute = parseAdminJobsRoute(
+				window.location.pathname,
+				window.location.search,
+			);
+			const currentSearch = window.location.search;
+			const canonicalUrl = buildAdminJobsRouteUrl(nextRoute, currentSearch);
+			const currentUrl = `${normalizePathname(window.location.pathname)}${currentSearch}`;
+			if (replace && canonicalUrl !== currentUrl) {
+				window.history.replaceState({}, "", canonicalUrl);
+			}
+			setRouteState(nextRoute);
+		};
+
+		syncRouteFromWindow(true);
+
 		const onPopState = () => {
-			setTaskDrawerRoute(parseTaskDrawerRoute(window.location.pathname));
+			syncRouteFromWindow(true);
 		};
 		window.addEventListener("popstate", onPopState);
 		return () => {
@@ -3135,9 +3263,14 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		(taskId: string) => {
 			setError(null);
 			setLlmDetail(null);
-			navigateTaskDrawerRoute({ taskId, llmCallId: null });
+			navigateAdminJobsRoute({
+				primaryTab: tab,
+				translationView,
+				taskDrawerRoute: { taskId, llmCallId: null },
+				drawerFromTab: tab,
+			});
 		},
-		[navigateTaskDrawerRoute],
+		[navigateAdminJobsRoute, tab, translationView],
 	);
 
 	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
@@ -3157,25 +3290,52 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		(callId: string) => {
 			if (!activeTaskDrawerTaskId) return;
 			setError(null);
-			navigateTaskDrawerRoute({
-				taskId: activeTaskDrawerTaskId,
-				llmCallId: callId,
+			navigateAdminJobsRoute({
+				primaryTab: tab,
+				translationView,
+				taskDrawerRoute: {
+					taskId: activeTaskDrawerTaskId,
+					llmCallId: callId,
+				},
+				drawerFromTab: taskDrawerFromTab,
 			});
 		},
-		[activeTaskDrawerTaskId, navigateTaskDrawerRoute],
+		[
+			activeTaskDrawerTaskId,
+			navigateAdminJobsRoute,
+			tab,
+			taskDrawerFromTab,
+			translationView,
+		],
 	);
 
 	const onCloseTaskDrawer = useCallback(() => {
-		navigateTaskDrawerRoute(null);
-	}, [navigateTaskDrawerRoute]);
+		navigateAdminJobsRoute({
+			primaryTab: taskDrawerFromTab ?? "realtime",
+			translationView,
+			taskDrawerRoute: null,
+			drawerFromTab: null,
+		});
+	}, [navigateAdminJobsRoute, taskDrawerFromTab, translationView]);
 
 	const onBackToTaskDetail = useCallback(() => {
 		if (!activeTaskDrawerTaskId) return;
-		navigateTaskDrawerRoute({
-			taskId: activeTaskDrawerTaskId,
-			llmCallId: null,
+		navigateAdminJobsRoute({
+			primaryTab: tab,
+			translationView,
+			taskDrawerRoute: {
+				taskId: activeTaskDrawerTaskId,
+				llmCallId: null,
+			},
+			drawerFromTab: taskDrawerFromTab,
 		});
-	}, [activeTaskDrawerTaskId, navigateTaskDrawerRoute]);
+	}, [
+		activeTaskDrawerTaskId,
+		navigateAdminJobsRoute,
+		tab,
+		taskDrawerFromTab,
+		translationView,
+	]);
 
 	const onOpenParentTaskFromLlm = useCallback(
 		(taskId: string | null) => {
@@ -3268,7 +3428,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			<Tabs
 				value={tab}
 				onValueChange={(nextValue) =>
-					setTab(nextValue as "realtime" | "scheduled" | "llm" | "translations")
+					navigateAdminJobsRoute({
+						primaryTab: nextValue as AdminJobsPrimaryTab,
+						translationView,
+						taskDrawerRoute: null,
+						drawerFromTab: null,
+					})
 				}
 				className="space-y-4"
 			>
@@ -3830,6 +3995,15 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				<TabsContent value="translations">
 					<TranslationSchedulerSection
+						viewTab={translationView}
+						onViewTabChange={(nextValue) =>
+							navigateAdminJobsRoute({
+								primaryTab: "translations",
+								translationView: nextValue,
+								taskDrawerRoute: null,
+								drawerFromTab: null,
+							})
+						}
 						refreshNonce={refreshNonce}
 						onOpenLlmCallDetail={(callId) => void onOpenLlmCallDetail(callId)}
 					/>

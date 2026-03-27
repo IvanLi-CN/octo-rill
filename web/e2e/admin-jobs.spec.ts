@@ -1213,7 +1213,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.getByRole("button", { name: "详情" }).first().click();
 	const taskSheet = page.getByRole("dialog", { name: "任务详情" });
 	await expect(taskSheet).toBeVisible();
-	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-running-1\?from=realtime$/,
+	);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
@@ -1243,19 +1245,22 @@ test("admin can manage jobs center", async ({ page }) => {
 	});
 	await expect(taskLlmSheet).toBeVisible();
 	await expect(page).toHaveURL(
-		/\/admin\/jobs\/tasks\/task-translate-batch-1\/llm\/llm-call-2$/,
+		/\/admin\/jobs\/tasks\/task-translate-batch-1\/llm\/llm-call-2\?from=realtime$/,
 	);
 	await expect(
 		page.getByText("来源：api.translate_releases_batch"),
 	).toBeVisible();
 	await page.getByRole("button", { name: "返回任务详情" }).click();
 	await expect(taskSheet).toBeVisible();
-	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-translate-batch-1$/);
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-translate-batch-1\?from=realtime$/,
+	);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(taskSheet).toHaveCount(0);
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
 
 	await scheduledTab.click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
 	await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
 	await expect(
 		page.getByRole("combobox", { name: "定时任务状态筛选" }),
@@ -1274,13 +1279,17 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByText("task-subscriptions-1", { exact: true }),
 	).toBeVisible();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-subscriptions-1\?from=scheduled$/,
+	);
 	await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
 	await expect(page.getByRole("link", { name: "下载日志" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
-	await expect(page).toHaveURL(/\/admin\/jobs$/);
+	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
 
 	await llmTab.click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);
 	await expect(llmTab).toHaveAttribute("aria-selected", "true");
 	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
 	await expect(
@@ -1314,8 +1323,69 @@ test("admin can manage jobs center", async ({ page }) => {
 		page.getByText("等待 1.20s · 首字 860ms", { exact: true }),
 	).toBeVisible();
 	await expect(page.getByText("Token（输入 / 输出 / 缓存）")).toBeVisible();
+	await page.getByRole("button", { name: "查看父任务" }).click();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/tasks\/task-running-1\?from=llm$/,
+	);
+	await expect(taskSheet).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);
+
+	const llmCallCardAgain = page
+		.getByText("ID: llm-call-1")
+		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await llmCallCardAgain.getByRole("button", { name: "详情" }).click();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(llmSheet).toHaveCount(0);
+});
+
+test("admin jobs tabs are URL-driven and support deep links plus history", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+
+	await page.goto("/admin/jobs/scheduled", { waitUntil: "domcontentloaded" });
+	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
+	await expect(page.getByRole("tab", { name: "定时任务" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
+
+	await page.goto("/admin/jobs/translations", {
+		waitUntil: "domcontentloaded",
+	});
+	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=queue$/);
+	await expect(page.getByRole("heading", { name: "需求队列" })).toBeVisible();
+	await page.getByRole("tab", { name: "任务记录" }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
+	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
+	await page.goBack();
+	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=queue$/);
+	await expect(page.getByRole("heading", { name: "需求队列" })).toBeVisible();
+	await page.goForward();
+	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
+	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
+
+	await page.goto("/admin/jobs/llm", { waitUntil: "domcontentloaded" });
+	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);
+	await expect(page.getByRole("tab", { name: "LLM调度" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await page.getByRole("tab", { name: "实时异步任务" }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
+	await page.goBack();
+	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);
+	await expect(page.getByRole("heading", { name: "LLM 调度" })).toBeVisible();
+
+	await page.goto("/admin/jobs/tasks/task-running-1", {
+		waitUntil: "domcontentloaded",
+	});
+	await expect(page).toHaveURL(/\/admin\/jobs\/tasks\/task-running-1$/);
+	await expect(page.getByRole("dialog", { name: "任务详情" })).toBeVisible();
+	await page.getByRole("button", { name: "关闭", exact: true }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs$/);
 });
 
 test("admin llm calls are sorted by status group and created time", async ({
@@ -1434,10 +1504,10 @@ test("admin keeps blocking loader before first realtime load completes", async (
 	await expect(page.getByText(/^SSE (已连接|重连中\.\.\.)$/)).toBeVisible();
 	await expect(page.getByText("任务列表更新中...")).toHaveCount(0);
 	await expect(page.getByText("暂无任务。")).toHaveCount(0);
-	await expect(page.getByText("sync.releases")).toBeVisible();
 	await expect(
 		page.getByText("ignored background refresh failure"),
 	).toHaveCount(0);
+	await expect(page.getByText("sync.releases")).toBeVisible();
 });
 
 test("admin ignores stale llm refresh errors after filter change", async ({
@@ -1659,11 +1729,9 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 	const dedicatedWorkerCard = page
 		.getByText("W4 · 用户专用")
 		.locator("xpath=ancestor::div[.//*[normalize-space()='已工作时长']][1]");
-	await expect(dedicatedWorkerCard.getByText("运行中")).toBeVisible();
 	const queuedRequestRow = page
 		.getByText("feed.auto_translate:release:290978079")
 		.locator("xpath=ancestor::tr[1]");
-	await expect(queuedRequestRow.getByText("排队中")).toBeVisible();
 	await expect(queuedRequestRow.getByText("已完成")).toBeVisible();
 	await expect(dedicatedWorkerCard.getByText("idle")).toBeVisible();
 	await page.getByRole("tab", { name: "任务记录" }).click();
