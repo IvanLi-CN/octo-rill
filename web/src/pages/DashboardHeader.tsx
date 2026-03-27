@@ -1,3 +1,5 @@
+import { RefreshCcw } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
 
 export type DashboardHeaderProps = {
@@ -8,11 +10,8 @@ export type DashboardHeaderProps = {
 	isAdmin: boolean;
 	aiDisabledHint?: boolean;
 	busy?: boolean;
-	onRefresh?: () => void;
+	syncingAll?: boolean;
 	onSyncAll?: () => void;
-	onSyncStarred?: () => void;
-	onSyncReleases?: () => void;
-	onSyncInbox?: () => void;
 	logoutHref?: string;
 };
 
@@ -24,11 +23,8 @@ export function DashboardHeader({
 	isAdmin,
 	aiDisabledHint = false,
 	busy = false,
-	onRefresh,
+	syncingAll = false,
 	onSyncAll,
-	onSyncStarred,
-	onSyncReleases,
-	onSyncInbox,
 	logoutHref = "/auth/logout",
 }: DashboardHeaderProps) {
 	return (
@@ -49,20 +45,11 @@ export function DashboardHeader({
 			</div>
 
 			<div className="flex flex-wrap gap-2">
-				<Button variant="secondary" disabled={busy} onClick={onRefresh}>
-					Refresh
-				</Button>
 				<Button disabled={busy} onClick={onSyncAll}>
-					Sync all
-				</Button>
-				<Button variant="outline" disabled={busy} onClick={onSyncStarred}>
-					Sync starred
-				</Button>
-				<Button variant="outline" disabled={busy} onClick={onSyncReleases}>
-					Sync releases
-				</Button>
-				<Button variant="outline" disabled={busy} onClick={onSyncInbox}>
-					Sync inbox
+					<RefreshCcw
+						className={syncingAll ? "size-4 animate-spin" : "size-4"}
+					/>
+					同步
 				</Button>
 				<Button asChild variant="ghost">
 					<a href={logoutHref}>Logout</a>

@@ -52,8 +52,8 @@ export function InboxList(props: { notifications: NotificationItem[] }) {
 			<CardContent className="pt-0">
 				{notifications.length === 0 ? (
 					<p className="text-muted-foreground text-sm">
-						暂无通知。请点击上方的 <span className="font-mono">Sync inbox</span>{" "}
-						同步数据。
+						暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
+						拉取最新数据。
 					</p>
 				) : (
 					<div className="space-y-3">

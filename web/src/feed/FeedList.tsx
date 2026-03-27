@@ -22,7 +22,6 @@ export function FeedList(props: {
 	reactionBusyKeys: Set<string>;
 	reactionErrorByKey: Record<string, string>;
 	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
-	onSyncReleases: () => void;
 }) {
 	const {
 		items,
@@ -39,7 +38,6 @@ export function FeedList(props: {
 		reactionBusyKeys,
 		reactionErrorByKey,
 		onToggleReaction,
-		onSyncReleases,
 	} = props;
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -98,7 +96,6 @@ export function FeedList(props: {
 							onToggleOriginal={() => onToggleOriginal(key)}
 							onTranslateNow={() => onTranslateNow(item)}
 							onToggleReaction={(content) => onToggleReaction(item, content)}
-							onSyncReleases={onSyncReleases}
 						/>
 					</div>
 				);
