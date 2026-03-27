@@ -5,6 +5,7 @@ import {
 	ApiError,
 	apiGet,
 	apiPost,
+	apiPostTaskSse,
 	apiPostJson,
 	apiPutJson,
 } from "@/api";
@@ -44,13 +45,6 @@ import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
 
-type TaskAcceptedResponse = {
-	mode: "task_id";
-	task_id: string;
-	task_type: string;
-	status: string;
-};
-
 type BriefGenerateResponse = {
 	date: string;
 	window_start: string | null;
@@ -72,6 +66,8 @@ type ReactionTokenCheckResponse = {
 	state: "valid" | "invalid";
 	message: string;
 };
+
+const SYNC_ALL_LABEL = "同步";
 
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
@@ -108,6 +104,10 @@ function parseDashboardQuery() {
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+function getErrorMessage(err: unknown) {
+	return err instanceof Error ? err.message : String(err);
 }
 
 function sessionExpiredHint() {
@@ -541,47 +541,44 @@ export function Dashboard(props: { me: MeResponse }) {
 		});
 	}, [refreshSidebar, run]);
 
-	const onSyncStarred = useCallback(() => {
-		void run("Sync starred", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/starred?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
-	const onSyncReleases = useCallback(() => {
-		void run("Sync releases", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/releases?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
-	const onSyncInbox = useCallback(() => {
-		void run("Sync inbox", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/notifications?return_mode=task_id",
-			);
-			await refreshAll();
-		});
-	}, [refreshAll, run]);
-
 	const onSyncAll = useCallback(() => {
-		void run("Sync all", async () => {
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/starred?return_mode=task_id",
-			);
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/releases?return_mode=task_id",
-			);
-			await apiPost<TaskAcceptedResponse>(
-				"/api/sync/notifications?return_mode=task_id",
-			);
-			await refreshAll();
+		void run(SYNC_ALL_LABEL, async () => {
+			let shouldRefresh = false;
+			let syncError: unknown = null;
+			let refreshError: unknown = null;
+
+			try {
+				await apiPostTaskSse("/api/sync/starred?return_mode=sse");
+				shouldRefresh = true;
+				await apiPostTaskSse("/api/sync/releases?return_mode=sse");
+				shouldRefresh = true;
+				await apiPostTaskSse("/api/sync/notifications?return_mode=sse");
+				shouldRefresh = true;
+			} catch (err) {
+				syncError = err;
+			}
+
+			if (shouldRefresh) {
+				try {
+					await refreshAll();
+				} catch (refreshErr) {
+					refreshError = refreshErr;
+					if (!syncError) throw refreshErr;
+				}
+			}
+
+			if (syncError && refreshError) {
+				throw new Error(
+					`${getErrorMessage(syncError)}；已完成的同步结果刷新失败：${getErrorMessage(refreshError)}`,
+				);
+			}
+
+			if (syncError) {
+				throw syncError;
+			}
 		});
 	}, [refreshAll, run]);
+	const syncingAll = busy === SYNC_ALL_LABEL;
 
 	const aiDisabledHint = useMemo(() => {
 		const any = feed.items.find((it) => it.translated?.status === "disabled");
@@ -628,33 +625,12 @@ export function Dashboard(props: { me: MeResponse }) {
 				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
 					<p className="text-muted-foreground mt-1 text-sm">
-						先同步 starred，再同步 releases；右侧是 Inbox 快捷入口。 或者直接点{" "}
-						<span className="font-mono">Sync all</span>。
+						点击顶部的 <span className="font-mono">同步</span>，会先刷新
+						starred， 再同步 releases 和 Inbox。
 					</p>
 					<div className="mt-4 flex flex-wrap gap-2">
 						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-							Sync all
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncStarred}
-						>
-							Sync starred
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncReleases}
-						>
-							Sync releases
-						</Button>
-						<Button
-							variant="outline"
-							disabled={Boolean(busy)}
-							onClick={onSyncInbox}
-						>
-							Sync inbox
+							同步
 						</Button>
 					</div>
 				</div>
@@ -675,7 +651,6 @@ export function Dashboard(props: { me: MeResponse }) {
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={reactionErrorByKey}
 				onToggleReaction={onToggleReaction}
-				onSyncReleases={onSyncReleases}
 			/>
 		</>
 	);
@@ -710,11 +685,8 @@ export function Dashboard(props: { me: MeResponse }) {
 					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
-					onRefresh={() => void refreshAll()}
+					syncingAll={syncingAll}
 					onSyncAll={onSyncAll}
-					onSyncStarred={onSyncStarred}
-					onSyncReleases={onSyncReleases}
-					onSyncInbox={onSyncInbox}
 				/>
 			}
 			footer={<AppMetaFooter />}

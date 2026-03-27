@@ -37,7 +37,6 @@ export function FeedItemCard(props: {
 	onToggleOriginal: () => void;
 	onTranslateNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
-	onSyncReleases: () => void;
 }) {
 	const {
 		item,
@@ -48,7 +47,6 @@ export function FeedItemCard(props: {
 		onToggleOriginal,
 		onTranslateNow,
 		onToggleReaction,
-		onSyncReleases,
 	} = props;
 
 	const kindLabel = "RELEASE";
@@ -221,19 +219,10 @@ export function FeedItemCard(props: {
 						: null}
 
 					{reactions.status === "sync_required" ? (
-						<>
-							<span className="text-muted-foreground font-mono text-[11px]">
-								反馈表情尚未就绪，请先同步 releases
-							</span>
-							<Button
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-								onClick={onSyncReleases}
-							>
-								Sync releases
-							</Button>
-						</>
+						<span className="text-muted-foreground font-mono text-[11px]">
+							反馈表情尚未就绪，请先使用顶部的{" "}
+							<span className="font-mono">同步</span> 更新 releases。
+						</span>
 					) : null}
 
 					{reactionError ? (
