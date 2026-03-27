@@ -665,7 +665,6 @@ export function Dashboard(props: { me: MeResponse }) {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
-					onRefresh={() => void refreshAll()}
 					onSyncAll={onSyncAll}
 				/>
 			}

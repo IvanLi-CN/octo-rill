@@ -231,7 +231,6 @@ function DashboardPreview(props: {
 					aiDisabledHint={aiDisabledHint}
 					busy={syncingAll}
 					syncingAll={syncingAll}
-					onRefresh={() => {}}
 					onSyncAll={() => {}}
 					logoutHref="#"
 				/>
@@ -398,6 +397,9 @@ export const Default: Story = {
 		await expect(
 			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
 		).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: "Refresh" }),
+		).not.toBeInTheDocument();
 		await expect(
 			canvas.queryByRole("button", { name: "Sync starred" }),
 		).not.toBeInTheDocument();

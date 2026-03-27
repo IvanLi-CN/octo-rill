@@ -16,7 +16,7 @@
 
 ### Goals
 
-- 将 Dashboard 的同步入口收敛为一个主按钮 `同步`，保留 `Refresh` 与 `Logout`。
+- 将 Dashboard 头部操作收敛为 `同步` 与 `Logout`，不再保留单独的 `Refresh`。
 - 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转。
 - 保证客户端全量同步顺序固定为 `starred -> releases -> notifications -> refreshAll`。
 - 更新 Storybook 与视觉证据，覆盖默认态、同步中与空态提示。
@@ -50,6 +50,7 @@
 ### MUST
 
 - 顶部同步操作只保留一个名为 `同步` 的按钮。
+- 顶部不得再显示单独的 `Refresh` 按钮。
 - `同步` 按钮左侧必须有刷新系 icon，并在全量同步执行中旋转。
 - `Sync starred`、`Sync releases`、`Sync inbox` 的顶部按钮必须移除。
 - Feed 空态仅保留一个页面内 `同步` CTA，不再展示拆分同步按钮。
@@ -75,7 +76,7 @@
 
 ### Edge cases / errors
 
-- `Refresh`、`Generate brief` 等非全量同步 busy 状态不应让 `同步` icon 旋转。
+- `Generate brief` 等非全量同步 busy 状态不应让 `同步` icon 旋转。
 - Inbox 为空时只提示使用顶部 `同步` 获取数据，不再出现 `Sync inbox` 局部按钮。
 - release 反馈需要 release 数据时，只提示使用顶部 `同步` 更新 releases，不再提供卡片级 `Sync releases`。
 
@@ -88,7 +89,7 @@
 
 - Given Dashboard 默认态
   When 页面渲染完成
-  Then 顶部只出现一个名为 `同步` 的同步按钮，且不存在 `Sync starred`、`Sync releases`、`Sync inbox` 按钮。
+  Then 顶部只出现一个名为 `同步` 的同步按钮，且不存在 `Refresh`、`Sync starred`、`Sync releases`、`Sync inbox` 按钮。
 
 - Given 用户触发全量同步
   When `同步` 流程进行中
@@ -153,13 +154,14 @@
 
 - 风险：若 props 收敛不完整，Storybook 与页面实现可能出现类型漂移。
 - 开放问题：无。
-- 假设：保留 `Refresh` 与 `Logout`，只收敛额外同步入口。
+- 假设：顶部仍保留 `Logout`，但同步相关入口只剩一个 `同步`。
 
 ## 变更记录（Change log）
 
 - 2026-03-27: 创建规格，冻结“单一同步入口 + 顺序固定 + Storybook 视觉证据”的执行口径。
 - 2026-03-27: 完成 Dashboard 同步入口、空态文案与 reaction 提示收敛，并更新 Dashboard Storybook stories。
 - 2026-03-27: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并补入 Storybook 视觉证据，状态更新为 `部分完成（2/3）`。
+- 2026-03-27: 根据最新产品口径移除顶部 `Refresh`，保持头部只剩 `同步` 与 `Logout`，并完成视觉证据刷新。
 
 ## 参考（References）
 

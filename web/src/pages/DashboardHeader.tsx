@@ -11,7 +11,6 @@ export type DashboardHeaderProps = {
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	syncingAll?: boolean;
-	onRefresh?: () => void;
 	onSyncAll?: () => void;
 	logoutHref?: string;
 };
@@ -25,7 +24,6 @@ export function DashboardHeader({
 	aiDisabledHint = false,
 	busy = false,
 	syncingAll = false,
-	onRefresh,
 	onSyncAll,
 	logoutHref = "/auth/logout",
 }: DashboardHeaderProps) {
@@ -47,9 +45,6 @@ export function DashboardHeader({
 			</div>
 
 			<div className="flex flex-wrap gap-2">
-				<Button variant="secondary" disabled={busy} onClick={onRefresh}>
-					Refresh
-				</Button>
 				<Button disabled={busy} onClick={onSyncAll}>
 					<RefreshCcw
 						className={syncingAll ? "size-4 animate-spin" : "size-4"}
