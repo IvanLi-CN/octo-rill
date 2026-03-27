@@ -106,6 +106,10 @@ function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+function getErrorMessage(err: unknown) {
+	return err instanceof Error ? err.message : String(err);
+}
+
 function sessionExpiredHint() {
 	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
 }
@@ -541,6 +545,7 @@ export function Dashboard(props: { me: MeResponse }) {
 		void run(SYNC_ALL_LABEL, async () => {
 			let shouldRefresh = false;
 			let syncError: unknown = null;
+			let refreshError: unknown = null;
 
 			try {
 				await apiPostTaskSse("/api/sync/starred?return_mode=sse");
@@ -557,8 +562,15 @@ export function Dashboard(props: { me: MeResponse }) {
 				try {
 					await refreshAll();
 				} catch (refreshErr) {
+					refreshError = refreshErr;
 					if (!syncError) throw refreshErr;
 				}
+			}
+
+			if (syncError && refreshError) {
+				throw new Error(
+					`${getErrorMessage(syncError)}；已完成的同步结果刷新失败：${getErrorMessage(refreshError)}`,
+				);
 			}
 
 			if (syncError) {
