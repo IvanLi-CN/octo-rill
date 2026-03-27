@@ -88,44 +88,8 @@
 
 ## Visual Evidence
 
-### 定时任务深链
-
-- source_type: `storybook_canvas`
-- target_program: `mock-only`
-- capture_scope: `browser-viewport`
-- sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
-- story_id_or_title: `admin-admin-jobs--scheduled-tab`
-- state: `scheduled-route`
-- evidence_note: 验证 `/admin/jobs/scheduled` 首载即高亮 `定时任务`，无需依赖运行时点击预热。
-
-![定时任务深链](./assets/scheduled-route.png)
-
-### 翻译调度队列路由
-
-- source_type: `storybook_canvas`
-- target_program: `mock-only`
-- capture_scope: `browser-viewport`
-- sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
-- story_id_or_title: `admin-admin-jobs--translation-worker-board-busy`
-- state: `translations-queue-route`
-- evidence_note: 验证 `/admin/jobs/translations?view=queue` 首载保持工作者板常驻，并默认落在 `需求队列` 子视图。
-
-![翻译调度队列路由](./assets/translation-queue-route.png)
-
-### 翻译调度历史路由
-
-- source_type: `storybook_canvas`
-- target_program: `mock-only`
-- capture_scope: `browser-viewport`
-- sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
-- story_id_or_title: `admin-admin-jobs--translation-history-route`
-- state: `translations-history-route`
-- evidence_note: 验证 `/admin/jobs/translations?view=history` 首载直接恢复 `任务记录` 子视图，同时保留顶部工作者板。
-
-![翻译调度历史路由](./assets/translation-history-route.png)
+- 验证来源：本地 Storybook route-state 与真实后台预览页。
+- 仓库内不保留截图资产；本次交付以构建、e2e 与人工走查结果为准。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
