@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（2/3）
+- Status: 已完成
 - Created: 2026-03-27
 - Last: 2026-03-27
 
@@ -138,7 +138,7 @@
 
 - [x] M1: 新建 spec 并写入 `docs/specs/README.md`。
 - [x] M2: 完成 Dashboard 同步入口与文案收敛。
-- [ ] M3: 完成 Storybook、视觉证据、快车道 PR 与 review-loop 收敛。
+- [x] M3: 完成 Storybook、视觉证据、快车道 PR 与 review-loop 收敛。
 
 ## 方案概述（Approach, high-level）
 
@@ -159,6 +159,7 @@
 - 2026-03-27: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并补入 Storybook 视觉证据，状态更新为 `部分完成（2/3）`。
 - 2026-03-27: 根据最新产品口径移除顶部 `Refresh`，保持头部只剩 `同步` 与 `Logout`，并完成视觉证据刷新。
 - 2026-03-27: 将最终保留的视觉证据收敛为一张默认态截图，移除多余截图资产。
+- 2026-03-27: 创建 PR #39 并完成快车道收敛，规格状态更新为 `已完成`。
 
 ## 参考（References）
 
