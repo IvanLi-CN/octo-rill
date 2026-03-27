@@ -201,17 +201,17 @@ function DashboardPreview(props: {
 						<h2 className="text-base font-semibold tracking-tight">
 							还没有缓存内容
 						</h2>
-							<p className="text-muted-foreground mt-1 text-sm">
-								可以先同步 Star / Release；Inbox 仍然单独同步。
-							</p>
-							<div className="mt-4 flex flex-wrap gap-2">
-								<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
-								<Button variant="outline">Sync starred</Button>
-								<Button variant="outline">Sync releases</Button>
-								<Button variant="outline">Sync inbox</Button>
-							</div>
-						</>
-					)}
+						<p className="text-muted-foreground mt-1 text-sm">
+							可以先同步 Star / Release；Inbox 仍然单独同步。
+						</p>
+						<div className="mt-4 flex flex-wrap gap-2">
+							<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
+							<Button variant="outline">Sync starred</Button>
+							<Button variant="outline">Sync releases</Button>
+							<Button variant="outline">Sync inbox</Button>
+						</div>
+					</>
+				)}
 			</div>
 		) : (
 			<FeedList
@@ -476,9 +476,7 @@ export const EmptyFeed: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(
-			canvas.getByText(/还没有缓存内容/),
-		).toBeVisible();
+		await expect(canvas.getByText(/还没有缓存内容/)).toBeVisible();
 		await expect(
 			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
 		).toHaveLength(2);

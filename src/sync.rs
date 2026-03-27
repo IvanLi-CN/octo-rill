@@ -1825,7 +1825,7 @@ async fn process_repo_release_work_item(
                   status = ?,
                   priority = 0,
                   has_new_repo_watchers = 0,
-                  deadline_at = NULL,
+                  deadline_at = ?,
                   last_release_count = ?,
                   last_candidate_failures = ?,
                   last_success_at = ?,
@@ -1838,6 +1838,7 @@ async fn process_repo_release_work_item(
                 "#,
             )
             .bind(jobs::STATUS_SUCCEEDED)
+            .bind(now.as_str())
             .bind(i64::try_from(release_count).unwrap_or(i64::MAX))
             .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
             .bind(now.as_str())
@@ -1861,7 +1862,7 @@ async fn process_repo_release_work_item(
                   status = ?,
                   priority = 0,
                   has_new_repo_watchers = 0,
-                  deadline_at = NULL,
+                  deadline_at = ?,
                   error_text = ?,
                   finished_at = ?,
                   updated_at = ?,
@@ -1871,6 +1872,7 @@ async fn process_repo_release_work_item(
                 "#,
             )
             .bind(jobs::STATUS_FAILED)
+            .bind(now.as_str())
             .bind(error_message.as_str())
             .bind(now.as_str())
             .bind(now.as_str())
@@ -2190,7 +2192,7 @@ async fn recover_repo_release_runtime_state_with_mode(
               status = ?,
               priority = 0,
               has_new_repo_watchers = 0,
-              deadline_at = NULL,
+              deadline_at = ?,
               error_text = ?,
               finished_at = ?,
               updated_at = ?,
@@ -2200,6 +2202,7 @@ async fn recover_repo_release_runtime_state_with_mode(
             "#,
         )
         .bind(jobs::STATUS_FAILED)
+        .bind(now.as_str())
         .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
         .bind(now.as_str())
         .bind(now.as_str())
@@ -2721,8 +2724,8 @@ mod tests {
     use super::{
         EligibleUserRow, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
         SyncRequestError, aggregate_repos, cmp_last_active_desc,
-        subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_starred_for_user_with_fetch,
+        recover_repo_release_runtime_state_on_startup, subscription_event_counts_as_critical,
+        subscription_timeout_error, sync_starred_for_user_with_fetch,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -2963,6 +2966,79 @@ mod tests {
         assert_eq!(event_rows[0], ("warning".to_owned(), 1, 1));
         assert_eq!(event_rows[1], ("warning".to_owned(), 2, 1));
         assert_eq!(event_rows[2], ("error".to_owned(), 3, 0));
+    }
+
+    #[tokio::test]
+    async fn recover_repo_release_runtime_state_keeps_deadline_non_null() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-06T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-stale-1")
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind(jobs::STATUS_RUNNING)
+        .bind("interactive")
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind("2026-03-06T00:01:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("seed stale repo release work item");
+
+        recover_repo_release_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("recover repo release runtime state");
+
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            r#"
+            SELECT status, deadline_at, finished_at
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-stale-1")
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered repo release work item");
+
+        assert_eq!(row.0, jobs::STATUS_FAILED);
+        assert!(!row.1.is_empty(), "deadline_at should stay non-null");
+        assert!(row.2.is_some(), "recovered work item should be finalized");
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
