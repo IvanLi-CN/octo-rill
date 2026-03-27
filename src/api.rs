@@ -7747,10 +7747,10 @@ mod tests {
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
-        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
-        guard_admin_user_update, has_repo_scope, llm_call_order_by_clause,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        markdown_structure_preserved, me, normalize_translation_fields,
+        extract_translation_fields, get_release_detail, github_graphql_errors_to_api_error,
+        github_graphql_http_error, guard_admin_user_update, has_repo_scope, list_releases,
+        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
+        map_job_action_error, markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
@@ -8080,6 +8080,54 @@ mod tests {
         assert_eq!(queued, 1);
     }
 
+    #[tokio::test]
+    async fn me_reuses_inflight_access_refresh_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+        let user_id = test_user_id(1);
+
+        set_last_active_at(&pool, user_id.as_str(), Some("2026-02-22T21:30:00Z")).await;
+        seed_access_refresh_task(
+            &pool,
+            "task-access-running",
+            user_id.as_str(),
+            jobs::STATUS_RUNNING,
+        )
+        .await;
+
+        let Json(resp) = me(State(state), session).await.expect("bootstrap me");
+        assert_eq!(resp.access_sync.reason, "reused_inflight");
+        assert_eq!(
+            resp.access_sync.task_type.as_deref(),
+            Some(jobs::TASK_SYNC_ACCESS_REFRESH)
+        );
+        assert_eq!(
+            resp.access_sync.task_id.as_deref(),
+            Some("task-access-running")
+        );
+        assert_eq!(
+            resp.access_sync.event_path.as_deref(),
+            Some("/api/tasks/task-access-running/events")
+        );
+
+        let inflight = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count inflight access refresh tasks");
+        assert_eq!(inflight, 1);
+    }
+
     async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -8107,6 +8155,50 @@ mod tests {
         .expect("seed release");
     }
 
+    async fn seed_repo_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+            "#,
+        )
+        .bind(format!("repo-release-{repo_id}-{release_id}"))
+        .bind(repo_id)
+        .bind(release_id)
+        .bind(format!("node-{release_id}"))
+        .bind("v1.2.3")
+        .bind("Release v1.2.3")
+        .bind("- item")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed shared repo release");
+    }
+
     async fn seed_star(pool: &SqlitePool, repo_id: i64) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -8131,6 +8223,55 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed starred");
+    }
+
+    async fn seed_access_refresh_task(
+        pool: &SqlitePool,
+        task_id: &str,
+        requested_by: &str,
+        status: &str,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        let started_at = match status {
+            jobs::STATUS_RUNNING | jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED => Some(now),
+            _ => None,
+        };
+        let finished_at = match status {
+            jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED | jobs::STATUS_CANCELED => Some(now),
+            _ => None,
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, 'tests', ?, NULL, '{}', NULL, NULL, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .bind(status)
+        .bind(requested_by)
+        .bind(now)
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed access refresh task");
     }
 
     async fn seed_llm_call(
@@ -10378,6 +10519,46 @@ mod tests {
         .await
         .expect("count releases with star");
         assert_eq!(count_with_star, 1);
+    }
+
+    #[tokio::test]
+    async fn list_releases_reads_shared_repo_cache_for_starred_user() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_releases(State(state), setup_session(1).await)
+            .await
+            .expect("list releases");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].full_name, "openai/codex");
+        assert_eq!(items[0].tag_name, "v1.2.3");
+        assert_eq!(items[0].name.as_deref(), Some("Release v1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_reads_shared_repo_cache_for_starred_user() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        assert_eq!(detail.tag_name, "v1.2.3");
+        assert_eq!(detail.name.as_deref(), Some("Release v1.2.3"));
+        assert_eq!(detail.body.as_deref(), Some("- item"));
+        assert_eq!(
+            detail.html_url,
+            "https://github.com/openai/codex/releases/tag/v1.2.3"
+        );
     }
 
     #[test]

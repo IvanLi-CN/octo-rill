@@ -196,6 +196,8 @@ export function Dashboard(props: { me: MeResponse }) {
 	);
 
 	const feed = useFeed();
+	const loadInitialFeed = feed.loadInitial;
+	const refreshFeed = feed.refresh;
 
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
@@ -267,8 +269,8 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const refreshAll = useCallback(async () => {
 		setBootError(null);
-		await Promise.all([feed.refresh(), refreshSidebar()]);
-	}, [feed, refreshSidebar]);
+		await Promise.all([refreshFeed(), refreshSidebar()]);
+	}, [refreshFeed, refreshSidebar]);
 
 	const trackTaskStream = useCallback(
 		(task: TaskAcceptedResponse, mode: TaskStreamMode) => {
@@ -309,14 +311,14 @@ export function Dashboard(props: { me: MeResponse }) {
 	});
 
 	useEffect(() => {
-		void feed.loadInitial();
+		void loadInitialFeed();
 		void refreshSidebar().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 		void loadReactionTokenStatus().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [feed.loadInitial, loadReactionTokenStatus, refreshSidebar]);
+	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;

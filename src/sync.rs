@@ -2707,6 +2707,7 @@ pub async fn sync_notifications(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashSet,
         fs,
         net::SocketAddr,
         sync::{
@@ -2722,10 +2723,12 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, cmp_last_active_desc,
-        recover_repo_release_runtime_state_on_startup, subscription_event_counts_as_critical,
-        subscription_timeout_error, sync_starred_for_user_with_fetch,
+        EligibleUserRow, ReleaseDemandRepo, RepoReleaseOrigin, StarPhaseSuccess,
+        StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        attach_and_wait_for_user_release_demand, attach_release_demand, cmp_last_active_desc,
+        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
+        subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_starred_for_user_with_fetch,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -3039,6 +3042,283 @@ mod tests {
         assert_eq!(row.0, jobs::STATUS_FAILED);
         assert!(!row.1.is_empty(), "deadline_at should stay non-null");
         assert!(row.2.is_some(), "recovered work item should be finalized");
+    }
+
+    #[tokio::test]
+    async fn attach_and_wait_release_demand_reuses_fresh_cache_and_emits_progress() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("9");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-access-fresh").await;
+
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let deadline_at = repo_release_deadline_at(now, RepoReleaseOrigin::System);
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id,
+              user_id,
+              repo_id,
+              full_name,
+              owner_login,
+              name,
+              description,
+              html_url,
+              stargazed_at,
+              is_private,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-shared-release")
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind("octo")
+        .bind("alpha")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/octo/alpha")
+        .bind(now_rfc3339.as_str())
+        .bind(0_i64)
+        .bind(now_rfc3339.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed starred repo");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-fresh-1")
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind(0_i64)
+        .bind(deadline_at.as_str())
+        .bind(7_i64)
+        .bind(0_i64)
+        .bind(Some(now_rfc3339.as_str()))
+        .bind(Option::<String>::None)
+        .bind(now_rfc3339.as_str())
+        .bind(Some(now_rfc3339.as_str()))
+        .bind(Some(now_rfc3339.as_str()))
+        .bind(now_rfc3339.as_str())
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("seed fresh repo release work item");
+
+        let result = attach_and_wait_for_user_release_demand(
+            state.as_ref(),
+            Some(("task-access-fresh", HashSet::new())),
+            user_id.as_str(),
+            RepoReleaseOrigin::Interactive,
+            "access_refresh",
+        )
+        .await
+        .expect("attach and wait for release demand");
+
+        assert_eq!(result.repos, 1);
+        assert_eq!(result.releases, 7);
+        assert_eq!(result.reused_fresh, 1);
+        assert_eq!(result.reused_running, 0);
+        assert_eq!(result.queued, 0);
+        assert_eq!(result.failed, 0);
+
+        let watcher = sqlx::query_as::<_, (String, i64, String, String)>(
+            r#"
+            SELECT status, is_new_repo, origin, reason
+            FROM repo_release_watchers
+            WHERE task_id = ? AND work_item_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("task-access-fresh")
+        .bind("repo-work-fresh-1")
+        .fetch_one(&pool)
+        .await
+        .expect("load repo release watcher");
+        assert_eq!(watcher.0, "succeeded");
+        assert_eq!(watcher.1, 1);
+        assert_eq!(watcher.2, RepoReleaseOrigin::Interactive.as_str());
+        assert_eq!(watcher.3, "access_refresh");
+
+        let progress_payload = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind("task-access-fresh")
+        .fetch_one(&pool)
+        .await
+        .expect("load task progress payload");
+        let progress: serde_json::Value =
+            serde_json::from_str(&progress_payload).expect("parse progress payload");
+        assert_eq!(
+            progress.get("stage").and_then(serde_json::Value::as_str),
+            Some("release_attached")
+        );
+        assert_eq!(
+            progress
+                .get("reused_fresh")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            progress.get("queued").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_release_demand_promotes_system_queue_for_interactive_new_repo() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("10");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-access-promote").await;
+
+        let now = chrono::Utc::now();
+        let now_rfc3339 = now.to_rfc3339();
+        let stale_success = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let original_deadline_at = repo_release_deadline_at(now, RepoReleaseOrigin::System);
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-promote-1")
+        .bind(43_i64)
+        .bind("octo/beta")
+        .bind(jobs::STATUS_QUEUED)
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind(0_i64)
+        .bind(original_deadline_at.as_str())
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(Some(stale_success.as_str()))
+        .bind(Option::<String>::None)
+        .bind(now_rfc3339.as_str())
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now_rfc3339.as_str())
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("seed queued repo release work item");
+
+        let attached = attach_release_demand(
+            state.as_ref(),
+            Some("task-access-promote"),
+            Some(user_id.as_str()),
+            &[ReleaseDemandRepo {
+                repo_id: 43,
+                full_name: "octo/beta".to_owned(),
+                is_new_repo: true,
+            }],
+            RepoReleaseOrigin::Interactive,
+            "access_refresh",
+        )
+        .await
+        .expect("attach release demand");
+
+        assert_eq!(attached.repos, 1);
+        assert_eq!(attached.queued, 1);
+        assert_eq!(attached.reused_running, 0);
+        assert_eq!(attached.reused_fresh, 0);
+
+        let row = sqlx::query_as::<_, (String, String, i64, i64, String)>(
+            r#"
+            SELECT status, request_origin, priority, has_new_repo_watchers, deadline_at
+            FROM repo_release_work_items
+            WHERE id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("repo-work-promote-1")
+        .fetch_one(&pool)
+        .await
+        .expect("load promoted repo release work item");
+
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert_eq!(row.1, RepoReleaseOrigin::Interactive.as_str());
+        assert_eq!(row.2, RepoReleaseOrigin::Interactive.priority());
+        assert_eq!(row.3, 1);
+        assert!(
+            row.4 < original_deadline_at,
+            "interactive demand should tighten the repo deadline"
+        );
+
+        let watcher = sqlx::query_as::<_, (String, String, i64, i64)>(
+            r#"
+            SELECT status, origin, priority, is_new_repo
+            FROM repo_release_watchers
+            WHERE task_id = ? AND work_item_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("task-access-promote")
+        .bind("repo-work-promote-1")
+        .fetch_one(&pool)
+        .await
+        .expect("load watcher after promotion");
+
+        assert_eq!(watcher.0, "pending");
+        assert_eq!(watcher.1, RepoReleaseOrigin::Interactive.as_str());
+        assert_eq!(watcher.2, RepoReleaseOrigin::Interactive.priority());
+        assert_eq!(watcher.3, 1);
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
