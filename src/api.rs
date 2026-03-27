@@ -18,6 +18,8 @@ use url::Url;
 use crate::{ai, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
+const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
+
 fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
     let parsed = Url::parse(html_url).ok()?;
     let host = parsed.host_str()?;
@@ -45,6 +47,7 @@ pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, A
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     user: UserSummary,
+    access_sync: AccessSyncBootstrap,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +62,7 @@ pub struct UserSummary {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct UserRow {
+struct MeUserRow {
     id: String,
     github_user_id: i64,
     login: String,
@@ -67,17 +70,47 @@ struct UserRow {
     avatar_url: Option<String>,
     email: Option<String>,
     is_admin: i64,
+    is_disabled: i64,
+    last_active_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessSyncBootstrap {
+    task_id: Option<String>,
+    task_type: Option<String>,
+    event_path: Option<String>,
+    reason: String,
+}
+
+impl AccessSyncBootstrap {
+    fn none() -> Self {
+        Self {
+            task_id: None,
+            task_type: None,
+            event_path: None,
+            reason: "none".to_owned(),
+        }
+    }
+
+    fn from_task(task: jobs::EnqueuedTask, reason: impl Into<String>) -> Self {
+        let task_id = task.task_id;
+        Self {
+            event_path: Some(format!("/api/tasks/{task_id}/events")),
+            task_id: Some(task_id),
+            task_type: Some(task.task_type),
+            reason: reason.into(),
+        }
+    }
 }
 
 pub async fn me(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<MeResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
-
-    let row = sqlx::query_as::<_, UserRow>(
+    let user_id = require_user_id(&session).await?;
+    let row = sqlx::query_as::<_, MeUserRow>(
         r#"
-        SELECT id, github_user_id, login, name, avatar_url, email, is_admin
+        SELECT id, github_user_id, login, name, avatar_url, email, is_admin, is_disabled, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -96,6 +129,14 @@ pub async fn me(
         ));
     };
 
+    if let Err(err) = ensure_account_enabled(row.is_disabled != 0) {
+        session.clear().await;
+        return Err(err);
+    }
+
+    let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
+    touch_user_last_active_at(state.as_ref(), &row.id).await?;
+
     Ok(Json(MeResponse {
         user: UserSummary {
             id: row.id,
@@ -106,7 +147,104 @@ pub async fn me(
             email: row.email,
             is_admin: row.is_admin != 0,
         },
+        access_sync,
     }))
+}
+
+fn last_active_is_stale(last_active_at: Option<&str>) -> bool {
+    let Some(last_active_at) = last_active_at else {
+        return true;
+    };
+    let Ok(last_active_at) = chrono::DateTime::parse_from_rfc3339(last_active_at) else {
+        return true;
+    };
+    chrono::Utc::now().signed_duration_since(last_active_at.with_timezone(&chrono::Utc))
+        >= chrono::Duration::hours(1)
+}
+
+async fn maybe_bootstrap_access_sync(
+    state: &AppState,
+    session: &Session,
+    row: &MeUserRow,
+) -> Result<AccessSyncBootstrap, ApiError> {
+    if let Some(task) = jobs::find_inflight_task_for_requester(
+        state,
+        jobs::TASK_SYNC_ACCESS_REFRESH,
+        row.id.as_str(),
+    )
+    .await
+    .map_err(ApiError::internal)?
+    {
+        clear_pending_access_sync_reason(session).await?;
+        return Ok(AccessSyncBootstrap::from_task(task, "reused_inflight"));
+    }
+
+    let pending_reason = load_pending_access_sync_reason(session).await?;
+    let reason = if let Some(reason) = pending_reason.as_deref() {
+        reason
+    } else if row.last_active_at.is_some() {
+        "inactive_over_1h"
+    } else {
+        "first_visit"
+    };
+
+    if pending_reason.is_none() && !last_active_is_stale(row.last_active_at.as_deref()) {
+        return Ok(AccessSyncBootstrap::none());
+    }
+
+    let task = jobs::enqueue_singleton_task_for_requester(
+        state,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            payload: json!({ "user_id": row.id.clone() }),
+            source: "api.me".to_owned(),
+            requested_by: Some(row.id.clone()),
+            parent_task_id: None,
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    clear_pending_access_sync_reason(session).await?;
+    Ok(AccessSyncBootstrap::from_task(task, reason))
+}
+
+async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET last_active_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn load_pending_access_sync_reason(session: &Session) -> Result<Option<String>, ApiError> {
+    session
+        .get::<String>(SESSION_PENDING_ACCESS_SYNC_REASON)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn mark_pending_access_sync_reason(session: &Session, reason: &str) -> Result<(), ApiError> {
+    session
+        .insert(SESSION_PENDING_ACCESS_SYNC_REASON, reason)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn clear_pending_access_sync_reason(session: &Session) -> Result<(), ApiError> {
+    session
+        .remove::<String>(SESSION_PENDING_ACCESS_SYNC_REASON)
+        .await
+        .map(|_| ())
+        .map_err(ApiError::internal)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -2583,10 +2721,9 @@ pub async fn list_releases(
     let items = sqlx::query_as::<_, ReleaseItem>(
         r#"
         SELECT sr.full_name, r.tag_name, r.name, r.published_at, r.html_url, r.is_prerelease, r.is_draft
-        FROM releases r
+        FROM repo_releases r
         JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = ?
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at) DESC
         LIMIT 200
         "#,
@@ -2654,18 +2791,19 @@ pub async fn get_release_detail(
           t.source_hash AS trans_source_hash,
           t.title AS trans_title,
           t.summary AS trans_summary
-        FROM releases r
-        LEFT JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
-          ON t.user_id = r.user_id
+          ON t.user_id = ?
           AND t.entity_type = 'release_detail'
           AND t.entity_id = CAST(r.release_id AS TEXT)
           AND t.lang = 'zh-CN'
-        WHERE r.user_id = ? AND r.release_id = ?
+        WHERE r.release_id = ?
         LIMIT 1
         "#,
     )
+    .bind(&user_id)
     .bind(&user_id)
     .bind(release_id)
     .fetch_optional(&state.pool)
@@ -2896,6 +3034,56 @@ async fn enqueue_or_stream_task(
     }
 }
 
+async fn enqueue_singleton_or_stream_task(
+    state: Arc<AppState>,
+    mode: ReturnMode,
+    new_task: jobs::NewTask,
+) -> Result<Response, ApiError> {
+    let task = jobs::enqueue_singleton_task_for_requester(state.as_ref(), new_task)
+        .await
+        .map_err(ApiError::internal)?;
+
+    match mode {
+        ReturnMode::TaskId => Ok(Json(TaskAcceptedResponse {
+            mode: "task_id".to_owned(),
+            task_id: task.task_id,
+            task_type: task.task_type,
+            status: task.status,
+        })
+        .into_response()),
+        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id)),
+        ReturnMode::Sync => Err(ApiError::internal("unexpected sync return mode")),
+    }
+}
+
+pub async fn task_events_sse(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let task_exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE id = ? AND requested_by = ?
+        "#,
+    )
+    .bind(task_id.as_str())
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if task_exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "task not found",
+        ));
+    }
+    Ok(jobs::task_sse_response(state, task_id))
+}
+
 async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<String>, fut: F) -> T
 where
     F: Future<Output = T>,
@@ -2935,6 +3123,42 @@ pub async fn sync_starred(
             task_type: jobs::TASK_SYNC_STARRED.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_starred".to_owned(),
+            requested_by: Some(user_id.clone()),
+            parent_task_id: None,
+        },
+    )
+    .await
+}
+
+pub async fn sync_all(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let starred = sync::sync_starred(state.as_ref(), user_id.as_str())
+            .await
+            .map_err(ApiError::internal)?;
+        let releases = sync::sync_releases(state.as_ref(), user_id.as_str())
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(json!({
+            "starred": starred,
+            "releases": releases,
+        }))
+        .into_response());
+    }
+
+    enqueue_singleton_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            payload: json!({ "user_id": user_id.clone() }),
+            source: "api.sync_all".to_owned(),
             requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
@@ -3876,10 +4100,9 @@ async fn fetch_feed_releases(
             r.react_hooray AS react_hooray,
             r.react_rocket AS react_rocket,
             r.react_eyes AS react_eyes
-          FROM releases r
+          FROM repo_releases r
           JOIN starred_repos sr
-            ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-          WHERE r.user_id = ?
+            ON sr.user_id = ? AND sr.repo_id = r.repo_id
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
@@ -4165,13 +4388,12 @@ async fn fetch_live_release_reactions(
 
 async fn persist_release_reaction_counts(
     state: &AppState,
-    user_id: &str,
     release_id: i64,
     counts: &ReleaseReactionCounts,
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
-        UPDATE releases
+        UPDATE repo_releases
         SET react_plus1 = ?,
             react_laugh = ?,
             react_heart = ?,
@@ -4179,7 +4401,7 @@ async fn persist_release_reaction_counts(
             react_rocket = ?,
             react_eyes = ?,
             updated_at = ?
-        WHERE user_id = ? AND release_id = ?
+        WHERE release_id = ?
         "#,
     )
     .bind(counts.plus1)
@@ -4189,7 +4411,6 @@ async fn persist_release_reaction_counts(
     .bind(counts.rocket)
     .bind(counts.eyes)
     .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
     .bind(release_id)
     .execute(&state.pool)
     .await
@@ -4363,13 +4584,9 @@ pub async fn list_feed(
     {
         for (node_id, reaction) in &live {
             if let Some(release_id) = release_by_node.get(node_id) {
-                let _ = persist_release_reaction_counts(
-                    state.as_ref(),
-                    &user_id,
-                    *release_id,
-                    &reaction.counts,
-                )
-                .await;
+                let _ =
+                    persist_release_reaction_counts(state.as_ref(), *release_id, &reaction.counts)
+                        .await;
             }
         }
         live_reactions_by_node = live;
@@ -4635,9 +4852,11 @@ pub async fn toggle_release_reaction(
 
     let row = sqlx::query_as::<_, ReleaseReactionRow>(
         r#"
-        SELECT release_id, node_id
-        FROM releases
-        WHERE user_id = ? AND release_id = ?
+        SELECT rr.release_id, rr.node_id
+        FROM repo_releases rr
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = rr.repo_id
+        WHERE rr.release_id = ?
         "#,
     )
     .bind(&user_id)
@@ -4726,8 +4945,7 @@ pub async fn toggle_release_reaction(
     let _ =
         persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
             .await;
-    persist_release_reaction_counts(state.as_ref(), &user_id, row.release_id, &updated.counts)
-        .await?;
+    persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
         release_id: row.release_id.to_string(),
@@ -5804,13 +6022,12 @@ async fn prepare_release_batch(
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT r.release_id, sr.full_name, r.tag_name, r.name, r.body
-        FROM releases r
+        FROM repo_releases r
         JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = "#,
+          ON sr.user_id = "#,
     );
     source_query.push_bind(user_id);
-    source_query.push(" AND r.release_id IN (");
+    source_query.push(" AND sr.repo_id = r.repo_id AND r.release_id IN (");
     {
         let mut separated = source_query.separated(", ");
         for release_id in release_ids {
@@ -6709,8 +6926,10 @@ async fn translate_release_detail_internal(
     let row = sqlx::query_as::<_, ReleaseDetailSourceRow>(
         r#"
         SELECT r.repo_id, r.html_url, r.tag_name, r.name, r.body
-        FROM releases r
-        WHERE r.user_id = ? AND r.release_id = ?
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        WHERE r.release_id = ?
         LIMIT 1
         "#,
     )
@@ -7447,6 +7666,7 @@ fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
 #[derive(Debug, sqlx::FromRow)]
 struct SessionAccessRow {
     is_disabled: i64,
+    last_active_at: Option<String>,
 }
 
 pub(crate) async fn require_active_user_id(
@@ -7456,7 +7676,7 @@ pub(crate) async fn require_active_user_id(
     let user_id = require_user_id(session).await?;
     let row = sqlx::query_as::<_, SessionAccessRow>(
         r#"
-        SELECT is_disabled
+        SELECT is_disabled, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -7480,19 +7700,16 @@ pub(crate) async fn require_active_user_id(
         return Err(err);
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE users
-        SET last_active_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(&user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    if load_pending_access_sync_reason(session).await?.is_none()
+        && last_active_is_stale(row.last_active_at.as_deref())
+    {
+        let reason = if row.last_active_at.is_some() {
+            "inactive_over_1h"
+        } else {
+            "first_visit"
+        };
+        mark_pending_access_sync_reason(session, reason).await?;
+    }
 
     Ok(user_id)
 }
@@ -7525,21 +7742,23 @@ mod tests {
         AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery,
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, TranslateBatchItem, TranslationCacheRow,
+        LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, TranslateBatchItem, TranslationCacheRow,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
         extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
-        guard_admin_user_update, has_repo_scope, llm_call_order_by_clause, looks_like_json_blob,
-        map_job_action_error, markdown_structure_preserved, normalize_translation_fields,
+        guard_admin_user_update, has_repo_scope, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
         release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_reactions_status, resolve_release_full_name,
-        split_markdown_chunks, translate_response_from_batch_item,
+        release_excerpt, release_reactions_status, require_active_user_id,
+        resolve_release_full_name, split_markdown_chunks, sync_all,
+        translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -7733,6 +7952,132 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed test user");
+    }
+
+    async fn set_last_active_at(pool: &SqlitePool, user_id: &str, last_active_at: Option<&str>) {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET last_active_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(last_active_at)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("set last_active_at");
+    }
+
+    #[tokio::test]
+    async fn stale_visit_marker_survives_until_me_bootstraps_access_sync() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+        let user_id = test_user_id(1);
+
+        set_last_active_at(&pool, user_id.as_str(), Some("2026-02-22T21:30:00Z")).await;
+
+        let resolved = require_active_user_id(state.as_ref(), &session)
+            .await
+            .expect("require active user");
+        assert_eq!(resolved, user_id);
+        assert_eq!(
+            load_pending_access_sync_reason(&session)
+                .await
+                .expect("load pending reason")
+                .as_deref(),
+            Some("inactive_over_1h")
+        );
+
+        let Json(resp) = me(State(state.clone()), session)
+            .await
+            .expect("bootstrap me");
+        assert_eq!(resp.access_sync.reason, "inactive_over_1h");
+        assert_eq!(
+            resp.access_sync.task_type.as_deref(),
+            Some(jobs::TASK_SYNC_ACCESS_REFRESH)
+        );
+        assert!(resp.access_sync.task_id.is_some());
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status = 'queued'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count queued access sync tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_all_task_id_reuses_inflight_access_refresh_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let response = sync_all(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(ReturnModeQuery {
+                return_mode: Some("task_id".to_owned()),
+            }),
+        )
+        .await
+        .expect("enqueue first sync_all");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read first response body");
+        let first: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse first task response");
+        let first_task_id = first
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("first task id")
+            .to_owned();
+
+        let response = sync_all(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(ReturnModeQuery {
+                return_mode: Some("task_id".to_owned()),
+            }),
+        )
+        .await
+        .expect("enqueue second sync_all");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read second response body");
+        let second: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse second task response");
+        let second_task_id = second
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("second task id");
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count access refresh tasks");
+        assert_eq!(queued, 1);
     }
 
     async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {

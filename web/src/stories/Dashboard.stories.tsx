@@ -158,17 +158,17 @@ function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
 	syncingAll?: boolean;
-	showEmptyFeed?: boolean;
 	showEmptyInbox?: boolean;
+	emptyState?: "content" | "auto-sync" | "no-cache";
 }) {
 	const {
 		initialTab = "all",
 		initialPatDialogOpen = false,
 		syncingAll = false,
-		showEmptyFeed = false,
 		showEmptyInbox = false,
+		emptyState = "content",
 	} = props;
-	const items = showEmptyFeed ? [] : makeMockFeed();
+	const items = emptyState === "content" ? makeMockFeed() : [];
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const inFlightKeys = new Set<string>();
 	const reactionBusyKeys = new Set<string>();
@@ -184,20 +184,36 @@ function DashboardPreview(props: {
 		mockBriefs[0]?.date ?? null,
 	);
 
-	const feedPanel = (
-		<>
-			{showEmptyFeed ? (
-				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
-					<p className="text-muted-foreground mt-1 text-sm">
-						点击顶部的 <span className="font-mono">{SYNC_ALL_LABEL}</span>
-						，会先刷新 starred，再同步 releases 和 Inbox。
-					</p>
-					<div className="mt-4 flex flex-wrap gap-2">
-						<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
-					</div>
-				</div>
-			) : null}
+	const feedPanel =
+		items.length === 0 ? (
+			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+				{emptyState === "auto-sync" ? (
+					<>
+						<h2 className="text-base font-semibold tracking-tight">
+							正在同步你的 Star / Release
+						</h2>
+						<p className="text-muted-foreground mt-1 text-sm">
+							先展示服务端已有缓存，再补齐最新仓库数据；完成后这里会自动刷新。
+						</p>
+					</>
+				) : (
+					<>
+						<h2 className="text-base font-semibold tracking-tight">
+							还没有缓存内容
+						</h2>
+							<p className="text-muted-foreground mt-1 text-sm">
+								可以先同步 Star / Release；Inbox 仍然单独同步。
+							</p>
+							<div className="mt-4 flex flex-wrap gap-2">
+								<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
+								<Button variant="outline">Sync starred</Button>
+								<Button variant="outline">Sync releases</Button>
+								<Button variant="outline">Sync inbox</Button>
+							</div>
+						</>
+					)}
+			</div>
+		) : (
 			<FeedList
 				items={items}
 				error={null}
@@ -216,8 +232,7 @@ function DashboardPreview(props: {
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
 			/>
-		</>
-	);
+		);
 
 	return (
 		<AppShell
@@ -375,8 +390,8 @@ const meta = {
 		initialTab: "all",
 		initialPatDialogOpen: false,
 		syncingAll: false,
-		showEmptyFeed: false,
 		showEmptyInbox: false,
+		emptyState: "content",
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -449,24 +464,33 @@ export const Syncing: Story = {
 
 export const EmptyFeed: Story = {
 	args: {
-		showEmptyFeed: true,
+		emptyState: "no-cache",
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"Feed 空态只保留一个页面内同步 CTA，并明确提示实际顺序是 starred → releases → Inbox。",
+					"Feed 无缓存时展示 staged refresh 的回退空态，既保留主同步按钮，也允许单独触发 Star / Release / Inbox。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			canvas.getByText(/会先刷新 starred，再同步 releases 和 Inbox/),
+			canvas.getByText(/还没有缓存内容/),
 		).toBeVisible();
 		await expect(
 			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
 		).toHaveLength(2);
+		await expect(
+			canvas.getByRole("button", { name: "Sync starred" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "Sync releases" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "Sync inbox" }),
+		).toBeVisible();
 	},
 };
 
@@ -493,6 +517,20 @@ export const PatDialogOpen: Story = {
 		docs: {
 			description: {
 				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
+			},
+		},
+	},
+};
+
+export const AccessSyncEmptyState: Story = {
+	args: {
+		emptyState: "auto-sync",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"首访或超过 1 小时未访问时的自动同步空态，验证 staged refresh 期间不会再提示手动点 Sync all。",
 			},
 		},
 	},

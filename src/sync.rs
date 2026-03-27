@@ -1,9 +1,9 @@
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
     time::Duration,
@@ -11,24 +11,33 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use axum::http::StatusCode;
+use chrono::{DateTime, Utc};
 use reqwest::{
     Response,
     header::{ACCEPT, HeaderMap, USER_AGENT},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
-use crate::{jobs, local_id, state::AppState};
+use crate::{jobs, local_id, runtime, state::AppState};
 
 const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2022-11-28";
 const SUBSCRIPTION_STAR_WORKERS: usize = 5;
-const SUBSCRIPTION_RELEASE_WORKERS: usize = 5;
 const SUBSCRIPTION_RETRY_LIMIT: usize = 3;
 const SUBSCRIPTION_RETRY_BACKOFF_MS: [u64; 3] = [500, 1_000, 2_000];
 const SUBSCRIPTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const REPO_RELEASE_WORKERS: usize = 5;
+const REPO_RELEASE_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(450);
+const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
+const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
+const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
+
+static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 pub struct SyncStarredResult {
@@ -39,6 +48,12 @@ pub struct SyncStarredResult {
 pub struct SyncReleasesResult {
     pub repos: usize,
     pub releases: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncAccessRefreshResult {
+    pub starred: SyncStarredResult,
+    pub release: SharedReleaseDemandResult,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +99,53 @@ pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Va
     })
 }
 
+fn repo_release_claim_lock() -> &'static tokio::sync::Mutex<()> {
+    REPO_RELEASE_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+pub fn spawn_repo_release_workers(state: Arc<AppState>) {
+    for _ in 0..REPO_RELEASE_WORKERS.max(1) {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                match claim_next_repo_release_work_item(state.as_ref()).await {
+                    Ok(Some(work_item)) => {
+                        if let Err(err) =
+                            process_repo_release_work_item(state.clone(), work_item).await
+                        {
+                            tracing::warn!(?err, "repo release worker: process work item failed");
+                        }
+                    }
+                    Ok(None) => tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await,
+                    Err(err) => {
+                        tracing::warn!(?err, "repo release worker: claim failed");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+pub fn spawn_repo_release_recovery_worker(state: Arc<AppState>) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = recover_repo_release_runtime_state(state.as_ref()).await {
+                tracing::warn!(
+                    ?err,
+                    "repo release worker: recover stale runtime state failed"
+                );
+            }
+            tokio::time::sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
+        }
+    })
+    .abort_handle()
+}
+
+pub async fn recover_repo_release_runtime_state_on_startup(state: &AppState) -> Result<()> {
+    recover_repo_release_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Startup).await
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct StarredRepoRow {
     repo_id: i64,
@@ -94,6 +156,68 @@ struct StarredRepoRow {
 struct EligibleUserRow {
     id: String,
     last_active_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoReleaseOrigin {
+    System,
+    Interactive,
+}
+
+impl RepoReleaseOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Interactive => "interactive",
+        }
+    }
+
+    fn priority(self) -> i64 {
+        match self {
+            Self::System => REPO_RELEASE_PRIORITY_SYSTEM,
+            Self::Interactive => REPO_RELEASE_PRIORITY_INTERACTIVE,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReleaseDemandRepo {
+    repo_id: i64,
+    full_name: String,
+    is_new_repo: bool,
+}
+
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct SharedReleaseDemandResult {
+    pub repos: usize,
+    pub releases: usize,
+    pub reused_running: usize,
+    pub reused_fresh: usize,
+    pub queued: usize,
+    pub failed: usize,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RepoReleaseWorkItemRow {
+    id: String,
+    repo_id: i64,
+    repo_full_name: String,
+    status: String,
+    request_origin: String,
+    priority: i64,
+    has_new_repo_watchers: i64,
+    deadline_at: String,
+    last_success_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ReleaseCandidateUserRow {
+    user_id: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct StaleRepoReleaseWorkRow {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,13 +362,6 @@ struct StarPhaseSuccess {
     user_id: String,
     last_active_at: Option<String>,
     repos: Vec<StarredRepoSnapshot>,
-}
-
-#[derive(Debug)]
-struct ReleasePhaseOutcome {
-    succeeded: bool,
-    releases_written: usize,
-    candidate_failures: usize,
 }
 
 #[derive(Clone)]
@@ -489,33 +606,612 @@ pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarred
 }
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
-    let repos = sqlx::query_as::<_, StarredRepoRow>(
+    let demand = attach_and_wait_for_user_release_demand(
+        state,
+        None,
+        user_id,
+        RepoReleaseOrigin::Interactive,
+        "manual_release_sync",
+    )
+    .await?;
+
+    Ok(SyncReleasesResult {
+        repos: demand.repos,
+        releases: demand.releases,
+    })
+}
+
+pub async fn sync_access_refresh(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+) -> Result<SyncAccessRefreshResult> {
+    let before_repos = load_user_starred_repo_rows(state, user_id).await?;
+    let before_repo_ids = before_repos
+        .iter()
+        .map(|repo| repo.repo_id)
+        .collect::<HashSet<_>>();
+    let starred = sync_starred(state, user_id).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "star_refreshed",
+            "repos": starred.repos,
+        }),
+    )
+    .await?;
+
+    let release = attach_and_wait_for_user_release_demand(
+        state,
+        Some((task_id, before_repo_ids)),
+        user_id,
+        RepoReleaseOrigin::Interactive,
+        "access_refresh",
+    )
+    .await?;
+
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "release_summary",
+            "repos": release.repos,
+            "releases": release.releases,
+            "queued": release.queued,
+            "reused_running": release.reused_running,
+            "reused_fresh": release.reused_fresh,
+            "failed": release.failed,
+        }),
+    )
+    .await?;
+
+    Ok(SyncAccessRefreshResult { starred, release })
+}
+
+#[derive(Debug, Default)]
+struct AttachReleaseDemandResult {
+    work_item_ids: Vec<String>,
+    repos: usize,
+    reused_running: usize,
+    reused_fresh: usize,
+    queued: usize,
+}
+
+#[derive(Debug, Default)]
+struct WaitReleaseDemandResult {
+    releases: usize,
+    failed: usize,
+    candidate_failures: usize,
+}
+
+struct RepoReleaseWatcherUpsert<'a> {
+    work_item_id: &'a str,
+    task_id: &'a str,
+    user_id: Option<&'a str>,
+    origin: RepoReleaseOrigin,
+    reason: &'a str,
+    is_new_repo: bool,
+    status: &'a str,
+    error_text: Option<&'a str>,
+    now_rfc3339: &'a str,
+}
+
+async fn load_user_starred_repo_rows(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<StarredRepoRow>> {
+    sqlx::query_as::<_, StarredRepoRow>(
         r#"
         SELECT repo_id, full_name
         FROM starred_repos
         WHERE user_id = ?
-        ORDER BY stargazed_at DESC
+        ORDER BY
+          CASE WHEN stargazed_at IS NULL THEN 1 ELSE 0 END ASC,
+          stargazed_at DESC,
+          full_name ASC
         "#,
     )
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .context("failed to query starred repos")?;
+    .context("failed to query starred repos")
+}
 
-    let mut total_releases = 0usize;
-    for repo in &repos {
-        let releases = fetch_repo_releases_for_user(state, user_id, &repo.full_name)
-            .await
-            .map_err(SyncRequestError::into_anyhow)?;
-        total_releases += releases.len();
-        let related_user_ids = vec![user_id.to_owned()];
-        upsert_releases_for_users(state, repo.repo_id, &related_user_ids, &releases).await?;
+async fn attach_and_wait_for_user_release_demand(
+    state: &AppState,
+    task_context: Option<(&str, HashSet<i64>)>,
+    user_id: &str,
+    origin: RepoReleaseOrigin,
+    reason: &str,
+) -> Result<SharedReleaseDemandResult> {
+    let repos = load_user_starred_repo_rows(state, user_id).await?;
+    let previous_repo_ids = task_context
+        .as_ref()
+        .map(|(_, ids)| ids.clone())
+        .unwrap_or_default();
+    let demand_repos = repos
+        .iter()
+        .map(|repo| ReleaseDemandRepo {
+            repo_id: repo.repo_id,
+            full_name: repo.full_name.clone(),
+            is_new_repo: !previous_repo_ids.contains(&repo.repo_id),
+        })
+        .collect::<Vec<_>>();
+    let task_id = task_context.as_ref().map(|(task_id, _)| *task_id);
+    let attached =
+        attach_release_demand(state, task_id, Some(user_id), &demand_repos, origin, reason).await?;
+
+    if let Some(task_id) = task_id {
+        jobs::append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "release_attached",
+                "repos": attached.repos,
+                "queued": attached.queued,
+                "reused_running": attached.reused_running,
+                "reused_fresh": attached.reused_fresh,
+            }),
+        )
+        .await?;
     }
 
-    Ok(SyncReleasesResult {
-        repos: repos.len(),
-        releases: total_releases,
+    let waited = wait_for_release_demand(state, task_id, &attached.work_item_ids).await?;
+    Ok(SharedReleaseDemandResult {
+        repos: attached.repos,
+        releases: waited.releases,
+        reused_running: attached.reused_running,
+        reused_fresh: attached.reused_fresh,
+        queued: attached.queued,
+        failed: waited.failed,
     })
+}
+
+async fn attach_release_demand(
+    state: &AppState,
+    task_id: Option<&str>,
+    user_id: Option<&str>,
+    repos: &[ReleaseDemandRepo],
+    origin: RepoReleaseOrigin,
+    reason: &str,
+) -> Result<AttachReleaseDemandResult> {
+    let mut result = AttachReleaseDemandResult {
+        repos: repos.len(),
+        ..AttachReleaseDemandResult::default()
+    };
+    if repos.is_empty() {
+        return Ok(result);
+    }
+
+    let now = Utc::now();
+    let now_rfc3339 = now.to_rfc3339();
+    let deadline_at = repo_release_deadline_at(now, origin);
+    let freshness_cutoff = repo_release_fresh_cutoff(now);
+
+    for repo in repos {
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .context("begin repo release attach tx")?;
+        let existing = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
+            r#"
+            SELECT
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_success_at
+            FROM repo_release_work_items
+            WHERE repo_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(repo.repo_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load repo release work item for {}",
+                repo.full_name
+            )
+        })?;
+
+        let work_item_id = if let Some(existing) = existing {
+            let is_fresh = existing
+                .last_success_at
+                .as_deref()
+                .is_some_and(|value| value >= freshness_cutoff.as_str());
+            let next_priority = existing.priority.max(origin.priority());
+            let next_origin = if next_priority == REPO_RELEASE_PRIORITY_INTERACTIVE {
+                RepoReleaseOrigin::Interactive.as_str()
+            } else {
+                existing.request_origin.as_str()
+            };
+            let next_has_new_repo_watchers =
+                if existing.has_new_repo_watchers != 0 || repo.is_new_repo {
+                    1
+                } else {
+                    0
+                };
+            let next_deadline =
+                earlier_timestamp(existing.deadline_at.as_str(), deadline_at.as_str());
+
+            if is_fresh && existing.status == jobs::STATUS_SUCCEEDED {
+                if let Some(task_id) = task_id {
+                    upsert_repo_release_watcher(
+                        &mut tx,
+                        RepoReleaseWatcherUpsert {
+                            work_item_id: &existing.id,
+                            task_id,
+                            user_id,
+                            origin,
+                            reason,
+                            is_new_repo: repo.is_new_repo,
+                            status: "succeeded",
+                            error_text: None,
+                            now_rfc3339: &now_rfc3339,
+                        },
+                    )
+                    .await?;
+                }
+                sqlx::query(
+                    r#"
+                    UPDATE repo_release_work_items
+                    SET request_origin = ?, priority = ?, has_new_repo_watchers = ?, deadline_at = ?, updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(next_origin)
+                .bind(next_priority)
+                .bind(next_has_new_repo_watchers)
+                .bind(next_deadline.as_str())
+                .bind(now_rfc3339.as_str())
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to refresh fresh repo release work item {}", repo.full_name))?;
+                result.reused_fresh += 1;
+                existing.id
+            } else {
+                let next_status = if existing.status == jobs::STATUS_RUNNING {
+                    jobs::STATUS_RUNNING
+                } else {
+                    jobs::STATUS_QUEUED
+                };
+                sqlx::query(
+                    r#"
+                    UPDATE repo_release_work_items
+                    SET
+                      repo_full_name = ?,
+                      status = ?,
+                      request_origin = ?,
+                      priority = ?,
+                      has_new_repo_watchers = ?,
+                      deadline_at = ?,
+                      error_text = CASE WHEN ? = 'running' THEN error_text ELSE NULL END,
+                      started_at = CASE WHEN ? = 'running' THEN started_at ELSE NULL END,
+                      finished_at = CASE WHEN ? = 'running' THEN finished_at ELSE NULL END,
+                      runtime_owner_id = CASE WHEN ? = 'running' THEN runtime_owner_id ELSE NULL END,
+                      lease_heartbeat_at = CASE WHEN ? = 'running' THEN lease_heartbeat_at ELSE NULL END,
+                      updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(&repo.full_name)
+                .bind(next_status)
+                .bind(next_origin)
+                .bind(next_priority)
+                .bind(next_has_new_repo_watchers)
+                .bind(next_deadline.as_str())
+                .bind(existing.status.as_str())
+                .bind(existing.status.as_str())
+                .bind(existing.status.as_str())
+                .bind(existing.status.as_str())
+                .bind(existing.status.as_str())
+                .bind(now_rfc3339.as_str())
+                .bind(&existing.id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to update repo release work item {}", repo.full_name))?;
+                if let Some(task_id) = task_id {
+                    upsert_repo_release_watcher(
+                        &mut tx,
+                        RepoReleaseWatcherUpsert {
+                            work_item_id: &existing.id,
+                            task_id,
+                            user_id,
+                            origin,
+                            reason,
+                            is_new_repo: repo.is_new_repo,
+                            status: "pending",
+                            error_text: None,
+                            now_rfc3339: &now_rfc3339,
+                        },
+                    )
+                    .await?;
+                }
+                if existing.status == jobs::STATUS_RUNNING {
+                    result.reused_running += 1;
+                } else {
+                    result.queued += 1;
+                }
+                existing.id
+            }
+        } else {
+            let work_item_id = local_id::generate_local_id();
+            sqlx::query(
+                r#"
+                INSERT INTO repo_release_work_items (
+                  id,
+                  repo_id,
+                  repo_full_name,
+                  status,
+                  request_origin,
+                  priority,
+                  has_new_repo_watchers,
+                  deadline_at,
+                  last_release_count,
+                  last_candidate_failures,
+                  last_success_at,
+                  error_text,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at,
+                  runtime_owner_id,
+                  lease_heartbeat_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, NULL, ?, NULL, NULL, ?, NULL, NULL)
+                "#,
+            )
+            .bind(&work_item_id)
+            .bind(repo.repo_id)
+            .bind(&repo.full_name)
+            .bind(jobs::STATUS_QUEUED)
+            .bind(origin.as_str())
+            .bind(origin.priority())
+            .bind(if repo.is_new_repo { 1_i64 } else { 0_i64 })
+            .bind(deadline_at.as_str())
+            .bind(now_rfc3339.as_str())
+            .bind(now_rfc3339.as_str())
+            .execute(&mut *tx)
+            .await
+            .with_context(|| {
+                format!("failed to insert repo release work item {}", repo.full_name)
+            })?;
+            if let Some(task_id) = task_id {
+                upsert_repo_release_watcher(
+                    &mut tx,
+                    RepoReleaseWatcherUpsert {
+                        work_item_id: &work_item_id,
+                        task_id,
+                        user_id,
+                        origin,
+                        reason,
+                        is_new_repo: repo.is_new_repo,
+                        status: "pending",
+                        error_text: None,
+                        now_rfc3339: &now_rfc3339,
+                    },
+                )
+                .await?;
+            }
+            result.queued += 1;
+            work_item_id
+        };
+
+        tx.commit().await.context("commit repo release attach tx")?;
+        result.work_item_ids.push(work_item_id);
+    }
+
+    Ok(result)
+}
+
+async fn upsert_repo_release_watcher(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    watcher: RepoReleaseWatcherUpsert<'_>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO repo_release_watchers (
+          id,
+          work_item_id,
+          task_id,
+          user_id,
+          origin,
+          priority,
+          reason,
+          is_new_repo,
+          status,
+          error_text,
+          created_at,
+          updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_id, work_item_id) DO UPDATE SET
+          user_id = excluded.user_id,
+          origin = excluded.origin,
+          priority = excluded.priority,
+          reason = excluded.reason,
+          is_new_repo = excluded.is_new_repo,
+          status = CASE
+            WHEN repo_release_watchers.status = 'succeeded' THEN repo_release_watchers.status
+            ELSE excluded.status
+          END,
+          error_text = excluded.error_text,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(watcher.work_item_id)
+    .bind(watcher.task_id)
+    .bind(watcher.user_id)
+    .bind(watcher.origin.as_str())
+    .bind(watcher.origin.priority())
+    .bind(watcher.reason)
+    .bind(if watcher.is_new_repo { 1_i64 } else { 0_i64 })
+    .bind(watcher.status)
+    .bind(watcher.error_text)
+    .bind(watcher.now_rfc3339)
+    .bind(watcher.now_rfc3339)
+    .execute(&mut **tx)
+    .await
+    .context("failed to upsert repo release watcher")?;
+    Ok(())
+}
+
+async fn wait_for_release_demand(
+    state: &AppState,
+    task_id: Option<&str>,
+    work_item_ids: &[String],
+) -> Result<WaitReleaseDemandResult> {
+    if work_item_ids.is_empty() {
+        return Ok(WaitReleaseDemandResult::default());
+    }
+
+    loop {
+        if let Some(task_id) = task_id
+            && is_job_cancel_requested(state, task_id).await?
+        {
+            break;
+        }
+
+        let pending = if let Some(task_id) = task_id {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM repo_release_watchers
+                WHERE task_id = ? AND status = 'pending'
+                "#,
+            )
+            .bind(task_id)
+            .fetch_one(&state.pool)
+            .await
+            .context("failed to count pending repo release watchers")?
+        } else {
+            let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT COUNT(*) FROM repo_release_work_items WHERE status IN ('queued', 'running') AND id IN (",
+            );
+            {
+                let mut separated = builder.separated(", ");
+                for work_item_id in work_item_ids {
+                    separated.push_bind(work_item_id);
+                }
+            }
+            builder.push(")");
+            builder
+                .build_query_scalar::<i64>()
+                .fetch_one(&state.pool)
+                .await
+                .context("failed to count pending repo release work items")?
+        };
+        if pending == 0 {
+            break;
+        }
+        tokio::time::sleep(REPO_RELEASE_WAIT_POLL_INTERVAL).await;
+    }
+
+    if let Some(task_id) = task_id {
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            r#"
+            SELECT
+              COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+            FROM repo_release_watchers rw
+            JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+            WHERE rw.task_id = "#,
+        );
+        builder.push_bind(task_id);
+        let row = builder
+            .build()
+            .fetch_one(&state.pool)
+            .await
+            .context("failed to summarize repo release watchers")?;
+        return Ok(WaitReleaseDemandResult {
+            releases: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
+            failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
+            candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
+                .unwrap_or_default(),
+        });
+    }
+
+    let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+          COALESCE(SUM(last_release_count), 0) AS release_count,
+          COALESCE(SUM(last_candidate_failures), 0) AS candidate_failures
+        FROM repo_release_work_items
+        WHERE id IN (
+        "#,
+    );
+    {
+        let mut separated = builder.separated(", ");
+        for work_item_id in work_item_ids {
+            separated.push_bind(work_item_id);
+        }
+    }
+    builder.push(")");
+    let row = builder
+        .build()
+        .fetch_one(&state.pool)
+        .await
+        .context("failed to summarize repo release work items")?;
+    Ok(WaitReleaseDemandResult {
+        releases: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
+        failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
+        candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
+            .unwrap_or_default(),
+    })
+}
+
+fn repo_release_deadline_at(now: DateTime<Utc>, origin: RepoReleaseOrigin) -> String {
+    let offset = match origin {
+        RepoReleaseOrigin::Interactive => chrono::Duration::minutes(2),
+        RepoReleaseOrigin::System => chrono::Duration::minutes(10),
+    };
+    (now + offset).to_rfc3339()
+}
+
+fn repo_release_fresh_cutoff(now: DateTime<Utc>) -> String {
+    (now - chrono::Duration::from_std(REPO_RELEASE_FRESHNESS_WINDOW).unwrap_or_default())
+        .to_rfc3339()
+}
+
+fn earlier_timestamp(left: &str, right: &str) -> String {
+    if right < left {
+        right.to_owned()
+    } else {
+        left.to_owned()
+    }
+}
+
+async fn is_job_cancel_requested(state: &AppState, task_id: &str) -> Result<bool> {
+    let cancel_requested = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT cancel_requested
+        FROM job_tasks
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to query job cancel_requested")?
+    .unwrap_or(0);
+    Ok(cancel_requested != 0)
 }
 
 pub async fn sync_subscriptions(
@@ -952,283 +1648,576 @@ async fn run_release_phase(
     context: &SubscriptionRunContext,
     repos: Vec<AggregatedRepo>,
 ) -> Result<(SyncSubscriptionReleaseSummary, usize)> {
-    let mut join_set = JoinSet::new();
-    let mut summary = SyncSubscriptionReleaseSummary {
-        total_repos: repos.len(),
-        ..SyncSubscriptionReleaseSummary::default()
-    };
-    let mut releases_written = 0usize;
+    let demand_repos = repos
+        .iter()
+        .map(|repo| ReleaseDemandRepo {
+            repo_id: repo.repo_id,
+            full_name: repo.full_name.clone(),
+            is_new_repo: false,
+        })
+        .collect::<Vec<_>>();
+    let attached = attach_release_demand(
+        context.state.as_ref(),
+        Some(context.task_id.as_str()),
+        None,
+        &demand_repos,
+        RepoReleaseOrigin::System,
+        "subscription_sync",
+    )
+    .await?;
 
-    for repo in repos {
-        while join_set.len() >= SUBSCRIPTION_RELEASE_WORKERS {
-            collect_release_result(
-                join_set.join_next().await,
-                &mut summary,
-                &mut releases_written,
-            )?;
-            if context.is_cancel_requested().await? {
-                context
-                    .log(
-                        "warning",
-                        "release",
-                        "run_canceled",
-                        "subscription sync canceled during release phase",
-                        json!({
-                            "completed_repos": summary.succeeded_repos + summary.failed_repos,
-                            "total_repos": summary.total_repos,
-                            "releases_written": releases_written,
-                        }),
-                    )
-                    .await?;
-                return Ok((summary, releases_written));
-            }
-        }
-        if context.is_cancel_requested().await? {
-            context
-                .log(
-                    "warning",
-                    "release",
-                    "run_canceled",
-                    "subscription sync canceled during release phase",
-                    json!({
-                        "completed_repos": summary.succeeded_repos + summary.failed_repos,
-                        "total_repos": summary.total_repos,
-                        "releases_written": releases_written,
-                    }),
-                )
-                .await?;
-            return Ok((summary, releases_written));
-        }
-        let worker_context = context.clone();
-        join_set.spawn(async move { sync_releases_for_repo(worker_context, repo).await });
-    }
-
-    while !join_set.is_empty() {
-        collect_release_result(
-            join_set.join_next().await,
-            &mut summary,
-            &mut releases_written,
-        )?;
-        if context.is_cancel_requested().await? {
-            context
-                .log(
-                    "warning",
-                    "release",
-                    "run_canceled",
-                    "subscription sync canceled during release phase",
-                    json!({
-                        "completed_repos": summary.succeeded_repos + summary.failed_repos,
-                        "total_repos": summary.total_repos,
-                        "releases_written": releases_written,
-                    }),
-                )
-                .await?;
-            return Ok((summary, releases_written));
-        }
-    }
-
-    Ok((summary, releases_written))
-}
-
-fn collect_release_result(
-    joined: Option<Result<Result<ReleasePhaseOutcome>, tokio::task::JoinError>>,
-    summary: &mut SyncSubscriptionReleaseSummary,
-    releases_written: &mut usize,
-) -> Result<()> {
-    let Some(joined) = joined else {
-        return Ok(());
-    };
-    match joined {
-        Ok(Ok(outcome)) => {
-            if outcome.succeeded {
-                summary.succeeded_repos += 1;
-            } else {
-                summary.failed_repos += 1;
-            }
-            summary.candidate_failures += outcome.candidate_failures;
-            *releases_written += outcome.releases_written;
-            Ok(())
-        }
-        Ok(Err(err)) => Err(err),
-        Err(err) => Err(anyhow!("release worker join failed: {err}")),
-    }
-}
-
-async fn sync_releases_for_repo(
-    context: SubscriptionRunContext,
-    repo: AggregatedRepo,
-) -> Result<ReleasePhaseOutcome> {
     context
         .log(
             "info",
             "release",
-            "repo_started",
-            format!("syncing releases for {}", repo.full_name),
+            "release_attached",
+            "subscription release demand attached to shared repo queue",
             json!({
-                "repo_id": repo.repo_id,
-                "repo_full_name": repo.full_name,
-                "is_private": repo.is_private,
-                "related_users": repo.related_users.iter().map(|item| item.user_id.clone()).collect::<Vec<_>>(),
+                "repos": attached.repos,
+                "queued": attached.queued,
+                "reused_running": attached.reused_running,
+                "reused_fresh": attached.reused_fresh,
             }),
         )
         .await?;
 
-    let related_user_ids = repo
-        .related_users
-        .iter()
-        .map(|item| item.user_id.clone())
-        .collect::<Vec<_>>();
-    let mut candidate_failures = 0usize;
+    let waited = wait_for_release_demand(
+        context.state.as_ref(),
+        Some(context.task_id.as_str()),
+        &attached.work_item_ids,
+    )
+    .await?;
 
-    for candidate in &repo.related_users {
-        for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
-            if context.is_cancel_requested().await? {
-                context
-                    .log(
-                        "warning",
-                        "release",
-                        "repo_canceled",
-                        format!("release sync canceled for {}", repo.full_name),
-                        json!({
-                            "repo_id": repo.repo_id,
-                            "repo_full_name": repo.full_name,
-                            "candidate_user_id": candidate.user_id,
-                            "attempt": attempt,
-                        }),
-                    )
-                    .await?;
-                return Ok(ReleasePhaseOutcome {
-                    succeeded: false,
-                    releases_written: 0,
-                    candidate_failures,
-                });
+    Ok((
+        SyncSubscriptionReleaseSummary {
+            total_repos: attached.repos,
+            succeeded_repos: attached.repos.saturating_sub(waited.failed),
+            failed_repos: waited.failed,
+            candidate_failures: waited.candidate_failures,
+        },
+        waited.releases,
+    ))
+}
+
+async fn claim_next_repo_release_work_item(
+    state: &AppState,
+) -> Result<Option<RepoReleaseWorkItemRow>> {
+    let _claim_guard = repo_release_claim_lock().lock().await;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("begin repo release claim tx")?;
+
+    let work_item_id = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM repo_release_work_items
+        WHERE status = ?
+        ORDER BY
+          priority DESC,
+          has_new_repo_watchers DESC,
+          deadline_at ASC,
+          created_at ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(jobs::STATUS_QUEUED)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("select queued repo release work item")?;
+
+    let Some(work_item_id) = work_item_id else {
+        tx.commit()
+            .await
+            .context("commit empty repo release claim tx")?;
+        return Ok(None);
+    };
+
+    let now = Utc::now().to_rfc3339();
+    let updated = sqlx::query(
+        r#"
+        UPDATE repo_release_work_items
+        SET
+          status = ?,
+          started_at = COALESCE(started_at, ?),
+          runtime_owner_id = ?,
+          lease_heartbeat_at = ?,
+          updated_at = ?
+        WHERE id = ? AND status = ?
+        "#,
+    )
+    .bind(jobs::STATUS_RUNNING)
+    .bind(now.as_str())
+    .bind(state.runtime_owner_id.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(&work_item_id)
+    .bind(jobs::STATUS_QUEUED)
+    .execute(&mut *tx)
+    .await
+    .context("claim repo release work item")?;
+
+    if updated.rows_affected() == 0 {
+        tx.commit()
+            .await
+            .context("commit failed repo release claim tx")?;
+        return Ok(None);
+    }
+
+    let work_item = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
+        r#"
+        SELECT
+          id,
+          repo_id,
+          repo_full_name,
+          status,
+          request_origin,
+          priority,
+          has_new_repo_watchers,
+          deadline_at,
+          last_success_at
+        FROM repo_release_work_items
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&work_item_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("reload claimed repo release work item")?;
+
+    tx.commit().await.context("commit repo release claim tx")?;
+    Ok(Some(work_item))
+}
+
+async fn process_repo_release_work_item(
+    state: Arc<AppState>,
+    work_item: RepoReleaseWorkItemRow,
+) -> Result<()> {
+    let heartbeat = runtime::spawn_lease_heartbeat(
+        "repo_release_work_items",
+        runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL,
+        {
+            let state = state.clone();
+            let work_item_id = work_item.id.clone();
+            move || {
+                let state = state.clone();
+                let work_item_id = work_item_id.clone();
+                async move {
+                    heartbeat_repo_release_work_item_lease(state.as_ref(), work_item_id.as_str())
+                        .await
+                }
             }
+        },
+    );
+
+    let result = execute_repo_release_work_item(state.as_ref(), &work_item).await;
+    heartbeat.stop().await;
+
+    let now = Utc::now().to_rfc3339();
+    match result {
+        Ok((release_count, candidate_failures)) => {
+            sqlx::query(
+                r#"
+                UPDATE repo_release_work_items
+                SET
+                  status = ?,
+                  priority = 0,
+                  has_new_repo_watchers = 0,
+                  deadline_at = NULL,
+                  last_release_count = ?,
+                  last_candidate_failures = ?,
+                  last_success_at = ?,
+                  error_text = NULL,
+                  finished_at = ?,
+                  updated_at = ?,
+                  runtime_owner_id = NULL,
+                  lease_heartbeat_at = NULL
+                WHERE id = ?
+                "#,
+            )
+            .bind(jobs::STATUS_SUCCEEDED)
+            .bind(i64::try_from(release_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(&work_item.id)
+            .execute(&state.pool)
+            .await
+            .with_context(|| {
+                format!("failed to finalize repo release work item {}", work_item.id)
+            })?;
+            mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
+                .await?;
+        }
+        Err(err) => {
+            let error_message = err.to_string();
+            sqlx::query(
+                r#"
+                UPDATE repo_release_work_items
+                SET
+                  status = ?,
+                  priority = 0,
+                  has_new_repo_watchers = 0,
+                  deadline_at = NULL,
+                  error_text = ?,
+                  finished_at = ?,
+                  updated_at = ?,
+                  runtime_owner_id = NULL,
+                  lease_heartbeat_at = NULL
+                WHERE id = ?
+                "#,
+            )
+            .bind(jobs::STATUS_FAILED)
+            .bind(error_message.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(&work_item.id)
+            .execute(&state.pool)
+            .await
+            .with_context(|| format!("failed to fail repo release work item {}", work_item.id))?;
+            mark_repo_release_watchers(
+                state.as_ref(),
+                &work_item.id,
+                "failed",
+                Some(error_message.as_str()),
+                &now,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_repo_release_work_item(
+    state: &AppState,
+    work_item: &RepoReleaseWorkItemRow,
+) -> Result<(usize, usize)> {
+    let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
+        r#"
+        SELECT DISTINCT u.id AS user_id, u.last_active_at
+        FROM starred_repos sr
+        JOIN users u ON u.id = sr.user_id
+        WHERE sr.repo_id = ?
+          AND u.is_disabled = 0
+        ORDER BY
+          CASE WHEN u.last_active_at IS NULL THEN 1 ELSE 0 END ASC,
+          u.last_active_at DESC,
+          u.id ASC
+        "#,
+    )
+    .bind(work_item.repo_id)
+    .fetch_all(&state.pool)
+    .await
+    .with_context(|| {
+        format!(
+            "failed to load repo release candidates for {}",
+            work_item.repo_full_name
+        )
+    })?;
+
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no active candidate users remain for {}",
+            work_item.repo_full_name
+        ));
+    }
+
+    let mut candidate_failures = 0usize;
+    for candidate in candidates {
+        for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
             match fetch_repo_releases_for_user(
-                context.state.as_ref(),
-                &candidate.user_id,
-                &repo.full_name,
+                state,
+                candidate.user_id.as_str(),
+                work_item.repo_full_name.as_str(),
             )
             .await
             {
                 Ok(releases) => {
-                    let written = upsert_releases_for_users(
-                        context.state.as_ref(),
-                        repo.repo_id,
-                        &related_user_ids,
-                        &releases,
-                    )
-                    .await?;
-                    context
-                        .log(
-                            "info",
-                            "release",
-                            "repo_succeeded",
-                            format!("synced releases for {}", repo.full_name),
-                            json!({
-                                "repo_id": repo.repo_id,
-                                "repo_full_name": repo.full_name,
-                                "candidate_user_id": candidate.user_id,
-                                "release_count": releases.len(),
-                                "releases_written": written,
-                            }),
-                        )
-                        .await?;
-                    return Ok(ReleasePhaseOutcome {
-                        succeeded: true,
-                        releases_written: written,
-                        candidate_failures,
-                    });
+                    let release_count =
+                        upsert_repo_releases(state, work_item.repo_id, &releases).await?;
+                    return Ok((release_count, candidate_failures));
                 }
                 Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
                     candidate_failures += 1;
-                    context
-                        .key_event(
-                            format!(
-                                "retryable release sync error for {} with user #{}",
-                                repo.full_name, candidate.user_id
-                            ),
-                            SubscriptionEventRecord {
-                                stage: "release",
-                                event_type: err.reason_code,
-                                severity: "warning",
-                                recoverable: true,
-                                attempt,
-                                user_id: Some(candidate.user_id.as_str()),
-                                repo_id: Some(repo.repo_id),
-                                repo_full_name: Some(repo.full_name.as_str()),
-                                payload: json!({
-                                    "repo_id": repo.repo_id,
-                                    "repo_full_name": repo.full_name,
-                                    "candidate_user_id": candidate.user_id,
-                                    "reason_code": err.reason_code,
-                                    "status": err.status,
-                                    "error": err.message,
-                                }),
-                            },
-                        )
-                        .await?;
                     tokio::time::sleep(subscription_retry_delay(attempt)).await;
                 }
-                Err(err) => {
+                Err(_) => {
                     candidate_failures += 1;
-                    context
-                        .key_event(
-                            format!(
-                                "release sync candidate failed for {} with user #{}",
-                                repo.full_name, candidate.user_id
-                            ),
-                            SubscriptionEventRecord {
-                                stage: "release",
-                                event_type: err.reason_code,
-                                severity: if err.retryable { "warning" } else { "error" },
-                                recoverable: err.retryable,
-                                attempt,
-                                user_id: Some(candidate.user_id.as_str()),
-                                repo_id: Some(repo.repo_id),
-                                repo_full_name: Some(repo.full_name.as_str()),
-                                payload: json!({
-                                    "repo_id": repo.repo_id,
-                                    "repo_full_name": repo.full_name,
-                                    "candidate_user_id": candidate.user_id,
-                                    "reason_code": err.reason_code,
-                                    "status": err.status,
-                                    "error": err.message,
-                                }),
-                            },
-                        )
-                        .await?;
                     break;
                 }
             }
         }
     }
 
-    context
-        .key_event(
-            format!("all candidates failed for {}", repo.full_name),
-            SubscriptionEventRecord {
-                stage: "release",
-                event_type: "repo_unreachable",
-                severity: "error",
-                recoverable: false,
-                attempt: 0,
-                user_id: None,
-                repo_id: Some(repo.repo_id),
-                repo_full_name: Some(repo.full_name.as_str()),
-                payload: json!({
-                    "repo_id": repo.repo_id,
-                    "repo_full_name": repo.full_name,
-                    "candidate_user_ids": related_user_ids,
-                }),
-            },
+    Err(anyhow!(
+        "all candidate users failed to sync {}",
+        work_item.repo_full_name
+    ))
+}
+
+async fn upsert_repo_releases(
+    state: &AppState,
+    repo_id: i64,
+    releases: &[GitHubRelease],
+) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    for release in releases {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(release_id) DO UPDATE SET
+              repo_id = excluded.repo_id,
+              node_id = excluded.node_id,
+              tag_name = excluded.tag_name,
+              name = excluded.name,
+              body = excluded.body,
+              html_url = excluded.html_url,
+              published_at = excluded.published_at,
+              created_at = excluded.created_at,
+              is_prerelease = excluded.is_prerelease,
+              is_draft = excluded.is_draft,
+              updated_at = excluded.updated_at,
+              react_plus1 = excluded.react_plus1,
+              react_laugh = excluded.react_laugh,
+              react_heart = excluded.react_heart,
+              react_hooray = excluded.react_hooray,
+              react_rocket = excluded.react_rocket,
+              react_eyes = excluded.react_eyes
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(repo_id)
+        .bind(release.id)
+        .bind(release.node_id.as_deref())
+        .bind(release.tag_name.as_str())
+        .bind(release.name.as_deref())
+        .bind(release.body.as_deref())
+        .bind(release.html_url.as_str())
+        .bind(release.published_at.as_deref())
+        .bind(release.created_at.as_deref())
+        .bind(release.prerelease as i64)
+        .bind(release.draft as i64)
+        .bind(now.as_str())
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.plus1)
+                .unwrap_or(0),
+        )
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.laugh)
+                .unwrap_or(0),
+        )
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.heart)
+                .unwrap_or(0),
+        )
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.hooray)
+                .unwrap_or(0),
+        )
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.rocket)
+                .unwrap_or(0),
+        )
+        .bind(
+            release
+                .reactions
+                .as_ref()
+                .map(|value| value.eyes)
+                .unwrap_or(0),
+        )
+        .execute(&state.pool)
+        .await
+        .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
+    }
+
+    Ok(releases.len())
+}
+
+async fn mark_repo_release_watchers(
+    state: &AppState,
+    work_item_id: &str,
+    status: &str,
+    error_text: Option<&str>,
+    now_rfc3339: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE repo_release_watchers
+        SET status = ?, error_text = ?, updated_at = ?
+        WHERE work_item_id = ? AND status = 'pending'
+        "#,
+    )
+    .bind(status)
+    .bind(error_text)
+    .bind(now_rfc3339)
+    .bind(work_item_id)
+    .execute(&state.pool)
+    .await
+    .context("failed to update repo release watchers")?;
+    Ok(())
+}
+
+async fn heartbeat_repo_release_work_item_lease(
+    state: &AppState,
+    work_item_id: &str,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE repo_release_work_items
+        SET lease_heartbeat_at = ?, updated_at = ?
+        WHERE id = ? AND status = ? AND runtime_owner_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(work_item_id)
+    .bind(jobs::STATUS_RUNNING)
+    .bind(state.runtime_owner_id.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to heartbeat repo release work item")?;
+    Ok(())
+}
+
+pub async fn recover_repo_release_runtime_state(state: &AppState) -> Result<()> {
+    recover_repo_release_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Sweep).await
+}
+
+async fn recover_repo_release_runtime_state_with_mode(
+    state: &AppState,
+    mode: runtime::RuntimeRecoveryMode,
+) -> Result<()> {
+    let cutoff = runtime::stale_cutoff_timestamp(Utc::now());
+    let stale_rows = match mode {
+        runtime::RuntimeRecoveryMode::Startup => {
+            sqlx::query_as::<_, StaleRepoReleaseWorkRow>(
+                r#"
+                SELECT id
+                FROM repo_release_work_items
+                WHERE status = ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                    OR (
+                      runtime_owner_id != ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM runtime_owners
+                        WHERE runtime_owner_id = repo_release_work_items.runtime_owner_id
+                          AND julianday(lease_heartbeat_at) > julianday(?)
+                      )
+                    )
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(jobs::STATUS_RUNNING)
+            .bind(cutoff.as_str())
+            .bind(state.runtime_owner_id.as_str())
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await
+        }
+        runtime::RuntimeRecoveryMode::Sweep => {
+            sqlx::query_as::<_, StaleRepoReleaseWorkRow>(
+                r#"
+                SELECT id
+                FROM repo_release_work_items
+                WHERE status = ?
+                  AND (
+                    runtime_owner_id IS NULL
+                    OR lease_heartbeat_at IS NULL
+                    OR julianday(lease_heartbeat_at) <= julianday(?)
+                  )
+                ORDER BY created_at ASC, id ASC
+                "#,
+            )
+            .bind(jobs::STATUS_RUNNING)
+            .bind(cutoff.as_str())
+            .fetch_all(&state.pool)
+            .await
+        }
+    }
+    .context("failed to load stale repo release work items")?;
+
+    let now = Utc::now().to_rfc3339();
+    for row in stale_rows {
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET
+              status = ?,
+              priority = 0,
+              has_new_repo_watchers = 0,
+              deadline_at = NULL,
+              error_text = ?,
+              finished_at = ?,
+              updated_at = ?,
+              runtime_owner_id = NULL,
+              lease_heartbeat_at = NULL
+            WHERE id = ?
+            "#,
+        )
+        .bind(jobs::STATUS_FAILED)
+        .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(&row.id)
+        .execute(&state.pool)
+        .await
+        .with_context(|| format!("failed to recover stale repo release work item {}", row.id))?;
+        mark_repo_release_watchers(
+            state,
+            &row.id,
+            "failed",
+            Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR),
+            &now,
         )
         .await?;
+    }
 
-    Ok(ReleasePhaseOutcome {
-        succeeded: false,
-        releases_written: 0,
-        candidate_failures,
-    })
+    Ok(())
 }
 
 fn cmp_last_active_desc(left: Option<&str>, right: Option<&str>) -> Ordering {
@@ -1612,110 +2601,6 @@ async fn fetch_repo_releases_with_token(
         page += 1;
     }
     Ok(releases)
-}
-
-async fn upsert_releases_for_users(
-    state: &AppState,
-    repo_id: i64,
-    user_ids: &[String],
-    releases: &[GitHubRelease],
-) -> Result<usize> {
-    let now = chrono::Utc::now().to_rfc3339();
-    for user_id in user_ids {
-        for release in releases {
-            sqlx::query(
-                r#"
-                INSERT INTO releases (
-                  id, user_id, repo_id, release_id, node_id, tag_name, name, body, html_url,
-                  published_at, created_at, is_prerelease, is_draft, updated_at,
-                  react_plus1, react_laugh, react_heart, react_hooray, react_rocket, react_eyes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id, release_id) DO UPDATE SET
-                  node_id = excluded.node_id,
-                  tag_name = excluded.tag_name,
-                  name = excluded.name,
-                  body = excluded.body,
-                  html_url = excluded.html_url,
-                  published_at = excluded.published_at,
-                  created_at = excluded.created_at,
-                  is_prerelease = excluded.is_prerelease,
-                  is_draft = excluded.is_draft,
-                  react_plus1 = excluded.react_plus1,
-                  react_laugh = excluded.react_laugh,
-                  react_heart = excluded.react_heart,
-                  react_hooray = excluded.react_hooray,
-                  react_rocket = excluded.react_rocket,
-                  react_eyes = excluded.react_eyes,
-                  updated_at = excluded.updated_at
-                "#,
-            )
-            .bind(local_id::generate_local_id())
-            .bind(user_id)
-            .bind(repo_id)
-            .bind(release.id)
-            .bind(release.node_id.as_deref())
-            .bind(&release.tag_name)
-            .bind(release.name.as_deref())
-            .bind(release.body.as_deref())
-            .bind(&release.html_url)
-            .bind(release.published_at.as_deref())
-            .bind(release.created_at.as_deref())
-            .bind(release.prerelease as i64)
-            .bind(release.draft as i64)
-            .bind(&now)
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.plus1)
-                    .unwrap_or(0),
-            )
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.laugh)
-                    .unwrap_or(0),
-            )
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.heart)
-                    .unwrap_or(0),
-            )
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.hooray)
-                    .unwrap_or(0),
-            )
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.rocket)
-                    .unwrap_or(0),
-            )
-            .bind(
-                release
-                    .reactions
-                    .as_ref()
-                    .map(|value| value.eyes)
-                    .unwrap_or(0),
-            )
-            .execute(&state.pool)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upsert release {} for user #{}",
-                    release.tag_name, user_id
-                )
-            })?;
-        }
-    }
-    Ok(user_ids.len() * releases.len())
 }
 
 pub async fn sync_notifications(

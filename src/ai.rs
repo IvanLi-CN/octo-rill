@@ -3045,10 +3045,10 @@ async fn build_brief_content(
           r.html_url,
           COALESCE(r.published_at, r.created_at, r.updated_at) AS published_at,
           r.is_prerelease
-        FROM releases r
+        FROM repo_releases r
         JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = ?
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        WHERE sr.user_id = ?
           AND r.is_draft = 0
           AND COALESCE(r.published_at, r.created_at, r.updated_at) >= ?
           AND COALESCE(r.published_at, r.created_at, r.updated_at) < ?
@@ -3058,6 +3058,7 @@ async fn build_brief_content(
         LIMIT 300
         "#,
     )
+    .bind(user_id)
     .bind(user_id)
     .bind(&start_utc)
     .bind(&end_utc)
