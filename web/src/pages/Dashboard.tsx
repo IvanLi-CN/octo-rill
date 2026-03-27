@@ -539,10 +539,31 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const onSyncAll = useCallback(() => {
 		void run(SYNC_ALL_LABEL, async () => {
-			await apiPostTaskSse("/api/sync/starred?return_mode=sse");
-			await apiPostTaskSse("/api/sync/releases?return_mode=sse");
-			await apiPostTaskSse("/api/sync/notifications?return_mode=sse");
-			await refreshAll();
+			let shouldRefresh = false;
+			let syncError: unknown = null;
+
+			try {
+				await apiPostTaskSse("/api/sync/starred?return_mode=sse");
+				shouldRefresh = true;
+				await apiPostTaskSse("/api/sync/releases?return_mode=sse");
+				shouldRefresh = true;
+				await apiPostTaskSse("/api/sync/notifications?return_mode=sse");
+				shouldRefresh = true;
+			} catch (err) {
+				syncError = err;
+			}
+
+			if (shouldRefresh) {
+				try {
+					await refreshAll();
+				} catch (refreshErr) {
+					if (!syncError) throw refreshErr;
+				}
+			}
+
+			if (syncError) {
+				throw syncError;
+			}
 		});
 	}, [refreshAll, run]);
 	const syncingAll = busy === SYNC_ALL_LABEL;
