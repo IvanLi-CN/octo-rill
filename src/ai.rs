@@ -114,9 +114,11 @@ impl LlmScheduler {
     }
 
     pub async fn set_max_concurrency(&self, max_concurrency: usize) {
-        self.max_concurrency
-            .store(max_concurrency.max(1), Ordering::Relaxed);
-        self.notify.notify_waiters();
+        let next = max_concurrency.max(1);
+        let previous = self.max_concurrency.swap(next, Ordering::Relaxed);
+        if next > previous {
+            self.notify_available_waiters(next - previous);
+        }
     }
 
     pub(crate) async fn admin_overrides(&self) -> HashMap<String, LlmCallAdminOverride> {
@@ -182,6 +184,13 @@ impl LlmScheduler {
             }
 
             notified.await;
+        }
+    }
+
+    fn notify_available_waiters(&self, slots: usize) {
+        let waiters = self.waiting_calls.load(Ordering::Relaxed);
+        for _ in 0..slots.min(waiters) {
+            self.notify.notify_one();
         }
     }
 }
@@ -1186,7 +1195,7 @@ impl SchedulerInFlightGuard {
         self.scheduler
             .in_flight_calls
             .fetch_sub(1, Ordering::Relaxed);
-        self.scheduler.notify.notify_waiters();
+        self.scheduler.notify.notify_one();
     }
 }
 
@@ -1204,7 +1213,7 @@ impl Drop for SchedulerInFlightGuard {
         self.scheduler
             .in_flight_calls
             .fetch_sub(1, Ordering::Relaxed);
-        self.scheduler.notify.notify_waiters();
+        self.scheduler.notify.notify_one();
     }
 }
 

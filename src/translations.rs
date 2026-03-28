@@ -745,20 +745,9 @@ impl TranslationSchedulerController {
             }
         }
         reconcile_worker_runtime_slots(&mut runtime, config);
-        let topology_changed = runtime.len() != previous_topology.len()
-            || runtime.iter().any(|entry| {
-                previous_topology
-                    .get(entry.worker_id.as_str())
-                    .map(|(worker_slot, worker_kind)| {
-                        *worker_slot != entry.worker_slot || worker_kind != &entry.worker_kind
-                    })
-                    .unwrap_or(true)
-            });
+        let topology_changed = translation_runtime_topology_changed(&runtime, &previous_topology);
         if topology_changed {
-            let updated_at = Utc::now().to_rfc3339();
-            for entry in runtime.iter_mut() {
-                entry.updated_at = updated_at.clone();
-            }
+            refresh_translation_runtime_updated_at(&mut runtime);
         }
         config
     }
@@ -878,8 +867,20 @@ impl TranslationSchedulerController {
     async fn remove_worker_runtime(&self, worker_id: &str) {
         let desired_config = self.desired_config().await;
         let mut runtime = self.runtime.write().await;
+        let previous_topology = runtime
+            .iter()
+            .map(|entry| {
+                (
+                    entry.worker_id.clone(),
+                    (entry.worker_slot, entry.worker_kind.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         runtime.retain(|entry| entry.worker_id != worker_id);
         reconcile_worker_runtime_slots(&mut runtime, desired_config);
+        if translation_runtime_topology_changed(&runtime, &previous_topology) {
+            refresh_translation_runtime_updated_at(&mut runtime);
+        }
     }
 
     async fn update_worker_runtime(
@@ -1019,6 +1020,28 @@ fn next_available_worker_slot(occupied_slots: &HashSet<i64>) -> i64 {
         next_slot += 1;
     }
     next_slot
+}
+
+fn translation_runtime_topology_changed(
+    runtime: &[TranslationWorkerRuntimeState],
+    previous_topology: &HashMap<String, (i64, String)>,
+) -> bool {
+    runtime.len() != previous_topology.len()
+        || runtime.iter().any(|entry| {
+            previous_topology
+                .get(entry.worker_id.as_str())
+                .map(|(worker_slot, worker_kind)| {
+                    *worker_slot != entry.worker_slot || worker_kind != &entry.worker_kind
+                })
+                .unwrap_or(true)
+        })
+}
+
+fn refresh_translation_runtime_updated_at(runtime: &mut [TranslationWorkerRuntimeState]) {
+    let updated_at = Utc::now().to_rfc3339();
+    for entry in runtime.iter_mut() {
+        entry.updated_at = updated_at.clone();
+    }
 }
 
 fn translation_worker_id(worker_kind: &str, worker_index: usize) -> String {
@@ -5478,6 +5501,65 @@ mod tests {
 
         let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         assert_eq!(workers.len(), 3);
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.worker_slot)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_worker_exit_refreshes_remaining_worker_timestamps_for_sse() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let worker_id = translation_worker_id("general", 3);
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(worker_id.as_str(), "general", 3),
+            TranslationWorkerRuntimeUpdate::idle(),
+        )
+        .await;
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = stale_updated_at.to_owned();
+            }
+        }
+
+        state
+            .translation_scheduler
+            .remove_worker_runtime(worker_id.as_str())
+            .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        assert_eq!(workers.len(), 3);
+        assert!(workers.iter().all(|worker| worker.worker_id != worker_id));
         assert!(
             workers
                 .iter()
