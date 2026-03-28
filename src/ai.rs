@@ -151,6 +151,8 @@ impl LlmScheduler {
         let queue_started_at = Instant::now();
         let mut waiting_guard = None;
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
             let mut acquired = false;
             {
                 let _gate = self.gate.lock().await;
@@ -179,7 +181,7 @@ impl LlmScheduler {
                 waiting_guard = Some(SchedulerWaitingGuard::new(&self.waiting_calls));
             }
 
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }

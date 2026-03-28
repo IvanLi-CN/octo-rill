@@ -727,7 +727,15 @@ impl TranslationSchedulerController {
         *self.desired_config.write().await = config;
 
         let desired_profiles = translation_worker_profiles(config);
+        let desired_worker_ids = desired_profiles
+            .iter()
+            .map(|profile| profile.worker_id.as_str())
+            .collect::<HashSet<_>>();
         let mut runtime = self.runtime.write().await;
+        runtime.retain(|entry| {
+            desired_worker_ids.contains(entry.worker_id.as_str())
+                || entry.current_batch_id.is_some()
+        });
         for profile in &desired_profiles {
             if let Some(entry) = runtime
                 .iter_mut()
@@ -797,6 +805,10 @@ impl TranslationSchedulerController {
         }
 
         self.unregister_worker(worker_id.as_str()).await;
+    }
+
+    async fn worker_is_desired(&self, worker_id: &str) -> bool {
+        self.profile_by_worker_id(worker_id).await.is_some()
     }
 
     async fn profile_by_worker_id(&self, worker_id: &str) -> Option<TranslationWorkerProfile> {
@@ -1951,6 +1963,18 @@ async fn run_translation_scheduler_once(
     state: &AppState,
     worker: TranslationWorkerProfile,
 ) -> Result<()> {
+    if !state
+        .translation_scheduler
+        .worker_is_desired(worker.worker_id.as_str())
+        .await
+    {
+        state
+            .translation_scheduler
+            .remove_worker_runtime(worker.worker_id.as_str())
+            .await;
+        return Ok(());
+    }
+
     let Some(batch) = claim_next_batch(state, worker.clone()).await? else {
         update_translation_worker_runtime(state, &worker, TranslationWorkerRuntimeUpdate::idle())
             .await;
@@ -2250,24 +2274,46 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         Ok(results) => {
             let res = finalize_batch_success(state, &batch, results).await;
             heartbeat.stop().await;
-            update_translation_worker_runtime(
-                state,
-                &worker,
-                TranslationWorkerRuntimeUpdate::idle(),
-            )
-            .await;
+            if state
+                .translation_scheduler
+                .worker_is_desired(worker.worker_id.as_str())
+                .await
+            {
+                update_translation_worker_runtime(
+                    state,
+                    &worker,
+                    TranslationWorkerRuntimeUpdate::idle(),
+                )
+                .await;
+            } else {
+                state
+                    .translation_scheduler
+                    .remove_worker_runtime(worker.worker_id.as_str())
+                    .await;
+            }
             res
         }
         Err(err) => {
             let error = err.to_string();
             let res = finalize_batch_failure(state, &batch, err.into()).await;
             heartbeat.stop().await;
-            update_translation_worker_runtime(
-                state,
-                &worker,
-                TranslationWorkerRuntimeUpdate::error(error.as_str()),
-            )
-            .await;
+            if state
+                .translation_scheduler
+                .worker_is_desired(worker.worker_id.as_str())
+                .await
+            {
+                update_translation_worker_runtime(
+                    state,
+                    &worker,
+                    TranslationWorkerRuntimeUpdate::error(error.as_str()),
+                )
+                .await;
+            } else {
+                state
+                    .translation_scheduler
+                    .remove_worker_runtime(worker.worker_id.as_str())
+                    .await;
+            }
             res
         }
     }
