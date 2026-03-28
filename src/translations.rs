@@ -1056,6 +1056,9 @@ fn translation_runtime_topology_changed(
 fn refresh_translation_runtime_updated_at(runtime: &mut [TranslationWorkerRuntimeState]) {
     let updated_at = Utc::now().to_rfc3339();
     for entry in runtime.iter_mut() {
+        if entry.status == "running" {
+            continue;
+        }
         entry.updated_at = updated_at.clone();
     }
 }
@@ -5783,6 +5786,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_resize_preserves_running_worker_timestamps() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let running_worker_id = translation_worker_id("user_dedicated", 1);
+        let running_updated_at = "2026-03-07T00:00:01Z";
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-running-dedicated", 1, 1, "deadline"),
+        )
+        .await;
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = if entry.worker_id == running_worker_id {
+                    running_updated_at.to_owned()
+                } else {
+                    stale_updated_at.to_owned()
+                };
+            }
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == running_worker_id)
+            .expect("dedicated worker exists after shrink");
+
+        assert_eq!(dedicated.status, "running");
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.updated_at, running_updated_at);
+        assert!(
+            workers
+                .iter()
+                .filter(|worker| worker.worker_id != running_worker_id)
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+    }
+
+    #[tokio::test]
     async fn drained_worker_exit_refreshes_remaining_worker_timestamps_for_sse() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -5850,6 +5906,8 @@ mod tests {
         let drained_worker_id = translation_worker_id("general", 3);
         let dedicated_worker_id = translation_worker_id("user_dedicated", 1);
         let now = Utc::now().to_rfc3339();
+        let running_updated_at = "2026-03-07T00:00:01Z";
+        let stale_updated_at = "2026-03-07T00:00:00Z";
 
         reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         sqlx::query(
@@ -5925,6 +5983,16 @@ mod tests {
             TranslationWorkerRuntimeUpdate::idle(),
         )
         .await;
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = if entry.worker_id == dedicated_worker_id {
+                    running_updated_at.to_owned()
+                } else {
+                    stale_updated_at.to_owned()
+                };
+            }
+        }
 
         state
             .translation_scheduler
@@ -5947,6 +6015,21 @@ mod tests {
         assert_eq!(
             batch_row.get::<String, _>("worker_kind"),
             "user_dedicated".to_owned()
+        );
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == dedicated_worker_id)
+            .expect("dedicated worker remains after drained exit");
+        assert_eq!(dedicated.status, "running");
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.updated_at, running_updated_at);
+        assert!(
+            workers
+                .iter()
+                .filter(|worker| worker.worker_id != dedicated_worker_id)
+                .all(|worker| worker.updated_at != stale_updated_at)
         );
     }
 
