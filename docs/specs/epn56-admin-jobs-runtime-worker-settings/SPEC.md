@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-03-27
-- Last: 2026-03-27
+- Last: 2026-03-28
 
 ## 背景 / 问题陈述
 
@@ -128,7 +128,9 @@
 ## 非功能性验收 / 质量门槛（Quality Gates）
 
 - [x] `cargo test`
+- [x] `cargo clippy --all-targets -- -D warnings`
 - [x] `cd web && bun run build`
+- [x] `cd web && bun run lint`
 - [x] `cd web && bun run storybook:build`
 - [x] `cd web && bun run e2e -- admin-jobs.spec.ts`
 
@@ -147,7 +149,7 @@
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
+- submission_gate: `owner-approved`
 - story_id_or_title: `Admin/Admin Jobs / LlmSettingsDialog`
 - state: `llm-settings-dialog-open`
 - evidence_note: 验证 `LLM 调度` 卡片右上角设置按钮可打开对话框，并回填当前并发上限与缩容说明。
@@ -160,7 +162,7 @@
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
+- submission_gate: `owner-approved`
 - story_id_or_title: `Admin/Admin Jobs / TranslationSettingsDialog`
 - state: `translation-settings-dialog-open`
 - evidence_note: 验证 `工作者板` 右上角设置按钮可打开双输入对话框，并展示排空缩容说明。
@@ -173,7 +175,7 @@
 - target_program: `mock-only`
 - capture_scope: `browser-viewport`
 - sensitive_exclusion: `N/A`
-- submission_gate: `pending-owner-approval`
+- submission_gate: `owner-approved`
 - story_id_or_title: `Admin/Admin Jobs / TranslationSettingsSaved`
 - state: `translation-worker-board-resized`
 - evidence_note: 验证保存 `5 general + 2 dedicated` 后，工作者板文案、卡片数量与顺序立即收敛到新运行时配置。
@@ -185,7 +187,7 @@
 - [x] M1: 单例 runtime settings 表、启动种子逻辑与接口契约冻结。
 - [x] M2: LLM permit gate 与 translation worker runtime registry 支持热更新与排空缩容。
 - [x] M3: 管理端设置按钮、弹窗、Storybook 与 Playwright 覆盖完成。
-- [ ] M4: 视觉证据、PR 与 review-loop 收敛到 merge-ready。
+- [x] M4: 视觉证据、PR 与 review-loop 收敛到 merge-ready。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
