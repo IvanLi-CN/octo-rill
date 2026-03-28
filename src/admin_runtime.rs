@@ -4,9 +4,10 @@ use sqlx::{Row, SqlitePool};
 
 use crate::{
     config::AppConfig,
+    state::AppState,
     translations::{
         DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-        DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
+        DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY, TranslationRuntimeConfig,
     },
 };
 
@@ -104,6 +105,32 @@ pub async fn update_translation_runtime_settings(
     })
 }
 
+pub async fn sync_persisted_runtime_settings(
+    state: std::sync::Arc<AppState>,
+) -> Result<AdminRuntimeSettingsSnapshot> {
+    let snapshot = match fetch_runtime_settings(&state.pool).await? {
+        Some(snapshot) => snapshot,
+        None => load_or_seed_runtime_settings(&state.pool, &state.config).await?,
+    };
+
+    state
+        .llm_scheduler
+        .set_max_concurrency(snapshot.llm_max_concurrency)
+        .await;
+    state
+        .translation_scheduler
+        .apply_runtime_config(
+            state.clone(),
+            TranslationRuntimeConfig::new(
+                snapshot.translation_general_worker_concurrency,
+                snapshot.translation_dedicated_worker_concurrency,
+            ),
+        )
+        .await;
+
+    Ok(snapshot)
+}
+
 async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntimeSettingsSnapshot>> {
     let row = sqlx::query(
         r#"
@@ -139,10 +166,18 @@ mod tests {
         SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
+    use std::sync::Arc;
     use url::Url;
 
     use super::*;
-    use crate::{config::AppConfig, crypto::EncryptionKey, local_id::generate_local_id};
+    use crate::{
+        ai::LlmScheduler,
+        config::AppConfig,
+        crypto::EncryptionKey,
+        local_id::generate_local_id,
+        state::build_oauth_client,
+        translations::{TranslationRuntimeConfig, TranslationSchedulerController},
+    };
 
     #[tokio::test]
     async fn load_or_seed_runtime_settings_is_idempotent_for_concurrent_callers() {
@@ -174,6 +209,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sync_persisted_runtime_settings_updates_live_schedulers() {
+        let pool = setup_pool().await;
+        let config = test_config(1);
+        load_or_seed_runtime_settings(&pool, &config)
+            .await
+            .expect("seed runtime settings");
+        let state = setup_state(pool.clone(), config.clone());
+
+        update_llm_runtime_settings(&pool, 4)
+            .await
+            .expect("update llm settings");
+        update_translation_runtime_settings(&pool, 5, 2)
+            .await
+            .expect("update translation settings");
+
+        sync_persisted_runtime_settings(state.clone())
+            .await
+            .expect("sync persisted runtime settings");
+
+        assert_eq!(state.llm_scheduler.max_concurrency(), 4);
+        assert_eq!(
+            state.translation_scheduler.desired_config().await,
+            TranslationRuntimeConfig::new(5, 2),
+        );
+        assert_eq!(
+            state.translation_scheduler.runtime_statuses().await.len(),
+            7
+        );
+
+        state.translation_scheduler.abort_all().await;
+    }
+
     async fn setup_pool() -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-admin-runtime-{}.db",
@@ -192,6 +260,22 @@ mod tests {
             .await
             .expect("run migrations");
         pool
+    }
+
+    fn setup_state(pool: SqlitePool, config: AppConfig) -> Arc<AppState> {
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(TranslationSchedulerController::new(
+                TranslationRuntimeConfig::default(),
+            )),
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key: config.encryption_key.clone(),
+            runtime_owner_id: generate_local_id(),
+            pool,
+            config,
+        })
     }
 
     fn test_config(ai_max_concurrency: usize) -> AppConfig {
