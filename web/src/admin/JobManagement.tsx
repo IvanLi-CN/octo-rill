@@ -3440,6 +3440,9 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				scheduleStreamRefresh("llm");
 			};
+			const onLlmSchedulerEvent = () => {
+				scheduleStreamRefresh("llm");
+			};
 			const onTranslationEvent = (evt: Event) => {
 				const message = evt as MessageEvent<string>;
 				let parsed: AdminTranslationStreamEvent | null = null;
@@ -3459,6 +3462,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			nextSource.addEventListener("job.event", onJobEvent as EventListener);
 			nextSource.addEventListener("llm.call", onLlmCallEvent as EventListener);
 			nextSource.addEventListener(
+				"llm.scheduler",
+				onLlmSchedulerEvent as EventListener,
+			);
+			nextSource.addEventListener(
 				"translation.event",
 				onTranslationEvent as EventListener,
 			);
@@ -3474,6 +3481,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				nextSource.removeEventListener(
 					"llm.call",
 					onLlmCallEvent as EventListener,
+				);
+				nextSource.removeEventListener(
+					"llm.scheduler",
+					onLlmSchedulerEvent as EventListener,
 				);
 				nextSource.removeEventListener(
 					"translation.event",
