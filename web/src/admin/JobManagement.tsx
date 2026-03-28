@@ -152,7 +152,7 @@ function formatTranslationWorkerBoardDescription(
 	) {
 		return "当前展示翻译工作者的实时槽位状态。";
 	}
-	return `当前展示 ${generalWorkerConcurrency} 个通用 worker 与 ${dedicatedWorkerConcurrency} 个用户专用 worker 的实时槽位状态。`;
+	return `目标配置为 ${generalWorkerConcurrency} 个通用 worker 与 ${dedicatedWorkerConcurrency} 个用户专用 worker；下方展示实时槽位状态。`;
 }
 
 function localInputToUtc(value: string) {
