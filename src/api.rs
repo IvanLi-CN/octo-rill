@@ -39,6 +39,84 @@ fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
 
+fn parse_internal_brief_release_id(target: &str) -> Option<i64> {
+    let base = Url::parse("https://octorill.local/").expect("valid local base url");
+    let joined = base.join(target.trim()).ok()?;
+
+    if joined.host_str() != Some("octorill.local") {
+        return None;
+    }
+
+    let tab = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))?;
+    if tab != "briefs" {
+        return None;
+    }
+
+    let raw_release = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "release").then_some(v.into_owned()))?;
+    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    raw_release.parse::<i64>().ok()
+}
+
+fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
+    let mut i = 0usize;
+
+    while i < markdown.len() {
+        let rest = &markdown[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+            let target = &markdown[url_start..url_end];
+            if parse_internal_brief_release_id(target) == Some(release_id) {
+                return true;
+            }
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        i += ch.len_utf8();
+    }
+
+    false
+}
+
+async fn user_has_brief_access_to_release(
+    state: &AppState,
+    user_id: &str,
+    release_id: i64,
+) -> Result<bool, ApiError> {
+    let hint = format!("%release={release_id}%");
+    let briefs = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT content_markdown
+        FROM briefs
+        WHERE user_id = ?
+          AND content_markdown LIKE ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(hint)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(briefs
+        .iter()
+        .any(|markdown| brief_contains_release_link(markdown, release_id)))
+}
+
 pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, ApiError> {
     local_id::normalize_local_id(&raw)
         .ok_or_else(|| ApiError::bad_request(format!("invalid {field}")))
@@ -2792,7 +2870,7 @@ pub async fn get_release_detail(
           t.title AS trans_title,
           t.summary AS trans_summary
         FROM repo_releases r
-        JOIN starred_repos sr
+        LEFT JOIN starred_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
           ON t.user_id = ?
@@ -2817,6 +2895,16 @@ pub async fn get_release_detail(
             "release not found",
         ));
     };
+
+    if row.repo_full_name.is_none()
+        && !user_has_brief_access_to_release(state.as_ref(), &user_id, release_id).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
 
     let original_title = row
         .name
@@ -7748,12 +7836,13 @@ mod tests {
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
-        extract_translation_fields, get_release_detail, github_graphql_errors_to_api_error,
-        github_graphql_http_error, guard_admin_user_update, has_repo_scope, last_active_is_stale,
-        list_releases, llm_call_order_by_clause, load_pending_access_sync_reason,
-        looks_like_json_blob, map_job_action_error, markdown_structure_preserved, me,
-        normalize_translation_fields, parse_batch_notification_translation_payload,
+        ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
+        ensure_account_enabled, extract_translation_fields, get_release_detail,
+        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
+        has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, me, normalize_translation_fields,
+        parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
@@ -8408,6 +8497,24 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed starred");
+    }
+
+    async fn seed_brief(pool: &SqlitePool, user_id: &str, date: &str, content_markdown: &str) {
+        let created_at = format!("{date}T08:00:00Z");
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (id, user_id, date, content_markdown, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(format!("brief-{date}"))
+        .bind(user_id)
+        .bind(date)
+        .bind(content_markdown)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed brief");
     }
 
     async fn seed_access_refresh_task(
@@ -10637,36 +10744,17 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
-    #[tokio::test]
-    async fn release_detail_query_is_readable_without_star() {
-        let pool = setup_pool().await;
-        seed_release(&pool, 42, 120).await;
+    #[test]
+    fn brief_contains_release_link_matches_exact_id() {
+        let markdown = "- [v1.2.3](/?tab=briefs&release=123)";
+        assert!(brief_contains_release_link(markdown, 123));
+        assert!(!brief_contains_release_link(markdown, 12));
+    }
 
-        #[derive(Debug, sqlx::FromRow)]
-        struct Row {
-            release_id: i64,
-            repo_full_name: Option<String>,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"
-            SELECT r.release_id, sr.full_name AS repo_full_name
-            FROM releases r
-            LEFT JOIN starred_repos sr
-              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-            WHERE r.user_id = ? AND r.release_id = ?
-            LIMIT 1
-            "#,
-        )
-        .bind(test_user_id(1))
-        .bind(120_i64)
-        .fetch_optional(&pool)
-        .await
-        .expect("query detail");
-
-        let row = row.expect("detail row");
-        assert_eq!(row.release_id, 120);
-        assert!(row.repo_full_name.is_none());
+    #[test]
+    fn brief_contains_release_link_accepts_query_order_variant() {
+        let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
+        assert!(brief_contains_release_link(markdown, 123));
     }
 
     #[tokio::test]
@@ -10744,6 +10832,42 @@ mod tests {
             detail.html_url,
             "https://github.com/openai/codex/releases/tag/v1.2.3"
         );
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_allows_historical_brief_link_without_current_star() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "- [v1.2.3](/?tab=briefs&release=120)",
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail from brief link");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_rejects_unstarred_release_without_brief_link() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let err = get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+            .await
+            .expect_err("release detail should stay hidden");
+
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

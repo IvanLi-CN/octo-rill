@@ -1019,9 +1019,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
-					syncingInbox={syncingInbox}
 					onSyncAll={onSyncAll}
-					onSyncInbox={onSyncInbox}
 				/>
 			}
 			footer={<AppMetaFooter />}
@@ -1094,7 +1092,16 @@ export function Dashboard(props: { me: MeResponse }) {
 							</div>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList notifications={notifications} />
+							<InboxList
+								notifications={notifications}
+								busy={Boolean(busy)}
+								syncing={syncingInbox}
+								onSync={
+									tab === "inbox" && notifications.length > 0
+										? onSyncInbox
+										: undefined
+								}
+							/>
 						</TabsContent>
 					</section>
 

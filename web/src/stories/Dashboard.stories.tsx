@@ -247,7 +247,6 @@ function DashboardPreview(props: {
 					busy={syncingAll}
 					syncingAll={syncingAll}
 					onSyncAll={() => {}}
-					onSyncInbox={() => {}}
 					logoutHref="#"
 				/>
 			}
@@ -313,7 +312,16 @@ function DashboardPreview(props: {
 							</div>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList notifications={notifications} />
+							<InboxList
+								notifications={notifications}
+								busy={syncingAll}
+								syncing={syncingAll}
+								onSync={
+									tab === "inbox" && notifications.length > 0
+										? () => {}
+										: undefined
+								}
+							/>
 						</TabsContent>
 					</section>
 
