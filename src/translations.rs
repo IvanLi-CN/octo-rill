@@ -15,7 +15,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
@@ -695,10 +695,10 @@ impl TranslationSchedulerController {
         self: &Arc<Self>,
         state: Arc<AppState>,
         config: TranslationRuntimeConfig,
-    ) -> TranslationRuntimeConfig {
-        let config = self.sync_runtime_with_config(config).await;
+    ) -> Result<TranslationRuntimeConfig> {
+        let config = self.sync_runtime_with_config(&state.pool, config).await?;
         self.ensure_workers_running(state).await;
-        config
+        Ok(config)
     }
 
     pub async fn spawn_initial_workers(self: &Arc<Self>, state: Arc<AppState>) {
@@ -707,12 +707,17 @@ impl TranslationSchedulerController {
 
     async fn sync_runtime_with_config(
         &self,
+        pool: &SqlitePool,
         config: TranslationRuntimeConfig,
-    ) -> TranslationRuntimeConfig {
+    ) -> Result<TranslationRuntimeConfig> {
         let config = TranslationRuntimeConfig::new(
             config.general_worker_concurrency,
             config.dedicated_worker_concurrency,
         );
+        if *self.desired_config.read().await == config {
+            return Ok(config);
+        }
+        let _claim_guard = translation_batch_claim_lock().lock().await;
         *self.desired_config.write().await = config;
 
         let desired_profiles = translation_worker_profiles(config);
@@ -745,11 +750,14 @@ impl TranslationSchedulerController {
             }
         }
         reconcile_worker_runtime_slots(&mut runtime, config);
+        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
         let topology_changed = translation_runtime_topology_changed(&runtime, &previous_topology);
         if topology_changed {
             refresh_translation_runtime_updated_at(&mut runtime);
         }
-        config
+        drop(runtime);
+        sync_running_batch_slot_updates(pool, &batch_slot_updates).await?;
+        Ok(config)
     }
 
     async fn ensure_workers_running(self: &Arc<Self>, state: Arc<AppState>) {
@@ -1073,8 +1081,71 @@ async fn reset_translation_worker_runtime_for_tests(state: &AppState) {
     let config = state.translation_scheduler.desired_config().await;
     state
         .translation_scheduler
-        .sync_runtime_with_config(config)
-        .await;
+        .sync_runtime_with_config(&state.pool, config)
+        .await
+        .expect("reset translation runtime");
+}
+
+#[derive(Debug, Clone)]
+struct RunningBatchSlotUpdate {
+    batch_id: String,
+    worker_id: String,
+    worker_slot: i64,
+    worker_kind: String,
+}
+
+fn collect_running_batch_slot_updates(
+    runtime: &[TranslationWorkerRuntimeState],
+    previous_topology: &HashMap<String, (i64, String)>,
+) -> Vec<RunningBatchSlotUpdate> {
+    runtime
+        .iter()
+        .filter_map(|entry| {
+            let batch_id = entry.current_batch_id.as_ref()?;
+            let previous = previous_topology.get(entry.worker_id.as_str());
+            let slot_changed = previous
+                .map(|(worker_slot, worker_kind)| {
+                    *worker_slot != entry.worker_slot || *worker_kind != entry.worker_kind
+                })
+                .unwrap_or(true);
+            if !slot_changed {
+                return None;
+            }
+            Some(RunningBatchSlotUpdate {
+                batch_id: batch_id.clone(),
+                worker_id: entry.worker_id.clone(),
+                worker_slot: entry.worker_slot,
+                worker_kind: entry.worker_kind.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn sync_running_batch_slot_updates(
+    pool: &SqlitePool,
+    updates: &[RunningBatchSlotUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let updated_at = Utc::now().to_rfc3339();
+    for update in updates {
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET worker_slot = ?, worker_kind = ?, updated_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ?
+            "#,
+        )
+        .bind(update.worker_slot)
+        .bind(update.worker_kind.as_str())
+        .bind(updated_at.as_str())
+        .bind(update.batch_id.as_str())
+        .bind(update.worker_id.as_str())
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 fn claim_origin_case_sql() -> &'static str {
@@ -5276,11 +5347,15 @@ mod tests {
             .max(1);
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                resized_general_concurrency,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(
+                    resized_general_concurrency,
+                    DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+                ),
+            )
+            .await
+            .expect("shrink runtime");
         let expected_slot =
             i64::try_from(resized_general_concurrency + 1).expect("expected slot fits in i64");
 
@@ -5326,6 +5401,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_resize_updates_running_batch_slot_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        let worker_id = translation_worker_id("user_dedicated", 1);
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-slot-sync")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(worker_id.as_str())
+        .bind(test_dedicated_worker_slot())
+        .bind("user_dedicated")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::running("batch-runtime-slot-sync", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
+
+        let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+            r#"
+            SELECT id, status, trigger_reason, worker_slot, request_count, item_count,
+                   estimated_input_tokens, created_at, started_at, finished_at, updated_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind("batch-runtime-slot-sync")
+        .fetch_one(&pool)
+        .await
+        .expect("load running batch");
+
+        assert_eq!(row.worker_slot, 3);
+    }
+
+    #[tokio::test]
     async fn runtime_resize_keeps_unique_slots_for_retained_running_workers() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -5340,11 +5484,12 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("resize runtime");
 
         let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         let slots = workers
@@ -5381,8 +5526,9 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(4, 1))
-            .await;
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(4, 1))
+            .await
+            .expect("expand runtime");
 
         let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         let slots = workers
@@ -5419,8 +5565,9 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(2, 1))
-            .await;
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
 
         let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         let slots = workers
@@ -5454,16 +5601,53 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
 
         let batch = claim_next_batch(state.as_ref(), test_worker_profile(3, "general"))
             .await
             .expect("claim result");
         assert!(batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_config_waits_for_inflight_claims_before_removing_worker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let claim_guard = translation_batch_claim_lock().lock().await;
+        let scheduler = Arc::clone(&state.translation_scheduler);
+        let resize_state = state.clone();
+        let resize = tokio::spawn(async move {
+            scheduler
+                .apply_runtime_config(resize_state, TranslationRuntimeConfig::new(2, 1))
+                .await
+                .expect("apply runtime config")
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            state
+                .translation_scheduler
+                .desired_config()
+                .await
+                .general_worker_concurrency,
+            DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
+        );
+
+        drop(claim_guard);
+
+        let applied = resize.await.expect("resize task should finish");
+        assert_eq!(applied.general_worker_concurrency, 2);
+        assert!(
+            !state
+                .translation_scheduler
+                .worker_is_desired("translation-worker-general-3")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -5486,11 +5670,12 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
 
         state
             .translation_scheduler
@@ -5498,7 +5683,8 @@ mod tests {
                 state.clone(),
                 TranslationRuntimeConfig::new(3, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
             )
-            .await;
+            .await
+            .expect("apply translation runtime config");
 
         state
             .translation_scheduler
@@ -5560,11 +5746,12 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
 
         let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         assert_eq!(workers.len(), 3);
@@ -5599,11 +5786,12 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
 
         update_translation_worker_runtime(
             state.as_ref(),
@@ -5656,11 +5844,12 @@ mod tests {
 
         state
             .translation_scheduler
-            .sync_runtime_with_config(TranslationRuntimeConfig::new(
-                2,
-                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
-            ))
-            .await;
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
 
         let status = load_admin_translation_status_response(state.as_ref())
             .await
