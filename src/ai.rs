@@ -117,7 +117,7 @@ impl LlmScheduler {
         let next = max_concurrency.max(1);
         let previous = self.max_concurrency.swap(next, Ordering::Relaxed);
         if next > previous {
-            self.notify_available_waiters(next - previous);
+            self.notify.notify_waiters();
         }
     }
 
@@ -184,13 +184,6 @@ impl LlmScheduler {
             }
 
             notified.await;
-        }
-    }
-
-    fn notify_available_waiters(&self, slots: usize) {
-        let waiters = self.waiting_calls.load(Ordering::Relaxed);
-        for _ in 0..slots.min(waiters) {
-            self.notify.notify_one();
         }
     }
 }
@@ -3359,6 +3352,32 @@ mod tests {
         assert_eq!(final_status.available_slots, 1);
         assert_eq!(final_status.in_flight_calls, 0);
         assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_resize_wakes_queued_call_without_releasing_active_slot() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, first_guard) = scheduler.acquire_slot().await;
+        let queued_scheduler = Arc::clone(&scheduler);
+        let queued = tokio::spawn(async move { queued_scheduler.acquire_slot().await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        scheduler.set_max_concurrency(2).await;
+
+        let (queued_wait_ms, second_guard) = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued acquire should be notified after resize")
+            .expect("queued acquire should finish");
+
+        assert!(queued_wait_ms >= 0);
+        let status = scheduler.runtime_status();
+        assert_eq!(status.max_concurrency, 2);
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 2);
+        assert_eq!(status.waiting_calls, 0);
+
+        drop(second_guard);
+        drop(first_guard);
     }
 
     #[tokio::test]
