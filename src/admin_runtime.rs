@@ -126,7 +126,7 @@ pub async fn sync_persisted_runtime_settings(
                 snapshot.translation_dedicated_worker_concurrency,
             ),
         )
-        .await;
+        .await?;
 
     Ok(snapshot)
 }
