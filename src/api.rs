@@ -2334,6 +2334,9 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(
         load_admin_llm_scheduler_status_response(state.as_ref()).await?,
     ))
@@ -2346,13 +2349,12 @@ pub async fn admin_patch_llm_runtime_config(
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
-    let snapshot = admin_runtime::update_llm_runtime_settings(&state.pool, max_concurrency)
+    admin_runtime::update_llm_runtime_settings(&state.pool, max_concurrency)
         .await
         .map_err(ApiError::internal)?;
-    state
-        .llm_scheduler
-        .set_max_concurrency(snapshot.llm_max_concurrency)
-        .await;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(
         load_admin_llm_scheduler_status_response(state.as_ref()).await?,
@@ -10079,6 +10081,48 @@ mod tests {
         assert_eq!(resp.calls_24h, 2);
         assert_eq!(resp.failed_24h, 1);
         assert!(resp.avg_wait_ms_24h.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_scheduler_status_syncs_persisted_runtime_settings() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let now = "2026-03-28T11:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 4, 3, 1, ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+
+        let state = setup_state(pool);
+        assert_eq!(state.llm_scheduler.max_concurrency(), 1);
+
+        let session = setup_session(1).await;
+        let resp = admin_get_llm_scheduler_status(State(state.clone()), session)
+            .await
+            .expect("status should succeed")
+            .0;
+
+        assert_eq!(resp.max_concurrency, 4);
+        assert_eq!(resp.available_slots, 4);
+        assert_eq!(state.llm_scheduler.max_concurrency(), 4);
     }
 
     #[tokio::test]

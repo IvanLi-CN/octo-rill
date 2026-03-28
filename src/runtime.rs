@@ -8,7 +8,7 @@ use tokio::{
     time::{self, MissedTickBehavior},
 };
 
-use crate::state::AppState;
+use crate::{admin_runtime, state::AppState};
 
 pub const RUNTIME_LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 pub const RUNTIME_LEASE_STALE_AFTER: Duration = Duration::from_secs(90);
@@ -125,7 +125,11 @@ pub fn spawn_runtime_owner_heartbeat(state: Arc<AppState>) -> LeaseHeartbeat {
         RUNTIME_LEASE_HEARTBEAT_INTERVAL,
         move || {
             let state = state.clone();
-            async move { touch_runtime_owner_lease(state.as_ref()).await }
+            async move {
+                touch_runtime_owner_lease(state.as_ref()).await?;
+                admin_runtime::sync_persisted_runtime_settings(state.clone()).await?;
+                Ok(())
+            }
         },
     )
 }

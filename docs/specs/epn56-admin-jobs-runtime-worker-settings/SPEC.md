@@ -55,6 +55,7 @@
 ## 当前实现说明
 
 - 后端已支持 LLM permit 热更新，并通过单例 `admin_runtime_settings` 记录 `llm_max_concurrency`、`translation_general_worker_concurrency`、`translation_dedicated_worker_concurrency`。
+- 所有 live runtime 会在 `runtime_owner` heartbeat 与管理员状态读取时回拉 `admin_runtime_settings`，因此无需显式广播也能把并发设置收敛到最新持久化值。
 - translation scheduler 已从固定 `3 + 1` runtime 改为动态 worker registry，worker 以 `general` 在前、`user_dedicated` 在后生成连续槽位与稳定 `worker_id`。
 - 管理页已增加两个设置按钮和对应对话框，并在保存成功后立即刷新当前卡片/工作者板状态。
 - Storybook 与 Playwright 已覆盖打开弹窗、非法值校验、保存成功与工作者板数量变化路径。

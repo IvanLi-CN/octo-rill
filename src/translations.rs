@@ -1206,6 +1206,9 @@ pub async fn admin_get_translation_status(
     session: Session,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(
         load_admin_translation_status_response(state.as_ref()).await?,
     ))
@@ -1230,24 +1233,16 @@ pub async fn admin_patch_translation_runtime_config(
         dedicated_worker_concurrency,
     )?;
 
-    let snapshot = admin_runtime::update_translation_runtime_settings(
+    admin_runtime::update_translation_runtime_settings(
         &state.pool,
         general_worker_concurrency,
         dedicated_worker_concurrency,
     )
     .await
     .map_err(ApiError::internal)?;
-
-    state
-        .translation_scheduler
-        .apply_runtime_config(
-            state.clone(),
-            TranslationRuntimeConfig::new(
-                snapshot.translation_general_worker_concurrency,
-                snapshot.translation_dedicated_worker_concurrency,
-            ),
-        )
-        .await;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(Json(
         load_admin_translation_status_response(state.as_ref()).await?,
@@ -5539,6 +5534,48 @@ mod tests {
         );
         assert_eq!(status.target_worker_concurrency, 3);
         assert_eq!(status.workers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_syncs_persisted_runtime_settings() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-28T11:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 1, 5, 2, ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+
+        admin_runtime::sync_persisted_runtime_settings(state.clone())
+            .await
+            .expect("sync runtime settings");
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load translation status");
+
+        assert_eq!(status.general_worker_concurrency, 5);
+        assert_eq!(status.dedicated_worker_concurrency, 2);
+        assert_eq!(status.worker_concurrency, 7);
+        assert_eq!(status.target_general_worker_concurrency, 5);
+        assert_eq!(status.target_dedicated_worker_concurrency, 2);
+        assert_eq!(status.target_worker_concurrency, 7);
+        assert_eq!(status.workers.len(), 7);
+
+        state.translation_scheduler.abort_all().await;
     }
 
     #[tokio::test]
