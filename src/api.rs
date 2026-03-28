@@ -7005,6 +7005,7 @@ async fn translate_release_detail_internal(
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailSourceRow {
         repo_id: i64,
+        starred_repo_id: Option<i64>,
         html_url: String,
         tag_name: String,
         name: Option<String>,
@@ -7013,9 +7014,9 @@ async fn translate_release_detail_internal(
 
     let row = sqlx::query_as::<_, ReleaseDetailSourceRow>(
         r#"
-        SELECT r.repo_id, r.html_url, r.tag_name, r.name, r.body
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body
         FROM repo_releases r
-        JOIN starred_repos sr
+        LEFT JOIN starred_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         WHERE r.release_id = ?
         LIMIT 1
@@ -7034,6 +7035,16 @@ async fn translate_release_detail_internal(
             "release not found",
         ));
     };
+
+    if row.starred_repo_id.is_none()
+        && !user_has_brief_access_to_release(state, user_id, release_id).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
 
     let original_title = row
         .name
@@ -7849,12 +7860,13 @@ mod tests {
         release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
         release_excerpt, release_reactions_status, require_active_user_id,
         resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_response_from_batch_item,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
-        config::{AppConfig, GitHubOAuthConfig},
+        config::{AiConfig, AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         jobs,
         state::{AppState, build_oauth_client},
@@ -7998,6 +8010,47 @@ mod tests {
                     .expect("parse github redirect"),
             },
             ai: None,
+            ai_max_concurrency: 1,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+            runtime_owner_id: "api-test-runtime-owner".to_owned(),
+        })
+    }
+
+    fn setup_state_with_ai(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
+            job_worker_concurrency: 4,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: Some(AiConfig {
+                base_url: Url::parse("https://api.example.test/v1/").expect("parse ai base url"),
+                model: "test-model".to_owned(),
+                api_key: "test-key".to_owned(),
+            }),
             ai_max_concurrency: 1,
             ai_model_context_limit: None,
             ai_daily_at_local: None,
@@ -8515,6 +8568,36 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed brief");
+    }
+
+    async fn seed_release_detail_translation(
+        pool: &SqlitePool,
+        user_id: &str,
+        entity_id: &str,
+        source_hash: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(source_hash)
+        .bind(title)
+        .bind(summary)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release detail translation");
     }
 
     async fn seed_access_refresh_task(
@@ -10855,6 +10938,39 @@ mod tests {
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+    }
+
+    #[tokio::test]
+    async fn translate_release_detail_allows_historical_brief_link_without_current_star() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "- [v1.2.3](/?tab=briefs&release=120)",
+        )
+        .await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+        seed_release_detail_translation(
+            &pool,
+            user_id.as_str(),
+            "120",
+            source_hash.as_str(),
+            Some("版本 v1.2.3"),
+            Some("- 条目"),
+        )
+        .await;
+
+        let translated = translate_release_detail_for_user(state.as_ref(), user_id.as_str(), "120")
+            .await
+            .expect("translate release detail from brief link");
+
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(translated.summary.as_deref(), Some("- 条目"));
     }
 
     #[tokio::test]
