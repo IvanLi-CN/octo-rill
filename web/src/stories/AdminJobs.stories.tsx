@@ -1501,7 +1501,7 @@ export const TranslationSettingsSaved: Story = {
 		).not.toBeInTheDocument();
 		await expect(
 			body.getByText(
-				"当前展示 5 个通用 worker 与 2 个用户专用 worker 的实时槽位状态。",
+				"目标配置为 5 个通用 worker 与 2 个用户专用 worker；下方展示实时槽位状态。",
 			),
 		).toBeVisible();
 	},
