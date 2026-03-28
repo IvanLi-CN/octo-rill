@@ -5,7 +5,6 @@ import {
 	ApiError,
 	apiGet,
 	apiPost,
-	apiPostTaskSse,
 	apiPostJson,
 	apiPutJson,
 } from "@/api";
@@ -45,6 +44,25 @@ import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
 
+type TaskAcceptedResponse = {
+	mode: "task_id";
+	task_id: string;
+	task_type: string;
+	status: string;
+};
+
+type TaskStreamMode = "access" | "refresh";
+
+type TaskStreamState = {
+	taskId: string;
+	eventPath: string;
+};
+
+type TaskEventPayload = {
+	stage?: string;
+	status?: string;
+	error?: string;
+};
 type BriefGenerateResponse = {
 	date: string;
 	window_start: string | null;
@@ -68,6 +86,7 @@ type ReactionTokenCheckResponse = {
 };
 
 const SYNC_ALL_LABEL = "同步";
+const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
 
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
@@ -104,10 +123,6 @@ function parseDashboardQuery() {
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
-}
-
-function getErrorMessage(err: unknown) {
-	return err instanceof Error ? err.message : String(err);
 }
 
 function sessionExpiredHint() {
@@ -150,9 +165,41 @@ function firstPendingReactionContent(
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 	const isAdmin = me.user.is_admin;
+	const accessSync = me.access_sync ?? {
+		task_id: null,
+		task_type: null,
+		event_path: null,
+		reason: "none" as const,
+	};
+	const initialAccessTask =
+		accessSync.task_id && accessSync.event_path
+			? {
+					taskId: accessSync.task_id,
+					eventPath: accessSync.event_path,
+					mode: "access" as const,
+				}
+			: null;
 
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
+	const [accessTaskStream, setAccessTaskStream] =
+		useState<TaskStreamState | null>(initialAccessTask);
+	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
+		TaskStreamState[]
+	>([]);
+	const [accessSyncStage, setAccessSyncStage] = useState<
+		"idle" | "waiting" | "star_refreshed" | "completed" | "failed"
+	>(initialAccessTask ? "waiting" : "idle");
+	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
+	const taskWaitersRef = useRef<
+		Map<
+			string,
+			{
+				promise: Promise<void>;
+				settle: (error?: Error) => void;
+			}
+		>
+	>(new Map());
 
 	const [tab, setTab] = useState<Tab>(() => parseDashboardQuery().tab);
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
@@ -160,6 +207,8 @@ export function Dashboard(props: { me: MeResponse }) {
 	);
 
 	const feed = useFeed();
+	const loadInitialFeed = feed.loadInitial;
+	const refreshFeed = feed.refresh;
 
 	const [showOriginalByKey, setShowOriginalByKey] = useState<
 		Record<string, boolean>
@@ -231,8 +280,61 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const refreshAll = useCallback(async () => {
 		setBootError(null);
-		await Promise.all([feed.refresh(), refreshSidebar()]);
-	}, [feed, refreshSidebar]);
+		await Promise.all([refreshFeed(), refreshSidebar()]);
+	}, [refreshFeed, refreshSidebar]);
+
+	const ensureTaskWaiter = useCallback((taskId: string) => {
+		const existing = taskWaitersRef.current.get(taskId);
+		if (existing) {
+			return existing.promise;
+		}
+
+		let settled = false;
+		let settle = (_error?: Error) => undefined;
+		const promise = new Promise<void>((resolve, reject) => {
+			settle = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				taskWaitersRef.current.delete(taskId);
+				if (error) {
+					reject(error);
+					return;
+				}
+				resolve();
+			};
+		});
+
+		taskWaitersRef.current.set(taskId, { promise, settle });
+		return promise;
+	}, []);
+
+	const settleTaskWaiter = useCallback((taskId: string, error?: Error) => {
+		taskWaitersRef.current.get(taskId)?.settle(error);
+	}, []);
+
+	const trackTaskStream = useCallback(
+		(task: TaskAcceptedResponse, mode: TaskStreamMode) => {
+			const next = {
+				taskId: task.task_id,
+				eventPath: `/api/tasks/${task.task_id}/events`,
+			};
+			const promise = ensureTaskWaiter(task.task_id);
+			if (mode === "access") {
+				setAccessTaskStream((current) =>
+					current?.taskId === next.taskId ? current : next,
+				);
+				setAccessSyncStage("waiting");
+				return promise;
+			}
+			setRefreshTaskStreams((current) =>
+				current.some((item) => item.taskId === next.taskId)
+					? current
+					: [...current, next],
+			);
+			return promise;
+		},
+		[ensureTaskWaiter],
+	);
 
 	const run = useCallback(async <T,>(label: string, fn: () => Promise<T>) => {
 		setBusy(label);
@@ -253,14 +355,211 @@ export function Dashboard(props: { me: MeResponse }) {
 	});
 
 	useEffect(() => {
-		void feed.loadInitial();
+		void loadInitialFeed();
 		void refreshSidebar().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 		void loadReactionTokenStatus().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [feed.loadInitial, loadReactionTokenStatus, refreshSidebar]);
+	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
+
+	useEffect(() => {
+		if (!accessTaskStream) return;
+
+		const source = new EventSource(accessTaskStream.eventPath);
+		let reconnectTimer: number | null = null;
+		const clearReconnectTimer = () => {
+			if (reconnectTimer === null) return;
+			window.clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		};
+		const refreshOnUi = () => {
+			void refreshAll().catch((err) => {
+				setBootError(err instanceof Error ? err.message : String(err));
+			});
+		};
+		const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
+			try {
+				return JSON.parse(event.data) as TaskEventPayload;
+			} catch {
+				return {};
+			}
+		};
+		const failStream = (message: string) => {
+			clearReconnectTimer();
+			setAccessSyncStage((current) =>
+				current === "completed" ? current : "failed",
+			);
+			setBootError(message);
+			source.close();
+			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
+			setAccessTaskStream((current) =>
+				current?.taskId === accessTaskStream.taskId ? null : current,
+			);
+		};
+
+		const onProgress = (event: Event) => {
+			const payload = parsePayload(event as MessageEvent<string>);
+			if (payload.stage === "star_refreshed") {
+				setAccessSyncStage("star_refreshed");
+				refreshOnUi();
+			}
+		};
+
+		const onCompleted = (event: Event) => {
+			const payload = parsePayload(event as MessageEvent<string>);
+			const completedTaskId = accessTaskStream.taskId;
+			const complete = async () => {
+				clearReconnectTimer();
+				const failed =
+					payload.status !== "succeeded"
+						? new Error(payload.error ?? "后台同步失败")
+						: undefined;
+				setAccessSyncStage(
+					payload.status === "succeeded" ? "completed" : "failed",
+				);
+				if (payload.status === "succeeded") {
+					try {
+						await refreshAll();
+					} catch (err) {
+						const error = err instanceof Error ? err : new Error(String(err));
+						setBootError(error.message);
+						source.close();
+						settleTaskWaiter(completedTaskId, error);
+						setAccessTaskStream((current) =>
+							current?.taskId === completedTaskId ? null : current,
+						);
+						return;
+					}
+				} else if (payload.error) {
+					setBootError(payload.error);
+				}
+				source.close();
+				settleTaskWaiter(completedTaskId, failed);
+				setAccessTaskStream((current) =>
+					current?.taskId === completedTaskId ? null : current,
+				);
+			};
+			void complete();
+		};
+
+		source.onopen = clearReconnectTimer;
+		source.addEventListener("task.progress", onProgress);
+		source.addEventListener("task.completed", onCompleted);
+		source.onerror = () => {
+			if (source.readyState === EventSource.CLOSED) {
+				failStream("后台任务事件流已断开，请刷新页面后重试。");
+				return;
+			}
+			if (reconnectTimer !== null) return;
+			reconnectTimer = window.setTimeout(() => {
+				reconnectTimer = null;
+				failStream("后台任务事件流恢复超时，请刷新页面后重试。");
+			}, TASK_STREAM_RECOVERY_GRACE_MS);
+		};
+
+		return () => {
+			clearReconnectTimer();
+			source.removeEventListener("task.progress", onProgress);
+			source.removeEventListener("task.completed", onCompleted);
+			source.close();
+		};
+	}, [accessTaskStream, refreshAll, settleTaskWaiter]);
+
+	useEffect(() => {
+		if (refreshTaskStreams.length === 0) return;
+
+		for (const task of refreshTaskStreams) {
+			if (refreshTaskSourcesRef.current.has(task.taskId)) {
+				continue;
+			}
+
+			const source = new EventSource(task.eventPath);
+			let reconnectTimer: number | null = null;
+			const clearReconnectTimer = () => {
+				if (reconnectTimer === null) return;
+				window.clearTimeout(reconnectTimer);
+				reconnectTimer = null;
+			};
+			refreshTaskSourcesRef.current.set(task.taskId, source);
+
+			const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
+				try {
+					return JSON.parse(event.data) as TaskEventPayload;
+				} catch {
+					return {};
+				}
+			};
+			const close = () => {
+				source.close();
+				refreshTaskSourcesRef.current.delete(task.taskId);
+				setRefreshTaskStreams((current) =>
+					current.filter((item) => item.taskId !== task.taskId),
+				);
+			};
+			const failStream = (message: string) => {
+				clearReconnectTimer();
+				setBootError(message);
+				settleTaskWaiter(task.taskId, new Error(message));
+				close();
+			};
+			const onCompleted = (event: Event) => {
+				const payload = parsePayload(event as MessageEvent<string>);
+				const completedTaskId = task.taskId;
+				const complete = async () => {
+					clearReconnectTimer();
+					const failed =
+						payload.status !== "succeeded"
+							? new Error(payload.error ?? "后台同步失败")
+							: undefined;
+					if (payload.status === "succeeded") {
+						try {
+							await refreshAll();
+						} catch (err) {
+							const error = err instanceof Error ? err : new Error(String(err));
+							setBootError(error.message);
+							settleTaskWaiter(completedTaskId, error);
+							close();
+							return;
+						}
+					} else if (payload.error) {
+						setBootError(payload.error);
+					}
+					settleTaskWaiter(completedTaskId, failed);
+					close();
+				};
+				void complete();
+			};
+
+			source.onopen = clearReconnectTimer;
+			source.addEventListener("task.completed", onCompleted);
+			source.onerror = () => {
+				if (source.readyState === EventSource.CLOSED) {
+					failStream("后台同步事件流已断开，请刷新页面后重试。");
+					return;
+				}
+				if (reconnectTimer !== null) return;
+				reconnectTimer = window.setTimeout(() => {
+					reconnectTimer = null;
+					failStream("后台同步事件流恢复超时，请刷新页面后重试。");
+				}, TASK_STREAM_RECOVERY_GRACE_MS);
+			};
+		}
+	}, [refreshTaskStreams, refreshAll, settleTaskWaiter]);
+
+	useEffect(() => {
+		return () => {
+			for (const source of refreshTaskSourcesRef.current.values()) {
+				source.close();
+			}
+			refreshTaskSourcesRef.current.clear();
+			for (const [taskId, waiter] of taskWaitersRef.current) {
+				waiter.settle(new Error(`Task stream ${taskId} was closed`));
+			}
+			taskWaitersRef.current.clear();
+		};
+	}, []);
 
 	const onToggleOriginal = useCallback((key: string) => {
 		setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -540,45 +839,43 @@ export function Dashboard(props: { me: MeResponse }) {
 			await refreshSidebar();
 		});
 	}, [refreshSidebar, run]);
+	const onSyncStarred = useCallback(() => {
+		void run("Sync starred", async () => {
+			const task = await apiPost<TaskAcceptedResponse>(
+				"/api/sync/starred?return_mode=task_id",
+			);
+			await trackTaskStream(task, "refresh");
+		});
+	}, [run, trackTaskStream]);
+
+	const onSyncReleases = useCallback(() => {
+		void run("Sync releases", async () => {
+			const task = await apiPost<TaskAcceptedResponse>(
+				"/api/sync/releases?return_mode=task_id",
+			);
+			await trackTaskStream(task, "refresh");
+		});
+	}, [run, trackTaskStream]);
+
+	const onSyncInbox = useCallback(() => {
+		void run("Sync inbox", async () => {
+			const task = await apiPost<TaskAcceptedResponse>(
+				"/api/sync/notifications?return_mode=task_id",
+			);
+			await trackTaskStream(task, "refresh");
+		});
+	}, [run, trackTaskStream]);
 
 	const onSyncAll = useCallback(() => {
 		void run(SYNC_ALL_LABEL, async () => {
-			let shouldRefresh = false;
-			let syncError: unknown = null;
-			let refreshError: unknown = null;
-
-			try {
-				await apiPostTaskSse("/api/sync/starred?return_mode=sse");
-				shouldRefresh = true;
-				await apiPostTaskSse("/api/sync/releases?return_mode=sse");
-				shouldRefresh = true;
-				await apiPostTaskSse("/api/sync/notifications?return_mode=sse");
-				shouldRefresh = true;
-			} catch (err) {
-				syncError = err;
-			}
-
-			if (shouldRefresh) {
-				try {
-					await refreshAll();
-				} catch (refreshErr) {
-					refreshError = refreshErr;
-					if (!syncError) throw refreshErr;
-				}
-			}
-
-			if (syncError && refreshError) {
-				throw new Error(
-					`${getErrorMessage(syncError)}；已完成的同步结果刷新失败：${getErrorMessage(refreshError)}`,
-				);
-			}
-
-			if (syncError) {
-				throw syncError;
-			}
+			const task = await apiPost<TaskAcceptedResponse>(
+				"/api/sync/all?return_mode=task_id",
+			);
+			await trackTaskStream(task, "access");
 		});
-	}, [refreshAll, run]);
+	}, [run, trackTaskStream]);
 	const syncingAll = busy === SYNC_ALL_LABEL;
+	const syncingInbox = busy === "Sync inbox";
 
 	const aiDisabledHint = useMemo(() => {
 		const any = feed.items.find((it) => it.translated?.status === "disabled");
@@ -623,16 +920,52 @@ export function Dashboard(props: { me: MeResponse }) {
 		<>
 			{!feed.loadingInitial && feed.items.length === 0 ? (
 				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-					<h2 className="text-base font-semibold tracking-tight">还没有内容</h2>
-					<p className="text-muted-foreground mt-1 text-sm">
-						点击顶部的 <span className="font-mono">同步</span>，会先刷新
-						starred， 再同步 releases 和 Inbox。
-					</p>
-					<div className="mt-4 flex flex-wrap gap-2">
-						<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-							同步
-						</Button>
-					</div>
+					{accessSyncStage === "waiting" ||
+					accessSyncStage === "star_refreshed" ? (
+						<>
+							<h2 className="text-base font-semibold tracking-tight">
+								正在同步你的 Star / Release
+							</h2>
+							<p className="text-muted-foreground mt-1 text-sm">
+								先展示服务端已有缓存，再补齐最新仓库数据；完成后这里会自动刷新。
+							</p>
+						</>
+					) : (
+						<>
+							<h2 className="text-base font-semibold tracking-tight">
+								还没有缓存内容
+							</h2>
+							<p className="text-muted-foreground mt-1 text-sm">
+								可以先同步 Star / Release；Inbox 仍然单独同步。
+							</p>
+							<div className="mt-4 flex flex-wrap gap-2">
+								<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+									{SYNC_ALL_LABEL}
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncStarred}
+								>
+									Sync starred
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncReleases}
+								>
+									Sync releases
+								</Button>
+								<Button
+									variant="outline"
+									disabled={Boolean(busy)}
+									onClick={onSyncInbox}
+								>
+									Sync inbox
+								</Button>
+							</div>
+						</>
+					)}
 				</div>
 			) : null}
 
@@ -759,7 +1092,12 @@ export function Dashboard(props: { me: MeResponse }) {
 							</div>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList notifications={notifications} />
+							<InboxList
+								notifications={notifications}
+								busy={Boolean(busy)}
+								syncing={syncingInbox}
+								onSync={tab === "inbox" ? onSyncInbox : undefined}
+							/>
 						</TabsContent>
 					</section>
 

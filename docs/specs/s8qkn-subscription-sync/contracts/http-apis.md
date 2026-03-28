@@ -1,5 +1,111 @@
 # HTTP / Job contract
 
+## `GET /api/me`
+
+Response shape:
+
+```json
+{
+  "user": {
+    "id": "usr_xxx",
+    "github_user_id": 30215105,
+    "login": "IvanLi-CN",
+    "name": "Ivan Li",
+    "avatar_url": null,
+    "email": null,
+    "is_admin": true
+  },
+  "access_sync": {
+    "task_id": "task_xxx",
+    "task_type": "sync.access_refresh",
+    "event_path": "/api/tasks/task_xxx/events",
+    "reason": "first_visit"
+  }
+}
+```
+
+Notes:
+
+- `access_sync.reason` uses `first_visit | inactive_over_1h | reused_inflight | none`.
+- `task_id / task_type / event_path` are `null` when `reason=none`.
+- `GET /api/me` decides whether to create or reuse `sync.access_refresh` by comparing the pre-touch `last_active_at` against a 1 hour inactivity window.
+
+## `GET /api/tasks/{task_id}/events`
+
+Behavior:
+
+- Authenticated user only.
+- Only the task owner (`job_tasks.requested_by`) can subscribe.
+- Returns task events as SSE.
+
+Event payload contract:
+
+- `task.running`
+- `task.progress`
+  - `stage=star_refreshed`
+  - `stage=release_attached`
+  - `stage=release_summary`
+- `task.completed`
+
+## `POST /api/sync/all`
+
+Behavior:
+
+- Authenticated user only.
+- `return_mode=task_id|sse` enqueues `sync.access_refresh`.
+- `return_mode=sync` runs `sync.starred + sync.releases` inline.
+- Does not include Inbox synchronization.
+
+## `POST /api/sync/releases`
+
+Behavior change:
+
+- Still user-scoped.
+- No longer performs per-user GitHub Release fan-out writes.
+- Instead it attaches the current user's starred repos to the shared repo release queue and waits for shared outcomes.
+
+Result shape:
+
+```json
+{
+  "repos": 42,
+  "releases": 133
+}
+```
+
+Notes:
+
+- `repos` is the number of visible starred repos attached to shared release demand.
+- `releases` is the summed shared release count from the satisfied work items.
+
+## `sync.access_refresh` task payload / result
+
+Payload (`job_tasks.payload_json`):
+
+```json
+{
+  "user_id": "usr_xxx"
+}
+```
+
+Result (`job_tasks.result_json`):
+
+```json
+{
+  "starred": {
+    "repos": 42
+  },
+  "release": {
+    "repos": 42,
+    "releases": 133,
+    "reused_running": 6,
+    "reused_fresh": 19,
+    "queued": 17,
+    "failed": 0
+  }
+}
+```
+
 ## `sync.subscriptions` task payload / result
 
 Payload (`job_tasks.payload_json`):
@@ -34,33 +140,19 @@ Result (`job_tasks.result_json`):
 }
 ```
 
-Semantics:
+Updated semantics:
 
-- `skipped=true` means the run record exists but the body did not execute because a previous run was still active.
-- `skip_reason` currently uses `previous_run_active`.
-
-## `GET /api/admin/jobs/realtime`
-
-Query changes:
-
-- Add `task_group=scheduled|realtime|all`.
-- `scheduled` includes `brief.daily_slot` + `sync.subscriptions`.
-- `realtime` excludes those scheduled task types.
+- `release` summary now reflects linked shared repo release work items instead of inline repo fetch fan-out.
+- `releases_written` now represents shared release rows observed from the satisfied repo work items.
 
 ## `GET /api/admin/jobs/realtime/{task_id}`
 
-Response changes for `task_type=sync.subscriptions`:
+Response changes for `task_type=sync.subscriptions` remain under `diagnostics.sync_subscriptions`.
 
-- `diagnostics.sync_subscriptions`
-  - `trigger`
-  - `schedule_key`
-  - `skipped`
-  - `skip_reason`
-  - `log_available`
-  - `log_download_path`
-  - `star` summary
-  - `release` summary
-  - `recent_events[]`
+Notes:
+
+- Existing admin diagnostics stay compatible.
+- `sync.access_refresh` currently reuses generic task detail rendering.
 
 ## `GET /api/admin/jobs/realtime/{task_id}/log`
 
