@@ -1503,8 +1503,8 @@ function TranslationSchedulerSection(props: {
 	const workerBoardDescription = useMemo(
 		() =>
 			formatTranslationWorkerBoardDescription(
-				status?.general_worker_concurrency,
-				status?.dedicated_worker_concurrency,
+				status?.target_general_worker_concurrency,
+				status?.target_dedicated_worker_concurrency,
 			),
 		[status],
 	);

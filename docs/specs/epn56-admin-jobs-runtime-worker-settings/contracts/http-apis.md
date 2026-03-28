@@ -32,7 +32,7 @@ Returns the refreshed `GET /api/admin/jobs/llm/status` payload after the new run
 
 ## Modified: `GET /api/admin/jobs/translations/status`
 
-Response adds persisted runtime config fields:
+Response adds live per-kind worker counts:
 
 - `general_worker_concurrency: number`
 - `dedicated_worker_concurrency: number`
@@ -44,7 +44,14 @@ Existing fields remain:
 - `busy_workers: number`
 - `workers: TranslationWorkerStatus[]`
 
-`worker_concurrency` is the sum of `general_worker_concurrency + dedicated_worker_concurrency`.
+The response also includes desired runtime config fields:
+
+- `target_general_worker_concurrency: number`
+- `target_dedicated_worker_concurrency: number`
+- `target_worker_concurrency: number`
+
+`worker_concurrency` is the sum of the live `general_worker_concurrency + dedicated_worker_concurrency`.
+`target_worker_concurrency` is the sum of the persisted desired config.
 
 ## New: `PATCH /api/admin/jobs/translations/runtime-config`
 
