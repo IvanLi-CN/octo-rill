@@ -971,55 +971,50 @@ fn reconcile_worker_runtime_slots(
         .iter()
         .map(|profile| (profile.worker_id.as_str(), profile))
         .collect::<HashMap<_, _>>();
-    let mut occupied_slots = HashSet::new();
+    runtime.sort_by(|left, right| {
+        let left_profile = desired_profiles_by_worker_id
+            .get(left.worker_id.as_str())
+            .copied();
+        let right_profile = desired_profiles_by_worker_id
+            .get(right.worker_id.as_str())
+            .copied();
+        translation_worker_runtime_sort_key(left, left_profile)
+            .cmp(&translation_worker_runtime_sort_key(right, right_profile))
+    });
 
-    for entry in runtime.iter_mut() {
+    // Keep the board topology continuous even while drained workers finish in the background.
+    for (index, entry) in runtime.iter_mut().enumerate() {
         if let Some(profile) = desired_profiles_by_worker_id.get(entry.worker_id.as_str()) {
             entry.worker_kind = profile.worker_kind.clone();
         }
-        if entry.current_batch_id.is_some() {
-            occupied_slots.insert(entry.worker_slot);
-        }
+        entry.worker_slot = i64::try_from(index + 1).unwrap_or(i64::MAX);
     }
-
-    for profile in desired_profiles {
-        let Some(entry) = runtime
-            .iter_mut()
-            .find(|entry| entry.worker_id == profile.worker_id)
-        else {
-            continue;
-        };
-
-        entry.worker_kind = profile.worker_kind.clone();
-        if entry.current_batch_id.is_some() {
-            continue;
-        }
-
-        let next_slot = if !occupied_slots.contains(&profile.worker_slot) {
-            profile.worker_slot
-        } else if !occupied_slots.contains(&entry.worker_slot) {
-            entry.worker_slot
-        } else {
-            next_available_worker_slot(&occupied_slots)
-        };
-
-        entry.worker_slot = next_slot;
-        occupied_slots.insert(next_slot);
-    }
-
-    runtime.sort_by(|left, right| {
-        left.worker_slot
-            .cmp(&right.worker_slot)
-            .then_with(|| left.worker_id.cmp(&right.worker_id))
-    });
 }
 
-fn next_available_worker_slot(occupied_slots: &HashSet<i64>) -> i64 {
-    let mut next_slot = 1_i64;
-    while occupied_slots.contains(&next_slot) {
-        next_slot += 1;
+fn translation_worker_runtime_sort_key<'a>(
+    entry: &'a TranslationWorkerRuntimeState,
+    desired_profile: Option<&'a TranslationWorkerProfile>,
+) -> (i32, i32, i64, &'a str) {
+    let worker_kind = desired_profile
+        .map(|profile| profile.worker_kind.as_str())
+        .unwrap_or(entry.worker_kind.as_str());
+    let worker_slot = desired_profile
+        .map(|profile| profile.worker_slot)
+        .unwrap_or(entry.worker_slot);
+    (
+        translation_worker_kind_priority(worker_kind),
+        if desired_profile.is_some() { 0 } else { 1 },
+        worker_slot,
+        entry.worker_id.as_str(),
+    )
+}
+
+fn translation_worker_kind_priority(worker_kind: &str) -> i32 {
+    match worker_kind {
+        "general" => 0,
+        "user_dedicated" => 1,
+        _ => 2,
     }
-    next_slot
 }
 
 fn translation_runtime_topology_changed(
@@ -5176,7 +5171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_translation_request_preserves_current_slot_after_runtime_resize() {
+    async fn create_translation_request_refreshes_running_batch_into_live_slot_after_runtime_resize()
+     {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         reset_translation_worker_runtime_for_tests(state.as_ref()).await;
@@ -5298,7 +5294,7 @@ mod tests {
             .find(|entry| entry.worker_id == worker_id)
             .expect("worker exists");
 
-        assert_eq!(worker.worker_slot, test_dedicated_worker_slot());
+        assert_eq!(worker.worker_slot, expected_slot);
         assert_eq!(worker.status, "running");
         assert_eq!(
             worker.current_batch_id.as_deref(),
@@ -5312,7 +5308,7 @@ mod tests {
             &translation_worker_profile_from_runtime(
                 worker_id.as_str(),
                 "user_dedicated",
-                test_dedicated_worker_slot(),
+                expected_slot,
             ),
             TranslationWorkerRuntimeUpdate::idle(),
         )
@@ -5368,6 +5364,77 @@ mod tests {
         assert_eq!(retained_general.worker_slot, 3);
         assert_eq!(retained_general.status, "running");
         assert_eq!(dedicated.worker_slot, 4);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_moves_running_dedicated_worker_after_new_general_slot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-dedicated-1", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(4, 1))
+            .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
+        let general = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("general", 4))
+            .expect("new general worker exists");
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
+            .expect("dedicated worker exists");
+
+        assert_eq!(slots, vec![1, 2, 3, 4, 5]);
+        assert_eq!(general.worker_slot, 4);
+        assert_eq!(dedicated.worker_slot, 5);
+        assert_eq!(dedicated.status, "running");
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_moves_running_dedicated_worker_into_compacted_slot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-dedicated-1", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(2, 1))
+            .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
+            .expect("dedicated worker exists");
+
+        assert_eq!(slots, vec![1, 2, 3]);
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.status, "running");
     }
 
     #[tokio::test]
