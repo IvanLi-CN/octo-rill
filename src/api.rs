@@ -7711,6 +7711,8 @@ pub(crate) async fn require_active_user_id(
         mark_pending_access_sync_reason(session, reason).await?;
     }
 
+    touch_user_last_active_at(state, &user_id).await?;
+
     Ok(user_id)
 }
 
@@ -7748,10 +7750,10 @@ mod tests {
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
         extract_translation_fields, get_release_detail, github_graphql_errors_to_api_error,
-        github_graphql_http_error, guard_admin_user_update, has_repo_scope, list_releases,
-        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
-        map_job_action_error, markdown_structure_preserved, me, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        github_graphql_http_error, guard_admin_user_update, has_repo_scope, last_active_is_stale,
+        list_releases, llm_call_order_by_clause, load_pending_access_sync_reason,
+        looks_like_json_blob, map_job_action_error, markdown_structure_preserved, me,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
@@ -7989,6 +7991,23 @@ mod tests {
                 .as_deref(),
             Some("inactive_over_1h")
         );
+        let touched_last_active_at = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT last_active_at
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load touched last_active_at");
+        assert!(touched_last_active_at.is_some());
+        assert_ne!(
+            touched_last_active_at.as_deref(),
+            Some("2026-02-22T21:30:00Z")
+        );
+        assert!(!last_active_is_stale(touched_last_active_at.as_deref()));
 
         let Json(resp) = me(State(state.clone()), session)
             .await

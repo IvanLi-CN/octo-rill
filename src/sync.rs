@@ -1150,8 +1150,8 @@ async fn wait_for_release_demand(
         r#"
         SELECT
           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
-          COALESCE(SUM(last_release_count), 0) AS release_count,
-          COALESCE(SUM(last_candidate_failures), 0) AS candidate_failures
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_release_count ELSE 0 END), 0) AS release_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_candidate_failures ELSE 0 END), 0) AS candidate_failures
         FROM repo_release_work_items
         WHERE id IN (
         "#,
@@ -2728,7 +2728,7 @@ mod tests {
         attach_and_wait_for_user_release_demand, attach_release_demand, cmp_last_active_desc,
         recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
         subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_starred_for_user_with_fetch,
+        sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -3042,6 +3042,73 @@ mod tests {
         assert_eq!(row.0, jobs::STATUS_FAILED);
         assert!(!row.1.is_empty(), "deadline_at should stay non-null");
         assert!(row.2.is_some(), "recovered work item should be finalized");
+    }
+
+    #[tokio::test]
+    async fn wait_for_release_demand_excludes_failed_work_item_release_totals() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-06T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-failed-1")
+        .bind(42_i64)
+        .bind("octo/alpha")
+        .bind(jobs::STATUS_FAILED)
+        .bind(RepoReleaseOrigin::Interactive.as_str())
+        .bind(RepoReleaseOrigin::Interactive.priority())
+        .bind(0_i64)
+        .bind(repo_release_deadline_at(
+            chrono::DateTime::parse_from_rfc3339(now)
+                .expect("parse now")
+                .with_timezone(&chrono::Utc),
+            RepoReleaseOrigin::Interactive,
+        ))
+        .bind(7_i64)
+        .bind(2_i64)
+        .bind(Some(now))
+        .bind(Some("boom"))
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some(now))
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("seed failed repo release work item");
+
+        let result =
+            wait_for_release_demand(state.as_ref(), None, &["repo-work-failed-1".to_owned()])
+                .await
+                .expect("wait for release demand");
+
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.releases, 0);
+        assert_eq!(result.candidate_failures, 0);
     }
 
     #[tokio::test]

@@ -86,6 +86,7 @@ type ReactionTokenCheckResponse = {
 };
 
 const SYNC_ALL_LABEL = "同步";
+const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
 
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
@@ -367,6 +368,12 @@ export function Dashboard(props: { me: MeResponse }) {
 		if (!accessTaskStream) return;
 
 		const source = new EventSource(accessTaskStream.eventPath);
+		let reconnectTimer: number | null = null;
+		const clearReconnectTimer = () => {
+			if (reconnectTimer === null) return;
+			window.clearTimeout(reconnectTimer);
+			reconnectTimer = null;
+		};
 		const refreshOnUi = () => {
 			void refreshAll().catch((err) => {
 				setBootError(err instanceof Error ? err.message : String(err));
@@ -378,6 +385,18 @@ export function Dashboard(props: { me: MeResponse }) {
 			} catch {
 				return {};
 			}
+		};
+		const failStream = (message: string) => {
+			clearReconnectTimer();
+			setAccessSyncStage((current) =>
+				current === "completed" ? current : "failed",
+			);
+			setBootError(message);
+			source.close();
+			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
+			setAccessTaskStream((current) =>
+				current?.taskId === accessTaskStream.taskId ? null : current,
+			);
 		};
 
 		const onProgress = (event: Event) => {
@@ -392,6 +411,7 @@ export function Dashboard(props: { me: MeResponse }) {
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
 			const complete = async () => {
+				clearReconnectTimer();
 				const failed =
 					payload.status !== "succeeded"
 						? new Error(payload.error ?? "后台同步失败")
@@ -424,11 +444,23 @@ export function Dashboard(props: { me: MeResponse }) {
 			void complete();
 		};
 
+		source.onopen = clearReconnectTimer;
 		source.addEventListener("task.progress", onProgress);
 		source.addEventListener("task.completed", onCompleted);
-		source.onerror = () => undefined;
+		source.onerror = () => {
+			if (source.readyState === EventSource.CLOSED) {
+				failStream("后台任务事件流已断开，请刷新页面后重试。");
+				return;
+			}
+			if (reconnectTimer !== null) return;
+			reconnectTimer = window.setTimeout(() => {
+				reconnectTimer = null;
+				failStream("后台任务事件流恢复超时，请刷新页面后重试。");
+			}, TASK_STREAM_RECOVERY_GRACE_MS);
+		};
 
 		return () => {
+			clearReconnectTimer();
 			source.removeEventListener("task.progress", onProgress);
 			source.removeEventListener("task.completed", onCompleted);
 			source.close();
@@ -444,6 +476,12 @@ export function Dashboard(props: { me: MeResponse }) {
 			}
 
 			const source = new EventSource(task.eventPath);
+			let reconnectTimer: number | null = null;
+			const clearReconnectTimer = () => {
+				if (reconnectTimer === null) return;
+				window.clearTimeout(reconnectTimer);
+				reconnectTimer = null;
+			};
 			refreshTaskSourcesRef.current.set(task.taskId, source);
 
 			const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
@@ -460,10 +498,17 @@ export function Dashboard(props: { me: MeResponse }) {
 					current.filter((item) => item.taskId !== task.taskId),
 				);
 			};
+			const failStream = (message: string) => {
+				clearReconnectTimer();
+				setBootError(message);
+				settleTaskWaiter(task.taskId, new Error(message));
+				close();
+			};
 			const onCompleted = (event: Event) => {
 				const payload = parsePayload(event as MessageEvent<string>);
 				const completedTaskId = task.taskId;
 				const complete = async () => {
+					clearReconnectTimer();
 					const failed =
 						payload.status !== "succeeded"
 							? new Error(payload.error ?? "后台同步失败")
@@ -487,8 +532,19 @@ export function Dashboard(props: { me: MeResponse }) {
 				void complete();
 			};
 
+			source.onopen = clearReconnectTimer;
 			source.addEventListener("task.completed", onCompleted);
-			source.onerror = () => undefined;
+			source.onerror = () => {
+				if (source.readyState === EventSource.CLOSED) {
+					failStream("后台同步事件流已断开，请刷新页面后重试。");
+					return;
+				}
+				if (reconnectTimer !== null) return;
+				reconnectTimer = window.setTimeout(() => {
+					reconnectTimer = null;
+					failStream("后台同步事件流恢复超时，请刷新页面后重试。");
+				}, TASK_STREAM_RECOVERY_GRACE_MS);
+			};
 		}
 	}, [refreshTaskStreams, refreshAll, settleTaskWaiter]);
 
