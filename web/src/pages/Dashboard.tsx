@@ -1096,11 +1096,7 @@ export function Dashboard(props: { me: MeResponse }) {
 								notifications={notifications}
 								busy={Boolean(busy)}
 								syncing={syncingInbox}
-								onSync={
-									tab === "inbox" && notifications.length > 0
-										? onSyncInbox
-										: undefined
-								}
+								onSync={tab === "inbox" ? onSyncInbox : undefined}
 							/>
 						</TabsContent>
 					</section>

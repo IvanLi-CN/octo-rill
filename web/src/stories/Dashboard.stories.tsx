@@ -316,11 +316,7 @@ function DashboardPreview(props: {
 								notifications={notifications}
 								busy={syncingAll}
 								syncing={syncingAll}
-								onSync={
-									tab === "inbox" && notifications.length > 0
-										? () => {}
-										: undefined
-								}
+								onSync={tab === "inbox" ? () => {} : undefined}
 							/>
 						</TabsContent>
 					</section>
@@ -509,9 +505,17 @@ export const InboxEmpty: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "Inbox 空态不再提供局部同步按钮，只提示回到顶部主同步入口。",
+				story:
+					"Inbox 空态保留局部 Sync inbox 入口，避免访问触发同步只覆盖 Star/Release 时无法补通知。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: "Sync inbox" }),
+		).toBeVisible();
+		await expect(canvas.getByText(/暂无通知。可以点击/)).toBeVisible();
 	},
 };
 

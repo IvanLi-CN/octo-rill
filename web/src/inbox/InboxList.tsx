@@ -22,7 +22,7 @@ export function InboxList(props: {
 	onSync?: () => void;
 }) {
 	const { notifications, busy = false, syncing = false, onSync } = props;
-	const showSync = Boolean(onSync) && notifications.length > 0;
+	const showSync = Boolean(onSync);
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
@@ -73,10 +73,17 @@ export function InboxList(props: {
 
 			<CardContent className="pt-0">
 				{notifications.length === 0 ? (
-					<p className="text-muted-foreground text-sm">
-						暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
-						拉取最新数据。
-					</p>
+					showSync ? (
+						<p className="text-muted-foreground text-sm">
+							暂无通知。可以点击 <span className="font-mono">Sync inbox</span>{" "}
+							拉取最新数据。
+						</p>
+					) : (
+						<p className="text-muted-foreground text-sm">
+							暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
+							拉取最新数据。
+						</p>
+					)
 				) : (
 					<div className="space-y-3">
 						{notifications.map((n) => (
