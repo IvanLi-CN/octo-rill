@@ -1,3 +1,4 @@
+import type * as React from "react";
 import { useEffect, useMemo, useState } from "react";
 
 import type { AdminTranslationWorkerStatus } from "@/api";
@@ -119,16 +120,28 @@ export function TranslationWorkerBoard(props: {
 	loading?: boolean;
 	title?: string;
 	description?: string;
+	headerAction?: React.ReactNode;
 	onWorkerClick?: (worker: AdminTranslationWorkerStatus) => void;
 }) {
 	const {
 		workers,
 		loading = false,
 		title = "工作者板",
-		description = "固定展示 3 个通用 worker 与 1 个用户专用 worker 的实时槽位状态。",
+		description,
+		headerAction,
 		onWorkerClick,
 	} = props;
 	const [nowMs, setNowMs] = useState(() => Date.now());
+	const resolvedDescription = useMemo(() => {
+		if (description) return description;
+		const generalWorkers = workers.filter(
+			(worker) => worker.worker_kind === "general",
+		).length;
+		const dedicatedWorkers = workers.filter(
+			(worker) => worker.worker_kind === "user_dedicated",
+		).length;
+		return `当前展示 ${generalWorkers} 个通用 worker 与 ${dedicatedWorkers} 个用户专用 worker 的实时槽位状态。`;
+	}, [description, workers]);
 	const runningWorkerClockKey = useMemo(
 		() =>
 			workers
@@ -151,9 +164,12 @@ export function TranslationWorkerBoard(props: {
 
 	return (
 		<Card>
-			<CardHeader>
-				<CardTitle>{title}</CardTitle>
-				<CardDescription>{description}</CardDescription>
+			<CardHeader className="flex flex-row items-start justify-between gap-4">
+				<div className="space-y-1.5">
+					<CardTitle>{title}</CardTitle>
+					<CardDescription>{resolvedDescription}</CardDescription>
+				</div>
+				{headerAction ? <div className="shrink-0">{headerAction}</div> : null}
 			</CardHeader>
 			<CardContent className="space-y-3">
 				{loading && workers.length === 0 ? (

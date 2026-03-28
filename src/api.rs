@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
 
-use crate::{ai, jobs, local_id, sync};
+use crate::{admin_runtime, ai, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
@@ -2174,6 +2174,11 @@ pub struct AdminLlmSchedulerStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AdminLlmRuntimeConfigUpdateRequest {
+    max_concurrency: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AdminLlmCallsQuery {
     status: Option<String>,
     source: Option<String>,
@@ -2329,8 +2334,37 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let runtime = state.llm_scheduler.runtime_status();
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        load_admin_llm_scheduler_status_response(state.as_ref()).await?,
+    ))
+}
 
+pub async fn admin_patch_llm_runtime_config(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<AdminLlmRuntimeConfigUpdateRequest>,
+) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
+    admin_runtime::update_llm_runtime_settings(&state.pool, max_concurrency)
+        .await
+        .map_err(ApiError::internal)?;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(
+        load_admin_llm_scheduler_status_response(state.as_ref()).await?,
+    ))
+}
+
+async fn load_admin_llm_scheduler_status_response(
+    state: &AppState,
+) -> Result<AdminLlmSchedulerStatusResponse, ApiError> {
+    let runtime = state.llm_scheduler.runtime_status();
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let (calls_24h, failed_24h, avg_wait_raw, avg_duration_raw) =
         sqlx::query_as::<_, (i64, i64, Option<f64>, Option<f64>)>(
@@ -2371,7 +2405,7 @@ pub async fn admin_get_llm_scheduler_status(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(Json(AdminLlmSchedulerStatusResponse {
+    Ok(AdminLlmSchedulerStatusResponse {
         scheduler_enabled: state.config.ai.is_some(),
         max_concurrency: runtime.max_concurrency,
         available_slots: runtime.available_slots,
@@ -2383,7 +2417,24 @@ pub async fn admin_get_llm_scheduler_status(
         avg_duration_ms_24h: avg_duration_raw.map(|value| value.round() as i64),
         last_success_at,
         last_failure_at,
-    }))
+    })
+}
+
+fn parse_positive_admin_concurrency(value: i64, field: &str) -> Result<usize, ApiError> {
+    let parsed = usize::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer"
+        )));
+    }
+    if parsed > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer <= {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(parsed)
 }
 
 struct AdminLlmCallListScope<'a> {
@@ -7855,13 +7906,13 @@ mod tests {
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
-        parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
-        parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
-        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_response_from_batch_item,
+        parse_positive_admin_concurrency, parse_release_id_param,
+        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
+        parse_unique_thread_ids, preserve_chunk_trailing_newline, release_cache_entry_reusable,
+        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -7917,6 +7968,23 @@ mod tests {
             trans_title: None,
             trans_summary: None,
         }
+    }
+
+    #[test]
+    fn parse_positive_admin_concurrency_rejects_values_above_max_permits() {
+        let overflow = i64::try_from(tokio::sync::Semaphore::MAX_PERMITS)
+            .expect("max permits fits in i64")
+            + 1;
+        let err = parse_positive_admin_concurrency(overflow, "max_concurrency")
+            .expect_err("overflow concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "max_concurrency must be a positive integer <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )),
+            "unexpected error: {err}"
+        );
     }
 
     fn test_task_detail_item(
@@ -8017,6 +8085,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),
@@ -8058,6 +8131,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),
@@ -10007,6 +10085,48 @@ mod tests {
         assert_eq!(resp.calls_24h, 2);
         assert_eq!(resp.failed_24h, 1);
         assert!(resp.avg_wait_ms_24h.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_get_llm_scheduler_status_syncs_persisted_runtime_settings() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let now = "2026-03-28T11:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 4, 3, 1, ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+
+        let state = setup_state(pool);
+        assert_eq!(state.llm_scheduler.max_concurrency(), 1);
+
+        let session = setup_session(1).await;
+        let resp = admin_get_llm_scheduler_status(State(state.clone()), session)
+            .await
+            .expect("status should succeed")
+            .0;
+
+        assert_eq!(resp.max_concurrency, 4);
+        assert_eq!(resp.available_slots, 4);
+        assert_eq!(state.llm_scheduler.max_concurrency(), 4);
     }
 
     #[tokio::test]

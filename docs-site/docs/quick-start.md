@@ -36,6 +36,7 @@ cp .env.example .env.local
 - `AI_MAX_CONCURRENCY`（可选，默认 `1`）
 
 更多变量说明见 [配置参考](/config)。
+首次启动后，管理员也可以在 `/admin/jobs` 里直接调整 LLM 并发上限与翻译 worker 数量；保存后的值会落到数据库，并作为后续重启时的实际运行配置。
 
 ## 3. 启动后端
 

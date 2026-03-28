@@ -32,6 +32,7 @@ description: OctoRill 本地开发与部署时最常用的配置项。
 
 - 未配置 AI 相关项时，核心登录与浏览流程仍可运行，但翻译与日报能力不可用或受限。
 - `AI_MAX_CONCURRENCY` 控制单进程内同时在途的上游 LLM 请求数；默认 `1`，可按实例容量逐步调高。
+- 管理员在任务中心保存新的 LLM / translation runtime 配置后，这些值会持久化到数据库，并在后续重启时覆盖首次启动的 env/default 种子。
 - 对 OpenAI-compatible 网关，`AI_MODEL` 通常需要匹配 `/v1/models` 返回的模型 ID。
 
 ## 本地数据与兼容性
