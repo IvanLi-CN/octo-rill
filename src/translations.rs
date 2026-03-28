@@ -811,6 +811,28 @@ impl TranslationSchedulerController {
         self.profile_by_worker_id(worker_id).await.is_some()
     }
 
+    async fn current_profile_by_worker_id(
+        &self,
+        worker_id: &str,
+    ) -> Option<TranslationWorkerProfile> {
+        if let Some(profile) = self.profile_by_worker_id(worker_id).await {
+            return Some(profile);
+        }
+
+        self.runtime
+            .read()
+            .await
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .map(|entry| {
+                translation_worker_profile_from_runtime(
+                    entry.worker_id.as_str(),
+                    entry.worker_kind.as_str(),
+                    entry.worker_slot,
+                )
+            })
+    }
+
     async fn profile_by_worker_id(&self, worker_id: &str) -> Option<TranslationWorkerProfile> {
         translation_worker_profiles(self.desired_config().await)
             .into_iter()
@@ -1734,11 +1756,17 @@ async fn refresh_live_batch_runtime_for_request(
     let Some(row) = row else {
         return Ok(());
     };
-    let profile = translation_worker_profile_from_runtime(
-        row.worker_id.as_str(),
-        row.worker_kind.as_str(),
-        row.worker_slot,
-    );
+    let profile = state
+        .translation_scheduler
+        .current_profile_by_worker_id(row.worker_id.as_str())
+        .await
+        .unwrap_or_else(|| {
+            translation_worker_profile_from_runtime(
+                row.worker_id.as_str(),
+                row.worker_kind.as_str(),
+                row.worker_slot,
+            )
+        });
     update_translation_worker_runtime(
         state,
         &profile,
@@ -4931,6 +4959,123 @@ mod tests {
         assert_eq!(
             worker.current_batch_id.as_deref(),
             Some("batch-runtime-refresh")
+        );
+        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.work_item_count, 1);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_preserves_current_slot_after_runtime_resize() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("runtime-refresh-resized");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+        let worker_id = translation_worker_id("user_dedicated", 1);
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-refresh-resized")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(worker_id.as_str())
+        .bind(test_dedicated_worker_slot())
+        .bind("user_dedicated")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-resized-item")
+        .bind("batch-runtime-refresh-resized")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', batch_id = 'batch-runtime-refresh-resized', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
+        let resized_general_concurrency = DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
+            .saturating_sub(1)
+            .max(1);
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                resized_general_concurrency,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+        let expected_slot =
+            i64::try_from(resized_general_concurrency + 1).expect("expected slot fits in i64");
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .expect("worker exists");
+
+        assert_eq!(worker.worker_slot, expected_slot);
+        assert_eq!(worker.status, "running");
+        assert_eq!(
+            worker.current_batch_id.as_deref(),
+            Some("batch-runtime-refresh-resized")
         );
         assert_eq!(worker.request_count, 2);
         assert_eq!(worker.work_item_count, 1);
