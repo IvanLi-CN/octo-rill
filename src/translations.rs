@@ -739,18 +739,14 @@ impl TranslationSchedulerController {
     async fn ensure_workers_running(self: &Arc<Self>, state: Arc<AppState>) {
         let desired_profiles = translation_worker_profiles(self.desired_config().await);
         let mut handles = self.worker_abort_handles.lock().await;
+        handles.retain(|_, handle| !handle.is_finished());
         for profile in desired_profiles {
             if handles.contains_key(&profile.worker_id) {
                 continue;
             }
-            let controller = Arc::clone(self);
-            let state = state.clone();
             let worker_id = profile.worker_id.clone();
-            let task_worker_id = worker_id.clone();
-            let task = tokio::spawn(async move {
-                controller.run_worker_loop(state, task_worker_id).await;
-            });
-            handles.insert(worker_id, task.abort_handle());
+            let abort_handle = self.spawn_worker_task(state.clone(), worker_id.clone());
+            handles.insert(worker_id, abort_handle);
         }
     }
 
@@ -785,7 +781,7 @@ impl TranslationSchedulerController {
             sleep(TRANSLATION_BATCH_SCAN_INTERVAL).await;
         }
 
-        self.unregister_worker(worker_id.as_str()).await;
+        self.finish_worker_exit(state, worker_id).await;
     }
 
     async fn worker_is_desired(&self, worker_id: &str) -> bool {
@@ -822,8 +818,34 @@ impl TranslationSchedulerController {
             .find(|profile| profile.worker_id == worker_id)
     }
 
-    async fn unregister_worker(&self, worker_id: &str) {
+    async fn finish_worker_exit(self: &Arc<Self>, state: Arc<AppState>, worker_id: String) {
+        if self.unregister_worker(worker_id.as_str()).await {
+            self.schedule_worker_reconcile(state);
+        }
+    }
+
+    async fn unregister_worker(&self, worker_id: &str) -> bool {
         self.worker_abort_handles.lock().await.remove(worker_id);
+        self.worker_is_desired(worker_id).await
+    }
+
+    fn schedule_worker_reconcile(self: &Arc<Self>, state: Arc<AppState>) {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            controller.ensure_workers_running(state).await;
+        });
+    }
+
+    fn spawn_worker_task(
+        self: &Arc<Self>,
+        state: Arc<AppState>,
+        worker_id: String,
+    ) -> tokio::task::AbortHandle {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            controller.run_worker_loop(state, worker_id).await;
+        })
+        .abort_handle()
     }
 
     async fn remove_worker_runtime(&self, worker_id: &str) {
@@ -5273,6 +5295,56 @@ mod tests {
             .await
             .expect("claim result");
         assert!(batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn unregister_worker_respawns_desired_worker_after_readd() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let worker_id = translation_worker_id("general", 3);
+        let stale_task = tokio::spawn(async {
+            sleep(Duration::from_secs(60)).await;
+        });
+
+        {
+            let mut handles = state
+                .translation_scheduler
+                .worker_abort_handles
+                .lock()
+                .await;
+            handles.insert(worker_id.clone(), stale_task.abort_handle());
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        state
+            .translation_scheduler
+            .apply_runtime_config(
+                state.clone(),
+                TranslationRuntimeConfig::new(3, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await;
+
+        state
+            .translation_scheduler
+            .finish_worker_exit(state.clone(), worker_id.clone())
+            .await;
+
+        tokio::task::yield_now().await;
+
+        let handles = state
+            .translation_scheduler
+            .worker_abort_handles
+            .lock()
+            .await;
+        assert!(handles.contains_key(worker_id.as_str()));
+        stale_task.abort();
     }
 
     #[tokio::test]
