@@ -7912,8 +7912,7 @@ mod tests {
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
         split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user,
-        translate_response_from_batch_item,
+        translate_release_detail_for_user, translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -8132,6 +8131,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),
