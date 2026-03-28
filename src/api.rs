@@ -2426,6 +2426,12 @@ fn parse_positive_admin_concurrency(value: i64, field: &str) -> Result<usize, Ap
             "{field} must be a positive integer"
         )));
     }
+    if parsed > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer <= {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
     Ok(parsed)
 }
 
@@ -7898,12 +7904,13 @@ mod tests {
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
-        parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
-        parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
-        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
+        parse_positive_admin_concurrency, parse_release_id_param,
+        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
+        parse_unique_thread_ids, preserve_chunk_trailing_newline, release_cache_entry_reusable,
+        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user,
         translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
@@ -7960,6 +7967,23 @@ mod tests {
             trans_title: None,
             trans_summary: None,
         }
+    }
+
+    #[test]
+    fn parse_positive_admin_concurrency_rejects_values_above_max_permits() {
+        let overflow = i64::try_from(tokio::sync::Semaphore::MAX_PERMITS)
+            .expect("max permits fits in i64")
+            + 1;
+        let err = parse_positive_admin_concurrency(overflow, "max_concurrency")
+            .expect_err("overflow concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "max_concurrency must be a positive integer <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )),
+            "unexpected error: {err}"
+        );
     }
 
     fn test_task_detail_item(

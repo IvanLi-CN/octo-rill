@@ -31,6 +31,7 @@ const TRANSLATION_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSLATION_MAX_ITEMS_PER_REQUEST: usize = 60;
 const TRANSLATION_MIN_WAIT_MS: i64 = 0;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
+const MAX_TRANSLATION_WORKER_CONCURRENCY: usize = 64;
 pub const DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY: usize = 3;
 pub const DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY: usize = 1;
 
@@ -1309,6 +1310,11 @@ fn parse_positive_worker_concurrency(value: i64, field: &str) -> Result<usize, A
     if parsed == 0 {
         return Err(ApiError::bad_request(format!(
             "{field} must be a positive integer"
+        )));
+    }
+    if parsed > MAX_TRANSLATION_WORKER_CONCURRENCY {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
         )));
     }
     Ok(parsed)
@@ -3687,6 +3693,21 @@ mod tests {
             worker_slot,
             worker_kind: worker_kind.to_owned(),
         }
+    }
+
+    #[test]
+    fn parse_positive_worker_concurrency_rejects_values_above_max() {
+        let overflow =
+            i64::try_from(MAX_TRANSLATION_WORKER_CONCURRENCY).expect("max fits in i64") + 1;
+        let err = parse_positive_worker_concurrency(overflow, "general_worker_concurrency")
+            .expect_err("overflow concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "general_worker_concurrency must be a positive integer <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            )),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
