@@ -25,6 +25,7 @@ type AdminJobsMockOptions = {
 	delayRules?: MockDelayRule[];
 	failureRules?: MockFailureRule[];
 	emitStreamEvents?: boolean;
+	emitLlmSchedulerEvents?: boolean;
 	emitTranslationEvents?: boolean;
 };
 
@@ -420,6 +421,8 @@ async function installAdminJobsMocks(
 
 	const emitTranslationEvents = options.emitTranslationEvents ?? false;
 	let translationEventDelivered = !emitTranslationEvents;
+	const emitLlmSchedulerEvents = options.emitLlmSchedulerEvents ?? false;
+	let llmSchedulerEventDelivered = !emitLlmSchedulerEvents;
 	const translationViewResponseCounts = new Map<string, number>();
 
 	function shouldServeCompletedTranslationView(key: string) {
@@ -746,6 +749,29 @@ async function installAdminJobsMocks(
 				})}`,
 				"",
 			];
+
+			if (emitLlmSchedulerEvents && !llmSchedulerEventDelivered) {
+				await sleep(200);
+				llmSchedulerEventDelivered = true;
+				llmSchedulerStatus = {
+					...llmSchedulerStatus,
+					max_concurrency: 5,
+					available_slots: Math.max(0, 5 - llmSchedulerStatus.in_flight_calls),
+				};
+				streamBody.push(
+					"event: llm.scheduler",
+					`data: ${JSON.stringify({
+						event_id: "scheduler:2026-02-26T03:00:02Z:5:4:1:1",
+						max_concurrency: 5,
+						available_slots: 4,
+						waiting_calls: llmSchedulerStatus.waiting_calls,
+						in_flight_calls: llmSchedulerStatus.in_flight_calls,
+						event_type: "llm.scheduler.updated",
+						created_at: "2026-02-26T03:00:02Z",
+					})}`,
+					"",
+				);
+			}
 
 			if (emitTranslationEvents && !translationEventDelivered) {
 				await sleep(200);
@@ -1828,6 +1854,26 @@ test("admin can update llm runtime concurrency from settings dialog", async ({
 	await input.fill("5");
 	await dialog.getByRole("button", { name: "保存设置" }).click();
 	await expect(dialog).toHaveCount(0);
+	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
+});
+
+test("admin refreshes llm scheduler via shared sse stream", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, {
+		emitLlmSchedulerEvents: true,
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/status",
+				afterCount: 1,
+				times: 1,
+				delayMs: 1200,
+			},
+		],
+	});
+
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
 });
 

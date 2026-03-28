@@ -718,6 +718,15 @@ impl TranslationSchedulerController {
             .map(|profile| profile.worker_id.as_str())
             .collect::<HashSet<_>>();
         let mut runtime = self.runtime.write().await;
+        let previous_topology = runtime
+            .iter()
+            .map(|entry| {
+                (
+                    entry.worker_id.clone(),
+                    (entry.worker_slot, entry.worker_kind.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         runtime.retain(|entry| {
             desired_worker_ids.contains(entry.worker_id.as_str())
                 || entry.current_batch_id.is_some()
@@ -733,6 +742,21 @@ impl TranslationSchedulerController {
             }
         }
         reconcile_worker_runtime_slots(&mut runtime, config);
+        let topology_changed = runtime.len() != previous_topology.len()
+            || runtime.iter().any(|entry| {
+                previous_topology
+                    .get(entry.worker_id.as_str())
+                    .map(|(worker_slot, worker_kind)| {
+                        *worker_slot != entry.worker_slot || worker_kind != &entry.worker_kind
+                    })
+                    .unwrap_or(true)
+            });
+        if topology_changed {
+            let updated_at = Utc::now().to_rfc3339();
+            for entry in runtime.iter_mut() {
+                entry.updated_at = updated_at.clone();
+            }
+        }
         config
     }
 
@@ -5411,6 +5435,43 @@ mod tests {
         assert_eq!(dedicated.current_batch_id.as_deref(), Some("batch-1"));
         assert_eq!(dedicated.request_count, 2);
         assert_eq!(dedicated.work_item_count, 3);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_refreshes_remaining_worker_timestamps_for_sse() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = stale_updated_at.to_owned();
+            }
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        assert_eq!(workers.len(), 3);
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.worker_slot)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[tokio::test]
