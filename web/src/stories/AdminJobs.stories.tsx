@@ -754,6 +754,13 @@ function AdminJobsPreview({
 				worker_concurrency:
 					translationWorkerConfig.general_worker_concurrency +
 					translationWorkerConfig.dedicated_worker_concurrency,
+				target_general_worker_concurrency:
+					translationWorkerConfig.general_worker_concurrency,
+				target_dedicated_worker_concurrency:
+					translationWorkerConfig.dedicated_worker_concurrency,
+				target_worker_concurrency:
+					translationWorkerConfig.general_worker_concurrency +
+					translationWorkerConfig.dedicated_worker_concurrency,
 				idle_workers: idleWorkers,
 				busy_workers: busyWorkers,
 				workers: translationWorkers,
