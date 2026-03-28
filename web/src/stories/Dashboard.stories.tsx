@@ -247,6 +247,7 @@ function DashboardPreview(props: {
 					busy={syncingAll}
 					syncingAll={syncingAll}
 					onSyncAll={() => {}}
+					onSyncInbox={() => {}}
 					logoutHref="#"
 				/>
 			}

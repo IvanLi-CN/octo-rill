@@ -11,7 +11,9 @@ export type DashboardHeaderProps = {
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	syncingAll?: boolean;
+	syncingInbox?: boolean;
 	onSyncAll?: () => void;
+	onSyncInbox?: () => void;
 	logoutHref?: string;
 };
 
@@ -24,7 +26,9 @@ export function DashboardHeader({
 	aiDisabledHint = false,
 	busy = false,
 	syncingAll = false,
+	syncingInbox = false,
 	onSyncAll,
+	onSyncInbox,
 	logoutHref = "/auth/logout",
 }: DashboardHeaderProps) {
 	return (
@@ -51,6 +55,14 @@ export function DashboardHeader({
 					/>
 					同步
 				</Button>
+				{onSyncInbox ? (
+					<Button variant="outline" disabled={busy} onClick={onSyncInbox}>
+						<RefreshCcw
+							className={syncingInbox ? "size-4 animate-spin" : "size-4"}
+						/>
+						Sync inbox
+					</Button>
+				) : null}
 				<Button asChild variant="ghost">
 					<a href={logoutHref}>Logout</a>
 				</Button>

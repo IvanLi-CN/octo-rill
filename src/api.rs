@@ -3116,7 +3116,7 @@ pub async fn sync_starred(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
@@ -3181,7 +3181,7 @@ pub async fn sync_releases(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
@@ -3210,7 +3210,7 @@ pub async fn sync_notifications(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
@@ -7757,8 +7757,8 @@ mod tests {
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
         release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
         release_excerpt, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, split_markdown_chunks, sync_all,
-        translate_response_from_batch_item,
+        resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -7773,7 +7773,7 @@ mod tests {
         body::to_bytes,
         extract::{Path, Query, State},
         http::{StatusCode, header},
-        response::IntoResponse,
+        response::{IntoResponse, Response},
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{
@@ -8077,6 +8077,172 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count access refresh tasks");
+        assert_eq!(queued, 1);
+    }
+
+    async fn task_id_from_response(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read task response body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse task response body");
+        payload
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("task id")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn sync_starred_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_starred(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_starred"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_starred(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_starred"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_STARRED)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync starred tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_releases_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_releases(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_releases"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_releases(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_releases"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_RELEASES)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync releases tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_notifications(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_notifications"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_notifications(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_notifications"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_NOTIFICATIONS)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync notifications tasks");
         assert_eq!(queued, 1);
     }
 
