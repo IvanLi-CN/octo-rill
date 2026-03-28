@@ -454,6 +454,13 @@ async function installAdminJobsMocks(
 				worker_concurrency:
 					translationRuntimeOverride.general_worker_concurrency +
 					translationRuntimeOverride.dedicated_worker_concurrency,
+				target_general_worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency,
+				target_dedicated_worker_concurrency:
+					translationRuntimeOverride.dedicated_worker_concurrency,
+				target_worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency +
+					translationRuntimeOverride.dedicated_worker_concurrency,
 				idle_workers: idleWorkers,
 				busy_workers: busyWorkers,
 				workers: translationRuntimeOverride.workers,
@@ -476,6 +483,9 @@ async function installAdminJobsMocks(
 				general_worker_concurrency: 3,
 				dedicated_worker_concurrency: 1,
 				worker_concurrency: 4,
+				target_general_worker_concurrency: 3,
+				target_dedicated_worker_concurrency: 1,
+				target_worker_concurrency: 4,
 				idle_workers: 4,
 				busy_workers: 0,
 				workers: completedTranslationWorkers,
@@ -498,6 +508,9 @@ async function installAdminJobsMocks(
 			general_worker_concurrency: 3,
 			dedicated_worker_concurrency: 1,
 			worker_concurrency: 4,
+			target_general_worker_concurrency: 3,
+			target_dedicated_worker_concurrency: 1,
+			target_worker_concurrency: 4,
 			idle_workers: 3,
 			busy_workers: 1,
 			workers: pendingTranslationWorkers,

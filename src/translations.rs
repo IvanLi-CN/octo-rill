@@ -142,6 +142,9 @@ pub struct AdminTranslationStatusResponse {
     pub general_worker_concurrency: i64,
     pub dedicated_worker_concurrency: i64,
     pub worker_concurrency: i64,
+    pub target_general_worker_concurrency: i64,
+    pub target_dedicated_worker_concurrency: i64,
+    pub target_worker_concurrency: i64,
     pub idle_workers: i64,
     pub busy_workers: i64,
     pub workers: Vec<AdminTranslationWorkerStatus>,
@@ -1257,6 +1260,21 @@ async fn load_admin_translation_status_response(
     let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let runtime_config = state.translation_scheduler.desired_config().await;
     let workers = translation_worker_runtime_statuses(state).await;
+    let general_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "general")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let dedicated_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "user_dedicated")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let worker_concurrency = i64::try_from(workers.len()).unwrap_or(i64::MAX);
     let idle_workers = i64::try_from(
         workers
             .iter()
@@ -1334,11 +1352,16 @@ async fn load_admin_translation_status_response(
         scan_interval_ms: i64::try_from(TRANSLATION_BATCH_SCAN_INTERVAL.as_millis())
             .unwrap_or(i64::MAX),
         batch_token_threshold: budget,
-        general_worker_concurrency: i64::try_from(runtime_config.general_worker_concurrency)
+        general_worker_concurrency,
+        dedicated_worker_concurrency,
+        worker_concurrency,
+        target_general_worker_concurrency: i64::try_from(runtime_config.general_worker_concurrency)
             .unwrap_or(i64::MAX),
-        dedicated_worker_concurrency: i64::try_from(runtime_config.dedicated_worker_concurrency)
-            .unwrap_or(i64::MAX),
-        worker_concurrency: i64::try_from(runtime_config.total_worker_concurrency())
+        target_dedicated_worker_concurrency: i64::try_from(
+            runtime_config.dedicated_worker_concurrency,
+        )
+        .unwrap_or(i64::MAX),
+        target_worker_concurrency: i64::try_from(runtime_config.total_worker_concurrency())
             .unwrap_or(i64::MAX),
         idle_workers,
         busy_workers,
@@ -5472,6 +5495,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_reports_live_counts_during_worker_drain() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load translation status");
+
+        assert_eq!(status.general_worker_concurrency, 3);
+        assert_eq!(
+            status.dedicated_worker_concurrency,
+            i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
+        );
+        assert_eq!(status.worker_concurrency, 4);
+        assert_eq!(
+            status.idle_workers + status.busy_workers,
+            status.worker_concurrency
+        );
+        assert_eq!(status.target_general_worker_concurrency, 2);
+        assert_eq!(
+            status.target_dedicated_worker_concurrency,
+            i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
+        );
+        assert_eq!(status.target_worker_concurrency, 3);
+        assert_eq!(status.workers.len(), 4);
     }
 
     #[tokio::test]

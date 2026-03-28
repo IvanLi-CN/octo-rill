@@ -651,6 +651,9 @@ export type AdminTranslationStatusResponse = {
 	general_worker_concurrency: number;
 	dedicated_worker_concurrency: number;
 	worker_concurrency: number;
+	target_general_worker_concurrency: number;
+	target_dedicated_worker_concurrency: number;
+	target_worker_concurrency: number;
 	idle_workers: number;
 	busy_workers: number;
 	workers: AdminTranslationWorkerStatus[];

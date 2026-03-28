@@ -1612,8 +1612,12 @@ function TranslationSchedulerSection(props: {
 
 	const openSettingsDialog = useCallback(() => {
 		setSettingsSaveError(null);
-		setGeneralWorkerInput(String(status?.general_worker_concurrency ?? ""));
-		setDedicatedWorkerInput(String(status?.dedicated_worker_concurrency ?? ""));
+		setGeneralWorkerInput(
+			String(status?.target_general_worker_concurrency ?? ""),
+		);
+		setDedicatedWorkerInput(
+			String(status?.target_dedicated_worker_concurrency ?? ""),
+		);
 		setSettingsDialogOpen(true);
 	}, [status]);
 
