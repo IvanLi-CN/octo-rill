@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -79,7 +79,7 @@ pub struct LlmSchedulerRuntimeStatus {
 #[derive(Debug)]
 pub struct LlmScheduler {
     max_concurrency: AtomicUsize,
-    gate: tokio::sync::Mutex<()>,
+    gate: Mutex<()>,
     notify: tokio::sync::Notify,
     status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
     waiting_calls: AtomicUsize,
@@ -101,7 +101,7 @@ impl LlmScheduler {
     pub fn new(max_concurrency: usize) -> Self {
         Self {
             max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
-            gate: tokio::sync::Mutex::new(()),
+            gate: Mutex::new(()),
             notify: tokio::sync::Notify::new(),
             status_overrides: tokio::sync::RwLock::new(HashMap::new()),
             waiting_calls: AtomicUsize::new(0),
@@ -155,7 +155,7 @@ impl LlmScheduler {
             tokio::pin!(notified);
             let mut acquired = false;
             {
-                let _gate = self.gate.lock().await;
+                let _gate = self.gate.lock().expect("llm scheduler gate lock poisoned");
                 let max_concurrency = self.max_concurrency();
                 let in_flight_calls = self.in_flight_calls.load(Ordering::Relaxed);
                 if in_flight_calls < max_concurrency {
@@ -1178,6 +1178,11 @@ impl SchedulerInFlightGuard {
             return;
         }
         self.slot_released = true;
+        let _gate = self
+            .scheduler
+            .gate
+            .lock()
+            .expect("llm scheduler gate lock poisoned");
         self.scheduler
             .in_flight_calls
             .fetch_sub(1, Ordering::Relaxed);
@@ -1191,6 +1196,11 @@ impl Drop for SchedulerInFlightGuard {
             return;
         }
         self.slot_released = true;
+        let _gate = self
+            .scheduler
+            .gate
+            .lock()
+            .expect("llm scheduler gate lock poisoned");
         self.scheduler
             .in_flight_calls
             .fetch_sub(1, Ordering::Relaxed);
