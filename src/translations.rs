@@ -1198,6 +1198,10 @@ pub async fn admin_patch_translation_runtime_config(
         req.dedicated_worker_concurrency,
         "dedicated_worker_concurrency",
     )?;
+    validate_translation_worker_concurrency_total(
+        general_worker_concurrency,
+        dedicated_worker_concurrency,
+    )?;
 
     let snapshot = admin_runtime::update_translation_runtime_settings(
         &state.pool,
@@ -1340,6 +1344,25 @@ fn parse_positive_worker_concurrency(value: i64, field: &str) -> Result<usize, A
         )));
     }
     Ok(parsed)
+}
+
+fn validate_translation_worker_concurrency_total(
+    general_worker_concurrency: usize,
+    dedicated_worker_concurrency: usize,
+) -> Result<(), ApiError> {
+    let total = general_worker_concurrency
+        .checked_add(dedicated_worker_concurrency)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            ))
+        })?;
+    if total > MAX_TRANSLATION_WORKER_CONCURRENCY {
+        return Err(ApiError::bad_request(format!(
+            "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn admin_list_translation_requests(
@@ -3727,6 +3750,20 @@ mod tests {
         assert!(
             err.to_string().contains(&format!(
                 "general_worker_concurrency must be a positive integer <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_translation_worker_concurrency_total_rejects_combined_overflow() {
+        let err =
+            validate_translation_worker_concurrency_total(MAX_TRANSLATION_WORKER_CONCURRENCY, 1)
+                .expect_err("combined worker concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
             )),
             "unexpected error: {err}"
         );

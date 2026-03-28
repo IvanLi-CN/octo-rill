@@ -42,6 +42,7 @@ pub async fn load_or_seed_runtime_settings(
           updated_at
         )
         VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
         "#,
     )
     .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
@@ -51,7 +52,9 @@ pub async fn load_or_seed_runtime_settings(
     .bind(now.as_str())
     .execute(pool)
     .await?;
-    Ok(snapshot)
+    fetch_runtime_settings(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("admin runtime settings row missing after seed"))
 }
 
 pub async fn update_llm_runtime_settings(
@@ -126,4 +129,95 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
         )
         .unwrap_or(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use sqlx::{
+        SqlitePool,
+        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    };
+    use url::Url;
+
+    use super::*;
+    use crate::{config::AppConfig, crypto::EncryptionKey, local_id::generate_local_id};
+
+    #[tokio::test]
+    async fn load_or_seed_runtime_settings_is_idempotent_for_concurrent_callers() {
+        let pool = setup_pool().await;
+        let config = test_config(7);
+
+        let (left, right) = tokio::join!(
+            load_or_seed_runtime_settings(&pool, &config),
+            load_or_seed_runtime_settings(&pool, &config),
+        );
+
+        let left = left.expect("left seed succeeds");
+        let right = right.expect("right seed succeeds");
+        let stored = fetch_runtime_settings(&pool)
+            .await
+            .expect("fetch seed row succeeds")
+            .expect("seed row exists");
+
+        assert_eq!(left, stored);
+        assert_eq!(right, stored);
+        assert_eq!(stored.llm_max_concurrency, 7);
+        assert_eq!(
+            stored.translation_general_worker_concurrency,
+            DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
+        );
+        assert_eq!(
+            stored.translation_dedicated_worker_concurrency,
+            DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+        );
+    }
+
+    async fn setup_pool() -> SqlitePool {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-admin-runtime-{}.db",
+            generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("create sqlite db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    fn test_config(ai_max_concurrency: usize) -> AppConfig {
+        AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-admin-runtime-tests"),
+            job_worker_concurrency: 2,
+            encryption_key: EncryptionKey::from_base64(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )
+            .expect("build encryption key"),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: None,
+            ai_max_concurrency,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        }
+    }
 }

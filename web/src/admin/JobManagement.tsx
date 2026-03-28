@@ -1508,6 +1508,17 @@ function TranslationSchedulerSection(props: {
 			),
 		[status],
 	);
+
+	useEffect(() => {
+		if (drawer?.kind !== "worker") {
+			return;
+		}
+		if (!status || selectedWorker) {
+			return;
+		}
+		setDrawer(null);
+	}, [drawer, selectedWorker, status]);
+
 	const loadStatus = useCallback(async () => {
 		setStatusLoading(true);
 		try {
