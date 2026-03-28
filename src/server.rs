@@ -23,10 +23,12 @@ use tower_sessions::session_store::ExpiredDeletion;
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::info;
 
-use crate::config::AppConfig;
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::state::AppState;
-use crate::{ai, api, auth, jobs, runtime, state, sync, translations, version};
+use crate::{
+    admin_runtime, ai, api, auth, config::AppConfig, jobs, runtime, state, sync, translations,
+    version,
+};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -44,6 +46,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .run(&pool)
         .await
         .context("failed to apply database migrations")?;
+
+    let runtime_settings = admin_runtime::load_or_seed_runtime_settings(&pool, &config)
+        .await
+        .context("failed to load admin runtime settings")?;
 
     let pragmas = read_sqlite_runtime_pragmas(&pool).await?;
     info!(
@@ -73,7 +79,13 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("failed to build http client")?;
 
     let app_state = Arc::new(AppState {
-        llm_scheduler: Arc::new(ai::LlmScheduler::new(config.ai_max_concurrency)),
+        llm_scheduler: Arc::new(ai::LlmScheduler::new(runtime_settings.llm_max_concurrency)),
+        translation_scheduler: Arc::new(translations::TranslationSchedulerController::new(
+            translations::TranslationRuntimeConfig::new(
+                runtime_settings.translation_general_worker_concurrency,
+                runtime_settings.translation_dedicated_worker_concurrency,
+            ),
+        )),
         config: config.clone(),
         pool: pool.clone(),
         http,
@@ -144,6 +156,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/jobs/llm/status",
             get(api::admin_get_llm_scheduler_status),
         )
+        .route(
+            "/admin/jobs/llm/runtime-config",
+            patch(api::admin_patch_llm_runtime_config),
+        )
         .route("/admin/jobs/llm/calls", get(api::admin_list_llm_calls))
         .route(
             "/admin/jobs/llm/calls/{call_id}",
@@ -152,6 +168,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route(
             "/admin/jobs/translations/status",
             get(translations::admin_get_translation_status),
+        )
+        .route(
+            "/admin/jobs/translations/runtime-config",
+            patch(translations::admin_patch_translation_runtime_config),
         )
         .route(
             "/admin/jobs/translations/requests",
@@ -277,8 +297,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             .map(|_| ai::spawn_model_catalog_sync_task(app_state.clone()));
         let llm_call_retention_abort_handle = ai::spawn_llm_call_retention_task(app_state.clone());
         let llm_call_recovery_abort_handle = ai::spawn_llm_call_recovery_task(app_state.clone());
-        let translation_scheduler_abort_handles =
-            translations::spawn_translation_scheduler(app_state.clone());
+        translations::spawn_translation_scheduler(app_state.clone()).await;
         let translation_recovery_abort_handle =
             translations::spawn_translation_recovery_task(app_state.clone());
 
@@ -292,13 +311,12 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             repo_release_recovery_abort_handle,
             translation_recovery_abort_handle,
         ];
-        abort_handles.extend(translation_scheduler_abort_handles);
         if let Some(handle) = model_catalog_abort_handle {
             abort_handles.push(handle);
         }
 
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal(abort_handles))
+            .with_graceful_shutdown(shutdown_signal(app_state.clone(), abort_handles))
             .await
             .context("http server exited")
     }
@@ -396,7 +414,7 @@ async fn read_sqlite_runtime_pragmas(pool: &SqlitePool) -> Result<SqliteRuntimeP
     })
 }
 
-async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
+async fn shutdown_signal(state: Arc<AppState>, abort_handles: Vec<AbortHandle>) {
     let abort_all = || {
         for handle in &abort_handles {
             handle.abort();
@@ -424,6 +442,8 @@ async fn shutdown_signal(abort_handles: Vec<AbortHandle>) {
         _ = ctrl_c => abort_all(),
         _ = terminate => abort_all(),
     }
+
+    state.translation_scheduler.abort_all().await;
 }
 
 async fn api_health() -> axum::Json<serde_json::Value> {

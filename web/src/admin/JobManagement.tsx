@@ -1,4 +1,4 @@
-import { CircleHelp } from "lucide-react";
+import { CircleHelp, Settings2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
@@ -34,6 +34,8 @@ import {
 	apiGetAdminTranslationRequests,
 	apiGetAdminTranslationStatus,
 	apiOpenAdminJobsEventsStream,
+	apiPatchAdminLlmRuntimeConfig,
+	apiPatchAdminTranslationRuntimeConfig,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
 import { Badge } from "@/components/ui/badge";
@@ -45,7 +47,16 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
 	Select,
 	SelectContent,
@@ -118,6 +129,30 @@ function formatDurationMs(value: number | null | undefined) {
 	if (typeof value !== "number") return "-";
 	if (value < 1000) return `${value}ms`;
 	return `${(value / 1000).toFixed(2)}s`;
+}
+
+function parsePositiveIntegerInput(value: string) {
+	if (!/^\d+$/.test(value.trim())) {
+		return null;
+	}
+	const parsed = Number(value);
+	if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+		return null;
+	}
+	return parsed;
+}
+
+function formatTranslationWorkerBoardDescription(
+	generalWorkerConcurrency: number | null | undefined,
+	dedicatedWorkerConcurrency: number | null | undefined,
+) {
+	if (
+		typeof generalWorkerConcurrency !== "number" ||
+		typeof dedicatedWorkerConcurrency !== "number"
+	) {
+		return "当前展示翻译工作者的实时槽位状态。";
+	}
+	return `当前展示 ${generalWorkerConcurrency} 个通用 worker 与 ${dedicatedWorkerConcurrency} 个用户专用 worker 的实时槽位状态。`;
 }
 
 function localInputToUtc(value: string) {
@@ -1436,6 +1471,13 @@ function TranslationSchedulerSection(props: {
 		useState<AdminTranslationBatchDetailResponse | null>(null);
 	const [drawerLoading, setDrawerLoading] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+	const [generalWorkerInput, setGeneralWorkerInput] = useState("");
+	const [dedicatedWorkerInput, setDedicatedWorkerInput] = useState("");
+	const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
+		null,
+	);
+	const [settingsSaving, setSettingsSaving] = useState(false);
 	const requestLoadedRef = useRef(false);
 	const batchLoadedRef = useRef(false);
 	const requestTotalPages = useMemo(
@@ -1458,6 +1500,14 @@ function TranslationSchedulerSection(props: {
 			status?.workers.find((worker) => worker.worker_id === drawer.id) ?? null
 		);
 	}, [drawer, status]);
+	const workerBoardDescription = useMemo(
+		() =>
+			formatTranslationWorkerBoardDescription(
+				status?.general_worker_concurrency,
+				status?.dedicated_worker_concurrency,
+			),
+		[status],
+	);
 	const loadStatus = useCallback(async () => {
 		setStatusLoading(true);
 		try {
@@ -1548,6 +1598,43 @@ function TranslationSchedulerSection(props: {
 		setDrawerLoading(false);
 		setError(null);
 	}, []);
+
+	const openSettingsDialog = useCallback(() => {
+		setSettingsSaveError(null);
+		setGeneralWorkerInput(String(status?.general_worker_concurrency ?? ""));
+		setDedicatedWorkerInput(String(status?.dedicated_worker_concurrency ?? ""));
+		setSettingsDialogOpen(true);
+	}, [status]);
+
+	const saveSettings = useCallback(async () => {
+		const generalWorkerConcurrency =
+			parsePositiveIntegerInput(generalWorkerInput);
+		if (!generalWorkerConcurrency) {
+			setSettingsSaveError("通用 worker 数量必须是大于 0 的整数。");
+			return;
+		}
+		const dedicatedWorkerConcurrency =
+			parsePositiveIntegerInput(dedicatedWorkerInput);
+		if (!dedicatedWorkerConcurrency) {
+			setSettingsSaveError("用户专用 worker 数量必须是大于 0 的整数。");
+			return;
+		}
+
+		setSettingsSaving(true);
+		setSettingsSaveError(null);
+		try {
+			const nextStatus = await apiPatchAdminTranslationRuntimeConfig({
+				general_worker_concurrency: generalWorkerConcurrency,
+				dedicated_worker_concurrency: dedicatedWorkerConcurrency,
+			});
+			setStatus(nextStatus);
+			setSettingsDialogOpen(false);
+		} catch (err) {
+			setSettingsSaveError(normalizeErrorMessage(err));
+		} finally {
+			setSettingsSaving(false);
+		}
+	}, [dedicatedWorkerInput, generalWorkerInput]);
 
 	useEffect(() => {
 		if (refreshNonce < 0) return;
@@ -1674,6 +1761,19 @@ function TranslationSchedulerSection(props: {
 			<TranslationWorkerBoard
 				workers={status?.workers ?? []}
 				loading={statusLoading && !status}
+				description={workerBoardDescription}
+				headerAction={
+					<Button
+						type="button"
+						variant="outline"
+						size="icon"
+						aria-label="配置翻译 worker 数量"
+						onClick={openSettingsDialog}
+						disabled={!status || settingsSaving}
+					>
+						<Settings2 />
+					</Button>
+				}
 				onWorkerClick={(worker) => openWorkerDetail(worker.worker_id)}
 			/>
 
@@ -2383,6 +2483,85 @@ function TranslationSchedulerSection(props: {
 					</div>
 				</SheetContent>
 			</Sheet>
+
+			<Dialog
+				open={settingsDialogOpen}
+				onOpenChange={(open) => {
+					setSettingsDialogOpen(open);
+					if (!open) {
+						setSettingsSaveError(null);
+					}
+				}}
+			>
+				<DialogContent className="max-w-md">
+					<DialogHeader>
+						<DialogTitle>配置翻译 worker 数量</DialogTitle>
+						<DialogDescription>
+							保存后立即生效；缩容不会打断当前批次，超出的 worker
+							会在当前工作完成后自然退场。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="space-y-4">
+						<div className="space-y-2">
+							<Label htmlFor="translation-general-worker-concurrency">
+								通用 worker 数量
+							</Label>
+							<Input
+								id="translation-general-worker-concurrency"
+								type="number"
+								min={1}
+								step={1}
+								inputMode="numeric"
+								value={generalWorkerInput}
+								onChange={(event) => setGeneralWorkerInput(event.target.value)}
+							/>
+						</div>
+						<div className="space-y-2">
+							<Label htmlFor="translation-dedicated-worker-concurrency">
+								用户专用 worker 数量
+							</Label>
+							<Input
+								id="translation-dedicated-worker-concurrency"
+								type="number"
+								min={1}
+								step={1}
+								inputMode="numeric"
+								value={dedicatedWorkerInput}
+								onChange={(event) =>
+									setDedicatedWorkerInput(event.target.value)
+								}
+							/>
+						</div>
+						{settingsSaveError ? (
+							<p className="text-destructive text-sm">{settingsSaveError}</p>
+						) : (
+							<p className="text-muted-foreground text-xs">
+								工作者板会按通用 worker 在前、用户专用 worker
+								在后的顺序连续编号。
+							</p>
+						)}
+					</div>
+
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setSettingsDialogOpen(false)}
+							disabled={settingsSaving}
+						>
+							取消
+						</Button>
+						<Button
+							type="button"
+							onClick={() => void saveSettings()}
+							disabled={settingsSaving}
+						>
+							{settingsSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 		</>
 	);
 }
@@ -2416,6 +2595,12 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
 	const [llmStatusLoading, setLlmStatusLoading] = useState(false);
+	const [llmSettingsDialogOpen, setLlmSettingsDialogOpen] = useState(false);
+	const [llmMaxConcurrencyInput, setLlmMaxConcurrencyInput] = useState("");
+	const [llmSettingsSaveError, setLlmSettingsSaveError] = useState<
+		string | null
+	>(null);
+	const [llmSettingsSaving, setLlmSettingsSaving] = useState(false);
 	const [llmStatusFilter, setLlmStatusFilter] =
 		useState<LlmStatusFilter>("all");
 	const [llmSourceFilter, setLlmSourceFilter] = useState("");
@@ -2772,6 +2957,34 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			}
 		}
 	}, []);
+
+	const openLlmSettingsDialog = useCallback(() => {
+		setLlmSettingsSaveError(null);
+		setLlmMaxConcurrencyInput(String(llmStatus?.max_concurrency ?? ""));
+		setLlmSettingsDialogOpen(true);
+	}, [llmStatus]);
+
+	const saveLlmSettings = useCallback(async () => {
+		const maxConcurrency = parsePositiveIntegerInput(llmMaxConcurrencyInput);
+		if (!maxConcurrency) {
+			setLlmSettingsSaveError("并发上限必须是大于 0 的整数。");
+			return;
+		}
+
+		setLlmSettingsSaving(true);
+		setLlmSettingsSaveError(null);
+		try {
+			const nextStatus = await apiPatchAdminLlmRuntimeConfig({
+				max_concurrency: maxConcurrency,
+			});
+			setLlmStatus(nextStatus);
+			setLlmSettingsDialogOpen(false);
+		} catch (err) {
+			setLlmSettingsSaveError(normalizeErrorMessage(err));
+		} finally {
+			setLlmSettingsSaving(false);
+		}
+	}, [llmMaxConcurrencyInput]);
 
 	const loadLlmCalls = useCallback(
 		async (options?: LoadOptions) => {
@@ -3831,11 +4044,23 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 				<TabsContent value="llm">
 					<Card>
-						<CardHeader>
-							<CardTitle>LLM 调度</CardTitle>
-							<CardDescription>
-								查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
-							</CardDescription>
+						<CardHeader className="flex flex-row items-start justify-between gap-4">
+							<div className="space-y-1.5">
+								<CardTitle>LLM 调度</CardTitle>
+								<CardDescription>
+									查看调度状态与调用级日志，支持按状态/来源/用户/时间筛选。
+								</CardDescription>
+							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="icon"
+								aria-label="配置 LLM 并发上限"
+								onClick={openLlmSettingsDialog}
+								disabled={!llmStatus || llmSettingsSaving}
+							>
+								<Settings2 />
+							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="max-w-sm">
@@ -3850,6 +4075,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									<p className="text-muted-foreground mt-1 text-xs">
 										平均等待{" "}
 										{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										并发上限 {formatCount(llmStatus?.max_concurrency)} · 可用{" "}
+										{formatCount(llmStatus?.available_slots)}
 									</p>
 								</div>
 							</div>
@@ -4030,6 +4259,68 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					/>
 				</TabsContent>
 			</Tabs>
+
+			<Dialog
+				open={llmSettingsDialogOpen}
+				onOpenChange={(open) => {
+					setLlmSettingsDialogOpen(open);
+					if (!open) {
+						setLlmSettingsSaveError(null);
+					}
+				}}
+			>
+				<DialogContent className="max-w-md">
+					<DialogHeader>
+						<DialogTitle>配置 LLM 并发上限</DialogTitle>
+						<DialogDescription>
+							保存后立即生效；若新值低于当前 in-flight
+							数量，已有调用会继续执行，新的调用会等待空闲槽位。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="space-y-4">
+						<div className="space-y-2">
+							<Label htmlFor="llm-max-concurrency">最大并发数</Label>
+							<Input
+								id="llm-max-concurrency"
+								type="number"
+								min={1}
+								step={1}
+								inputMode="numeric"
+								value={llmMaxConcurrencyInput}
+								onChange={(event) =>
+									setLlmMaxConcurrencyInput(event.target.value)
+								}
+							/>
+						</div>
+						{llmSettingsSaveError ? (
+							<p className="text-destructive text-sm">{llmSettingsSaveError}</p>
+						) : (
+							<p className="text-muted-foreground text-xs">
+								当前页面会保留正在执行的调用，不会因为缩容而中断已有任务。
+							</p>
+						)}
+					</div>
+
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setLlmSettingsDialogOpen(false)}
+							disabled={llmSettingsSaving}
+						>
+							取消
+						</Button>
+						<Button
+							type="button"
+							onClick={() => void saveLlmSettings()}
+							disabled={llmSettingsSaving}
+						>
+							{llmSettingsSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 
 			<Sheet
 				open={isTaskDrawerOpen}

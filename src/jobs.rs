@@ -1174,7 +1174,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                 );
             }
 
-            for worker in translations::translation_worker_runtime_statuses().await {
+            for worker in translations::translation_worker_runtime_statuses(state.as_ref()).await {
                 let last_seen = last_translation_worker_updated_at
                     .get(worker.worker_id.as_str())
                     .cloned();
@@ -2346,6 +2346,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),

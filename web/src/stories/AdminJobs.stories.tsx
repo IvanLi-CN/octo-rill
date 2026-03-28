@@ -646,10 +646,31 @@ function AdminJobsPreview({
 		const realtimeTasks = realtimeTasksSeed.map((item) => ({ ...item }));
 		const scheduledRuns = scheduledRunsSeed.map((item) => ({ ...item }));
 		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
-		const translationWorkers =
+		let llmSchedulerStatus = {
+			scheduler_enabled: true,
+			max_concurrency: 2,
+			waiting_calls: 1,
+			in_flight_calls: 1,
+			available_slots: 1,
+			calls_24h: llmCalls.length,
+			failed_24h: llmCalls.filter((item) => item.status === "failed").length,
+			avg_wait_ms_24h: 810,
+			avg_duration_ms_24h: 1570,
+			last_success_at: llmCalls.at(-1)?.finished_at ?? null,
+			last_failure_at: llmCalls[0]?.finished_at ?? null,
+		};
+		let translationWorkers =
 			translationState === "busy"
 				? translationBusyWorkersSeed.map((item) => ({ ...item }))
 				: translationCompletedWorkersSeed.map((item) => ({ ...item }));
+		let translationWorkerConfig = {
+			general_worker_concurrency: translationWorkers.filter(
+				(worker) => worker.worker_kind === "general",
+			).length,
+			dedicated_worker_concurrency: translationWorkers.filter(
+				(worker) => worker.worker_kind === "user_dedicated",
+			).length,
+		};
 		const translationRequests = [
 			{
 				...translationRequestSeed,
@@ -681,6 +702,72 @@ function AdminJobsPreview({
 						},
 					]
 				: [translationBatchSeed];
+
+		function buildIdleWorkers(
+			generalWorkerConcurrency: number,
+			dedicatedWorkerConcurrency: number,
+		) {
+			return [
+				...Array.from({ length: generalWorkerConcurrency }, (_, index) => ({
+					worker_id: `translation-worker-general-${index + 1}`,
+					worker_slot: index + 1,
+					worker_kind: "general" as const,
+					status: "idle" as const,
+					current_batch_id: null,
+					request_count: 0,
+					work_item_count: 0,
+					trigger_reason: null,
+					updated_at: "2026-02-26T04:00:03Z",
+					error_text: null,
+				})),
+				...Array.from({ length: dedicatedWorkerConcurrency }, (_, index) => ({
+					worker_id: `translation-worker-user-dedicated-${index + 1}`,
+					worker_slot: generalWorkerConcurrency + index + 1,
+					worker_kind: "user_dedicated" as const,
+					status: "idle" as const,
+					current_batch_id: null,
+					request_count: 0,
+					work_item_count: 0,
+					trigger_reason: null,
+					updated_at: "2026-02-26T04:00:03Z",
+					error_text: null,
+				})),
+			];
+		}
+
+		function buildTranslationStatusPayload() {
+			const busyWorkers = translationWorkers.filter(
+				(worker) => worker.status === "running",
+			).length;
+			const idleWorkers = translationWorkers.filter(
+				(worker) => worker.status === "idle",
+			).length;
+			return {
+				scheduler_enabled: true,
+				llm_enabled: true,
+				scan_interval_ms: 250,
+				batch_token_threshold: 1800,
+				general_worker_concurrency:
+					translationWorkerConfig.general_worker_concurrency,
+				dedicated_worker_concurrency:
+					translationWorkerConfig.dedicated_worker_concurrency,
+				worker_concurrency:
+					translationWorkerConfig.general_worker_concurrency +
+					translationWorkerConfig.dedicated_worker_concurrency,
+				idle_workers: idleWorkers,
+				busy_workers: busyWorkers,
+				workers: translationWorkers,
+				queued_requests: translationState === "busy" ? 1 : 0,
+				queued_work_items: translationState === "busy" ? 1 : 0,
+				running_batches: translationState === "busy" ? 1 : 0,
+				requests_24h: 1,
+				completed_batches_24h: translationState === "busy" ? 0 : 1,
+				failed_batches_24h: 0,
+				avg_wait_ms_24h: translationState === "busy" ? null : 320,
+				last_batch_finished_at:
+					translationState === "busy" ? null : "2026-02-26T04:00:03Z",
+			};
+		}
 
 		window.fetch = async (input, init) => {
 			const req =
@@ -842,26 +929,30 @@ function AdminJobsPreview({
 				url.pathname === "/api/admin/jobs/llm/status" &&
 				req.method === "GET"
 			) {
-				return new Response(
-					JSON.stringify({
-						scheduler_enabled: true,
-						max_concurrency: 2,
-						waiting_calls: 1,
-						in_flight_calls: 1,
-						available_slots: 1,
-						calls_24h: llmCalls.length,
-						failed_24h: llmCalls.filter((item) => item.status === "failed")
-							.length,
-						avg_wait_ms_24h: 810,
-						avg_duration_ms_24h: 1570,
-						last_success_at: llmCalls.at(-1)?.finished_at ?? null,
-						last_failure_at: llmCalls[0]?.finished_at ?? null,
-					}),
-					{
-						status: 200,
-						headers: { "content-type": "application/json" },
-					},
-				);
+				return new Response(JSON.stringify(llmSchedulerStatus), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/llm/runtime-config" &&
+				req.method === "PATCH"
+			) {
+				const body = (await req.json()) as { max_concurrency?: number };
+				llmSchedulerStatus = {
+					...llmSchedulerStatus,
+					max_concurrency: Number(body.max_concurrency ?? 1),
+					available_slots: Math.max(
+						0,
+						Number(body.max_concurrency ?? 1) -
+							llmSchedulerStatus.in_flight_calls,
+					),
+				};
+				return new Response(JSON.stringify(llmSchedulerStatus), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 
 			if (
@@ -941,34 +1032,36 @@ function AdminJobsPreview({
 				url.pathname === "/api/admin/jobs/translations/status" &&
 				req.method === "GET"
 			) {
-				const busyWorkers = translationWorkers.filter(
-					(worker) => worker.status === "running",
-				).length;
-				const idleWorkers = translationWorkers.filter(
-					(worker) => worker.status === "idle",
-				).length;
-				return new Response(
-					JSON.stringify({
-						scheduler_enabled: true,
-						llm_enabled: true,
-						scan_interval_ms: 250,
-						batch_token_threshold: 1800,
-						worker_concurrency: 4,
-						idle_workers: idleWorkers,
-						busy_workers: busyWorkers,
-						workers: translationWorkers,
-						queued_requests: translationState === "busy" ? 1 : 0,
-						queued_work_items: translationState === "busy" ? 1 : 0,
-						running_batches: translationState === "busy" ? 1 : 0,
-						requests_24h: 1,
-						completed_batches_24h: translationState === "busy" ? 0 : 1,
-						failed_batches_24h: 0,
-						avg_wait_ms_24h: translationState === "busy" ? null : 320,
-						last_batch_finished_at:
-							translationState === "busy" ? null : "2026-02-26T04:00:03Z",
-					}),
-					{ status: 200, headers: { "content-type": "application/json" } },
+				return new Response(JSON.stringify(buildTranslationStatusPayload()), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/translations/runtime-config" &&
+				req.method === "PATCH"
+			) {
+				const body = (await req.json()) as {
+					general_worker_concurrency?: number;
+					dedicated_worker_concurrency?: number;
+				};
+				translationWorkerConfig = {
+					general_worker_concurrency: Number(
+						body.general_worker_concurrency ?? 1,
+					),
+					dedicated_worker_concurrency: Number(
+						body.dedicated_worker_concurrency ?? 1,
+					),
+				};
+				translationWorkers = buildIdleWorkers(
+					translationWorkerConfig.general_worker_concurrency,
+					translationWorkerConfig.dedicated_worker_concurrency,
 				);
+				return new Response(JSON.stringify(buildTranslationStatusPayload()), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 
 			if (
@@ -1288,6 +1381,20 @@ export const LlmConversationDetail: Story = {
 	},
 };
 
+export const LlmSettingsDialog: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/llm" />,
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			body.getByRole("button", { name: "配置 LLM 并发上限" }),
+		);
+		await expect(
+			body.getByRole("heading", { name: "配置 LLM 并发上限" }),
+		).toBeVisible();
+		await expect(body.getByLabelText("最大并发数")).toHaveValue(2);
+	},
+};
+
 export const TaskDrawerDetail: Story = {
 	render: () => (
 		<AdminJobsPreview routeUrl="/admin/jobs/tasks/task-translate-batch-story" />
@@ -1342,6 +1449,54 @@ export const TranslationWorkerBoard: Story = {
 				canvasElement.ownerDocument.defaultView?.location.search,
 			).toContain("view=history"),
 		);
+	},
+};
+
+export const TranslationSettingsDialog: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/translations?view=queue" />
+	),
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			body.getByRole("button", { name: "配置翻译 worker 数量" }),
+		);
+		await expect(
+			body.getByRole("heading", { name: "配置翻译 worker 数量" }),
+		).toBeVisible();
+		await expect(body.getByLabelText("通用 worker 数量")).toHaveValue(3);
+		await expect(body.getByLabelText("用户专用 worker 数量")).toHaveValue(1);
+	},
+};
+
+export const TranslationSettingsSaved: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/translations?view=queue" />
+	),
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			body.getByRole("button", { name: "配置翻译 worker 数量" }),
+		);
+		const generalInput = body.getByLabelText(
+			"通用 worker 数量",
+		) as HTMLInputElement;
+		const dedicatedInput = body.getByLabelText(
+			"用户专用 worker 数量",
+		) as HTMLInputElement;
+		await userEvent.clear(generalInput);
+		await userEvent.type(generalInput, "5");
+		await userEvent.clear(dedicatedInput);
+		await userEvent.type(dedicatedInput, "2");
+		await userEvent.click(body.getByRole("button", { name: "保存设置" }));
+		await expect(
+			body.queryByRole("heading", { name: "配置翻译 worker 数量" }),
+		).not.toBeInTheDocument();
+		await expect(
+			body.getByText(
+				"当前展示 5 个通用 worker 与 2 个用户专用 worker 的实时槽位状态。",
+			),
+		).toBeVisible();
 	},
 };
 

@@ -83,3 +83,4 @@
 | erscd | 管理员任务中心：LLM 调度观测与调用排障 | 已完成 | `erscd-admin-llm-scheduler-observability/SPEC.md` | 2026-02-27 | local implementation completed |
 | 96dp9 | Dashboard 同步入口收敛与顺序固定 | 已完成 | `96dp9-dashboard-sync-unification/SPEC.md` | 2026-03-27 | PR #39; single sync entry shipped with one retained visual evidence asset |
 | g8p8z | 管理员任务中心 Tab 路由化 | 已完成 | `g8p8z-admin-jobs-tab-routing/SPEC.md` | 2026-03-27 | local implementation completed; pathname-driven primary tabs + translation `view` deep links + task drawer `from` restore |
+| epn56 | 管理员任务中心运行时 worker 数量设置 | 部分完成（3/4） | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-03-27 | runtime config dialogs + persisted hot updates; cargo/web/storybook/e2e green |
