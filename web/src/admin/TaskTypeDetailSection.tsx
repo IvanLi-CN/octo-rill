@@ -246,6 +246,36 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
+		case "sync.access_refresh": {
+			const starred = readObject(result, "starred");
+			const release = readObject(result, "release");
+			return {
+				pageTitle: "访问增量同步详情页",
+				pageSummary:
+					"展示用户访问触发的 staged refresh，包括 Star 快照刷新与共享 Release 队列结果。",
+				fields: buildFields(
+					field("目标用户", userId ? `#${userId}` : null),
+					field(
+						"Star 仓库数",
+						readNumber(starred, "repos") !== null
+							? `${readNumber(starred, "repos")}`
+							: null,
+					),
+					field(
+						"Release 仓库数",
+						readNumber(release, "repos") !== null
+							? `${readNumber(release, "repos")}`
+							: null,
+					),
+					field(
+						"共享 Release 数",
+						readNumber(release, "releases") !== null
+							? `${readNumber(release, "releases")}`
+							: null,
+					),
+				),
+			};
+		}
 		case "sync.notifications": {
 			const notifications = readNumber(result, "notifications");
 			const since = readString(result, "since");

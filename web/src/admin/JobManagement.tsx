@@ -735,6 +735,8 @@ function taskTypeLabel(taskType: string) {
 			return "日报生成";
 		case "sync.all":
 			return "全量同步";
+		case "sync.access_refresh":
+			return "访问增量同步";
 		case "sync.starred":
 			return "同步 Star";
 		case "sync.releases":
@@ -1254,6 +1256,19 @@ function resolveListLoadPhase(
 		return "initial";
 	}
 	return "refreshing";
+}
+
+function shouldReuseInitialListRequest(
+	hasLoadedOnce: boolean,
+	initialRequestInFlight: boolean,
+	activeRequestKey: string | null,
+	nextRequestKey: string,
+): boolean {
+	return (
+		!hasLoadedOnce &&
+		initialRequestInFlight &&
+		activeRequestKey === nextRequestKey
+	);
 }
 
 type TranslationStatusFilter =
@@ -2437,6 +2452,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const tasksLoadedOnceRef = useRef(false);
 	const tasksInitialRequestInFlightRef = useRef(false);
 	const tasksRequestIdRef = useRef(0);
+	const tasksRequestKeyRef = useRef<string | null>(null);
 	const scheduledRunsLoadedOnceRef = useRef(false);
 	const scheduledRunsInitialRequestInFlightRef = useRef(false);
 	const scheduledRunsRequestIdRef = useRef(0);
@@ -2619,15 +2635,20 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 
 	const loadRealtimeTasks = useCallback(
 		async (options?: LoadOptions) => {
+			const requestKey = `${statusFilter}:${taskPage}`;
 			if (
-				options?.background &&
-				!tasksLoadedOnceRef.current &&
-				tasksInitialRequestInFlightRef.current
+				shouldReuseInitialListRequest(
+					tasksLoadedOnceRef.current,
+					tasksInitialRequestInFlightRef.current,
+					tasksRequestKeyRef.current,
+					requestKey,
+				)
 			) {
 				return;
 			}
 			const requestId = tasksRequestIdRef.current + 1;
 			tasksRequestIdRef.current = requestId;
+			tasksRequestKeyRef.current = requestKey;
 			tasksInitialRequestInFlightRef.current = !tasksLoadedOnceRef.current;
 			setTasksLoadPhase(
 				resolveListLoadPhase(tasksLoadedOnceRef.current, options),

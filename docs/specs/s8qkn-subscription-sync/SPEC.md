@@ -1,47 +1,78 @@
-# 全用户 Star / Release 半小时定时同步闭环（#s8qkn）
+# 全局 Repo Release 复用与访问触发增量同步（#s8qkn）
 
 ## 状态
 
-- Status: 待实现
-- Created: 2026-03-06
-- Last: 2026-03-06
+- Status: Implemented
 
 ## 背景 / 问题陈述
 
-当前项目仅支持用户手动触发 Star / Release 同步，缺少面向全体启用用户的周期性订阅同步能力，也缺少对应的运行日志、关键事件审计与后台可观测入口。
+旧实现把 Release 同步和存储都绑定在用户维度：
+
+- `sync.releases` 直接按用户当前 `starred_repos` 向 GitHub 抓取并写入用户私有 `releases`
+- `sync.subscriptions` 虽然聚合了 repo 抓取，但仍会 fan-out 回写到每个用户的 `releases`
+- 新用户或长时间未访问的用户进入站点后，看不到“先展示已有缓存、再补齐最新数据”的 staged refresh
+- Dashboard 的 `Sync all` 由多个 sibling tasks 组成，顺序不可控，无法保证 `starred` 先于 `releases`
+
+这一轮把 Release 读写模型、任务编排和访问 bootstrap 一次性收敛到共享仓库模型。
 
 ## 目标 / 非目标
 
 ### Goals
 
-- 新增系统级定时任务 `sync.subscriptions`，每 30 分钟自动执行一次全用户订阅同步。
-- 同步流程固定为两阶段：先按用户活跃度刷新 Star 快照，再按聚合仓库抓取 Release 并 fan-out 回写到关联用户。
-- 两阶段均采用 5 个 worker 并发；恢复性错误最多重试 3 次，不可恢复错误落库记录。
-- 每次调度都生成任务运行记录与 NDJSON 日志文件，并在管理端详情页可查看摘要与下载日志。
-- 新增 `sync_subscription_events` 领域事件表，支持按 task / user / repo 维度检索关键事件。
-- 管理端 Scheduled Runs 支持同时查看 `brief.daily_slot` 与 `sync.subscriptions`。
+- 引入共享 `repo_releases` 缓存，所有用户从 `starred_repos + repo_releases` 读取 Release。
+- 引入全局 `repo_release_work_items` / `repo_release_watchers`，把访问触发、手动同步、定时订阅同步统一汇聚到 repo 级共享队列。
+- 新增 `sync.access_refresh`：
+  - 仅覆盖 `Star + Release`
+  - 首访或超过 1 小时未访问时自动触发
+  - `star_refreshed` 后立即让前端刷新可见缓存
+  - Release work 完成后再刷新一次
+- `sync.subscriptions` 改成：
+  - 刷新用户 Star
+  - 聚合 repo demand
+  - 挂到共享 repo release queue
+  - 等待关联 outcome 并输出摘要
+- `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
 
 ### Non-goals
 
-- 不重构用户侧 `/api/starred`、`/api/releases`、feed、brief、翻译、reaction` 的读模型。
-- 不引入跨实例分布式锁；当前按单 SQLite 进程模型做调度去重。
-- 不在本轮实现真实程序截图或新的可视化报表页。
+- 不把访问触发同步扩展到 Inbox。
+- 不引入跨实例分布式锁或 leader election。
+- 不引入 GitHub webhook / upstream push 模式。
 
 ## 范围（Scope）
 
 ### In scope
 
-- DB migration：`job_tasks.log_file_path`、半小时调度去重状态表、`sync_subscription_events`。
-- 后端运行时：全用户订阅同步协调器、5x5 worker pool、公平排序、错误分类与重试。
-- 日志与可观测：NDJSON 日志文件、关键事件落库、管理端任务详情诊断、日志下载接口。
-- 管理端前端：Scheduled Runs 列表扩容到新任务类型，新增 `sync.subscriptions` 专属详情展示与 Storybook story。
-- 自动化测试：排序/去重/诊断/日志/管理端任务详情覆盖。
+- DB migration:
+  - `repo_releases`
+  - `repo_release_work_items`
+  - `repo_release_watchers`
+  - 从旧 `releases` 去重回填到 `repo_releases`
+- 后端运行时：
+  - repo 级共享 release worker
+  - runtime lease heartbeat / recovery
+  - `sync.access_refresh`
+  - `/api/me.access_sync`
+  - `/api/tasks/{task_id}/events`
+- 读模型切换：
+  - `/api/releases`
+  - `/api/releases/{id}/detail`
+  - feed
+  - brief
+  - release translation
+  - release reaction
+- Dashboard staged refresh：
+  - 读取 `me.access_sync`
+  - 订阅 task SSE
+  - 在 `star_refreshed` / `task.completed` 两次刷新
+  - 空态改成“自动同步中 / 无缓存内容”两态
+- Storybook：
+  - 新增 `AccessSyncEmptyState` 稳定场景
 
 ### Out of scope
 
-- 跨节点 leader election / Redis 分布式调度。
-- Release 数据模型去重重构或用户视图改造成仓库共享表。
-- 事件表归档与冷热分层。
+- 删除历史 `releases` 表或一次性清理所有遗留测试数据。
+- 新增专门的 repo release 管理后台页面。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -49,103 +80,112 @@
 
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） |
 | --- | --- | --- | --- | --- | --- | --- |
-| `sync.subscriptions` | Job task | internal | New | `./contracts/http-apis.md` | backend | scheduler / admin |
-| `GET /api/admin/jobs/realtime/{task_id}` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
-| `GET /api/admin/jobs/realtime/{task_id}/log` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
-| `GET /api/admin/jobs/realtime` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
-| `job_tasks` / `scheduled_task_dispatch_state` / `sync_subscription_events` | DB schema | internal | Modify/New | `./contracts/db.md` | backend | backend |
-
-### 契约文档（按 Kind 拆分）
-
-- [contracts/http-apis.md](./contracts/http-apis.md)
-- [contracts/db.md](./contracts/db.md)
+| `GET /api/me` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
+| `GET /api/tasks/{task_id}/events` | HTTP API / SSE | external | New | `./contracts/http-apis.md` | backend | web |
+| `POST /api/sync/all` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web |
+| `POST /api/sync/releases` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
+| `sync.access_refresh` | Job task | internal | New | `./contracts/http-apis.md` | backend | api / web |
+| `sync.subscriptions` | Job task | internal | Modify | `./contracts/http-apis.md` | backend | scheduler / admin |
+| `repo_releases` / `repo_release_work_items` / `repo_release_watchers` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 
 ## 功能与行为规格（Functional / Behavior Spec）
 
-### 调度与去重
+### 访问触发刷新
 
-- 半小时调度键使用 UTC `YYYY-MM-DDTHH:MM`（分钟仅 `00` 或 `30`）。
-- 同一 `schedule_key` 只允许 dispatch 一次。
-- 若上一轮 `sync.subscriptions` 仍处于 `queued|running`，当前触发不并发执行，而是生成一条 `status=succeeded + result.skipped=true + skip_reason=previous_run_active` 的运行记录，并生成日志文件。
+- `GET /api/me` 必须先读取用户旧 `last_active_at`，再决定是否 stale，最后才 touch 新的 `last_active_at`。
+- 触发条件：
+  - `last_active_at IS NULL`
+  - 或者距当前时间超过 1 小时
+- 若当前用户已有 `queued|running` 的 `sync.access_refresh`，则直接复用该 task，`reason=reused_inflight`。
+- 否则新建 `sync.access_refresh`，`reason=first_visit|inactive_over_1h`。
 
-### Star 阶段
+### `sync.access_refresh`
 
-- 仅处理 `users.is_disabled = 0` 的用户。
-- 用户排序：`last_active_at DESC, user_id ASC`；`NULL last_active_at` 排最后。
-- 采用 5 个 worker 并发刷新 Star 快照。
-- 单个用户只有在完整获取成功后才事务性替换 `starred_repos`；失败时保留旧快照。
-- Star 阶段失败的用户不参与本轮 repo 聚合。
+- 阶段固定为：
+  1. 刷新当前用户 Star 快照
+  2. 触发 `task.progress(stage=star_refreshed)`
+  3. 将当前可见 repo 挂到共享 repo release queue
+  4. 触发 `task.progress(stage=release_attached)`
+  5. 等待关联 work item 满足“已有新鲜缓存或本轮完成”
+  6. 触发 `task.progress(stage=release_summary)`
+  7. `task.completed`
+- 访问自动刷新只覆盖 `Star + Release`，不自动同步 Inbox。
 
-### Repo / Release 阶段
+### 共享 repo release queue
 
-- repo 聚合输入仅来自本轮 Star 阶段成功用户。
-- 聚合结果为 `(repo_id, repo_full_name, is_private, related_users[])`，其中 `related_users` 必须同时满足“本轮 Star 成功 + 当前仍对该 repo 加星”。
-- repo 队列排序：`related_users.len DESC, repo_full_name ASC`。
-- 候选凭据排序：`related_user.last_active_at DESC, user_id ASC`。
-- 每个 repo 只向 GitHub 拉取一次 Release；成功后 fan-out upsert 到全部关联用户的现有 `releases` 记录。
-- repo 级恢复性错误：对当前候选凭据最多重试 3 次（带退避），重试耗尽后再切换到下一位关联用户。
-- repo 级不可恢复错误：记录关键事件后直接切换下一位候选用户；全部候选均失败则该 repo 记为失败。
+- `repo_release_work_items` 一条 repo 只保留一条共享 work item。
+- claim 顺序固定为：
+  - `priority DESC`
+  - `has_new_repo_watchers DESC`
+  - `deadline_at ASC`
+  - `created_at ASC`
+- 访问触发 demand 使用 `priority=interactive`，定时订阅同步使用 `priority=system`。
+- 若系统排队 work item 被访问 demand 命中，则允许升级优先级，但不抢占已 running work item。
+- 单个 repo 抓取时按“当前仍 star 该 repo 的用户”挑选候选 token，排序规则：
+  - `last_active_at DESC`
+  - `user_id ASC`
+- 成功抓取后写入共享 `repo_releases`，并把等待中的 watcher 标记为 `succeeded`。
+- 失败时把等待中的 watcher 标记为 `failed`。
 
-### 错误与事件
+### `sync.subscriptions`
 
-- 恢复性错误：transport/connect/timeout/429/5xx/secondary rate limit。
-- 不可恢复错误：缺 token、401、scope 不足、repo 明确 404/451；`401/403` 若明显是凭据/权限问题，记用户事件并继续尝试下一位候选用户。
-- 关键事件写入 `sync_subscription_events`；高层进度继续写 `job_task_events`。
-- 每次任务都生成 NDJSON 日志文件；日志包含阶段切换、worker 结果、重试、skip、最终汇总。
+- Star 阶段仍然按用户活跃度刷新 `starred_repos`，失败用户不会参与 repo 聚合。
+- Release 阶段不再 inline 抓 GitHub Release，也不再 fan-out 写用户私有 `releases`。
+- Release 阶段改成：
+  - 聚合 repo demand
+  - 挂到共享 repo release queue
+  - 等待共享 queue 结果
+  - 在任务结果里输出 repo 级摘要
+
+### 读模型与可见性
+
+- Release 可见性统一为“当前用户 stars 了该 repo”。
+- 下列读路径统一改成 `starred_repos + repo_releases`：
+  - `/api/releases`
+  - `/api/releases/{id}/detail`
+  - `/api/feed`
+  - daily brief
+  - release batch translation / detail translation
+  - release reaction toggle / reaction count persistence
+- reaction counts 保存在共享 `repo_releases`。
+- viewer-specific reaction 状态继续按当前用户 live 查询，不做共享存储。
+
+### Dashboard staged refresh
+
+- 首屏仍先加载旧 feed / brief / inbox。
+- 若 `me.access_sync.task_id` 存在，则立即连用户侧 SSE。
+- 收到 `star_refreshed` 时执行第一次 `refreshAll()`，以显示服务端已知的共享缓存。
+- 收到 `task.completed(status=succeeded)` 时执行第二次 `refreshAll()`。
+- 当 access sync 进行中且 feed 为空时，空态显示“正在同步你的 Star / Release”。
+- 当 access sync 不在进行中且 feed 为空时，空态显示“还没有缓存内容”。
 
 ## 验收标准（Acceptance Criteria）
 
-- Given UTC 到达新的整点或半点且当前没有活动中的 `sync.subscriptions`
-  When 调度器运行
-  Then 只生成一条对应 `schedule_key` 的运行记录与日志文件，并按 Star -> Release 顺序执行。
+- Given 用户首次访问或超过 1 小时未访问
+  When `GET /api/me` 返回
+  Then 响应包含 `access_sync.task_id`，并且同一用户不会重复入队多个 `sync.access_refresh`。
 
-- Given 上一轮 `sync.subscriptions` 仍处于 `queued|running`
-  When 下一次半小时调度触发
-  Then 新增一条 `skipped=true` 的运行记录与日志文件，不与上一轮并发执行。
+- Given 用户已经有旧缓存 Release
+  When `sync.access_refresh` 发出 `star_refreshed`
+  Then Dashboard 第一次刷新可以看到与当前 `starred_repos` 匹配的共享 `repo_releases`。
 
-- Given 多个用户 `last_active_at` 不同
-  When Star 阶段分派
-  Then 实际分派顺序遵循 `last_active_at DESC, user_id ASC`，并发不超过 5。
+- Given 某个 repo 已经被系统同步或另一位用户访问 demand 排队
+  When 当前用户访问再次命中同 repo
+  Then 不会产生重复 GitHub 抓取，队列只升级 demand。
 
-- Given 多个聚合 repo 关联用户数不同
-  When Release 阶段分派
-  Then repo 队列遵循 `related_users DESC, repo_full_name ASC`，候选凭据顺序遵循关联用户活跃度倒序。
+- Given shared `repo_releases` 已启用
+  When feed / release detail / brief / translation / reaction 读取 Release
+  Then 只依赖“当前用户 star 可见 + 共享 repo release 缓存”，不依赖用户私有 `releases`。
 
-- Given 某 repo 抓取成功且存在 N 个关联用户
-  When fan-out 回写
-  Then Release 只从 GitHub 拉取一次，但会 upsert 到全部 N 个用户的 `releases`。
+## Visual Evidence
 
-- Given 网络超时 / 429 / 5xx / secondary rate limit
-  When 请求失败
-  Then 每个候选凭据最多重试 3 次，并记录 recoverable 关键事件。
+source_type=storybook_canvas  
+target_program=mock-only  
+capture_scope=element  
+sensitive_exclusion=N/A  
+submission_gate=pending-owner-approval  
+story_id_or_title=Pages/Dashboard/AccessSyncEmptyState  
+state=auto-sync-empty-state  
+evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
 
-- Given 管理员查看 `sync.subscriptions` 任务详情
-  When 页面加载完成
-  Then 可看到两阶段摘要、skip/失败原因、最近关键事件与日志下载入口。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [ ] M1: Spec / contract / migration 冻结。
-- [ ] M2: 半小时调度、任务日志、领域事件表与全用户同步运行时落地。
-- [ ] M3: 管理端任务详情、Scheduled Runs 与 Storybook 完成。
-- [ ] M4: Rust + Web 验证完成，spec 同步收口。
-
-## 文档更新
-
-- 更新 `docs/specs/README.md` index。
-- 补充本规格 `contracts/db.md` 与 `contracts/http-apis.md`。
-
-## 风险与开放问题
-
-- SQLite 单机调度去重不覆盖多实例并发；后续若引入多实例需补 leader / distributed lock。
-- `sync_subscription_events` 长期增长后可能需要 retention / archive 策略。
-- 本轮 fan-out 沿用现有 `releases` 用户维度存储，后续若做共享仓库模型需另开规格。
-
-## 假设
-
-- 默认使用本地文件系统存储任务日志，路径位于应用可写目录下。
-- 当前部署为单进程 SQLite，半小时调度去重无需跨实例协调。
-
-## 变更记录（Change log）
-
-- 2026-03-06: 新建规格，冻结半小时订阅同步、事件表、日志下载与管理端可观测范围。
+![Access sync empty state](./assets/access-sync-empty-state.png)

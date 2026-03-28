@@ -29,6 +29,7 @@ pub const TASK_SYNC_STARRED: &str = "sync.starred";
 pub const TASK_SYNC_RELEASES: &str = "sync.releases";
 pub const TASK_SYNC_NOTIFICATIONS: &str = "sync.notifications";
 pub const TASK_SYNC_ALL: &str = "sync.all";
+pub const TASK_SYNC_ACCESS_REFRESH: &str = "sync.access_refresh";
 pub const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
@@ -78,6 +79,7 @@ struct DispatchStateRow {
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
 static TASK_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 pub fn is_scheduled_task_type(task_type: &str) -> bool {
     SCHEDULED_TASK_TYPES.contains(&task_type)
@@ -85,6 +87,10 @@ pub fn is_scheduled_task_type(task_type: &str) -> bool {
 
 fn task_claim_lock() -> &'static tokio::sync::Mutex<()> {
     TASK_CLAIM_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn task_singleton_enqueue_lock() -> &'static tokio::sync::Mutex<()> {
+    TASK_SINGLETON_ENQUEUE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 pub fn spawn_task_workers(state: Arc<AppState>, count: usize) {
@@ -528,6 +534,58 @@ pub async fn enqueue_task(state: &AppState, new_task: NewTask) -> Result<Enqueue
         task_type: new_task.task_type,
         status: STATUS_QUEUED.to_owned(),
     })
+}
+
+pub async fn find_inflight_task_for_requester(
+    state: &AppState,
+    task_type: &str,
+    requested_by: &str,
+) -> Result<Option<EnqueuedTask>> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct InflightTaskRow {
+        id: String,
+        task_type: String,
+        status: String,
+    }
+
+    let row = sqlx::query_as::<_, InflightTaskRow>(
+        r#"
+        SELECT id, task_type, status
+        FROM job_tasks
+        WHERE task_type = ?
+          AND requested_by = ?
+          AND status IN (?, ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_type)
+    .bind(requested_by)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to find inflight task for requester")?;
+
+    Ok(row.map(|row| EnqueuedTask {
+        task_id: row.id,
+        task_type: row.task_type,
+        status: row.status,
+    }))
+}
+
+pub async fn enqueue_singleton_task_for_requester(
+    state: &AppState,
+    new_task: NewTask,
+) -> Result<EnqueuedTask> {
+    let _guard = task_singleton_enqueue_lock().lock().await;
+    if let Some(requested_by) = new_task.requested_by.as_deref()
+        && let Some(existing) =
+            find_inflight_task_for_requester(state, &new_task.task_type, requested_by).await?
+    {
+        return Ok(existing);
+    }
+    enqueue_task(state, new_task).await
 }
 
 pub async fn start_inline_task(state: &AppState, new_task: NewTask) -> Result<EnqueuedTask> {
@@ -1346,6 +1404,11 @@ async fn execute_task(
         TASK_SYNC_RELEASES => {
             let user_id = payload_local_id(payload, "user_id")?;
             let res = sync::sync_releases(state, user_id.as_str()).await?;
+            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
+        }
+        TASK_SYNC_ACCESS_REFRESH => {
+            let user_id = payload_local_id(payload, "user_id")?;
+            let res = sync::sync_access_refresh(state, task_id, user_id.as_str()).await?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
         TASK_SYNC_NOTIFICATIONS => {

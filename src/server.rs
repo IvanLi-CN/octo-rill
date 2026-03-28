@@ -26,7 +26,7 @@ use tracing::info;
 use crate::config::AppConfig;
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::state::AppState;
-use crate::{ai, api, auth, jobs, runtime, state, translations, version};
+use crate::{ai, api, auth, jobs, runtime, state, sync, translations, version};
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -98,6 +98,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/health", get(api_health))
         .route("/version", get(api_version))
         .route("/me", get(api::me))
+        .route("/tasks/{task_id}/events", get(api::task_events_sse))
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
         .route(
@@ -218,6 +219,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             post(translations::reject_legacy_translation_routes),
         )
         .route("/sync/starred", post(api::sync_starred))
+        .route("/sync/all", post(api::sync_all))
         .route("/sync/releases", post(api::sync_releases))
         .route("/sync/notifications", post(api::sync_notifications));
 
@@ -258,11 +260,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let serve_result = async {
         jobs::recover_runtime_state_on_startup(app_state.as_ref()).await?;
+        sync::recover_repo_release_runtime_state_on_startup(app_state.as_ref()).await?;
         translations::recover_runtime_state_on_startup(app_state.as_ref()).await?;
         ai::recover_runtime_state_on_startup(app_state.as_ref()).await?;
 
         jobs::spawn_task_workers(app_state.clone(), config.job_worker_concurrency);
         let task_recovery_abort_handle = jobs::spawn_task_recovery_worker(app_state.clone());
+        sync::spawn_repo_release_workers(app_state.clone());
+        let repo_release_recovery_abort_handle =
+            sync::spawn_repo_release_recovery_worker(app_state.clone());
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
         let model_catalog_abort_handle = config
@@ -283,6 +289,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             llm_call_retention_abort_handle,
             llm_call_recovery_abort_handle,
             task_recovery_abort_handle,
+            repo_release_recovery_abort_handle,
             translation_recovery_abort_handle,
         ];
         abort_handles.extend(translation_scheduler_abort_handles);

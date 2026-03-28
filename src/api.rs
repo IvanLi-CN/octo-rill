@@ -18,6 +18,8 @@ use url::Url;
 use crate::{ai, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
+const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
+
 fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
     let parsed = Url::parse(html_url).ok()?;
     let host = parsed.host_str()?;
@@ -37,6 +39,84 @@ fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
 
+fn parse_internal_brief_release_id(target: &str) -> Option<i64> {
+    let base = Url::parse("https://octorill.local/").expect("valid local base url");
+    let joined = base.join(target.trim()).ok()?;
+
+    if joined.host_str() != Some("octorill.local") {
+        return None;
+    }
+
+    let tab = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))?;
+    if tab != "briefs" {
+        return None;
+    }
+
+    let raw_release = joined
+        .query_pairs()
+        .find_map(|(k, v)| (k == "release").then_some(v.into_owned()))?;
+    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    raw_release.parse::<i64>().ok()
+}
+
+fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
+    let mut i = 0usize;
+
+    while i < markdown.len() {
+        let rest = &markdown[i..];
+
+        if rest.starts_with('[')
+            && let Some(text_end_rel) = rest.find("](")
+            && let Some(url_end_rel) = rest[text_end_rel + 2..].find(')')
+        {
+            let url_start = i + text_end_rel + 2;
+            let url_end = url_start + url_end_rel;
+            let target = &markdown[url_start..url_end];
+            if parse_internal_brief_release_id(target) == Some(release_id) {
+                return true;
+            }
+            i = url_end + 1;
+            continue;
+        }
+
+        let mut chars = rest.chars();
+        let ch = chars.next().expect("rest is non-empty");
+        i += ch.len_utf8();
+    }
+
+    false
+}
+
+async fn user_has_brief_access_to_release(
+    state: &AppState,
+    user_id: &str,
+    release_id: i64,
+) -> Result<bool, ApiError> {
+    let hint = format!("%release={release_id}%");
+    let briefs = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT content_markdown
+        FROM briefs
+        WHERE user_id = ?
+          AND content_markdown LIKE ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(hint)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(briefs
+        .iter()
+        .any(|markdown| brief_contains_release_link(markdown, release_id)))
+}
+
 pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, ApiError> {
     local_id::normalize_local_id(&raw)
         .ok_or_else(|| ApiError::bad_request(format!("invalid {field}")))
@@ -45,6 +125,7 @@ pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, A
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     user: UserSummary,
+    access_sync: AccessSyncBootstrap,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +140,7 @@ pub struct UserSummary {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct UserRow {
+struct MeUserRow {
     id: String,
     github_user_id: i64,
     login: String,
@@ -67,17 +148,47 @@ struct UserRow {
     avatar_url: Option<String>,
     email: Option<String>,
     is_admin: i64,
+    is_disabled: i64,
+    last_active_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessSyncBootstrap {
+    task_id: Option<String>,
+    task_type: Option<String>,
+    event_path: Option<String>,
+    reason: String,
+}
+
+impl AccessSyncBootstrap {
+    fn none() -> Self {
+        Self {
+            task_id: None,
+            task_type: None,
+            event_path: None,
+            reason: "none".to_owned(),
+        }
+    }
+
+    fn from_task(task: jobs::EnqueuedTask, reason: impl Into<String>) -> Self {
+        let task_id = task.task_id;
+        Self {
+            event_path: Some(format!("/api/tasks/{task_id}/events")),
+            task_id: Some(task_id),
+            task_type: Some(task.task_type),
+            reason: reason.into(),
+        }
+    }
 }
 
 pub async fn me(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<Json<MeResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
-
-    let row = sqlx::query_as::<_, UserRow>(
+    let user_id = require_user_id(&session).await?;
+    let row = sqlx::query_as::<_, MeUserRow>(
         r#"
-        SELECT id, github_user_id, login, name, avatar_url, email, is_admin
+        SELECT id, github_user_id, login, name, avatar_url, email, is_admin, is_disabled, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -96,6 +207,14 @@ pub async fn me(
         ));
     };
 
+    if let Err(err) = ensure_account_enabled(row.is_disabled != 0) {
+        session.clear().await;
+        return Err(err);
+    }
+
+    let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
+    touch_user_last_active_at(state.as_ref(), &row.id).await?;
+
     Ok(Json(MeResponse {
         user: UserSummary {
             id: row.id,
@@ -106,7 +225,104 @@ pub async fn me(
             email: row.email,
             is_admin: row.is_admin != 0,
         },
+        access_sync,
     }))
+}
+
+fn last_active_is_stale(last_active_at: Option<&str>) -> bool {
+    let Some(last_active_at) = last_active_at else {
+        return true;
+    };
+    let Ok(last_active_at) = chrono::DateTime::parse_from_rfc3339(last_active_at) else {
+        return true;
+    };
+    chrono::Utc::now().signed_duration_since(last_active_at.with_timezone(&chrono::Utc))
+        >= chrono::Duration::hours(1)
+}
+
+async fn maybe_bootstrap_access_sync(
+    state: &AppState,
+    session: &Session,
+    row: &MeUserRow,
+) -> Result<AccessSyncBootstrap, ApiError> {
+    if let Some(task) = jobs::find_inflight_task_for_requester(
+        state,
+        jobs::TASK_SYNC_ACCESS_REFRESH,
+        row.id.as_str(),
+    )
+    .await
+    .map_err(ApiError::internal)?
+    {
+        clear_pending_access_sync_reason(session).await?;
+        return Ok(AccessSyncBootstrap::from_task(task, "reused_inflight"));
+    }
+
+    let pending_reason = load_pending_access_sync_reason(session).await?;
+    let reason = if let Some(reason) = pending_reason.as_deref() {
+        reason
+    } else if row.last_active_at.is_some() {
+        "inactive_over_1h"
+    } else {
+        "first_visit"
+    };
+
+    if pending_reason.is_none() && !last_active_is_stale(row.last_active_at.as_deref()) {
+        return Ok(AccessSyncBootstrap::none());
+    }
+
+    let task = jobs::enqueue_singleton_task_for_requester(
+        state,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            payload: json!({ "user_id": row.id.clone() }),
+            source: "api.me".to_owned(),
+            requested_by: Some(row.id.clone()),
+            parent_task_id: None,
+        },
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    clear_pending_access_sync_reason(session).await?;
+    Ok(AccessSyncBootstrap::from_task(task, reason))
+}
+
+async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<(), ApiError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET last_active_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn load_pending_access_sync_reason(session: &Session) -> Result<Option<String>, ApiError> {
+    session
+        .get::<String>(SESSION_PENDING_ACCESS_SYNC_REASON)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn mark_pending_access_sync_reason(session: &Session, reason: &str) -> Result<(), ApiError> {
+    session
+        .insert(SESSION_PENDING_ACCESS_SYNC_REASON, reason)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn clear_pending_access_sync_reason(session: &Session) -> Result<(), ApiError> {
+    session
+        .remove::<String>(SESSION_PENDING_ACCESS_SYNC_REASON)
+        .await
+        .map(|_| ())
+        .map_err(ApiError::internal)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -2583,10 +2799,9 @@ pub async fn list_releases(
     let items = sqlx::query_as::<_, ReleaseItem>(
         r#"
         SELECT sr.full_name, r.tag_name, r.name, r.published_at, r.html_url, r.is_prerelease, r.is_draft
-        FROM releases r
+        FROM repo_releases r
         JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = ?
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at) DESC
         LIMIT 200
         "#,
@@ -2654,18 +2869,19 @@ pub async fn get_release_detail(
           t.source_hash AS trans_source_hash,
           t.title AS trans_title,
           t.summary AS trans_summary
-        FROM releases r
+        FROM repo_releases r
         LEFT JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
-          ON t.user_id = r.user_id
+          ON t.user_id = ?
           AND t.entity_type = 'release_detail'
           AND t.entity_id = CAST(r.release_id AS TEXT)
           AND t.lang = 'zh-CN'
-        WHERE r.user_id = ? AND r.release_id = ?
+        WHERE r.release_id = ?
         LIMIT 1
         "#,
     )
+    .bind(&user_id)
     .bind(&user_id)
     .bind(release_id)
     .fetch_optional(&state.pool)
@@ -2679,6 +2895,16 @@ pub async fn get_release_detail(
             "release not found",
         ));
     };
+
+    if row.repo_full_name.is_none()
+        && !user_has_brief_access_to_release(state.as_ref(), &user_id, release_id).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
 
     let original_title = row
         .name
@@ -2896,6 +3122,56 @@ async fn enqueue_or_stream_task(
     }
 }
 
+async fn enqueue_singleton_or_stream_task(
+    state: Arc<AppState>,
+    mode: ReturnMode,
+    new_task: jobs::NewTask,
+) -> Result<Response, ApiError> {
+    let task = jobs::enqueue_singleton_task_for_requester(state.as_ref(), new_task)
+        .await
+        .map_err(ApiError::internal)?;
+
+    match mode {
+        ReturnMode::TaskId => Ok(Json(TaskAcceptedResponse {
+            mode: "task_id".to_owned(),
+            task_id: task.task_id,
+            task_type: task.task_type,
+            status: task.status,
+        })
+        .into_response()),
+        ReturnMode::Sse => Ok(jobs::task_sse_response(state, task.task_id)),
+        ReturnMode::Sync => Err(ApiError::internal("unexpected sync return mode")),
+    }
+}
+
+pub async fn task_events_sse(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(task_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let task_exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE id = ? AND requested_by = ?
+        "#,
+    )
+    .bind(task_id.as_str())
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if task_exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "task not found",
+        ));
+    }
+    Ok(jobs::task_sse_response(state, task_id))
+}
+
 async fn run_with_api_llm_context<F, T>(source: &str, requested_by: Option<String>, fut: F) -> T
 where
     F: Future<Output = T>,
@@ -2928,13 +3204,49 @@ pub async fn sync_starred(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
             task_type: jobs::TASK_SYNC_STARRED.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_starred".to_owned(),
+            requested_by: Some(user_id.clone()),
+            parent_task_id: None,
+        },
+    )
+    .await
+}
+
+pub async fn sync_all(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(mode_query): Query<ReturnModeQuery>,
+) -> Result<Response, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let mode = ReturnMode::from_query(&mode_query)?;
+
+    if matches!(mode, ReturnMode::Sync) {
+        let starred = sync::sync_starred(state.as_ref(), user_id.as_str())
+            .await
+            .map_err(ApiError::internal)?;
+        let releases = sync::sync_releases(state.as_ref(), user_id.as_str())
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(json!({
+            "starred": starred,
+            "releases": releases,
+        }))
+        .into_response());
+    }
+
+    enqueue_singleton_or_stream_task(
+        state,
+        mode,
+        jobs::NewTask {
+            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            payload: json!({ "user_id": user_id.clone() }),
+            source: "api.sync_all".to_owned(),
             requested_by: Some(user_id.clone()),
             parent_task_id: None,
         },
@@ -2957,7 +3269,7 @@ pub async fn sync_releases(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
@@ -2986,7 +3298,7 @@ pub async fn sync_notifications(
         return Ok(Json(res).into_response());
     }
 
-    enqueue_or_stream_task(
+    enqueue_singleton_or_stream_task(
         state,
         mode,
         jobs::NewTask {
@@ -3876,10 +4188,9 @@ async fn fetch_feed_releases(
             r.react_hooray AS react_hooray,
             r.react_rocket AS react_rocket,
             r.react_eyes AS react_eyes
-          FROM releases r
+          FROM repo_releases r
           JOIN starred_repos sr
-            ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-          WHERE r.user_id = ?
+            ON sr.user_id = ? AND sr.repo_id = r.repo_id
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
@@ -4165,13 +4476,12 @@ async fn fetch_live_release_reactions(
 
 async fn persist_release_reaction_counts(
     state: &AppState,
-    user_id: &str,
     release_id: i64,
     counts: &ReleaseReactionCounts,
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
-        UPDATE releases
+        UPDATE repo_releases
         SET react_plus1 = ?,
             react_laugh = ?,
             react_heart = ?,
@@ -4179,7 +4489,7 @@ async fn persist_release_reaction_counts(
             react_rocket = ?,
             react_eyes = ?,
             updated_at = ?
-        WHERE user_id = ? AND release_id = ?
+        WHERE release_id = ?
         "#,
     )
     .bind(counts.plus1)
@@ -4189,7 +4499,6 @@ async fn persist_release_reaction_counts(
     .bind(counts.rocket)
     .bind(counts.eyes)
     .bind(chrono::Utc::now().to_rfc3339())
-    .bind(user_id)
     .bind(release_id)
     .execute(&state.pool)
     .await
@@ -4363,13 +4672,9 @@ pub async fn list_feed(
     {
         for (node_id, reaction) in &live {
             if let Some(release_id) = release_by_node.get(node_id) {
-                let _ = persist_release_reaction_counts(
-                    state.as_ref(),
-                    &user_id,
-                    *release_id,
-                    &reaction.counts,
-                )
-                .await;
+                let _ =
+                    persist_release_reaction_counts(state.as_ref(), *release_id, &reaction.counts)
+                        .await;
             }
         }
         live_reactions_by_node = live;
@@ -4635,9 +4940,11 @@ pub async fn toggle_release_reaction(
 
     let row = sqlx::query_as::<_, ReleaseReactionRow>(
         r#"
-        SELECT release_id, node_id
-        FROM releases
-        WHERE user_id = ? AND release_id = ?
+        SELECT rr.release_id, rr.node_id
+        FROM repo_releases rr
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = rr.repo_id
+        WHERE rr.release_id = ?
         "#,
     )
     .bind(&user_id)
@@ -4726,8 +5033,7 @@ pub async fn toggle_release_reaction(
     let _ =
         persist_reaction_pat_check_result(state.as_ref(), &user_id, "valid", Some("PAT is valid"))
             .await;
-    persist_release_reaction_counts(state.as_ref(), &user_id, row.release_id, &updated.counts)
-        .await?;
+    persist_release_reaction_counts(state.as_ref(), row.release_id, &updated.counts).await?;
 
     Ok(Json(ToggleReleaseReactionResponse {
         release_id: row.release_id.to_string(),
@@ -5804,13 +6110,12 @@ async fn prepare_release_batch(
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT r.release_id, sr.full_name, r.tag_name, r.name, r.body
-        FROM releases r
+        FROM repo_releases r
         JOIN starred_repos sr
-          ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-        WHERE r.user_id = "#,
+          ON sr.user_id = "#,
     );
     source_query.push_bind(user_id);
-    source_query.push(" AND r.release_id IN (");
+    source_query.push(" AND sr.repo_id = r.repo_id AND r.release_id IN (");
     {
         let mut separated = source_query.separated(", ");
         for release_id in release_ids {
@@ -6700,6 +7005,7 @@ async fn translate_release_detail_internal(
     #[derive(Debug, sqlx::FromRow)]
     struct ReleaseDetailSourceRow {
         repo_id: i64,
+        starred_repo_id: Option<i64>,
         html_url: String,
         tag_name: String,
         name: Option<String>,
@@ -6708,9 +7014,11 @@ async fn translate_release_detail_internal(
 
     let row = sqlx::query_as::<_, ReleaseDetailSourceRow>(
         r#"
-        SELECT r.repo_id, r.html_url, r.tag_name, r.name, r.body
-        FROM releases r
-        WHERE r.user_id = ? AND r.release_id = ?
+        SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body
+        FROM repo_releases r
+        LEFT JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        WHERE r.release_id = ?
         LIMIT 1
         "#,
     )
@@ -6727,6 +7035,16 @@ async fn translate_release_detail_internal(
             "release not found",
         ));
     };
+
+    if row.starred_repo_id.is_none()
+        && !user_has_brief_access_to_release(state, user_id, release_id).await?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "release not found",
+        ));
+    }
 
     let original_title = row
         .name
@@ -7447,6 +7765,7 @@ fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
 #[derive(Debug, sqlx::FromRow)]
 struct SessionAccessRow {
     is_disabled: i64,
+    last_active_at: Option<String>,
 }
 
 pub(crate) async fn require_active_user_id(
@@ -7456,7 +7775,7 @@ pub(crate) async fn require_active_user_id(
     let user_id = require_user_id(session).await?;
     let row = sqlx::query_as::<_, SessionAccessRow>(
         r#"
-        SELECT is_disabled
+        SELECT is_disabled, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -7480,19 +7799,18 @@ pub(crate) async fn require_active_user_id(
         return Err(err);
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE users
-        SET last_active_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(&user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    if load_pending_access_sync_reason(session).await?.is_none()
+        && last_active_is_stale(row.last_active_at.as_deref())
+    {
+        let reason = if row.last_active_at.is_some() {
+            "inactive_over_1h"
+        } else {
+            "first_visit"
+        };
+        mark_pending_access_sync_reason(session, reason).await?;
+    }
+
+    touch_user_last_active_at(state, &user_id).await?;
 
     Ok(user_id)
 }
@@ -7525,26 +7843,30 @@ mod tests {
         AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery,
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, TranslateBatchItem, TranslationCacheRow,
+        LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, TranslateBatchItem, TranslationCacheRow,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, build_task_diagnostics, ensure_account_enabled,
-        extract_translation_fields, github_graphql_errors_to_api_error, github_graphql_http_error,
-        guard_admin_user_update, has_repo_scope, llm_call_order_by_clause, looks_like_json_blob,
-        map_job_action_error, markdown_structure_preserved, normalize_translation_fields,
+        ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
+        ensure_account_enabled, extract_translation_fields, get_release_detail,
+        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
+        has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_release_id_param, parse_repo_full_name_from_release_url, parse_translation_json,
         parse_unique_release_ids, parse_unique_thread_ids, preserve_chunk_trailing_newline,
         release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_reactions_status, resolve_release_full_name,
-        split_markdown_chunks, translate_response_from_batch_item,
+        release_excerpt, release_reactions_status, require_active_user_id,
+        resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_response_from_batch_item,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
-        config::{AppConfig, GitHubOAuthConfig},
+        config::{AiConfig, AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         jobs,
         state::{AppState, build_oauth_client},
@@ -7554,7 +7876,7 @@ mod tests {
         body::to_bytes,
         extract::{Path, Query, State},
         http::{StatusCode, header},
-        response::IntoResponse,
+        response::{IntoResponse, Response},
     };
     use reqwest::header::{HeaderMap, HeaderValue};
     use sqlx::{
@@ -7704,6 +8026,47 @@ mod tests {
         })
     }
 
+    fn setup_state_with_ai(pool: SqlitePool) -> Arc<AppState> {
+        let encryption_key =
+            EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                .expect("build encryption key");
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
+            job_worker_concurrency: 4,
+            encryption_key: encryption_key.clone(),
+            github: GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
+                    .expect("parse github redirect"),
+            },
+            ai: Some(AiConfig {
+                base_url: Url::parse("https://api.example.test/v1/").expect("parse ai base url"),
+                model: "test-model".to_owned(),
+                api_key: "test-key".to_owned(),
+            }),
+            ai_max_concurrency: 1,
+            ai_model_context_limit: None,
+            ai_daily_at_local: None,
+        };
+        let oauth = build_oauth_client(&config).expect("build oauth client");
+        Arc::new(AppState {
+            llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            config,
+            pool,
+            http: reqwest::Client::new(),
+            oauth,
+            encryption_key,
+            runtime_owner_id: "api-test-runtime-owner".to_owned(),
+        })
+    }
+
     async fn setup_session(user_id: i64) -> Session {
         let store = Arc::new(MemoryStore::default());
         let session = Session::new(None, store, None);
@@ -7735,6 +8098,363 @@ mod tests {
         .expect("seed test user");
     }
 
+    async fn set_last_active_at(pool: &SqlitePool, user_id: &str, last_active_at: Option<&str>) {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET last_active_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(last_active_at)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("set last_active_at");
+    }
+
+    #[tokio::test]
+    async fn stale_visit_marker_survives_until_me_bootstraps_access_sync() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+        let user_id = test_user_id(1);
+
+        set_last_active_at(&pool, user_id.as_str(), Some("2026-02-22T21:30:00Z")).await;
+
+        let resolved = require_active_user_id(state.as_ref(), &session)
+            .await
+            .expect("require active user");
+        assert_eq!(resolved, user_id);
+        assert_eq!(
+            load_pending_access_sync_reason(&session)
+                .await
+                .expect("load pending reason")
+                .as_deref(),
+            Some("inactive_over_1h")
+        );
+        let touched_last_active_at = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT last_active_at
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load touched last_active_at");
+        assert!(touched_last_active_at.is_some());
+        assert_ne!(
+            touched_last_active_at.as_deref(),
+            Some("2026-02-22T21:30:00Z")
+        );
+        assert!(!last_active_is_stale(touched_last_active_at.as_deref()));
+
+        let Json(resp) = me(State(state.clone()), session)
+            .await
+            .expect("bootstrap me");
+        assert_eq!(resp.access_sync.reason, "inactive_over_1h");
+        assert_eq!(
+            resp.access_sync.task_type.as_deref(),
+            Some(jobs::TASK_SYNC_ACCESS_REFRESH)
+        );
+        assert!(resp.access_sync.task_id.is_some());
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status = 'queued'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count queued access sync tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_all_task_id_reuses_inflight_access_refresh_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let response = sync_all(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(ReturnModeQuery {
+                return_mode: Some("task_id".to_owned()),
+            }),
+        )
+        .await
+        .expect("enqueue first sync_all");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read first response body");
+        let first: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse first task response");
+        let first_task_id = first
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("first task id")
+            .to_owned();
+
+        let response = sync_all(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(ReturnModeQuery {
+                return_mode: Some("task_id".to_owned()),
+            }),
+        )
+        .await
+        .expect("enqueue second sync_all");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read second response body");
+        let second: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse second task response");
+        let second_task_id = second
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("second task id");
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count access refresh tasks");
+        assert_eq!(queued, 1);
+    }
+
+    async fn task_id_from_response(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read task response body");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse task response body");
+        payload
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .expect("task id")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn sync_starred_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_starred(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_starred"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_starred(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_starred"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_STARRED)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync starred tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_releases_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_releases(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_releases"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_releases(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_releases"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_RELEASES)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync releases tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_task_id_reuses_inflight_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+
+        let first_task_id = task_id_from_response(
+            sync_notifications(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue first sync_notifications"),
+        )
+        .await;
+
+        let second_task_id = task_id_from_response(
+            sync_notifications(
+                State(state.clone()),
+                setup_session(1).await,
+                Query(ReturnModeQuery {
+                    return_mode: Some("task_id".to_owned()),
+                }),
+            )
+            .await
+            .expect("enqueue second sync_notifications"),
+        )
+        .await;
+
+        assert_eq!(second_task_id, first_task_id);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_NOTIFICATIONS)
+        .fetch_one(&pool)
+        .await
+        .expect("count sync notifications tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn me_reuses_inflight_access_refresh_task() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+        let user_id = test_user_id(1);
+
+        set_last_active_at(&pool, user_id.as_str(), Some("2026-02-22T21:30:00Z")).await;
+        seed_access_refresh_task(
+            &pool,
+            "task-access-running",
+            user_id.as_str(),
+            jobs::STATUS_RUNNING,
+        )
+        .await;
+
+        let Json(resp) = me(State(state), session).await.expect("bootstrap me");
+        assert_eq!(resp.access_sync.reason, "reused_inflight");
+        assert_eq!(
+            resp.access_sync.task_type.as_deref(),
+            Some(jobs::TASK_SYNC_ACCESS_REFRESH)
+        );
+        assert_eq!(
+            resp.access_sync.task_id.as_deref(),
+            Some("task-access-running")
+        );
+        assert_eq!(
+            resp.access_sync.event_path.as_deref(),
+            Some("/api/tasks/task-access-running/events")
+        );
+
+        let inflight = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE requested_by = ?
+              AND task_type = ?
+              AND status IN ('queued', 'running')
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .fetch_one(&pool)
+        .await
+        .expect("count inflight access refresh tasks");
+        assert_eq!(inflight, 1);
+    }
+
     async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -7762,6 +8482,50 @@ mod tests {
         .expect("seed release");
     }
 
+    async fn seed_repo_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+            "#,
+        )
+        .bind(format!("repo-release-{repo_id}-{release_id}"))
+        .bind(repo_id)
+        .bind(release_id)
+        .bind(format!("node-{release_id}"))
+        .bind("v1.2.3")
+        .bind("Release v1.2.3")
+        .bind("- item")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed shared repo release");
+    }
+
     async fn seed_star(pool: &SqlitePool, repo_id: i64) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -7786,6 +8550,103 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed starred");
+    }
+
+    async fn seed_brief(pool: &SqlitePool, user_id: &str, date: &str, content_markdown: &str) {
+        let created_at = format!("{date}T08:00:00Z");
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (id, user_id, date, content_markdown, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(format!("brief-{date}"))
+        .bind(user_id)
+        .bind(date)
+        .bind(content_markdown)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed brief");
+    }
+
+    async fn seed_release_detail_translation(
+        pool: &SqlitePool,
+        user_id: &str,
+        entity_id: &str,
+        source_hash: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(source_hash)
+        .bind(title)
+        .bind(summary)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release detail translation");
+    }
+
+    async fn seed_access_refresh_task(
+        pool: &SqlitePool,
+        task_id: &str,
+        requested_by: &str,
+        status: &str,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        let started_at = match status {
+            jobs::STATUS_RUNNING | jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED => Some(now),
+            _ => None,
+        };
+        let finished_at = match status {
+            jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED | jobs::STATUS_CANCELED => Some(now),
+            _ => None,
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, 'tests', ?, NULL, '{}', NULL, NULL, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .bind(status)
+        .bind(requested_by)
+        .bind(now)
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed access refresh task");
     }
 
     async fn seed_llm_call(
@@ -9966,36 +10827,17 @@ mod tests {
         assert_ne!(hash1, hash2);
     }
 
-    #[tokio::test]
-    async fn release_detail_query_is_readable_without_star() {
-        let pool = setup_pool().await;
-        seed_release(&pool, 42, 120).await;
+    #[test]
+    fn brief_contains_release_link_matches_exact_id() {
+        let markdown = "- [v1.2.3](/?tab=briefs&release=123)";
+        assert!(brief_contains_release_link(markdown, 123));
+        assert!(!brief_contains_release_link(markdown, 12));
+    }
 
-        #[derive(Debug, sqlx::FromRow)]
-        struct Row {
-            release_id: i64,
-            repo_full_name: Option<String>,
-        }
-
-        let row = sqlx::query_as::<_, Row>(
-            r#"
-            SELECT r.release_id, sr.full_name AS repo_full_name
-            FROM releases r
-            LEFT JOIN starred_repos sr
-              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-            WHERE r.user_id = ? AND r.release_id = ?
-            LIMIT 1
-            "#,
-        )
-        .bind(test_user_id(1))
-        .bind(120_i64)
-        .fetch_optional(&pool)
-        .await
-        .expect("query detail");
-
-        let row = row.expect("detail row");
-        assert_eq!(row.release_id, 120);
-        assert!(row.repo_full_name.is_none());
+    #[test]
+    fn brief_contains_release_link_accepts_query_order_variant() {
+        let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
+        assert!(brief_contains_release_link(markdown, 123));
     }
 
     #[tokio::test]
@@ -10033,6 +10875,115 @@ mod tests {
         .await
         .expect("count releases with star");
         assert_eq!(count_with_star, 1);
+    }
+
+    #[tokio::test]
+    async fn list_releases_reads_shared_repo_cache_for_starred_user() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_releases(State(state), setup_session(1).await)
+            .await
+            .expect("list releases");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].full_name, "openai/codex");
+        assert_eq!(items[0].tag_name, "v1.2.3");
+        assert_eq!(items[0].name.as_deref(), Some("Release v1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_reads_shared_repo_cache_for_starred_user() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        assert_eq!(detail.tag_name, "v1.2.3");
+        assert_eq!(detail.name.as_deref(), Some("Release v1.2.3"));
+        assert_eq!(detail.body.as_deref(), Some("- item"));
+        assert_eq!(
+            detail.html_url,
+            "https://github.com/openai/codex/releases/tag/v1.2.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_allows_historical_brief_link_without_current_star() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "- [v1.2.3](/?tab=briefs&release=120)",
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail from brief link");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+    }
+
+    #[tokio::test]
+    async fn translate_release_detail_allows_historical_brief_link_without_current_star() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "- [v1.2.3](/?tab=briefs&release=120)",
+        )
+        .await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+        seed_release_detail_translation(
+            &pool,
+            user_id.as_str(),
+            "120",
+            source_hash.as_str(),
+            Some("版本 v1.2.3"),
+            Some("- 条目"),
+        )
+        .await;
+
+        let translated = translate_release_detail_for_user(state.as_ref(), user_id.as_str(), "120")
+            .await
+            .expect("translate release detail from brief link");
+
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(translated.summary.as_deref(), Some("- 条目"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_rejects_unstarred_release_without_brief_link() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let err = get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+            .await
+            .expect_err("release detail should stay hidden");
+
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

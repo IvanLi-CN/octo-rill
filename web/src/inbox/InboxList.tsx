@@ -1,4 +1,4 @@
-import { ArrowUpRight, Inbox } from "lucide-react";
+import { ArrowUpRight, Inbox, RefreshCcw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { formatIsoShortLocal } from "@/lib/datetime";
@@ -15,8 +15,14 @@ function threadUrl(threadId: string) {
 	return `https://github.com/notifications/thread/${threadId}`;
 }
 
-export function InboxList(props: { notifications: NotificationItem[] }) {
-	const { notifications } = props;
+export function InboxList(props: {
+	notifications: NotificationItem[];
+	busy?: boolean;
+	syncing?: boolean;
+	onSync?: () => void;
+}) {
+	const { notifications, busy = false, syncing = false, onSync } = props;
+	const showSync = Boolean(onSync);
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
@@ -31,30 +37,53 @@ export function InboxList(props: { notifications: NotificationItem[] }) {
 							{notifications.length} threads
 						</CardDescription>
 					</div>
-					<Button
-						asChild
-						variant="outline"
-						size="sm"
-						className="font-mono text-xs"
-					>
-						<a
-							href="https://github.com/notifications"
-							target="_blank"
-							rel="noreferrer"
+					<div className="flex items-center gap-2">
+						{showSync ? (
+							<Button
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+								disabled={busy}
+								onClick={onSync}
+							>
+								<RefreshCcw
+									className={syncing ? "size-4 animate-spin" : "size-4"}
+								/>
+								Sync inbox
+							</Button>
+						) : null}
+						<Button
+							asChild
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
 						>
-							<ArrowUpRight className="size-4" />
-							GitHub
-						</a>
-					</Button>
+							<a
+								href="https://github.com/notifications"
+								target="_blank"
+								rel="noreferrer"
+							>
+								<ArrowUpRight className="size-4" />
+								GitHub
+							</a>
+						</Button>
+					</div>
 				</div>
 			</CardHeader>
 
 			<CardContent className="pt-0">
 				{notifications.length === 0 ? (
-					<p className="text-muted-foreground text-sm">
-						暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
-						拉取最新数据。
-					</p>
+					showSync ? (
+						<p className="text-muted-foreground text-sm">
+							暂无通知。可以点击 <span className="font-mono">Sync inbox</span>{" "}
+							拉取最新数据。
+						</p>
+					) : (
+						<p className="text-muted-foreground text-sm">
+							暂无通知。请点击顶部的 <span className="font-mono">同步</span>{" "}
+							拉取最新数据。
+						</p>
+					)
 				) : (
 					<div className="space-y-3">
 						{notifications.map((n) => (

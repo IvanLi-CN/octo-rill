@@ -200,6 +200,12 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 					email: "admin@example.com",
 					is_admin: true,
 				},
+				access_sync: {
+					task_id: null,
+					task_type: null,
+					event_path: null,
+					reason: "none",
+				},
 			}}
 			userManagementStoryState={storyState}
 		/>

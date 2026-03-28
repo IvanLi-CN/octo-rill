@@ -185,6 +185,12 @@ export type MeResponse = {
 		email: string | null;
 		is_admin: boolean;
 	};
+	access_sync?: {
+		task_id: string | null;
+		task_type: string | null;
+		event_path: string | null;
+		reason: "first_visit" | "inactive_over_1h" | "reused_inflight" | "none";
+	};
 };
 export type AdminUserProfileResponse = {
 	user_id: LocalUserId;
