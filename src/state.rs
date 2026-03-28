@@ -7,7 +7,10 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use url::Url;
 
-use crate::{ai::LlmScheduler, config::AppConfig, crypto::EncryptionKey};
+use crate::{
+    ai::LlmScheduler, config::AppConfig, crypto::EncryptionKey,
+    translations::TranslationSchedulerController,
+};
 
 pub type GitHubOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
@@ -20,6 +23,7 @@ pub struct AppState {
     pub oauth: GitHubOAuthClient,
     pub encryption_key: EncryptionKey,
     pub llm_scheduler: Arc<LlmScheduler>,
+    pub translation_scheduler: Arc<TranslationSchedulerController>,
     pub runtime_owner_id: String,
 }
 

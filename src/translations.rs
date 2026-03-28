@@ -15,12 +15,12 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use tokio::time::sleep;
 use tower_sessions::Session;
 use tracing::warn;
 
-use crate::{ai, api, error::ApiError, runtime, state::AppState};
+use crate::{admin_runtime, ai, api, error::ApiError, runtime, state::AppState};
 
 const TRANSLATION_PROTOCOL_VERSION: &str = "translation-request.v1";
 const TRANSLATION_MODEL_PROFILE_DISABLED: &str = "ai-disabled";
@@ -31,12 +31,10 @@ const TRANSLATION_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TRANSLATION_MAX_ITEMS_PER_REQUEST: usize = 60;
 const TRANSLATION_MIN_WAIT_MS: i64 = 0;
 const TRANSLATION_MAX_WAIT_MS: i64 = 60_000;
-const TRANSLATION_WORKER_CONCURRENCY: i64 = 4;
-const TRANSLATION_USER_DEDICATED_WORKER_SLOT: i64 = 4;
+const MAX_TRANSLATION_WORKER_CONCURRENCY: usize = 64;
+pub const DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY: usize = 3;
+pub const DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY: usize = 1;
 
-static TRANSLATION_WORKER_RUNTIME: OnceLock<
-    tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
-> = OnceLock::new();
 static TRANSLATION_BATCH_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +139,12 @@ pub struct AdminTranslationStatusResponse {
     pub llm_enabled: bool,
     pub scan_interval_ms: i64,
     pub batch_token_threshold: i64,
+    pub general_worker_concurrency: i64,
+    pub dedicated_worker_concurrency: i64,
     pub worker_concurrency: i64,
+    pub target_general_worker_concurrency: i64,
+    pub target_dedicated_worker_concurrency: i64,
+    pub target_worker_concurrency: i64,
     pub idle_workers: i64,
     pub busy_workers: i64,
     pub workers: Vec<AdminTranslationWorkerStatus>,
@@ -153,6 +156,12 @@ pub struct AdminTranslationStatusResponse {
     pub failed_batches_24h: i64,
     pub avg_wait_ms_24h: Option<i64>,
     pub last_batch_finished_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminTranslationRuntimeConfigUpdateRequest {
+    pub general_worker_concurrency: i64,
+    pub dedicated_worker_concurrency: i64,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -257,19 +266,107 @@ struct TranslationWorkerRuntimeState {
     error_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslationRuntimeConfig {
+    pub general_worker_concurrency: usize,
+    pub dedicated_worker_concurrency: usize,
+}
+
+impl Default for TranslationRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
+            dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+        }
+    }
+}
+
+impl TranslationRuntimeConfig {
+    pub fn new(general_worker_concurrency: usize, dedicated_worker_concurrency: usize) -> Self {
+        Self {
+            general_worker_concurrency: general_worker_concurrency.max(1),
+            dedicated_worker_concurrency: dedicated_worker_concurrency.max(1),
+        }
+    }
+
+    fn total_worker_concurrency(self) -> usize {
+        self.general_worker_concurrency + self.dedicated_worker_concurrency
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct RunningBatchRuntimeRow {
     id: String,
+    worker_id: String,
     worker_slot: i64,
+    worker_kind: String,
     request_count: i64,
     item_count: i64,
     trigger_reason: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TranslationWorkerProfile {
+    worker_id: String,
     worker_slot: i64,
-    worker_kind: &'static str,
+    worker_kind: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TranslationWorkerRuntimeUpdate<'a> {
+    status: &'a str,
+    current_batch_id: Option<&'a str>,
+    request_count: i64,
+    work_item_count: i64,
+    trigger_reason: Option<&'a str>,
+    error_text: Option<&'a str>,
+}
+
+impl<'a> TranslationWorkerRuntimeUpdate<'a> {
+    const fn idle() -> Self {
+        Self {
+            status: "idle",
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            error_text: None,
+        }
+    }
+
+    const fn running(
+        current_batch_id: &'a str,
+        request_count: i64,
+        work_item_count: i64,
+        trigger_reason: &'a str,
+    ) -> Self {
+        Self {
+            status: "running",
+            current_batch_id: Some(current_batch_id),
+            request_count,
+            work_item_count,
+            trigger_reason: Some(trigger_reason),
+            error_text: None,
+        }
+    }
+
+    const fn error(error_text: &'a str) -> Self {
+        Self {
+            status: "error",
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            error_text: Some(error_text),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TranslationSchedulerController {
+    desired_config: tokio::sync::RwLock<TranslationRuntimeConfig>,
+    runtime: tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>,
+    worker_abort_handles: tokio::sync::Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 #[allow(dead_code)]
@@ -465,7 +562,9 @@ fn request_status_from_work_item_status(work_item_status: &str) -> &'static str 
 #[derive(Debug, Clone)]
 struct ClaimedBatch {
     id: String,
+    worker_id: String,
     worker_slot: i64,
+    worker_kind: String,
     partition_key: String,
     target_lang: String,
     protocol_version: String,
@@ -520,6 +619,21 @@ impl ClaimCandidateRow {
 }
 
 impl TranslationWorkerRuntimeState {
+    fn idle(profile: &TranslationWorkerProfile) -> Self {
+        Self {
+            worker_id: profile.worker_id.clone(),
+            worker_slot: profile.worker_slot,
+            worker_kind: profile.worker_kind.clone(),
+            status: "idle".to_owned(),
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            updated_at: Utc::now().to_rfc3339(),
+            error_text: None,
+        }
+    }
+
     fn to_admin_status(&self) -> AdminTranslationWorkerStatus {
         AdminTranslationWorkerStatus {
             worker_id: self.worker_id.clone(),
@@ -536,59 +650,424 @@ impl TranslationWorkerRuntimeState {
     }
 }
 
-fn translation_worker_profiles() -> [TranslationWorkerProfile; 4] {
-    [
-        TranslationWorkerProfile {
-            worker_slot: 1,
-            worker_kind: "general",
-        },
-        TranslationWorkerProfile {
-            worker_slot: 2,
-            worker_kind: "general",
-        },
-        TranslationWorkerProfile {
-            worker_slot: 3,
-            worker_kind: "general",
-        },
-        TranslationWorkerProfile {
-            worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
-            worker_kind: "user_dedicated",
-        },
-    ]
+impl TranslationSchedulerController {
+    pub fn new(config: TranslationRuntimeConfig) -> Self {
+        let config = TranslationRuntimeConfig::new(
+            config.general_worker_concurrency,
+            config.dedicated_worker_concurrency,
+        );
+        let runtime = translation_worker_profiles(config)
+            .into_iter()
+            .map(|profile| TranslationWorkerRuntimeState::idle(&profile))
+            .collect();
+        Self {
+            desired_config: tokio::sync::RwLock::new(config),
+            runtime: tokio::sync::RwLock::new(runtime),
+            worker_abort_handles: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn desired_config(&self) -> TranslationRuntimeConfig {
+        *self.desired_config.read().await
+    }
+
+    pub async fn runtime_statuses(&self) -> Vec<AdminTranslationWorkerStatus> {
+        let mut runtime = self.runtime.read().await.clone();
+        runtime.sort_by(|left, right| {
+            left.worker_slot
+                .cmp(&right.worker_slot)
+                .then_with(|| left.worker_id.cmp(&right.worker_id))
+        });
+        runtime
+            .into_iter()
+            .map(|entry| entry.to_admin_status())
+            .collect()
+    }
+
+    pub async fn abort_all(&self) {
+        let mut handles = self.worker_abort_handles.lock().await;
+        for (_, handle) in handles.drain() {
+            handle.abort();
+        }
+    }
+
+    pub async fn apply_runtime_config(
+        self: &Arc<Self>,
+        state: Arc<AppState>,
+        config: TranslationRuntimeConfig,
+    ) -> Result<TranslationRuntimeConfig> {
+        let config = self.sync_runtime_with_config(&state.pool, config).await?;
+        self.ensure_workers_running(state).await;
+        Ok(config)
+    }
+
+    pub async fn spawn_initial_workers(self: &Arc<Self>, state: Arc<AppState>) {
+        self.ensure_workers_running(state).await;
+    }
+
+    async fn sync_runtime_with_config(
+        &self,
+        pool: &SqlitePool,
+        config: TranslationRuntimeConfig,
+    ) -> Result<TranslationRuntimeConfig> {
+        let config = TranslationRuntimeConfig::new(
+            config.general_worker_concurrency,
+            config.dedicated_worker_concurrency,
+        );
+        if *self.desired_config.read().await == config {
+            return Ok(config);
+        }
+        let _claim_guard = translation_batch_claim_lock().lock().await;
+        *self.desired_config.write().await = config;
+
+        let desired_profiles = translation_worker_profiles(config);
+        let desired_worker_ids = desired_profiles
+            .iter()
+            .map(|profile| profile.worker_id.as_str())
+            .collect::<HashSet<_>>();
+        let mut runtime = self.runtime.write().await;
+        let previous_topology = runtime
+            .iter()
+            .map(|entry| {
+                (
+                    entry.worker_id.clone(),
+                    (entry.worker_slot, entry.worker_kind.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        runtime.retain(|entry| {
+            desired_worker_ids.contains(entry.worker_id.as_str())
+                || entry.current_batch_id.is_some()
+        });
+        for profile in &desired_profiles {
+            if let Some(entry) = runtime
+                .iter_mut()
+                .find(|entry| entry.worker_id == profile.worker_id)
+            {
+                entry.worker_kind = profile.worker_kind.clone();
+            } else {
+                runtime.push(TranslationWorkerRuntimeState::idle(profile));
+            }
+        }
+        reconcile_worker_runtime_slots(&mut runtime, config);
+        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
+        let topology_changed = translation_runtime_topology_changed(&runtime, &previous_topology);
+        if topology_changed {
+            refresh_translation_runtime_updated_at(&mut runtime);
+        }
+        drop(runtime);
+        sync_running_batch_slot_updates(pool, &batch_slot_updates).await?;
+        Ok(config)
+    }
+
+    async fn ensure_workers_running(self: &Arc<Self>, state: Arc<AppState>) {
+        let desired_profiles = translation_worker_profiles(self.desired_config().await);
+        let mut handles = self.worker_abort_handles.lock().await;
+        handles.retain(|_, handle| !handle.is_finished());
+        for profile in desired_profiles {
+            if handles.contains_key(&profile.worker_id) {
+                continue;
+            }
+            let worker_id = profile.worker_id.clone();
+            let abort_handle = self.spawn_worker_task(state.clone(), worker_id.clone());
+            handles.insert(worker_id, abort_handle);
+        }
+    }
+
+    async fn run_worker_loop(self: Arc<Self>, state: Arc<AppState>, worker_id: String) {
+        if let Some(profile) = self.profile_by_worker_id(worker_id.as_str()).await {
+            self.update_worker_runtime(&profile, TranslationWorkerRuntimeUpdate::idle())
+                .await;
+        }
+
+        loop {
+            let Some(profile) = self.profile_by_worker_id(worker_id.as_str()).await else {
+                if let Err(err) = self
+                    .remove_worker_runtime(&state.pool, worker_id.as_str())
+                    .await
+                {
+                    warn!(
+                        ?err,
+                        worker_id = worker_id.as_str(),
+                        "failed to remove drained translation worker runtime"
+                    );
+                }
+                break;
+            };
+
+            if let Err(err) = run_translation_scheduler_once(state.as_ref(), profile.clone()).await
+            {
+                warn!(
+                    ?err,
+                    worker_id = profile.worker_id.as_str(),
+                    worker_slot = profile.worker_slot,
+                    "translation scheduler tick failed"
+                );
+                let error_text = err.to_string();
+                self.update_worker_runtime(
+                    &profile,
+                    TranslationWorkerRuntimeUpdate::error(error_text.as_str()),
+                )
+                .await;
+            }
+
+            sleep(TRANSLATION_BATCH_SCAN_INTERVAL).await;
+        }
+
+        self.finish_worker_exit(state, worker_id).await;
+    }
+
+    async fn worker_is_desired(&self, worker_id: &str) -> bool {
+        self.profile_by_worker_id(worker_id).await.is_some()
+    }
+
+    async fn current_profile_by_worker_id(
+        &self,
+        worker_id: &str,
+    ) -> Option<TranslationWorkerProfile> {
+        if let Some(profile) = self
+            .runtime
+            .read()
+            .await
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .map(|entry| {
+                translation_worker_profile_from_runtime(
+                    entry.worker_id.as_str(),
+                    entry.worker_kind.as_str(),
+                    entry.worker_slot,
+                )
+            })
+        {
+            return Some(profile);
+        }
+
+        self.profile_by_worker_id(worker_id).await
+    }
+
+    async fn profile_by_worker_id(&self, worker_id: &str) -> Option<TranslationWorkerProfile> {
+        translation_worker_profiles(self.desired_config().await)
+            .into_iter()
+            .find(|profile| profile.worker_id == worker_id)
+    }
+
+    async fn finish_worker_exit(self: &Arc<Self>, state: Arc<AppState>, worker_id: String) {
+        if self.unregister_worker(worker_id.as_str()).await {
+            self.schedule_worker_reconcile(state);
+        }
+    }
+
+    async fn unregister_worker(&self, worker_id: &str) -> bool {
+        self.worker_abort_handles.lock().await.remove(worker_id);
+        self.worker_is_desired(worker_id).await
+    }
+
+    fn schedule_worker_reconcile(self: &Arc<Self>, state: Arc<AppState>) {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            controller.ensure_workers_running(state).await;
+        });
+    }
+
+    fn spawn_worker_task(
+        self: &Arc<Self>,
+        state: Arc<AppState>,
+        worker_id: String,
+    ) -> tokio::task::AbortHandle {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            controller.run_worker_loop(state, worker_id).await;
+        })
+        .abort_handle()
+    }
+
+    async fn remove_worker_runtime(&self, pool: &SqlitePool, worker_id: &str) -> Result<()> {
+        let desired_config = self.desired_config().await;
+        let mut runtime = self.runtime.write().await;
+        let previous_topology = runtime
+            .iter()
+            .map(|entry| {
+                (
+                    entry.worker_id.clone(),
+                    (entry.worker_slot, entry.worker_kind.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        runtime.retain(|entry| entry.worker_id != worker_id);
+        reconcile_worker_runtime_slots(&mut runtime, desired_config);
+        let batch_slot_updates = collect_running_batch_slot_updates(&runtime, &previous_topology);
+        if translation_runtime_topology_changed(&runtime, &previous_topology) {
+            refresh_translation_runtime_updated_at(&mut runtime);
+        }
+        drop(runtime);
+        sync_running_batch_slot_updates(pool, &batch_slot_updates).await?;
+        Ok(())
+    }
+
+    async fn update_worker_runtime(
+        &self,
+        profile: &TranslationWorkerProfile,
+        update: TranslationWorkerRuntimeUpdate<'_>,
+    ) {
+        let desired_config = self.desired_config().await;
+        let mut runtime = self.runtime.write().await;
+        let entry = if let Some(index) = runtime
+            .iter()
+            .position(|entry| entry.worker_id == profile.worker_id)
+        {
+            &mut runtime[index]
+        } else {
+            runtime.push(TranslationWorkerRuntimeState::idle(profile));
+            runtime
+                .last_mut()
+                .expect("translation worker runtime entry should exist after insert")
+        };
+
+        let next_batch_id = update.current_batch_id.map(str::to_owned);
+        let next_trigger_reason = update.trigger_reason.map(str::to_owned);
+        let next_error_text = update.error_text.map(str::to_owned);
+        let changed = entry.worker_slot != profile.worker_slot
+            || entry.worker_kind != profile.worker_kind
+            || entry.status != update.status
+            || entry.current_batch_id != next_batch_id
+            || entry.request_count != update.request_count
+            || entry.work_item_count != update.work_item_count
+            || entry.trigger_reason != next_trigger_reason
+            || entry.error_text != next_error_text;
+        if !changed {
+            return;
+        }
+
+        entry.worker_slot = profile.worker_slot;
+        entry.worker_kind = profile.worker_kind.clone();
+        entry.status = update.status.to_owned();
+        entry.current_batch_id = next_batch_id;
+        entry.request_count = update.request_count;
+        entry.work_item_count = update.work_item_count;
+        entry.trigger_reason = next_trigger_reason;
+        entry.error_text = next_error_text;
+        entry.updated_at = Utc::now().to_rfc3339();
+        reconcile_worker_runtime_slots(&mut runtime, desired_config);
+    }
 }
 
-fn translation_worker_profile_for_slot(worker_slot: i64) -> Option<TranslationWorkerProfile> {
-    translation_worker_profiles()
-        .into_iter()
-        .find(|profile| profile.worker_slot == worker_slot)
+fn translation_worker_profiles(config: TranslationRuntimeConfig) -> Vec<TranslationWorkerProfile> {
+    let mut profiles = Vec::with_capacity(config.total_worker_concurrency());
+    for worker_index in 1..=config.general_worker_concurrency {
+        profiles.push(TranslationWorkerProfile {
+            worker_id: translation_worker_id("general", worker_index),
+            worker_slot: i64::try_from(worker_index).unwrap_or(i64::MAX),
+            worker_kind: "general".to_owned(),
+        });
+    }
+    for worker_index in 1..=config.dedicated_worker_concurrency {
+        let slot = config.general_worker_concurrency + worker_index;
+        profiles.push(TranslationWorkerProfile {
+            worker_id: translation_worker_id("user_dedicated", worker_index),
+            worker_slot: i64::try_from(slot).unwrap_or(i64::MAX),
+            worker_kind: "user_dedicated".to_owned(),
+        });
+    }
+    profiles
 }
 
-fn translation_worker_runtime() -> &'static tokio::sync::RwLock<Vec<TranslationWorkerRuntimeState>>
-{
-    TRANSLATION_WORKER_RUNTIME.get_or_init(|| {
-        let now = Utc::now().to_rfc3339();
-        tokio::sync::RwLock::new(
-            translation_worker_profiles()
-                .into_iter()
-                .map(|profile| TranslationWorkerRuntimeState {
-                    worker_id: translation_worker_id(profile.worker_slot),
-                    worker_slot: profile.worker_slot,
-                    worker_kind: profile.worker_kind.to_owned(),
-                    status: "idle".to_owned(),
-                    current_batch_id: None,
-                    request_count: 0,
-                    work_item_count: 0,
-                    trigger_reason: None,
-                    updated_at: now.clone(),
-                    error_text: None,
+fn translation_worker_profile_from_runtime(
+    worker_id: &str,
+    worker_kind: &str,
+    worker_slot: i64,
+) -> TranslationWorkerProfile {
+    TranslationWorkerProfile {
+        worker_id: worker_id.to_owned(),
+        worker_slot,
+        worker_kind: worker_kind.to_owned(),
+    }
+}
+
+fn reconcile_worker_runtime_slots(
+    runtime: &mut [TranslationWorkerRuntimeState],
+    config: TranslationRuntimeConfig,
+) {
+    let desired_profiles = translation_worker_profiles(config);
+    let desired_profiles_by_worker_id = desired_profiles
+        .iter()
+        .map(|profile| (profile.worker_id.as_str(), profile))
+        .collect::<HashMap<_, _>>();
+    runtime.sort_by(|left, right| {
+        let left_profile = desired_profiles_by_worker_id
+            .get(left.worker_id.as_str())
+            .copied();
+        let right_profile = desired_profiles_by_worker_id
+            .get(right.worker_id.as_str())
+            .copied();
+        translation_worker_runtime_sort_key(left, left_profile)
+            .cmp(&translation_worker_runtime_sort_key(right, right_profile))
+    });
+
+    // Keep the board topology continuous even while drained workers finish in the background.
+    for (index, entry) in runtime.iter_mut().enumerate() {
+        if let Some(profile) = desired_profiles_by_worker_id.get(entry.worker_id.as_str()) {
+            entry.worker_kind = profile.worker_kind.clone();
+        }
+        entry.worker_slot = i64::try_from(index + 1).unwrap_or(i64::MAX);
+    }
+}
+
+fn translation_worker_runtime_sort_key<'a>(
+    entry: &'a TranslationWorkerRuntimeState,
+    desired_profile: Option<&'a TranslationWorkerProfile>,
+) -> (i32, i32, i64, &'a str) {
+    let worker_kind = desired_profile
+        .map(|profile| profile.worker_kind.as_str())
+        .unwrap_or(entry.worker_kind.as_str());
+    let worker_slot = desired_profile
+        .map(|profile| profile.worker_slot)
+        .unwrap_or(entry.worker_slot);
+    (
+        translation_worker_kind_priority(worker_kind),
+        if desired_profile.is_some() { 0 } else { 1 },
+        worker_slot,
+        entry.worker_id.as_str(),
+    )
+}
+
+fn translation_worker_kind_priority(worker_kind: &str) -> i32 {
+    match worker_kind {
+        "general" => 0,
+        "user_dedicated" => 1,
+        _ => 2,
+    }
+}
+
+fn translation_runtime_topology_changed(
+    runtime: &[TranslationWorkerRuntimeState],
+    previous_topology: &HashMap<String, (i64, String)>,
+) -> bool {
+    runtime.len() != previous_topology.len()
+        || runtime.iter().any(|entry| {
+            previous_topology
+                .get(entry.worker_id.as_str())
+                .map(|(worker_slot, worker_kind)| {
+                    *worker_slot != entry.worker_slot || worker_kind != &entry.worker_kind
                 })
-                .collect(),
-        )
-    })
+                .unwrap_or(true)
+        })
 }
 
-fn translation_worker_id(worker_slot: i64) -> String {
-    format!("translation-worker-{worker_slot}")
+fn refresh_translation_runtime_updated_at(runtime: &mut [TranslationWorkerRuntimeState]) {
+    let updated_at = Utc::now().to_rfc3339();
+    for entry in runtime.iter_mut() {
+        if entry.status == "running" {
+            continue;
+        }
+        entry.updated_at = updated_at.clone();
+    }
+}
+
+fn translation_worker_id(worker_kind: &str, worker_index: usize) -> String {
+    format!(
+        "translation-worker-{}-{worker_index}",
+        worker_kind.replace('_', "-")
+    )
 }
 
 fn translation_batch_claim_lock() -> &'static tokio::sync::Mutex<()> {
@@ -596,74 +1075,93 @@ fn translation_batch_claim_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 async fn update_translation_worker_runtime(
-    profile: TranslationWorkerProfile,
-    status: &str,
-    current_batch_id: Option<&str>,
-    request_count: i64,
-    work_item_count: i64,
-    trigger_reason: Option<&str>,
-    error_text: Option<&str>,
+    state: &AppState,
+    profile: &TranslationWorkerProfile,
+    update: TranslationWorkerRuntimeUpdate<'_>,
 ) {
-    let runtime = translation_worker_runtime();
-    let mut guard = runtime.write().await;
-    let Some(entry) = guard
-        .iter_mut()
-        .find(|entry| entry.worker_slot == profile.worker_slot)
-    else {
-        return;
-    };
-
-    let next_batch_id = current_batch_id.map(str::to_owned);
-    let next_trigger_reason = trigger_reason.map(str::to_owned);
-    let next_error_text = error_text.map(str::to_owned);
-    let changed = entry.status != status
-        || entry.current_batch_id != next_batch_id
-        || entry.request_count != request_count
-        || entry.work_item_count != work_item_count
-        || entry.trigger_reason != next_trigger_reason
-        || entry.error_text != next_error_text;
-    if !changed {
-        return;
-    }
-
-    entry.status = status.to_owned();
-    entry.current_batch_id = next_batch_id;
-    entry.request_count = request_count;
-    entry.work_item_count = work_item_count;
-    entry.trigger_reason = next_trigger_reason;
-    entry.error_text = next_error_text;
-    entry.updated_at = Utc::now().to_rfc3339();
+    state
+        .translation_scheduler
+        .update_worker_runtime(profile, update)
+        .await;
 }
 
-pub async fn translation_worker_runtime_statuses() -> Vec<AdminTranslationWorkerStatus> {
-    translation_worker_runtime()
-        .read()
-        .await
-        .iter()
-        .map(TranslationWorkerRuntimeState::to_admin_status)
-        .collect()
+pub async fn translation_worker_runtime_statuses(
+    state: &AppState,
+) -> Vec<AdminTranslationWorkerStatus> {
+    state.translation_scheduler.runtime_statuses().await
 }
 
 #[cfg(test)]
-async fn reset_translation_worker_runtime_for_tests() {
-    let runtime = translation_worker_runtime();
-    let now = Utc::now().to_rfc3339();
-    let mut guard = runtime.write().await;
-    *guard = translation_worker_profiles()
-        .into_iter()
-        .map(|profile| TranslationWorkerRuntimeState {
-            worker_id: translation_worker_id(profile.worker_slot),
-            worker_slot: profile.worker_slot,
-            worker_kind: profile.worker_kind.to_owned(),
-            status: "idle".to_owned(),
-            current_batch_id: None,
-            request_count: 0,
-            work_item_count: 0,
-            trigger_reason: None,
-            updated_at: now.clone(),
-            error_text: None,
+async fn reset_translation_worker_runtime_for_tests(state: &AppState) {
+    state.translation_scheduler.abort_all().await;
+    let config = state.translation_scheduler.desired_config().await;
+    state
+        .translation_scheduler
+        .sync_runtime_with_config(&state.pool, config)
+        .await
+        .expect("reset translation runtime");
+}
+
+#[derive(Debug, Clone)]
+struct RunningBatchSlotUpdate {
+    batch_id: String,
+    worker_id: String,
+    worker_slot: i64,
+    worker_kind: String,
+}
+
+fn collect_running_batch_slot_updates(
+    runtime: &[TranslationWorkerRuntimeState],
+    previous_topology: &HashMap<String, (i64, String)>,
+) -> Vec<RunningBatchSlotUpdate> {
+    runtime
+        .iter()
+        .filter_map(|entry| {
+            let batch_id = entry.current_batch_id.as_ref()?;
+            let previous = previous_topology.get(entry.worker_id.as_str());
+            let slot_changed = previous
+                .map(|(worker_slot, worker_kind)| {
+                    *worker_slot != entry.worker_slot || *worker_kind != entry.worker_kind
+                })
+                .unwrap_or(true);
+            if !slot_changed {
+                return None;
+            }
+            Some(RunningBatchSlotUpdate {
+                batch_id: batch_id.clone(),
+                worker_id: entry.worker_id.clone(),
+                worker_slot: entry.worker_slot,
+                worker_kind: entry.worker_kind.clone(),
+            })
         })
-        .collect();
+        .collect()
+}
+
+async fn sync_running_batch_slot_updates(
+    pool: &SqlitePool,
+    updates: &[RunningBatchSlotUpdate],
+) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let updated_at = Utc::now().to_rfc3339();
+    for update in updates {
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET worker_slot = ?, worker_kind = ?, updated_at = ?
+            WHERE id = ? AND status = 'running' AND worker_id = ?
+            "#,
+        )
+        .bind(update.worker_slot)
+        .bind(update.worker_kind.as_str())
+        .bind(updated_at.as_str())
+        .bind(update.batch_id.as_str())
+        .bind(update.worker_id.as_str())
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 fn claim_origin_case_sql() -> &'static str {
@@ -698,39 +1196,12 @@ fn request_effective_status_sql(status_column: &str, work_item_status_column: &s
         "CASE WHEN {status_column} = 'queued' AND {work_item_status_column} IN ('running', 'batched') THEN 'running' ELSE {status_column} END"
     )
 }
-pub fn spawn_translation_scheduler(state: Arc<AppState>) -> Vec<tokio::task::AbortHandle> {
-    translation_worker_profiles()
-        .into_iter()
-        .map(|profile| {
-            let state = state.clone();
-            tokio::spawn(async move {
-                update_translation_worker_runtime(profile, "idle", None, 0, 0, None, None).await;
-                loop {
-                    if let Err(err) = run_translation_scheduler_once(state.as_ref(), profile).await
-                    {
-                        warn!(
-                            ?err,
-                            worker_slot = profile.worker_slot,
-                            "translation scheduler tick failed"
-                        );
-                        let error_text = err.to_string();
-                        update_translation_worker_runtime(
-                            profile,
-                            "error",
-                            None,
-                            0,
-                            0,
-                            None,
-                            Some(error_text.as_str()),
-                        )
-                        .await;
-                    }
-                    sleep(TRANSLATION_BATCH_SCAN_INTERVAL).await;
-                }
-            })
-            .abort_handle()
-        })
-        .collect::<Vec<_>>()
+
+pub async fn spawn_translation_scheduler(state: Arc<AppState>) {
+    state
+        .translation_scheduler
+        .spawn_initial_workers(state.clone())
+        .await;
 }
 
 pub fn spawn_translation_recovery_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
@@ -840,9 +1311,70 @@ pub async fn admin_get_translation_status(
     session: Session,
 ) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
-    let _llm_runtime = state.llm_scheduler.runtime_status();
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        load_admin_translation_status_response(state.as_ref()).await?,
+    ))
+}
+
+pub async fn admin_patch_translation_runtime_config(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<AdminTranslationRuntimeConfigUpdateRequest>,
+) -> Result<Json<AdminTranslationStatusResponse>, ApiError> {
+    let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
+    let general_worker_concurrency = parse_positive_worker_concurrency(
+        req.general_worker_concurrency,
+        "general_worker_concurrency",
+    )?;
+    let dedicated_worker_concurrency = parse_positive_worker_concurrency(
+        req.dedicated_worker_concurrency,
+        "dedicated_worker_concurrency",
+    )?;
+    validate_translation_worker_concurrency_total(
+        general_worker_concurrency,
+        dedicated_worker_concurrency,
+    )?;
+
+    admin_runtime::update_translation_runtime_settings(
+        &state.pool,
+        general_worker_concurrency,
+        dedicated_worker_concurrency,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    admin_runtime::sync_persisted_runtime_settings(state.clone())
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(
+        load_admin_translation_status_response(state.as_ref()).await?,
+    ))
+}
+
+async fn load_admin_translation_status_response(
+    state: &AppState,
+) -> Result<AdminTranslationStatusResponse, ApiError> {
     let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-    let workers = translation_worker_runtime_statuses().await;
+    let runtime_config = state.translation_scheduler.desired_config().await;
+    let workers = translation_worker_runtime_statuses(state).await;
+    let general_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "general")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let dedicated_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "user_dedicated")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let worker_concurrency = i64::try_from(workers.len()).unwrap_or(i64::MAX);
     let idle_workers = i64::try_from(
         workers
             .iter()
@@ -859,37 +1391,37 @@ pub async fn admin_get_translation_status(
     .unwrap_or(i64::MAX);
 
     let queued_requests = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_requests WHERE status = 'queued'",
         &[],
     )
     .await?;
     let queued_work_items = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_work_items WHERE status = 'queued'",
         &[],
     )
     .await?;
     let running_batches = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_batches WHERE status = 'running'",
         &[],
     )
     .await?;
     let requests_24h = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_requests WHERE created_at >= ?",
         &[&since],
     )
     .await?;
     let completed_batches_24h = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_batches WHERE created_at >= ? AND status = 'completed'",
         &[&since],
     )
     .await?;
     let failed_batches_24h = scalar_i64(
-        state.as_ref(),
+        state,
         "SELECT COUNT(*) FROM translation_batches WHERE created_at >= ? AND status = 'failed'",
         &[&since],
     )
@@ -906,21 +1438,31 @@ pub async fn admin_get_translation_status(
     .await
     .map_err(ApiError::internal)?
     .map(|v| v.round() as i64);
-    let last_batch_finished_at = load_last_batch_finished_at(state.as_ref()).await?;
+    let last_batch_finished_at = load_last_batch_finished_at(state).await?;
 
     let budget = i64::from(
-        ai::compute_input_budget_with_source(state.as_ref(), TRANSLATION_BATCH_MAX_TOKENS)
+        ai::compute_input_budget_with_source(state, TRANSLATION_BATCH_MAX_TOKENS)
             .await
             .input_budget,
     );
 
-    Ok(Json(AdminTranslationStatusResponse {
+    Ok(AdminTranslationStatusResponse {
         scheduler_enabled: true,
         llm_enabled: state.config.ai.is_some(),
         scan_interval_ms: i64::try_from(TRANSLATION_BATCH_SCAN_INTERVAL.as_millis())
             .unwrap_or(i64::MAX),
         batch_token_threshold: budget,
-        worker_concurrency: TRANSLATION_WORKER_CONCURRENCY,
+        general_worker_concurrency,
+        dedicated_worker_concurrency,
+        worker_concurrency,
+        target_general_worker_concurrency: i64::try_from(runtime_config.general_worker_concurrency)
+            .unwrap_or(i64::MAX),
+        target_dedicated_worker_concurrency: i64::try_from(
+            runtime_config.dedicated_worker_concurrency,
+        )
+        .unwrap_or(i64::MAX),
+        target_worker_concurrency: i64::try_from(runtime_config.total_worker_concurrency())
+            .unwrap_or(i64::MAX),
         idle_workers,
         busy_workers,
         workers,
@@ -932,7 +1474,42 @@ pub async fn admin_get_translation_status(
         failed_batches_24h,
         avg_wait_ms_24h,
         last_batch_finished_at,
-    }))
+    })
+}
+
+fn parse_positive_worker_concurrency(value: i64, field: &str) -> Result<usize, ApiError> {
+    let parsed = usize::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer"
+        )));
+    }
+    if parsed > MAX_TRANSLATION_WORKER_CONCURRENCY {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn validate_translation_worker_concurrency_total(
+    general_worker_concurrency: usize,
+    dedicated_worker_concurrency: usize,
+) -> Result<(), ApiError> {
+    let total = general_worker_concurrency
+        .checked_add(dedicated_worker_concurrency)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            ))
+        })?;
+    if total > MAX_TRANSLATION_WORKER_CONCURRENCY {
+        return Err(ApiError::bad_request(format!(
+            "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn admin_list_translation_requests(
@@ -1409,7 +1986,7 @@ async fn refresh_live_batch_runtime_for_request(
     };
     let row = sqlx::query_as::<_, RunningBatchRuntimeRow>(
         r#"
-        SELECT id, worker_slot, request_count, item_count, trigger_reason
+        SELECT id, worker_id, worker_slot, worker_kind, request_count, item_count, trigger_reason
         FROM translation_batches
         WHERE id = ? AND status = 'running'
         "#,
@@ -1421,17 +1998,26 @@ async fn refresh_live_batch_runtime_for_request(
     let Some(row) = row else {
         return Ok(());
     };
-    let Some(profile) = translation_worker_profile_for_slot(row.worker_slot) else {
-        return Ok(());
-    };
+    let profile = state
+        .translation_scheduler
+        .current_profile_by_worker_id(row.worker_id.as_str())
+        .await
+        .unwrap_or_else(|| {
+            translation_worker_profile_from_runtime(
+                row.worker_id.as_str(),
+                row.worker_kind.as_str(),
+                row.worker_slot,
+            )
+        });
     update_translation_worker_runtime(
-        profile,
-        "running",
-        Some(row.id.as_str()),
-        row.request_count,
-        row.item_count,
-        Some(row.trigger_reason.as_str()),
-        None,
+        state,
+        &profile,
+        TranslationWorkerRuntimeUpdate::running(
+            row.id.as_str(),
+            row.request_count,
+            row.item_count,
+            row.trigger_reason.as_str(),
+        ),
     )
     .await;
     Ok(())
@@ -1647,8 +2233,36 @@ async fn run_translation_scheduler_once(
     state: &AppState,
     worker: TranslationWorkerProfile,
 ) -> Result<()> {
-    let Some(batch) = claim_next_batch(state, worker).await? else {
-        update_translation_worker_runtime(worker, "idle", None, 0, 0, None, None).await;
+    if !state
+        .translation_scheduler
+        .worker_is_desired(worker.worker_id.as_str())
+        .await
+    {
+        state
+            .translation_scheduler
+            .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+            .await?;
+        return Ok(());
+    }
+
+    let Some(batch) = claim_next_batch(state, worker.clone()).await? else {
+        if state
+            .translation_scheduler
+            .worker_is_desired(worker.worker_id.as_str())
+            .await
+        {
+            update_translation_worker_runtime(
+                state,
+                &worker,
+                TranslationWorkerRuntimeUpdate::idle(),
+            )
+            .await;
+        } else {
+            state
+                .translation_scheduler
+                .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                .await?;
+        }
         return Ok(());
     };
     execute_claimed_batch(state, batch).await
@@ -1659,6 +2273,13 @@ async fn claim_next_batch(
     worker: TranslationWorkerProfile,
 ) -> Result<Option<ClaimedBatch>> {
     let _claim_guard = translation_batch_claim_lock().lock().await;
+    if !state
+        .translation_scheduler
+        .worker_is_desired(worker.worker_id.as_str())
+        .await
+    {
+        return Ok(None);
+    }
     let claim_origin_case = claim_origin_case_sql();
     let first_query = if worker.worker_kind == "user_dedicated" {
         format!(
@@ -1779,8 +2400,9 @@ async fn claim_next_batch(
         r#"
         INSERT INTO translation_batches (
           id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
-          worker_slot, request_count, item_count, estimated_input_tokens, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+          worker_id, worker_slot, worker_kind, request_count, item_count, estimated_input_tokens,
+          status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
         "#,
     )
     .bind(batch_id.as_str())
@@ -1789,7 +2411,9 @@ async fn claim_next_batch(
     .bind(first.model_profile.as_str())
     .bind(first.target_lang.as_str())
     .bind(trigger_reason.as_str())
+    .bind(worker.worker_id.as_str())
     .bind(worker.worker_slot)
+    .bind(worker.worker_kind.as_str())
     .bind(request_count)
     .bind(i64::try_from(selected.len()).unwrap_or(i64::MAX))
     .bind(token_sum)
@@ -1855,7 +2479,9 @@ async fn claim_next_batch(
 
     Ok(Some(ClaimedBatch {
         id: batch_id,
+        worker_id: worker.worker_id.clone(),
         worker_slot: worker.worker_slot,
+        worker_kind: worker.worker_kind.clone(),
         partition_key,
         target_lang: first.target_lang,
         protocol_version: first.protocol_version,
@@ -1872,14 +2498,11 @@ async fn claim_next_batch(
 
 async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let worker = TranslationWorkerProfile {
-        worker_slot: batch.worker_slot,
-        worker_kind: if batch.worker_slot == TRANSLATION_USER_DEDICATED_WORKER_SLOT {
-            "user_dedicated"
-        } else {
-            "general"
-        },
-    };
+    let worker = translation_worker_profile_from_runtime(
+        batch.worker_id.as_str(),
+        batch.worker_kind.as_str(),
+        batch.worker_slot,
+    );
     sqlx::query(
         r#"
         UPDATE translation_batches
@@ -1899,13 +2522,14 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     .execute(&state.pool)
     .await?;
     update_translation_worker_runtime(
-        worker,
-        "running",
-        Some(batch.id.as_str()),
-        batch.request_count,
-        i64::try_from(batch.items.len()).unwrap_or(i64::MAX),
-        Some(batch.trigger_reason.as_str()),
-        None,
+        state,
+        &worker,
+        TranslationWorkerRuntimeUpdate::running(
+            batch.id.as_str(),
+            batch.request_count,
+            i64::try_from(batch.items.len()).unwrap_or(i64::MAX),
+            batch.trigger_reason.as_str(),
+        ),
     )
     .await;
     for item in &batch.items {
@@ -1942,23 +2566,46 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         Ok(results) => {
             let res = finalize_batch_success(state, &batch, results).await;
             heartbeat.stop().await;
-            update_translation_worker_runtime(worker, "idle", None, 0, 0, None, None).await;
+            if state
+                .translation_scheduler
+                .worker_is_desired(worker.worker_id.as_str())
+                .await
+            {
+                update_translation_worker_runtime(
+                    state,
+                    &worker,
+                    TranslationWorkerRuntimeUpdate::idle(),
+                )
+                .await;
+            } else {
+                state
+                    .translation_scheduler
+                    .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                    .await?;
+            }
             res
         }
         Err(err) => {
             let error = err.to_string();
             let res = finalize_batch_failure(state, &batch, err.into()).await;
             heartbeat.stop().await;
-            update_translation_worker_runtime(
-                worker,
-                "error",
-                None,
-                0,
-                0,
-                None,
-                Some(error.as_str()),
-            )
-            .await;
+            if state
+                .translation_scheduler
+                .worker_is_desired(worker.worker_id.as_str())
+                .await
+            {
+                update_translation_worker_runtime(
+                    state,
+                    &worker,
+                    TranslationWorkerRuntimeUpdate::error(error.as_str()),
+                )
+                .await;
+            } else {
+                state
+                    .translation_scheduler
+                    .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                    .await?;
+            }
             res
         }
     }
@@ -3218,6 +3865,57 @@ mod tests {
         state::build_oauth_client,
     };
 
+    fn test_dedicated_worker_slot() -> i64 {
+        i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY + 1)
+            .expect("dedicated worker slot should fit in i64")
+    }
+
+    fn test_worker_profile(worker_slot: i64, worker_kind: &str) -> TranslationWorkerProfile {
+        let worker_index = if worker_kind == "user_dedicated" {
+            usize::try_from(
+                worker_slot.saturating_sub(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY as i64),
+            )
+            .unwrap_or(1)
+            .max(1)
+        } else {
+            usize::try_from(worker_slot).unwrap_or(1).max(1)
+        };
+        TranslationWorkerProfile {
+            worker_id: translation_worker_id(worker_kind, worker_index),
+            worker_slot,
+            worker_kind: worker_kind.to_owned(),
+        }
+    }
+
+    #[test]
+    fn parse_positive_worker_concurrency_rejects_values_above_max() {
+        let overflow =
+            i64::try_from(MAX_TRANSLATION_WORKER_CONCURRENCY).expect("max fits in i64") + 1;
+        let err = parse_positive_worker_concurrency(overflow, "general_worker_concurrency")
+            .expect_err("overflow concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "general_worker_concurrency must be a positive integer <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_translation_worker_concurrency_total_rejects_combined_overflow() {
+        let err =
+            validate_translation_worker_concurrency_total(MAX_TRANSLATION_WORKER_CONCURRENCY, 1)
+                .expect_err("combined worker concurrency should fail");
+
+        assert!(
+            err.to_string().contains(&format!(
+                "general_worker_concurrency + dedicated_worker_concurrency must be <= {MAX_TRANSLATION_WORKER_CONCURRENCY}"
+            )),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn normalize_request_items_rejects_unsupported_kind() {
         let err = normalize_request_items(&[TranslationRequestItemInput {
@@ -3752,15 +4450,9 @@ mod tests {
             .await
             .expect("request created");
 
-        run_translation_scheduler_once(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("scheduler tick");
+        run_translation_scheduler_once(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("scheduler tick");
 
         let request_status: String =
             sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ?")
@@ -3827,7 +4519,7 @@ mod tests {
     async fn create_translation_request_with_origin_persists_request_origin() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("123");
 
@@ -3850,7 +4542,7 @@ mod tests {
     async fn load_translation_request_detail_includes_request_origin() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("detail-origin");
 
@@ -3872,20 +4564,13 @@ mod tests {
     async fn scheduler_clears_worker_error_after_successful_idle_scan() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
-        reset_translation_worker_runtime_for_tests().await;
-        let worker = TranslationWorkerProfile {
-            worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
-            worker_kind: "user_dedicated",
-        };
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        let worker = test_worker_profile(test_dedicated_worker_slot(), "user_dedicated");
 
         update_translation_worker_runtime(
-            worker,
-            "error",
-            None,
-            0,
-            0,
-            None,
-            Some("temporary failure"),
+            state.as_ref(),
+            &worker,
+            TranslationWorkerRuntimeUpdate::error("temporary failure"),
         )
         .await;
 
@@ -3893,10 +4578,10 @@ mod tests {
             .await
             .expect("idle scan succeeds");
 
-        let workers = translation_worker_runtime_statuses().await;
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         let dedicated = workers
             .iter()
-            .find(|entry| entry.worker_slot == TRANSLATION_USER_DEDICATED_WORKER_SLOT)
+            .find(|entry| entry.worker_slot == test_dedicated_worker_slot())
             .expect("dedicated worker exists");
 
         assert_eq!(dedicated.status, "idle");
@@ -3907,7 +4592,7 @@ mod tests {
     async fn claim_next_batch_routes_user_dedicated_worker_only_to_user_requests() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut system_item = sample_release_item("111");
@@ -3930,33 +4615,21 @@ mod tests {
 
         let dedicated_batch = claim_next_batch(
             state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: TRANSLATION_USER_DEDICATED_WORKER_SLOT,
-                worker_kind: "user_dedicated",
-            },
+            test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
         )
         .await
         .expect("claim user batch")
         .expect("user batch exists");
 
-        assert_eq!(
-            dedicated_batch.worker_slot,
-            TRANSLATION_USER_DEDICATED_WORKER_SLOT
-        );
+        assert_eq!(dedicated_batch.worker_slot, test_dedicated_worker_slot());
         assert_eq!(dedicated_batch.request_count, 1);
         assert_eq!(dedicated_batch.items.len(), 1);
         assert_eq!(dedicated_batch.items[0].entity_id, "222");
 
-        let general_batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim general batch")
-        .expect("general batch exists");
+        let general_batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim general batch")
+            .expect("general batch exists");
 
         assert_eq!(general_batch.worker_slot, 1);
         assert_eq!(general_batch.items[0].entity_id, "111");
@@ -3966,7 +4639,7 @@ mod tests {
     async fn scheduler_persists_batch_worker_slot_and_request_count() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("123");
@@ -3975,15 +4648,9 @@ mod tests {
             .await
             .expect("request created");
 
-        run_translation_scheduler_once(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 2,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("scheduler tick");
+        run_translation_scheduler_once(state.as_ref(), test_worker_profile(2, "general"))
+            .await
+            .expect("scheduler tick");
 
         let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
             r#"
@@ -4005,7 +4672,7 @@ mod tests {
     async fn recover_runtime_state_marks_stale_batches_requests_and_linked_llm_calls_failed() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("recover-stale-batch");
@@ -4013,16 +4680,10 @@ mod tests {
         let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
-        let batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim batch")
-        .expect("batch exists");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
         let work_item_id = batch.items[0].id.clone();
         let stale_at = "2026-03-06T00:00:00Z";
 
@@ -4162,7 +4823,7 @@ mod tests {
     async fn recover_runtime_state_keeps_live_current_owner_batches_running() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("recover-live-batch");
@@ -4170,16 +4831,10 @@ mod tests {
         create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
-        let batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim batch")
-        .expect("batch exists");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -4220,7 +4875,7 @@ mod tests {
     async fn recover_runtime_state_keeps_live_foreign_owner_batches_running() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("recover-foreign-live-batch");
@@ -4228,16 +4883,10 @@ mod tests {
         create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
-        let batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim batch")
-        .expect("batch exists");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -4293,7 +4942,7 @@ mod tests {
      {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("recover-startup-foreign-batch");
@@ -4301,16 +4950,10 @@ mod tests {
         let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
-        let batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim batch")
-        .expect("batch exists");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
         let work_item_id = batch.items[0].id.clone();
         let now = Utc::now().to_rfc3339();
 
@@ -4443,7 +5086,7 @@ mod tests {
     async fn recover_runtime_state_on_startup_keeps_live_foreign_owner_batches_running() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
 
         let mut item = sample_release_item("recover-startup-live-foreign-batch");
@@ -4451,16 +5094,10 @@ mod tests {
         create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
-        let batch = claim_next_batch(
-            state.as_ref(),
-            TranslationWorkerProfile {
-                worker_slot: 1,
-                worker_kind: "general",
-            },
-        )
-        .await
-        .expect("claim batch")
-        .expect("batch exists");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
@@ -4522,7 +5159,7 @@ mod tests {
     async fn create_translation_request_refreshes_running_batch_worker_runtime() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
-        reset_translation_worker_runtime_for_tests().await;
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("runtime-refresh");
 
@@ -4540,9 +5177,9 @@ mod tests {
             r#"
             INSERT INTO translation_batches (
               id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
-              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
-              started_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
             "#,
         )
         .bind("batch-runtime-refresh")
@@ -4551,7 +5188,9 @@ mod tests {
         .bind(current_model_profile())
         .bind("zh-CN")
         .bind("deadline_due")
+        .bind("translation-worker-general-2")
         .bind(2_i64)
+        .bind("general")
         .bind(1_i64)
         .bind(1_i64)
         .bind(128_i64)
@@ -4603,7 +5242,7 @@ mod tests {
             .await
             .expect("second request created");
 
-        let workers = translation_worker_runtime_statuses().await;
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
         let worker = workers
             .iter()
             .find(|entry| entry.worker_slot == 2)
@@ -4619,33 +5258,866 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn translation_worker_runtime_statuses_report_updates() {
-        reset_translation_worker_runtime_for_tests().await;
+    async fn create_translation_request_refreshes_running_batch_into_live_slot_after_runtime_resize()
+     {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("runtime-refresh-resized");
+
+        let first = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("first request created");
+        let work_item_id = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item id for first request");
+        let now = Utc::now().to_rfc3339();
+        let worker_id = translation_worker_id("user_dedicated", 1);
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-refresh-resized")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(worker_id.as_str())
+        .bind(test_dedicated_worker_slot())
+        .bind("user_dedicated")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-resized-item")
+        .bind("batch-runtime-refresh-resized")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running', batch_id = 'batch-runtime-refresh-resized', started_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item running");
+
         update_translation_worker_runtime(
-            TranslationWorkerProfile {
-                worker_slot: 4,
-                worker_kind: "user_dedicated",
-            },
-            "running",
-            Some("batch-1"),
-            2,
-            3,
-            Some("deadline"),
-            None,
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::running(
+                "batch-runtime-refresh-resized",
+                1,
+                1,
+                "deadline_due",
+            ),
         )
         .await;
 
-        let workers = translation_worker_runtime_statuses().await;
+        let resized_general_concurrency = DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
+            .saturating_sub(1)
+            .max(1);
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(
+                    resized_general_concurrency,
+                    DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+                ),
+            )
+            .await
+            .expect("shrink runtime");
+        let expected_slot =
+            i64::try_from(resized_general_concurrency + 1).expect("expected slot fits in i64");
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .expect("worker exists");
+
+        assert_eq!(worker.worker_slot, expected_slot);
+        assert_eq!(worker.status, "running");
+        assert_eq!(
+            worker.current_batch_id.as_deref(),
+            Some("batch-runtime-refresh-resized")
+        );
+        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.work_item_count, 1);
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                expected_slot,
+            ),
+            TranslationWorkerRuntimeUpdate::idle(),
+        )
+        .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .expect("worker exists after idle");
+
+        assert_eq!(worker.worker_slot, expected_slot);
+        assert_eq!(worker.status, "idle");
+        assert_eq!(worker.current_batch_id, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_updates_running_batch_slot_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        let worker_id = translation_worker_id("user_dedicated", 1);
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-runtime-slot-sync")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(worker_id.as_str())
+        .bind(test_dedicated_worker_slot())
+        .bind("user_dedicated")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running batch");
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::running("batch-runtime-slot-sync", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
+
+        let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+            r#"
+            SELECT id, status, trigger_reason, worker_slot, request_count, item_count,
+                   estimated_input_tokens, created_at, started_at, finished_at, updated_at
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind("batch-runtime-slot-sync")
+        .fetch_one(&pool)
+        .await
+        .expect("load running batch");
+
+        assert_eq!(row.worker_slot, 3);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_keeps_unique_slots_for_retained_running_workers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("resize runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
         let dedicated = workers
             .iter()
-            .find(|worker| worker.worker_slot == 4)
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
+            .expect("dedicated worker exists");
+        let retained_general = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("general", 3))
+            .expect("retained worker exists");
+
+        assert_eq!(slots, vec![1, 2, 3, 4]);
+        assert_eq!(retained_general.worker_slot, 3);
+        assert_eq!(retained_general.status, "running");
+        assert_eq!(dedicated.worker_slot, 4);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_moves_running_dedicated_worker_after_new_general_slot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-dedicated-1", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(4, 1))
+            .await
+            .expect("expand runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
+        let general = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("general", 4))
+            .expect("new general worker exists");
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
             .expect("dedicated worker exists");
 
-        assert_eq!(workers.len(), TRANSLATION_WORKER_CONCURRENCY as usize);
+        assert_eq!(slots, vec![1, 2, 3, 4, 5]);
+        assert_eq!(general.worker_slot, 4);
+        assert_eq!(dedicated.worker_slot, 5);
+        assert_eq!(dedicated.status, "running");
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_moves_running_dedicated_worker_into_compacted_slot() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-dedicated-1", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(&state.pool, TranslationRuntimeConfig::new(2, 1))
+            .await
+            .expect("shrink runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
+            .expect("dedicated worker exists");
+
+        assert_eq!(slots, vec![1, 2, 3]);
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.status, "running");
+    }
+
+    #[tokio::test]
+    async fn claim_next_batch_skips_removed_worker_after_runtime_resize() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        seed_user(&state.pool, 1, "octo").await;
+
+        create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("claim-removed-worker"),
+        )
+        .await
+        .expect("request created");
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(3, "general"))
+            .await
+            .expect("claim result");
+        assert!(batch.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_runtime_config_waits_for_inflight_claims_before_removing_worker() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let claim_guard = translation_batch_claim_lock().lock().await;
+        let scheduler = Arc::clone(&state.translation_scheduler);
+        let resize_state = state.clone();
+        let resize = tokio::spawn(async move {
+            scheduler
+                .apply_runtime_config(resize_state, TranslationRuntimeConfig::new(2, 1))
+                .await
+                .expect("apply runtime config")
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            state
+                .translation_scheduler
+                .desired_config()
+                .await
+                .general_worker_concurrency,
+            DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
+        );
+
+        drop(claim_guard);
+
+        let applied = resize.await.expect("resize task should finish");
+        assert_eq!(applied.general_worker_concurrency, 2);
+        assert!(
+            !state
+                .translation_scheduler
+                .worker_is_desired("translation-worker-general-3")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_worker_respawns_desired_worker_after_readd() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let worker_id = translation_worker_id("general", 3);
+        let stale_task = tokio::spawn(async {
+            sleep(Duration::from_secs(60)).await;
+        });
+
+        {
+            let mut handles = state
+                .translation_scheduler
+                .worker_abort_handles
+                .lock()
+                .await;
+            handles.insert(worker_id.clone(), stale_task.abort_handle());
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        state
+            .translation_scheduler
+            .apply_runtime_config(
+                state.clone(),
+                TranslationRuntimeConfig::new(3, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("apply translation runtime config");
+
+        state
+            .translation_scheduler
+            .finish_worker_exit(state.clone(), worker_id.clone())
+            .await;
+
+        tokio::task::yield_now().await;
+
+        let handles = state
+            .translation_scheduler
+            .worker_abort_handles
+            .lock()
+            .await;
+        assert!(handles.contains_key(worker_id.as_str()));
+        stale_task.abort();
+    }
+
+    #[tokio::test]
+    async fn translation_worker_runtime_statuses_report_updates() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-1", 2, 3, "deadline"),
+        )
+        .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_slot == test_dedicated_worker_slot())
+            .expect("dedicated worker exists");
+
+        assert_eq!(
+            workers.len(),
+            DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
+                + DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY
+        );
         assert_eq!(dedicated.status, "running");
         assert_eq!(dedicated.current_batch_id.as_deref(), Some("batch-1"));
         assert_eq!(dedicated.request_count, 2);
         assert_eq!(dedicated.work_item_count, 3);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_refreshes_remaining_worker_timestamps_for_sse() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = stale_updated_at.to_owned();
+            }
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        assert_eq!(workers.len(), 3);
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.worker_slot)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_preserves_running_worker_timestamps() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let running_worker_id = translation_worker_id("user_dedicated", 1);
+        let running_updated_at = "2026-03-07T00:00:01Z";
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(test_dedicated_worker_slot(), "user_dedicated"),
+            TranslationWorkerRuntimeUpdate::running("batch-running-dedicated", 1, 1, "deadline"),
+        )
+        .await;
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = if entry.worker_id == running_worker_id {
+                    running_updated_at.to_owned()
+                } else {
+                    stale_updated_at.to_owned()
+                };
+            }
+        }
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == running_worker_id)
+            .expect("dedicated worker exists after shrink");
+
+        assert_eq!(dedicated.status, "running");
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.updated_at, running_updated_at);
+        assert!(
+            workers
+                .iter()
+                .filter(|worker| worker.worker_id != running_worker_id)
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_worker_exit_refreshes_remaining_worker_timestamps_for_sse() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let worker_id = translation_worker_id("general", 3);
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(worker_id.as_str(), "general", 3),
+            TranslationWorkerRuntimeUpdate::idle(),
+        )
+        .await;
+
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = stale_updated_at.to_owned();
+            }
+        }
+
+        state
+            .translation_scheduler
+            .remove_worker_runtime(&state.pool, worker_id.as_str())
+            .await
+            .expect("remove drained worker runtime");
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        assert_eq!(workers.len(), 3);
+        assert!(workers.iter().all(|worker| worker.worker_id != worker_id));
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+        assert_eq!(
+            workers
+                .iter()
+                .map(|worker| worker.worker_slot)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_worker_exit_updates_running_batch_slot_metadata() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let drained_worker_id = translation_worker_id("general", 3);
+        let dedicated_worker_id = translation_worker_id("user_dedicated", 1);
+        let now = Utc::now().to_rfc3339();
+        let running_updated_at = "2026-03-07T00:00:01Z";
+        let stale_updated_at = "2026-03-07T00:00:00Z";
+
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_id, worker_slot, worker_kind, request_count, item_count,
+              estimated_input_tokens, status, created_at, started_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
+            "#,
+        )
+        .bind("batch-drained-slot-sync")
+        .bind("general:release_summary:feed_card:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline_due")
+        .bind(dedicated_worker_id.as_str())
+        .bind(test_dedicated_worker_slot())
+        .bind("user_dedicated")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert running dedicated batch");
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                dedicated_worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::running("batch-drained-slot-sync", 1, 1, "deadline"),
+        )
+        .await;
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let before_exit = sqlx::query(
+            r#"
+            SELECT worker_slot
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind("batch-drained-slot-sync")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch batch before drained worker exit");
+        assert_eq!(before_exit.get::<i64, _>("worker_slot"), 4);
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(drained_worker_id.as_str(), "general", 3),
+            TranslationWorkerRuntimeUpdate::idle(),
+        )
+        .await;
+        {
+            let mut runtime = state.translation_scheduler.runtime.write().await;
+            for entry in runtime.iter_mut() {
+                entry.updated_at = if entry.worker_id == dedicated_worker_id {
+                    running_updated_at.to_owned()
+                } else {
+                    stale_updated_at.to_owned()
+                };
+            }
+        }
+
+        state
+            .translation_scheduler
+            .remove_worker_runtime(&state.pool, drained_worker_id.as_str())
+            .await
+            .expect("remove drained worker runtime");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT worker_slot, worker_kind
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind("batch-drained-slot-sync")
+        .fetch_one(&pool)
+        .await
+        .expect("fetch batch after drained worker exit");
+        assert_eq!(batch_row.get::<i64, _>("worker_slot"), 3);
+        assert_eq!(
+            batch_row.get::<String, _>("worker_kind"),
+            "user_dedicated".to_owned()
+        );
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == dedicated_worker_id)
+            .expect("dedicated worker remains after drained exit");
+        assert_eq!(dedicated.status, "running");
+        assert_eq!(dedicated.worker_slot, 3);
+        assert_eq!(dedicated.updated_at, running_updated_at);
+        assert!(
+            workers
+                .iter()
+                .filter(|worker| worker.worker_id != dedicated_worker_id)
+                .all(|worker| worker.updated_at != stale_updated_at)
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_reports_live_counts_during_worker_drain() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(
+                &state.pool,
+                TranslationRuntimeConfig::new(2, DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+            )
+            .await
+            .expect("shrink runtime");
+
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load translation status");
+
+        assert_eq!(status.general_worker_concurrency, 3);
+        assert_eq!(
+            status.dedicated_worker_concurrency,
+            i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
+        );
+        assert_eq!(status.worker_concurrency, 4);
+        assert_eq!(
+            status.idle_workers + status.busy_workers,
+            status.worker_concurrency
+        );
+        assert_eq!(status.target_general_worker_concurrency, 2);
+        assert_eq!(
+            status.target_dedicated_worker_concurrency,
+            i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
+        );
+        assert_eq!(status.target_worker_concurrency, 3);
+        assert_eq!(status.workers.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_syncs_persisted_runtime_settings() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-28T11:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 1, 5, 2, ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+
+        admin_runtime::sync_persisted_runtime_settings(state.clone())
+            .await
+            .expect("sync runtime settings");
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load translation status");
+
+        assert_eq!(status.general_worker_concurrency, 5);
+        assert_eq!(status.dedicated_worker_concurrency, 2);
+        assert_eq!(status.worker_concurrency, 7);
+        assert_eq!(status.target_general_worker_concurrency, 5);
+        assert_eq!(status.target_dedicated_worker_concurrency, 2);
+        assert_eq!(status.target_worker_concurrency, 7);
+        assert_eq!(status.workers.len(), 7);
+
+        state.translation_scheduler.abort_all().await;
     }
 
     #[tokio::test]
@@ -5094,6 +6566,9 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(TranslationSchedulerController::new(
+                TranslationRuntimeConfig::default(),
+            )),
             config,
             pool,
             http: reqwest::Client::new(),

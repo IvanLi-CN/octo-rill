@@ -25,6 +25,7 @@ type AdminJobsMockOptions = {
 	delayRules?: MockDelayRule[];
 	failureRules?: MockFailureRule[];
 	emitStreamEvents?: boolean;
+	emitLlmSchedulerEvents?: boolean;
 	emitTranslationEvents?: boolean;
 };
 
@@ -199,6 +200,19 @@ async function installAdminJobsMocks(
 			updated_at: "2026-02-26T04:00:00Z",
 		},
 	];
+	let llmSchedulerStatus = {
+		scheduler_enabled: true,
+		max_concurrency: 2,
+		available_slots: 1,
+		waiting_calls: 1,
+		in_flight_calls: 1,
+		calls_24h: llmCalls.length,
+		failed_24h: llmCalls.filter((item) => item.status === "failed").length,
+		avg_wait_ms_24h: 640,
+		avg_duration_ms_24h: 1300,
+		last_success_at: "2026-02-26T03:00:01Z",
+		last_failure_at: "2026-02-26T02:00:03Z",
+	};
 
 	const recentRunningWorkerUpdatedAt = new Date(
 		Date.now() - 75_000,
@@ -323,6 +337,43 @@ async function installAdminJobsMocks(
 			error_text: null,
 		},
 	];
+	let translationRuntimeOverride: {
+		general_worker_concurrency: number;
+		dedicated_worker_concurrency: number;
+		workers: typeof completedTranslationWorkers;
+	} | null = null;
+
+	function buildIdleTranslationWorkers(
+		generalWorkerConcurrency: number,
+		dedicatedWorkerConcurrency: number,
+	) {
+		return [
+			...Array.from({ length: generalWorkerConcurrency }, (_, index) => ({
+				worker_id: `translation-worker-general-${index + 1}`,
+				worker_slot: index + 1,
+				worker_kind: "general" as const,
+				status: "idle" as const,
+				current_batch_id: null,
+				request_count: 0,
+				work_item_count: 0,
+				trigger_reason: null,
+				updated_at: "2026-02-26T04:00:03Z",
+				error_text: null,
+			})),
+			...Array.from({ length: dedicatedWorkerConcurrency }, (_, index) => ({
+				worker_id: `translation-worker-user-dedicated-${index + 1}`,
+				worker_slot: generalWorkerConcurrency + index + 1,
+				worker_kind: "user_dedicated" as const,
+				status: "idle" as const,
+				current_batch_id: null,
+				request_count: 0,
+				work_item_count: 0,
+				trigger_reason: null,
+				updated_at: "2026-02-26T04:00:03Z",
+				error_text: null,
+			})),
+		];
+	}
 
 	const completedTranslationRequestItem = {
 		producer_ref: "feed.auto_translate:release:290978079",
@@ -370,6 +421,8 @@ async function installAdminJobsMocks(
 
 	const emitTranslationEvents = options.emitTranslationEvents ?? false;
 	let translationEventDelivered = !emitTranslationEvents;
+	const emitLlmSchedulerEvents = options.emitLlmSchedulerEvents ?? false;
+	let llmSchedulerEventDelivered = !emitLlmSchedulerEvents;
 	const translationViewResponseCounts = new Map<string, number>();
 
 	function shouldServeCompletedTranslationView(key: string) {
@@ -382,13 +435,57 @@ async function installAdminJobsMocks(
 	}
 
 	function buildTranslationStatus(completed: boolean) {
+		if (translationRuntimeOverride) {
+			const busyWorkers = translationRuntimeOverride.workers.filter(
+				(worker) => worker.status === "running",
+			).length;
+			const idleWorkers = translationRuntimeOverride.workers.filter(
+				(worker) => worker.status === "idle",
+			).length;
+			return {
+				scheduler_enabled: true,
+				llm_enabled: true,
+				scan_interval_ms: 250,
+				batch_token_threshold: 1800,
+				general_worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency,
+				dedicated_worker_concurrency:
+					translationRuntimeOverride.dedicated_worker_concurrency,
+				worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency +
+					translationRuntimeOverride.dedicated_worker_concurrency,
+				target_general_worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency,
+				target_dedicated_worker_concurrency:
+					translationRuntimeOverride.dedicated_worker_concurrency,
+				target_worker_concurrency:
+					translationRuntimeOverride.general_worker_concurrency +
+					translationRuntimeOverride.dedicated_worker_concurrency,
+				idle_workers: idleWorkers,
+				busy_workers: busyWorkers,
+				workers: translationRuntimeOverride.workers,
+				queued_requests: 0,
+				queued_work_items: 0,
+				running_batches: 0,
+				requests_24h: 1,
+				completed_batches_24h: 1,
+				failed_batches_24h: 0,
+				avg_wait_ms_24h: 320,
+				last_batch_finished_at: "2026-02-26T04:00:03Z",
+			};
+		}
 		if (completed) {
 			return {
 				scheduler_enabled: true,
 				llm_enabled: true,
 				scan_interval_ms: 250,
 				batch_token_threshold: 1800,
+				general_worker_concurrency: 3,
+				dedicated_worker_concurrency: 1,
 				worker_concurrency: 4,
+				target_general_worker_concurrency: 3,
+				target_dedicated_worker_concurrency: 1,
+				target_worker_concurrency: 4,
 				idle_workers: 4,
 				busy_workers: 0,
 				workers: completedTranslationWorkers,
@@ -408,7 +505,12 @@ async function installAdminJobsMocks(
 			llm_enabled: true,
 			scan_interval_ms: 250,
 			batch_token_threshold: 1800,
+			general_worker_concurrency: 3,
+			dedicated_worker_concurrency: 1,
 			worker_concurrency: 4,
+			target_general_worker_concurrency: 3,
+			target_dedicated_worker_concurrency: 1,
+			target_worker_concurrency: 4,
 			idle_workers: 3,
 			busy_workers: 1,
 			workers: pendingTranslationWorkers,
@@ -660,6 +762,29 @@ async function installAdminJobsMocks(
 				})}`,
 				"",
 			];
+
+			if (emitLlmSchedulerEvents && !llmSchedulerEventDelivered) {
+				await sleep(200);
+				llmSchedulerEventDelivered = true;
+				llmSchedulerStatus = {
+					...llmSchedulerStatus,
+					max_concurrency: 5,
+					available_slots: Math.max(0, 5 - llmSchedulerStatus.in_flight_calls),
+				};
+				streamBody.push(
+					"event: llm.scheduler",
+					`data: ${JSON.stringify({
+						event_id: "scheduler:2026-02-26T03:00:02Z:5:4:1:1",
+						max_concurrency: 5,
+						available_slots: 4,
+						waiting_calls: llmSchedulerStatus.waiting_calls,
+						in_flight_calls: llmSchedulerStatus.in_flight_calls,
+						event_type: "llm.scheduler.updated",
+						created_at: "2026-02-26T03:00:02Z",
+					})}`,
+					"",
+				);
+			}
 
 			if (emitTranslationEvents && !translationEventDelivered) {
 				await sleep(200);
@@ -970,19 +1095,24 @@ async function installAdminJobsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/status") {
-			return json(route, {
-				scheduler_enabled: true,
-				max_concurrency: 2,
-				available_slots: 1,
-				waiting_calls: 1,
-				in_flight_calls: 1,
-				calls_24h: llmCalls.length,
-				failed_24h: llmCalls.filter((item) => item.status === "failed").length,
-				avg_wait_ms_24h: 640,
-				avg_duration_ms_24h: 1300,
-				last_success_at: "2026-02-26T03:00:01Z",
-				last_failure_at: "2026-02-26T02:00:03Z",
-			});
+			return json(route, llmSchedulerStatus);
+		}
+
+		if (
+			req.method() === "PATCH" &&
+			pathname === "/api/admin/jobs/llm/runtime-config"
+		) {
+			const body = (req.postDataJSON() ?? {}) as { max_concurrency?: number };
+			const maxConcurrency = Number(body.max_concurrency ?? 1);
+			llmSchedulerStatus = {
+				...llmSchedulerStatus,
+				max_concurrency: maxConcurrency,
+				available_slots: Math.max(
+					0,
+					maxConcurrency - llmSchedulerStatus.in_flight_calls,
+				),
+			};
+			return json(route, llmSchedulerStatus);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/calls") {
@@ -1100,6 +1230,29 @@ async function installAdminJobsMocks(
 				route,
 				buildTranslationStatus(shouldServeCompletedTranslationView("status")),
 			);
+		}
+
+		if (
+			req.method() === "PATCH" &&
+			pathname === "/api/admin/jobs/translations/runtime-config"
+		) {
+			const body = (req.postDataJSON() ?? {}) as {
+				general_worker_concurrency?: number;
+				dedicated_worker_concurrency?: number;
+			};
+			translationRuntimeOverride = {
+				general_worker_concurrency: Number(
+					body.general_worker_concurrency ?? 1,
+				),
+				dedicated_worker_concurrency: Number(
+					body.dedicated_worker_concurrency ?? 1,
+				),
+				workers: buildIdleTranslationWorkers(
+					Number(body.general_worker_concurrency ?? 1),
+					Number(body.dedicated_worker_concurrency ?? 1),
+				),
+			};
+			return json(route, buildTranslationStatus(true));
 		}
 
 		if (
@@ -1360,10 +1513,10 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
 	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
-	await page.goBack();
+	await page.goBack({ waitUntil: "commit" });
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=queue$/);
 	await expect(page.getByRole("heading", { name: "需求队列" })).toBeVisible();
-	await page.goForward();
+	await page.goForward({ waitUntil: "commit" });
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
 	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
 
@@ -1694,6 +1847,117 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 		llmDialog.getByRole("heading", { name: "LLM 调用详情" }),
 	).toBeVisible();
 	await expect(llmDialog.getByText("llm-translation-1")).toBeVisible();
+});
+
+test("admin can update llm runtime concurrency from settings dialog", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+
+	await page.getByRole("button", { name: "配置 LLM 并发上限" }).click();
+	const dialog = page.getByRole("dialog", { name: "配置 LLM 并发上限" });
+	await expect(dialog).toBeVisible();
+	const input = dialog.getByLabel("最大并发数");
+	await expect(input).toHaveValue("2");
+	await input.fill("0");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog.getByText("并发上限必须是大于 0 的整数。")).toBeVisible();
+	await input.fill("5");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog).toHaveCount(0);
+	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
+});
+
+test("admin refreshes llm scheduler via shared sse stream", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page, {
+		emitLlmSchedulerEvents: true,
+		delayRules: [
+			{
+				pathname: "/api/admin/jobs/llm/status",
+				afterCount: 1,
+				times: 1,
+				delayMs: 1200,
+			},
+		],
+	});
+
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "LLM调度" }).click();
+	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
+});
+
+test("admin can update translation worker counts from settings dialog", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
+
+	const settingsButton = page.getByRole("button", {
+		name: "配置翻译 worker 数量",
+	});
+	await expect(settingsButton).toBeVisible();
+	await page.getByRole("tab", { name: "任务记录" }).click();
+	await expect(settingsButton).toBeVisible();
+	await settingsButton.click();
+
+	const dialog = page.getByRole("dialog", { name: "配置翻译 worker 数量" });
+	await expect(dialog).toBeVisible();
+	const generalInput = dialog.getByLabel("通用 worker 数量");
+	const dedicatedInput = dialog.getByLabel("用户专用 worker 数量");
+	await expect(generalInput).toHaveValue("3");
+	await expect(dedicatedInput).toHaveValue("1");
+	await generalInput.fill("0");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(
+		dialog.getByText("通用 worker 数量必须是大于 0 的整数。"),
+	).toBeVisible();
+	await generalInput.fill("5");
+	await dedicatedInput.fill("2");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+	await expect(dialog).toHaveCount(0);
+	await expect(
+		page.getByText(
+			"目标配置为 5 个通用 worker 与 2 个用户专用 worker；下方展示实时槽位状态。",
+		),
+	).toBeVisible();
+	await expect(page.getByText("W7 · 用户专用")).toBeVisible();
+});
+
+test("translation worker drawer closes when resize removes the selected worker", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
+
+	await page.getByRole("button", { name: "打开 W3 · 通用 详情" }).click();
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toBeVisible();
+	await expect(page.getByText("translation-worker-3")).toBeVisible();
+
+	await page.evaluate(() => {
+		const button = document.querySelector<HTMLButtonElement>(
+			'button[aria-label="配置翻译 worker 数量"]',
+		);
+		if (!button) {
+			throw new Error("translation settings button not found");
+		}
+		button.click();
+	});
+	const dialog = page.getByRole("dialog", { name: "配置翻译 worker 数量" });
+	await dialog.getByLabel("通用 worker 数量").fill("2");
+	await dialog.getByLabel("用户专用 worker 数量").fill("1");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+
+	await expect(dialog).toHaveCount(0);
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toHaveCount(
+		0,
+	);
+	await expect(page.getByText("W3 · 通用")).toHaveCount(0);
 });
 
 test("admin refreshes translation scheduler via shared sse stream", async ({

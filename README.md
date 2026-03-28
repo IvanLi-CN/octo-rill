@@ -113,6 +113,7 @@ Then open `http://127.0.0.1:50885`.
 - For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
 - 模型输入上限会按内置目录解析，并固定每天同步外部目录（OpenRouter + LiteLLM）；若设置 `AI_MODEL_CONTEXT_LIMIT`，会以手动值优先。
 - LLM 调度默认只允许单进程内 `1` 个上游请求并行；如需提速，可通过 `AI_MAX_CONCURRENCY` 提高 permit 并发上限。
+- 管理员任务中心支持在线调整 LLM 并发上限与翻译 worker 数量；首次启动时这些值以 env/default 为种子，管理员保存后会持久化到数据库，并在后续重启时继续生效。
 - Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
 - 日报落库前会做 `release_id` 内链完整性校验与补齐，按查询参数做精确匹配（避免 `12/123` 前缀误判）。
 

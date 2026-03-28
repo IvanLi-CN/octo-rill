@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -78,12 +78,36 @@ pub struct LlmSchedulerRuntimeStatus {
 
 #[derive(Debug)]
 pub struct LlmScheduler {
-    max_concurrency: usize,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    max_concurrency: AtomicUsize,
+    gate: Mutex<SchedulerGateState>,
     status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
 }
+
+#[derive(Debug, Default)]
+struct SchedulerGateState {
+    waiters: VecDeque<Arc<SchedulerQueuedWaiterState>>,
+}
+
+#[derive(Debug)]
+struct SchedulerQueuedWaiterState {
+    notify: tokio::sync::Notify,
+    state: AtomicUsize,
+}
+
+impl SchedulerQueuedWaiterState {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            state: AtomicUsize::new(SCHEDULER_WAITER_WAITING),
+        }
+    }
+}
+
+const SCHEDULER_WAITER_WAITING: usize = 0;
+const SCHEDULER_WAITER_GRANTED: usize = 1;
+const SCHEDULER_WAITER_CANCELED: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct InputBudget {
@@ -99,12 +123,23 @@ fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
 impl LlmScheduler {
     pub fn new(max_concurrency: usize) -> Self {
         Self {
-            max_concurrency: max_concurrency.max(1),
-            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+            max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
+            gate: Mutex::new(SchedulerGateState::default()),
             status_overrides: tokio::sync::RwLock::new(HashMap::new()),
             waiting_calls: AtomicUsize::new(0),
             in_flight_calls: AtomicUsize::new(0),
         }
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_max_concurrency(&self, max_concurrency: usize) {
+        self.max_concurrency
+            .store(max_concurrency.max(1), Ordering::Relaxed);
+        let mut gate = self.gate.lock().expect("llm scheduler gate lock poisoned");
+        self.schedule_waiters_locked(&mut gate);
     }
 
     pub(crate) async fn admin_overrides(&self) -> HashMap<String, LlmCallAdminOverride> {
@@ -123,36 +158,87 @@ impl LlmScheduler {
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
+        let max_concurrency = self.max_concurrency();
+        let in_flight_calls = self.in_flight_calls.load(Ordering::Relaxed);
         LlmSchedulerRuntimeStatus {
-            max_concurrency: i64::try_from(self.max_concurrency).unwrap_or(i64::MAX),
-            available_slots: i64::try_from(self.semaphore.available_permits()).unwrap_or(i64::MAX),
+            max_concurrency: i64::try_from(max_concurrency).unwrap_or(i64::MAX),
+            available_slots: i64::try_from(max_concurrency.saturating_sub(in_flight_calls))
+                .unwrap_or(i64::MAX),
             waiting_calls: i64::try_from(self.waiting_calls.load(Ordering::Relaxed))
                 .unwrap_or(i64::MAX),
-            in_flight_calls: i64::try_from(self.in_flight_calls.load(Ordering::Relaxed))
-                .unwrap_or(i64::MAX),
+            in_flight_calls: i64::try_from(in_flight_calls).unwrap_or(i64::MAX),
         }
     }
 
     async fn acquire_slot(self: &Arc<Self>) -> (i64, SchedulerInFlightGuard) {
         let queue_started_at = Instant::now();
-        let waiting_guard = SchedulerWaitingGuard::new(&self.waiting_calls);
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("llm scheduler semaphore should stay open");
-        drop(waiting_guard);
+        let mut waiting_guard = None;
+        let queued_waiter = {
+            let mut gate = self.gate.lock().expect("llm scheduler gate lock poisoned");
+            self.prune_canceled_waiters_locked(&mut gate);
+            if gate.waiters.is_empty()
+                && self.in_flight_calls.load(Ordering::Relaxed) < self.max_concurrency()
+            {
+                self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+                None
+            } else {
+                waiting_guard = Some(SchedulerWaitingGuard::new(&self.waiting_calls));
+                let state = Arc::new(SchedulerQueuedWaiterState::new());
+                gate.waiters.push_back(Arc::clone(&state));
+                Some(SchedulerQueuedWaiter::new(self, state))
+            }
+        };
 
-        self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(mut queued_waiter) = queued_waiter {
+            queued_waiter.state.notify.notified().await;
+            queued_waiter.complete();
+        }
+
+        drop(waiting_guard);
         let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
         (
             wait_ms,
             SchedulerInFlightGuard {
                 scheduler: Arc::clone(self),
-                permit: Some(permit),
+                slot_released: false,
             },
         )
+    }
+
+    fn prune_canceled_waiters_locked(&self, gate: &mut SchedulerGateState) {
+        gate.waiters
+            .retain(|waiter| waiter.state.load(Ordering::Acquire) != SCHEDULER_WAITER_CANCELED);
+    }
+
+    fn schedule_waiters_locked(&self, gate: &mut SchedulerGateState) {
+        self.prune_canceled_waiters_locked(gate);
+        while self.in_flight_calls.load(Ordering::Relaxed) < self.max_concurrency() {
+            let Some(waiter) = gate.waiters.pop_front() else {
+                break;
+            };
+            if waiter
+                .state
+                .compare_exchange(
+                    SCHEDULER_WAITER_WAITING,
+                    SCHEDULER_WAITER_GRANTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+            waiter.notify.notify_one();
+        }
+    }
+
+    fn release_reserved_slot(&self) {
+        let mut gate = self.gate.lock().expect("llm scheduler gate lock poisoned");
+        if self.in_flight_calls.load(Ordering::Relaxed) > 0 {
+            self.in_flight_calls.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.schedule_waiters_locked(&mut gate);
     }
 }
 
@@ -1139,20 +1225,64 @@ fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
 
 struct SchedulerInFlightGuard {
     scheduler: Arc<LlmScheduler>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    slot_released: bool,
 }
 
 impl SchedulerInFlightGuard {
     fn release_permit(&mut self) {
-        self.permit.take();
+        if self.slot_released {
+            return;
+        }
+        self.slot_released = true;
+        self.scheduler.release_reserved_slot();
     }
 }
 
 impl Drop for SchedulerInFlightGuard {
     fn drop(&mut self) {
-        self.scheduler
-            .in_flight_calls
-            .fetch_sub(1, Ordering::Relaxed);
+        if self.slot_released {
+            return;
+        }
+        self.slot_released = true;
+        self.scheduler.release_reserved_slot();
+    }
+}
+
+struct SchedulerQueuedWaiter {
+    scheduler: Arc<LlmScheduler>,
+    state: Arc<SchedulerQueuedWaiterState>,
+    completed: bool,
+}
+
+impl SchedulerQueuedWaiter {
+    fn new(scheduler: &Arc<LlmScheduler>, state: Arc<SchedulerQueuedWaiterState>) -> Self {
+        Self {
+            scheduler: Arc::clone(scheduler),
+            state,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SchedulerQueuedWaiter {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        match self.state.state.compare_exchange(
+            SCHEDULER_WAITER_WAITING,
+            SCHEDULER_WAITER_CANCELED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SCHEDULER_WAITER_CANCELED) => {}
+            Err(SCHEDULER_WAITER_GRANTED) => self.scheduler.release_reserved_slot(),
+            Err(_) => {}
+        }
     }
 }
 
@@ -3217,6 +3347,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),
@@ -3293,6 +3428,68 @@ mod tests {
         assert_eq!(final_status.available_slots, 1);
         assert_eq!(final_status.in_flight_calls, 0);
         assert_eq!(final_status.waiting_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_resize_wakes_queued_call_without_releasing_active_slot() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, first_guard) = scheduler.acquire_slot().await;
+        let queued_scheduler = Arc::clone(&scheduler);
+        let queued = tokio::spawn(async move { queued_scheduler.acquire_slot().await });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        scheduler.set_max_concurrency(2).await;
+
+        let (queued_wait_ms, second_guard) = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("queued acquire should be notified after resize")
+            .expect("queued acquire should finish");
+
+        assert!(queued_wait_ms >= 0);
+        let status = scheduler.runtime_status();
+        assert_eq!(status.max_concurrency, 2);
+        assert_eq!(status.available_slots, 0);
+        assert_eq!(status.in_flight_calls, 2);
+        assert_eq!(status.waiting_calls, 0);
+
+        drop(second_guard);
+        drop(first_guard);
+    }
+
+    #[tokio::test]
+    async fn llm_scheduler_release_keeps_older_waiter_ahead_of_new_arrival() {
+        let scheduler = Arc::new(LlmScheduler::new(1));
+        let (_wait_ms, first_guard) = scheduler.acquire_slot().await;
+        let queued_scheduler = Arc::clone(&scheduler);
+        let (queued_acquired_tx, queued_acquired_rx) = tokio::sync::oneshot::channel();
+        let (release_queued_tx, release_queued_rx) = tokio::sync::oneshot::channel();
+        let queued = tokio::spawn(async move {
+            let (_queued_wait_ms, queued_guard) = queued_scheduler.acquire_slot().await;
+            let _ = queued_acquired_tx.send(());
+            let _ = release_queued_rx.await;
+            drop(queued_guard);
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(scheduler.runtime_status().waiting_calls, 1);
+
+        drop(first_guard);
+
+        tokio::spawn(async move {
+            let _ = queued_acquired_rx.await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let _ = release_queued_tx.send(());
+        });
+
+        let newcomer_started_at = Instant::now();
+        let (_newcomer_wait_ms, newcomer_guard) = scheduler.acquire_slot().await;
+        assert!(
+            newcomer_started_at.elapsed() >= Duration::from_millis(20),
+            "older queued waiter should receive the freed slot first"
+        );
+
+        drop(newcomer_guard);
+        queued.await.expect("queued waiter should finish");
     }
 
     #[tokio::test]

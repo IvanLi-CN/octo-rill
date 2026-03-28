@@ -907,6 +907,17 @@ struct AdminLlmCallEventStreamItem {
     created_at: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminLlmSchedulerEventStreamItem {
+    event_id: String,
+    max_concurrency: i64,
+    available_slots: i64,
+    waiting_calls: i64,
+    in_flight_calls: i64,
+    event_type: String,
+    created_at: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TranslationStreamCursor {
     updated_at: String,
@@ -934,6 +945,34 @@ struct TranslationStreamRow {
     id: String,
     status: String,
     updated_at: String,
+}
+
+fn next_llm_scheduler_stream_event(
+    last_max_concurrency: &mut i64,
+    runtime_status: ai::LlmSchedulerRuntimeStatus,
+    created_at: DateTime<Utc>,
+) -> Option<AdminLlmSchedulerEventStreamItem> {
+    if runtime_status.max_concurrency == *last_max_concurrency {
+        return None;
+    }
+    *last_max_concurrency = runtime_status.max_concurrency;
+    let created_at = created_at.to_rfc3339();
+    Some(AdminLlmSchedulerEventStreamItem {
+        event_id: format!(
+            "{}:{}:{}:{}:{}",
+            created_at,
+            runtime_status.max_concurrency,
+            runtime_status.available_slots,
+            runtime_status.waiting_calls,
+            runtime_status.in_flight_calls
+        ),
+        max_concurrency: runtime_status.max_concurrency,
+        available_slots: runtime_status.available_slots,
+        waiting_calls: runtime_status.waiting_calls,
+        in_flight_calls: runtime_status.in_flight_calls,
+        event_type: "llm.scheduler.updated".to_owned(),
+        created_at,
+    })
 }
 
 async fn load_translation_stream_cursor(
@@ -1020,6 +1059,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
         )
         .await
         .unwrap_or_default();
+        let mut last_llm_scheduler_max_concurrency = state.llm_scheduler.runtime_status().max_concurrency;
         let mut last_translation_worker_updated_at = HashMap::<String, String>::new();
 
         // Emit one lightweight frame immediately so proxies/browsers can
@@ -1112,6 +1152,20 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                 );
             }
 
+            if let Some(payload) = next_llm_scheduler_stream_event(
+                &mut last_llm_scheduler_max_concurrency,
+                state.llm_scheduler.runtime_status(),
+                Utc::now(),
+            ) {
+                let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
+                yield Ok::<Event, Infallible>(
+                    Event::default()
+                        .id(format!("llm-scheduler-{}", payload.event_id))
+                        .event("llm.scheduler")
+                        .data(data),
+                );
+            }
+
             let request_rows = load_translation_stream_rows(
                 &state.pool,
                 "translation_requests",
@@ -1174,7 +1228,7 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
                 );
             }
 
-            for worker in translations::translation_worker_runtime_statuses().await {
+            for worker in translations::translation_worker_runtime_statuses(state.as_ref()).await {
                 let last_seen = last_translation_worker_updated_at
                     .get(worker.worker_id.as_str())
                     .cloned();
@@ -1883,7 +1937,8 @@ mod tests {
         STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_RELEASES,
         TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
         current_subscription_schedule_key, is_scheduled_task_type, load_translation_stream_cursor,
-        load_translation_stream_rows, recover_runtime_state, recover_runtime_state_on_startup,
+        load_translation_stream_rows, next_llm_scheduler_stream_event, recover_runtime_state,
+        recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
     use sqlx::{
@@ -1924,6 +1979,53 @@ mod tests {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
         assert!(!is_scheduled_task_type("translate.release"));
+    }
+
+    #[test]
+    fn next_llm_scheduler_stream_event_only_emits_when_max_concurrency_changes() {
+        let changed_at = Utc
+            .with_ymd_and_hms(2026, 3, 28, 10, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let unchanged_at = Utc
+            .with_ymd_and_hms(2026, 3, 28, 10, 1, 0)
+            .single()
+            .expect("valid datetime");
+        let mut last_max_concurrency = 2_i64;
+
+        assert!(
+            next_llm_scheduler_stream_event(
+                &mut last_max_concurrency,
+                crate::ai::LlmSchedulerRuntimeStatus {
+                    max_concurrency: 2,
+                    available_slots: 0,
+                    waiting_calls: 3,
+                    in_flight_calls: 2,
+                },
+                unchanged_at,
+            )
+            .is_none()
+        );
+
+        let payload = next_llm_scheduler_stream_event(
+            &mut last_max_concurrency,
+            crate::ai::LlmSchedulerRuntimeStatus {
+                max_concurrency: 5,
+                available_slots: 3,
+                waiting_calls: 1,
+                in_flight_calls: 2,
+            },
+            changed_at,
+        )
+        .expect("scheduler change should emit event");
+
+        assert_eq!(last_max_concurrency, 5);
+        assert_eq!(payload.max_concurrency, 5);
+        assert_eq!(payload.available_slots, 3);
+        assert_eq!(payload.waiting_calls, 1);
+        assert_eq!(payload.in_flight_calls, 2);
+        assert_eq!(payload.event_type, "llm.scheduler.updated");
+        assert_eq!(payload.created_at, "2026-03-28T10:00:00+00:00");
     }
 
     #[tokio::test]
@@ -2346,6 +2448,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),
