@@ -1278,12 +1278,21 @@ async fn load_admin_translation_status_response(
     let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let runtime_config = state.translation_scheduler.desired_config().await;
     let workers = translation_worker_runtime_statuses(state).await;
-    let general_worker_concurrency =
-        i64::try_from(runtime_config.general_worker_concurrency).unwrap_or(i64::MAX);
-    let dedicated_worker_concurrency =
-        i64::try_from(runtime_config.dedicated_worker_concurrency).unwrap_or(i64::MAX);
-    let worker_concurrency =
-        i64::try_from(runtime_config.total_worker_concurrency()).unwrap_or(i64::MAX);
+    let general_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "general")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let dedicated_worker_concurrency = i64::try_from(
+        workers
+            .iter()
+            .filter(|worker| worker.worker_kind == "user_dedicated")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let worker_concurrency = i64::try_from(workers.len()).unwrap_or(i64::MAX);
     let idle_workers = i64::try_from(
         workers
             .iter()
@@ -1364,9 +1373,14 @@ async fn load_admin_translation_status_response(
         general_worker_concurrency,
         dedicated_worker_concurrency,
         worker_concurrency,
-        target_general_worker_concurrency: general_worker_concurrency,
-        target_dedicated_worker_concurrency: dedicated_worker_concurrency,
-        target_worker_concurrency: worker_concurrency,
+        target_general_worker_concurrency: i64::try_from(runtime_config.general_worker_concurrency)
+            .unwrap_or(i64::MAX),
+        target_dedicated_worker_concurrency: i64::try_from(
+            runtime_config.dedicated_worker_concurrency,
+        )
+        .unwrap_or(i64::MAX),
+        target_worker_concurrency: i64::try_from(runtime_config.total_worker_concurrency())
+            .unwrap_or(i64::MAX),
         idle_workers,
         busy_workers,
         workers,
@@ -5585,13 +5599,16 @@ mod tests {
             .await
             .expect("load translation status");
 
-        assert_eq!(status.general_worker_concurrency, 2);
+        assert_eq!(status.general_worker_concurrency, 3);
         assert_eq!(
             status.dedicated_worker_concurrency,
             i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
         );
-        assert_eq!(status.worker_concurrency, 3);
-        assert_eq!(status.idle_workers + status.busy_workers, 4);
+        assert_eq!(status.worker_concurrency, 4);
+        assert_eq!(
+            status.idle_workers + status.busy_workers,
+            status.worker_concurrency
+        );
         assert_eq!(status.target_general_worker_concurrency, 2);
         assert_eq!(
             status.target_dedicated_worker_concurrency,
