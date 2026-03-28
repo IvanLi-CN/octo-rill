@@ -1474,10 +1474,10 @@ test("admin jobs tabs are URL-driven and support deep links plus history", async
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
 	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
-	await page.goBack();
+	await page.goBack({ waitUntil: "commit" });
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=queue$/);
 	await expect(page.getByRole("heading", { name: "需求队列" })).toBeVisible();
-	await page.goForward();
+	await page.goForward({ waitUntil: "commit" });
 	await expect(page).toHaveURL(/\/admin\/jobs\/translations\?view=history$/);
 	await expect(page.getByRole("heading", { name: "任务记录" })).toBeVisible();
 
@@ -1867,6 +1867,38 @@ test("admin can update translation worker counts from settings dialog", async ({
 		),
 	).toBeVisible();
 	await expect(page.getByText("W7 · 用户专用")).toBeVisible();
+});
+
+test("translation worker drawer closes when resize removes the selected worker", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs");
+	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
+
+	await page.getByRole("button", { name: "打开 W3 · 通用 详情" }).click();
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toBeVisible();
+	await expect(page.getByText("translation-worker-3")).toBeVisible();
+
+	await page.evaluate(() => {
+		const button = document.querySelector<HTMLButtonElement>(
+			'button[aria-label="配置翻译 worker 数量"]',
+		);
+		if (!button) {
+			throw new Error("translation settings button not found");
+		}
+		button.click();
+	});
+	const dialog = page.getByRole("dialog", { name: "配置翻译 worker 数量" });
+	await dialog.getByLabel("通用 worker 数量").fill("2");
+	await dialog.getByLabel("用户专用 worker 数量").fill("1");
+	await dialog.getByRole("button", { name: "保存设置" }).click();
+
+	await expect(dialog).toHaveCount(0);
+	await expect(page.getByRole("heading", { name: "工作者详情" })).toHaveCount(
+		0,
+	);
+	await expect(page.getByText("W3 · 通用")).toHaveCount(0);
 });
 
 test("admin refreshes translation scheduler via shared sse stream", async ({
