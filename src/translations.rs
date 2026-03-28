@@ -668,25 +668,10 @@ impl TranslationSchedulerController {
     }
 
     pub async fn runtime_statuses(&self) -> Vec<AdminTranslationWorkerStatus> {
-        let desired_profiles = translation_worker_profiles(self.desired_config().await);
-        let desired_order = desired_profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| (profile.worker_id.clone(), index))
-            .collect::<HashMap<_, _>>();
         let mut runtime = self.runtime.read().await.clone();
         runtime.sort_by(|left, right| {
-            let left_order = desired_order
-                .get(&left.worker_id)
-                .copied()
-                .unwrap_or(usize::MAX);
-            let right_order = desired_order
-                .get(&right.worker_id)
-                .copied()
-                .unwrap_or(usize::MAX);
-            left_order
-                .cmp(&right_order)
-                .then_with(|| left.worker_slot.cmp(&right.worker_slot))
+            left.worker_slot
+                .cmp(&right.worker_slot)
                 .then_with(|| left.worker_id.cmp(&right.worker_id))
         });
         runtime
@@ -741,17 +726,12 @@ impl TranslationSchedulerController {
                 .iter_mut()
                 .find(|entry| entry.worker_id == profile.worker_id)
             {
-                entry.worker_slot = profile.worker_slot;
                 entry.worker_kind = profile.worker_kind.clone();
             } else {
                 runtime.push(TranslationWorkerRuntimeState::idle(profile));
             }
         }
-        runtime.sort_by(|left, right| {
-            left.worker_slot
-                .cmp(&right.worker_slot)
-                .then_with(|| left.worker_id.cmp(&right.worker_id))
-        });
+        reconcile_worker_runtime_slots(&mut runtime, config);
         config
     }
 
@@ -815,11 +795,8 @@ impl TranslationSchedulerController {
         &self,
         worker_id: &str,
     ) -> Option<TranslationWorkerProfile> {
-        if let Some(profile) = self.profile_by_worker_id(worker_id).await {
-            return Some(profile);
-        }
-
-        self.runtime
+        if let Some(profile) = self
+            .runtime
             .read()
             .await
             .iter()
@@ -831,6 +808,11 @@ impl TranslationSchedulerController {
                     entry.worker_slot,
                 )
             })
+        {
+            return Some(profile);
+        }
+
+        self.profile_by_worker_id(worker_id).await
     }
 
     async fn profile_by_worker_id(&self, worker_id: &str) -> Option<TranslationWorkerProfile> {
@@ -844,10 +826,10 @@ impl TranslationSchedulerController {
     }
 
     async fn remove_worker_runtime(&self, worker_id: &str) {
-        self.runtime
-            .write()
-            .await
-            .retain(|entry| entry.worker_id != worker_id);
+        let desired_config = self.desired_config().await;
+        let mut runtime = self.runtime.write().await;
+        runtime.retain(|entry| entry.worker_id != worker_id);
+        reconcile_worker_runtime_slots(&mut runtime, desired_config);
     }
 
     async fn update_worker_runtime(
@@ -855,6 +837,7 @@ impl TranslationSchedulerController {
         profile: &TranslationWorkerProfile,
         update: TranslationWorkerRuntimeUpdate<'_>,
     ) {
+        let desired_config = self.desired_config().await;
         let mut runtime = self.runtime.write().await;
         let entry = if let Some(index) = runtime
             .iter()
@@ -892,6 +875,7 @@ impl TranslationSchedulerController {
         entry.trigger_reason = next_trigger_reason;
         entry.error_text = next_error_text;
         entry.updated_at = Utc::now().to_rfc3339();
+        reconcile_worker_runtime_slots(&mut runtime, desired_config);
     }
 }
 
@@ -925,6 +909,66 @@ fn translation_worker_profile_from_runtime(
         worker_slot,
         worker_kind: worker_kind.to_owned(),
     }
+}
+
+fn reconcile_worker_runtime_slots(
+    runtime: &mut [TranslationWorkerRuntimeState],
+    config: TranslationRuntimeConfig,
+) {
+    let desired_profiles = translation_worker_profiles(config);
+    let desired_profiles_by_worker_id = desired_profiles
+        .iter()
+        .map(|profile| (profile.worker_id.as_str(), profile))
+        .collect::<HashMap<_, _>>();
+    let mut occupied_slots = HashSet::new();
+
+    for entry in runtime.iter_mut() {
+        if let Some(profile) = desired_profiles_by_worker_id.get(entry.worker_id.as_str()) {
+            entry.worker_kind = profile.worker_kind.clone();
+        }
+        if entry.current_batch_id.is_some() {
+            occupied_slots.insert(entry.worker_slot);
+        }
+    }
+
+    for profile in desired_profiles {
+        let Some(entry) = runtime
+            .iter_mut()
+            .find(|entry| entry.worker_id == profile.worker_id)
+        else {
+            continue;
+        };
+
+        entry.worker_kind = profile.worker_kind.clone();
+        if entry.current_batch_id.is_some() {
+            continue;
+        }
+
+        let next_slot = if !occupied_slots.contains(&profile.worker_slot) {
+            profile.worker_slot
+        } else if !occupied_slots.contains(&entry.worker_slot) {
+            entry.worker_slot
+        } else {
+            next_available_worker_slot(&occupied_slots)
+        };
+
+        entry.worker_slot = next_slot;
+        occupied_slots.insert(next_slot);
+    }
+
+    runtime.sort_by(|left, right| {
+        left.worker_slot
+            .cmp(&right.worker_slot)
+            .then_with(|| left.worker_id.cmp(&right.worker_id))
+    });
+}
+
+fn next_available_worker_slot(occupied_slots: &HashSet<i64>) -> i64 {
+    let mut next_slot = 1_i64;
+    while occupied_slots.contains(&next_slot) {
+        next_slot += 1;
+    }
+    next_slot
 }
 
 fn translation_worker_id(worker_kind: &str, worker_index: usize) -> String {
@@ -2004,8 +2048,23 @@ async fn run_translation_scheduler_once(
     }
 
     let Some(batch) = claim_next_batch(state, worker.clone()).await? else {
-        update_translation_worker_runtime(state, &worker, TranslationWorkerRuntimeUpdate::idle())
+        if state
+            .translation_scheduler
+            .worker_is_desired(worker.worker_id.as_str())
+            .await
+        {
+            update_translation_worker_runtime(
+                state,
+                &worker,
+                TranslationWorkerRuntimeUpdate::idle(),
+            )
             .await;
+        } else {
+            state
+                .translation_scheduler
+                .remove_worker_runtime(worker.worker_id.as_str())
+                .await;
+        }
         return Ok(());
     };
     execute_claimed_batch(state, batch).await
@@ -2016,6 +2075,13 @@ async fn claim_next_batch(
     worker: TranslationWorkerProfile,
 ) -> Result<Option<ClaimedBatch>> {
     let _claim_guard = translation_batch_claim_lock().lock().await;
+    if !state
+        .translation_scheduler
+        .worker_is_desired(worker.worker_id.as_str())
+        .await
+    {
+        return Ok(None);
+    }
     let claim_origin_case = claim_origin_case_sql();
     let first_query = if worker.worker_kind == "user_dedicated" {
         format!(
@@ -5048,6 +5114,22 @@ mod tests {
         .await
         .expect("mark work item running");
 
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::running(
+                "batch-runtime-refresh-resized",
+                1,
+                1,
+                "deadline_due",
+            ),
+        )
+        .await;
+
         let resized_general_concurrency = DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY
             .saturating_sub(1)
             .max(1);
@@ -5071,7 +5153,7 @@ mod tests {
             .find(|entry| entry.worker_id == worker_id)
             .expect("worker exists");
 
-        assert_eq!(worker.worker_slot, expected_slot);
+        assert_eq!(worker.worker_slot, test_dedicated_worker_slot());
         assert_eq!(worker.status, "running");
         assert_eq!(
             worker.current_batch_id.as_deref(),
@@ -5079,6 +5161,97 @@ mod tests {
         );
         assert_eq!(worker.request_count, 2);
         assert_eq!(worker.work_item_count, 1);
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &translation_worker_profile_from_runtime(
+                worker_id.as_str(),
+                "user_dedicated",
+                test_dedicated_worker_slot(),
+            ),
+            TranslationWorkerRuntimeUpdate::idle(),
+        )
+        .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let worker = workers
+            .iter()
+            .find(|entry| entry.worker_id == worker_id)
+            .expect("worker exists after idle");
+
+        assert_eq!(worker.worker_slot, expected_slot);
+        assert_eq!(worker.status, "idle");
+        assert_eq!(worker.current_batch_id, None);
+    }
+
+    #[tokio::test]
+    async fn runtime_resize_keeps_unique_slots_for_retained_running_workers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        reset_translation_worker_runtime_for_tests(state.as_ref()).await;
+
+        update_translation_worker_runtime(
+            state.as_ref(),
+            &test_worker_profile(3, "general"),
+            TranslationWorkerRuntimeUpdate::running("batch-general-3", 1, 1, "deadline"),
+        )
+        .await;
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        let workers = translation_worker_runtime_statuses(state.as_ref()).await;
+        let slots = workers
+            .iter()
+            .map(|worker| worker.worker_slot)
+            .collect::<Vec<_>>();
+        let dedicated = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("user_dedicated", 1))
+            .expect("dedicated worker exists");
+        let retained_general = workers
+            .iter()
+            .find(|worker| worker.worker_id == translation_worker_id("general", 3))
+            .expect("retained worker exists");
+
+        assert_eq!(slots, vec![1, 2, 3, 4]);
+        assert_eq!(retained_general.worker_slot, 3);
+        assert_eq!(retained_general.status, "running");
+        assert_eq!(dedicated.worker_slot, 4);
+    }
+
+    #[tokio::test]
+    async fn claim_next_batch_skips_removed_worker_after_runtime_resize() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        seed_user(&state.pool, 1, "octo").await;
+
+        create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("claim-removed-worker"),
+        )
+        .await
+        .expect("request created");
+
+        state
+            .translation_scheduler
+            .sync_runtime_with_config(TranslationRuntimeConfig::new(
+                2,
+                DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+            ))
+            .await;
+
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(3, "general"))
+            .await
+            .expect("claim result");
+        assert!(batch.is_none());
     }
 
     #[tokio::test]
