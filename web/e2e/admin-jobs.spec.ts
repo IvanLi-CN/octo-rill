@@ -1922,7 +1922,7 @@ test("admin can update translation worker counts from settings dialog", async ({
 	await expect(dialog).toHaveCount(0);
 	await expect(
 		page.getByText(
-			"当前展示 5 个通用 worker 与 2 个用户专用 worker 的实时槽位状态。",
+			"目标配置为 5 个通用 worker 与 2 个用户专用 worker；下方展示实时槽位状态。",
 		),
 	).toBeVisible();
 	await expect(page.getByText("W7 · 用户专用")).toBeVisible();
