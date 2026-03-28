@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
 
-use crate::{ai, jobs, local_id, sync};
+use crate::{admin_runtime, ai, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
@@ -2174,6 +2174,11 @@ pub struct AdminLlmSchedulerStatusResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AdminLlmRuntimeConfigUpdateRequest {
+    max_concurrency: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AdminLlmCallsQuery {
     status: Option<String>,
     source: Option<String>,
@@ -2329,8 +2334,35 @@ pub async fn admin_get_llm_scheduler_status(
     session: Session,
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
-    let runtime = state.llm_scheduler.runtime_status();
+    Ok(Json(
+        load_admin_llm_scheduler_status_response(state.as_ref()).await?,
+    ))
+}
 
+pub async fn admin_patch_llm_runtime_config(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<AdminLlmRuntimeConfigUpdateRequest>,
+) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
+    let snapshot = admin_runtime::update_llm_runtime_settings(&state.pool, max_concurrency)
+        .await
+        .map_err(ApiError::internal)?;
+    state
+        .llm_scheduler
+        .set_max_concurrency(snapshot.llm_max_concurrency)
+        .await;
+
+    Ok(Json(
+        load_admin_llm_scheduler_status_response(state.as_ref()).await?,
+    ))
+}
+
+async fn load_admin_llm_scheduler_status_response(
+    state: &AppState,
+) -> Result<AdminLlmSchedulerStatusResponse, ApiError> {
+    let runtime = state.llm_scheduler.runtime_status();
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let (calls_24h, failed_24h, avg_wait_raw, avg_duration_raw) =
         sqlx::query_as::<_, (i64, i64, Option<f64>, Option<f64>)>(
@@ -2371,7 +2403,7 @@ pub async fn admin_get_llm_scheduler_status(
     .await
     .map_err(ApiError::internal)?;
 
-    Ok(Json(AdminLlmSchedulerStatusResponse {
+    Ok(AdminLlmSchedulerStatusResponse {
         scheduler_enabled: state.config.ai.is_some(),
         max_concurrency: runtime.max_concurrency,
         available_slots: runtime.available_slots,
@@ -2383,7 +2415,18 @@ pub async fn admin_get_llm_scheduler_status(
         avg_duration_ms_24h: avg_duration_raw.map(|value| value.round() as i64),
         last_success_at,
         last_failure_at,
-    }))
+    })
+}
+
+fn parse_positive_admin_concurrency(value: i64, field: &str) -> Result<usize, ApiError> {
+    let parsed = usize::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer"
+        )));
+    }
+    Ok(parsed)
 }
 
 struct AdminLlmCallListScope<'a> {
@@ -8017,6 +8060,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),

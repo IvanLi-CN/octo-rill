@@ -1,3 +1,4 @@
+mod admin_runtime;
 mod ai;
 mod api;
 mod auth;

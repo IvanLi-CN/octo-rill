@@ -78,8 +78,9 @@ pub struct LlmSchedulerRuntimeStatus {
 
 #[derive(Debug)]
 pub struct LlmScheduler {
-    max_concurrency: usize,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    max_concurrency: AtomicUsize,
+    gate: tokio::sync::Mutex<()>,
+    notify: tokio::sync::Notify,
     status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
@@ -99,12 +100,23 @@ fn model_limit_catalog() -> &'static tokio::sync::RwLock<ModelLimitCatalog> {
 impl LlmScheduler {
     pub fn new(max_concurrency: usize) -> Self {
         Self {
-            max_concurrency: max_concurrency.max(1),
-            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrency.max(1))),
+            max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
+            gate: tokio::sync::Mutex::new(()),
+            notify: tokio::sync::Notify::new(),
             status_overrides: tokio::sync::RwLock::new(HashMap::new()),
             waiting_calls: AtomicUsize::new(0),
             in_flight_calls: AtomicUsize::new(0),
         }
+    }
+
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency.load(Ordering::Relaxed)
+    }
+
+    pub async fn set_max_concurrency(&self, max_concurrency: usize) {
+        self.max_concurrency
+            .store(max_concurrency.max(1), Ordering::Relaxed);
+        self.notify.notify_waiters();
     }
 
     pub(crate) async fn admin_overrides(&self) -> HashMap<String, LlmCallAdminOverride> {
@@ -123,36 +135,52 @@ impl LlmScheduler {
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
+        let max_concurrency = self.max_concurrency();
+        let in_flight_calls = self.in_flight_calls.load(Ordering::Relaxed);
         LlmSchedulerRuntimeStatus {
-            max_concurrency: i64::try_from(self.max_concurrency).unwrap_or(i64::MAX),
-            available_slots: i64::try_from(self.semaphore.available_permits()).unwrap_or(i64::MAX),
+            max_concurrency: i64::try_from(max_concurrency).unwrap_or(i64::MAX),
+            available_slots: i64::try_from(max_concurrency.saturating_sub(in_flight_calls))
+                .unwrap_or(i64::MAX),
             waiting_calls: i64::try_from(self.waiting_calls.load(Ordering::Relaxed))
                 .unwrap_or(i64::MAX),
-            in_flight_calls: i64::try_from(self.in_flight_calls.load(Ordering::Relaxed))
-                .unwrap_or(i64::MAX),
+            in_flight_calls: i64::try_from(in_flight_calls).unwrap_or(i64::MAX),
         }
     }
 
     async fn acquire_slot(self: &Arc<Self>) -> (i64, SchedulerInFlightGuard) {
         let queue_started_at = Instant::now();
-        let waiting_guard = SchedulerWaitingGuard::new(&self.waiting_calls);
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("llm scheduler semaphore should stay open");
-        drop(waiting_guard);
+        let mut waiting_guard = None;
+        loop {
+            let mut acquired = false;
+            {
+                let _gate = self.gate.lock().await;
+                let max_concurrency = self.max_concurrency();
+                let in_flight_calls = self.in_flight_calls.load(Ordering::Relaxed);
+                if in_flight_calls < max_concurrency {
+                    self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
+                    acquired = true;
+                }
+            }
 
-        self.in_flight_calls.fetch_add(1, Ordering::Relaxed);
-        let wait_ms = i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
-        (
-            wait_ms,
-            SchedulerInFlightGuard {
-                scheduler: Arc::clone(self),
-                permit: Some(permit),
-            },
-        )
+            if acquired {
+                drop(waiting_guard);
+                let wait_ms =
+                    i64::try_from(queue_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+                return (
+                    wait_ms,
+                    SchedulerInFlightGuard {
+                        scheduler: Arc::clone(self),
+                        slot_released: false,
+                    },
+                );
+            }
+
+            if waiting_guard.is_none() {
+                waiting_guard = Some(SchedulerWaitingGuard::new(&self.waiting_calls));
+            }
+
+            self.notify.notified().await;
+        }
     }
 }
 
@@ -1139,20 +1167,32 @@ fn next_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
 
 struct SchedulerInFlightGuard {
     scheduler: Arc<LlmScheduler>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    slot_released: bool,
 }
 
 impl SchedulerInFlightGuard {
     fn release_permit(&mut self) {
-        self.permit.take();
+        if self.slot_released {
+            return;
+        }
+        self.slot_released = true;
+        self.scheduler
+            .in_flight_calls
+            .fetch_sub(1, Ordering::Relaxed);
+        self.scheduler.notify.notify_waiters();
     }
 }
 
 impl Drop for SchedulerInFlightGuard {
     fn drop(&mut self) {
+        if self.slot_released {
+            return;
+        }
+        self.slot_released = true;
         self.scheduler
             .in_flight_calls
             .fetch_sub(1, Ordering::Relaxed);
+        self.scheduler.notify.notify_waiters();
     }
 }
 
@@ -3217,6 +3257,11 @@ mod tests {
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
+            translation_scheduler: Arc::new(
+                crate::translations::TranslationSchedulerController::new(
+                    crate::translations::TranslationRuntimeConfig::default(),
+                ),
+            ),
             config,
             pool,
             http: reqwest::Client::new(),

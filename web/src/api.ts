@@ -389,6 +389,9 @@ export type AdminLlmSchedulerStatusResponse = {
 	last_success_at: string | null;
 	last_failure_at: string | null;
 };
+export type AdminLlmRuntimeConfigUpdateRequest = {
+	max_concurrency: number;
+};
 export type AdminLlmCallItem = {
 	id: string;
 	status: string;
@@ -482,6 +485,14 @@ export async function apiPatchAdminScheduledSlot(
 }
 export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {
 	return apiGet<AdminLlmSchedulerStatusResponse>("/api/admin/jobs/llm/status");
+}
+export async function apiPatchAdminLlmRuntimeConfig(
+	body: AdminLlmRuntimeConfigUpdateRequest,
+): Promise<AdminLlmSchedulerStatusResponse> {
+	return apiPatchJson<AdminLlmSchedulerStatusResponse>(
+		"/api/admin/jobs/llm/runtime-config",
+		body,
+	);
 }
 export async function apiGetAdminLlmCalls(
 	params: URLSearchParams,
@@ -637,6 +648,8 @@ export type AdminTranslationStatusResponse = {
 	llm_enabled: boolean;
 	scan_interval_ms: number;
 	batch_token_threshold: number;
+	general_worker_concurrency: number;
+	dedicated_worker_concurrency: number;
 	worker_concurrency: number;
 	idle_workers: number;
 	busy_workers: number;
@@ -649,6 +662,10 @@ export type AdminTranslationStatusResponse = {
 	failed_batches_24h: number;
 	avg_wait_ms_24h: number | null;
 	last_batch_finished_at: string | null;
+};
+export type AdminTranslationRuntimeConfigUpdateRequest = {
+	general_worker_concurrency: number;
+	dedicated_worker_concurrency: number;
 };
 export type AdminTranslationRequestListItem = {
 	id: string;
@@ -750,6 +767,14 @@ export async function apiGetTranslationRequest(
 export async function apiGetAdminTranslationStatus(): Promise<AdminTranslationStatusResponse> {
 	return apiGet<AdminTranslationStatusResponse>(
 		"/api/admin/jobs/translations/status",
+	);
+}
+export async function apiPatchAdminTranslationRuntimeConfig(
+	body: AdminTranslationRuntimeConfigUpdateRequest,
+): Promise<AdminTranslationStatusResponse> {
+	return apiPatchJson<AdminTranslationStatusResponse>(
+		"/api/admin/jobs/translations/runtime-config",
+		body,
 	);
 }
 export async function apiGetAdminTranslationRequests(
