@@ -51,7 +51,7 @@
 - feed 自动翻译必须调用 `POST /api/translate/results`，由前端上报可见 release 与最后一个可见 release 之后的连续 10 条；当窗口条目数超过接口单次 `60` 条上限时，前端必须按连续顺序拆成多次调用。
 - `ai_translations` 必须升级为带状态的结果真相源；同一用户、同一实体、同一语言在任意时刻只保留 1 条当前结果记录，并显式表达 `queued/running/ready/disabled/missing/error`。
 - 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
-- 后端必须保证同一用户、同一 release、同一 source hash 的重复 resolve 不会新增重复 `translation_work_items`，且不会因为轮询新增重复 `translation_requests`。
+- 后端必须保证同一用户、同一 release、同一 source hash、同一请求模式的重复 resolve / 重复同源请求会复用同一条 `translation_requests` 记录，不会新增重复 `translation_work_items`，也不会因为轮询继续制造额外 request 行。
 - 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
 - feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
 - 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。

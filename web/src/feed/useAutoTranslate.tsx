@@ -98,6 +98,12 @@ type CandidateTask = {
 	task: TranslationTask;
 };
 
+type WindowEntry = {
+	key: string;
+	top: number;
+	bottom: number;
+};
+
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T | PromiseLike<T>) => void;
 	let reject!: (reason?: unknown) => void;
@@ -165,6 +171,17 @@ function buildVisibleWindowPlan<T extends { top: number; bottom: number }>(
 			lastVisibleIndex + 1 + SECONDARY_PREFETCH_COUNT,
 		),
 	];
+}
+
+function buildVisibleWindowKeys(
+	candidates: WindowEntry[],
+	viewportHeight: number,
+) {
+	return new Set(
+		buildVisibleWindowPlan(candidates, viewportHeight).map(
+			(entry) => entry.key,
+		),
+	);
 }
 
 function resultLabel(result: TranslationResultItem) {
@@ -371,6 +388,15 @@ export function useAutoTranslate(params: {
 		[finalizeFailure, finalizeSuccess, finalizeTerminal],
 	);
 
+	const hasPollableTasks = useCallback((windowKeys: Set<string>) => {
+		for (const [key, task] of requestTasksRef.current) {
+			if (task.rejectOnFailure || windowKeys.has(key)) {
+				return true;
+			}
+		}
+		return false;
+	}, []);
+
 	const resolveCandidateTasks = useCallback(
 		async (
 			entries: CandidateTask[],
@@ -402,11 +428,11 @@ export function useAutoTranslate(params: {
 	const pollPendingTasks = useCallback(async () => {
 		if (!enabled || !mountedRef.current || pollBusyRef.current) return;
 		pollBusyRef.current = true;
+		let shouldReschedule = false;
 		try {
 			const viewportHeight =
 				window.innerHeight || document.documentElement.clientHeight || 0;
-			const windowEntries: Array<{ key: string; top: number; bottom: number }> =
-				[];
+			const windowEntries: WindowEntry[] = [];
 			for (const [key, element] of keyToElementRef.current) {
 				if (!itemByKeyRef.current.has(key)) continue;
 				const rect = element.getBoundingClientRect();
@@ -417,11 +443,7 @@ export function useAutoTranslate(params: {
 					bottom: rect.bottom,
 				});
 			}
-			const windowKeys = new Set(
-				buildVisibleWindowPlan(windowEntries, viewportHeight).map(
-					(entry) => entry.key,
-				),
-			);
+			const windowKeys = buildVisibleWindowKeys(windowEntries, viewportHeight);
 			const pending = Array.from(requestTasksRef.current.entries()).map(
 				([key, task]) => {
 					if (!task.rejectOnFailure && !windowKeys.has(key)) {
@@ -450,6 +472,7 @@ export function useAutoTranslate(params: {
 					task: TranslationTask;
 				} => Boolean(entry),
 			);
+			shouldReschedule = hasPollableTasks(windowKeys);
 			if (active.length === 0) return;
 
 			await resolveCandidateTasks(active, {
@@ -465,13 +488,14 @@ export function useAutoTranslate(params: {
 					}
 				},
 			});
+			shouldReschedule = hasPollableTasks(windowKeys);
 		} finally {
 			pollBusyRef.current = false;
-			if (requestTasksRef.current.size > 0) {
+			if (shouldReschedule) {
 				schedulePendingPollRef.current();
 			}
 		}
-	}, [enabled, finalizeFailure, resolveCandidateTasks]);
+	}, [enabled, finalizeFailure, hasPollableTasks, resolveCandidateTasks]);
 
 	const schedulePendingPoll = useCallback(() => {
 		if (!enabled || !mountedRef.current || requestTasksRef.current.size === 0)
@@ -615,19 +639,28 @@ export function useAutoTranslate(params: {
 				plannerDirtyRef.current = false;
 				const viewportHeight =
 					window.innerHeight || document.documentElement.clientHeight || 0;
-				const plan = buildVisibleWindowPlan(prepareCandidates(), viewportHeight)
+				const plannedEntries = buildVisibleWindowPlan(
+					prepareCandidates(),
+					viewportHeight,
+				);
+				const plan = plannedEntries
 					.map((entry) => entry.candidate)
 					.filter((candidate): candidate is TranslationCandidate =>
 						Boolean(candidate),
 					);
 				if (plan.length > 0) {
 					await submitCandidates(plan);
+				} else {
+					const windowKeys = new Set(plannedEntries.map((entry) => entry.key));
+					if (hasPollableTasks(windowKeys)) {
+						schedulePendingPollRef.current();
+					}
 				}
 			} while (plannerDirtyRef.current);
 		} finally {
 			plannerBusyRef.current = false;
 		}
-	}, [enabled, prepareCandidates, submitCandidates]);
+	}, [enabled, hasPollableTasks, prepareCandidates, submitCandidates]);
 
 	const scheduleViewportPlan = useCallback(() => {
 		if (!enabled || !mountedRef.current) return;

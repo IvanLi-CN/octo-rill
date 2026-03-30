@@ -2014,13 +2014,24 @@ async fn insert_translation_request_record(
         serde_json::to_string(&item.target_slots).map_err(ApiError::internal)?;
     let source = derive_request_source(std::slice::from_ref(item));
 
-    sqlx::query(
+    sqlx::query_scalar(
         r#"
         INSERT INTO translation_requests (
           id, mode, source, request_origin, requested_by, scope_user_id, producer_ref, kind,
           variant, entity_id, target_lang, max_wait_ms, source_hash, source_blocks_json,
           target_slots_json, status, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+        ON CONFLICT(
+          mode, request_origin, scope_user_id, producer_ref, kind, variant, entity_id,
+          target_lang, source_hash
+        )
+        DO UPDATE SET source = excluded.source,
+                      requested_by = excluded.requested_by,
+                      max_wait_ms = excluded.max_wait_ms,
+                      source_blocks_json = excluded.source_blocks_json,
+                      target_slots_json = excluded.target_slots_json,
+                      updated_at = excluded.updated_at
+        RETURNING id
         "#,
     )
     .bind(request_id.as_str())
@@ -2040,11 +2051,9 @@ async fn insert_translation_request_record(
     .bind(target_slots_json.as_str())
     .bind(now)
     .bind(now)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(ApiError::internal)?;
-
-    Ok(request_id)
+    .map_err(ApiError::internal)
 }
 
 async fn insert_translation_request(
@@ -4440,11 +4449,11 @@ async fn load_last_batch_finished_at(state: &AppState) -> Result<Option<String>,
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
     use url::Url;
 
@@ -4743,7 +4752,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("load batch counters");
-        assert_eq!(batch.get::<i64, _>("request_count"), 2);
+        assert_eq!(batch.get::<i64, _>("request_count"), 1);
 
         let batch_item = sqlx::query(
             "SELECT producer_count FROM translation_batch_items WHERE batch_id = ? AND work_item_id = ?",
@@ -4753,7 +4762,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load batch item counters");
-        assert_eq!(batch_item.get::<i64, _>("producer_count"), 2);
+        assert_eq!(batch_item.get::<i64, _>("producer_count"), 1);
     }
 
     #[tokio::test]
@@ -4928,7 +4937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_translation_request_dedupes_work_items() {
+    async fn create_translation_request_reuses_existing_request_row() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -4949,12 +4958,6 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count requests");
-        let attached_requests: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM translation_requests WHERE work_item_id IS NOT NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count attached requests");
         let distinct_work_item_ids: i64 = sqlx::query_scalar(
             "SELECT COUNT(DISTINCT work_item_id) FROM translation_requests WHERE id IN (?, ?)",
         )
@@ -4964,14 +4967,14 @@ mod tests {
         .await
         .expect("count distinct work item ids");
 
-        assert_eq!(requests, 2);
+        assert_eq!(requests, 1);
         assert_eq!(work_items, 1);
-        assert_eq!(attached_requests, 2);
         assert_eq!(distinct_work_item_ids, 1);
+        assert_eq!(first.request_id, second.request_id);
     }
 
     #[tokio::test]
-    async fn create_translation_request_dedupes_work_items_under_concurrency() {
+    async fn create_translation_request_reuses_existing_request_row_under_concurrency() {
         let pool = setup_pool_with_max_connections(4).await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -4990,6 +4993,10 @@ mod tests {
         let first = first.expect("first concurrent request created");
         let second = second.expect("second concurrent request created");
 
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
         let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
             .fetch_one(&pool)
             .await
@@ -5003,8 +5010,10 @@ mod tests {
         .await
         .expect("count distinct work item ids");
 
+        assert_eq!(requests, 1);
         assert_eq!(work_items, 1);
         assert_eq!(distinct_work_item_ids, 1);
+        assert_eq!(first.request_id, second.request_id);
     }
 
     #[tokio::test]
@@ -5049,6 +5058,50 @@ mod tests {
         assert_eq!(result_rows, 1);
         assert_eq!(first[0].status, "queued");
         assert_eq!(second[0].status, "queued");
+        assert_eq!(first[0].work_item_id, second[0].work_item_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_dedupes_request_rows_under_concurrency() {
+        let pool = setup_pool_with_max_connections(4).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("resolve-concurrent-123");
+
+        let first_state = state.clone();
+        let second_state = state.clone();
+        let first_item = item.clone();
+        let second_item = item.clone();
+
+        let (first, second) = tokio::join!(
+            resolve_translation_results_for_user(
+                first_state.as_ref(),
+                "1",
+                std::slice::from_ref(&first_item),
+                false,
+            ),
+            resolve_translation_results_for_user(
+                second_state.as_ref(),
+                "1",
+                std::slice::from_ref(&second_item),
+                false,
+            ),
+        );
+
+        let first = first.expect("first concurrent resolve");
+        let second = second.expect("second concurrent resolve");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+            .fetch_one(&pool)
+            .await
+            .expect("count work items");
+
+        assert_eq!(requests, 1);
+        assert_eq!(work_items, 1);
         assert_eq!(first[0].work_item_id, second[0].work_item_id);
     }
 
@@ -5235,6 +5288,7 @@ mod tests {
             replay.result.work_item_id.as_deref(),
             Some(work_item_id.as_str())
         );
+        assert_eq!(replay.request_id, created.request_id);
 
         sqlx::query(
             r#"
@@ -5320,17 +5374,13 @@ mod tests {
                 .await
                 .expect("load work item status");
 
-        assert_eq!(requests, 2);
+        assert_eq!(requests, 1);
         assert_eq!(resolved[0].status, "queued");
-        assert_eq!(request_rows.len(), 2);
+        assert_eq!(request_rows.len(), 1);
         assert_eq!(request_rows[0].0, created.request_id);
-        assert_eq!(request_rows[0].1, "failed");
-        assert_eq!(request_rows[0].2.as_deref(), Some("error"));
+        assert_eq!(request_rows[0].1, "queued");
+        assert_eq!(request_rows[0].2, None);
         assert_eq!(request_rows[0].3.as_deref(), Some(work_item_id.as_str()));
-        assert_eq!(request_rows[1].0, replay.request_id);
-        assert_eq!(request_rows[1].1, "queued");
-        assert_eq!(request_rows[1].2, None);
-        assert_eq!(request_rows[1].3.as_deref(), Some(work_item_id.as_str()));
         assert_eq!(work_item_status, "queued");
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
@@ -6235,7 +6285,7 @@ mod tests {
             worker.current_batch_id.as_deref(),
             Some("batch-runtime-refresh")
         );
-        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.request_count, 1);
         assert_eq!(worker.work_item_count, 1);
     }
 
@@ -6373,7 +6423,7 @@ mod tests {
             worker.current_batch_id.as_deref(),
             Some("batch-runtime-refresh-resized")
         );
-        assert_eq!(worker.request_count, 2);
+        assert_eq!(worker.request_count, 1);
         assert_eq!(worker.work_item_count, 1);
 
         update_translation_worker_runtime(
@@ -7515,7 +7565,9 @@ mod tests {
         ));
         let options = SqliteConnectOptions::new()
             .filename(&database_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(options)
