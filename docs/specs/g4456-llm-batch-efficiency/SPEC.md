@@ -48,7 +48,7 @@
 - 模型目录同步固定为：启动时懒刷新 + 每 24h 刷新。
 - 未识别模型兜底固定为：`32768`。
 - 仅保留一个手动覆盖变量：`AI_MODEL_CONTEXT_LIMIT`。
-- feed 自动翻译必须调用 `POST /api/translate/results`，由前端上报可见 release 与最后一个可见 release 之后的连续 10 条。
+- feed 自动翻译必须调用 `POST /api/translate/results`，由前端上报可见 release 与最后一个可见 release 之后的连续 10 条；当窗口条目数超过接口单次 `60` 条上限时，前端必须按连续顺序拆成多次调用。
 - `ai_translations` 必须升级为带状态的结果真相源；同一用户、同一实体、同一语言在任意时刻只保留 1 条当前结果记录，并显式表达 `queued/running/ready/disabled/missing/error`。
 - 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
 - 后端必须保证同一用户、同一 release、同一 source hash 的重复 resolve 不会新增重复 `translation_work_items`，且不会因为轮询新增重复 `translation_requests`。
@@ -72,7 +72,7 @@
 
 ### Core flows
 
-- Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条统一发给结果聚合接口。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
+- Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条按原顺序交给结果聚合接口。若候选数超过单次 `60` 条限制，则前端继续按顺序拆成多次 resolve 调用。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
 - Feed 自动翻译：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；若窗口内请求足够多，调度器优先按 `1800 tokens` 左右切成多个小批，以便更多 worker 并行启动，而不是等待大批次攒满再跑。
 - Release detail 翻译：详情 Markdown chunk 批量翻译，失败 chunk 再单条重试。
 - Notification 翻译：支持线程批量翻译，缓存命中时直接返回。
@@ -84,7 +84,7 @@
 - batch 返回格式不合法：批次降级到单条翻译。
 - 同一 demand window 在滚动抖动期间被多次 resolve：后端复用已存在结果行/work item，不重复创建记录。
 - 已失败条目在自动轮询中再次被 resolve：后端保持 `error` 终态，不自动重排队。
-- 已失败条目被用户手动重试：后端复用原 request/work item 并重置为 queued，而不是再插入一条新的 request。
+- 已失败条目被用户手动重试：后端复用原 request/work item，并优先复用最近一次失败 request 的快照把它重置为 queued；较早的历史 request 快照不得被批量回写。
 - 旧 source hash 的 work item 晚到完成：不得覆盖结果表里已经切换到更新 source hash 的状态或译文。
 - 单条资源不存在：batch item 返回 `status=error` + `error` 信息；单条接口保持 404 语义。
 
@@ -107,7 +107,7 @@
 
 - Given 首批 feed 中存在多个可见 release 且其后仍有待翻译条目
   When 自动翻译触发
-  Then 前端必须调用 1 次 `POST /api/translate/results`，其中包含所有可见 release 与最后一个可见卡片之后的连续 10 条 release。
+  Then 前端必须调用 `POST /api/translate/results`，并按顺序覆盖所有可见 release 与最后一个可见卡片之后的连续 10 条 release；若总数超过 60 条，则允许拆成多次连续调用。
 
 - Given 同一条 release 在短时间内被前端多次 resolve
   When source hash 未变化

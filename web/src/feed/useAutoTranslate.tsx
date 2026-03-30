@@ -8,6 +8,7 @@ import {
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
+const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
@@ -307,10 +308,20 @@ export function useAutoTranslate(params: {
 			items: TranslationRequestItemInput[],
 			options?: { retryOnError?: boolean },
 		) => {
-			return apiResolveTranslationResults({
-				items,
-				retry_on_error: options?.retryOnError ?? false,
-			});
+			const all: TranslationResultItem[] = [];
+			for (
+				let index = 0;
+				index < items.length;
+				index += RESOLVE_RESULTS_MAX_ITEMS
+			) {
+				const chunk = items.slice(index, index + RESOLVE_RESULTS_MAX_ITEMS);
+				const response = await apiResolveTranslationResults({
+					items: chunk,
+					retry_on_error: options?.retryOnError ?? false,
+				});
+				all.push(...response.items);
+			}
+			return { items: all };
 		},
 		[],
 	);

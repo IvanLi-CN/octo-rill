@@ -1912,16 +1912,28 @@ async fn ensure_translation_result_for_item(
                 .await?;
                 if retry_on_error && result.status == "error" {
                     reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
-                    let request_id = insert_translation_request_record(
-                        tx,
-                        user_id,
-                        "async",
-                        item,
-                        request_origin,
-                        source_hash.as_str(),
-                        now,
-                    )
-                    .await?;
+                    let request_id = if let Some(existing_request_id) =
+                        load_latest_request_id_for_work_item(
+                            tx,
+                            work_item.id.as_str(),
+                            source_hash.as_str(),
+                        )
+                        .await?
+                    {
+                        reset_request_for_retry(tx, existing_request_id.as_str(), now).await?;
+                        existing_request_id
+                    } else {
+                        insert_translation_request_record(
+                            tx,
+                            user_id,
+                            "async",
+                            item,
+                            request_origin,
+                            source_hash.as_str(),
+                            now,
+                        )
+                        .await?
+                    };
                     attach_request_to_work_item(
                         tx,
                         request_id.as_str(),
@@ -2285,6 +2297,55 @@ async fn attach_request_to_work_item(
     .bind(request_status)
     .bind(request_status)
     .bind(now)
+    .bind(now)
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn load_latest_request_id_for_work_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    source_hash: &str,
+) -> Result<Option<String>, ApiError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM translation_requests
+        WHERE work_item_id = ? AND source_hash = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(work_item_id)
+    .bind(source_hash)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn reset_request_for_retry(
+    tx: &mut Transaction<'_, Sqlite>,
+    request_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_requests
+        SET status = 'queued',
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
     .bind(now)
     .bind(request_id)
     .execute(&mut **tx)
@@ -5160,11 +5221,18 @@ mod tests {
         let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
             .expect("request created");
+        let replay = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("second request created");
         let work_item_id = created
             .result
             .work_item_id
             .clone()
             .expect("work item attached");
+        assert_eq!(
+            replay.result.work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
 
         sqlx::query(
             r#"
@@ -5182,7 +5250,25 @@ mod tests {
         .bind(created.request_id.as_str())
         .execute(&pool)
         .await
-        .expect("mark request failed");
+        .expect("mark first request failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .bind(replay.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark second request failed");
 
         sqlx::query(
             r#"
@@ -5239,7 +5325,7 @@ mod tests {
         assert_eq!(request_rows[0].1, "failed");
         assert_eq!(request_rows[0].2.as_deref(), Some("error"));
         assert_eq!(request_rows[0].3.as_deref(), Some(work_item_id.as_str()));
-        assert_ne!(request_rows[1].0, created.request_id);
+        assert_eq!(request_rows[1].0, replay.request_id);
         assert_eq!(request_rows[1].1, "queued");
         assert_eq!(request_rows[1].2, None);
         assert_eq!(request_rows[1].3.as_deref(), Some(work_item_id.as_str()));

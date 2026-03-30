@@ -45,7 +45,7 @@
 - 若结果表中当前 source hash 已是 `ready/disabled/missing/error`，接口直接返回对应终态。
 - 若结果表中当前 source hash 已是 `queued/running`，接口会继续核对活跃 work item；若 work item 仍在途则直接返回 queued/running。
 - 若结果表未命中当前 source hash，或结果表处于 pending 但已找不到活跃 work item，接口会在后端创建或复用 work item，并把结果表推进到新的 pending 状态后再返回当前状态。
-- 若条目上一次结果为 error，默认继续返回 error；只有 `retry_on_error=true` 时才允许在原 request/work item 上重置并重新入队。
+- 若条目上一次结果为 error，默认继续返回 error；只有 `retry_on_error=true` 时才允许在原 request/work item 上重置并重新入队，并优先复用最近一次失败的 `translation_requests` 快照供 request-based 读取接口继续追踪。
 
 ## Submit Translation Request（POST /api/translate/requests）
 
