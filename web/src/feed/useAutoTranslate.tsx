@@ -207,6 +207,14 @@ export function useAutoTranslate(params: {
 		[bumpRender],
 	);
 
+	const retireTask = useCallback((key: string, task: TranslationTask) => {
+		if (requestTasksRef.current.get(key) === task) {
+			requestTasksRef.current.delete(key);
+			pollErrorCountRef.current.delete(key);
+		}
+		task.deferred.resolve(null);
+	}, []);
+
 	const scheduleViewportPlanRef = useRef<() => void>(() => {});
 	const schedulePendingPollRef = useRef<() => void>(() => {});
 
@@ -415,8 +423,7 @@ export function useAutoTranslate(params: {
 					continue;
 				}
 				if (existing) {
-					byKey.set(candidate.key, existing.promise);
-					continue;
+					retireTask(candidate.key, existing);
 				}
 
 				const deferred = createDeferred<TranslateResponse | null>();
@@ -470,6 +477,7 @@ export function useAutoTranslate(params: {
 			finalizeFailure,
 			resolveRequestItems,
 			schedulePendingPoll,
+			retireTask,
 		],
 	);
 
@@ -575,6 +583,9 @@ export function useAutoTranslate(params: {
 			if (existing && existing.sourceKey === sourceKey) {
 				return existing.promise;
 			}
+			if (existing) {
+				retireTask(key, existing);
+			}
 
 			const candidate: TranslationCandidate = {
 				key,
@@ -610,7 +621,13 @@ export function useAutoTranslate(params: {
 				throw error;
 			}
 		},
-		[applyResolvedResults, bumpRender, finalizeFailure, resolveRequestItems],
+		[
+			applyResolvedResults,
+			bumpRender,
+			finalizeFailure,
+			resolveRequestItems,
+			retireTask,
+		],
 	);
 
 	useEffect(() => {
