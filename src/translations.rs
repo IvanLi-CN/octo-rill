@@ -2574,6 +2574,8 @@ async fn upsert_translation_demand_state(
                       error_text = NULL,
                       active_work_item_id = excluded.active_work_item_id,
                       updated_at = excluded.updated_at
+        WHERE ai_translations.source_hash = excluded.source_hash
+           OR ai_translations.updated_at <= excluded.updated_at
         "#,
     )
     .bind(crate::local_id::generate_local_id())
@@ -5334,6 +5336,67 @@ mod tests {
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_translation_demand_state_keeps_newer_source_hash() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("source-guard");
+        let newer_hash = build_source_hash(&item);
+        let older_hash = "older-source-hash";
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'running', NULL, NULL, NULL, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .bind(newer_hash.as_str())
+        .bind("new-work-item")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .execute(&pool)
+        .await
+        .expect("seed newer translation state");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_translation_demand_state(
+            &mut tx,
+            "1",
+            &item,
+            older_hash,
+            "queued",
+            "old-work-item",
+            "2026-03-30T00:00:01Z",
+        )
+        .await
+        .expect("stale demand upsert");
+        tx.commit().await.expect("commit tx");
+
+        let row: (String, String, String) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, active_work_item_id
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load translation state");
+
+        assert_eq!(row.0, newer_hash);
+        assert_eq!(row.1, "running");
+        assert_eq!(row.2, "new-work-item");
     }
 
     #[tokio::test]

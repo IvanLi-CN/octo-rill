@@ -542,15 +542,22 @@ export function useAutoTranslate(params: {
 		for (const [key, element] of keyToElementRef.current) {
 			const item = itemByKeyRef.current.get(key);
 			if (!item || !shouldAutoTranslate(item)) continue;
-			if (requestTasksRef.current.has(key)) continue;
 			const requestItem = buildReleaseSummaryRequestItem(item);
+			const sourceKey = buildRequestSourceKey(requestItem);
+			const existing = requestTasksRef.current.get(key);
+			if (existing) {
+				if (existing.sourceKey === sourceKey) {
+					continue;
+				}
+				retireTask(key, existing);
+			}
 			const rect = element.getBoundingClientRect();
 			if (rect.bottom <= 0) continue;
 			candidates.push({
 				key,
 				item,
 				requestItem,
-				sourceKey: buildRequestSourceKey(requestItem),
+				sourceKey,
 				top: rect.top,
 				bottom: rect.bottom,
 			});
@@ -562,7 +569,7 @@ export function useAutoTranslate(params: {
 			}
 			return left.bottom - right.bottom;
 		});
-	}, [shouldAutoTranslate]);
+	}, [retireTask, shouldAutoTranslate]);
 
 	const runViewportPlan = useCallback(async () => {
 		if (!enabled || !mountedRef.current) return;
