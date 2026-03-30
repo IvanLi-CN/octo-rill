@@ -71,6 +71,7 @@ type TranslationTask = {
 	sourceKey: string;
 	requestItem: TranslationRequestItemInput;
 	createdAtMs: number;
+	rejectOnFailure: boolean;
 	deferred: Deferred<TranslateResponse | null>;
 	promise: Promise<TranslateResponse | null>;
 };
@@ -157,6 +158,12 @@ function resultLabel(result: TranslationResultItem) {
 	return result.error ?? `translate returned ${result.status}`;
 }
 
+function isTerminalTranslationResultStatus(
+	status: TranslationResultItem["status"],
+) {
+	return status === "error" || status === "missing";
+}
+
 export function useAutoTranslate(params: {
 	enabled: boolean;
 	onTranslated: (
@@ -218,6 +225,25 @@ export function useAutoTranslate(params: {
 	const scheduleViewportPlanRef = useRef<() => void>(() => {});
 	const schedulePendingPollRef = useRef<() => void>(() => {});
 
+	const settleTaskPromise = useCallback(
+		(
+			task: TranslationTask,
+			mapped: TranslateResponse | null,
+			error?: unknown,
+		) => {
+			if (mapped) {
+				task.deferred.resolve(mapped);
+				return;
+			}
+			if (task.rejectOnFailure) {
+				task.deferred.reject(error);
+				return;
+			}
+			task.deferred.resolve(null);
+		},
+		[],
+	);
+
 	const finalizeSuccess = useCallback(
 		(
 			candidate: TranslationCandidate,
@@ -235,9 +261,10 @@ export function useAutoTranslate(params: {
 					mapped,
 				);
 			}
+			settleTaskPromise(task, mapped);
 			scheduleViewportPlanRef.current();
 		},
-		[clearTask, onTranslated],
+		[clearTask, onTranslated, settleTaskPromise],
 	);
 
 	const finalizeFailure = useCallback(
@@ -254,10 +281,25 @@ export function useAutoTranslate(params: {
 			} else {
 				retryCountRef.current.set(candidate.key, retries + 1);
 			}
-			task.deferred.reject(error);
+			settleTaskPromise(task, null, error);
 			scheduleViewportPlanRef.current();
 		},
-		[clearTask],
+		[clearTask, settleTaskPromise],
+	);
+
+	const finalizeTerminal = useCallback(
+		(
+			candidate: TranslationCandidate,
+			task: TranslationTask,
+			error?: unknown,
+		) => {
+			clearTask(candidate.key, task);
+			failedRef.current.add(candidate.key);
+			retryCountRef.current.delete(candidate.key);
+			settleTaskPromise(task, null, error);
+			scheduleViewportPlanRef.current();
+		},
+		[clearTask, settleTaskPromise],
 	);
 
 	const resolveRequestItems = useCallback(
@@ -316,15 +358,17 @@ export function useAutoTranslate(params: {
 
 				const mapped = mapTranslationItemToFeedResponse(resolved);
 				if (!mapped) {
+					if (isTerminalTranslationResultStatus(resolved.status)) {
+						finalizeTerminal(candidate, task, new Error(resultLabel(resolved)));
+						continue;
+					}
 					finalizeFailure(candidate, task, new Error(resultLabel(resolved)));
 					continue;
 				}
-
-				task.deferred.resolve(mapped);
 				finalizeSuccess(candidate, task, mapped);
 			}
 		},
-		[finalizeFailure, finalizeSuccess],
+		[finalizeFailure, finalizeSuccess, finalizeTerminal],
 	);
 
 	const pollPendingTasks = useCallback(async () => {
@@ -431,6 +475,7 @@ export function useAutoTranslate(params: {
 					sourceKey,
 					requestItem,
 					createdAtMs: Date.now(),
+					rejectOnFailure: false,
 					deferred,
 					promise: deferred.promise,
 				};
@@ -581,6 +626,7 @@ export function useAutoTranslate(params: {
 
 			const existing = requestTasksRef.current.get(key);
 			if (existing && existing.sourceKey === sourceKey) {
+				existing.rejectOnFailure = true;
 				return existing.promise;
 			}
 			if (existing) {
@@ -601,6 +647,7 @@ export function useAutoTranslate(params: {
 				sourceKey,
 				requestItem,
 				createdAtMs: Date.now(),
+				rejectOnFailure: true,
 				deferred,
 				promise: deferred.promise,
 			};

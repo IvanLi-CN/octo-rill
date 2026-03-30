@@ -1912,7 +1912,24 @@ async fn ensure_translation_result_for_item(
                 .await?;
                 if retry_on_error && result.status == "error" {
                     reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
-                    reset_requests_for_work_item_retry(tx, work_item.id.as_str(), now).await?;
+                    let request_id = insert_translation_request_record(
+                        tx,
+                        user_id,
+                        "async",
+                        item,
+                        request_origin,
+                        source_hash.as_str(),
+                        now,
+                    )
+                    .await?;
+                    attach_request_to_work_item(
+                        tx,
+                        request_id.as_str(),
+                        work_item.id.as_str(),
+                        "queued",
+                        now,
+                    )
+                    .await?;
                     upsert_translation_demand_state(
                         tx,
                         user_id,
@@ -2754,34 +2771,6 @@ async fn reset_retryable_terminal_work_item(
             finished_at = NULL,
             updated_at = ?
         WHERE id = ?
-        "#,
-    )
-    .bind(now)
-    .bind(work_item_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    Ok(())
-}
-
-async fn reset_requests_for_work_item_retry(
-    tx: &mut Transaction<'_, Sqlite>,
-    work_item_id: &str,
-    now: &str,
-) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE translation_requests
-        SET status = 'queued',
-            result_status = NULL,
-            title_zh = NULL,
-            summary_md = NULL,
-            body_md = NULL,
-            error_text = NULL,
-            started_at = NULL,
-            finished_at = NULL,
-            updated_at = ?
-        WHERE work_item_id = ?
         "#,
     )
     .bind(now)
@@ -5226,19 +5215,16 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count requests");
-        let request_status: String =
-            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
-                .bind(created.request_id.as_str())
-                .fetch_one(&pool)
-                .await
-                .expect("load request status");
-        let request_result_status: Option<String> = sqlx::query_scalar(
-            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        let request_rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, status, result_status, work_item_id
+            FROM translation_requests
+            ORDER BY created_at ASC, id ASC
+            "#,
         )
-        .bind(created.request_id.as_str())
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
-        .expect("load request result status");
+        .expect("load request rows");
         let work_item_status: String =
             sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
                 .bind(work_item_id.as_str())
@@ -5246,10 +5232,17 @@ mod tests {
                 .await
                 .expect("load work item status");
 
-        assert_eq!(requests, 1);
+        assert_eq!(requests, 2);
         assert_eq!(resolved[0].status, "queued");
-        assert_eq!(request_status, "queued");
-        assert_eq!(request_result_status, None);
+        assert_eq!(request_rows.len(), 2);
+        assert_eq!(request_rows[0].0, created.request_id);
+        assert_eq!(request_rows[0].1, "failed");
+        assert_eq!(request_rows[0].2.as_deref(), Some("error"));
+        assert_eq!(request_rows[0].3.as_deref(), Some(work_item_id.as_str()));
+        assert_ne!(request_rows[1].0, created.request_id);
+        assert_eq!(request_rows[1].1, "queued");
+        assert_eq!(request_rows[1].2, None);
+        assert_eq!(request_rows[1].3.as_deref(), Some(work_item_id.as_str()));
         assert_eq!(work_item_status, "queued");
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
