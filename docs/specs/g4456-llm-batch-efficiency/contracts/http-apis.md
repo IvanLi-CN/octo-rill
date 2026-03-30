@@ -44,8 +44,9 @@
 - 接口先读取 `ai_translations` 结果表；只有 `status=ready` 的记录会被其他读取接口当作可直接展示的译文。
 - 若结果表中当前 source hash 已是 `ready/disabled/missing/error`，接口直接返回对应终态。
 - 若结果表中当前 source hash 已是 `queued/running`，接口会继续核对活跃 work item；若 work item 仍在途则直接返回 queued/running。
-- 若结果表未命中当前 source hash，或结果表处于 pending 但已找不到活跃 work item，接口会在后端创建或复用 work item，并把结果表推进到新的 pending 状态后再返回当前状态。
+- 若结果表未命中当前 source hash，或结果表处于 pending 但已找不到活跃 work item，接口会在后端创建或复用 work item；若旧行上仍有可展示的 `ready/disabled/missing` 结果，则该行内容必须保留，只额外挂住新的活跃 work item，而不是先把旧结果清空。
 - 若同一用户对同一 source hash 重复调用相同模式的 ensure/resolve，后端必须复用现有 `translation_requests` 行，而不是继续累加重复 request 记录。
+- 若旧 source hash 的 resolve 在更晚时间再次到达，后端不得把结果表回退到更旧的 pending/ready 状态；只有当前已绑定的活跃 work item 或同 source hash 的终态结果才允许真正覆盖结果行。
 - 若条目上一次结果为 error，默认继续返回 error；只有 `retry_on_error=true` 时才允许在原 request/work item 上重置并重新入队，并优先复用最近一次失败的 `translation_requests` 快照供 request-based 读取接口继续追踪。
 
 ## Submit Translation Request（POST /api/translate/requests）

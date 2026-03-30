@@ -5851,7 +5851,7 @@ async fn mark_translation_requested(
           active_work_item_id = NULL,
           updated_at = excluded.updated_at
         WHERE ai_translations.source_hash = excluded.source_hash
-           OR ai_translations.updated_at <= excluded.updated_at
+          AND ai_translations.status NOT IN ('ready', 'disabled', 'missing')
         "#,
     )
     .bind(crate::local_id::generate_local_id())
@@ -11077,51 +11077,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_translation_requested_blocks_older_result_until_newer_request_finishes() {
+    async fn mark_translation_requested_keeps_existing_ready_translation_visible() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 7, "race-user", 0, 0).await;
 
         let user_id = test_user_id(7);
         let entity_id = "42";
-        let older_hash = "older-source";
-        let newer_hash = "newer-source";
-
-        mark_translation_requested(
-            state.as_ref(),
-            user_id.as_str(),
-            "2026-03-30T00:00:02Z",
-            TranslationUpsert {
-                entity_type: "release",
-                entity_id,
-                lang: "zh-CN",
-                source_hash: newer_hash,
-                title: None,
-                summary: None,
-            },
-        )
-        .await
-        .expect("mark newer request");
+        let ready_hash = "ready-source";
+        let pending_hash = "pending-source";
 
         upsert_translation(
             state.as_ref(),
             user_id.as_str(),
-            "2026-03-30T00:00:01Z",
+            "2099-03-30T00:00:01Z",
             TranslationUpsert {
                 entity_type: "release",
                 entity_id,
                 lang: "zh-CN",
-                source_hash: older_hash,
+                source_hash: ready_hash,
                 title: Some("旧标题"),
                 summary: Some("旧摘要"),
             },
         )
         .await
-        .expect("older result should not overwrite newer request");
+        .expect("seed ready translation");
 
-        let row: (String, String, Option<String>) = sqlx::query_as(
+        mark_translation_requested(
+            state.as_ref(),
+            user_id.as_str(),
+            "2099-03-30T00:00:02Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: pending_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await
+        .expect("mark refresh request");
+
+        let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
             r#"
-            SELECT source_hash, status, summary
+            SELECT source_hash, status, title, summary
             FROM ai_translations
             WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
             LIMIT 1
@@ -11131,26 +11131,27 @@ mod tests {
         .bind(entity_id)
         .fetch_one(&pool)
         .await
-        .expect("load pending translation row");
-        assert_eq!(row.0, newer_hash);
-        assert_eq!(row.1, "running");
-        assert_eq!(row.2, None);
+        .expect("load preserved ready translation row");
+        assert_eq!(row.0, ready_hash);
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2.as_deref(), Some("旧标题"));
+        assert_eq!(row.3.as_deref(), Some("旧摘要"));
 
         upsert_translation(
             state.as_ref(),
             user_id.as_str(),
-            "2026-03-30T00:00:02Z",
+            "2099-03-30T00:00:03Z",
             TranslationUpsert {
                 entity_type: "release",
                 entity_id,
                 lang: "zh-CN",
-                source_hash: newer_hash,
+                source_hash: pending_hash,
                 title: Some("新标题"),
                 summary: Some("新摘要"),
             },
         )
         .await
-        .expect("newer result should land");
+        .expect("refresh result should land");
 
         let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
             r#"
@@ -11165,7 +11166,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load completed translation row");
-        assert_eq!(row.0, newer_hash);
+        assert_eq!(row.0, pending_hash);
         assert_eq!(row.1, "ready");
         assert_eq!(row.2.as_deref(), Some("新标题"));
         assert_eq!(row.3.as_deref(), Some("新摘要"));

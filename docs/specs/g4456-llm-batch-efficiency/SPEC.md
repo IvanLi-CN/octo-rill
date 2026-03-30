@@ -52,6 +52,7 @@
 - `ai_translations` 必须升级为带状态的结果真相源；同一用户、同一实体、同一语言在任意时刻只保留 1 条当前结果记录，并显式表达 `queued/running/ready/disabled/missing/error`。
 - 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
 - 后端必须保证同一用户、同一 release、同一 source hash、同一请求模式的重复 resolve / 重复同源请求会复用同一条 `translation_requests` 记录，不会新增重复 `translation_work_items`，也不会因为轮询继续制造额外 request 行。
+- 当较新的 source hash 进入排队时，后端不得为了挂起新任务而清空已经 `ready` 的旧译文；现有可展示译文必须保留到新任务真正进入终态为止。
 - 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
 - feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
 - 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。
@@ -83,6 +84,7 @@
 - 外部目录刷新失败：不影响主流程，使用已缓存目录/内置映射/兜底值。
 - batch 返回格式不合法：批次降级到单条翻译。
 - 同一 demand window 在滚动抖动期间被多次 resolve：后端复用已存在结果行/work item，不重复创建记录。
+- 不同 source hash 的 resolve 交错到达：较晚到达的旧 source hash 不得把结果表回退到更旧的 pending/ready 状态，也不得抢占已经绑定中的活跃 work item。
 - 已失败条目在自动轮询中再次被 resolve：后端保持 `error` 终态，不自动重排队。
 - 已失败条目被用户手动重试：后端复用原 request/work item，并优先复用最近一次失败 request 的快照把它重置为 queued；较早的历史 request 快照不得被批量回写。
 - 旧 source hash 的 work item 晚到完成：不得覆盖结果表里已经切换到更新 source hash 的状态或译文。
@@ -116,6 +118,10 @@
 - Given 某条 release 的译文尚未 ready
   When 结果聚合接口被重复轮询
   Then 接口必须持续返回 `queued/running` 并复用原结果行/work item，直到任务进入终态。
+
+- Given 某条 release 已经存在一条可展示的 `ready` 译文
+  When 新 source hash 被结果聚合接口补建 work item
+  Then 旧的 `ready` 译文必须继续保留，直到新 work item 产出终态结果；中途不得因为 pending 标记让 UI 回退成空白。
 
 - Given 用户打开 feed 首屏并触发自动翻译
   When 当前可见窗口只产生少量 release 任务
