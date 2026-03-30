@@ -2900,6 +2900,7 @@ pub async fn get_release_detail(
         is_prerelease: i64,
         is_draft: i64,
         trans_source_hash: Option<String>,
+        trans_status: Option<String>,
         trans_title: Option<String>,
         trans_summary: Option<String>,
     }
@@ -2918,6 +2919,7 @@ pub async fn get_release_detail(
           r.is_prerelease,
           r.is_draft,
           t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary
         FROM repo_releases r
@@ -2928,7 +2930,7 @@ pub async fn get_release_detail(
           AND t.entity_type = 'release_detail'
           AND t.entity_id = CAST(r.release_id AS TEXT)
           AND t.lang = 'zh-CN'
-          AND t.status = 'ready'
+          AND t.status IN ('ready', 'disabled', 'missing', 'error')
         WHERE r.release_id = ?
         LIMIT 1
         "#,
@@ -2977,26 +2979,27 @@ pub async fn get_release_detail(
             status: "disabled".to_owned(),
             title: None,
             summary: None,
-        })
-    } else if translation_fresh
-        && release_detail_translation_ready(
-            Some(original_body.as_str()),
-            row.trans_summary.as_deref(),
-        )
-    {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: row.trans_title.clone(),
-            summary: row.trans_summary.clone(),
+            auto_translate: None,
         })
     } else {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "missing".to_owned(),
-            title: None,
-            summary: None,
-        })
+        match (translation_fresh, row.trans_status.as_deref()) {
+            (true, Some("ready"))
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    row.trans_summary.as_deref(),
+                ) =>
+            {
+                Some(TranslatedItem {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: row.trans_title.clone(),
+                    summary: row.trans_summary.clone(),
+                    auto_translate: None,
+                })
+            }
+            (true, Some(status)) => translated_terminal_item(status),
+            _ => Some(translated_missing_item(true)),
+        }
     };
 
     Ok(Json(ReleaseDetailResponse {
@@ -3790,9 +3793,11 @@ pub struct FeedItem {
 #[derive(Debug, Serialize)]
 pub struct TranslatedItem {
     lang: String,
-    status: String, // ready | missing | disabled
+    status: String, // ready | missing | disabled | error
     title: Option<String>,
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_translate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -3846,6 +3851,7 @@ struct FeedRow {
     react_rocket: Option<i64>,
     react_eyes: Option<i64>,
     trans_source_hash: Option<String>,
+    trans_status: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
 }
@@ -4066,7 +4072,7 @@ fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str>
     }
 }
 
-fn release_excerpt(body: Option<&str>) -> Option<String> {
+pub(crate) fn release_excerpt(body: Option<&str>) -> Option<String> {
     let body = body?;
     let normalized = body.replace("\r\n", "\n");
 
@@ -4249,11 +4255,12 @@ async fn fetch_feed_releases(
           i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
           i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary
         FROM items i
         LEFT JOIN ai_translations t
-          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status = 'ready'
+          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status IN ('ready', 'disabled', 'missing', 'error')
     "#;
 
     let (sql, has_cursor) = if cursor.is_some() {
@@ -4558,6 +4565,36 @@ async fn persist_release_reaction_counts(
     Ok(())
 }
 
+fn translated_terminal_item(status: &str) -> Option<TranslatedItem> {
+    match status {
+        "disabled" => Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: None,
+        }),
+        "missing" | "error" => Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: status.to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: Some(false),
+        }),
+        _ => None,
+    }
+}
+
+fn translated_missing_item(auto_translate: bool) -> TranslatedItem {
+    TranslatedItem {
+        lang: "zh-CN".to_owned(),
+        status: "missing".to_owned(),
+        title: None,
+        summary: None,
+        auto_translate: if auto_translate { None } else { Some(false) },
+    }
+}
+
 fn feed_item_from_row(
     r: FeedRow,
     ai_enabled: bool,
@@ -4593,56 +4630,60 @@ fn feed_item_from_row(
             status: "disabled".to_owned(),
             title: None,
             summary: None,
+            auto_translate: None,
         })
     } else {
         let current_hash = ai::sha256_hex(&source);
         if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
-            let mut title = r.trans_title.clone().filter(|s| !s.trim().is_empty());
-            let mut summary = r.trans_summary.clone().filter(|s| !s.trim().is_empty());
-            let mut status = "ready".to_owned();
+            if let Some(status) = r.trans_status.as_deref()
+                && status != "ready"
+            {
+                translated_terminal_item(status)
+            } else {
+                let mut title = r.trans_title.clone().filter(|s| !s.trim().is_empty());
+                let mut summary = r.trans_summary.clone().filter(|s| !s.trim().is_empty());
+                let mut status = "ready".to_owned();
 
-            // Some early cached entries accidentally stored the entire JSON blob in `summary`.
-            // Try to recover it without forcing an AI call; if we can't, mark as missing so the
-            // client can re-translate.
-            if let Some(raw) = summary.as_deref() {
-                let t = raw.trim_start();
-                if t.starts_with('{') || t.starts_with("\"{") {
-                    if let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw) {
-                        if title.is_none() {
-                            title = t_title;
+                // Some early cached entries accidentally stored the entire JSON blob in `summary`.
+                // Try to recover it without forcing an AI call; if we can't, mark as missing so the
+                // client can re-translate.
+                if let Some(raw) = summary.as_deref() {
+                    let t = raw.trim_start();
+                    if t.starts_with('{') || t.starts_with("\"{") {
+                        if let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
+                        {
+                            if title.is_none() {
+                                title = t_title;
+                            }
+                            if t_summary.is_some() {
+                                summary = t_summary;
+                            }
+                        } else {
+                            status = "missing".to_owned();
+                            title = None;
+                            summary = None;
                         }
-                        if t_summary.is_some() {
-                            summary = t_summary;
-                        }
-                    } else {
-                        status = "missing".to_owned();
-                        title = None;
-                        summary = None;
                     }
                 }
-            }
-            if status == "ready"
-                && let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref())
-                && !markdown_structure_preserved(src, s)
-            {
-                status = "missing".to_owned();
-                title = None;
-                summary = None;
-            }
+                if status == "ready"
+                    && let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref())
+                    && !markdown_structure_preserved(src, s)
+                {
+                    status = "missing".to_owned();
+                    title = None;
+                    summary = None;
+                }
 
-            Some(TranslatedItem {
-                lang: "zh-CN".to_owned(),
-                status,
-                title,
-                summary,
-            })
+                Some(TranslatedItem {
+                    lang: "zh-CN".to_owned(),
+                    status,
+                    title,
+                    summary,
+                    auto_translate: None,
+                })
+            }
         } else {
-            Some(TranslatedItem {
-                lang: "zh-CN".to_owned(),
-                status: "missing".to_owned(),
-                title: None,
-                summary: None,
-            })
+            Some(translated_missing_item(true))
         }
     };
 
@@ -5136,7 +5177,7 @@ pub struct TranslateNotificationsBatchRequest {
 #[derive(Debug, Serialize)]
 pub struct TranslateResponse {
     pub lang: String,
-    pub status: String, // ready | disabled
+    pub status: String, // ready | disabled | missing | error
     pub title: Option<String>,
     pub summary: Option<String>,
 }
@@ -6154,6 +6195,7 @@ struct ReleaseBatchSourceRow {
 struct TranslationCacheRow {
     entity_id: String,
     source_hash: String,
+    status: String,
     title: Option<String>,
     summary: Option<String>,
 }
@@ -6191,6 +6233,7 @@ struct PreparedReleaseBatch {
     candidates: Vec<ReleaseBatchCandidate>,
     pending: Vec<ReleaseBatchCandidate>,
     translated: HashMap<i64, (Option<String>, Option<String>)>,
+    terminal: HashMap<i64, String>,
     missing: HashSet<i64>,
 }
 
@@ -6204,6 +6247,7 @@ async fn prepare_release_batch(
             candidates: Vec::new(),
             pending: Vec::new(),
             translated: HashMap::new(),
+            terminal: HashMap::new(),
             missing: HashSet::new(),
         });
     }
@@ -6274,12 +6318,12 @@ async fn prepare_release_batch(
     if !candidates.is_empty() {
         let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
-            SELECT entity_id, source_hash, title, summary
+            SELECT entity_id, source_hash, status, title, summary
             FROM ai_translations
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status = 'ready' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -6300,12 +6344,17 @@ async fn prepare_release_batch(
 
     let mut pending = Vec::new();
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
+    let mut terminal = HashMap::<i64, String>::new();
 
     for item in &candidates {
         let cache = cache_by_entity.get(&item.entity_id);
         if let Some(cache) = cache
             && cache.source_hash == item.source_hash
         {
+            if matches!(cache.status.as_str(), "disabled" | "missing") {
+                terminal.insert(item.release_id, cache.status.clone());
+                continue;
+            }
             if let Some(raw) = cache.summary.as_deref()
                 && looks_like_json_blob(raw)
                 && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
@@ -6332,6 +6381,7 @@ async fn prepare_release_batch(
         candidates,
         pending,
         translated,
+        terminal,
         missing,
     })
 }
@@ -6339,6 +6389,7 @@ async fn prepare_release_batch(
 fn build_release_batch_item(
     release_id: i64,
     missing: &HashSet<i64>,
+    terminal: &HashMap<i64, String>,
     translated: &HashMap<i64, (Option<String>, Option<String>)>,
 ) -> TranslateBatchItem {
     if missing.contains(&release_id) {
@@ -6349,6 +6400,21 @@ fn build_release_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+        };
+    }
+
+    if let Some(status) = terminal.get(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: status.clone(),
+            title: None,
+            summary: None,
+            error: if status == "missing" {
+                Some("translation result missing".to_owned())
+            } else {
+                None
+            },
         };
     }
 
@@ -6471,7 +6537,12 @@ async fn translate_releases_batch_internal(
     Ok(release_ids
         .iter()
         .map(|release_id| {
-            build_release_batch_item(*release_id, &prepared.missing, &prepared.translated)
+            build_release_batch_item(
+                *release_id,
+                &prepared.missing,
+                &prepared.terminal,
+                &prepared.translated,
+            )
         })
         .collect())
 }
@@ -6593,8 +6664,12 @@ async fn translate_releases_batch_stream_worker(
             if pending_ids.contains(release_id) {
                 continue;
             }
-            let item =
-                build_release_batch_item(*release_id, &prepared.missing, &prepared.translated);
+            let item = build_release_batch_item(
+                *release_id,
+                &prepared.missing,
+                &prepared.terminal,
+                &prepared.translated,
+            );
             if !send_batch_stream_event(
                 &tx,
                 TranslateBatchStreamEvent {
@@ -6689,6 +6764,7 @@ async fn translate_releases_batch_stream_worker(
                     let out = build_release_batch_item(
                         item.release_id,
                         &prepared.missing,
+                        &prepared.terminal,
                         &prepared.translated,
                     );
                     if !send_batch_stream_event(
@@ -7207,14 +7283,19 @@ async fn translate_release_detail_internal(
     #[derive(Debug, sqlx::FromRow)]
     struct TranslationRow {
         source_hash: String,
+        status: String,
         title: Option<String>,
         summary: Option<String>,
     }
     let cached = sqlx::query_as::<_, TranslationRow>(
         r#"
-        SELECT source_hash, title, summary
+        SELECT source_hash, status, title, summary
         FROM ai_translations
-        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN' AND status = 'ready'
+        WHERE user_id = ?
+          AND entity_type = 'release_detail'
+          AND entity_id = ?
+          AND lang = 'zh-CN'
+          AND status IN ('ready', 'disabled', 'missing', 'error')
         LIMIT 1
         "#,
     )
@@ -7226,14 +7307,31 @@ async fn translate_release_detail_internal(
 
     if let Some(cached) = cached
         && cached.source_hash == source_hash
-        && release_detail_translation_ready(Some(original_body.as_str()), cached.summary.as_deref())
     {
-        return Ok(TranslateResponse {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: cached.title,
-            summary: cached.summary,
-        });
+        match cached.status.as_str() {
+            "ready"
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    cached.summary.as_deref(),
+                ) =>
+            {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: cached.title,
+                    summary: cached.summary,
+                });
+            }
+            "disabled" | "missing" | "error" => {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: cached.status,
+                    title: None,
+                    summary: None,
+                });
+            }
+            _ => {}
+        }
     }
 
     mark_translation_requested(
@@ -7710,12 +7808,12 @@ async fn translate_notifications_batch_internal(
     if !candidates.is_empty() {
         let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
-            SELECT entity_id, source_hash, title, summary
+            SELECT entity_id, source_hash, status, title, summary
             FROM ai_translations
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND status = 'ready' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -7735,11 +7833,16 @@ async fn translate_notifications_batch_internal(
     }
 
     let mut translated = HashMap::<String, (Option<String>, Option<String>)>::new();
+    let mut terminal = HashMap::<String, String>::new();
     let mut pending = Vec::new();
     for item in &candidates {
         if let Some(cache) = cache_by_id.get(&item.thread_id)
             && cache.source_hash == item.source_hash
         {
+            if matches!(cache.status.as_str(), "disabled" | "missing") {
+                terminal.insert(item.thread_id.clone(), cache.status.clone());
+                continue;
+            }
             if let Some(raw) = cache.summary.as_deref()
                 && looks_like_json_blob(raw)
                 && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
@@ -7815,6 +7918,21 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("notification not found".to_owned()),
+            });
+            continue;
+        }
+        if let Some(status) = terminal.get(thread_id) {
+            out.push(TranslateBatchItem {
+                id: thread_id.clone(),
+                lang: "zh-CN".to_owned(),
+                status: status.clone(),
+                title: None,
+                summary: None,
+                error: if status == "missing" {
+                    Some("translation result missing".to_owned())
+                } else {
+                    None
+                },
             });
             continue;
         }
@@ -8028,7 +8146,7 @@ mod tests {
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
-        ensure_account_enabled, extract_translation_fields, get_release_detail,
+        ensure_account_enabled, extract_translation_fields, feed_item_from_row, get_release_detail,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
@@ -8041,8 +8159,10 @@ mod tests {
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
         split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
+        translate_release_detail_for_user, translate_response_from_batch_item, truncate_chars,
+        upsert_translation,
     };
+    use crate::ai;
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
@@ -8094,6 +8214,7 @@ mod tests {
             react_rocket: None,
             react_eyes: None,
             trans_source_hash: None,
+            trans_status: None,
             trans_title: None,
             trans_summary: None,
         }
@@ -11037,6 +11158,7 @@ mod tests {
         let cache = TranslationCacheRow {
             entity_id: "1".to_owned(),
             source_hash: "hash".to_owned(),
+            status: "ready".to_owned(),
             title: Some("标题".to_owned()),
             summary: None,
         };
@@ -11048,11 +11170,56 @@ mod tests {
         let cache = TranslationCacheRow {
             entity_id: "1".to_owned(),
             source_hash: "hash".to_owned(),
+            status: "ready".to_owned(),
             title: Some("标题".to_owned()),
             summary: Some("{\"title_zh\":\"标题\"}".to_owned()),
         };
         assert!(looks_like_json_blob(cache.summary.as_deref().unwrap_or("")));
         assert!(!release_cache_entry_reusable(&cache, "body excerpt"));
+    }
+
+    #[test]
+    fn feed_item_from_row_keeps_terminal_missing_non_retryable() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let excerpt = release_excerpt(row.release_body.as_deref()).expect("release excerpt");
+        let source = format!(
+            "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            truncate_chars(excerpt.as_str(), 2000),
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("missing".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, Some(false));
+    }
+
+    #[test]
+    fn feed_item_from_row_keeps_terminal_error_non_retryable() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let excerpt = release_excerpt(row.release_body.as_deref()).expect("release excerpt");
+        let source = format!(
+            "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            truncate_chars(excerpt.as_str(), 2000),
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("error".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
     }
 
     #[test]
@@ -11316,6 +11483,43 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
         assert_eq!(translated.summary.as_deref(), Some("- 条目"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_preserves_terminal_missing_state() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'missing', NULL, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(source_hash.as_str())
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed terminal missing detail translation");
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        let translated = detail.translated.expect("translated detail");
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, Some(false));
     }
 
     #[tokio::test]

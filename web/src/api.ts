@@ -510,9 +510,10 @@ export async function apiGetAdminLlmCallDetail(
 }
 export type ReleaseDetailTranslated = {
 	lang: string;
-	status: "ready" | "missing" | "disabled";
+	status: "ready" | "missing" | "disabled" | "error";
 	title: string | null;
 	summary: string | null;
+	auto_translate?: boolean;
 };
 export type ReleaseDetailResponse = {
 	release_id: string;

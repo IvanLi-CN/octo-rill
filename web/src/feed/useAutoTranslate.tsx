@@ -229,6 +229,7 @@ export function useAutoTranslate(params: {
 		(item: FeedItem) =>
 			enabled &&
 			item.translated?.status === "missing" &&
+			item.translated.auto_translate !== false &&
 			!failedRef.current.has(keyOf(item)),
 		[enabled],
 	);

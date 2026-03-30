@@ -83,7 +83,10 @@ export function FeedItemCard(props: {
 	const showTranslationControls = Boolean(item.translated);
 	const aiDisabled = item.translated?.status === "disabled";
 	const canTranslate =
-		!aiDisabled && item.translated?.status === "missing" && !isTranslating;
+		!aiDisabled &&
+		(item.translated?.status === "missing" ||
+			item.translated?.status === "error") &&
+		!isTranslating;
 
 	const reactions = item.reactions;
 

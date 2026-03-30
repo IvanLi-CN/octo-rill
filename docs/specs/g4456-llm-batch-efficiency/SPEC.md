@@ -53,6 +53,7 @@
 - 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
 - 后端必须保证同一用户、同一 release、同一 source hash、同一请求模式的重复 resolve / 重复同源请求会复用同一条 `translation_requests` 记录，不会新增重复 `translation_work_items`，也不会因为轮询继续制造额外 request 行。
 - 当较新的 source hash 进入排队时，后端不得为了挂起新任务而清空已经 `ready` 的旧译文；现有可展示译文必须保留到新任务真正进入终态为止。
+- feed / release detail 的普通读取接口必须透传当前 source hash 上的 `disabled/missing/error` 终态；其中 `missing/error` 需要显式标记为“禁止自动重排队”，避免页面刷新后再次自动建队列。
 - 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
 - feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
 - 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。
@@ -74,6 +75,7 @@
 ### Core flows
 
 - Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条按原顺序交给结果聚合接口。若候选数超过单次 `60` 条限制，则前端继续按顺序拆成多次 resolve 调用。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
+- Feed 自动翻译：`release_summary/feed_card` 的 source hash 以服务端当前 release 数据为准；若旧页面带来的旧 source blocks 晚到，后端必须先 canonicalize 到当前 release，再决定复用/建队列，旧 source 不得覆盖当前结果行。
 - Feed 自动翻译：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；若窗口内请求足够多，调度器优先按 `1800 tokens` 左右切成多个小批，以便更多 worker 并行启动，而不是等待大批次攒满再跑。
 - Release detail 翻译：详情 Markdown chunk 批量翻译，失败 chunk 再单条重试。
 - Notification 翻译：支持线程批量翻译，缓存命中时直接返回。

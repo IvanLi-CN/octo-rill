@@ -1833,10 +1833,11 @@ async fn resolve_translation_results_for_user(
         .map_err(ApiError::internal)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
+        let canonical_item = canonicalize_translation_result_item(&mut tx, user_id, item).await?;
         let result = ensure_translation_result_for_item(
             &mut tx,
             user_id,
-            item,
+            &canonical_item,
             "user",
             now.as_str(),
             retry_on_error,
@@ -2580,6 +2581,13 @@ async fn upsert_translation_demand_state(
     let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
         return Ok(());
     };
+    if let Some(current_source_hash) =
+        current_server_source_hash_for_item(tx, user_id, item).await?
+        && current_source_hash != source_hash
+    {
+        return Ok(());
+    }
+
     let update_same_source = sqlx::query(
         r#"
         UPDATE ai_translations
@@ -4450,6 +4458,102 @@ fn map_entity_type(kind: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct CanonicalFeedReleaseRow {
+    full_name: String,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+}
+
+async fn build_canonical_feed_card_request_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<Option<TranslationRequestItemInput>, ApiError> {
+    if item.kind != "release_summary" || item.variant != "feed_card" {
+        return Ok(None);
+    }
+
+    let Ok(release_id) = item.entity_id.parse::<i64>() else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query_as::<_, CanonicalFeedReleaseRow>(
+        r#"
+        SELECT sr.full_name, r.tag_name, r.name, r.body
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        WHERE r.release_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let excerpt = crate::api::release_excerpt(row.body.as_deref())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let metadata = row.full_name.trim().to_owned();
+
+    let mut source_blocks = vec![TranslationSourceBlock {
+        slot: "title".to_owned(),
+        text: title,
+    }];
+    if let Some(excerpt) = excerpt {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "excerpt".to_owned(),
+            text: excerpt,
+        });
+    }
+    if !metadata.is_empty() {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "metadata".to_owned(),
+            text: metadata,
+        });
+    }
+
+    Ok(Some(TranslationRequestItemInput {
+        source_blocks,
+        ..item.clone()
+    }))
+}
+
+async fn canonicalize_translation_result_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<TranslationRequestItemInput, ApiError> {
+    Ok(build_canonical_feed_card_request_item(tx, user_id, item)
+        .await?
+        .unwrap_or_else(|| item.clone()))
+}
+
+async fn current_server_source_hash_for_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+) -> Result<Option<String>, ApiError> {
+    Ok(build_canonical_feed_card_request_item(tx, user_id, item)
+        .await?
+        .map(|canonical| build_source_hash(&canonical)))
+}
+
 fn pending_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
     TranslationResultItem {
         producer_ref,
@@ -5649,6 +5753,172 @@ mod tests {
         assert_eq!(row.2.as_deref(), Some("当前标题"));
         assert_eq!(row.3.as_deref(), Some("当前摘要"));
         assert_eq!(row.4.as_deref(), Some("current-work-item"));
+    }
+
+    #[tokio::test]
+    async fn upsert_translation_demand_state_ignores_stale_feed_card_source_when_server_moved_on() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            420,
+            "openai/codex",
+            "Release v2.0.0",
+            "- current body",
+        )
+        .await;
+
+        let current_item = release_feed_item(
+            "420",
+            "Release v2.0.0",
+            Some("- current body"),
+            Some("openai/codex"),
+        );
+        let stale_item = release_feed_item(
+            "420",
+            "Release v1.9.0",
+            Some("- stale body"),
+            Some("openai/codex"),
+        );
+        let current_hash = build_source_hash(&current_item);
+        let stale_hash = build_source_hash(&stale_item);
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind("1")
+        .bind("420")
+        .bind(current_hash.as_str())
+        .bind("当前标题")
+        .bind("当前摘要")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .execute(&pool)
+        .await
+        .expect("seed current translation");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_translation_demand_state(
+            &mut tx,
+            "1",
+            &stale_item,
+            stale_hash.as_str(),
+            "queued",
+            "stale-work-item",
+            "2026-03-30T00:00:03Z",
+        )
+        .await
+        .expect("ignore stale demand");
+        tx.commit().await.expect("commit tx");
+
+        let row: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, title, summary, active_work_item_id
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind("420")
+        .fetch_one(&pool)
+        .await
+        .expect("load guarded translation row");
+
+        assert_eq!(row.0, current_hash);
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2.as_deref(), Some("当前标题"));
+        assert_eq!(row.3.as_deref(), Some("当前摘要"));
+        assert!(row.4.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_uses_canonical_feed_card_source() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            420,
+            "openai/codex",
+            "Release v2.0.0",
+            "- current body",
+        )
+        .await;
+
+        let current_item = release_feed_item(
+            "420",
+            "Release v2.0.0",
+            Some("- current body"),
+            Some("openai/codex"),
+        );
+        let stale_item = release_feed_item(
+            "420",
+            "Release v1.9.0",
+            Some("- stale body"),
+            Some("openai/codex"),
+        );
+        let current_hash = build_source_hash(&current_item);
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind("1")
+        .bind("420")
+        .bind(current_hash.as_str())
+        .bind("当前标题")
+        .bind("当前摘要")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .execute(&pool)
+        .await
+        .expect("seed current translation");
+
+        let resolved =
+            resolve_translation_results_for_user(state.as_ref(), "1", &[stale_item], false)
+                .await
+                .expect("resolve canonical result");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, "ready");
+        assert_eq!(resolved[0].title_zh.as_deref(), Some("当前标题"));
+        assert_eq!(resolved[0].summary_md.as_deref(), Some("当前摘要"));
+
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let work_item_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+                .fetch_one(&pool)
+                .await
+                .expect("count work items");
+        assert_eq!(request_count, 0);
+        assert_eq!(work_item_count, 0);
     }
 
     #[tokio::test]
@@ -7732,7 +8002,12 @@ mod tests {
         assert_eq!(derive_request_source(&[detail_item]), "release_detail");
     }
 
-    fn sample_release_item(entity_id: &str) -> TranslationRequestItemInput {
+    fn release_feed_item(
+        entity_id: &str,
+        title: &str,
+        excerpt: Option<&str>,
+        metadata: Option<&str>,
+    ) -> TranslationRequestItemInput {
         TranslationRequestItemInput {
             producer_ref: format!("feed.auto_translate:release:{entity_id}"),
             kind: "release_summary".to_owned(),
@@ -7743,17 +8018,36 @@ mod tests {
             source_blocks: vec![
                 TranslationSourceBlock {
                     slot: "title".to_owned(),
-                    text: format!("Release {entity_id}"),
+                    text: title.to_owned(),
                 },
                 TranslationSourceBlock {
                     slot: "excerpt".to_owned(),
-                    text: "- change A
-- change B"
+                    text: excerpt
+                        .unwrap_or(
+                            "- change A
+- change B",
+                        )
                         .to_owned(),
+                },
+                TranslationSourceBlock {
+                    slot: "metadata".to_owned(),
+                    text: metadata.unwrap_or("octo/repo").to_owned(),
                 },
             ],
             target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
         }
+    }
+
+    fn sample_release_item(entity_id: &str) -> TranslationRequestItemInput {
+        release_feed_item(
+            entity_id,
+            &format!("Release {entity_id}"),
+            Some(
+                "- change A
+- change B",
+            ),
+            Some("octo/repo"),
+        )
     }
 
     async fn setup_pool() -> SqlitePool {
@@ -7838,5 +8132,86 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    async fn seed_feed_release(
+        pool: &SqlitePool,
+        user_id: &str,
+        repo_id: i64,
+        release_id: i64,
+        full_name: &str,
+        title: &str,
+        body: &str,
+    ) {
+        let now = "2026-03-30T00:00:00Z";
+        let mut full_name_parts = full_name.splitn(2, '/');
+        let owner_login = full_name_parts.next().unwrap_or("owner");
+        let name = full_name_parts.next().unwrap_or("repo");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+            "#,
+        )
+        .bind(format!("repo-release-{repo_id}-{release_id}"))
+        .bind(repo_id)
+        .bind(release_id)
+        .bind(format!("node-{release_id}"))
+        .bind(title)
+        .bind(title)
+        .bind(body)
+        .bind(format!(
+            "https://github.com/{full_name}/releases/tag/{title}"
+        ))
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed feed release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            "#,
+        )
+        .bind(format!("star-{repo_id}-{release_id}"))
+        .bind(user_id)
+        .bind(repo_id)
+        .bind(full_name)
+        .bind(owner_login)
+        .bind(name)
+        .bind("translation canonical test")
+        .bind(format!("https://github.com/{full_name}"))
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed star");
     }
 }

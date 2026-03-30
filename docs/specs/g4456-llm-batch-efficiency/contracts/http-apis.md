@@ -46,8 +46,14 @@
 - 若结果表中当前 source hash 已是 `queued/running`，接口会继续核对活跃 work item；若 work item 仍在途则直接返回 queued/running。
 - 若结果表未命中当前 source hash，或结果表处于 pending 但已找不到活跃 work item，接口会在后端创建或复用 work item；若旧行上仍有可展示的 `ready/disabled/missing` 结果，则该行内容必须保留，只额外挂住新的活跃 work item，而不是先把旧结果清空。
 - 若同一用户对同一 source hash 重复调用相同模式的 ensure/resolve，后端必须复用现有 `translation_requests` 行，而不是继续累加重复 request 记录。
+- 对 `kind=release_summary` 且 `variant=feed_card` 的条目，后端必须先用当前 release 数据重建 canonical source blocks，再参与 source hash 命中、去重与建队列；旧页面带来的旧 source 不得绑定当前结果行。
 - 若旧 source hash 的 resolve 在更晚时间再次到达，后端不得把结果表回退到更旧的 pending/ready 状态；只有当前已绑定的活跃 work item 或同 source hash 的终态结果才允许真正覆盖结果行。
 - 若条目上一次结果为 error，默认继续返回 error；只有 `retry_on_error=true` 时才允许在原 request/work item 上重置并重新入队，并优先复用最近一次失败的 `translation_requests` 快照供 request-based 读取接口继续追踪。
+
+## Feed / Detail Read Semantics
+
+- `/api/feed` 与 release detail 普通读取接口必须透传当前 source hash 上的 `ready/disabled/missing/error` 终态，而不是只识别 `ready`。
+- 当普通读取接口返回 `missing/error` 且这是结果表里的当前终态时，响应需要显式标记“不要自动重排队”；只有新的显式 resolve / 手动翻译调用，才能再次进入 ensure 队列。
 
 ## Submit Translation Request（POST /api/translate/requests）
 
