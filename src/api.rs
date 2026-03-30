@@ -5829,6 +5829,45 @@ async fn upsert_translation(
     Ok(())
 }
 
+async fn mark_translation_requested(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    t: TranslationUpsert<'_>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(user_id, entity_type, entity_id, lang) DO UPDATE SET
+          source_hash = excluded.source_hash,
+          status = excluded.status,
+          title = NULL,
+          summary = NULL,
+          error_text = NULL,
+          active_work_item_id = NULL,
+          updated_at = excluded.updated_at
+        WHERE ai_translations.source_hash = excluded.source_hash
+           OR ai_translations.updated_at <= excluded.updated_at
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(user_id)
+    .bind(t.entity_type)
+    .bind(t.entity_id)
+    .bind(t.lang)
+    .bind(t.source_hash)
+    .bind(requested_at)
+    .bind(requested_at)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct ReleaseBatchCandidate {
     release_id: i64,
@@ -6362,6 +6401,31 @@ async fn upsert_release_batch_translations(
     Ok(())
 }
 
+async fn mark_release_batch_translations_requested(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    candidates: &[ReleaseBatchCandidate],
+) -> Result<(), ApiError> {
+    for item in candidates {
+        mark_translation_requested(
+            state,
+            user_id,
+            requested_at,
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id: &item.entity_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn translate_releases_batch_internal(
     state: &AppState,
     user_id: &str,
@@ -6383,6 +6447,13 @@ async fn translate_releases_batch_internal(
 
     let requested_at = chrono::Utc::now().to_rfc3339();
     let mut prepared = prepare_release_batch(state, user_id, release_ids).await?;
+    mark_release_batch_translations_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.pending,
+    )
+    .await?;
     let translated_pending = translate_release_candidates_with_ai(state, &prepared.pending).await;
     for (release_id, values) in translated_pending {
         prepared.translated.insert(release_id, values);
@@ -7165,6 +7236,21 @@ async fn translate_release_detail_internal(
         });
     }
 
+    mark_translation_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "release_detail",
+            entity_id: &entity_id,
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: None,
+            summary: None,
+        },
+    )
+    .await?;
+
     let translated_title = ai::chat_completion(
         state,
         "你是一个翻译助手，只把 GitHub Release 标题翻译成自然中文。输出纯文本，不要解释。",
@@ -7678,6 +7764,23 @@ async fn translate_notifications_batch_internal(
         pending.push(item.clone());
     }
 
+    for item in &pending {
+        mark_translation_requested(
+            state,
+            user_id,
+            requested_at.as_str(),
+            TranslationUpsert {
+                entity_type: "notification",
+                entity_id: &item.thread_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
+    }
+
     let pending_translated = translate_notification_candidates_with_ai(state, &pending).await;
     for (thread_id, value) in pending_translated {
         translated.insert(thread_id, value);
@@ -7921,7 +8024,7 @@ mod tests {
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
         LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, TranslateBatchItem, TranslationCacheRow,
-        admin_download_realtime_task_log, admin_get_llm_call_detail,
+        TranslationUpsert, admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
@@ -7929,7 +8032,7 @@ mod tests {
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        markdown_structure_preserved, me, normalize_translation_fields,
+        mark_translation_requested, markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_positive_admin_concurrency, parse_release_id_param,
@@ -7938,7 +8041,7 @@ mod tests {
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
         split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_response_from_batch_item,
+        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use std::{fs, net::SocketAddr, sync::Arc};
 
@@ -10971,6 +11074,101 @@ mod tests {
         let hash1 = release_detail_source_hash("acme/repo", "v1.0.0", "line one");
         let hash2 = release_detail_source_hash("acme/repo", "v1.0.0", "line two");
         assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn mark_translation_requested_blocks_older_result_until_newer_request_finishes() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 7, "race-user", 0, 0).await;
+
+        let user_id = test_user_id(7);
+        let entity_id = "42";
+        let older_hash = "older-source";
+        let newer_hash = "newer-source";
+
+        mark_translation_requested(
+            state.as_ref(),
+            user_id.as_str(),
+            "2026-03-30T00:00:02Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: newer_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await
+        .expect("mark newer request");
+
+        upsert_translation(
+            state.as_ref(),
+            user_id.as_str(),
+            "2026-03-30T00:00:01Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: older_hash,
+                title: Some("旧标题"),
+                summary: Some("旧摘要"),
+            },
+        )
+        .await
+        .expect("older result should not overwrite newer request");
+
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, summary
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(entity_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load pending translation row");
+        assert_eq!(row.0, newer_hash);
+        assert_eq!(row.1, "running");
+        assert_eq!(row.2, None);
+
+        upsert_translation(
+            state.as_ref(),
+            user_id.as_str(),
+            "2026-03-30T00:00:02Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: newer_hash,
+                title: Some("新标题"),
+                summary: Some("新摘要"),
+            },
+        )
+        .await
+        .expect("newer result should land");
+
+        let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, title, summary
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(entity_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load completed translation row");
+        assert_eq!(row.0, newer_hash);
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2.as_deref(), Some("新标题"));
+        assert_eq!(row.3.as_deref(), Some("新摘要"));
     }
 
     #[test]

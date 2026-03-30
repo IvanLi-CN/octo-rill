@@ -403,8 +403,30 @@ export function useAutoTranslate(params: {
 		if (!enabled || !mountedRef.current || pollBusyRef.current) return;
 		pollBusyRef.current = true;
 		try {
+			const viewportHeight =
+				window.innerHeight || document.documentElement.clientHeight || 0;
+			const windowEntries: Array<{ key: string; top: number; bottom: number }> =
+				[];
+			for (const [key, element] of keyToElementRef.current) {
+				if (!itemByKeyRef.current.has(key)) continue;
+				const rect = element.getBoundingClientRect();
+				if (rect.bottom <= 0) continue;
+				windowEntries.push({
+					key,
+					top: rect.top,
+					bottom: rect.bottom,
+				});
+			}
+			const windowKeys = new Set(
+				buildVisibleWindowPlan(windowEntries, viewportHeight).map(
+					(entry) => entry.key,
+				),
+			);
 			const pending = Array.from(requestTasksRef.current.entries()).map(
 				([key, task]) => {
+					if (!task.rejectOnFailure && !windowKeys.has(key)) {
+						return null;
+					}
 					const item = itemByKeyRef.current.get(key);
 					if (!item) return null;
 					return {
