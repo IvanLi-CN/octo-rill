@@ -86,6 +86,18 @@ type TranslationCandidate = {
 	bottom: number;
 };
 
+type ViewportPlanEntry = {
+	key: string;
+	top: number;
+	bottom: number;
+	candidate: TranslationCandidate | null;
+};
+
+type CandidateTask = {
+	candidate: TranslationCandidate;
+	task: TranslationTask;
+};
+
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T | PromiseLike<T>) => void;
 	let reject!: (reason?: unknown) => void;
@@ -117,15 +129,15 @@ function intersectsViewportRange(
 	return bottom > rangeTop && top < rangeBottom;
 }
 
-function buildVisibleWindowPlan(
-	candidates: TranslationCandidate[],
+function buildVisibleWindowPlan<T extends { top: number; bottom: number }>(
+	candidates: T[],
 	viewportHeight: number,
 ) {
 	if (viewportHeight <= 0 || candidates.length === 0) {
-		return [] as TranslationCandidate[];
+		return [] as T[];
 	}
 
-	const visible: TranslationCandidate[] = [];
+	const visible: T[] = [];
 	let lastVisibleIndex = -1;
 	for (let index = 0; index < candidates.length; index += 1) {
 		const candidate = candidates[index];
@@ -303,29 +315,6 @@ export function useAutoTranslate(params: {
 		[clearTask, settleTaskPromise],
 	);
 
-	const resolveRequestItems = useCallback(
-		async (
-			items: TranslationRequestItemInput[],
-			options?: { retryOnError?: boolean },
-		) => {
-			const all: TranslationResultItem[] = [];
-			for (
-				let index = 0;
-				index < items.length;
-				index += RESOLVE_RESULTS_MAX_ITEMS
-			) {
-				const chunk = items.slice(index, index + RESOLVE_RESULTS_MAX_ITEMS);
-				const response = await apiResolveTranslationResults({
-					items: chunk,
-					retry_on_error: options?.retryOnError ?? false,
-				});
-				all.push(...response.items);
-			}
-			return { items: all };
-		},
-		[],
-	);
-
 	const applyResolvedResults = useCallback(
 		(
 			candidates: Array<{
@@ -382,6 +371,34 @@ export function useAutoTranslate(params: {
 		[finalizeFailure, finalizeSuccess, finalizeTerminal],
 	);
 
+	const resolveCandidateTasks = useCallback(
+		async (
+			entries: CandidateTask[],
+			options?: {
+				retryOnError?: boolean;
+				onChunkError?: (chunk: CandidateTask[], error: unknown) => void;
+			},
+		) => {
+			for (
+				let index = 0;
+				index < entries.length;
+				index += RESOLVE_RESULTS_MAX_ITEMS
+			) {
+				const chunk = entries.slice(index, index + RESOLVE_RESULTS_MAX_ITEMS);
+				try {
+					const response = await apiResolveTranslationResults({
+						items: chunk.map(({ candidate }) => candidate.requestItem),
+						retry_on_error: options?.retryOnError ?? false,
+					});
+					applyResolvedResults(chunk, response.items);
+				} catch (error) {
+					options?.onChunkError?.(chunk, error);
+				}
+			}
+		},
+		[applyResolvedResults],
+	);
+
 	const pollPendingTasks = useCallback(async () => {
 		if (!enabled || !mountedRef.current || pollBusyRef.current) return;
 		pollBusyRef.current = true;
@@ -413,39 +430,26 @@ export function useAutoTranslate(params: {
 			);
 			if (active.length === 0) return;
 
-			const response = await resolveRequestItems(
-				active.map(({ task }) => task.requestItem),
-			);
-			applyResolvedResults(active, response.items);
-		} catch (error) {
-			for (const [key, task] of requestTasksRef.current) {
-				const item = itemByKeyRef.current.get(key);
-				if (!item) continue;
-				const count = (pollErrorCountRef.current.get(key) ?? 0) + 1;
-				if (count >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
-					finalizeFailure(
-						{
-							key,
-							item,
-							requestItem: task.requestItem,
-							sourceKey: task.sourceKey,
-							top: 0,
-							bottom: 0,
-						},
-						task,
-						error,
-					);
-				} else {
-					pollErrorCountRef.current.set(key, count);
-				}
-			}
+			await resolveCandidateTasks(active, {
+				onChunkError: (chunk, error) => {
+					for (const { candidate, task } of chunk) {
+						const count =
+							(pollErrorCountRef.current.get(candidate.key) ?? 0) + 1;
+						if (count >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
+							finalizeFailure(candidate, task, error);
+						} else {
+							pollErrorCountRef.current.set(candidate.key, count);
+						}
+					}
+				},
+			});
 		} finally {
 			pollBusyRef.current = false;
 			if (requestTasksRef.current.size > 0) {
 				schedulePendingPollRef.current();
 			}
 		}
-	}, [applyResolvedResults, enabled, finalizeFailure, resolveRequestItems]);
+	}, [enabled, finalizeFailure, resolveCandidateTasks]);
 
 	const schedulePendingPoll = useCallback(() => {
 		if (!enabled || !mountedRef.current || requestTasksRef.current.size === 0)
@@ -509,17 +513,13 @@ export function useAutoTranslate(params: {
 
 			bumpRender();
 
-			try {
-				const response = await resolveRequestItems(
-					candidates.map(({ candidate }) => candidate.requestItem),
-				);
-				applyResolvedResults(candidates, response.items);
-			} catch (error) {
-				for (const { candidate, task } of candidates) {
-					finalizeFailure(candidate, task, error);
-				}
-				return byKey;
-			}
+			await resolveCandidateTasks(candidates, {
+				onChunkError: (chunk, error) => {
+					for (const { candidate, task } of chunk) {
+						finalizeFailure(candidate, task, error);
+					}
+				},
+			});
 
 			if (requestTasksRef.current.size > 0) {
 				schedulePendingPoll();
@@ -528,38 +528,47 @@ export function useAutoTranslate(params: {
 			return byKey;
 		},
 		[
-			applyResolvedResults,
 			bumpRender,
 			finalizeFailure,
-			resolveRequestItems,
+			resolveCandidateTasks,
 			schedulePendingPoll,
 			retireTask,
 		],
 	);
 
 	const prepareCandidates = useCallback(() => {
-		const candidates: TranslationCandidate[] = [];
+		const candidates: ViewportPlanEntry[] = [];
 		for (const [key, element] of keyToElementRef.current) {
 			const item = itemByKeyRef.current.get(key);
-			if (!item || !shouldAutoTranslate(item)) continue;
-			const requestItem = buildReleaseSummaryRequestItem(item);
-			const sourceKey = buildRequestSourceKey(requestItem);
-			const existing = requestTasksRef.current.get(key);
-			if (existing) {
-				if (existing.sourceKey === sourceKey) {
-					continue;
-				}
-				retireTask(key, existing);
-			}
+			if (!item) continue;
 			const rect = element.getBoundingClientRect();
 			if (rect.bottom <= 0) continue;
+			const existing = requestTasksRef.current.get(key);
+			let candidate: TranslationCandidate | null = null;
+			if (shouldAutoTranslate(item)) {
+				const requestItem = buildReleaseSummaryRequestItem(item);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				if (existing) {
+					if (existing.sourceKey !== sourceKey) {
+						retireTask(key, existing);
+					}
+				}
+				if (!existing || existing.sourceKey !== sourceKey) {
+					candidate = {
+						key,
+						item,
+						requestItem,
+						sourceKey,
+						top: rect.top,
+						bottom: rect.bottom,
+					};
+				}
+			}
 			candidates.push({
 				key,
-				item,
-				requestItem,
-				sourceKey,
 				top: rect.top,
 				bottom: rect.bottom,
+				candidate,
 			});
 		}
 
@@ -584,10 +593,11 @@ export function useAutoTranslate(params: {
 				plannerDirtyRef.current = false;
 				const viewportHeight =
 					window.innerHeight || document.documentElement.clientHeight || 0;
-				const plan = buildVisibleWindowPlan(
-					prepareCandidates(),
-					viewportHeight,
-				);
+				const plan = buildVisibleWindowPlan(prepareCandidates(), viewportHeight)
+					.map((entry) => entry.candidate)
+					.filter((candidate): candidate is TranslationCandidate =>
+						Boolean(candidate),
+					);
 				if (plan.length > 0) {
 					await submitCandidates(plan);
 				}
@@ -672,27 +682,26 @@ export function useAutoTranslate(params: {
 			requestTasksRef.current.set(key, task);
 			bumpRender();
 			try {
-				const response = await resolveRequestItems([requestItem], {
+				await resolveCandidateTasks([{ candidate, task }], {
 					retryOnError: true,
+					onChunkError: (chunk, error) => {
+						for (const { candidate, task } of chunk) {
+							finalizeFailure(candidate, task, error);
+						}
+					},
 				});
-				applyResolvedResults([{ candidate, task }], response.items);
 				if (requestTasksRef.current.size > 0) {
 					schedulePendingPollRef.current();
 				}
 				return await task.promise;
 			} catch (error) {
-				finalizeFailure(candidate, task, error);
-				failedRef.current.add(key);
+				if (requestTasksRef.current.get(key) === task) {
+					finalizeFailure(candidate, task, error);
+				}
 				throw error;
 			}
 		},
-		[
-			applyResolvedResults,
-			bumpRender,
-			finalizeFailure,
-			resolveRequestItems,
-			retireTask,
-		],
+		[bumpRender, finalizeFailure, resolveCandidateTasks, retireTask],
 	);
 
 	useEffect(() => {
