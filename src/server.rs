@@ -207,6 +207,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(translations::get_translation_request),
         )
         .route(
+            "/translate/results",
+            post(translations::resolve_translation_results),
+        )
+        .route(
             "/translate/requests/{request_id}/stream",
             get(translations::stream_translation_request),
         )

@@ -571,6 +571,10 @@ export type TranslationBatchSubmitRequest = {
 	items: TranslationRequestItemInput[];
 	item?: never;
 };
+export type TranslationResolveRequest = {
+	items: TranslationRequestItemInput[];
+	retry_on_error?: boolean;
+};
 export type TranslationSubmitRequest =
 	| TranslationSingleSubmitRequest
 	| TranslationBatchSubmitRequest;
@@ -622,6 +626,9 @@ export type TranslationBatchSubmitItemResponse = {
 };
 export type TranslationBatchSubmitResponse = {
 	requests: TranslationBatchSubmitItemResponse[];
+};
+export type TranslationResolveResponse = {
+	items: TranslationResultItem[];
 };
 export type TranslationRequestStreamEvent = {
 	event: "queued" | "batched" | "running" | "completed" | "failed";
@@ -765,6 +772,16 @@ export async function apiGetTranslationRequest(
 ): Promise<TranslationRequestResponse> {
 	return apiGet<TranslationRequestResponse>(
 		`/api/translate/requests/${encodeURIComponent(requestId)}`,
+	);
+}
+export async function apiResolveTranslationResults(
+	body: TranslationResolveRequest,
+	init?: RequestInit,
+): Promise<TranslationResolveResponse> {
+	return apiPostJson<TranslationResolveResponse>(
+		"/api/translate/results",
+		body,
+		init,
 	);
 }
 export async function apiGetAdminTranslationStatus(): Promise<AdminTranslationStatusResponse> {

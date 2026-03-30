@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-02-25
-- Last: 2026-02-25
+- Last: 2026-03-30
 
 ## 背景 / 问题陈述
 
@@ -18,20 +18,21 @@
 
 - 固定模型上限信源与同步策略（内置，不开放配置）。
 - 引入 token 预算驱动的批量装箱，覆盖 release/release detail/notification/brief 相关 LLM 路径。
-- 保持现有单条 API 对外兼容，新增 batch API 供前端聚合调用。
+- 把 release feed 自动翻译切换为“可见卡片 + 最后一个可见卡片之后 10 条”的结果聚合模型。
+- 为 release feed 新增后端 ensure/resolve 结果接口，由后端负责结果表状态、work item 去重与排队复用。
 
 ### Non-goals
 
 - 不新增管理后台或运行时配置页面。
 - 不引入更多 token 预算环境变量。
-- 不改变翻译结果语义与 UI 交互语义（仅改变调用组织方式）。
+- 不改翻译调度器 worker 分流规则或 feed 分页行为。
 
 ## 范围（Scope）
 
 ### In scope
 
-- 后端：`src/ai.rs`、`src/api.rs`、`src/server.rs`、`src/config.rs`
-- 前端：`web/src/feed/useAutoTranslate.tsx`、`web/src/feed/types.ts`
+- 后端：`src/ai.rs`、`src/api.rs`、`src/server.rs`、`src/config.rs`、`src/translations.rs`
+- 前端：`web/src/api.ts`、`web/src/feed/useAutoTranslate.tsx`、`web/src/feed/types.ts`
 - 文档：`README.md`、`docs/product.md`、`.env.example`
 
 ### Out of scope
@@ -47,16 +48,21 @@
 - 模型目录同步固定为：启动时懒刷新 + 每 24h 刷新。
 - 未识别模型兜底固定为：`32768`。
 - 仅保留一个手动覆盖变量：`AI_MODEL_CONTEXT_LIMIT`。
-- 新增 batch API：
-  - `POST /api/translate/releases/batch`
-  - `POST /api/translate/release/detail/batch`
-  - `POST /api/translate/notifications/batch`
-- 单条 API 保持兼容并委托 batch 核心执行。
+- feed 自动翻译必须调用 `POST /api/translate/results`，由前端上报可见 release 与最后一个可见 release 之后的连续 10 条。
+- `ai_translations` 必须升级为带状态的结果真相源；同一用户、同一实体、同一语言在任意时刻只保留 1 条当前结果记录，并显式表达 `queued/running/ready/disabled/missing/error`。
+- 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
+- 后端必须保证同一用户、同一 release、同一 source hash 的重复 resolve 不会新增重复 `translation_work_items`，且不会因为轮询新增重复 `translation_requests`。
+- 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
+- feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
+- 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。
+- 同一条 release 处于 `queued/running/ready/disabled/error` 任一状态时，前端不得重复制造新的自动翻译记录。
+- 自动结果轮询不得把 `error` 条目重新加入队列。
+- 手动“翻译”必须复用同一套结果聚合接口；仅当调用方显式声明重试意图时，后端才允许把旧 `error` request/work item 重置并重新入队。
 
 ### SHOULD
 
-- batch 支持部分成功返回，避免整批失败导致全量重试。
-- batch 解析失败时自动回退到单条翻译。
+- 结果聚合接口支持部分成功返回，避免整批失败导致全量重试。
+- 前端对 pending 条目执行批量状态轮询，避免退回逐条 request_id 查询。
 
 ### COULD
 
@@ -66,7 +72,8 @@
 
 ### Core flows
 
-- Feed 自动翻译：可见 release 条目聚合为 batch 请求，后端按 token 预算分组后调用 LLM。
+- Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条统一发给结果聚合接口。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
+- Feed 自动翻译：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；若窗口内请求足够多，调度器优先按 `1800 tokens` 左右切成多个小批，以便更多 worker 并行启动，而不是等待大批次攒满再跑。
 - Release detail 翻译：详情 Markdown chunk 批量翻译，失败 chunk 再单条重试。
 - Notification 翻译：支持线程批量翻译，缓存命中时直接返回。
 - Brief 生成：多个 repo 的 release 摘要可在同一批次请求中处理。
@@ -75,6 +82,10 @@
 
 - 外部目录刷新失败：不影响主流程，使用已缓存目录/内置映射/兜底值。
 - batch 返回格式不合法：批次降级到单条翻译。
+- 同一 demand window 在滚动抖动期间被多次 resolve：后端复用已存在结果行/work item，不重复创建记录。
+- 已失败条目在自动轮询中再次被 resolve：后端保持 `error` 终态，不自动重排队。
+- 已失败条目被用户手动重试：后端复用原 request/work item 并重置为 queued，而不是再插入一条新的 request。
+- 旧 source hash 的 work item 晚到完成：不得覆盖结果表里已经切换到更新 source hash 的状态或译文。
 - 单条资源不存在：batch item 返回 `status=error` + `error` 信息；单条接口保持 404 语义。
 
 ## 接口契约（Interfaces & Contracts）
@@ -83,12 +94,9 @@
 
 | 接口（Name） | 类型（Kind） | 范围（Scope） | 变更（Change） | 契约文档（Contract Doc） | 负责人（Owner） | 使用方（Consumers） | 备注（Notes） |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `/api/translate/releases/batch` | HTTP | internal | New | ./contracts/http-apis.md | backend | web feed auto-translate | release 批量翻译 |
-| `/api/translate/release/detail/batch` | HTTP | internal | New | ./contracts/http-apis.md | backend | web detail panel | release detail 批量翻译 |
-| `/api/translate/notifications/batch` | HTTP | internal | New | ./contracts/http-apis.md | backend | future inbox batching | notification 批量翻译 |
-| `/api/translate/release` | HTTP | internal | Modify | ./contracts/http-apis.md | backend | existing web/manual retry | 内部改为委托 batch |
-| `/api/translate/release/detail` | HTTP | internal | Modify | ./contracts/http-apis.md | backend | existing web detail | 内部改为委托 batch core |
-| `/api/translate/notification` | HTTP | internal | Modify | ./contracts/http-apis.md | backend | existing inbox usage | 内部改为委托 batch |
+| `/api/translate/results` | HTTP | internal | New | ./contracts/http-apis.md | backend | web feed auto-translate | release feed 的结果聚合 + ensure 入口 |
+| `/api/translate/requests` | HTTP | internal | Existing | ./contracts/http-apis.md | backend | web detail panel | 详情侧栏仍使用单条/批量异步提交入口 |
+| `/api/translate/requests/{request_id}` | HTTP | internal | Existing | ./contracts/http-apis.md | backend | web detail panel | 单条 request 查询与状态回收 |
 
 ### 契约文档（按 Kind 拆分）
 
@@ -97,17 +105,37 @@
 
 ## 验收标准（Acceptance Criteria）
 
-- Given Feed 同时出现 >= 8 条待翻译 release
+- Given 首批 feed 中存在多个可见 release 且其后仍有待翻译条目
   When 自动翻译触发
-  Then 前端调用 batch 接口而非逐条接口，后端可返回逐项结果。
+  Then 前端必须调用 1 次 `POST /api/translate/results`，其中包含所有可见 release 与最后一个可见卡片之后的连续 10 条 release。
+
+- Given 同一条 release 在短时间内被前端多次 resolve
+  When source hash 未变化
+  Then 后端不得新增重复 `translation_work_items`，且自动 resolve 不得继续制造新的 `translation_requests`。
+
+- Given 某条 release 的译文尚未 ready
+  When 结果聚合接口被重复轮询
+  Then 接口必须持续返回 `queued/running` 并复用原结果行/work item，直到任务进入终态。
+
+- Given 用户打开 feed 首屏并触发自动翻译
+  When 当前可见窗口只产生少量 release 任务
+  Then 首批 work item 应在约 `500ms` 聚合窗口后开始 claim，不得继续等待 `4s` 级别的 deadline。
+
+- Given 可见窗口与后续 10 条合计形成大量待翻译 release
+  When 调度器装箱 batch
+  Then 单个 translation batch 的输入预算必须被 `1800 tokens` 截断，避免只生成 1-2 个超大 batch 而闲置其余 worker。
+
+- Given 某条 release 已进入 `error`
+  When 自动可见窗口继续调用结果聚合接口
+  Then 后端必须继续返回 `error`，不得仅因轮询再次把该条 release 加回队列。
 
 - Given 模型目录刷新失败
   When 计算 token 预算
   Then 系统仍可使用缓存/内置映射/兜底值继续翻译，不中断主流程。
 
-- Given 单条接口被调用
-  When 请求有效
-  Then 结果语义与历史一致（ready/disabled，404 语义不变）。
+- Given 某条 release 已有自动 request 在途
+  When 用户手动点击“翻译”
+  Then 前端直接复用已有 request，不重复创建新的自动翻译任务。
 
 - Given release detail 存在多个 chunk
   When 调用翻译
@@ -124,7 +152,7 @@
 ### Testing
 
 - Unit tests: 批量解析、装箱、fallback、缓存命中路径。
-- Integration tests: 新 batch API 与旧单条 API 的兼容行为。
+- Integration tests: 新 results resolve API 与旧单条 request API 的兼容行为。
 - E2E tests: Dashboard 自动翻译流程不回归。
 
 ### Quality checks
@@ -132,16 +160,18 @@
 - `cargo test`
 - `cargo fmt --check`
 - `cd web && bun run build`
+- `cd web && bun run storybook:build`
+- `cd web && bun run e2e -- release-detail.spec.ts`
 
 ## 文档更新（Docs to Update）
 
 - `README.md`: 增加 `AI_MODEL_CONTEXT_LIMIT` 与模型目录行为说明。
-- `docs/product.md`: 补充自动翻译批处理策略。
+- `docs/product.md`: 补充 visible-window 自动翻译策略与结果聚合接口语义。
 - `.env.example`: 增加 `AI_MODEL_CONTEXT_LIMIT`。
 
 ## 计划资产（Plan assets）
 
-- Directory: `docs/specs/g4456-llm-batch-efficiency/assets/`
+- Directory: None
 - In-plan references: None
 
 ## 资产晋升（Asset promotion）
@@ -153,13 +183,13 @@ None
 - [x] M1: 建立 specs-first 文档基线与接口契约。
 - [x] M2: 后端模型上限解析器 + 固定信源同步机制。
 - [x] M3: 后端 batch API 与单条委托改造（release/release detail/notification/brief）。
-- [ ] M4: 前端自动翻译切换到 batch API + 回归验证。
+- [x] M4: 前端自动翻译切换到 visible-window 结果聚合接口 + Storybook / E2E 回归验证。
 
 ## 方案概述（Approach, high-level）
 
 - 在 `ai.rs` 建立统一 token 预算与批量装箱能力，作为 LLM 路径共享底座。
-- 在 `api.rs` 实现 batch endpoint，单条 endpoint 委托 batch 内核，保持对外兼容。
-- 在 `web` 端通过短窗口聚合调用 batch 接口，减少逐条请求。
+- 在 `translations.rs` 中新增结果聚合接口，由后端复用现有 request/work item/cache 模型并负责幂等 ensure。
+- 在 `web` 端以真实视口为基础维护 visible-window，持续请求译文结果而不是直接创建 request。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
@@ -167,10 +197,16 @@ None
 - 开放问题：notification batch 当前未在 UI 主流程消费（接口先行）。
 - 假设：现有 OpenAI-compatible 网关遵守 chat/completions 协议并支持既定 `max_tokens`。
 
+## Visual Evidence
+
+- 本任务不提交静态截图资产。
+- 可通过 Storybook `Pages/Dashboard/VisibleWindowQueue` 与 `Pages/Dashboard/VisibleWindowSettling` 复现可见窗口自动翻译状态。
+
 ## 变更记录（Change log）
 
 - 2026-02-25: 创建规格并冻结“固定信源 + 固定同步 + 固定兜底 + 单环境变量”约束。
 - 2026-02-25: 完成后端批处理核心与前端自动翻译批调接入；前端构建受缺失依赖阻塞，待补依赖后复验。
+- 2026-03-30: 完成 release feed visible-window 结果聚合接口、request/work item 双层去重、Storybook 场景与 Playwright 回归验证。
 
 ## 参考（References）
 

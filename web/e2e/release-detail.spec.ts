@@ -14,7 +14,14 @@ type ApiOptions = {
 	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
+	autoTranslateFeedCount?: number;
 	releaseDetailPendingPolls?: number;
+};
+
+type MockApiTracker = {
+	translationResolveEntityIds: string[][];
+	translationBatchEntityIds: string[][];
+	translationSingleEntityIds: string[];
 };
 
 function json(route: Route, payload: unknown, status = 200) {
@@ -25,7 +32,64 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
-async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
+function makeAutoTranslateReleaseId(index: number) {
+	return `200${`${index + 1}`.padStart(2, "0")}`;
+}
+
+function makeAutoTranslateFeedItems(count: number) {
+	return Array.from({ length: count }, (_, index) => {
+		const releaseId = makeAutoTranslateReleaseId(index);
+		return {
+			kind: "release",
+			ts: `2026-02-22T${`${(index % 10) + 10}`.padStart(2, "0")}:22:33Z`,
+			id: releaseId,
+			repo_full_name: "owner/repo",
+			title: `Release ${releaseId}`,
+			excerpt: [
+				`- lane ${index + 1} keeps current-screen work first`,
+				"- next-screen requests should submit in parallel",
+				"- secondary prefetch continues within token budget",
+			].join("\n"),
+			subtitle: null,
+			reason: null,
+			subject_type: null,
+			html_url: `https://github.com/owner/repo/releases/tag/v${releaseId}`,
+			unread: null,
+			translated: {
+				lang: "zh-CN",
+				status: "missing",
+				title: null,
+				summary: null,
+			},
+			reactions: null,
+		};
+	});
+}
+
+function makeFeedTranslationPayload(releaseId: string) {
+	return {
+		producer_ref: `feed.auto_translate:release:${releaseId}`,
+		entity_id: releaseId,
+		kind: "release_summary",
+		variant: "feed_card",
+		status: "ready" as const,
+		title_zh: `发布说明 ${releaseId}`,
+		summary_md: `这是 release ${releaseId} 的中文摘要。`,
+		body_md: null,
+		error: null,
+		work_item_id: `work-feed-${releaseId}`,
+		batch_id: `batch-feed-${releaseId}`,
+	};
+}
+
+function makeFeedRequestId(releaseId: string) {
+	return `req-feed-${releaseId}`;
+}
+
+async function installApiMocks(
+	page: Page,
+	options?: Partial<ApiOptions>,
+): Promise<MockApiTracker> {
 	const cfg: ApiOptions = {
 		releaseId: "123",
 		detailTitle: "Release 123",
@@ -39,9 +103,15 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
 		briefCreatedAt: "2026-02-23T08:00:00Z",
 		releaseDetailPendingPolls: 0,
+		autoTranslateFeedCount: 18,
 		...options,
 	};
 	const translationRequestPolls = new Map<string, number>();
+	const tracker: MockApiTracker = {
+		translationResolveEntityIds: [],
+		translationBatchEntityIds: [],
+		translationSingleEntityIds: [],
+	};
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -63,60 +133,49 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
-			const translated = cfg.withReactionFeed
-				? {
-						lang: "zh-CN",
-						status: "ready",
-						title: cfg.translatedTitle,
-						summary: cfg.translatedSummary,
-					}
-				: cfg.withAutoTranslateFeed
-					? {
-							lang: "zh-CN",
-							status: "missing",
-							title: null,
-							summary: null,
-						}
-					: null;
-			const items =
-				cfg.withReactionFeed || cfg.withAutoTranslateFeed
-					? [
-							{
-								kind: "release",
-								ts: cfg.feedTimestamp,
-								id: cfg.releaseId,
-								repo_full_name: "owner/repo",
-								title: cfg.detailTitle,
-								excerpt: "- fix A\n- fix B",
-								subtitle: null,
-								reason: null,
-								subject_type: null,
-								html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
-								unread: null,
-								translated,
-								reactions: cfg.withReactionFeed
-									? {
-											counts: {
-												plus1: 2,
-												laugh: 0,
-												heart: 0,
-												hooray: 0,
-												rocket: 0,
-												eyes: 0,
-											},
-											viewer: {
-												plus1: false,
-												laugh: false,
-												heart: false,
-												hooray: false,
-												rocket: false,
-												eyes: false,
-											},
-											status: "ready",
-										}
-									: null,
+			const items = cfg.withReactionFeed
+				? [
+						{
+							kind: "release",
+							ts: cfg.feedTimestamp,
+							id: cfg.releaseId,
+							repo_full_name: "owner/repo",
+							title: cfg.detailTitle,
+							excerpt: "- fix A\n- fix B",
+							subtitle: null,
+							reason: null,
+							subject_type: null,
+							html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
+							unread: null,
+							translated: {
+								lang: "zh-CN",
+								status: "ready",
+								title: cfg.translatedTitle,
+								summary: cfg.translatedSummary,
 							},
-						]
+							reactions: {
+								counts: {
+									plus1: 2,
+									laugh: 0,
+									heart: 0,
+									hooray: 0,
+									rocket: 0,
+									eyes: 0,
+								},
+								viewer: {
+									plus1: false,
+									laugh: false,
+									heart: false,
+									hooray: false,
+									rocket: false,
+									eyes: false,
+								},
+								status: "ready",
+							},
+						},
+					]
+				: cfg.withAutoTranslateFeed
+					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18)
 					: [];
 			return json(route, { items, next_cursor: null });
 		}
@@ -172,6 +231,19 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 			});
 		}
 
+		if (req.method() === "POST" && pathname === "/api/translate/results") {
+			const body = req.postDataJSON() as {
+				items?: Array<{ entity_id?: string }>;
+			};
+			const entityIds = (body.items ?? []).map((item) => item.entity_id ?? "");
+			tracker.translationResolveEntityIds.push(entityIds);
+			return json(route, {
+				items: entityIds.map((entityId) =>
+					makeFeedTranslationPayload(entityId),
+				),
+			});
+		}
+
 		if (req.method() === "POST" && pathname === "/api/translate/requests") {
 			const body = req.postDataJSON() as {
 				mode?: string;
@@ -181,16 +253,22 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 					kind?: string;
 					variant?: string;
 				};
+				items?: Array<{
+					producer_ref?: string;
+					entity_id?: string;
+					kind?: string;
+					variant?: string;
+				}>;
 			};
-			const item = body.item;
-			if (!item || item.entity_id !== cfg.releaseId) {
-				return json(
-					route,
-					{ error: { message: "unexpected translation request" } },
-					400,
-				);
-			}
 			if (body.mode === "wait") {
+				const item = body.item;
+				if (!item || item.entity_id !== cfg.releaseId) {
+					return json(
+						route,
+						{ error: { message: "unexpected translation request" } },
+						400,
+					);
+				}
 				const requestId = `req-${item.kind ?? "translation"}-1`;
 				const isPendingReleaseDetail =
 					item.kind === "release_detail" && cfg.releaseDetailPendingPolls > 0;
@@ -226,6 +304,51 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 					},
 				});
 			}
+			if (body.mode === "async" && Array.isArray(body.items)) {
+				const entityIds = body.items.map((item) => item.entity_id ?? "");
+				tracker.translationBatchEntityIds.push(entityIds);
+				return json(route, {
+					requests: body.items.map((item) => ({
+						request_id: makeFeedRequestId(item.entity_id ?? ""),
+						status: "queued",
+						producer_ref:
+							item.producer_ref ??
+							`feed.auto_translate:release:${item.entity_id ?? ""}`,
+						entity_id: item.entity_id ?? "",
+						kind: item.kind ?? "release_summary",
+						variant: item.variant ?? "feed_card",
+					})),
+				});
+			}
+			if (body.mode === "async" && body.item) {
+				const entityId = body.item.entity_id ?? "";
+				tracker.translationSingleEntityIds.push(entityId);
+				return json(route, {
+					request_id: makeFeedRequestId(entityId),
+					status: "queued",
+					result:
+						body.item.kind === "release_detail"
+							? {
+									producer_ref: `release_detail:${entityId}`,
+									entity_id: entityId,
+									kind: "release_detail",
+									variant: "detail_card",
+									status: "queued",
+									title_zh: null,
+									summary_md: null,
+									body_md: null,
+									error: null,
+									work_item_id: "work-detail-1",
+									batch_id: "batch-detail-1",
+								}
+							: {
+									...makeFeedTranslationPayload(entityId),
+									status: "queued",
+									title_zh: null,
+									summary_md: null,
+								},
+				});
+			}
 			return json(
 				route,
 				{ error: { message: "unsupported translation mode" } },
@@ -246,6 +369,14 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 			const isPendingReleaseDetail =
 				requestId === "req-release_detail-1" &&
 				polls < cfg.releaseDetailPendingPolls;
+			if (requestId.startsWith("req-feed-")) {
+				const releaseId = requestId.replace("req-feed-", "");
+				return json(route, {
+					request_id: requestId,
+					status: "completed",
+					result: makeFeedTranslationPayload(releaseId),
+				});
+			}
 			return json(route, {
 				request_id: requestId,
 				status: isPendingReleaseDetail ? "running" : "completed",
@@ -271,6 +402,8 @@ async function installApiMocks(page: Page, options?: Partial<ApiOptions>) {
 			404,
 		);
 	});
+
+	return tracker;
 }
 
 test("deep link with release id opens briefs tab and loads release detail", async ({
@@ -394,9 +527,12 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await expect(page.getByText("#123")).toBeVisible();
 });
 
-test("feed auto translate resolves from wait request", async ({ page }) => {
-	await installApiMocks(page, {
+test("feed auto translate resolves visible cards and the next 10 through results aggregation", async ({
+	page,
+}) => {
+	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 18,
 	});
 
 	await page.goto("/?tab=releases");
@@ -404,11 +540,27 @@ test("feed auto translate resolves from wait request", async ({ page }) => {
 		"aria-selected",
 		"true",
 	);
+	await expect
+		.poll(() => tracker.translationResolveEntityIds.length)
+		.toBeGreaterThan(0);
+
+	const firstWindow = tracker.translationResolveEntityIds[0];
+	expect(firstWindow.length).toBeGreaterThan(0);
+	expect(firstWindow).toEqual(
+		Array.from({ length: firstWindow.length }, (_, index) =>
+			makeAutoTranslateReleaseId(index),
+		),
+	);
+
+	expect(new Set(firstWindow).size).toBe(firstWindow.length);
+	expect(tracker.translationBatchEntityIds).toHaveLength(0);
+	expect(tracker.translationSingleEntityIds).toHaveLength(0);
+
 	await expect(
-		page.getByRole("heading", { name: "发布说明 123" }),
+		page.getByRole("heading", { name: "发布说明 20001" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+		page.getByText("这是 release 20001 的中文摘要。", { exact: true }),
 	).toBeVisible();
 });
 

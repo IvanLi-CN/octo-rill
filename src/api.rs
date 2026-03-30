@@ -2928,6 +2928,7 @@ pub async fn get_release_detail(
           AND t.entity_type = 'release_detail'
           AND t.entity_id = CAST(r.release_id AS TEXT)
           AND t.lang = 'zh-CN'
+          AND t.status = 'ready'
         WHERE r.release_id = ?
         LIMIT 1
         "#,
@@ -4252,7 +4253,7 @@ async fn fetch_feed_releases(
           t.summary AS trans_summary
         FROM items i
         LEFT JOIN ai_translations t
-          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
+          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status = 'ready'
     "#;
 
     let (sql, has_cursor) = if cursor.is_some() {
@@ -5788,18 +5789,27 @@ struct TranslationUpsert<'a> {
 async fn upsert_translation(
     state: &AppState,
     user_id: &str,
+    requested_at: &str,
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, NULL, NULL, ?, ?)
         ON CONFLICT(user_id, entity_type, entity_id, lang) DO UPDATE SET
           source_hash = excluded.source_hash,
+          status = excluded.status,
           title = excluded.title,
           summary = excluded.summary,
+          error_text = excluded.error_text,
+          active_work_item_id = excluded.active_work_item_id,
           updated_at = excluded.updated_at
+        WHERE ai_translations.source_hash = excluded.source_hash
+           OR ai_translations.updated_at <= ?
         "#,
     )
     .bind(crate::local_id::generate_local_id())
@@ -5812,6 +5822,7 @@ async fn upsert_translation(
     .bind(t.summary)
     .bind(&now)
     .bind(&now)
+    .bind(requested_at)
     .execute(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -6229,7 +6240,7 @@ async fn prepare_release_batch(
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status = 'ready' AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -6326,6 +6337,7 @@ fn build_release_batch_item(
 async fn upsert_release_batch_translations(
     state: &AppState,
     user_id: &str,
+    requested_at: &str,
     candidates: &[ReleaseBatchCandidate],
     translated: &HashMap<i64, (Option<String>, Option<String>)>,
 ) -> Result<(), ApiError> {
@@ -6334,6 +6346,7 @@ async fn upsert_release_batch_translations(
             upsert_translation(
                 state,
                 user_id,
+                requested_at,
                 TranslationUpsert {
                     entity_type: "release",
                     entity_id: &item.entity_id,
@@ -6368,14 +6381,21 @@ async fn translate_releases_batch_internal(
             .collect());
     }
 
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut prepared = prepare_release_batch(state, user_id, release_ids).await?;
     let translated_pending = translate_release_candidates_with_ai(state, &prepared.pending).await;
     for (release_id, values) in translated_pending {
         prepared.translated.insert(release_id, values);
     }
 
-    upsert_release_batch_translations(state, user_id, &prepared.candidates, &prepared.translated)
-        .await?;
+    upsert_release_batch_translations(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.candidates,
+        &prepared.translated,
+    )
+    .await?;
 
     Ok(release_ids
         .iter()
@@ -6403,6 +6423,7 @@ async fn translate_releases_batch_stream_worker(
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let heartbeat = jobs::spawn_task_lease_heartbeat(state.clone(), task_id.clone());
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut ready_count = 0usize;
     let mut disabled_count = 0usize;
     let mut missing_count = 0usize;
@@ -6579,6 +6600,7 @@ async fn translate_releases_batch_stream_worker(
                         upsert_release_batch_translations(
                             state.as_ref(),
                             &user_id,
+                            requested_at.as_str(),
                             &batch,
                             &batch_translated,
                         )
@@ -7109,6 +7131,7 @@ async fn translate_release_detail_internal(
 
     let source_hash = release_detail_source_hash(&repo_full_name, &original_title, &original_body);
     let entity_id = release_id.to_string();
+    let requested_at = chrono::Utc::now().to_rfc3339();
 
     #[derive(Debug, sqlx::FromRow)]
     struct TranslationRow {
@@ -7120,7 +7143,7 @@ async fn translate_release_detail_internal(
         r#"
         SELECT source_hash, title, summary
         FROM ai_translations
-        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN' AND status = 'ready'
         LIMIT 1
         "#,
     )
@@ -7188,6 +7211,7 @@ async fn translate_release_detail_internal(
     upsert_translation(
         state,
         user_id,
+        requested_at.as_str(),
         TranslationUpsert {
             entity_type: "release_detail",
             entity_id: &entity_id,
@@ -7539,6 +7563,7 @@ async fn translate_notifications_batch_internal(
             .collect());
     }
 
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT thread_id, repo_full_name, subject_title, reason, subject_type
@@ -7604,7 +7629,7 @@ async fn translate_notifications_batch_internal(
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND status = 'ready' AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -7663,6 +7688,7 @@ async fn translate_notifications_batch_internal(
             upsert_translation(
                 state,
                 user_id,
+                requested_at.as_str(),
                 TranslationUpsert {
                     entity_type: "notification",
                     entity_id: &item.thread_id,
@@ -8660,9 +8686,9 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO ai_translations (
-              id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
             )
-            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
             "#,
         )
         .bind(crate::local_id::generate_local_id())

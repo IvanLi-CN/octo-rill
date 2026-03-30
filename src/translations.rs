@@ -64,6 +64,13 @@ pub struct TranslationSubmitRequest {
     pub items: Option<Vec<TranslationRequestItemInput>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TranslationResolveRequest {
+    pub items: Vec<TranslationRequestItemInput>,
+    #[serde(default)]
+    pub retry_on_error: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranslationResultItem {
     pub producer_ref: String,
@@ -99,6 +106,11 @@ pub struct TranslationBatchSubmitItemResponse {
 #[derive(Debug, Serialize)]
 pub struct TranslationBatchSubmitResponse {
     pub requests: Vec<TranslationBatchSubmitItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TranslationResolveResponse {
+    pub items: Vec<TranslationResultItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,6 +521,54 @@ impl RequestRow {
             work_item_id: self.work_item_id.clone(),
             batch_id: self.batch_id.clone(),
         }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct TranslationStateRow {
+    id: String,
+    user_id: String,
+    entity_type: String,
+    entity_id: String,
+    lang: String,
+    source_hash: String,
+    status: String,
+    title: Option<String>,
+    summary: Option<String>,
+    error_text: Option<String>,
+    active_work_item_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TranslationStateRow {
+    fn to_result(&self, item: &TranslationRequestItemInput) -> TranslationResultItem {
+        let mut result = TranslationResultItem {
+            producer_ref: item.producer_ref.clone(),
+            entity_id: item.entity_id.clone(),
+            kind: item.kind.clone(),
+            variant: item.variant.clone(),
+            status: self.status.clone(),
+            title_zh: None,
+            summary_md: None,
+            body_md: None,
+            error: self.error_text.clone(),
+            work_item_id: self.active_work_item_id.clone(),
+            batch_id: None,
+        };
+        if self.status == "ready" {
+            if item.target_slots.iter().any(|slot| slot == "title_zh") {
+                result.title_zh = self.title.clone();
+            }
+            if item.target_slots.iter().any(|slot| slot == "summary_md") {
+                result.summary_md = self.summary.clone();
+            }
+            if item.target_slots.iter().any(|slot| slot == "body_md") {
+                result.body_md = self.summary.clone();
+            }
+        }
+        result
     }
 }
 
@@ -1291,6 +1351,19 @@ pub async fn get_translation_request(
     Ok(Json(detail_to_public_response(detail)))
 }
 
+pub async fn resolve_translation_results(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<TranslationResolveRequest>,
+) -> Result<Json<TranslationResolveResponse>, ApiError> {
+    let user_id = api::require_active_user_id(state.as_ref(), &session).await?;
+    let items = normalize_request_items(&req.items)?;
+    let items =
+        resolve_translation_results_for_user(state.as_ref(), &user_id, &items, req.retry_on_error)
+            .await?;
+    Ok(Json(TranslationResolveResponse { items }))
+}
+
 pub async fn stream_translation_request(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -1440,11 +1513,7 @@ async fn load_admin_translation_status_response(
     .map(|v| v.round() as i64);
     let last_batch_finished_at = load_last_batch_finished_at(state).await?;
 
-    let budget = i64::from(
-        ai::compute_input_budget_with_source(state, TRANSLATION_BATCH_MAX_TOKENS)
-            .await
-            .input_budget,
-    );
+    let budget = i64::from(translation_batch_input_budget(state).await);
 
     Ok(AdminTranslationStatusResponse {
         scheduler_enabled: true,
@@ -1475,6 +1544,13 @@ async fn load_admin_translation_status_response(
         avg_wait_ms_24h,
         last_batch_finished_at,
     })
+}
+
+async fn translation_batch_input_budget(state: &AppState) -> u32 {
+    ai::compute_input_budget_with_source(state, TRANSLATION_BATCH_MAX_TOKENS)
+        .await
+        .input_budget
+        .clamp(1, TRANSLATION_BATCH_MAX_TOKENS)
 }
 
 fn parse_positive_worker_concurrency(value: i64, field: &str) -> Result<usize, ApiError> {
@@ -1739,6 +1815,31 @@ async fn create_translation_request_with_origin(
     Ok(created)
 }
 
+async fn resolve_translation_results_for_user(
+    state: &AppState,
+    user_id: &str,
+    items: &[TranslationRequestItemInput],
+    retry_on_error: bool,
+) -> Result<Vec<TranslationResultItem>, ApiError> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let result = ensure_translation_result_for_item(
+            &mut tx,
+            user_id,
+            item,
+            "user",
+            now.as_str(),
+            retry_on_error,
+        )
+        .await?;
+        out.push(result);
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(out)
+}
+
 async fn create_translation_requests_batch_with_origin(
     state: &AppState,
     user_id: &str,
@@ -1762,16 +1863,122 @@ async fn create_translation_requests_batch_with_origin(
     Ok(out)
 }
 
-async fn insert_translation_request(
+async fn ensure_translation_result_for_item(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    request_origin: &str,
+    now: &str,
+    retry_on_error: bool,
+) -> Result<TranslationResultItem, ApiError> {
+    let source_hash = build_source_hash(item);
+    if let Some(existing) = load_translation_state_row(tx, user_id, item).await?
+        && existing.source_hash == source_hash
+    {
+        match existing.status.as_str() {
+            "ready" | "disabled" | "missing" => return Ok(existing.to_result(item)),
+            "error" if !retry_on_error => return Ok(existing.to_result(item)),
+            _ => {}
+        }
+
+        let work_item = if let Some(work_item_id) = existing.active_work_item_id.as_deref() {
+            load_work_item_by_id(tx, work_item_id)
+                .await?
+                .filter(|row| row.source_hash == source_hash)
+        } else {
+            None
+        }
+        .or(load_existing_work_item(tx, user_id, item, &source_hash).await?);
+
+        if let Some(work_item) = work_item {
+            if work_item.result_status.is_some()
+                && matches!(work_item.status.as_str(), "completed" | "failed")
+            {
+                let result = terminal_result_from_work_row(&work_item, item.producer_ref.clone());
+                persist_translation_terminal_state(
+                    tx,
+                    user_id,
+                    item.kind.as_str(),
+                    item.entity_id.as_str(),
+                    item.target_lang.as_str(),
+                    source_hash.as_str(),
+                    result.status.as_str(),
+                    result.title_zh.as_deref(),
+                    result.summary_md.as_deref().or(result.body_md.as_deref()),
+                    result.error.as_deref(),
+                    work_item.id.as_str(),
+                    now,
+                )
+                .await?;
+                if retry_on_error && result.status == "error" {
+                    reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
+                    reset_requests_for_work_item_retry(tx, work_item.id.as_str(), now).await?;
+                    upsert_translation_demand_state(
+                        tx,
+                        user_id,
+                        item,
+                        source_hash.as_str(),
+                        "queued",
+                        work_item.id.as_str(),
+                        now,
+                    )
+                    .await?;
+                    return Ok(queued_request_result(item, Some(work_item.id)));
+                }
+                return Ok(result);
+            }
+
+            let pending = pending_result_from_work_row(&work_item, item.producer_ref.clone());
+            upsert_translation_demand_state(
+                tx,
+                user_id,
+                item,
+                source_hash.as_str(),
+                pending.status.as_str(),
+                work_item.id.as_str(),
+                now,
+            )
+            .await?;
+            return Ok(pending);
+        }
+
+        if existing.status == "error" && !retry_on_error {
+            return Ok(existing.to_result(item));
+        }
+    }
+
+    let request_id = insert_translation_request_record(
+        tx,
+        user_id,
+        "async",
+        item,
+        request_origin,
+        source_hash.as_str(),
+        now,
+    )
+    .await?;
+    ensure_translation_result_demand(
+        tx,
+        user_id,
+        item,
+        source_hash.as_str(),
+        request_id.as_str(),
+        retry_on_error,
+        now,
+    )
+    .await
+}
+
+async fn insert_translation_request_record(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     mode: &str,
     item: &TranslationRequestItemInput,
     request_origin: &str,
+    source_hash: &str,
     now: &str,
-) -> Result<CreatedTranslationRequest, ApiError> {
+) -> Result<String, ApiError> {
     let request_id = crate::local_id::generate_local_id();
-    let source_hash = build_source_hash(item);
     let source_blocks_json =
         serde_json::to_string(&item.source_blocks).map_err(ApiError::internal)?;
     let target_slots_json =
@@ -1799,7 +2006,7 @@ async fn insert_translation_request(
     .bind(item.entity_id.as_str())
     .bind(item.target_lang.as_str())
     .bind(item.max_wait_ms)
-    .bind(source_hash.as_str())
+    .bind(source_hash)
     .bind(source_blocks_json.as_str())
     .bind(target_slots_json.as_str())
     .bind(now)
@@ -1807,6 +2014,29 @@ async fn insert_translation_request(
     .execute(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
+
+    Ok(request_id)
+}
+
+async fn insert_translation_request(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    mode: &str,
+    item: &TranslationRequestItemInput,
+    request_origin: &str,
+    now: &str,
+) -> Result<CreatedTranslationRequest, ApiError> {
+    let source_hash = build_source_hash(item);
+    let request_id = insert_translation_request_record(
+        tx,
+        user_id,
+        mode,
+        item,
+        request_origin,
+        source_hash.as_str(),
+        now,
+    )
+    .await?;
 
     if let Some(cached) = load_cached_result(tx, user_id, item, &source_hash).await? {
         let status = request_status_from_result_status(cached.status.as_str());
@@ -1820,6 +2050,16 @@ async fn insert_translation_request(
 
     if let Some(work_item_id) = create_work_item(tx, user_id, item, &source_hash, now).await? {
         attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now).await?;
+        upsert_translation_demand_state(
+            tx,
+            user_id,
+            item,
+            source_hash.as_str(),
+            "queued",
+            work_item_id.as_str(),
+            now,
+        )
+        .await?;
         return Ok(CreatedTranslationRequest {
             request_id,
             status: "queued".to_owned(),
@@ -1836,6 +2076,16 @@ async fn insert_translation_request(
     {
         reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
         attach_request_to_work_item(tx, request_id.as_str(), &existing.id, "queued", now).await?;
+        upsert_translation_demand_state(
+            tx,
+            user_id,
+            item,
+            source_hash.as_str(),
+            "queued",
+            existing.id.as_str(),
+            now,
+        )
+        .await?;
         return Ok(CreatedTranslationRequest {
             request_id,
             status: "queued".to_owned(),
@@ -1856,6 +2106,21 @@ async fn insert_translation_request(
             now,
         )
         .await?;
+        persist_translation_terminal_state(
+            tx,
+            user_id,
+            item.kind.as_str(),
+            item.entity_id.as_str(),
+            item.target_lang.as_str(),
+            source_hash.as_str(),
+            result.status.as_str(),
+            result.title_zh.as_deref(),
+            result.summary_md.as_deref().or(result.body_md.as_deref()),
+            result.error.as_deref(),
+            existing.id.as_str(),
+            now,
+        )
+        .await?;
         if let Some(batch_id) = existing.batch_id.as_deref() {
             refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
         }
@@ -1870,6 +2135,16 @@ async fn insert_translation_request(
     let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
     attach_request_to_work_item(tx, request_id.as_str(), &existing.id, status.as_str(), now)
         .await?;
+    upsert_translation_demand_state(
+        tx,
+        user_id,
+        item,
+        source_hash.as_str(),
+        result.status.as_str(),
+        existing.id.as_str(),
+        now,
+    )
+    .await?;
     if let Some(batch_id) = existing.batch_id.as_deref() {
         refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
     }
@@ -1878,6 +2153,95 @@ async fn insert_translation_request(
         status,
         result,
     })
+}
+
+async fn ensure_translation_result_demand(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+    request_id: &str,
+    retry_on_error: bool,
+    now: &str,
+) -> Result<TranslationResultItem, ApiError> {
+    if let Some(work_item_id) = create_work_item(tx, user_id, item, source_hash, now).await? {
+        attach_request_to_work_item(tx, request_id, &work_item_id, "queued", now).await?;
+        upsert_translation_demand_state(
+            tx,
+            user_id,
+            item,
+            source_hash,
+            "queued",
+            work_item_id.as_str(),
+            now,
+        )
+        .await?;
+        return Ok(queued_request_result(item, Some(work_item_id)));
+    }
+
+    let existing = load_existing_work_item(tx, user_id, item, source_hash)
+        .await?
+        .ok_or_else(|| ApiError::internal("translation work item missing after dedupe conflict"))?;
+
+    if existing.result_status.is_some()
+        && matches!(existing.status.as_str(), "completed" | "failed")
+    {
+        let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
+        persist_translation_terminal_state(
+            tx,
+            user_id,
+            item.kind.as_str(),
+            item.entity_id.as_str(),
+            item.target_lang.as_str(),
+            source_hash,
+            result.status.as_str(),
+            result.title_zh.as_deref(),
+            result.summary_md.as_deref().or(result.body_md.as_deref()),
+            result.error.as_deref(),
+            existing.id.as_str(),
+            now,
+        )
+        .await?;
+        if retry_on_error && result.status == "error" {
+            reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
+            attach_request_to_work_item(tx, request_id, existing.id.as_str(), "queued", now)
+                .await?;
+            upsert_translation_demand_state(
+                tx,
+                user_id,
+                item,
+                source_hash,
+                "queued",
+                existing.id.as_str(),
+                now,
+            )
+            .await?;
+            return Ok(queued_request_result(item, Some(existing.id)));
+        }
+        apply_request_result(tx, request_id, Some(existing.id.as_str()), &result, now).await?;
+        if let Some(batch_id) = existing.batch_id.as_deref() {
+            refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+        }
+        return Ok(result);
+    }
+
+    let status = request_status_from_work_item_status(existing.status.as_str()).to_owned();
+    let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
+    attach_request_to_work_item(tx, request_id, &existing.id, status.as_str(), now).await?;
+    upsert_translation_demand_state(
+        tx,
+        user_id,
+        item,
+        source_hash,
+        result.status.as_str(),
+        existing.id.as_str(),
+        now,
+    )
+    .await?;
+    if let Some(batch_id) = existing.batch_id.as_deref() {
+        refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
+    }
+    Ok(result)
 }
 
 async fn attach_request_to_work_item(
@@ -2062,18 +2426,18 @@ async fn apply_request_result(
     Ok(())
 }
 
-async fn load_cached_result(
+async fn load_translation_state_row(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
-    source_hash: &str,
-) -> Result<Option<TranslationResultItem>, ApiError> {
+) -> Result<Option<TranslationStateRow>, ApiError> {
     let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
         return Ok(None);
     };
-    let row = sqlx::query(
+    sqlx::query_as::<_, TranslationStateRow>(
         r#"
-        SELECT source_hash, title, summary
+        SELECT id, user_id, entity_type, entity_id, lang, source_hash, status,
+               title, summary, error_text, active_work_item_id, created_at, updated_at
         FROM ai_translations
         WHERE user_id = ? AND entity_type = ? AND entity_id = ? AND lang = ?
         LIMIT 1
@@ -2085,40 +2449,190 @@ async fn load_cached_result(
     .bind(item.target_lang.as_str())
     .fetch_optional(&mut **tx)
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::internal)
+}
 
-    let Some(row) = row else {
+async fn load_cached_result(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+) -> Result<Option<TranslationResultItem>, ApiError> {
+    let Some(row) = load_translation_state_row(tx, user_id, item).await? else {
         return Ok(None);
     };
-    let stored_hash: String = row.try_get("source_hash").map_err(ApiError::internal)?;
-    if stored_hash != source_hash {
+    if row.source_hash != source_hash
+        || !matches!(row.status.as_str(), "ready" | "disabled" | "missing")
+    {
         return Ok(None);
     }
-    let title: Option<String> = row.try_get("title").map_err(ApiError::internal)?;
-    let summary: Option<String> = row.try_get("summary").map_err(ApiError::internal)?;
-    let mut result = TranslationResultItem {
-        producer_ref: item.producer_ref.clone(),
-        entity_id: item.entity_id.clone(),
-        kind: item.kind.clone(),
-        variant: item.variant.clone(),
-        status: "ready".to_owned(),
-        title_zh: None,
-        summary_md: None,
-        body_md: None,
-        error: None,
-        work_item_id: None,
-        batch_id: None,
+    Ok(Some(row.to_result(item)))
+}
+
+async fn upsert_translation_demand_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+    status: &str,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
+        return Ok(());
     };
-    if item.target_slots.iter().any(|slot| slot == "title_zh") {
-        result.title_zh = title.clone();
+    sqlx::query(
+        r#"
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
+        ON CONFLICT(user_id, entity_type, entity_id, lang)
+        DO UPDATE SET source_hash = excluded.source_hash,
+                      status = excluded.status,
+                      title = NULL,
+                      summary = NULL,
+                      error_text = NULL,
+                      active_work_item_id = excluded.active_work_item_id,
+                      updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(user_id)
+    .bind(entity_type)
+    .bind(item.entity_id.as_str())
+    .bind(item.target_lang.as_str())
+    .bind(source_hash)
+    .bind(status)
+    .bind(work_item_id)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_translation_terminal_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    kind: &str,
+    entity_id: &str,
+    target_lang: &str,
+    source_hash: &str,
+    result_status: &str,
+    title: Option<&str>,
+    summary: Option<&str>,
+    error_text: Option<&str>,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    let Some(entity_type) = map_entity_type(kind) else {
+        return Ok(());
+    };
+    let update = sqlx::query(
+        r#"
+        UPDATE ai_translations
+        SET source_hash = ?,
+            status = ?,
+            title = ?,
+            summary = ?,
+            error_text = ?,
+            active_work_item_id = NULL,
+            updated_at = ?
+        WHERE user_id = ?
+          AND entity_type = ?
+          AND entity_id = ?
+          AND lang = ?
+          AND (source_hash = ? OR active_work_item_id = ?)
+        "#,
+    )
+    .bind(source_hash)
+    .bind(result_status)
+    .bind(title)
+    .bind(summary)
+    .bind(error_text)
+    .bind(now)
+    .bind(user_id)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(target_lang)
+    .bind(source_hash)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if update.rows_affected() > 0 {
+        return Ok(());
     }
-    if item.target_slots.iter().any(|slot| slot == "summary_md") {
-        result.summary_md = summary.clone();
+
+    sqlx::query(
+        r#"
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM ai_translations
+          WHERE user_id = ? AND entity_type = ? AND entity_id = ? AND lang = ?
+        )
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(user_id)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(target_lang)
+    .bind(source_hash)
+    .bind(result_status)
+    .bind(title)
+    .bind(summary)
+    .bind(error_text)
+    .bind(now)
+    .bind(now)
+    .bind(user_id)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(target_lang)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn mark_translation_states_running_for_work_items(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_ids: Vec<&str>,
+    now: &str,
+) -> Result<(), ApiError> {
+    if work_item_ids.is_empty() {
+        return Ok(());
     }
-    if item.target_slots.iter().any(|slot| slot == "body_md") {
-        result.body_md = summary.clone();
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(
+        r#"
+        UPDATE ai_translations
+        SET status = 'running',
+            updated_at = "#,
+    );
+    query.push_bind(now);
+    query.push(r#" WHERE status = 'queued' AND active_work_item_id IN ("#);
+    {
+        let mut separated = query.separated(", ");
+        for id in work_item_ids {
+            separated.push_bind(id);
+        }
     }
-    Ok(Some(result))
+    query.push(")");
+    query
+        .build()
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(())
 }
 
 async fn load_existing_work_item(
@@ -2143,6 +2657,27 @@ async fn load_existing_work_item(
     .fetch_optional(&mut **tx)
     .await
     .map_err(ApiError::internal)
+}
+
+async fn load_work_item_by_id(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+) -> Result<Option<WorkItemRow>, ApiError> {
+    sqlx::query_as::<_, WorkItemRow>(
+        r#"
+        SELECT id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
+               model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
+               deadline_at, status, batch_id, result_status, title_zh, summary_md, body_md,
+               error_text, cache_hit, created_at, started_at, finished_at, updated_at
+        FROM translation_work_items
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(work_item_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(ApiError::internal)
 }
 
 async fn create_work_item(
@@ -2219,6 +2754,34 @@ async fn reset_retryable_terminal_work_item(
             finished_at = NULL,
             updated_at = ?
         WHERE id = ?
+        "#,
+    )
+    .bind(now)
+    .bind(work_item_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn reset_requests_for_work_item_retry(
+    tx: &mut Transaction<'_, Sqlite>,
+    work_item_id: &str,
+    now: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        UPDATE translation_requests
+        SET status = 'queued',
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE work_item_id = ?
         "#,
     )
     .bind(now)
@@ -2320,11 +2883,7 @@ async fn claim_next_batch(
         return Ok(None);
     };
 
-    let budget = i64::from(
-        ai::compute_input_budget_with_source(state, TRANSLATION_BATCH_MAX_TOKENS)
-            .await
-            .input_budget,
-    );
+    let budget = i64::from(translation_batch_input_budget(state).await);
     let candidates_query = format!(
         r#"
         SELECT w.id, w.dedupe_key, w.scope_user_id, w.kind, w.variant, w.entity_id, w.target_lang,
@@ -2905,21 +3464,23 @@ async fn finalize_batch_success(
             .await?;
         }
 
-        if result.result_status == "ready"
-            && let Some(work_item) = batch
-                .items
-                .iter()
-                .find(|item| item.id == result.work_item_id)
+        if let Some(work_item) = batch
+            .items
+            .iter()
+            .find(|item| item.id == result.work_item_id)
         {
-            upsert_cached_translation(
+            persist_translation_terminal_state(
                 &mut tx,
                 &work_item.scope_user_id,
                 work_item.kind.as_str(),
                 work_item.entity_id.as_str(),
                 work_item.target_lang.as_str(),
                 work_item.source_hash.as_str(),
+                result.result_status.as_str(),
                 result.title_zh.as_deref(),
                 result.summary_md.as_deref().or(result.body_md.as_deref()),
+                result.error.as_deref(),
+                work_item.id.as_str(),
                 now.as_str(),
             )
             .await?;
@@ -3092,6 +3653,22 @@ async fn fail_batch_with_message(
             )
             .await?;
         }
+
+        persist_translation_terminal_state(
+            tx,
+            item.scope_user_id.as_str(),
+            item.kind.as_str(),
+            item.entity_id.as_str(),
+            item.target_lang.as_str(),
+            item.source_hash.as_str(),
+            "error",
+            None,
+            None,
+            Some(message),
+            item.id.as_str(),
+            now,
+        )
+        .await?;
     }
     sqlx::query(
         r#"
@@ -3254,6 +3831,7 @@ async fn mark_requests_running_for_work_items_in_tx(
     if work_item_ids.is_empty() {
         return Ok(());
     }
+    let state_work_item_ids = work_item_ids.clone();
     let mut query = sqlx::QueryBuilder::<Sqlite>::new(
         r#"
         UPDATE translation_requests
@@ -3271,6 +3849,7 @@ async fn mark_requests_running_for_work_items_in_tx(
     }
     query.push(")");
     query.build().execute(&mut **tx).await?;
+    mark_translation_states_running_for_work_items(tx, state_work_item_ids, now).await?;
     Ok(())
 }
 
@@ -3785,47 +4364,6 @@ fn terminal_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> Tra
 
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(raw)?.with_timezone(&Utc))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn upsert_cached_translation(
-    tx: &mut Transaction<'_, Sqlite>,
-    user_id: &str,
-    kind: &str,
-    entity_id: &str,
-    target_lang: &str,
-    source_hash: &str,
-    title: Option<&str>,
-    summary: Option<&str>,
-    now: &str,
-) -> Result<()> {
-    let Some(entity_type) = map_entity_type(kind) else {
-        return Ok(());
-    };
-    sqlx::query(
-        r#"
-        INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, entity_type, entity_id, lang)
-        DO UPDATE SET source_hash = excluded.source_hash,
-                      title = excluded.title,
-                      summary = excluded.summary,
-                      updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(crate::local_id::generate_local_id())
-    .bind(user_id)
-    .bind(entity_type)
-    .bind(entity_id)
-    .bind(target_lang)
-    .bind(source_hash)
-    .bind(title)
-    .bind(summary)
-    .bind(now)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
 }
 
 async fn scalar_i64(state: &AppState, sql: &str, binds: &[&str]) -> Result<i64, ApiError> {
@@ -4415,6 +4953,308 @@ mod tests {
 
         assert_eq!(work_items, 1);
         assert_eq!(distinct_work_item_ids, 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_reuses_existing_request_row() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("resolve-123");
+
+        let first = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("first resolve call");
+        let second = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("second resolve call");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+            .fetch_one(&pool)
+            .await
+            .expect("count work items");
+        let result_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_translations")
+            .fetch_one(&pool)
+            .await
+            .expect("count result rows");
+
+        assert_eq!(requests, 1);
+        assert_eq!(work_items, 1);
+        assert_eq!(result_rows, 1);
+        assert_eq!(first[0].status, "queued");
+        assert_eq!(second[0].status, "queued");
+        assert_eq!(first[0].work_item_id, second[0].work_item_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_reuses_ready_result_row_without_requests() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("ready-123");
+        let source_hash = build_source_hash(&item);
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .bind(source_hash.as_str())
+        .bind("已翻译标题")
+        .bind("- 已翻译摘要")
+        .bind("2026-03-30T00:00:00Z")
+        .bind("2026-03-30T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed ready translation row");
+
+        let first = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("first resolve call");
+        let second = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("second resolve call");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let work_items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+            .fetch_one(&pool)
+            .await
+            .expect("count work items");
+
+        assert_eq!(requests, 0);
+        assert_eq!(work_items, 0);
+        assert_eq!(first[0].status, "ready");
+        assert_eq!(second[0].status, "ready");
+        assert_eq!(first[0].title_zh.as_deref(), Some("已翻译标题"));
+        assert_eq!(first[0].summary_md.as_deref(), Some("- 已翻译摘要"));
+        assert_eq!(first[0].work_item_id, None);
+        assert_eq!(second[0].work_item_id, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_keeps_terminal_error_without_retry_flag() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("retry-123");
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("resolve after error without retry");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+        let request_result_status: Option<String> = sqlx::query_scalar(
+            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request result status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+
+        assert_eq!(requests, 1);
+        assert_eq!(resolved[0].status, "error");
+        assert_eq!(request_status, "failed");
+        assert_eq!(request_result_status.as_deref(), Some("error"));
+        assert_eq!(work_item_status, "failed");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_retries_terminal_error_when_forced() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("retry-forced-123");
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'boom',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            true,
+        )
+        .await
+        .expect("resolve after forced retry");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+        let request_result_status: Option<String> = sqlx::query_scalar(
+            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request result status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+
+        assert_eq!(requests, 1);
+        assert_eq!(resolved[0].status, "queued");
+        assert_eq!(request_status, "queued");
+        assert_eq!(request_result_status, None);
+        assert_eq!(work_item_status, "queued");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -6075,6 +6915,10 @@ mod tests {
             i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(i64::MAX)
         );
         assert_eq!(status.target_worker_concurrency, 3);
+        assert_eq!(
+            status.batch_token_threshold,
+            i64::from(TRANSLATION_BATCH_MAX_TOKENS)
+        );
         assert_eq!(status.workers.len(), 4);
     }
 
@@ -6115,6 +6959,10 @@ mod tests {
         assert_eq!(status.target_general_worker_concurrency, 5);
         assert_eq!(status.target_dedicated_worker_concurrency, 2);
         assert_eq!(status.target_worker_concurrency, 7);
+        assert_eq!(
+            status.batch_token_threshold,
+            i64::from(TRANSLATION_BATCH_MAX_TOKENS)
+        );
         assert_eq!(status.workers.len(), 7);
 
         state.translation_scheduler.abort_all().await;

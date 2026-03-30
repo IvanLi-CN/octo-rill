@@ -1,21 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
-	apiGetTranslationRequest,
-	apiSubmitTranslationRequest,
+	apiResolveTranslationResults,
 	type TranslationRequestItemInput,
-	ApiError,
+	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
 import type { FeedItem, TranslateResponse } from "@/feed/types";
 
-const MAX_CONCURRENT = 2;
-const QUEUE_FLUSH_DELAY_MS = 300;
+const SECONDARY_PREFETCH_COUNT = 10;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
-const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
+const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
+const AUTO_TRANSLATE_MAX_WAIT_MS = 500;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
-const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
+const REQUEST_PENDING_MAX_AGE_MS =
+	REQUEST_STATUS_POLL_WINDOW_MS * REQUEST_RESUME_WINDOW_MAX_RETRIES;
 
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
@@ -31,7 +31,7 @@ function buildReleaseSummaryRequestItem(
 		variant: "feed_card",
 		entity_id: item.id,
 		target_lang: "zh-CN",
-		max_wait_ms: 4_000,
+		max_wait_ms: AUTO_TRANSLATE_MAX_WAIT_MS,
 		source_blocks: [
 			{ slot: "title", text: title },
 			...(excerpt ? [{ slot: "excerpt" as const, text: excerpt }] : []),
@@ -61,17 +61,37 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
-type ActiveTranslationRequest = {
-	requestId: string;
-	sourceKey: string;
-	resumeWindowCount: number;
+type Deferred<T> = {
+	promise: Promise<T>;
+	resolve: (value: T | PromiseLike<T>) => void;
+	reject: (reason?: unknown) => void;
 };
 
-function isMissingTranslationRequestError(error: unknown) {
-	return (
-		error instanceof ApiError &&
-		(error.status === 404 || error.code === REQUEST_NOT_FOUND_ERROR_CODE)
-	);
+type TranslationTask = {
+	sourceKey: string;
+	requestItem: TranslationRequestItemInput;
+	createdAtMs: number;
+	deferred: Deferred<TranslateResponse | null>;
+	promise: Promise<TranslateResponse | null>;
+};
+
+type TranslationCandidate = {
+	key: string;
+	item: FeedItem;
+	requestItem: TranslationRequestItemInput;
+	sourceKey: string;
+	top: number;
+	bottom: number;
+};
+
+function createDeferred<T>(): Deferred<T> {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((nextResolve, nextReject) => {
+		resolve = nextResolve;
+		reject = nextReject;
+	});
+	return { promise, resolve, reject };
 }
 
 function buildRequestSourceKey(item: TranslationRequestItemInput) {
@@ -86,10 +106,55 @@ function buildRequestSourceKey(item: TranslationRequestItemInput) {
 	});
 }
 
-function sleep(ms: number) {
-	return new Promise((resolve) => {
-		window.setTimeout(resolve, ms);
-	});
+function intersectsViewportRange(
+	top: number,
+	bottom: number,
+	rangeTop: number,
+	rangeBottom: number,
+) {
+	return bottom > rangeTop && top < rangeBottom;
+}
+
+function buildVisibleWindowPlan(
+	candidates: TranslationCandidate[],
+	viewportHeight: number,
+) {
+	if (viewportHeight <= 0 || candidates.length === 0) {
+		return [] as TranslationCandidate[];
+	}
+
+	const visible: TranslationCandidate[] = [];
+	let lastVisibleIndex = -1;
+	for (let index = 0; index < candidates.length; index += 1) {
+		const candidate = candidates[index];
+		if (
+			intersectsViewportRange(
+				candidate.top,
+				candidate.bottom,
+				0,
+				viewportHeight,
+			)
+		) {
+			visible.push(candidate);
+			lastVisibleIndex = index;
+		}
+	}
+
+	if (lastVisibleIndex < 0) {
+		return candidates.slice(0, SECONDARY_PREFETCH_COUNT + 1);
+	}
+
+	return [
+		...visible,
+		...candidates.slice(
+			lastVisibleIndex + 1,
+			lastVisibleIndex + 1 + SECONDARY_PREFETCH_COUNT,
+		),
+	];
+}
+
+function resultLabel(result: TranslationResultItem) {
+	return result.error ?? `translate returned ${result.status}`;
 }
 
 export function useAutoTranslate(params: {
@@ -101,21 +166,27 @@ export function useAutoTranslate(params: {
 }) {
 	const { enabled, onTranslated } = params;
 
-	const observerRef = useRef<IntersectionObserver | null>(null);
-	const keyToElementRef = useRef(new Map<string, Element>());
-	const elementToKeyRef = useRef(new Map<Element, string>());
+	const mountedRef = useRef(false);
+	const resizeObserverRef = useRef<ResizeObserver | null>(null);
+	const plannerFrameRef = useRef<number | null>(null);
+	const plannerBusyRef = useRef(false);
+	const plannerDirtyRef = useRef(false);
+	const pollTimerRef = useRef<number | null>(null);
+	const pollBusyRef = useRef(false);
+
+	const keyToElementRef = useRef(new Map<string, HTMLElement>());
 	const itemByKeyRef = useRef(new Map<string, FeedItem>());
-
-	const queuedRef = useRef<string[]>([]);
-	const inFlightRef = useRef(new Set<string>());
+	const requestTasksRef = useRef(new Map<string, TranslationTask>());
 	const failedRef = useRef(new Set<string>());
-	const activeRequestRef = useRef(new Map<string, ActiveTranslationRequest>());
-	const waitRetryCountRef = useRef(new Map<string, number>());
-	const runningRef = useRef(0);
-	const flushTimerRef = useRef<number | null>(null);
+	const retryCountRef = useRef(new Map<string, number>());
+	const pollErrorCountRef = useRef(new Map<string, number>());
 
-	// Force re-renders when in-flight state changes (refs don't trigger renders).
 	const [, forceRender] = useState(0);
+
+	const bumpRender = useCallback(() => {
+		if (!mountedRef.current) return;
+		forceRender((value) => value + 1);
+	}, []);
 
 	const shouldAutoTranslate = useCallback(
 		(item: FeedItem) =>
@@ -125,235 +196,369 @@ export function useAutoTranslate(params: {
 		[enabled],
 	);
 
-	const loadActiveRequest = useCallback(async (requestId: string) => {
-		let latest = await apiGetTranslationRequest(requestId);
-		const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
-		while (isPendingTranslationResultStatus(latest.result.status)) {
-			if (Date.now() >= deadline) {
-				return { response: latest, terminal: false as const };
+	const clearTask = useCallback(
+		(key: string, task: TranslationTask) => {
+			if (requestTasksRef.current.get(key) === task) {
+				requestTasksRef.current.delete(key);
+				pollErrorCountRef.current.delete(key);
+				bumpRender();
 			}
-			await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-			latest = await apiGetTranslationRequest(requestId);
-		}
-		return { response: latest, terminal: true as const };
-	}, []);
-
-	const clearTrackedRequest = useCallback((key: string) => {
-		activeRequestRef.current.delete(key);
-		waitRetryCountRef.current.delete(key);
-	}, []);
-
-	const resolveTrackedRequest = useCallback(
-		async (
-			key: string,
-			requestItem: TranslationRequestItemInput,
-			trackedRequest: ActiveTranslationRequest | undefined,
-		) => {
-			let requestId = trackedRequest?.requestId ?? null;
-			let resumeWindowCount = trackedRequest?.resumeWindowCount ?? 0;
-			for (let attempt = 0; attempt < 2; attempt += 1) {
-				try {
-					if (requestId) {
-						const active = await loadActiveRequest(requestId);
-						return {
-							response: active.response,
-							terminal: active.terminal,
-							resumeWindowCount,
-						};
-					}
-					let response = await apiSubmitTranslationRequest({
-						mode: "wait",
-						item: requestItem,
-					});
-					let terminal = true;
-					if (isPendingTranslationResultStatus(response.result.status)) {
-						const active = await loadActiveRequest(response.request_id);
-						response = active.response;
-						terminal = active.terminal;
-					}
-					return { response, terminal, resumeWindowCount: 0 };
-				} catch (error) {
-					if (!isMissingTranslationRequestError(error) || attempt === 1) {
-						throw error;
-					}
-					clearTrackedRequest(key);
-					requestId = null;
-					resumeWindowCount = 0;
-				}
-			}
-			throw new Error("translation request could not be recovered");
 		},
-		[clearTrackedRequest, loadActiveRequest],
+		[bumpRender],
 	);
 
-	const translateSingle = useCallback(
-		async (item: FeedItem) => {
-			const key = keyOf(item);
-			const requestItem = buildReleaseSummaryRequestItem(item);
-			const requestSourceKey = buildRequestSourceKey(requestItem);
-			const trackedRequest = activeRequestRef.current.get(key);
-			const requestToResume =
-				trackedRequest?.sourceKey === requestSourceKey
-					? trackedRequest
-					: undefined;
-			if (!requestToResume) {
-				clearTrackedRequest(key);
-			}
-			const resolved = await resolveTrackedRequest(
-				key,
-				requestItem,
-				requestToResume,
-			);
-			const { response, terminal } = resolved;
+	const scheduleViewportPlanRef = useRef<() => void>(() => {});
+	const schedulePendingPollRef = useRef<() => void>(() => {});
 
-			const resumeWindowCount = resolved.resumeWindowCount;
-
-			const translated = response.result;
-			if (!terminal) {
-				const nextResumeWindowCount = resumeWindowCount + 1;
-				if (nextResumeWindowCount >= REQUEST_RESUME_WINDOW_MAX_RETRIES) {
-					activeRequestRef.current.delete(key);
-					throw new Error("translation request exceeded resume window");
-				}
-				activeRequestRef.current.set(key, {
-					requestId: response.request_id,
-					sourceKey: requestSourceKey,
-					resumeWindowCount: nextResumeWindowCount,
-				});
-				return { translated, mapped: null, terminal: false as const };
-			}
-
-			activeRequestRef.current.delete(key);
-			const mapped = mapTranslationItemToFeedResponse(translated);
+	const finalizeSuccess = useCallback(
+		(
+			candidate: TranslationCandidate,
+			task: TranslationTask,
+			mapped: TranslateResponse | null,
+		) => {
+			clearTask(candidate.key, task);
 			if (!mapped) {
-				if (translated.status === "missing" || translated.status === "error") {
-					return { translated, mapped, terminal: true as const };
-				}
-				throw new ApiError(
-					504,
-					translated.error ?? "translate wait timeout",
-					"translation_wait_timeout",
+				failedRef.current.add(candidate.key);
+			} else {
+				failedRef.current.delete(candidate.key);
+				retryCountRef.current.delete(candidate.key);
+				onTranslated(
+					{ kind: candidate.item.kind, id: candidate.item.id },
+					mapped,
 				);
 			}
-			return { translated, mapped, terminal: true as const };
+			scheduleViewportPlanRef.current();
 		},
-		[clearTrackedRequest, resolveTrackedRequest],
+		[clearTask, onTranslated],
 	);
 
-	const requeueRequest = useCallback((key: string, consumeBudget = true) => {
-		if (failedRef.current.has(key)) return false;
-		if (consumeBudget) {
-			const retries = waitRetryCountRef.current.get(key) ?? 0;
-			if (retries >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
-				failedRef.current.add(key);
-				waitRetryCountRef.current.delete(key);
-				activeRequestRef.current.delete(key);
-				return false;
+	const finalizeFailure = useCallback(
+		(
+			candidate: TranslationCandidate,
+			task: TranslationTask,
+			error?: unknown,
+		) => {
+			clearTask(candidate.key, task);
+			const retries = retryCountRef.current.get(candidate.key) ?? 0;
+			if (retries + 1 >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
+				failedRef.current.add(candidate.key);
+				retryCountRef.current.delete(candidate.key);
+			} else {
+				retryCountRef.current.set(candidate.key, retries + 1);
 			}
-			waitRetryCountRef.current.set(key, retries + 1);
-		}
-		if (!queuedRef.current.includes(key)) {
-			queuedRef.current.push(key);
-		}
-		return true;
-	}, []);
-
-	const requeueAfterFailure = useCallback(
-		(item: FeedItem) => {
-			requeueRequest(keyOf(item));
+			task.deferred.reject(error);
+			scheduleViewportPlanRef.current();
 		},
-		[requeueRequest],
+		[clearTask],
 	);
 
-	const pump = useCallback(() => {
-		if (!enabled) return;
-		while (
-			runningRef.current < MAX_CONCURRENT &&
-			queuedRef.current.length > 0
-		) {
-			const key = queuedRef.current.shift();
-			if (!key || inFlightRef.current.has(key)) {
-				continue;
+	const resolveRequestItems = useCallback(
+		async (
+			items: TranslationRequestItemInput[],
+			options?: { retryOnError?: boolean },
+		) => {
+			return apiResolveTranslationResults({
+				items,
+				retry_on_error: options?.retryOnError ?? false,
+			});
+		},
+		[],
+	);
+
+	const applyResolvedResults = useCallback(
+		(
+			candidates: Array<{
+				candidate: TranslationCandidate;
+				task: TranslationTask;
+			}>,
+			results: TranslationResultItem[],
+		) => {
+			const resultsByProducerRef = new Map(
+				results.map((result) => [result.producer_ref, result]),
+			);
+
+			for (const { candidate, task } of candidates) {
+				if (requestTasksRef.current.get(candidate.key) !== task) {
+					continue;
+				}
+
+				pollErrorCountRef.current.delete(candidate.key);
+				const resolved = resultsByProducerRef.get(
+					candidate.requestItem.producer_ref,
+				);
+				if (!resolved) {
+					finalizeFailure(
+						candidate,
+						task,
+						new Error("translation result missing from resolve response"),
+					);
+					continue;
+				}
+
+				if (isPendingTranslationResultStatus(resolved.status)) {
+					if (Date.now() - task.createdAtMs > REQUEST_PENDING_MAX_AGE_MS) {
+						finalizeFailure(
+							candidate,
+							task,
+							new Error("translation request exceeded resume window"),
+						);
+					}
+					continue;
+				}
+
+				const mapped = mapTranslationItemToFeedResponse(resolved);
+				if (!mapped) {
+					finalizeFailure(candidate, task, new Error(resultLabel(resolved)));
+					continue;
+				}
+
+				task.deferred.resolve(mapped);
+				finalizeSuccess(candidate, task, mapped);
 			}
+		},
+		[finalizeFailure, finalizeSuccess],
+	);
 
-			const item = itemByKeyRef.current.get(key);
-			if (!item || !shouldAutoTranslate(item)) {
-				continue;
+	const pollPendingTasks = useCallback(async () => {
+		if (!enabled || !mountedRef.current || pollBusyRef.current) return;
+		pollBusyRef.current = true;
+		try {
+			const pending = Array.from(requestTasksRef.current.entries()).map(
+				([key, task]) => {
+					const item = itemByKeyRef.current.get(key);
+					if (!item) return null;
+					return {
+						candidate: {
+							key,
+							item,
+							requestItem: task.requestItem,
+							sourceKey: task.sourceKey,
+							top: 0,
+							bottom: 0,
+						},
+						task,
+					};
+				},
+			);
+			const active = pending.filter(
+				(
+					entry,
+				): entry is {
+					candidate: TranslationCandidate;
+					task: TranslationTask;
+				} => Boolean(entry),
+			);
+			if (active.length === 0) return;
+
+			const response = await resolveRequestItems(
+				active.map(({ task }) => task.requestItem),
+			);
+			applyResolvedResults(active, response.items);
+		} catch (error) {
+			for (const [key, task] of requestTasksRef.current) {
+				const item = itemByKeyRef.current.get(key);
+				if (!item) continue;
+				const count = (pollErrorCountRef.current.get(key) ?? 0) + 1;
+				if (count >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
+					finalizeFailure(
+						{
+							key,
+							item,
+							requestItem: task.requestItem,
+							sourceKey: task.sourceKey,
+							top: 0,
+							bottom: 0,
+						},
+						task,
+						error,
+					);
+				} else {
+					pollErrorCountRef.current.set(key, count);
+				}
 			}
+		} finally {
+			pollBusyRef.current = false;
+			if (requestTasksRef.current.size > 0) {
+				schedulePendingPollRef.current();
+			}
+		}
+	}, [applyResolvedResults, enabled, finalizeFailure, resolveRequestItems]);
 
-			inFlightRef.current.add(key);
-			runningRef.current += 1;
-			forceRender((x) => x + 1);
+	const schedulePendingPoll = useCallback(() => {
+		if (!enabled || !mountedRef.current || requestTasksRef.current.size === 0)
+			return;
+		if (pollTimerRef.current !== null || pollBusyRef.current) return;
+		pollTimerRef.current = window.setTimeout(() => {
+			pollTimerRef.current = null;
+			void pollPendingTasks();
+		}, REQUEST_STATUS_POLL_INTERVAL_MS);
+	}, [enabled, pollPendingTasks]);
 
-			void translateSingle(item)
-				.then(({ translated, mapped, terminal }) => {
-					if (!terminal) {
-						requeueRequest(key, false);
-						return;
-					}
-					waitRetryCountRef.current.delete(key);
-					if (mapped) {
-						onTranslated(item, mapped);
-					}
-					if (translated.status !== "ready") {
-						failedRef.current.add(key);
-					}
-				})
-				.catch(() => {
-					requeueAfterFailure(item);
-				})
-				.finally(() => {
-					inFlightRef.current.delete(key);
-					runningRef.current -= 1;
-					forceRender((x) => x + 1);
-					pump();
+	schedulePendingPollRef.current = schedulePendingPoll;
+
+	const submitCandidates = useCallback(
+		async (rawCandidates: TranslationCandidate[]) => {
+			const byKey = new Map<string, Promise<TranslateResponse | null>>();
+			const candidates: Array<{
+				candidate: TranslationCandidate;
+				task: TranslationTask;
+			}> = [];
+
+			for (const candidate of rawCandidates) {
+				const latestItem =
+					itemByKeyRef.current.get(candidate.key) ?? candidate.item;
+				const requestItem = buildReleaseSummaryRequestItem(latestItem);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				const existing = requestTasksRef.current.get(candidate.key);
+				if (existing && existing.sourceKey === sourceKey) {
+					byKey.set(candidate.key, existing.promise);
+					continue;
+				}
+				if (existing) {
+					byKey.set(candidate.key, existing.promise);
+					continue;
+				}
+
+				const deferred = createDeferred<TranslateResponse | null>();
+				const task: TranslationTask = {
+					sourceKey,
+					requestItem,
+					createdAtMs: Date.now(),
+					deferred,
+					promise: deferred.promise,
+				};
+				requestTasksRef.current.set(candidate.key, task);
+				byKey.set(candidate.key, deferred.promise);
+				candidates.push({
+					candidate: {
+						...candidate,
+						item: latestItem,
+						requestItem,
+						sourceKey,
+					},
+					task,
 				});
-		}
-	}, [
-		enabled,
-		onTranslated,
-		requeueAfterFailure,
-		requeueRequest,
-		shouldAutoTranslate,
-		translateSingle,
-	]);
+			}
 
-	const schedulePump = useCallback(() => {
-		if (!enabled) return;
-		if (flushTimerRef.current !== null) return;
-		flushTimerRef.current = window.setTimeout(() => {
-			flushTimerRef.current = null;
-			pump();
-		}, QUEUE_FLUSH_DELAY_MS);
-	}, [enabled, pump]);
+			if (candidates.length === 0) {
+				return byKey;
+			}
 
-	const enqueue = useCallback(
-		(key: string) => {
-			if (!enabled) return;
-			if (inFlightRef.current.has(key) || failedRef.current.has(key)) return;
-			if (queuedRef.current.includes(key)) return;
-			queuedRef.current.push(key);
-			schedulePump();
+			bumpRender();
+
+			try {
+				const response = await resolveRequestItems(
+					candidates.map(({ candidate }) => candidate.requestItem),
+				);
+				applyResolvedResults(candidates, response.items);
+			} catch (error) {
+				for (const { candidate, task } of candidates) {
+					finalizeFailure(candidate, task, error);
+				}
+				return byKey;
+			}
+
+			if (requestTasksRef.current.size > 0) {
+				schedulePendingPoll();
+			}
+
+			return byKey;
 		},
-		[enabled, schedulePump],
+		[
+			applyResolvedResults,
+			bumpRender,
+			finalizeFailure,
+			resolveRequestItems,
+			schedulePendingPoll,
+		],
 	);
+
+	const prepareCandidates = useCallback(() => {
+		const candidates: TranslationCandidate[] = [];
+		for (const [key, element] of keyToElementRef.current) {
+			const item = itemByKeyRef.current.get(key);
+			if (!item || !shouldAutoTranslate(item)) continue;
+			if (requestTasksRef.current.has(key)) continue;
+			const requestItem = buildReleaseSummaryRequestItem(item);
+			const rect = element.getBoundingClientRect();
+			if (rect.bottom <= 0) continue;
+			candidates.push({
+				key,
+				item,
+				requestItem,
+				sourceKey: buildRequestSourceKey(requestItem),
+				top: rect.top,
+				bottom: rect.bottom,
+			});
+		}
+
+		return candidates.sort((left, right) => {
+			if (left.top !== right.top) {
+				return left.top - right.top;
+			}
+			return left.bottom - right.bottom;
+		});
+	}, [shouldAutoTranslate]);
+
+	const runViewportPlan = useCallback(async () => {
+		if (!enabled || !mountedRef.current) return;
+		if (plannerBusyRef.current) {
+			plannerDirtyRef.current = true;
+			return;
+		}
+
+		plannerBusyRef.current = true;
+		try {
+			do {
+				plannerDirtyRef.current = false;
+				const viewportHeight =
+					window.innerHeight || document.documentElement.clientHeight || 0;
+				const plan = buildVisibleWindowPlan(
+					prepareCandidates(),
+					viewportHeight,
+				);
+				if (plan.length > 0) {
+					await submitCandidates(plan);
+				}
+			} while (plannerDirtyRef.current);
+		} finally {
+			plannerBusyRef.current = false;
+		}
+	}, [enabled, prepareCandidates, submitCandidates]);
+
+	const scheduleViewportPlan = useCallback(() => {
+		if (!enabled || !mountedRef.current) return;
+		if (plannerFrameRef.current !== null) return;
+		plannerFrameRef.current = window.requestAnimationFrame(() => {
+			plannerFrameRef.current = null;
+			void runViewportPlan();
+		});
+	}, [enabled, runViewportPlan]);
+
+	scheduleViewportPlanRef.current = scheduleViewportPlan;
 
 	const register = useCallback(
-		(item: FeedItem) => (el: HTMLElement | null) => {
+		(item: FeedItem) => (element: HTMLElement | null) => {
 			const key = keyOf(item);
 			itemByKeyRef.current.set(key, item);
 
-			const prev = keyToElementRef.current.get(key);
-			if (prev && observerRef.current) {
-				observerRef.current.unobserve(prev);
-				elementToKeyRef.current.delete(prev);
+			const previous = keyToElementRef.current.get(key);
+			if (previous && previous !== element) {
+				resizeObserverRef.current?.unobserve(previous);
 				keyToElementRef.current.delete(key);
 			}
 
-			if (!el || !enabled) return;
-			keyToElementRef.current.set(key, el);
-			elementToKeyRef.current.set(el, key);
-			observerRef.current?.observe(el);
+			if (!element || !enabled) {
+				if (!element && previous) {
+					keyToElementRef.current.delete(key);
+				}
+				scheduleViewportPlanRef.current();
+				return;
+			}
+
+			keyToElementRef.current.set(key, element);
+			resizeObserverRef.current?.observe(element);
+			scheduleViewportPlanRef.current();
 		},
 		[enabled],
 	);
@@ -361,82 +566,109 @@ export function useAutoTranslate(params: {
 	const translateNow = useCallback(
 		async (item: FeedItem) => {
 			const key = keyOf(item);
+			const requestItem = buildReleaseSummaryRequestItem(item);
+			const sourceKey = buildRequestSourceKey(requestItem);
 			failedRef.current.delete(key);
-			waitRetryCountRef.current.delete(key);
-			queuedRef.current = queuedRef.current.filter(
-				(queuedKey) => queuedKey !== key,
-			);
-			inFlightRef.current.add(key);
-			forceRender((x) => x + 1);
+			retryCountRef.current.delete(key);
 
+			const existing = requestTasksRef.current.get(key);
+			if (existing && existing.sourceKey === sourceKey) {
+				return existing.promise;
+			}
+
+			const candidate: TranslationCandidate = {
+				key,
+				item,
+				requestItem,
+				sourceKey,
+				top: 0,
+				bottom: 0,
+			};
+
+			const deferred = createDeferred<TranslateResponse | null>();
+			const task: TranslationTask = {
+				sourceKey,
+				requestItem,
+				createdAtMs: Date.now(),
+				deferred,
+				promise: deferred.promise,
+			};
+			requestTasksRef.current.set(key, task);
+			bumpRender();
 			try {
-				const { translated, mapped, terminal } = await translateSingle(item);
-				if (!terminal) {
-					requeueRequest(key, false);
-					schedulePump();
-					return null;
+				const response = await resolveRequestItems([requestItem], {
+					retryOnError: true,
+				});
+				applyResolvedResults([{ candidate, task }], response.items);
+				if (requestTasksRef.current.size > 0) {
+					schedulePendingPollRef.current();
 				}
-				waitRetryCountRef.current.delete(key);
-				if (!mapped) {
-					failedRef.current.add(key);
-					throw new Error(translated.error ?? "translate failed");
-				}
-				onTranslated(item, mapped);
-				if (translated.status !== "ready") {
-					failedRef.current.add(key);
-				}
-				return mapped;
-			} catch (err) {
+				return await task.promise;
+			} catch (error) {
+				finalizeFailure(candidate, task, error);
 				failedRef.current.add(key);
-				throw err;
-			} finally {
-				inFlightRef.current.delete(key);
-				forceRender((x) => x + 1);
+				throw error;
 			}
 		},
-		[onTranslated, requeueRequest, schedulePump, translateSingle],
+		[applyResolvedResults, bumpRender, finalizeFailure, resolveRequestItems],
 	);
 
 	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+		};
+	}, []);
+
+	useEffect(() => {
 		if (!enabled) {
-			if (flushTimerRef.current !== null) {
-				window.clearTimeout(flushTimerRef.current);
-				flushTimerRef.current = null;
+			if (plannerFrameRef.current !== null) {
+				window.cancelAnimationFrame(plannerFrameRef.current);
+				plannerFrameRef.current = null;
 			}
-			observerRef.current?.disconnect();
-			observerRef.current = null;
+			if (pollTimerRef.current !== null) {
+				window.clearTimeout(pollTimerRef.current);
+				pollTimerRef.current = null;
+			}
+			resizeObserverRef.current?.disconnect();
+			resizeObserverRef.current = null;
 			return;
 		}
 
-		observerRef.current = new IntersectionObserver(
-			(entries) => {
-				for (const e of entries) {
-					if (!e.isIntersecting) continue;
-					const key = elementToKeyRef.current.get(e.target);
-					if (!key) continue;
-					const item = itemByKeyRef.current.get(key);
-					if (item && shouldAutoTranslate(item)) enqueue(key);
-				}
-			},
-			{ rootMargin: "600px 0px", threshold: 0.01 },
-		);
+		resizeObserverRef.current = new ResizeObserver(() => {
+			scheduleViewportPlan();
+		});
 
-		for (const el of keyToElementRef.current.values()) {
-			observerRef.current.observe(el);
+		for (const element of keyToElementRef.current.values()) {
+			resizeObserverRef.current.observe(element);
 		}
 
-		return () => {
-			if (flushTimerRef.current !== null) {
-				window.clearTimeout(flushTimerRef.current);
-				flushTimerRef.current = null;
-			}
-			observerRef.current?.disconnect();
-			observerRef.current = null;
+		const handleViewportChange = () => {
+			scheduleViewportPlan();
 		};
-	}, [enabled, enqueue, shouldAutoTranslate]);
 
-	// Re-render is driven by forceRender; derive the current in-flight keys from the ref.
-	const inFlightKeys = new Set(inFlightRef.current);
+		window.addEventListener("scroll", handleViewportChange, { passive: true });
+		window.addEventListener("resize", handleViewportChange);
+		scheduleViewportPlan();
+		schedulePendingPoll();
+
+		return () => {
+			window.removeEventListener("scroll", handleViewportChange);
+			window.removeEventListener("resize", handleViewportChange);
+			if (plannerFrameRef.current !== null) {
+				window.cancelAnimationFrame(plannerFrameRef.current);
+				plannerFrameRef.current = null;
+			}
+			if (pollTimerRef.current !== null) {
+				window.clearTimeout(pollTimerRef.current);
+				pollTimerRef.current = null;
+			}
+			resizeObserverRef.current?.disconnect();
+			resizeObserverRef.current = null;
+		};
+	}, [enabled, schedulePendingPoll, scheduleViewportPlan]);
+
+	const inFlightKeys = new Set(requestTasksRef.current.keys());
 
 	return { register, translateNow, inFlightKeys };
 }
