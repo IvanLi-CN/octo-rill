@@ -602,6 +602,22 @@ fn queued_request_result(
     }
 }
 
+fn missing_result(item: &TranslationRequestItemInput) -> TranslationResultItem {
+    TranslationResultItem {
+        producer_ref: item.producer_ref.clone(),
+        entity_id: item.entity_id.clone(),
+        kind: item.kind.clone(),
+        variant: item.variant.clone(),
+        status: "missing".to_owned(),
+        title_zh: None,
+        summary_md: None,
+        body_md: None,
+        error: None,
+        work_item_id: None,
+        batch_id: None,
+    }
+}
+
 fn request_status_from_result_status(result_status: &str) -> &'static str {
     match result_status {
         "ready" | "disabled" => "completed",
@@ -1885,6 +1901,14 @@ async fn ensure_translation_result_for_item(
     retry_on_error: bool,
 ) -> Result<TranslationResultItem, ApiError> {
     let source_hash = build_source_hash(item);
+    if item.kind == "release_summary"
+        && item.variant == "feed_card"
+        && current_server_source_hash_for_item(tx, user_id, item)
+            .await?
+            .is_none()
+    {
+        return Ok(missing_result(item));
+    }
     if let Some(existing) = load_translation_state_row(tx, user_id, item).await?
         && existing.source_hash == source_hash
     {
@@ -5207,7 +5231,7 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("resolve-123");
+        let item = seed_canonical_release_item(&pool, "1", 42, 123).await;
 
         let first = resolve_translation_results_for_user(
             state.as_ref(),
@@ -5252,7 +5276,7 @@ mod tests {
         let pool = setup_pool_with_max_connections(4).await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("resolve-concurrent-123");
+        let item = seed_canonical_release_item(&pool, "1", 43, 124).await;
 
         let first_state = state.clone();
         let second_state = state.clone();
@@ -5296,7 +5320,7 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("ready-123");
+        let item = seed_canonical_release_item(&pool, "1", 44, 125).await;
         let source_hash = build_source_hash(&item);
 
         sqlx::query(
@@ -5361,7 +5385,7 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("retry-123");
+        let item = seed_canonical_release_item(&pool, "1", 45, 126).await;
 
         let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
@@ -5457,7 +5481,7 @@ mod tests {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("retry-forced-123");
+        let item = seed_canonical_release_item(&pool, "1", 46, 127).await;
 
         let created = create_translation_request(state.as_ref(), "1", "async", &item)
             .await
@@ -6030,6 +6054,47 @@ mod tests {
                 .expect("count work items");
         assert_eq!(request_count, 0);
         assert_eq!(work_item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_rejects_noncanonical_feed_card_source() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let stale_item = release_feed_item(
+            "420",
+            "Release v1.9.0",
+            Some("- stale body"),
+            Some("openai/codex"),
+        );
+
+        let resolved =
+            resolve_translation_results_for_user(state.as_ref(), "1", &[stale_item], false)
+                .await
+                .expect("resolve non-canonical result");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, "missing");
+        assert!(resolved[0].work_item_id.is_none());
+        assert!(resolved[0].batch_id.is_none());
+
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let work_item_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM translation_work_items")
+                .fetch_one(&pool)
+                .await
+                .expect("count work items");
+        let translation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ai_translations")
+            .fetch_one(&pool)
+            .await
+            .expect("count result rows");
+        assert_eq!(request_count, 0);
+        assert_eq!(work_item_count, 0);
+        assert_eq!(translation_count, 0);
     }
 
     #[tokio::test]
@@ -8157,6 +8222,33 @@ mod tests {
                 "- change A
 - change B",
             ),
+            Some("octo/repo"),
+        )
+    }
+
+    async fn seed_canonical_release_item(
+        pool: &SqlitePool,
+        user_id: &str,
+        repo_id: i64,
+        release_id: i64,
+    ) -> TranslationRequestItemInput {
+        let title = format!("Release {release_id}");
+        let body = "- change A
+- change B";
+        seed_feed_release(
+            pool,
+            user_id,
+            repo_id,
+            release_id,
+            "octo/repo",
+            &title,
+            body,
+        )
+        .await;
+        release_feed_item(
+            &release_id.to_string(),
+            title.as_str(),
+            Some(body),
             Some("octo/repo"),
         )
     }

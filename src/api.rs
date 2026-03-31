@@ -3008,6 +3008,7 @@ pub async fn get_release_detail(
                     auto_translate: None,
                 })
             }
+            (true, Some("ready")) => Some(translated_missing_item(true)),
             (false, Some("ready")) if refresh_in_flight => {
                 translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
                     .or_else(|| Some(translated_missing_item(false)))
@@ -11633,6 +11634,45 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("旧标题"));
         assert_eq!(translated.summary.as_deref(), Some("- 旧摘要"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_treats_invalid_fresh_ready_as_missing() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'ready', ?, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(source_hash.as_str())
+        .bind("空摘要标题")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed invalid ready detail translation");
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        let translated = detail.translated.expect("translated detail");
+        assert_eq!(translated.status, "missing");
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
     }
 
     #[tokio::test]
