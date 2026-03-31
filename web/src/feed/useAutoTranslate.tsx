@@ -228,8 +228,10 @@ export function useAutoTranslate(params: {
 	const shouldAutoTranslate = useCallback(
 		(item: FeedItem) =>
 			enabled &&
-			item.translated?.status === "missing" &&
-			item.translated.auto_translate !== false &&
+			((item.translated?.status === "missing" &&
+				item.translated.auto_translate !== false) ||
+				(item.translated?.status === "ready" &&
+					item.translated.auto_translate === true)) &&
 			!failedRef.current.has(keyOf(item)),
 		[enabled],
 	);

@@ -2581,6 +2581,7 @@ async fn upsert_translation_demand_state(
     let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
         return Ok(());
     };
+    let existing = load_translation_state_row(tx, user_id, item).await?;
     if let Some(current_source_hash) =
         current_server_source_hash_for_item(tx, user_id, item).await?
         && current_source_hash != source_hash
@@ -2588,62 +2589,81 @@ async fn upsert_translation_demand_state(
         return Ok(());
     }
 
-    let update_same_source = sqlx::query(
-        r#"
-        UPDATE ai_translations
-        SET source_hash = ?,
-            status = ?,
-            title = NULL,
-            summary = NULL,
-            error_text = NULL,
-            active_work_item_id = ?,
-            updated_at = ?
-        WHERE user_id = ?
-          AND entity_type = ?
-          AND entity_id = ?
-          AND lang = ?
-          AND source_hash = ?
-        "#,
-    )
-    .bind(source_hash)
-    .bind(status)
-    .bind(work_item_id)
-    .bind(now)
-    .bind(user_id)
-    .bind(entity_type)
-    .bind(item.entity_id.as_str())
-    .bind(item.target_lang.as_str())
-    .bind(source_hash)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    if update_same_source.rows_affected() > 0 {
-        return Ok(());
-    }
+    if let Some(existing) = existing {
+        if existing.source_hash == source_hash {
+            sqlx::query(
+                r#"
+                UPDATE ai_translations
+                SET source_hash = ?,
+                    status = ?,
+                    title = NULL,
+                    summary = NULL,
+                    error_text = NULL,
+                    active_work_item_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(source_hash)
+            .bind(status)
+            .bind(work_item_id)
+            .bind(now)
+            .bind(existing.id.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            return Ok(());
+        }
 
-    let preserve_existing = sqlx::query(
-        r#"
-        UPDATE ai_translations
-        SET active_work_item_id = ?,
-            updated_at = ?
-        WHERE user_id = ?
-          AND entity_type = ?
-          AND entity_id = ?
-          AND lang = ?
-          AND (active_work_item_id IS NULL OR active_work_item_id = ?)
-        "#,
-    )
-    .bind(work_item_id)
-    .bind(now)
-    .bind(user_id)
-    .bind(entity_type)
-    .bind(item.entity_id.as_str())
-    .bind(item.target_lang.as_str())
-    .bind(work_item_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-    if preserve_existing.rows_affected() > 0 {
+        let preserves_visible_ready = existing.status == "ready"
+            && (existing
+                .title
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || existing
+                    .summary
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty()));
+
+        if preserves_visible_ready {
+            sqlx::query(
+                r#"
+                UPDATE ai_translations
+                SET active_work_item_id = ?,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(work_item_id)
+            .bind(now)
+            .bind(existing.id.as_str())
+            .execute(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+            return Ok(());
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET source_hash = ?,
+                status = ?,
+                title = NULL,
+                summary = NULL,
+                error_text = NULL,
+                active_work_item_id = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(source_hash)
+        .bind(status)
+        .bind(work_item_id)
+        .bind(now)
+        .bind(existing.id.as_str())
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
         return Ok(());
     }
 
@@ -5558,9 +5578,31 @@ mod tests {
     async fn upsert_translation_demand_state_keeps_newer_source_hash() {
         let pool = setup_pool().await;
         seed_user(&pool, 1, "octo").await;
-        let item = sample_release_item("source-guard");
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            421,
+            "openai/codex",
+            "Release v2.0.1",
+            "- current body",
+        )
+        .await;
+
+        let item = release_feed_item(
+            "421",
+            "Release v2.0.1",
+            Some("- current body"),
+            Some("openai/codex"),
+        );
         let newer_hash = build_source_hash(&item);
-        let older_hash = "older-source-hash";
+        let stale_item = release_feed_item(
+            "421",
+            "Release v2.0.0",
+            Some("- stale body"),
+            Some("openai/codex"),
+        );
+        let older_hash = build_source_hash(&stale_item);
 
         sqlx::query(
             r#"
@@ -5586,8 +5628,8 @@ mod tests {
         upsert_translation_demand_state(
             &mut tx,
             "1",
-            &item,
-            older_hash,
+            &stale_item,
+            older_hash.as_str(),
             "queued",
             "old-work-item",
             "2026-03-30T00:00:01Z",
@@ -5686,7 +5728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_translation_demand_state_does_not_replace_existing_active_refresh() {
+    async fn upsert_translation_demand_state_replaces_existing_active_refresh() {
         let pool = setup_pool().await;
         seed_user(&pool, 1, "octo").await;
         let item = sample_release_item("active-guard");
@@ -5719,13 +5761,13 @@ mod tests {
             &mut tx,
             "1",
             &item,
-            "stale-source-hash",
+            "next-source-hash",
             "queued",
-            "stale-work-item",
+            "next-work-item",
             "2026-03-30T00:00:03Z",
         )
         .await
-        .expect("late stale demand");
+        .expect("replace active refresh");
         tx.commit().await.expect("commit tx");
 
         let row: (
@@ -5752,7 +5794,76 @@ mod tests {
         assert_eq!(row.1, "ready");
         assert_eq!(row.2.as_deref(), Some("当前标题"));
         assert_eq!(row.3.as_deref(), Some("当前摘要"));
-        assert_eq!(row.4.as_deref(), Some("current-work-item"));
+        assert_eq!(row.4.as_deref(), Some("next-work-item"));
+    }
+
+    #[tokio::test]
+    async fn upsert_translation_demand_state_moves_pending_row_to_latest_source_hash() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("pending-guard");
+        let pending_hash = "pending-source-hash";
+        let latest_hash = build_source_hash(&item);
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+              error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'queued', NULL, NULL, NULL, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .bind(pending_hash)
+        .bind("old-work-item")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .execute(&pool)
+        .await
+        .expect("seed pending refresh");
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_translation_demand_state(
+            &mut tx,
+            "1",
+            &item,
+            latest_hash.as_str(),
+            "queued",
+            "latest-work-item",
+            "2026-03-30T00:00:03Z",
+        )
+        .await
+        .expect("move pending refresh to latest source");
+        tx.commit().await.expect("commit tx");
+
+        let row: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, title, summary, active_work_item_id
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load latest pending refresh row");
+
+        assert_eq!(row.0, latest_hash);
+        assert_eq!(row.1, "queued");
+        assert!(row.2.is_none());
+        assert!(row.3.is_none());
+        assert_eq!(row.4.as_deref(), Some("latest-work-item"));
     }
 
     #[tokio::test]

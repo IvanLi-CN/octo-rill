@@ -3009,7 +3009,7 @@ pub async fn get_release_detail(
                 })
             }
             (false, Some("ready")) if refresh_in_flight => {
-                translated_ready_item(row.trans_title.clone(), row.trans_summary.clone())
+                translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
                     .or_else(|| Some(translated_missing_item(false)))
             }
             (true, Some(status)) => translated_terminal_item(status),
@@ -4607,6 +4607,7 @@ fn translated_terminal_item(status: &str) -> Option<TranslatedItem> {
 fn translated_ready_item(
     raw_title: Option<String>,
     raw_summary: Option<String>,
+    auto_translate: Option<bool>,
 ) -> Option<TranslatedItem> {
     let (title, summary) = normalize_translation_fields(raw_title, raw_summary);
     if title.is_none() && summary.is_none() {
@@ -4617,7 +4618,7 @@ fn translated_ready_item(
         status: "ready".to_owned(),
         title,
         summary,
-        auto_translate: None,
+        auto_translate,
     })
 }
 
@@ -4706,7 +4707,7 @@ fn feed_item_from_row(
                 })
             }
         } else if refresh_in_flight {
-            translated_ready_item(r.trans_title.clone(), r.trans_summary.clone())
+            translated_ready_item(r.trans_title.clone(), r.trans_summary.clone(), Some(true))
                 .or_else(|| Some(translated_missing_item(false)))
         } else {
             Some(translated_missing_item(true))
@@ -11266,6 +11267,7 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("旧标题"));
         assert_eq!(translated.summary.as_deref(), Some("- 旧摘要"));
+        assert_eq!(translated.auto_translate, Some(true));
     }
 
     #[test]
