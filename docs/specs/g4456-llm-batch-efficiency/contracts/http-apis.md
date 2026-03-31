@@ -54,6 +54,7 @@
 
 - `/api/feed` 与 release detail 普通读取接口必须透传当前 source hash 上的 `ready/disabled/missing/error` 终态，而不是只识别 `ready`。
 - 当普通读取接口返回 `missing/error` 且这是结果表里的当前终态时，响应需要显式标记“不要自动重排队”；只有新的显式 resolve / 手动翻译调用，才能再次进入 ensure 队列。
+- 当结果表保留的是旧 source hash 的 `ready` 译文、同时 `active_work_item_id` 指向仍在途的 refresh work item 时，普通读取接口必须继续返回旧 `ready` 译文，直到该 work item 终态落地。
 
 ## Submit Translation Request（POST /api/translate/requests）
 

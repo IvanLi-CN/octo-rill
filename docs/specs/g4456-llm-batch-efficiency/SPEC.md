@@ -54,6 +54,7 @@
 - 后端必须保证同一用户、同一 release、同一 source hash、同一请求模式的重复 resolve / 重复同源请求会复用同一条 `translation_requests` 记录，不会新增重复 `translation_work_items`，也不会因为轮询继续制造额外 request 行。
 - 当较新的 source hash 进入排队时，后端不得为了挂起新任务而清空已经 `ready` 的旧译文；现有可展示译文必须保留到新任务真正进入终态为止。
 - feed / release detail 的普通读取接口必须透传当前 source hash 上的 `disabled/missing/error` 终态；其中 `missing/error` 需要显式标记为“禁止自动重排队”，避免页面刷新后再次自动建队列。
+- 若结果表里仍保留旧 source hash 的 `ready` 译文，且新的 source hash 已经挂上活跃 work item，则普通读取接口必须继续返回这份旧 `ready` 译文，直到 refresh work item 进入终态，而不是先退回 `missing`。
 - 前端必须按真实 DOM 视口几何持续重算 demand window，不再在前端执行 token 装箱或优先级拆批。
 - feed 自动翻译的用户侧等待预算必须保持短窗口；默认 `max_wait_ms=500`，避免页面首次打开后长时间停留在 `queued`。
 - 后端调度器继续以 work item token 预算与现有 worker 分流规则决定实际批次，但单批输入预算必须被 `1800 tokens` 硬上限截断，不得随模型上下文上限膨胀到数千 token。
