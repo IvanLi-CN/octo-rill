@@ -15,6 +15,8 @@ type ApiOptions = {
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
 	autoTranslateFeedCount?: number;
+	autoTranslateInitialReadyIds?: string[];
+	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	releaseDetailPendingPolls?: number;
 };
 
@@ -36,9 +38,17 @@ function makeAutoTranslateReleaseId(index: number) {
 	return `200${`${index + 1}`.padStart(2, "0")}`;
 }
 
-function makeAutoTranslateFeedItems(count: number) {
+function makeAutoTranslateFeedItems(
+	count: number,
+	options?: {
+		initialReadyIds?: string[];
+	},
+) {
+	const initialReadyIds = new Set(options?.initialReadyIds ?? []);
 	return Array.from({ length: count }, (_, index) => {
 		const releaseId = makeAutoTranslateReleaseId(index);
+		const initialReady = initialReadyIds.has(releaseId);
+		const readyPayload = makeFeedTranslationPayload(releaseId);
 		return {
 			kind: "release",
 			ts: `2026-02-22T${`${(index % 10) + 10}`.padStart(2, "0")}:22:33Z`,
@@ -55,28 +65,40 @@ function makeAutoTranslateFeedItems(count: number) {
 			subject_type: null,
 			html_url: `https://github.com/owner/repo/releases/tag/v${releaseId}`,
 			unread: null,
-			translated: {
-				lang: "zh-CN",
-				status: "missing",
-				title: null,
-				summary: null,
-			},
+			translated: initialReady
+				? {
+						lang: "zh-CN",
+						status: "ready",
+						title: readyPayload.title_zh,
+						summary: readyPayload.summary_md,
+						auto_translate: true,
+					}
+				: {
+						lang: "zh-CN",
+						status: "missing",
+						title: null,
+						summary: null,
+					},
 			reactions: null,
 		};
 	});
 }
 
-function makeFeedTranslationPayload(releaseId: string) {
+function makeFeedTranslationPayload(
+	releaseId: string,
+	status: "ready" | "missing" | "error" = "ready",
+) {
 	return {
 		producer_ref: `feed.auto_translate:release:${releaseId}`,
 		entity_id: releaseId,
 		kind: "release_summary",
 		variant: "feed_card",
-		status: "ready" as const,
-		title_zh: `发布说明 ${releaseId}`,
-		summary_md: `这是 release ${releaseId} 的中文摘要。`,
+		status,
+		title_zh: status === "ready" ? `发布说明 ${releaseId}` : null,
+		summary_md:
+			status === "ready" ? `这是 release ${releaseId} 的中文摘要。` : null,
 		body_md: null,
-		error: null,
+		error: status === "error" ? `translate returned ${status}` : null,
 		work_item_id: `work-feed-${releaseId}`,
 		batch_id: `batch-feed-${releaseId}`,
 	};
@@ -175,7 +197,9 @@ async function installApiMocks(
 						},
 					]
 				: cfg.withAutoTranslateFeed
-					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18)
+					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18, {
+							initialReadyIds: cfg.autoTranslateInitialReadyIds,
+						})
 					: [];
 			return json(route, { items, next_cursor: null });
 		}
@@ -239,7 +263,10 @@ async function installApiMocks(
 			tracker.translationResolveEntityIds.push(entityIds);
 			return json(route, {
 				items: entityIds.map((entityId) =>
-					makeFeedTranslationPayload(entityId),
+					makeFeedTranslationPayload(
+						entityId,
+						cfg.autoTranslateResolveStatuses?.[entityId] ?? "ready",
+					),
 				),
 			});
 		}
@@ -562,6 +589,39 @@ test("feed auto translate resolves visible cards and the next 10 through results
 	await expect(
 		page.getByText("这是 release 20001 的中文摘要。", { exact: true }),
 	).toBeVisible();
+});
+
+test("feed auto translate clears stale ready cards when aggregation returns missing", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 12,
+		autoTranslateInitialReadyIds: [releaseId],
+		autoTranslateResolveStatuses: {
+			[releaseId]: "missing",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(
+		page.getByRole("heading", { name: `Release ${releaseId}` }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toHaveCount(0);
+	await expect(
+		page.getByText(`这是 release ${releaseId} 的中文摘要。`, { exact: true }),
+	).toHaveCount(0);
+	await expect(
+		page.getByRole("button", { name: "翻译" }).first(),
+	).toBeDisabled();
 });
 
 test.describe("localized timestamps", () => {

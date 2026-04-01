@@ -6,7 +6,7 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
-import type { FeedItem, TranslateResponse } from "@/feed/types";
+import type { FeedItem, TranslatedItem, TranslateResponse } from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
@@ -42,19 +42,58 @@ function buildReleaseSummaryRequestItem(
 	};
 }
 
-function mapTranslationItemToFeedResponse(item: {
+function mapTranslationItemToFeedTranslated(item: {
 	status: "ready" | "disabled" | "missing" | "error" | "queued" | "running";
 	title_zh: string | null;
 	summary_md: string | null;
-}): TranslateResponse | null {
-	if (item.status !== "ready" && item.status !== "disabled") {
+}): TranslatedItem | null {
+	switch (item.status) {
+		case "ready":
+			return {
+				lang: "zh-CN",
+				status: "ready",
+				title: item.title_zh,
+				summary: item.summary_md,
+			};
+		case "disabled":
+			return {
+				lang: "zh-CN",
+				status: "disabled",
+				title: null,
+				summary: null,
+			};
+		case "missing":
+			return {
+				lang: "zh-CN",
+				status: "missing",
+				title: null,
+				summary: null,
+				auto_translate: false,
+			};
+		case "error":
+			return {
+				lang: "zh-CN",
+				status: "error",
+				title: null,
+				summary: null,
+				auto_translate: false,
+			};
+		default:
+			return null;
+	}
+}
+
+function mapTranslatedToTranslateResponse(
+	item: TranslatedItem | null,
+): TranslateResponse | null {
+	if (!item || (item.status !== "ready" && item.status !== "disabled")) {
 		return null;
 	}
 	return {
 		lang: "zh-CN",
 		status: item.status === "disabled" ? "disabled" : "ready",
-		title: item.title_zh,
-		summary: item.summary_md,
+		title: item.title,
+		summary: item.summary,
 	};
 }
 
@@ -198,7 +237,7 @@ export function useAutoTranslate(params: {
 	enabled: boolean;
 	onTranslated: (
 		item: Pick<FeedItem, "kind" | "id">,
-		res: TranslateResponse,
+		translated: TranslatedItem,
 	) => void;
 }) {
 	const { enabled, onTranslated } = params;
@@ -281,9 +320,10 @@ export function useAutoTranslate(params: {
 		(
 			candidate: TranslationCandidate,
 			task: TranslationTask,
-			mapped: TranslateResponse | null,
+			translated: TranslatedItem,
 		) => {
 			clearTask(candidate.key, task);
+			const mapped = mapTranslatedToTranslateResponse(translated);
 			if (!mapped) {
 				failedRef.current.add(candidate.key);
 			} else {
@@ -291,7 +331,7 @@ export function useAutoTranslate(params: {
 				retryCountRef.current.delete(candidate.key);
 				onTranslated(
 					{ kind: candidate.item.kind, id: candidate.item.id },
-					mapped,
+					translated,
 				);
 			}
 			settleTaskPromise(task, mapped);
@@ -324,15 +364,22 @@ export function useAutoTranslate(params: {
 		(
 			candidate: TranslationCandidate,
 			task: TranslationTask,
+			translated: TranslatedItem | null,
 			error?: unknown,
 		) => {
 			clearTask(candidate.key, task);
+			if (translated) {
+				onTranslated(
+					{ kind: candidate.item.kind, id: candidate.item.id },
+					translated,
+				);
+			}
 			failedRef.current.add(candidate.key);
 			retryCountRef.current.delete(candidate.key);
 			settleTaskPromise(task, null, error);
 			scheduleViewportPlanRef.current();
 		},
-		[clearTask, settleTaskPromise],
+		[clearTask, onTranslated, settleTaskPromise],
 	);
 
 	const applyResolvedResults = useCallback(
@@ -376,16 +423,30 @@ export function useAutoTranslate(params: {
 					continue;
 				}
 
-				const mapped = mapTranslationItemToFeedResponse(resolved);
-				if (!mapped) {
+				const translated = mapTranslationItemToFeedTranslated(resolved);
+				if (!translated) {
 					if (isTerminalTranslationResultStatus(resolved.status)) {
-						finalizeTerminal(candidate, task, new Error(resultLabel(resolved)));
+						finalizeTerminal(
+							candidate,
+							task,
+							null,
+							new Error(resultLabel(resolved)),
+						);
 						continue;
 					}
 					finalizeFailure(candidate, task, new Error(resultLabel(resolved)));
 					continue;
 				}
-				finalizeSuccess(candidate, task, mapped);
+				if (isTerminalTranslationResultStatus(resolved.status)) {
+					finalizeTerminal(
+						candidate,
+						task,
+						translated,
+						new Error(resultLabel(resolved)),
+					);
+					continue;
+				}
+				finalizeSuccess(candidate, task, translated);
 			}
 		},
 		[finalizeFailure, finalizeSuccess, finalizeTerminal],
