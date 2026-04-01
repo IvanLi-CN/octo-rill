@@ -595,8 +595,7 @@ test("feed auto translate clears stale ready cards when aggregation returns miss
 	page,
 }) => {
 	const releaseId = makeAutoTranslateReleaseId(0);
-
-	await installApiMocks(page, {
+	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
 		autoTranslateFeedCount: 12,
 		autoTranslateInitialReadyIds: [releaseId],
@@ -619,9 +618,14 @@ test("feed auto translate clears stale ready cards when aggregation returns miss
 	await expect(
 		page.getByText(`这是 release ${releaseId} 的中文摘要。`, { exact: true }),
 	).toHaveCount(0);
-	await expect(
-		page.getByRole("button", { name: "翻译" }).first(),
-	).toBeDisabled();
+
+	const translateButton = page.getByRole("button", { name: "翻译" }).first();
+	await expect(translateButton).toBeEnabled();
+	await translateButton.click();
+	await expect
+		.poll(() => tracker.translationResolveEntityIds.length)
+		.toBeGreaterThan(1);
+	expect(tracker.translationResolveEntityIds.at(-1)).toEqual([releaseId]);
 });
 
 test.describe("localized timestamps", () => {

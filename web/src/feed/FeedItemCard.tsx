@@ -85,8 +85,7 @@ export function FeedItemCard(props: {
 	const canTranslate =
 		!aiDisabled &&
 		(item.translated?.status === "error" ||
-			(item.translated?.status === "missing" &&
-				item.translated.auto_translate !== false)) &&
+			item.translated?.status === "missing") &&
 		!isTranslating;
 
 	const reactions = item.reactions;
