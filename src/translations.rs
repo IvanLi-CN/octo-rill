@@ -1876,7 +1876,7 @@ async fn ensure_translation_result_for_item(
 ) -> Result<TranslationResultItem, ApiError> {
     let source_hash = build_source_hash(item);
     if item.kind == "release_summary"
-        && item.variant == "feed_card"
+        && matches!(item.variant.as_str(), "feed_card" | "feed_body")
         && current_server_source_hash_for_item(tx, user_id, item)
             .await?
             .is_none()
@@ -4452,7 +4452,7 @@ fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
         return Some(source.to_owned());
     }
     match (item.kind.as_str(), item.variant.as_str()) {
-        ("release_summary", "feed_card") => Some("feed.auto_translate".to_owned()),
+        ("release_summary", "feed_card" | "feed_body") => Some("feed.auto_translate".to_owned()),
         ("release_detail", _) => Some("release_detail".to_owned()),
         ("notification", _) => Some("notification".to_owned()),
         _ => Some(item.kind.clone()),
@@ -4484,12 +4484,13 @@ struct CanonicalFeedReleaseRow {
     body: Option<String>,
 }
 
-async fn build_canonical_feed_card_request_item(
+async fn build_canonical_feed_request_item(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
 ) -> Result<Option<TranslationRequestItemInput>, ApiError> {
-    if item.kind != "release_summary" || item.variant != "feed_card" {
+    if item.kind != "release_summary" || !matches!(item.variant.as_str(), "feed_card" | "feed_body")
+    {
         return Ok(None);
     }
 
@@ -4524,7 +4525,7 @@ async fn build_canonical_feed_card_request_item(
         .filter(|value| !value.is_empty())
         .unwrap_or(&row.tag_name)
         .to_owned();
-    let excerpt = crate::api::release_excerpt(row.body.as_deref())
+    let body = crate::api::release_feed_body(row.body.as_deref())
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let metadata = row.full_name.trim().to_owned();
@@ -4533,10 +4534,10 @@ async fn build_canonical_feed_card_request_item(
         slot: "title".to_owned(),
         text: title,
     }];
-    if let Some(excerpt) = excerpt {
+    if let Some(body) = body {
         source_blocks.push(TranslationSourceBlock {
-            slot: "excerpt".to_owned(),
-            text: excerpt,
+            slot: "body_markdown".to_owned(),
+            text: body,
         });
     }
     if !metadata.is_empty() {
@@ -4557,7 +4558,7 @@ async fn canonicalize_translation_result_item(
     user_id: &str,
     item: &TranslationRequestItemInput,
 ) -> Result<TranslationRequestItemInput, ApiError> {
-    Ok(build_canonical_feed_card_request_item(tx, user_id, item)
+    Ok(build_canonical_feed_request_item(tx, user_id, item)
         .await?
         .unwrap_or_else(|| item.clone()))
 }
@@ -4567,7 +4568,7 @@ async fn current_server_source_hash_for_item(
     user_id: &str,
     item: &TranslationRequestItemInput,
 ) -> Result<Option<String>, ApiError> {
-    Ok(build_canonical_feed_card_request_item(tx, user_id, item)
+    Ok(build_canonical_feed_request_item(tx, user_id, item)
         .await?
         .map(|canonical| build_source_hash(&canonical)))
 }
@@ -4704,7 +4705,7 @@ mod tests {
         let err = normalize_request_items(&[TranslationRequestItemInput {
             producer_ref: "r1".to_owned(),
             kind: "other".to_owned(),
-            variant: "feed_card".to_owned(),
+            variant: "feed_body".to_owned(),
             entity_id: "123".to_owned(),
             target_lang: "zh-CN".to_owned(),
             max_wait_ms: 1000,
@@ -4861,7 +4862,7 @@ mod tests {
             "#,
         )
         .bind("batch-queued-window")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -4976,7 +4977,7 @@ mod tests {
             "#,
         )
         .bind("batch-terminal-window")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -5349,7 +5350,8 @@ mod tests {
         assert_eq!(first[0].status, "ready");
         assert_eq!(second[0].status, "ready");
         assert_eq!(first[0].title_zh.as_deref(), Some("已翻译标题"));
-        assert_eq!(first[0].summary_md.as_deref(), Some("- 已翻译摘要"));
+        assert_eq!(first[0].summary_md, None);
+        assert_eq!(first[0].body_md.as_deref(), Some("- 已翻译摘要"));
         assert_eq!(first[0].work_item_id, None);
         assert_eq!(second[0].work_item_id, None);
     }
@@ -5957,7 +5959,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_translation_results_uses_canonical_feed_card_source() {
+    async fn resolve_translation_results_uses_canonical_feed_body_source() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -6015,7 +6017,8 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].status, "ready");
         assert_eq!(resolved[0].title_zh.as_deref(), Some("当前标题"));
-        assert_eq!(resolved[0].summary_md.as_deref(), Some("当前摘要"));
+        assert_eq!(resolved[0].summary_md, None);
+        assert_eq!(resolved[0].body_md.as_deref(), Some("当前摘要"));
 
         let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
             .fetch_one(&pool)
@@ -6031,7 +6034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_translation_results_rejects_noncanonical_feed_card_source() {
+    async fn resolve_translation_results_rejects_noncanonical_feed_body_source() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         seed_user(&pool, 1, "octo").await;
@@ -6837,7 +6840,7 @@ mod tests {
             "#,
         )
         .bind("batch-runtime-refresh")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -6941,7 +6944,7 @@ mod tests {
             "#,
         )
         .bind("batch-runtime-refresh-resized")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -7088,7 +7091,7 @@ mod tests {
             "#,
         )
         .bind("batch-runtime-slot-sync")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -7574,7 +7577,7 @@ mod tests {
             "#,
         )
         .bind("batch-drained-slot-sync")
-        .bind("general:release_summary:feed_card:zh-CN")
+        .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
         .bind(current_model_profile())
         .bind("zh-CN")
@@ -7986,7 +7989,7 @@ mod tests {
                 scope_user_id: "1".to_owned(),
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
                 kind: "release_summary".to_owned(),
-                variant: "feed_card".to_owned(),
+                variant: "feed_body".to_owned(),
                 entity_id: "123".to_owned(),
                 target_lang: "zh-CN".to_owned(),
                 max_wait_ms: 1500,
@@ -8008,7 +8011,7 @@ mod tests {
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
                 entity_id: "123".to_owned(),
                 kind: "release_summary".to_owned(),
-                variant: "feed_card".to_owned(),
+                variant: "feed_body".to_owned(),
                 status: "queued".to_owned(),
                 title_zh: None,
                 summary_md: None,
@@ -8047,7 +8050,7 @@ mod tests {
                 scope_user_id: "1".to_owned(),
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
                 kind: "release_summary".to_owned(),
-                variant: "feed_card".to_owned(),
+                variant: "feed_body".to_owned(),
                 entity_id: "123".to_owned(),
                 target_lang: "zh-CN".to_owned(),
                 max_wait_ms: 1500,
@@ -8069,7 +8072,7 @@ mod tests {
                 producer_ref: "feed.auto_translate:release:123".to_owned(),
                 entity_id: "123".to_owned(),
                 kind: "release_summary".to_owned(),
-                variant: "feed_card".to_owned(),
+                variant: "feed_body".to_owned(),
                 status: "queued".to_owned(),
                 title_zh: None,
                 summary_md: None,
@@ -8124,7 +8127,7 @@ mod tests {
         let feed_item = TranslationRequestItemInput {
             producer_ref: "123".to_owned(),
             kind: "release_summary".to_owned(),
-            variant: "feed_card".to_owned(),
+            variant: "feed_body".to_owned(),
             entity_id: "123".to_owned(),
             target_lang: "zh-CN".to_owned(),
             max_wait_ms: 1000,
@@ -8155,13 +8158,13 @@ mod tests {
     fn release_feed_item(
         entity_id: &str,
         title: &str,
-        excerpt: Option<&str>,
+        body: Option<&str>,
         metadata: Option<&str>,
     ) -> TranslationRequestItemInput {
         TranslationRequestItemInput {
             producer_ref: format!("feed.auto_translate:release:{entity_id}"),
             kind: "release_summary".to_owned(),
-            variant: "feed_card".to_owned(),
+            variant: "feed_body".to_owned(),
             entity_id: entity_id.to_owned(),
             target_lang: "zh-CN".to_owned(),
             max_wait_ms: 1500,
@@ -8171,8 +8174,8 @@ mod tests {
                     text: title.to_owned(),
                 },
                 TranslationSourceBlock {
-                    slot: "excerpt".to_owned(),
-                    text: excerpt
+                    slot: "body_markdown".to_owned(),
+                    text: body
                         .unwrap_or(
                             "- change A
 - change B",
@@ -8184,7 +8187,7 @@ mod tests {
                     text: metadata.unwrap_or("octo/repo").to_owned(),
                 },
             ],
-            target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
+            target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
         }
     }
 

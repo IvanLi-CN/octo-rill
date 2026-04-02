@@ -56,11 +56,12 @@ function makeAutoTranslateFeedItems(
 			id: releaseId,
 			repo_full_name: "owner/repo",
 			title: `Release ${releaseId}`,
-			excerpt: [
+			body: [
 				`- lane ${index + 1} keeps current-screen work first`,
 				"- next-screen requests should submit in parallel",
 				"- secondary prefetch continues within token budget",
 			].join("\n"),
+			body_truncated: false,
 			subtitle: null,
 			reason: null,
 			subject_type: null,
@@ -93,7 +94,7 @@ function makeFeedTranslationPayload(
 		producer_ref: `feed.auto_translate:release:${releaseId}`,
 		entity_id: releaseId,
 		kind: "release_summary",
-		variant: "feed_card",
+		variant: "feed_body",
 		status,
 		title_zh: status === "ready" ? `发布说明 ${releaseId}` : null,
 		summary_md:
@@ -166,7 +167,8 @@ async function installApiMocks(
 							id: cfg.releaseId,
 							repo_full_name: "owner/repo",
 							title: cfg.detailTitle,
-							excerpt: "- fix A\n- fix B",
+							body: "- fix A\n- fix B",
+							body_truncated: false,
 							subtitle: null,
 							reason: null,
 							subject_type: null,
@@ -245,6 +247,7 @@ async function installApiMocks(
 				tag_name: "v1.2.3",
 				name: cfg.detailTitle,
 				body: "- fix A\n- fix B",
+				body_truncated: false,
 				html_url: "https://github.com/owner/repo/releases/tag/v1.2.3",
 				published_at: cfg.detailPublishedAt,
 				is_prerelease: 0,
@@ -321,7 +324,7 @@ async function installApiMocks(
 								: `feed.auto_translate:release:${cfg.releaseId}`),
 						entity_id: cfg.releaseId,
 						kind: item.kind ?? "release_summary",
-						variant: item.variant ?? "feed_card",
+						variant: item.variant ?? "feed_body",
 						status: isPendingReleaseDetail ? "running" : "ready",
 						title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
 						summary_md:
@@ -354,7 +357,7 @@ async function installApiMocks(
 							`feed.auto_translate:release:${item.entity_id ?? ""}`,
 						entity_id: item.entity_id ?? "",
 						kind: item.kind ?? "release_summary",
-						variant: item.variant ?? "feed_card",
+						variant: item.variant ?? "feed_body",
 					})),
 				});
 			}
@@ -631,12 +634,13 @@ test("feed auto translate clears stale ready cards when aggregation returns miss
 	).toHaveCount(0);
 
 	const translateButton = page.getByRole("button", { name: "翻译" }).first();
-	await expect(translateButton).toBeEnabled();
-	await translateButton.click();
+	await expect(translateButton).toBeDisabled();
 	await expect
 		.poll(() => tracker.translationResolveEntityIds.length)
-		.toBeGreaterThan(1);
-	expect(tracker.translationResolveEntityIds.at(-1)).toEqual([releaseId]);
+		.toBeGreaterThan(0);
+	expect(
+		tracker.translationResolveEntityIds.some((ids) => ids.includes(releaseId)),
+	).toBe(true);
 });
 
 test("feed auto translate keeps retrying stale ready refreshes after transient resolve failures", async ({

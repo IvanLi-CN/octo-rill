@@ -606,6 +606,7 @@ pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarred
 }
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
+    let before_release_ids = load_release_ids_for_user(state, user_id).await?;
     let demand = attach_and_wait_for_user_release_demand(
         state,
         None,
@@ -614,6 +615,29 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         "manual_release_sync",
     )
     .await?;
+
+    let after_release_ids = load_release_ids_for_user(state, user_id).await?;
+    let mut new_release_ids = after_release_ids
+        .difference(&before_release_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    if let Err(err) = enqueue_background_release_translation_task(
+        state,
+        user_id,
+        &new_release_ids,
+        "sync.releases.auto_translate",
+        None,
+        Some(user_id),
+    )
+    .await
+    {
+        tracing::warn!(
+            ?err,
+            user_id,
+            "sync.releases: enqueue background translation failed"
+        );
+    }
 
     Ok(SyncReleasesResult {
         repos: demand.repos,
@@ -720,6 +744,114 @@ async fn load_user_starred_repo_rows(
     .fetch_all(&state.pool)
     .await
     .context("failed to query starred repos")
+}
+
+async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<HashSet<i64>> {
+    let rows = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT DISTINCT r.release_id
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query release ids for user")?;
+    Ok(rows.into_iter().collect())
+}
+
+async fn load_release_ids_for_repo_ids(state: &AppState, repo_ids: &[i64]) -> Result<HashSet<i64>> {
+    if repo_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT DISTINCT release_id
+        FROM repo_releases
+        WHERE repo_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for repo_id in repo_ids {
+            separated.push_bind(repo_id);
+        }
+    }
+    query.push(")");
+
+    let rows = query
+        .build_query_scalar::<i64>()
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to query release ids for repo ids")?;
+    Ok(rows.into_iter().collect())
+}
+
+async fn load_user_relevant_release_ids(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if release_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT DISTINCT r.release_id
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = 
+        "#,
+    );
+    query.push_bind(user_id);
+    query.push(" AND sr.repo_id = r.repo_id WHERE r.release_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id);
+        }
+    }
+    query.push(") ORDER BY r.release_id DESC");
+
+    query
+        .build_query_scalar::<i64>()
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to query relevant release ids for user")
+}
+
+async fn enqueue_background_release_translation_task(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+    source: &str,
+    parent_task_id: Option<&str>,
+    requested_by: Option<&str>,
+) -> Result<Option<String>> {
+    if release_ids.is_empty() || state.config.ai.is_none() {
+        return Ok(None);
+    }
+
+    let task = jobs::enqueue_task(
+        state,
+        jobs::NewTask {
+            task_type: jobs::TASK_TRANSLATE_RELEASE_BATCH.to_owned(),
+            payload: json!({
+                "user_id": user_id,
+                "release_ids": release_ids,
+            }),
+            source: source.to_owned(),
+            requested_by: requested_by.map(str::to_owned),
+            parent_task_id: parent_task_id.map(str::to_owned),
+        },
+    )
+    .await
+    .context("failed to enqueue background release translation task")?;
+    Ok(Some(task.task_id))
 }
 
 async fn attach_and_wait_for_user_release_demand(
@@ -1290,6 +1422,8 @@ pub async fn sync_subscriptions(
     .await?;
 
     let repos = aggregate_repos(&successful_users);
+    let repo_ids = repos.iter().map(|repo| repo.repo_id).collect::<Vec<_>>();
+    let before_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -1303,6 +1437,38 @@ pub async fn sync_subscriptions(
     .await?;
 
     let (release_summary, releases_written) = run_release_phase(&context, repos).await?;
+    let after_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
+    let mut new_release_ids = after_release_ids
+        .difference(&before_release_ids)
+        .copied()
+        .collect::<Vec<_>>();
+    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    if !new_release_ids.is_empty() && state.config.ai.is_some() {
+        for user in &successful_users {
+            let user_release_ids =
+                load_user_relevant_release_ids(state, user.user_id.as_str(), &new_release_ids)
+                    .await?;
+            if user_release_ids.is_empty() {
+                continue;
+            }
+            if let Err(err) = enqueue_background_release_translation_task(
+                state,
+                user.user_id.as_str(),
+                &user_release_ids,
+                "sync.subscriptions.auto_translate",
+                Some(task_id),
+                None,
+            )
+            .await
+            {
+                tracing::warn!(
+                    ?err,
+                    user_id = user.user_id.as_str(),
+                    "sync.subscriptions: enqueue background translation failed"
+                );
+            }
+        }
+    }
     jobs::append_task_event(
         state,
         task_id,
