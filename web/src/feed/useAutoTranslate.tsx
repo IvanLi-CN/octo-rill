@@ -22,23 +22,23 @@ function buildReleaseSummaryRequestItem(
 	item: FeedItem,
 ): TranslationRequestItemInput {
 	const title = item.title?.trim() || `release:${item.id}`;
-	const excerpt = item.excerpt?.trim();
+	const body = item.body?.trim();
 	const metadata = [item.repo_full_name, item.reason, item.subject_type]
 		.filter((value): value is string => Boolean(value?.trim()))
 		.join("\n");
 	return {
 		producer_ref: `feed.auto_translate:release:${item.id}`,
 		kind: "release_summary",
-		variant: "feed_card",
+		variant: "feed_body",
 		entity_id: item.id,
 		target_lang: "zh-CN",
 		max_wait_ms: AUTO_TRANSLATE_MAX_WAIT_MS,
 		source_blocks: [
 			{ slot: "title", text: title },
-			...(excerpt ? [{ slot: "excerpt" as const, text: excerpt }] : []),
+			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
 			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
 		],
-		target_slots: ["title_zh", "summary_md"],
+		target_slots: ["title_zh", "body_md"],
 	};
 }
 
@@ -46,14 +46,16 @@ function mapTranslationItemToFeedTranslated(item: {
 	status: "ready" | "disabled" | "missing" | "error" | "queued" | "running";
 	title_zh: string | null;
 	summary_md: string | null;
+	body_md?: string | null;
 }): TranslatedItem | null {
+	const translatedBody = item.body_md ?? item.summary_md;
 	switch (item.status) {
 		case "ready":
 			return {
 				lang: "zh-CN",
 				status: "ready",
 				title: item.title_zh,
-				summary: item.summary_md,
+				summary: translatedBody,
 			};
 		case "disabled":
 			return {

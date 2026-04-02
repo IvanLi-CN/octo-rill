@@ -28,7 +28,12 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
-type FeedMode = "default" | "visible-window-queued" | "visible-window-settling";
+type FeedMode =
+	| "default"
+	| "visible-window-queued"
+	| "visible-window-settling"
+	| "body-limit-error"
+	| "sync-preheated";
 const SYNC_ALL_LABEL = "同步";
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
@@ -38,8 +43,8 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 		id,
 		repo_full_name: "acme/rocket",
 		title: `v${id}`,
-		excerpt:
-			"- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
+		body: "- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
+		body_truncated: false,
 		subtitle: null,
 		reason: null,
 		subject_type: null,
@@ -108,7 +113,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10000", {
 			ts: "2026-02-21T06:20:00Z",
 			title: "v1.7.3",
-			excerpt: "- Patch release\n- Fixes a regression in auth flow",
+			body: "- Patch release\n- Fixes a regression in auth flow",
 			html_url: "https://github.com/acme/rocket/releases/tag/v1.7.3",
 			translated: {
 				lang: "zh-CN",
@@ -129,7 +134,7 @@ function makeVisibleWindowFeed(
 			ts: `2026-02-21T0${(index % 6) + 1}:15:00Z`,
 			title: `v2.0.${seq}`,
 			html_url: `https://github.com/acme/rocket/releases/tag/v2.0.${seq}`,
-			excerpt: [
+			body: [
 				`- Release lane ${seq}`,
 				"- Includes UI polish and API cleanup",
 				"- Refresh worker telemetry and translation batching",
@@ -152,6 +157,53 @@ function makeVisibleWindowFeed(
 	}
 
 	return items;
+}
+
+function makeBodyLimitErrorFeed(): FeedItem[] {
+	return [
+		buildFeedItem("30001", {
+			title: "v3.0.0",
+			body: [
+				"- Introduces the new deployment lane",
+				"- Ships a very long migration checklist",
+				"- Operators should read the full release on GitHub",
+			].join("\n"),
+			body_truncated: true,
+			translated: {
+				lang: "zh-CN",
+				status: "error",
+				title: null,
+				summary: null,
+				auto_translate: false,
+			},
+		}),
+	];
+}
+
+function makeSyncPreheatedFeed(): FeedItem[] {
+	return [
+		buildFeedItem("40001", {
+			title: "v4.1.0",
+			body: [
+				"- Background sync already queued translation",
+				"- The first dashboard open should reuse cached zh-CN content",
+			].join("\n"),
+			translated: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v4.1.0（后台预热）",
+				summary: [
+					"- 后台同步已经预热翻译",
+					"- 首次打开列表直接命中缓存结果",
+				].join("\n"),
+			},
+		}),
+		buildFeedItem("40000", {
+			ts: "2026-02-21T05:40:00Z",
+			title: "v4.0.9",
+			body: "- Next release is still translating in background",
+		}),
+	];
 }
 
 function makeVisibleWindowInFlightKeys(
@@ -227,10 +279,17 @@ function DashboardPreview(props: {
 			? []
 			: feedMode === "default"
 				? makeMockFeed()
-				: makeVisibleWindowFeed(feedMode);
+				: feedMode === "body-limit-error"
+					? makeBodyLimitErrorFeed()
+					: feedMode === "sync-preheated"
+						? makeSyncPreheatedFeed()
+						: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const inFlightKeys =
-		emptyState !== "content" || feedMode === "default"
+		emptyState !== "content" ||
+		feedMode === "default" ||
+		feedMode === "body-limit-error" ||
+		feedMode === "sync-preheated"
 			? new Set<string>()
 			: makeVisibleWindowInFlightKeys(feedMode);
 	const reactionBusyKeys = new Set<string>();
@@ -655,5 +714,48 @@ export const AccessSyncEmptyState: Story = {
 					"首访或超过 1 小时未访问时的自动同步空态，验证 staged refresh 期间不会再提示手动点 Sync all。",
 			},
 		},
+	},
+};
+
+export const BodyLimitError: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "body-limit-error",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"超长 Release 正文在列表中只展示受限正文，并明确提示该卡片不会自动翻译。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText(/列表正文已截断显示/)).toBeVisible();
+		await expect(canvas.getByText(/自动翻译不可用/)).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "翻译" })).toBeDisabled();
+	},
+};
+
+export const SyncPreheated: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "sync-preheated",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"同步任务写入新 release 后，后台预热翻译应让首次打开列表直接看到已缓存的正文译文。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v4.1.0（后台预热）" }),
+		).toBeVisible();
+		await expect(canvas.getByText(/后台同步已经预热翻译/)).toBeVisible();
 	},
 };
