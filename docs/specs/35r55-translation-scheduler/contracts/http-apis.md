@@ -90,4 +90,4 @@ Admin views expose scheduler runtime status, request aggregates, batch aggregate
 - `POST /api/translate/notification`
 - `POST /api/translate/notifications/batch`
 
-All legacy translation endpoints now return `410 Gone` with `translation_scheduler_required`.
+All legacy translation endpoints remain compatibility shims. They still accept the historical request shapes and delegate to the same translation handlers during frontend/backend rollouts; new producers should migrate to `/api/translate/requests*`.
