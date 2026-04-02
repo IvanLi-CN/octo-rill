@@ -1,4 +1,10 @@
-# Release Feed 正文卡片与同步后后台翻译
+# Release Feed 正文卡片与同步后后台翻译（#3k9fd）
+
+## 状态
+
+- Status: 已完成
+- Created: 2026-04-03
+- Last: 2026-04-03
 
 ## 背景
 
