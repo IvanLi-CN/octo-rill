@@ -1,10 +1,11 @@
-export type TranslatedStatus = "ready" | "missing" | "disabled";
+export type TranslatedStatus = "ready" | "missing" | "disabled" | "error";
 
 export type TranslatedItem = {
 	lang: string;
 	status: TranslatedStatus;
 	title: string | null;
 	summary: string | null;
+	auto_translate?: boolean;
 };
 
 // Feed is releases-only (Inbox has its own API + UI tab).

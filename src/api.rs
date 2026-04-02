@@ -2900,8 +2900,10 @@ pub async fn get_release_detail(
         is_prerelease: i64,
         is_draft: i64,
         trans_source_hash: Option<String>,
+        trans_status: Option<String>,
         trans_title: Option<String>,
         trans_summary: Option<String>,
+        trans_work_status: Option<String>,
     }
 
     let row = sqlx::query_as::<_, ReleaseDetailRow>(
@@ -2918,8 +2920,10 @@ pub async fn get_release_detail(
           r.is_prerelease,
           r.is_draft,
           t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
           t.title AS trans_title,
-          t.summary AS trans_summary
+          t.summary AS trans_summary,
+          tw.status AS trans_work_status
         FROM repo_releases r
         LEFT JOIN starred_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
@@ -2928,6 +2932,9 @@ pub async fn get_release_detail(
           AND t.entity_type = 'release_detail'
           AND t.entity_id = CAST(r.release_id AS TEXT)
           AND t.lang = 'zh-CN'
+          AND t.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items tw
+          ON tw.id = t.active_work_item_id
         WHERE r.release_id = ?
         LIMIT 1
         "#,
@@ -2970,32 +2977,45 @@ pub async fn get_release_detail(
         release_detail_source_hash(&resolved_full_name, &original_title, &original_body);
     let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
 
+    let refresh_in_flight = !translation_fresh
+        && row.trans_status.as_deref() == Some("ready")
+        && matches!(
+            row.trans_work_status.as_deref(),
+            Some("queued" | "batched" | "running")
+        );
+
     let translated = if state.config.ai.is_none() {
         Some(TranslatedItem {
             lang: "zh-CN".to_owned(),
             status: "disabled".to_owned(),
             title: None,
             summary: None,
-        })
-    } else if translation_fresh
-        && release_detail_translation_ready(
-            Some(original_body.as_str()),
-            row.trans_summary.as_deref(),
-        )
-    {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: row.trans_title.clone(),
-            summary: row.trans_summary.clone(),
+            auto_translate: None,
         })
     } else {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "missing".to_owned(),
-            title: None,
-            summary: None,
-        })
+        match (translation_fresh, row.trans_status.as_deref()) {
+            (true, Some("ready"))
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    row.trans_summary.as_deref(),
+                ) =>
+            {
+                Some(TranslatedItem {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: row.trans_title.clone(),
+                    summary: row.trans_summary.clone(),
+                    auto_translate: None,
+                })
+            }
+            (true, Some("ready")) => Some(translated_missing_item(true)),
+            (false, Some("ready")) if refresh_in_flight => {
+                translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
+                    .or_else(|| Some(translated_missing_item(false)))
+            }
+            (true, Some(status)) => translated_terminal_item(status),
+            _ => Some(translated_missing_item(true)),
+        }
     };
 
     Ok(Json(ReleaseDetailResponse {
@@ -3789,9 +3809,11 @@ pub struct FeedItem {
 #[derive(Debug, Serialize)]
 pub struct TranslatedItem {
     lang: String,
-    status: String, // ready | missing | disabled
+    status: String, // ready | missing | disabled | error
     title: Option<String>,
     summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_translate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -3845,8 +3867,10 @@ struct FeedRow {
     react_rocket: Option<i64>,
     react_eyes: Option<i64>,
     trans_source_hash: Option<String>,
+    trans_status: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
+    trans_work_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4065,7 +4089,7 @@ fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str>
     }
 }
 
-fn release_excerpt(body: Option<&str>) -> Option<String> {
+pub(crate) fn release_excerpt(body: Option<&str>) -> Option<String> {
     let body = body?;
     let normalized = body.replace("\r\n", "\n");
 
@@ -4248,11 +4272,15 @@ async fn fetch_feed_releases(
           i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
           i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
           t.title AS trans_title,
-          t.summary AS trans_summary
+          t.summary AS trans_summary,
+          tw.status AS trans_work_status
         FROM items i
         LEFT JOIN ai_translations t
-          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN'
+          ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items tw
+          ON tw.id = t.active_work_item_id
     "#;
 
     let (sql, has_cursor) = if cursor.is_some() {
@@ -4557,6 +4585,54 @@ async fn persist_release_reaction_counts(
     Ok(())
 }
 
+fn translated_terminal_item(status: &str) -> Option<TranslatedItem> {
+    match status {
+        "disabled" => Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: None,
+        }),
+        "missing" | "error" => Some(TranslatedItem {
+            lang: "zh-CN".to_owned(),
+            status: status.to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: Some(false),
+        }),
+        _ => None,
+    }
+}
+
+fn translated_ready_item(
+    raw_title: Option<String>,
+    raw_summary: Option<String>,
+    auto_translate: Option<bool>,
+) -> Option<TranslatedItem> {
+    let (title, summary) = normalize_translation_fields(raw_title, raw_summary);
+    if title.is_none() && summary.is_none() {
+        return None;
+    }
+    Some(TranslatedItem {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title,
+        summary,
+        auto_translate,
+    })
+}
+
+fn translated_missing_item(auto_translate: bool) -> TranslatedItem {
+    TranslatedItem {
+        lang: "zh-CN".to_owned(),
+        status: "missing".to_owned(),
+        title: None,
+        summary: None,
+        auto_translate: if auto_translate { None } else { Some(false) },
+    }
+}
+
 fn feed_item_from_row(
     r: FeedRow,
     ai_enabled: bool,
@@ -4592,56 +4668,50 @@ fn feed_item_from_row(
             status: "disabled".to_owned(),
             title: None,
             summary: None,
+            auto_translate: None,
         })
     } else {
         let current_hash = ai::sha256_hex(&source);
+        let refresh_in_flight = r.trans_source_hash.as_deref() != Some(current_hash.as_str())
+            && r.trans_status.as_deref() == Some("ready")
+            && matches!(
+                r.trans_work_status.as_deref(),
+                Some("queued" | "batched" | "running")
+            );
         if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
-            let mut title = r.trans_title.clone().filter(|s| !s.trim().is_empty());
-            let mut summary = r.trans_summary.clone().filter(|s| !s.trim().is_empty());
-            let mut status = "ready".to_owned();
-
-            // Some early cached entries accidentally stored the entire JSON blob in `summary`.
-            // Try to recover it without forcing an AI call; if we can't, mark as missing so the
-            // client can re-translate.
-            if let Some(raw) = summary.as_deref() {
-                let t = raw.trim_start();
-                if t.starts_with('{') || t.starts_with("\"{") {
-                    if let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw) {
-                        if title.is_none() {
-                            title = t_title;
-                        }
-                        if t_summary.is_some() {
-                            summary = t_summary;
-                        }
-                    } else {
-                        status = "missing".to_owned();
-                        title = None;
-                        summary = None;
-                    }
-                }
-            }
-            if status == "ready"
-                && let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref())
-                && !markdown_structure_preserved(src, s)
+            if let Some(status) = r.trans_status.as_deref()
+                && status != "ready"
             {
-                status = "missing".to_owned();
-                title = None;
-                summary = None;
-            }
+                translated_terminal_item(status)
+            } else {
+                let (mut title, mut summary) =
+                    normalize_translation_fields(r.trans_title.clone(), r.trans_summary.clone());
+                let mut status = "ready".to_owned();
+                if title.is_none() && summary.is_none() {
+                    status = "missing".to_owned();
+                }
+                if status == "ready"
+                    && let (Some(src), Some(s)) = (excerpt.as_deref(), summary.as_deref())
+                    && !markdown_structure_preserved(src, s)
+                {
+                    status = "missing".to_owned();
+                    title = None;
+                    summary = None;
+                }
 
-            Some(TranslatedItem {
-                lang: "zh-CN".to_owned(),
-                status,
-                title,
-                summary,
-            })
+                Some(TranslatedItem {
+                    lang: "zh-CN".to_owned(),
+                    status,
+                    title,
+                    summary,
+                    auto_translate: None,
+                })
+            }
+        } else if refresh_in_flight {
+            translated_ready_item(r.trans_title.clone(), r.trans_summary.clone(), Some(true))
+                .or_else(|| Some(translated_missing_item(false)))
         } else {
-            Some(TranslatedItem {
-                lang: "zh-CN".to_owned(),
-                status: "missing".to_owned(),
-                title: None,
-                summary: None,
-            })
+            Some(translated_missing_item(true))
         }
     };
 
@@ -5135,7 +5205,7 @@ pub struct TranslateNotificationsBatchRequest {
 #[derive(Debug, Serialize)]
 pub struct TranslateResponse {
     pub lang: String,
-    pub status: String, // ready | disabled
+    pub status: String, // ready | disabled | missing | error
     pub title: Option<String>,
     pub summary: Option<String>,
 }
@@ -5788,18 +5858,27 @@ struct TranslationUpsert<'a> {
 async fn upsert_translation(
     state: &AppState,
     user_id: &str,
+    requested_at: &str,
     t: TranslationUpsert<'_>,
 ) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO ai_translations (id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?, NULL, NULL, ?, ?)
         ON CONFLICT(user_id, entity_type, entity_id, lang) DO UPDATE SET
           source_hash = excluded.source_hash,
+          status = excluded.status,
           title = excluded.title,
           summary = excluded.summary,
+          error_text = excluded.error_text,
+          active_work_item_id = excluded.active_work_item_id,
           updated_at = excluded.updated_at
+        WHERE ai_translations.source_hash = excluded.source_hash
+           OR ai_translations.updated_at <= ?
         "#,
     )
     .bind(crate::local_id::generate_local_id())
@@ -5812,6 +5891,46 @@ async fn upsert_translation(
     .bind(t.summary)
     .bind(&now)
     .bind(&now)
+    .bind(requested_at)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(())
+}
+
+async fn mark_translation_requested(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    t: TranslationUpsert<'_>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO ai_translations (
+          id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary,
+          error_text, active_work_item_id, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'running', NULL, NULL, NULL, NULL, ?, ?)
+        ON CONFLICT(user_id, entity_type, entity_id, lang) DO UPDATE SET
+          source_hash = excluded.source_hash,
+          status = excluded.status,
+          title = NULL,
+          summary = NULL,
+          error_text = NULL,
+          active_work_item_id = NULL,
+          updated_at = excluded.updated_at
+        WHERE ai_translations.source_hash = excluded.source_hash
+          AND ai_translations.status NOT IN ('ready', 'disabled', 'missing')
+        "#,
+    )
+    .bind(crate::local_id::generate_local_id())
+    .bind(user_id)
+    .bind(t.entity_type)
+    .bind(t.entity_id)
+    .bind(t.lang)
+    .bind(t.source_hash)
+    .bind(requested_at)
+    .bind(requested_at)
     .execute(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -6104,6 +6223,7 @@ struct ReleaseBatchSourceRow {
 struct TranslationCacheRow {
     entity_id: String,
     source_hash: String,
+    status: String,
     title: Option<String>,
     summary: Option<String>,
 }
@@ -6141,6 +6261,7 @@ struct PreparedReleaseBatch {
     candidates: Vec<ReleaseBatchCandidate>,
     pending: Vec<ReleaseBatchCandidate>,
     translated: HashMap<i64, (Option<String>, Option<String>)>,
+    terminal: HashMap<i64, String>,
     missing: HashSet<i64>,
 }
 
@@ -6154,6 +6275,7 @@ async fn prepare_release_batch(
             candidates: Vec::new(),
             pending: Vec::new(),
             translated: HashMap::new(),
+            terminal: HashMap::new(),
             missing: HashSet::new(),
         });
     }
@@ -6224,12 +6346,12 @@ async fn prepare_release_batch(
     if !candidates.is_empty() {
         let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
-            SELECT entity_id, source_hash, title, summary
+            SELECT entity_id, source_hash, status, title, summary
             FROM ai_translations
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -6250,12 +6372,17 @@ async fn prepare_release_batch(
 
     let mut pending = Vec::new();
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
+    let mut terminal = HashMap::<i64, String>::new();
 
     for item in &candidates {
         let cache = cache_by_entity.get(&item.entity_id);
         if let Some(cache) = cache
             && cache.source_hash == item.source_hash
         {
+            if matches!(cache.status.as_str(), "disabled" | "missing") {
+                terminal.insert(item.release_id, cache.status.clone());
+                continue;
+            }
             if let Some(raw) = cache.summary.as_deref()
                 && looks_like_json_blob(raw)
                 && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
@@ -6282,6 +6409,7 @@ async fn prepare_release_batch(
         candidates,
         pending,
         translated,
+        terminal,
         missing,
     })
 }
@@ -6289,6 +6417,7 @@ async fn prepare_release_batch(
 fn build_release_batch_item(
     release_id: i64,
     missing: &HashSet<i64>,
+    terminal: &HashMap<i64, String>,
     translated: &HashMap<i64, (Option<String>, Option<String>)>,
 ) -> TranslateBatchItem {
     if missing.contains(&release_id) {
@@ -6299,6 +6428,21 @@ fn build_release_batch_item(
             title: None,
             summary: None,
             error: Some("release not found".to_owned()),
+        };
+    }
+
+    if let Some(status) = terminal.get(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: status.clone(),
+            title: None,
+            summary: None,
+            error: if status == "missing" {
+                Some("translation result missing".to_owned())
+            } else {
+                None
+            },
         };
     }
 
@@ -6326,6 +6470,7 @@ fn build_release_batch_item(
 async fn upsert_release_batch_translations(
     state: &AppState,
     user_id: &str,
+    requested_at: &str,
     candidates: &[ReleaseBatchCandidate],
     translated: &HashMap<i64, (Option<String>, Option<String>)>,
 ) -> Result<(), ApiError> {
@@ -6334,6 +6479,7 @@ async fn upsert_release_batch_translations(
             upsert_translation(
                 state,
                 user_id,
+                requested_at,
                 TranslationUpsert {
                     entity_type: "release",
                     entity_id: &item.entity_id,
@@ -6345,6 +6491,31 @@ async fn upsert_release_batch_translations(
             )
             .await?;
         }
+    }
+    Ok(())
+}
+
+async fn mark_release_batch_translations_requested(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    candidates: &[ReleaseBatchCandidate],
+) -> Result<(), ApiError> {
+    for item in candidates {
+        mark_translation_requested(
+            state,
+            user_id,
+            requested_at,
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id: &item.entity_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
     }
     Ok(())
 }
@@ -6368,19 +6539,38 @@ async fn translate_releases_batch_internal(
             .collect());
     }
 
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut prepared = prepare_release_batch(state, user_id, release_ids).await?;
+    mark_release_batch_translations_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.pending,
+    )
+    .await?;
     let translated_pending = translate_release_candidates_with_ai(state, &prepared.pending).await;
     for (release_id, values) in translated_pending {
         prepared.translated.insert(release_id, values);
     }
 
-    upsert_release_batch_translations(state, user_id, &prepared.candidates, &prepared.translated)
-        .await?;
+    upsert_release_batch_translations(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.candidates,
+        &prepared.translated,
+    )
+    .await?;
 
     Ok(release_ids
         .iter()
         .map(|release_id| {
-            build_release_batch_item(*release_id, &prepared.missing, &prepared.translated)
+            build_release_batch_item(
+                *release_id,
+                &prepared.missing,
+                &prepared.terminal,
+                &prepared.translated,
+            )
         })
         .collect())
 }
@@ -6403,6 +6593,7 @@ async fn translate_releases_batch_stream_worker(
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let heartbeat = jobs::spawn_task_lease_heartbeat(state.clone(), task_id.clone());
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut ready_count = 0usize;
     let mut disabled_count = 0usize;
     let mut missing_count = 0usize;
@@ -6501,8 +6692,12 @@ async fn translate_releases_batch_stream_worker(
             if pending_ids.contains(release_id) {
                 continue;
             }
-            let item =
-                build_release_batch_item(*release_id, &prepared.missing, &prepared.translated);
+            let item = build_release_batch_item(
+                *release_id,
+                &prepared.missing,
+                &prepared.terminal,
+                &prepared.translated,
+            );
             if !send_batch_stream_event(
                 &tx,
                 TranslateBatchStreamEvent {
@@ -6579,6 +6774,7 @@ async fn translate_releases_batch_stream_worker(
                         upsert_release_batch_translations(
                             state.as_ref(),
                             &user_id,
+                            requested_at.as_str(),
                             &batch,
                             &batch_translated,
                         )
@@ -6596,6 +6792,7 @@ async fn translate_releases_batch_stream_worker(
                     let out = build_release_batch_item(
                         item.release_id,
                         &prepared.missing,
+                        &prepared.terminal,
                         &prepared.translated,
                     );
                     if !send_batch_stream_event(
@@ -7109,18 +7306,24 @@ async fn translate_release_detail_internal(
 
     let source_hash = release_detail_source_hash(&repo_full_name, &original_title, &original_body);
     let entity_id = release_id.to_string();
+    let requested_at = chrono::Utc::now().to_rfc3339();
 
     #[derive(Debug, sqlx::FromRow)]
     struct TranslationRow {
         source_hash: String,
+        status: String,
         title: Option<String>,
         summary: Option<String>,
     }
     let cached = sqlx::query_as::<_, TranslationRow>(
         r#"
-        SELECT source_hash, title, summary
+        SELECT source_hash, status, title, summary
         FROM ai_translations
-        WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+        WHERE user_id = ?
+          AND entity_type = 'release_detail'
+          AND entity_id = ?
+          AND lang = 'zh-CN'
+          AND status IN ('ready', 'disabled', 'missing', 'error')
         LIMIT 1
         "#,
     )
@@ -7132,15 +7335,47 @@ async fn translate_release_detail_internal(
 
     if let Some(cached) = cached
         && cached.source_hash == source_hash
-        && release_detail_translation_ready(Some(original_body.as_str()), cached.summary.as_deref())
     {
-        return Ok(TranslateResponse {
-            lang: "zh-CN".to_owned(),
-            status: "ready".to_owned(),
-            title: cached.title,
-            summary: cached.summary,
-        });
+        match cached.status.as_str() {
+            "ready"
+                if release_detail_translation_ready(
+                    Some(original_body.as_str()),
+                    cached.summary.as_deref(),
+                ) =>
+            {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: "ready".to_owned(),
+                    title: cached.title,
+                    summary: cached.summary,
+                });
+            }
+            "disabled" | "missing" | "error" => {
+                return Ok(TranslateResponse {
+                    lang: "zh-CN".to_owned(),
+                    status: cached.status,
+                    title: None,
+                    summary: None,
+                });
+            }
+            _ => {}
+        }
     }
+
+    mark_translation_requested(
+        state,
+        user_id,
+        requested_at.as_str(),
+        TranslationUpsert {
+            entity_type: "release_detail",
+            entity_id: &entity_id,
+            lang: "zh-CN",
+            source_hash: &source_hash,
+            title: None,
+            summary: None,
+        },
+    )
+    .await?;
 
     let translated_title = ai::chat_completion(
         state,
@@ -7188,6 +7423,7 @@ async fn translate_release_detail_internal(
     upsert_translation(
         state,
         user_id,
+        requested_at.as_str(),
         TranslationUpsert {
             entity_type: "release_detail",
             entity_id: &entity_id,
@@ -7539,6 +7775,7 @@ async fn translate_notifications_batch_internal(
             .collect());
     }
 
+    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         SELECT thread_id, repo_full_name, subject_title, reason, subject_type
@@ -7599,12 +7836,12 @@ async fn translate_notifications_batch_internal(
     if !candidates.is_empty() {
         let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
-            SELECT entity_id, source_hash, title, summary
+            SELECT entity_id, source_hash, status, title, summary
             FROM ai_translations
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'notification' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -7624,11 +7861,16 @@ async fn translate_notifications_batch_internal(
     }
 
     let mut translated = HashMap::<String, (Option<String>, Option<String>)>::new();
+    let mut terminal = HashMap::<String, String>::new();
     let mut pending = Vec::new();
     for item in &candidates {
         if let Some(cache) = cache_by_id.get(&item.thread_id)
             && cache.source_hash == item.source_hash
         {
+            if matches!(cache.status.as_str(), "disabled" | "missing") {
+                terminal.insert(item.thread_id.clone(), cache.status.clone());
+                continue;
+            }
             if let Some(raw) = cache.summary.as_deref()
                 && looks_like_json_blob(raw)
                 && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
@@ -7653,6 +7895,23 @@ async fn translate_notifications_batch_internal(
         pending.push(item.clone());
     }
 
+    for item in &pending {
+        mark_translation_requested(
+            state,
+            user_id,
+            requested_at.as_str(),
+            TranslationUpsert {
+                entity_type: "notification",
+                entity_id: &item.thread_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
+    }
+
     let pending_translated = translate_notification_candidates_with_ai(state, &pending).await;
     for (thread_id, value) in pending_translated {
         translated.insert(thread_id, value);
@@ -7663,6 +7922,7 @@ async fn translate_notifications_batch_internal(
             upsert_translation(
                 state,
                 user_id,
+                requested_at.as_str(),
                 TranslationUpsert {
                     entity_type: "notification",
                     entity_id: &item.thread_id,
@@ -7686,6 +7946,21 @@ async fn translate_notifications_batch_internal(
                 title: None,
                 summary: None,
                 error: Some("notification not found".to_owned()),
+            });
+            continue;
+        }
+        if let Some(status) = terminal.get(thread_id) {
+            out.push(TranslateBatchItem {
+                id: thread_id.clone(),
+                lang: "zh-CN".to_owned(),
+                status: status.clone(),
+                title: None,
+                summary: None,
+                error: if status == "missing" {
+                    Some("translation result missing".to_owned())
+                } else {
+                    None
+                },
             });
             continue;
         }
@@ -7895,15 +8170,15 @@ mod tests {
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
         LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, TranslateBatchItem, TranslationCacheRow,
-        admin_download_realtime_task_log, admin_get_llm_call_detail,
+        TranslationUpsert, admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
-        ensure_account_enabled, extract_translation_fields, get_release_detail,
+        ensure_account_enabled, extract_translation_fields, feed_item_from_row, get_release_detail,
         github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
         has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        markdown_structure_preserved, me, normalize_translation_fields,
+        mark_translation_requested, markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_positive_admin_concurrency, parse_release_id_param,
@@ -7912,8 +8187,10 @@ mod tests {
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
         split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_response_from_batch_item,
+        translate_release_detail_for_user, translate_response_from_batch_item, truncate_chars,
+        upsert_translation,
     };
+    use crate::ai;
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
@@ -7965,8 +8242,10 @@ mod tests {
             react_rocket: None,
             react_eyes: None,
             trans_source_hash: None,
+            trans_status: None,
             trans_title: None,
             trans_summary: None,
+            trans_work_status: None,
         }
     }
 
@@ -8660,9 +8939,9 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO ai_translations (
-              id, user_id, entity_type, entity_id, lang, source_hash, title, summary, created_at, updated_at
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
             )
-            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
             "#,
         )
         .bind(crate::local_id::generate_local_id())
@@ -10908,6 +11187,7 @@ mod tests {
         let cache = TranslationCacheRow {
             entity_id: "1".to_owned(),
             source_hash: "hash".to_owned(),
+            status: "ready".to_owned(),
             title: Some("标题".to_owned()),
             summary: None,
         };
@@ -10919,11 +11199,76 @@ mod tests {
         let cache = TranslationCacheRow {
             entity_id: "1".to_owned(),
             source_hash: "hash".to_owned(),
+            status: "ready".to_owned(),
             title: Some("标题".to_owned()),
             summary: Some("{\"title_zh\":\"标题\"}".to_owned()),
         };
         assert!(looks_like_json_blob(cache.summary.as_deref().unwrap_or("")));
         assert!(!release_cache_entry_reusable(&cache, "body excerpt"));
+    }
+
+    #[test]
+    fn feed_item_from_row_keeps_terminal_missing_non_retryable() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let excerpt = release_excerpt(row.release_body.as_deref()).expect("release excerpt");
+        let source = format!(
+            "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            truncate_chars(excerpt.as_str(), 2000),
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("missing".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, Some(false));
+    }
+
+    #[test]
+    fn feed_item_from_row_keeps_terminal_error_non_retryable() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let excerpt = release_excerpt(row.release_body.as_deref()).expect("release excerpt");
+        let source = format!(
+            "v=4\nkind=release\nrepo={}\ntitle={}\nexcerpt={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            truncate_chars(excerpt.as_str(), 2000),
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("error".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
+    }
+
+    #[test]
+    fn feed_item_from_row_keeps_ready_translation_visible_while_refresh_pending() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.4".to_owned());
+        row.release_body = Some("- new item".to_owned());
+        row.trans_source_hash = Some("older-hash".to_owned());
+        row.trans_status = Some("ready".to_owned());
+        row.trans_title = Some("旧标题".to_owned());
+        row.trans_summary = Some("- 旧摘要".to_owned());
+        row.trans_work_status = Some("queued".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("旧标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 旧摘要"));
+        assert_eq!(translated.auto_translate, Some(true));
     }
 
     #[test]
@@ -10945,6 +11290,102 @@ mod tests {
         let hash1 = release_detail_source_hash("acme/repo", "v1.0.0", "line one");
         let hash2 = release_detail_source_hash("acme/repo", "v1.0.0", "line two");
         assert_ne!(hash1, hash2);
+    }
+
+    #[tokio::test]
+    async fn mark_translation_requested_keeps_existing_ready_translation_visible() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 7, "race-user", 0, 0).await;
+
+        let user_id = test_user_id(7);
+        let entity_id = "42";
+        let ready_hash = "ready-source";
+        let pending_hash = "pending-source";
+
+        upsert_translation(
+            state.as_ref(),
+            user_id.as_str(),
+            "2099-03-30T00:00:01Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: ready_hash,
+                title: Some("旧标题"),
+                summary: Some("旧摘要"),
+            },
+        )
+        .await
+        .expect("seed ready translation");
+
+        mark_translation_requested(
+            state.as_ref(),
+            user_id.as_str(),
+            "2099-03-30T00:00:02Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: pending_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await
+        .expect("mark refresh request");
+
+        let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, title, summary
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(entity_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load preserved ready translation row");
+        assert_eq!(row.0, ready_hash);
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2.as_deref(), Some("旧标题"));
+        assert_eq!(row.3.as_deref(), Some("旧摘要"));
+
+        upsert_translation(
+            state.as_ref(),
+            user_id.as_str(),
+            "2099-03-30T00:00:03Z",
+            TranslationUpsert {
+                entity_type: "release",
+                entity_id,
+                lang: "zh-CN",
+                source_hash: pending_hash,
+                title: Some("新标题"),
+                summary: Some("新摘要"),
+            },
+        )
+        .await
+        .expect("refresh result should land");
+
+        let row: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, title, summary
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(entity_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load completed translation row");
+        assert_eq!(row.0, pending_hash);
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2.as_deref(), Some("新标题"));
+        assert_eq!(row.3.as_deref(), Some("新摘要"));
     }
 
     #[test]
@@ -11091,6 +11532,147 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
         assert_eq!(translated.summary.as_deref(), Some("- 条目"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_preserves_terminal_missing_state() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'missing', NULL, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(source_hash.as_str())
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed terminal missing detail translation");
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        let translated = detail.translated.expect("translated detail");
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, Some(false));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_keeps_ready_translation_visible_while_refresh_pending() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state_with_ai(pool.clone());
+        let work_item_id = "refresh-work-item";
+        let stale_source_hash =
+            release_detail_source_hash("openai/codex", "Release v1.2.3", "- older");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang, protocol_version,
+              model_profile, source_hash, source_blocks_json, target_slots_json, token_estimate,
+              deadline_at, status, cache_hit, created_at, updated_at
+            )
+            VALUES (?, ?, ?, 'release_detail', 'full', ?, 'zh-CN', 4, 'default', ?, '[]', '[]', 0, ?, 'queued', 0, ?, ?)
+            "#,
+        )
+        .bind(work_item_id)
+        .bind("dedupe-refresh-work-item")
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(stale_source_hash.as_str())
+        .bind("2026-02-23T00:00:05Z")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed queued detail refresh work item");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(stale_source_hash.as_str())
+        .bind("旧标题")
+        .bind("- 旧摘要")
+        .bind(work_item_id)
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale ready detail translation");
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        let translated = detail.translated.expect("translated detail");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("旧标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 旧摘要"));
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_treats_invalid_fresh_ready_as_missing() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash = release_detail_source_hash("openai/codex", "Release v1.2.3", "- item");
+
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release_detail', ?, 'zh-CN', ?, 'ready', ?, NULL, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("120")
+        .bind(source_hash.as_str())
+        .bind("空摘要标题")
+        .bind("2026-02-23T00:00:00Z")
+        .bind("2026-02-23T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed invalid ready detail translation");
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail");
+
+        let translated = detail.translated.expect("translated detail");
+        assert_eq!(translated.status, "missing");
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
     }
 
     #[tokio::test]

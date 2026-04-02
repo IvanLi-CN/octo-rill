@@ -207,37 +207,35 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(translations::get_translation_request),
         )
         .route(
+            "/translate/results",
+            post(translations::resolve_translation_results),
+        )
+        .route(
             "/translate/requests/{request_id}/stream",
             get(translations::stream_translation_request),
         )
         .route(
             "/translate/releases/batch",
-            post(translations::reject_legacy_translation_routes),
+            post(api::translate_releases_batch),
         )
         .route(
             "/translate/releases/batch/stream",
-            post(translations::reject_legacy_translation_routes),
+            post(api::translate_releases_batch_stream),
         )
-        .route(
-            "/translate/release",
-            post(translations::reject_legacy_translation_routes),
-        )
+        .route("/translate/release", post(api::translate_release))
         .route(
             "/translate/release/detail/batch",
-            post(translations::reject_legacy_translation_routes),
+            post(api::translate_release_detail_batch),
         )
         .route(
             "/translate/release/detail",
-            post(translations::reject_legacy_translation_routes),
+            post(api::translate_release_detail),
         )
         .route(
             "/translate/notifications/batch",
-            post(translations::reject_legacy_translation_routes),
+            post(api::translate_notifications_batch),
         )
-        .route(
-            "/translate/notification",
-            post(translations::reject_legacy_translation_routes),
-        )
+        .route("/translate/notification", post(api::translate_notification))
         .route("/sync/starred", post(api::sync_starred))
         .route("/sync/all", post(api::sync_all))
         .route("/sync/releases", post(api::sync_releases))

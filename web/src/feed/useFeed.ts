@@ -5,7 +5,7 @@ import type {
 	FeedItem,
 	FeedResponse,
 	ReleaseReactions,
-	TranslateResponse,
+	TranslatedItem,
 } from "@/feed/types";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
@@ -92,19 +92,14 @@ export function useFeed() {
 	}, [loadInitial]);
 
 	const applyTranslation = useCallback(
-		(item: Pick<FeedItem, "kind" | "id">, res: TranslateResponse) => {
+		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
 			const key = itemKey(item);
 			setItems((prev) =>
 				prev.map((it) => {
 					if (itemKey(it) !== key) return it;
 					return {
 						...it,
-						translated: {
-							lang: res.lang,
-							status: res.status === "disabled" ? "disabled" : "ready",
-							title: res.title,
-							summary: res.summary,
-						},
+						translated: { ...translated },
 					};
 				}),
 			);

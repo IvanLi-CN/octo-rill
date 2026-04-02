@@ -28,23 +28,57 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
+type FeedMode = "default" | "visible-window-queued" | "visible-window-settling";
 const SYNC_ALL_LABEL = "同步";
+
+function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
+	return {
+		kind: "release",
+		ts: "2026-02-21T08:05:00Z",
+		id,
+		repo_full_name: "acme/rocket",
+		title: `v${id}`,
+		excerpt:
+			"- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: `https://github.com/acme/rocket/releases/tag/${id}`,
+		unread: null,
+		translated: {
+			lang: "zh-CN",
+			status: "missing",
+			title: null,
+			summary: null,
+		},
+		reactions: {
+			counts: {
+				plus1: 0,
+				laugh: 0,
+				heart: 0,
+				hooray: 0,
+				rocket: 0,
+				eyes: 0,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+		...overrides,
+	};
+}
 
 function makeMockFeed(): FeedItem[] {
 	return [
-		{
-			kind: "release",
-			ts: "2026-02-21T08:05:00Z",
-			id: "10001",
-			repo_full_name: "acme/rocket",
+		buildFeedItem("10001", {
 			title: "v1.8.0",
-			excerpt:
-				"- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
-			subtitle: null,
-			reason: null,
-			subject_type: null,
 			html_url: "https://github.com/acme/rocket/releases/tag/v1.8.0",
-			unread: null,
 			translated: {
 				lang: "zh-CN",
 				status: "ready",
@@ -70,46 +104,64 @@ function makeMockFeed(): FeedItem[] {
 				},
 				status: "ready",
 			},
-		},
-		{
-			kind: "release",
+		}),
+		buildFeedItem("10000", {
 			ts: "2026-02-21T06:20:00Z",
-			id: "10000",
-			repo_full_name: "acme/rocket",
 			title: "v1.7.3",
 			excerpt: "- Patch release\n- Fixes a regression in auth flow",
-			subtitle: null,
-			reason: null,
-			subject_type: null,
 			html_url: "https://github.com/acme/rocket/releases/tag/v1.7.3",
-			unread: null,
 			translated: {
 				lang: "zh-CN",
 				status: "disabled",
 				title: null,
 				summary: null,
 			},
-			reactions: {
-				counts: {
-					plus1: 0,
-					laugh: 0,
-					heart: 0,
-					hooray: 0,
-					rocket: 0,
-					eyes: 0,
-				},
-				viewer: {
-					plus1: false,
-					laugh: false,
-					heart: false,
-					hooray: false,
-					rocket: false,
-					eyes: false,
-				},
-				status: "ready",
-			},
-		},
+		}),
 	];
+}
+
+function makeVisibleWindowFeed(
+	mode: "visible-window-queued" | "visible-window-settling",
+): FeedItem[] {
+	const items = Array.from({ length: 12 }, (_, index) => {
+		const seq = `${index + 1}`.padStart(2, "0");
+		return buildFeedItem(`200${seq}`, {
+			ts: `2026-02-21T0${(index % 6) + 1}:15:00Z`,
+			title: `v2.0.${seq}`,
+			html_url: `https://github.com/acme/rocket/releases/tag/v2.0.${seq}`,
+			excerpt: [
+				`- Release lane ${seq}`,
+				"- Includes UI polish and API cleanup",
+				"- Refresh worker telemetry and translation batching",
+			].join("\n"),
+		});
+	});
+
+	if (mode === "visible-window-settling") {
+		for (const index of [0, 1, 2, 3]) {
+			items[index] = {
+				...items[index],
+				translated: {
+					lang: "zh-CN",
+					status: "ready",
+					title: `${items[index].title}（中文）`,
+					summary: `- 中文摘要 ${index + 1}\n- 可见卡片已经优先收敛\n- 可见窗口后的 10 条继续预取`,
+				},
+			};
+		}
+	}
+
+	return items;
+}
+
+function makeVisibleWindowInFlightKeys(
+	mode: "visible-window-queued" | "visible-window-settling",
+) {
+	return new Set(
+		mode === "visible-window-queued"
+			? ["release:20001", "release:20002", "release:20003", "release:20004"]
+			: ["release:20005", "release:20006"],
+	);
 }
 
 const mockBriefs: BriefItem[] = [
@@ -160,6 +212,7 @@ function DashboardPreview(props: {
 	syncingAll?: boolean;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
+	feedMode?: FeedMode;
 }) {
 	const {
 		initialTab = "all",
@@ -167,10 +220,19 @@ function DashboardPreview(props: {
 		syncingAll = false,
 		showEmptyInbox = false,
 		emptyState = "content",
+		feedMode = "default",
 	} = props;
-	const items = emptyState === "content" ? makeMockFeed() : [];
+	const items =
+		emptyState !== "content"
+			? []
+			: feedMode === "default"
+				? makeMockFeed()
+				: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
-	const inFlightKeys = new Set<string>();
+	const inFlightKeys =
+		emptyState !== "content" || feedMode === "default"
+			? new Set<string>()
+			: makeVisibleWindowInFlightKeys(feedMode);
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) => it.translated?.status === "disabled",
@@ -397,6 +459,7 @@ const meta = {
 		syncingAll: false,
 		showEmptyInbox: false,
 		emptyState: "content",
+		feedMode: "default",
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -464,6 +527,54 @@ export const Syncing: Story = {
 		const icon = syncButton.querySelector("svg");
 		expect(icon).not.toBeNull();
 		expect(icon?.classList.contains("animate-spin")).toBe(true);
+	},
+};
+
+export const VisibleWindowQueue: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "visible-window-queued",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"前端按真实视口收集当前可见 release，并把最后一个可见卡片之后的 10 条一起交给结果聚合接口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v2.0.01" }),
+		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: "翻译中…" }),
+		).toHaveLength(4);
+	},
+};
+
+export const VisibleWindowSettling: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "visible-window-settling",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"部分可见卡片已回填中文，后续窗口仍继续从结果聚合接口回收运行中的译文。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v2.0.01（中文）" }),
+		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: "翻译中…" }),
+		).toHaveLength(2);
 	},
 };
 
