@@ -84,6 +84,7 @@
 
 - Release feed 自动翻译不再直接调用该接口。
 - Release detail 侧栏与其他保留路径仍可继续使用该接口。
+- 旧的 `/api/translate/release*` 与 `/api/translate/notification*` 端点继续保留为兼容 shim，防止前后端滚动发布时旧 bundle 因缓存命中而失效；新代码不得新增对这些旧端点的依赖。
 
 ## Get Translation Request（GET /api/translate/requests/{request_id}）
 

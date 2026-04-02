@@ -38,7 +38,7 @@
 ## 当前实现说明
 
 - 统一翻译调度器已落地：请求、去重 work item、watcher、batch 与 `llm_calls.parent_translation_batch_id` 已入库。
-- 新生产者入口已切到 `POST/GET /api/translate/requests*`，旧翻译接口统一返回 `410 Gone`，避免新旧双轨并存。
+- 新生产者入口已切到 `POST/GET /api/translate/requests*`，旧翻译接口仍保留兼容 shim 并复用同一翻译核心，避免前后端滚动发布时缓存 bundle 立刻失效。
 - Feed 自动翻译改为 `stream` 请求，Release Detail 改为 `wait` 请求，管理员在 `/admin/jobs` 可查看“翻译调度”标签页与批次/LLM 追链。
 - 当前批次执行层仍按 `kind + entity_id + scope_user_id` 复用既有翻译核心函数；`source_blocks` / `target_slots` 已作为统一协议、去重哈希与管理端展示输入。
 - `translation_batches` 与关联 `llm_calls` 现在持有运行期 lease；服务启动前先回收孤儿 `running` 记录，运行中按固定心跳/过期阈值做 sweep，避免请求、work item、batch、LLM 调用卡死在 `running`。

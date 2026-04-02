@@ -126,18 +126,6 @@ struct TranslationRequestStreamEvent {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TranslationLegacyRemovedResponse {
-    ok: bool,
-    error: TranslationLegacyRemovedError,
-}
-
-#[derive(Debug, Serialize)]
-struct TranslationLegacyRemovedError {
-    code: &'static str,
-    message: &'static str,
-}
-
 #[derive(Debug, Deserialize)]
 pub struct AdminTranslationListQuery {
     pub status: Option<String>,
@@ -1294,20 +1282,6 @@ pub fn spawn_translation_recovery_task(state: Arc<AppState>) -> tokio::task::Abo
 
 pub async fn recover_runtime_state_on_startup(state: &AppState) -> Result<()> {
     recover_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Startup).await
-}
-
-pub async fn reject_legacy_translation_routes() -> Response {
-    (
-        StatusCode::GONE,
-        Json(TranslationLegacyRemovedResponse {
-            ok: false,
-            error: TranslationLegacyRemovedError {
-                code: "translation_scheduler_required",
-                message: "legacy translation endpoints were removed; use /api/translate/requests",
-            },
-        }),
-    )
-        .into_response()
 }
 
 pub async fn submit_translation_request(

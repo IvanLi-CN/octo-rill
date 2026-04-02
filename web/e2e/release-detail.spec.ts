@@ -17,6 +17,7 @@ type ApiOptions = {
 	autoTranslateFeedCount?: number;
 	autoTranslateInitialReadyIds?: string[];
 	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
+	autoTranslateResolveFailureCount?: number;
 	releaseDetailPendingPolls?: number;
 };
 
@@ -129,6 +130,8 @@ async function installApiMocks(
 		...options,
 	};
 	const translationRequestPolls = new Map<string, number>();
+	let autoTranslateResolveFailureCount =
+		cfg.autoTranslateResolveFailureCount ?? 0;
 	const tracker: MockApiTracker = {
 		translationResolveEntityIds: [],
 		translationBatchEntityIds: [],
@@ -261,6 +264,14 @@ async function installApiMocks(
 			};
 			const entityIds = (body.items ?? []).map((item) => item.entity_id ?? "");
 			tracker.translationResolveEntityIds.push(entityIds);
+			if (autoTranslateResolveFailureCount > 0) {
+				autoTranslateResolveFailureCount -= 1;
+				return json(
+					route,
+					{ error: { message: "transient translate results failure" } },
+					503,
+				);
+			}
 			return json(route, {
 				items: entityIds.map((entityId) =>
 					makeFeedTranslationPayload(
@@ -626,6 +637,40 @@ test("feed auto translate clears stale ready cards when aggregation returns miss
 		.poll(() => tracker.translationResolveEntityIds.length)
 		.toBeGreaterThan(1);
 	expect(tracker.translationResolveEntityIds.at(-1)).toEqual([releaseId]);
+});
+
+test("feed auto translate keeps retrying stale ready refreshes after transient resolve failures", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 12,
+		autoTranslateInitialReadyIds: [releaseId],
+		autoTranslateResolveStatuses: {
+			[releaseId]: "missing",
+		},
+		autoTranslateResolveFailureCount: 3,
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect
+		.poll(() => tracker.translationResolveEntityIds.length)
+		.toBeGreaterThan(3);
+
+	await expect(
+		page.getByRole("heading", { name: `Release ${releaseId}` }),
+	).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toHaveCount(0);
+	await expect(
+		page.getByText(`这是 release ${releaseId} 的中文摘要。`, { exact: true }),
+	).toHaveCount(0);
 });
 
 test.describe("localized timestamps", () => {

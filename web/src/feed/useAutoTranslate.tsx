@@ -348,9 +348,17 @@ export function useAutoTranslate(params: {
 		) => {
 			clearTask(candidate.key, task);
 			const retries = retryCountRef.current.get(candidate.key) ?? 0;
+			const keepsVisibleReady =
+				!task.rejectOnFailure &&
+				candidate.item.translated?.status === "ready" &&
+				candidate.item.translated.auto_translate === true;
 			if (retries + 1 >= REQUEST_ERROR_RECOVERY_MAX_RETRIES) {
-				failedRef.current.add(candidate.key);
-				retryCountRef.current.delete(candidate.key);
+				if (keepsVisibleReady) {
+					retryCountRef.current.delete(candidate.key);
+				} else {
+					failedRef.current.add(candidate.key);
+					retryCountRef.current.delete(candidate.key);
+				}
 			} else {
 				retryCountRef.current.set(candidate.key, retries + 1);
 			}
