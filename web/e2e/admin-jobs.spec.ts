@@ -227,7 +227,7 @@ async function installAdminJobsMocks(
 		scope_user_id: CURRENT_USER_ID,
 		producer_ref: "feed.auto_translate:release:290978079",
 		kind: "release_summary",
-		variant: "feed_card",
+		variant: "feed_body",
 		entity_id: "290978079",
 		batch_id: "batch-translation-1",
 		created_at: "2026-02-26T04:00:00Z",
@@ -379,7 +379,7 @@ async function installAdminJobsMocks(
 		producer_ref: "feed.auto_translate:release:290978079",
 		entity_id: "290978079",
 		kind: "release_summary",
-		variant: "feed_card",
+		variant: "feed_body",
 		status: "ready",
 		title_zh: "发布说明 290978079",
 		summary_md: "- 修复了调度窗口\n- 保持单请求语义",
@@ -1829,7 +1829,7 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	).toBeVisible();
 	const requestDialog = page.getByLabel("翻译请求详情");
 	await expect(
-		requestDialog.getByText("release_summary · feed_card", { exact: true }),
+		requestDialog.getByText("release_summary · feed_body", { exact: true }),
 	).toBeVisible();
 	await expect(
 		requestDialog.getByText(
@@ -2014,7 +2014,7 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
 	await expect(
-		page.getByText("release_summary · feed_card · entity 290978079"),
+		page.getByText("release_summary · feed_body · entity 290978079"),
 	).toBeVisible();
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByText("W4 · 请求 1 · work items 1")).toBeVisible();
