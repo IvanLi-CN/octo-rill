@@ -77,6 +77,7 @@
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
 | g4456 | LLM 批处理效率改造 | 已完成 | `g4456-llm-batch-efficiency/SPEC.md` | 2026-03-30 | local implementation completed; release feed visible-window resolve flow, backend dedupe, and Playwright coverage aligned |
+| 3k9fd | Release Feed 正文卡片与同步后后台翻译 | 已完成 | `3k9fd-release-feed-body-translation/SPEC.md` | 2026-04-03 | PR #44; body-based release feed cards + sync-triggered background translation |
 | gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-03-27 | PR #28, PR #38; admin jobs runtime recovery + stale running cleanup aligned |
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
 | regzy | OctoRill 文档站点与 Storybook 文档快车道实施 | 已完成 | `regzy-octo-rill-docs-site/SPEC.md` | 2026-03-09 | PR #31; docs-site + pages workflow + storybook docs; checks green; review-loop clear |
