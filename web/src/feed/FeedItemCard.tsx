@@ -59,20 +59,20 @@ export function FeedItemCard(props: {
 
 	const translatedSummary =
 		item.translated?.status === "ready" ? item.translated.summary : null;
-	const originalExcerpt = item.excerpt?.trim() ? item.excerpt : null;
+	const originalBody = item.body?.trim() ? item.body : null;
 
 	const showAiFallbackInOriginal =
-		showOriginal && !originalExcerpt && Boolean(translatedSummary?.trim());
+		showOriginal && !originalBody && Boolean(translatedSummary?.trim());
 
 	// Prefer the active language, but never render an empty original view if we do have an AI
 	// summary available (some releases legitimately ship with an empty body).
 	const bodyText = showAiFallbackInOriginal
 		? translatedSummary
 		: showOriginal
-			? originalExcerpt
+			? originalBody
 			: translatedSummary?.trim()
 				? translatedSummary
-				: originalExcerpt;
+				: originalBody;
 
 	const subtitleBits = [
 		item.reason || item.subtitle,
@@ -86,6 +86,7 @@ export function FeedItemCard(props: {
 		!aiDisabled &&
 		(item.translated?.status === "error" ||
 			item.translated?.status === "missing") &&
+		item.translated?.auto_translate !== false &&
 		!isTranslating;
 
 	const reactions = item.reactions;
@@ -177,6 +178,18 @@ export function FeedItemCard(props: {
 					{showAiFallbackInOriginal ? (
 						<div className="text-muted-foreground mb-2 font-mono text-[11px]">
 							原文 Release notes 为空/无法提取，以下为 AI 中文翻译
+						</div>
+					) : null}
+					{item.body_truncated ? (
+						<div className="text-muted-foreground mb-2 font-mono text-[11px]">
+							列表正文已截断显示；超长 Release 不会自动翻译。
+						</div>
+					) : null}
+					{!canTranslate &&
+					item.translated?.status === "error" &&
+					item.translated.auto_translate === false ? (
+						<div className="text-muted-foreground mb-2 font-mono text-[11px]">
+							自动翻译不可用。
 						</div>
 					) : null}
 					<Markdown content={bodyText} />
