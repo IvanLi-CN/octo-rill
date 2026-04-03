@@ -556,19 +556,13 @@ function DashboardPreview(props: {
 							{feedPanel}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<div className="space-y-6">
-								<ReleaseDailyCard
-									briefs={briefs}
-									selectedDate={selectedDate}
-									busy={false}
-									onGenerate={() => {}}
-									onOpenRelease={setActiveReleaseId}
-								/>
-								<ReleaseDetailCard
-									releaseId={activeReleaseId}
-									onClose={() => setActiveReleaseId(null)}
-								/>
-							</div>
+							<ReleaseDailyCard
+								briefs={briefs}
+								selectedDate={selectedDate}
+								busy={false}
+								onGenerate={() => {}}
+								onOpenRelease={setActiveReleaseId}
+							/>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
 							<InboxList
@@ -592,6 +586,11 @@ function DashboardPreview(props: {
 					</aside>
 				</div>
 			</Tabs>
+
+			<ReleaseDetailCard
+				releaseId={activeReleaseId}
+				onClose={() => setActiveReleaseId(null)}
+			/>
 
 			<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
 				<DialogContent
@@ -739,16 +738,21 @@ export const BriefsLongContentWithDetail: Story = {
 		docs: {
 			description: {
 				story:
-					"从日报内部链接打开 release 详情时，详情正文同样随内容扩展，并继续由页面主滚动条承载。",
+					"从日报内部链接打开 release 详情时，详情应以模态弹窗显示，不再作为正文流里的第二张卡片出现。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(await canvas.findByText(/翻译总览/)).toBeVisible();
-		await expect(canvas.getByText(/变更波次 10/)).toBeVisible();
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(await body.findByRole("dialog")).toBeVisible();
+		await expect(await body.findByText(/翻译总览/)).toBeVisible();
+		await expect(body.getByText(/变更波次 10/)).toBeVisible();
 		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
 		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
+		await expect(
+			canvas.queryByRole("heading", { name: "Release 详情" }),
+		).not.toBeInTheDocument();
 	},
 };
 
