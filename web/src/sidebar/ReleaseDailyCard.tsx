@@ -79,7 +79,7 @@ export function ReleaseDailyCard(props: {
 						的时间边界统计“昨日更新”。
 					</p>
 				) : selected ? (
-					<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
+					<div className="bg-muted/10 rounded-lg border p-4">
 						<Markdown
 							content={selected.content_markdown}
 							onInternalReleaseClick={onOpenRelease}

@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
+import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -26,6 +27,7 @@ import {
 	type NotificationItem,
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
+import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
 type FeedMode =
@@ -35,6 +37,7 @@ type FeedMode =
 	| "body-limit-error"
 	| "sync-preheated";
 const SYNC_ALL_LABEL = "同步";
+const LONG_BRIEF_RELEASE_ID = "777001";
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 	return {
@@ -235,6 +238,127 @@ const mockBriefs: BriefItem[] = [
 	},
 ];
 
+const longBriefMarkdown = [
+	"## 概览",
+	"",
+	"- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00",
+	"- 更新项目：8 个",
+	"- Release：14 条（预发布 3 条）",
+	"- 涉及项目：`acme/rocket`、`acme/satellite`、`acme/hangar`、`acme/telemetry`、`acme/spark`、`acme/atlas`、`acme/relay`、`acme/fleet`",
+	"",
+	"## 项目更新",
+	"",
+	...Array.from({ length: 8 }, (_, index) => {
+		const repo = [
+			"acme/rocket",
+			"acme/satellite",
+			"acme/hangar",
+			"acme/telemetry",
+			"acme/spark",
+			"acme/atlas",
+			"acme/relay",
+			"acme/fleet",
+		][index];
+		const releaseId = index === 0 ? LONG_BRIEF_RELEASE_ID : `${777002 + index}`;
+		return [
+			`### [${repo}](https://github.com/${repo})`,
+			"",
+			`- [v${index + 3}.4.${index}](/?tab=briefs&release=${releaseId}) · 2026-04-03T0${index}:12:00Z · [GitHub Release](https://github.com/${repo}/releases/tag/v${index + 3}.4.${index})`,
+			`  - 完成第 ${index + 1} 波发布，补齐构建链路、监控面板与回滚脚本。`,
+			`  - 新增 \`owner-reviewed\` 发布检查项，并收敛环境差异带来的配置漂移。`,
+			`  - 清理过期镜像标签、重跑 smoke tests，并同步更新部署说明。`,
+			"",
+		].join("\n");
+	}),
+].join("\n");
+
+const longBriefs: BriefItem[] = [
+	{
+		date: "2026-04-03",
+		window_start: "2026-04-02T08:00:00+08:00",
+		window_end: "2026-04-03T08:00:00+08:00",
+		content_markdown: longBriefMarkdown,
+		created_at: "2026-04-03T08:00:35Z",
+	},
+	mockBriefs[1],
+];
+
+const longReleaseDetail: ReleaseDetailResponse = {
+	release_id: LONG_BRIEF_RELEASE_ID,
+	repo_full_name: "acme/rocket",
+	tag_name: "v3.4.0",
+	name: "v3.4.0 · release train",
+	body: [
+		"## Release train summary",
+		"",
+		...Array.from({ length: 10 }, (_, index) => {
+			return [
+				`### Wave ${index + 1}`,
+				"",
+				"- Added rollout guardrails for environment-specific configuration.",
+				"- Replayed migration checks against staging and production snapshots.",
+				"- Published recovery steps and post-release verification notes.",
+				"",
+			].join("\n");
+		}),
+	].join("\n"),
+	html_url: "https://github.com/acme/rocket/releases/tag/v3.4.0",
+	published_at: "2026-04-03T06:18:00Z",
+	is_prerelease: 0,
+	is_draft: 0,
+	translated: {
+		lang: "zh-CN",
+		status: "ready",
+		title: "v3.4.0 · 发布波次总览",
+		summary: [
+			"## 翻译总览",
+			"",
+			...Array.from({ length: 10 }, (_, index) => {
+				return [
+					`### 变更波次 ${index + 1}`,
+					"",
+					"- 补齐环境差异下的发布守卫，统一回滚前置检查。",
+					"- 对 staging / production 快照重新跑迁移校验，并记录验证结果。",
+					"- 更新 smoke test、值班 SOP 与发布后核对清单，确保交付闭环。",
+					"",
+				].join("\n");
+			}),
+		].join("\n"),
+	},
+};
+
+function useStorybookReleaseDetailMock(detail: ReleaseDetailResponse | null) {
+	useLayoutEffect(() => {
+		if (!detail) return;
+
+		const previousFetch = globalThis.fetch.bind(globalThis);
+		const detailPath = `/api/releases/${encodeURIComponent(detail.release_id)}/detail`;
+
+		globalThis.fetch = async (input, init) => {
+			const rawUrl =
+				typeof input === "string"
+					? input
+					: input instanceof URL
+						? input.toString()
+						: input.url;
+			const resolvedUrl = new URL(rawUrl, window.location.origin);
+
+			if (resolvedUrl.pathname === detailPath) {
+				return new Response(JSON.stringify(detail), {
+					headers: { "Content-Type": "application/json" },
+					status: 200,
+				});
+			}
+
+			return previousFetch(input, init);
+		};
+
+		return () => {
+			globalThis.fetch = previousFetch;
+		};
+	}, [detail]);
+}
+
 const mockNotifs: NotificationItem[] = [
 	{
 		thread_id: "90001",
@@ -265,6 +389,9 @@ function DashboardPreview(props: {
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
 	feedMode?: FeedMode;
+	briefs?: BriefItem[];
+	initialReleaseId?: string | null;
+	releaseDetail?: ReleaseDetailResponse | null;
 }) {
 	const {
 		initialTab = "all",
@@ -273,7 +400,11 @@ function DashboardPreview(props: {
 		showEmptyInbox = false,
 		emptyState = "content",
 		feedMode = "default",
+		briefs = mockBriefs,
+		initialReleaseId = null,
+		releaseDetail = null,
 	} = props;
+	useStorybookReleaseDetailMock(releaseDetail);
 	const items =
 		emptyState !== "content"
 			? []
@@ -302,7 +433,10 @@ function DashboardPreview(props: {
 		Record<string, boolean>
 	>({});
 	const [selectedDate, setSelectedDate] = useState<string | null>(
-		mockBriefs[0]?.date ?? null,
+		briefs[0]?.date ?? null,
+	);
+	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
+		initialReleaseId,
 	);
 
 	const feedPanel =
@@ -361,7 +495,7 @@ function DashboardPreview(props: {
 				<DashboardHeader
 					feedCount={items.length}
 					inboxCount={notifications.length}
-					briefCount={mockBriefs.length}
+					briefCount={briefs.length}
 					login="storybook-user"
 					isAdmin
 					aiDisabledHint={aiDisabledHint}
@@ -422,15 +556,13 @@ function DashboardPreview(props: {
 							{feedPanel}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<div className="space-y-6">
-								<ReleaseDailyCard
-									briefs={mockBriefs}
-									selectedDate={selectedDate}
-									busy={false}
-									onGenerate={() => {}}
-									onOpenRelease={() => {}}
-								/>
-							</div>
+							<ReleaseDailyCard
+								briefs={briefs}
+								selectedDate={selectedDate}
+								busy={false}
+								onGenerate={() => {}}
+								onOpenRelease={setActiveReleaseId}
+							/>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
 							<InboxList
@@ -445,7 +577,7 @@ function DashboardPreview(props: {
 					<aside className="space-y-6">
 						{tab === "briefs" ? (
 							<BriefListCard
-								briefs={mockBriefs}
+								briefs={briefs}
 								selectedDate={selectedDate}
 								onSelectDate={(d) => setSelectedDate(d)}
 							/>
@@ -454,6 +586,11 @@ function DashboardPreview(props: {
 					</aside>
 				</div>
 			</Tabs>
+
+			<ReleaseDetailCard
+				releaseId={activeReleaseId}
+				onClose={() => setActiveReleaseId(null)}
+			/>
 
 			<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
 				<DialogContent
@@ -519,6 +656,9 @@ const meta = {
 		showEmptyInbox: false,
 		emptyState: "content",
 		feedMode: "default",
+		briefs: undefined,
+		initialReleaseId: null,
+		releaseDetail: null,
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -564,6 +704,55 @@ export const BriefsFocused: Story = {
 				story: "把初始焦点切到 Briefs，用来验证日报与摘要场景的可读性。",
 			},
 		},
+	},
+};
+
+export const BriefsLongContent: Story = {
+	render: () => <DashboardPreview initialTab="briefs" briefs={longBriefs} />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"长日报内容应直接拉伸卡片高度，由页面整体滚动承载阅读，不再在卡片内部出现纵向滚动区。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText(/更新项目：8 个/)).toBeVisible();
+		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
+		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
+	},
+};
+
+export const BriefsLongContentWithDetail: Story = {
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={longBriefs}
+			initialReleaseId={LONG_BRIEF_RELEASE_ID}
+			releaseDetail={longReleaseDetail}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"从日报内部链接打开 release 详情时，详情应以模态弹窗显示，不再作为正文流里的第二张卡片出现。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(await body.findByRole("dialog")).toBeVisible();
+		await expect(await body.findByText(/翻译总览/)).toBeVisible();
+		await expect(body.getByText(/变更波次 10/)).toBeVisible();
+		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
+		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
+		await expect(
+			canvas.queryByRole("heading", { name: "Release 详情" }),
+		).not.toBeInTheDocument();
 	},
 };
 
