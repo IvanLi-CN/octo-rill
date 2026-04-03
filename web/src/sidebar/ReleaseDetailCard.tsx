@@ -1,4 +1,4 @@
-import { ArrowUpRight, Languages, RefreshCcw } from "lucide-react";
+import { ArrowUpRight, Languages, RefreshCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -220,7 +220,10 @@ export function ReleaseDetailCard(props: {
 				if (!open) onClose();
 			}}
 		>
-			<DialogContent className="flex max-h-[calc(100vh-2rem)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
+			<DialogContent
+				showCloseButton={false}
+				className="flex max-h-[calc(100vh-2rem)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl"
+			>
 				<DialogHeader className="border-b px-6 py-5 text-left">
 					<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
 						<div className="min-w-0">
@@ -282,6 +285,15 @@ export function ReleaseDetailCard(props: {
 									</a>
 								</Button>
 							) : null}
+							<Button
+								variant="ghost"
+								size="sm"
+								className="shrink-0 font-mono text-xs"
+								onClick={onClose}
+							>
+								<X className="size-4" />
+								关闭
+							</Button>
 						</div>
 					</div>
 				</DialogHeader>
