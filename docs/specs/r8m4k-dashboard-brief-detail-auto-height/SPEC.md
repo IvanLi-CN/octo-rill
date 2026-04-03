@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（2/3）
+- Status: 已完成
 - Created: 2026-04-03
 - Last: 2026-04-03
 
@@ -130,7 +130,7 @@
 
 - [x] M1: 新建 spec 并登记到 `docs/specs/README.md`。
 - [x] M2: 去除日报与详情卡片的纵向内部滚动限制。
-- [ ] M3: 补齐 Storybook 长内容场景、完成视觉证据与快车道收口。
+- [x] M3: 补齐 Storybook 长内容场景、完成视觉证据与快车道收口。
 
 ## 方案概述（Approach, high-level）
 
@@ -149,6 +149,7 @@
 - 2026-04-03: 创建规格，冻结“日报/详情卡片跟随内容高度展开，不再内部滚动”的实现口径。
 - 2026-04-03: 去除 `Release 日报` 与 `Release 详情` Markdown 容器的 `max-h-96` / `overflow-auto` 限制，并补齐长内容 Storybook 场景。
 - 2026-04-03: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并用 Storybook 稳定场景补入视觉证据，状态更新为 `部分完成（2/3）`。
+- 2026-04-03: 创建 PR #45，快车道收口到 PR-ready，规格状态更新为 `已完成`。
 
 ## 参考（References）
 

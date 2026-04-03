@@ -85,4 +85,4 @@
 | 96dp9 | Dashboard 同步入口收敛与顺序固定 | 已完成 | `96dp9-dashboard-sync-unification/SPEC.md` | 2026-03-27 | PR #39; single sync entry shipped with one retained visual evidence asset |
 | g8p8z | 管理员任务中心 Tab 路由化 | 已完成 | `g8p8z-admin-jobs-tab-routing/SPEC.md` | 2026-03-27 | local implementation completed; pathname-driven primary tabs + translation `view` deep links + task drawer `from` restore |
 | epn56 | 管理员任务中心运行时 worker 数量设置 | 已完成 | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-03-28 | PR #42; checks green; review-loop clear; runtime config dialogs + persisted hot updates |
-| r8m4k | Dashboard 日报/详情卡片自适应高度修正 | 部分完成（2/3） | `r8m4k-dashboard-brief-detail-auto-height/SPEC.md` | 2026-04-03 | implementation + storybook evidence complete; fast-track PR handoff pending |
+| r8m4k | Dashboard 日报/详情卡片自适应高度修正 | 已完成 | `r8m4k-dashboard-brief-detail-auto-height/SPEC.md` | 2026-04-03 | PR #45; brief/detail cards now grow with content and use Storybook-backed visual evidence |
