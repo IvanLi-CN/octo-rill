@@ -460,24 +460,21 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 
 	await expect(page).toHaveURL(/tab=briefs/);
 	await expect(page).toHaveURL(/release=289513858/);
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog).toBeVisible();
+	await expect(detailDialog.getByText("#289513858")).toBeVisible();
+	await expect(detailDialog.getByText("owner/repo")).toBeVisible();
+	await expect(
+		detailDialog.getByRole("heading", { name: "Release 289513858" }),
+	).toBeVisible();
+
+	await detailDialog.getByRole("button", { name: "关闭" }).click();
+	await expect(page).toHaveURL(/tab=briefs/);
+	await expect(page).not.toHaveURL(/release=289513858/);
+	await expect(detailDialog).toHaveCount(0);
 	await expect(page.getByRole("tab", { name: "日报" })).toHaveAttribute(
 		"aria-selected",
 		"true",
-	);
-	await expect(
-		page.getByRole("heading", { name: "Release 详情" }),
-	).toBeVisible();
-	await expect(page.getByText("#289513858")).toBeVisible();
-	await expect(page.getByText("owner/repo")).toBeVisible();
-	await expect(
-		page.getByRole("heading", { name: "Release 289513858" }),
-	).toBeVisible();
-
-	await page.getByRole("button", { name: "关闭" }).click();
-	await expect(page).toHaveURL(/tab=briefs/);
-	await expect(page).not.toHaveURL(/release=289513858/);
-	await expect(page.getByRole("heading", { name: "Release 详情" })).toHaveCount(
-		0,
 	);
 });
 
@@ -731,6 +728,7 @@ test.describe("localized timestamps", () => {
 					},
 				),
 			).toBeVisible();
+			await page.getByRole("button", { name: "关闭" }).click();
 			await expect(briefPanel).toContainText("2026-07-22 19:22:33");
 			await expect(briefPanel).not.toContainText("2026-07-22T11:22:33Z");
 		});
@@ -762,6 +760,7 @@ test.describe("localized timestamps", () => {
 					},
 				),
 			).toBeVisible();
+			await page.getByRole("button", { name: "关闭" }).click();
 			await expect(briefPanel).toContainText("2026-07-22 07:22:33");
 			await expect(briefPanel).not.toContainText("2026-07-22T11:22:33Z");
 		});

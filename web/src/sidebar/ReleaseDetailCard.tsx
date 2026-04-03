@@ -14,12 +14,12 @@ import {
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import {
-	Card,
-	CardContent,
-	CardDescription,
-	CardHeader,
-	CardTitle,
-} from "@/components/ui/card";
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { normalizeReleaseId } from "@/lib/releaseId";
 
@@ -214,115 +214,125 @@ export function ReleaseDetailCard(props: {
 	}
 
 	return (
-		<Card className="bg-card/80 shadow-sm">
-			<CardHeader>
-				<div className="flex items-start justify-between gap-3">
-					<div className="min-w-0">
-						<CardTitle className="text-base">Release 详情</CardTitle>
-						<CardDescription className="font-mono text-xs">
-							{loading ? "加载中…" : `#${normalizedReleaseId}`}
-							{activeDetail?.published_at
-								? ` · ${formatIsoShortLocal(activeDetail.published_at)}`
-								: ""}
-						</CardDescription>
-					</div>
+		<Dialog
+			open
+			onOpenChange={(open) => {
+				if (!open) onClose();
+			}}
+		>
+			<DialogContent
+				showCloseButton={false}
+				className="flex max-h-[calc(100vh-2rem)] max-w-[calc(100%-2rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl"
+			>
+				<DialogHeader className="border-b px-6 py-5 text-left">
+					<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+						<div className="min-w-0">
+							<DialogTitle className="text-base">Release 详情</DialogTitle>
+							<DialogDescription className="font-mono text-xs">
+								{loading ? "加载中…" : `#${normalizedReleaseId}`}
+								{activeDetail?.published_at
+									? ` · ${formatIsoShortLocal(activeDetail.published_at)}`
+									: ""}
+							</DialogDescription>
+						</div>
 
-					<div className="flex shrink-0 items-center gap-2">
-						{activeDetail?.translated?.status === "disabled" ? (
-							<span className="text-muted-foreground font-mono text-[11px]">
-								AI 未配置
-							</span>
-						) : (
-							<>
-								{hasReadyTranslation ? (
+						<div className="flex shrink-0 flex-wrap items-center gap-2">
+							{activeDetail?.translated?.status === "disabled" ? (
+								<span className="text-muted-foreground font-mono text-[11px]">
+									AI 未配置
+								</span>
+							) : (
+								<>
+									{hasReadyTranslation ? (
+										<Button
+											variant="ghost"
+											size="sm"
+											className="font-mono text-xs"
+											onClick={() => setShowOriginal((v) => !v)}
+											disabled={loading || !activeDetail}
+										>
+											<Languages className="size-4" />
+											{showOriginal ? "中文" : "原文"}
+										</Button>
+									) : null}
 									<Button
 										variant="ghost"
 										size="sm"
 										className="font-mono text-xs"
-										onClick={() => setShowOriginal((v) => !v)}
-										disabled={loading || !activeDetail}
+										onClick={onTranslate}
+										disabled={loading || !activeDetail || translating}
 									>
-										<Languages className="size-4" />
-										{showOriginal ? "中文" : "原文"}
+										<RefreshCcw className="size-4" />
+										{translating ? "翻译中…" : "翻译"}
 									</Button>
-								) : null}
+								</>
+							)}
+
+							{activeDetail?.html_url ? (
 								<Button
-									variant="ghost"
+									asChild
+									variant="outline"
 									size="sm"
 									className="font-mono text-xs"
-									onClick={onTranslate}
-									disabled={loading || !activeDetail || translating}
 								>
-									<RefreshCcw className="size-4" />
-									{translating ? "翻译中…" : "翻译"}
+									<a
+										href={activeDetail.html_url}
+										target="_blank"
+										rel="noreferrer"
+									>
+										<ArrowUpRight className="size-4" />
+										GitHub
+									</a>
 								</Button>
-							</>
-						)}
-
-						{activeDetail?.html_url ? (
+							) : null}
 							<Button
-								asChild
-								variant="outline"
+								variant="ghost"
 								size="sm"
-								className="font-mono text-xs"
+								className="shrink-0 font-mono text-xs"
+								onClick={onClose}
 							>
-								<a
-									href={activeDetail.html_url}
-									target="_blank"
-									rel="noreferrer"
-								>
-									<ArrowUpRight className="size-4" />
-									GitHub
-								</a>
+								<X className="size-4" />
+								关闭
 							</Button>
-						) : null}
-						<Button
-							variant="ghost"
-							size="sm"
-							className="font-mono text-xs"
-							onClick={onClose}
-						>
-							<X className="size-4" />
-							关闭
-						</Button>
+						</div>
 					</div>
-				</div>
-			</CardHeader>
+				</DialogHeader>
 
-			<CardContent className="pt-0">
-				{loadError ? (
-					<p className="text-destructive text-sm">{loadError}</p>
-				) : loading ? (
-					<p className="text-muted-foreground text-sm">
-						正在加载 release 详情…
-					</p>
-				) : display ? (
-					<div className="space-y-3">
-						{translateError ? (
-							<p className="text-destructive text-xs">{translateError}</p>
-						) : null}
-						<h3 className="text-sm font-semibold tracking-tight">
-							{display.title}
-						</h3>
-						{activeDetail?.repo_full_name ? (
-							<p className="text-muted-foreground font-mono text-xs">
-								{activeDetail.repo_full_name}
-							</p>
-						) : null}
-						{display.body ? (
-							<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
-								<Markdown content={display.body} />
-							</div>
-						) : (
-							<p className="text-muted-foreground text-sm">
-								该 release 无正文。
-							</p>
-						)}
-					</div>
-				) : (
-					<p className="text-muted-foreground text-sm">未找到该 release。</p>
-				)}
-			</CardContent>
-		</Card>
+				<div className="overflow-y-auto px-6 py-5">
+					{loadError ? (
+						<p className="text-destructive text-sm">{loadError}</p>
+					) : loading ? (
+						<p className="text-muted-foreground text-sm">
+							正在加载 release 详情…
+						</p>
+					) : display ? (
+						<div className="space-y-3">
+							{translateError ? (
+								<p className="text-destructive text-xs">{translateError}</p>
+							) : null}
+							<h3 className="text-sm font-semibold tracking-tight">
+								{display.title}
+							</h3>
+							{activeDetail?.repo_full_name ? (
+								<p className="text-muted-foreground font-mono text-xs">
+									{activeDetail.repo_full_name}
+								</p>
+							) : null}
+							{display.body ? (
+								<div className="bg-muted/10 rounded-lg border p-4">
+									<Markdown content={display.body} />
+								</div>
+							) : (
+								<p className="text-muted-foreground text-sm">
+									该 release 无正文。
+								</p>
+							)}
+						</div>
+					) : (
+						<p className="text-muted-foreground text-sm">未找到该 release。</p>
+					)}
+				</div>
+			</DialogContent>
+		</Dialog>
 	);
 }

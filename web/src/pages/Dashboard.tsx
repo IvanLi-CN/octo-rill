@@ -1077,19 +1077,13 @@ export function Dashboard(props: { me: MeResponse }) {
 							{feedPanel}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<div className="space-y-6">
-								<ReleaseDailyCard
-									briefs={briefs}
-									selectedDate={selectedBriefDate}
-									busy={busy === "Generate brief"}
-									onGenerate={onGenerateBrief}
-									onOpenRelease={onOpenReleaseDetail}
-								/>
-								<ReleaseDetailCard
-									releaseId={activeReleaseId}
-									onClose={onCloseReleaseDetail}
-								/>
-							</div>
+							<ReleaseDailyCard
+								briefs={briefs}
+								selectedDate={selectedBriefDate}
+								busy={busy === "Generate brief"}
+								onGenerate={onGenerateBrief}
+								onOpenRelease={onOpenReleaseDetail}
+							/>
 						</TabsContent>
 						<TabsContent value="inbox" className="mt-0 min-w-0">
 							<InboxList
@@ -1113,6 +1107,11 @@ export function Dashboard(props: { me: MeResponse }) {
 					</aside>
 				</div>
 			</Tabs>
+
+			<ReleaseDetailCard
+				releaseId={activeReleaseId}
+				onClose={onCloseReleaseDetail}
+			/>
 
 			<Dialog open={patDialogOpen} onOpenChange={onPatDialogOpenChange}>
 				<DialogContent
