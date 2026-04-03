@@ -310,7 +310,7 @@ export function ReleaseDetailCard(props: {
 							</p>
 						) : null}
 						{display.body ? (
-							<div className="bg-muted/10 max-h-96 overflow-auto rounded-lg border p-4">
+							<div className="bg-muted/10 rounded-lg border p-4">
 								<Markdown content={display.body} />
 							</div>
 						) : (
