@@ -8,8 +8,12 @@ on:
   workflow_dispatch:
     inputs:
       head_sha:
-        description: Commit SHA on main to backfill release for
-        required: true
+        description: Existing released commit SHA to backfill assets for (optional)
+        required: false
+        type: string
+      release_tag:
+        description: Existing release tag to backfill assets for (defaults to latest published release)
+        required: false
         type: string
 
 permissions:
@@ -21,10 +25,11 @@ permissions:
 env:
   REGISTRY: ghcr.io
   PLATFORMS: linux/amd64
-  RELEASE_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.workflow_run.head_sha }}
+  RELEASE_BUNDLE_NAME: octo-rill-linux-x86_64
+  RELEASE_TRIGGER_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.head_sha }}
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.workflow_run.head_sha }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && (inputs.release_tag || inputs.head_sha || 'latest') || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
@@ -38,91 +43,84 @@ jobs:
       github.event.workflow_run.event == 'push') ||
       github.event_name == 'workflow_dispatch'
     outputs:
-      should_release: ${{ steps.intent.outputs.should_release }}
+      should_release: ${{ steps.metadata.outputs.should_release }}
       bump_level: ${{ steps.intent.outputs.bump_level }}
       channel: ${{ steps.intent.outputs.channel }}
-      prerelease: ${{ steps.intent.outputs.prerelease }}
+      prerelease: ${{ steps.metadata.outputs.app_is_prerelease }}
       release_intent_label: ${{ steps.intent.outputs.release_intent_label }}
       pr_number: ${{ steps.intent.outputs.pr_number }}
       pr_url: ${{ steps.intent.outputs.pr_url }}
-      reason: ${{ steps.intent.outputs.reason }}
-      app_effective_version: ${{ steps.export.outputs.app_effective_version }}
-      app_release_tag: ${{ steps.export.outputs.app_release_tag }}
-      app_is_prerelease: ${{ steps.export.outputs.app_is_prerelease }}
+      reason: ${{ steps.metadata.outputs.reason }}
+      release_mode: ${{ steps.metadata.outputs.release_mode }}
+      release_head_sha: ${{ steps.metadata.outputs.release_head_sha }}
+      app_effective_version: ${{ steps.metadata.outputs.app_effective_version }}
+      app_release_tag: ${{ steps.metadata.outputs.app_release_tag }}
+      app_is_prerelease: ${{ steps.metadata.outputs.app_is_prerelease }}
+      reuse_existing_tag: ${{ steps.metadata.outputs.reuse_existing_tag }}
+      publish_docker: ${{ steps.metadata.outputs.publish_docker }}
+      generate_release_notes: ${{ steps.metadata.outputs.generate_release_notes }}
+      release_tag_source: ${{ steps.metadata.outputs.release_tag_source }}
     steps:
-      - name: Checkout (workflow_run)
+      - name: Checkout workflow revision
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ env.RELEASE_HEAD_SHA }}
+          path: workflow-src
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout release target metadata
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: release-src
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Determine release intent
+        if: ${{ github.event_name == 'workflow_run' }}
         id: intent
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKFLOW_RUN_SHA: ${{ env.RELEASE_HEAD_SHA }}
-        run: bash ./.github/scripts/release-intent.sh
+          WORKFLOW_RUN_SHA: ${{ env.RELEASE_TRIGGER_SHA }}
+        run: bash ./workflow-src/.github/scripts/release-intent.sh
 
-      - name: Compute effective version
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
+      - name: Refresh workflow revision tags
+        shell: bash
+        working-directory: ./workflow-src
+        run: git fetch --tags --force
+
+      - name: Refresh release target tags
+        if: ${{ github.event_name == 'workflow_run' }}
+        shell: bash
+        working-directory: ./release-src
+        run: git fetch --tags --force
+
+      - name: Resolve release metadata
+        id: metadata
         shell: bash
         env:
-          BUMP_LEVEL: ${{ steps.intent.outputs.bump_level }}
-          RELEASE_CHANNEL: ${{ steps.intent.outputs.channel }}
-          COMMIT_SHA: ${{ env.RELEASE_HEAD_SHA }}
-        run: bash ./.github/scripts/compute-version.sh
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_RUN_SHA: ${{ env.RELEASE_TRIGGER_SHA }}
+          INPUT_HEAD_SHA: ${{ inputs.head_sha }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          INTENT_SHOULD_RELEASE: ${{ steps.intent.outputs.should_release }}
+          INTENT_BUMP_LEVEL: ${{ steps.intent.outputs.bump_level }}
+          INTENT_CHANNEL: ${{ steps.intent.outputs.channel }}
+          INTENT_REASON: ${{ steps.intent.outputs.reason }}
+          REPO_ROOT: ${{ github.event_name == 'workflow_run' && format('{0}/release-src', github.workspace) || format('{0}/workflow-src', github.workspace) }}
+        run: python3 ./workflow-src/.github/scripts/release_metadata.py
 
-      - name: Export release metadata
-        id: export
+      - name: Validate release metadata
+        if: ${{ steps.metadata.outputs.should_release == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "app_effective_version=${APP_EFFECTIVE_VERSION:-}" >> "$GITHUB_OUTPUT"
-          echo "app_release_tag=${APP_RELEASE_TAG:-}" >> "$GITHUB_OUTPUT"
-          echo "app_is_prerelease=${APP_IS_PRERELEASE:-false}" >> "$GITHUB_OUTPUT"
-
-      - name: Validate effective version export
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${APP_EFFECTIVE_VERSION:-}" ]]; then
+          if [[ -z "${{ steps.metadata.outputs.app_effective_version }}" ]]; then
             echo "APP_EFFECTIVE_VERSION is empty; stop release to avoid stale UI version."
             exit 1
           fi
-          echo "APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}"
-
-      - name: Configure Git user
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Create and push tag (if missing)
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${APP_RELEASE_TAG}"
-          echo "target tag: ${tag}"
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists. Skipping push."
-          else
-            git tag -a "${tag}" -m "${tag}"
-            git push origin "${tag}"
-          fi
-
-      - name: Create GitHub Release
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.export.outputs.app_release_tag }}
-          name: ${{ steps.export.outputs.app_release_tag }}
-          prerelease: ${{ steps.intent.outputs.prerelease == 'true' }}
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "APP_EFFECTIVE_VERSION=${{ steps.metadata.outputs.app_effective_version }}"
 
       - name: Write summary
         if: always()
@@ -135,20 +133,112 @@ jobs:
           {
             echo "### Release decision"
             echo "- should_release: ${{ steps.intent.outputs.should_release }}"
-            echo "- reason: ${{ steps.intent.outputs.reason }}"
+            echo "- resolved_should_release: ${{ steps.metadata.outputs.should_release }}"
+            echo "- reason: ${{ steps.metadata.outputs.reason }}"
+            echo "- release_mode: ${{ steps.metadata.outputs.release_mode }}"
+            echo "- release_tag_source: ${{ steps.metadata.outputs.release_tag_source }}"
+            echo "- reuse_existing_tag: ${{ steps.metadata.outputs.reuse_existing_tag }}"
             echo "- release_intent_label: ${{ steps.intent.outputs.release_intent_label }}"
             echo "- channel: ${{ steps.intent.outputs.channel }}"
-            echo "- prerelease: ${{ steps.intent.outputs.prerelease }}"
-            echo "- app_release_tag: ${APP_RELEASE_TAG:-<none>}"
+            echo "- prerelease: ${{ steps.metadata.outputs.app_is_prerelease }}"
+            echo "- publish_docker: ${{ steps.metadata.outputs.publish_docker }}"
+            echo "- release_head_sha: ${{ steps.metadata.outputs.release_head_sha }}"
+            echo "- app_release_tag: ${{ steps.metadata.outputs.app_release_tag || '<none>' }}"
             echo "- pr: ${pr_url}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  bundle-release:
+    name: Build release bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: [prepare]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    permissions:
+      contents: read
+    env:
+      APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
+      BUNDLE_NAME: ${{ env.RELEASE_BUNDLE_NAME }}
+    steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          path: workflow-src
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout release target
+        uses: actions/checkout@v4
+        with:
+          path: release-src
+          ref: ${{ needs.prepare.outputs.release_head_sha }}
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libsqlite3-dev
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Cache cargo directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            release-src/target
+          key: ${{ runner.os }}-release-bundle-cargo-${{ hashFiles('release-src/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-bundle-cargo-
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            release-src/web/node_modules
+          key: ${{ runner.os }}-release-bundle-bun-${{ hashFiles('release-src/web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-bundle-bun-
+
+      - name: Build release bundle
+        id: bundle
+        shell: bash
+        env:
+          REPO_ROOT: ${{ github.workspace }}/release-src
+          BUNDLE_ROOT: ${{ github.workspace }}/.tmp/release-bundle
+          ARCHIVE_DIR: ${{ github.workspace }}/.tmp/release-archives
+        run: bash ./workflow-src/.github/scripts/build-release-bundle.sh
+
+      - name: Verify release bundle contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_path="${{ steps.bundle.outputs.archive_path }}"
+          extract_root="$RUNNER_TEMP/release-bundle-check"
+          mkdir -p "${extract_root}"
+          tar -xzf "${archive_path}" -C "${extract_root}"
+          test -x "${extract_root}/${{ env.RELEASE_BUNDLE_NAME }}/octo-rill"
+          test -f "${extract_root}/${{ env.RELEASE_BUNDLE_NAME }}/.env.example"
+          test -f "${extract_root}/${{ env.RELEASE_BUNDLE_NAME }}/web/dist/index.html"
+
+      - name: Upload release bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_BUNDLE_NAME }}
+          path: ${{ steps.bundle.outputs.archive_path }}
+          if-no-files-found: error
 
   docker-release:
     name: Build and push Docker image
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [prepare]
-    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.publish_docker == 'true' }}
     permissions:
       contents: read
       packages: write
@@ -157,10 +247,10 @@ jobs:
       APP_RELEASE_TAG: ${{ needs.prepare.outputs.app_release_tag }}
       APP_IS_PRERELEASE: ${{ needs.prepare.outputs.app_is_prerelease }}
     steps:
-      - name: Checkout (workflow_run)
+      - name: Checkout release target
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.RELEASE_HEAD_SHA }}
+          ref: ${{ needs.prepare.outputs.release_head_sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -214,12 +304,98 @@ jobs:
           cache-from: type=registry,ref=${{ steps.image.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ steps.image.outputs.image }}:buildcache,mode=max
 
+  publish-release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [prepare, bundle-release, docker-release]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.outputs.should_release == 'true' &&
+        needs['bundle-release'].result == 'success' &&
+        (needs.prepare.outputs.publish_docker != 'true' || needs['docker-release'].result == 'success')
+      }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release target
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.release_head_sha }}
+
+      - name: Refresh local tags
+        run: git fetch --tags --force
+
+      - name: Configure Git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push tag (if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.app_release_tag }}"
+          echo "target tag: ${tag}"
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists. Skipping push."
+          else
+            git tag -a "${tag}" -m "${tag}"
+            git push origin "${tag}"
+          fi
+
+      - name: Download release bundle artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: ${{ env.RELEASE_BUNDLE_NAME }}
+          path: ./.artifacts/release-bundle
+
+      - name: Create or update GitHub Release
+        if: ${{ needs.prepare.outputs.generate_release_notes == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.app_release_tag }}
+          name: ${{ needs.prepare.outputs.app_release_tag }}
+          prerelease: ${{ needs.prepare.outputs.app_is_prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            ./.artifacts/release-bundle/${{ env.RELEASE_BUNDLE_NAME }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update GitHub Release assets
+        if: ${{ needs.prepare.outputs.generate_release_notes != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.app_release_tag }}
+          name: ${{ needs.prepare.outputs.app_release_tag }}
+          prerelease: ${{ needs.prepare.outputs.app_is_prerelease == 'true' }}
+          files: |
+            ./.artifacts/release-bundle/${{ env.RELEASE_BUNDLE_NAME }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Release publish"
+            echo "- release: ${{ needs.prepare.outputs.app_release_tag }}"
+            echo "- release_mode: ${{ needs.prepare.outputs.release_mode }}"
+            echo "- publish_docker: ${{ needs.prepare.outputs.publish_docker }}"
+            echo "- release_notes: ${{ needs.prepare.outputs.generate_release_notes }}"
+            echo "- bundle_asset: ${{ env.RELEASE_BUNDLE_NAME }}.tar.gz"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   pr-release-comment:
     name: Comment PR with release version
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [prepare, docker-release]
-    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.pr_number != '' }}
+    needs: [prepare, publish-release]
+    if: ${{ always() && needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.pr_number != '' && needs['publish-release'].result == 'success' }}
     permissions:
       contents: read
       issues: write
