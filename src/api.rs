@@ -126,6 +126,7 @@ pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, A
 pub struct MeResponse {
     user: UserSummary,
     access_sync: AccessSyncBootstrap,
+    dashboard: DashboardBootstrap,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +159,13 @@ struct AccessSyncBootstrap {
     task_type: Option<String>,
     event_path: Option<String>,
     reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardBootstrap {
+    daily_boundary_local: String,
+    daily_boundary_time_zone: Option<String>,
+    daily_boundary_utc_offset_minutes: i32,
 }
 
 impl AccessSyncBootstrap {
@@ -214,6 +222,15 @@ pub async fn me(
 
     let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
     touch_user_last_active_at(state.as_ref(), &row.id).await?;
+    let daily_boundary_local = state
+        .config
+        .ai_daily_at_local
+        .unwrap_or_else(|| chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid daily boundary"))
+        .format("%H:%M")
+        .to_string();
+    let now_local = chrono::Local::now();
+    let daily_boundary_time_zone = iana_time_zone::get_timezone().ok();
+    let daily_boundary_utc_offset_minutes = now_local.offset().local_minus_utc() / 60;
 
     Ok(Json(MeResponse {
         user: UserSummary {
@@ -226,6 +243,11 @@ pub async fn me(
             is_admin: row.is_admin != 0,
         },
         access_sync,
+        dashboard: DashboardBootstrap {
+            daily_boundary_local,
+            daily_boundary_time_zone,
+            daily_boundary_utc_offset_minutes,
+        },
     }))
 }
 

@@ -15,7 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { FeedList } from "@/feed/FeedList";
+import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type { FeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -38,6 +38,12 @@ type FeedMode =
 	| "sync-preheated";
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
+const STORYBOOK_DAILY_BOUNDARY = "08:00";
+const STORYBOOK_DAILY_BOUNDARY_TIME_ZONE = "Asia/Shanghai";
+const STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES = 8 * 60;
+const STORYBOOK_NOW = new Date("2026-04-04T12:00:00+08:00");
+const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
+const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 	return {
@@ -85,13 +91,15 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 function makeMockFeed(): FeedItem[] {
 	return [
 		buildFeedItem("10001", {
-			title: "v1.8.0",
-			html_url: "https://github.com/acme/rocket/releases/tag/v1.8.0",
+			ts: "2026-04-04T16:16:29+08:00",
+			title: "v2.63.0",
+			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
 			translated: {
 				lang: "zh-CN",
 				status: "ready",
-				title: "v1.8.0（稳定版）",
-				summary: "- 这是一个稳定版本\n- 包含性能改进\n- 建议升级并重新构建镜像",
+				title: "v2.63.0（稳定版）",
+				summary:
+					"- 发布稳定版本并更新构建链路\n- 补齐 smoke tests 与缓存策略\n- 建议升级后重新构建镜像",
 			},
 			reactions: {
 				counts: {
@@ -113,17 +121,42 @@ function makeMockFeed(): FeedItem[] {
 				status: "ready",
 			},
 		}),
-		buildFeedItem("10000", {
-			ts: "2026-02-21T06:20:00Z",
-			title: "v1.7.3",
-			body: "- Patch release\n- Fixes a regression in auth flow",
-			html_url: "https://github.com/acme/rocket/releases/tag/v1.7.3",
+		buildFeedItem("10002", {
+			ts: "2026-04-04T15:56:24+08:00",
+			repo_full_name: "lobehub/lobe-chat",
+			title: "桌面版 Canary v2.1.48-canary.31",
+			body: "- Canary 构建\n- 自动发布桌面包\n- 建议先在测试环境验证",
+			html_url:
+				"https://github.com/lobehub/lobe-chat/releases/tag/v2.1.48-canary.31",
 			translated: {
 				lang: "zh-CN",
 				status: "disabled",
 				title: null,
 				summary: null,
 			},
+		}),
+		buildFeedItem("10003", {
+			ts: "2026-04-04T07:10:00+08:00",
+			title: "nightly guardrails",
+			body: `- ${HISTORY_RAW_MARKER}\n- Tighten upload guardrails\n- Normalize rollout order`,
+			html_url:
+				"https://github.com/acme/rocket/releases/tag/nightly-guardrails",
+		}),
+		buildFeedItem("10004", {
+			ts: "2026-04-03T21:30:00+08:00",
+			repo_full_name: "acme/satellite",
+			title: "oauth action bubble polish",
+			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
+			html_url:
+				"https://github.com/acme/satellite/releases/tag/oauth-action-bubble",
+		}),
+		buildFeedItem("10005", {
+			ts: "2026-04-03T06:20:00+08:00",
+			repo_full_name: "acme/fleet",
+			title: "fallback lane release",
+			body: `- ${FALLBACK_RAW_MARKER}\n- no brief available for this day\n- keep original release cards visible`,
+			html_url:
+				"https://github.com/acme/fleet/releases/tag/fallback-lane-release",
 		}),
 	];
 }
@@ -221,20 +254,12 @@ function makeVisibleWindowInFlightKeys(
 
 const mockBriefs: BriefItem[] = [
 	{
-		date: "2026-02-21",
-		window_start: "2026-02-20T08:00:00+08:00",
-		window_end: "2026-02-21T08:00:00+08:00",
+		date: "2026-04-04",
+		window_start: "2026-04-03T08:00:00+08:00",
+		window_end: "2026-04-04T08:00:00+08:00",
 		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-02-20T08:00:00+08:00 → 2026-02-21T08:00:00+08:00\n- 更新项目：1 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.8.0](/?tab=briefs&release=10001) · 2026-02-21T08:05:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.8.0)\n  - 稳定版发布，包含性能优化。\n  - 建议升级后重新构建镜像。\n",
-		created_at: "2026-02-21T08:00:03Z",
-	},
-	{
-		date: "2026-02-20",
-		window_start: "2026-02-19T08:00:00+08:00",
-		window_end: "2026-02-20T08:00:00+08:00",
-		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-02-19T08:00:00+08:00 → 2026-02-20T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.7.3](/?tab=briefs&release=10000) · 2026-02-20T06:20:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.7.3)\n  - 修复认证回归问题。\n",
-		created_at: "2026-02-20T08:00:04Z",
+			"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：2 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)、[acme/satellite](https://github.com/acme/satellite)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n",
+		created_at: "2026-04-04T08:00:03+08:00",
 	},
 ];
 
@@ -274,13 +299,13 @@ const longBriefMarkdown = [
 
 const longBriefs: BriefItem[] = [
 	{
-		date: "2026-04-03",
-		window_start: "2026-04-02T08:00:00+08:00",
-		window_end: "2026-04-03T08:00:00+08:00",
+		date: "2026-04-04",
+		window_start: "2026-04-03T08:00:00+08:00",
+		window_end: "2026-04-04T08:00:00+08:00",
 		content_markdown: longBriefMarkdown,
-		created_at: "2026-04-03T08:00:35Z",
+		created_at: "2026-04-04T08:00:35+08:00",
 	},
-	mockBriefs[1],
+	mockBriefs[0],
 ];
 
 const longReleaseDetail: ReleaseDetailResponse = {
@@ -390,6 +415,10 @@ function DashboardPreview(props: {
 	emptyState?: "content" | "auto-sync" | "no-cache";
 	feedMode?: FeedMode;
 	briefs?: BriefItem[];
+	dailyBoundaryLocal?: string;
+	dailyBoundaryTimeZone?: string;
+	dailyBoundaryUtcOffsetMinutes?: number;
+	now?: Date;
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
 }) {
@@ -401,6 +430,10 @@ function DashboardPreview(props: {
 		emptyState = "content",
 		feedMode = "default",
 		briefs = mockBriefs,
+		dailyBoundaryLocal = STORYBOOK_DAILY_BOUNDARY,
+		dailyBoundaryTimeZone = STORYBOOK_DAILY_BOUNDARY_TIME_ZONE,
+		dailyBoundaryUtcOffsetMinutes = STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES,
+		now = STORYBOOK_NOW,
 		initialReleaseId = null,
 		releaseDetail = null,
 	} = props;
@@ -439,7 +472,12 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 
-	const feedPanel =
+	const openReleaseDetail = (releaseId: string) => {
+		setTab("briefs");
+		setActiveReleaseId(releaseId);
+	};
+
+	const renderFeedPanel = (mode: "all" | "releases") =>
 		items.length === 0 ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 				{emptyState === "auto-sync" ? (
@@ -469,8 +507,14 @@ function DashboardPreview(props: {
 				)}
 			</div>
 		) : (
-			<FeedList
+			<FeedGroupedList
+				mode={mode}
 				items={items}
+				briefs={briefs}
+				dailyBoundaryLocal={dailyBoundaryLocal}
+				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+				now={now}
 				error={null}
 				loadingInitial={false}
 				loadingMore={false}
@@ -486,6 +530,7 @@ function DashboardPreview(props: {
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
+				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
 			/>
 		);
 
@@ -550,10 +595,10 @@ function DashboardPreview(props: {
 				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
 					<section className="min-w-0">
 						<TabsContent value="all" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("all")}
 						</TabsContent>
 						<TabsContent value="releases" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("releases")}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard
@@ -670,7 +715,7 @@ export const Default: Story = {
 		docs: {
 			description: {
 				story:
-					"主工作区默认入口，验证顶部只保留一个主同步按钮，Feed 与侧栏维持正常内容态。",
+					"主工作区默认入口，验证顶部只保留一个主同步按钮，且 `全部` tab 会把历史日组默认折叠为日报。",
 			},
 		},
 	},
@@ -690,6 +735,76 @@ export const Default: Story = {
 		).not.toBeInTheDocument();
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const ReleasesGroupedByDay: Story = {
+	args: {
+		initialTab: "releases",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`Releases` tab 需要把原始 Release 卡片按日报边界分组，并用弱化日期分隔线提示每天的 Release 数。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("2026-04-04")).toBeVisible();
+		await expect(canvas.getByText("2026-04-03")).toBeVisible();
+		await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+	},
+};
+
+export const AllHistoryCollapsedToBriefs: Story = {
+	args: {
+		initialTab: "all",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`全部` tab 中，今天保持原始 Release feed，历史日组默认折叠为真实日报，并允许用户单独展开查看原始 releases。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText(HISTORY_RAW_MARKER),
+		).not.toBeInTheDocument();
+		await step("expand historical releases", async () => {
+			await canvas.getByRole("button", { name: "展开 Releases" }).click();
+			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+		});
+	},
+};
+
+export const AllHistoryFallbackToReleaseCards: Story = {
+	args: {
+		initialTab: "all",
+		briefs: [],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"历史日组没有对应日报时，`全部` tab 不显示伪摘要，而是直接退回为日期分隔线 + 原始 Release 卡片。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("2026-04-02")).toBeVisible();
+		await expect(canvas.getByText(FALLBACK_RAW_MARKER)).toBeVisible();
+		await expect(
+			canvas.queryByRole("button", { name: "展开 Releases" }),
 		).not.toBeInTheDocument();
 	},
 };
