@@ -216,6 +216,8 @@ def choose_existing_tag(tags: list[ReleaseTag], *, channel: str | None) -> Relea
         scoped = [tag for tag in tags if tag.channel == channel]
         if scoped:
             return max(scoped, key=lambda item: item.sort_key)
+        if channel == "stable":
+            return None
 
     stable = [tag for tag in tags if not tag.prerelease]
     if stable:

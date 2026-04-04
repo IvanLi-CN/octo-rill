@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 bundle_name="${BUNDLE_NAME:-octo-rill-linux-x86_64}"
 bundle_root="${BUNDLE_ROOT:-${repo_root}/.tmp/release-bundle}"
 archive_dir="${ARCHIVE_DIR:-${repo_root}/.tmp/release-archives}"

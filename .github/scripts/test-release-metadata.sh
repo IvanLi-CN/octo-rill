@@ -137,6 +137,30 @@ with tempfile.TemporaryDirectory() as tmp_dir:
     assert reused_after_channel_drift.reuse_existing_tag is True
     assert reused_after_channel_drift.reason == "reuse_existing_tag"
 
+    (repo / "README.md").write_text("rc only target\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "rc only target")
+    third_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", f"v2.4.5-rc.{third_sha[:7]}", third_sha)
+
+    stable_promotion = module.resolve_release_metadata(
+        repo_root=repo,
+        repository="IvanLi-CN/octo-rill",
+        event_name="workflow_run",
+        workflow_run_sha=third_sha,
+        input_head_sha="",
+        input_release_tag="",
+        intent_should_release=True,
+        intent_bump_level="patch",
+        intent_channel="stable",
+        intent_reason="intent_release",
+        client=None,
+    )
+    assert stable_promotion.app_release_tag == "v2.4.5"
+    assert stable_promotion.app_effective_version == "2.4.5"
+    assert stable_promotion.app_is_prerelease is False
+    assert stable_promotion.reuse_existing_tag is False
+
     explicit_backfill = module.resolve_release_metadata(
         repo_root=repo,
         repository="IvanLi-CN/octo-rill",
@@ -180,7 +204,44 @@ dispatch_inputs = contract.require_mapping(
 )
 release_tag_input = contract.require_mapping(dispatch_inputs.get("release_tag"), "release.yml.on.workflow_dispatch.inputs.release_tag")
 assert release_tag_input.get("required") is False
+prepare_job = contract.job_config(release_workflow, "prepare", "release.yml")
+prepare_checkout = contract.uses_step_config(
+    prepare_job,
+    "Checkout workflow revision",
+    "actions/checkout@v4",
+    "release.yml.jobs.prepare",
+)
+prepare_checkout_with = contract.require_mapping(
+    prepare_checkout.get("with"),
+    "release.yml.jobs.prepare.steps['Checkout workflow revision'].with",
+)
+assert prepare_checkout_with.get("path") == "workflow-src"
+resolve_step = contract.step_config(prepare_job, "Resolve release metadata", "release.yml.jobs.prepare")
+assert "workflow-src/.github/scripts/release_metadata.py" in contract.step_run(
+    resolve_step,
+    "release.yml.jobs.prepare.steps['Resolve release metadata']",
+)
 bundle_job = contract.job_config(release_workflow, "bundle-release", "release.yml")
+bundle_checkout = contract.uses_step_config(
+    bundle_job,
+    "Checkout workflow revision",
+    "actions/checkout@v4",
+    "release.yml.jobs.bundle-release",
+)
+bundle_checkout_with = contract.require_mapping(
+    bundle_checkout.get("with"),
+    "release.yml.jobs.bundle-release.steps['Checkout workflow revision'].with",
+)
+assert bundle_checkout_with.get("path") == "workflow-src"
+bundle_build_step = contract.step_config(
+    bundle_job,
+    "Build release bundle",
+    "release.yml.jobs.bundle-release",
+)
+assert "workflow-src/.github/scripts/build-release-bundle.sh" in contract.step_run(
+    bundle_build_step,
+    "release.yml.jobs.bundle-release.steps['Build release bundle']",
+)
 bundle_upload = contract.uses_step_config(
     bundle_job,
     "Upload release bundle artifact",

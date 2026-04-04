@@ -61,11 +61,20 @@ jobs:
       generate_release_notes: ${{ steps.metadata.outputs.generate_release_notes }}
       release_tag_source: ${{ steps.metadata.outputs.release_tag_source }}
     steps:
-      - name: Checkout release context
+      - name: Checkout workflow revision
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.head_sha || github.ref }}
+          path: workflow-src
+          ref: ${{ github.workflow_sha }}
+
+      - name: Checkout release target metadata
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: release-src
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Determine release intent
         if: ${{ github.event_name == 'workflow_run' }}
@@ -74,10 +83,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_RUN_SHA: ${{ env.RELEASE_TRIGGER_SHA }}
-        run: bash ./.github/scripts/release-intent.sh
+        run: bash ./workflow-src/.github/scripts/release-intent.sh
 
-      - name: Refresh local tags
+      - name: Refresh workflow revision tags
         shell: bash
+        working-directory: ./workflow-src
+        run: git fetch --tags --force
+
+      - name: Refresh release target tags
+        if: ${{ github.event_name == 'workflow_run' }}
+        shell: bash
+        working-directory: ./release-src
         run: git fetch --tags --force
 
       - name: Resolve release metadata
@@ -92,8 +108,8 @@ jobs:
           INTENT_BUMP_LEVEL: ${{ steps.intent.outputs.bump_level }}
           INTENT_CHANNEL: ${{ steps.intent.outputs.channel }}
           INTENT_REASON: ${{ steps.intent.outputs.reason }}
-          REPO_ROOT: ${{ github.workspace }}
-        run: python3 ./.github/scripts/release_metadata.py
+          REPO_ROOT: ${{ github.event_name == 'workflow_run' && format('{0}/release-src', github.workspace) || format('{0}/workflow-src', github.workspace) }}
+        run: python3 ./workflow-src/.github/scripts/release_metadata.py
 
       - name: Validate release metadata
         if: ${{ steps.metadata.outputs.should_release == 'true' }}
@@ -143,9 +159,16 @@ jobs:
       APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
       BUNDLE_NAME: ${{ env.RELEASE_BUNDLE_NAME }}
     steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          path: workflow-src
+          ref: ${{ github.workflow_sha }}
+
       - name: Checkout release target
         uses: actions/checkout@v4
         with:
+          path: release-src
           ref: ${{ needs.prepare.outputs.release_head_sha }}
 
       - name: Install system dependencies
@@ -185,7 +208,11 @@ jobs:
       - name: Build release bundle
         id: bundle
         shell: bash
-        run: bash ./.github/scripts/build-release-bundle.sh
+        env:
+          REPO_ROOT: ${{ github.workspace }}/release-src
+          BUNDLE_ROOT: ${{ github.workspace }}/.tmp/release-bundle
+          ARCHIVE_DIR: ${{ github.workspace }}/.tmp/release-archives
+        run: bash ./workflow-src/.github/scripts/build-release-bundle.sh
 
       - name: Verify release bundle contents
         shell: bash
