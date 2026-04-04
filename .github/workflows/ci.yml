@@ -139,6 +139,7 @@ jobs:
       - name: Check quality-gates scripts
         run: |
           python3 -m py_compile \
+            .github/scripts/release_metadata.py \
             .github/scripts/release_pr_comment.py \
             .github/scripts/metadata_gate.py \
             .github/scripts/check_live_quality_gates.py \
@@ -234,6 +235,7 @@ jobs:
 
       - name: Quality gates self-tests
         run: |
+          bash .github/scripts/test-release-metadata.sh
           bash .github/scripts/test-quality-gates-contract.sh
           bash .github/scripts/test-live-quality-gates.sh
           bash .github/scripts/test-inline-metadata-workflows.sh
@@ -359,6 +361,9 @@ jobs:
     needs: [lint, unit-tests, frontend-e2e, worktree-bootstrap]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     timeout-minutes: 25
+    env:
+      APP_EFFECTIVE_VERSION: pr-${{ github.run_id }}-${{ github.run_attempt }}
+      BUNDLE_NAME: octo-rill-linux-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -371,5 +376,43 @@ jobs:
         with:
           toolchain: 1.91.0
 
-      - name: Cargo build (release)
-        run: cargo build --release --locked
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.9
+
+      - name: Cache cargo directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-build-release-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-build-release-cargo-
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bun/install/cache
+            web/node_modules
+          key: ${{ runner.os }}-build-release-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-build-release-bun-
+
+      - name: Build release bundle
+        id: bundle
+        run: bash ./.github/scripts/build-release-bundle.sh
+
+      - name: Verify release bundle contents
+        run: |
+          set -euo pipefail
+          archive_path="${{ steps.bundle.outputs.archive_path }}"
+          extract_root="$RUNNER_TEMP/release-bundle-check"
+          mkdir -p "${extract_root}"
+          tar -xzf "${archive_path}" -C "${extract_root}"
+          test -x "${extract_root}/${BUNDLE_NAME}/octo-rill"
+          test -f "${extract_root}/${BUNDLE_NAME}/.env.example"
+          test -f "${extract_root}/${BUNDLE_NAME}/web/dist/index.html"

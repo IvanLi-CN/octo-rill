@@ -141,6 +141,23 @@ Every PR must contain exactly one `type:*` label and one `channel:*` label:
 - Stable release: publish `${image}:vX.Y.Z` and `${image}:latest`
 - RC release: publish `${image}:vX.Y.Z-rc.<sha7>` only (no `latest`)
 
+### Release assets
+
+- Every published GitHub Release uploads `octo-rill-linux-x86_64.tar.gz`.
+- The archive always expands to `octo-rill-linux-x86_64/` and includes:
+  - `octo-rill`
+  - `web/dist/`
+  - `.env.example`
+- Release reruns reuse the existing tag on the target commit when one already exists, instead of computing a newer patch number.
+
+### Manual asset backfill
+
+- `Release` workflow `workflow_dispatch` is a backfill-only entrypoint for existing releases.
+- `release_tag` takes priority when provided and backfills that exact release.
+- When no inputs are provided, the workflow backfills the latest published GitHub Release.
+- `head_sha` is optional and only works when that commit already points at an existing release tag.
+- Backfill runs update the release asset in place and do not republish Docker tags.
+
 ### Troubleshooting
 
 - `PR Label Gate` fails:

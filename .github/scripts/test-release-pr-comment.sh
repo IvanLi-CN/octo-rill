@@ -184,7 +184,7 @@ assert missing_pr_result == {
 
 release_workflow = contract.load_yaml(release_workflow_path)
 comment_job = contract.job_config(release_workflow, "pr-release-comment", "release.yml")
-assert set(comment_job.get("needs", [])) == {"prepare", "docker-release"}
+assert set(comment_job.get("needs", [])) == {"prepare", "publish-release"}
 assert "needs.prepare.outputs.should_release == 'true'" in comment_job.get("if", "")
 assert "needs.prepare.outputs.pr_number != ''" in comment_job.get("if", "")
 permissions = contract.require_mapping(comment_job.get("permissions"), "release.yml.jobs.pr-release-comment.permissions")
