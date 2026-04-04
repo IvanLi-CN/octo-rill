@@ -244,6 +244,30 @@ assert "workflow-src/.github/scripts/build-release-bundle.sh" in contract.step_r
     bundle_build_step,
     "release.yml.jobs.bundle-release.steps['Build release bundle']",
 )
+bundle_cargo_cache = contract.uses_step_config(
+    bundle_job,
+    "Cache cargo directories",
+    "actions/cache@v4",
+    "release.yml.jobs.bundle-release",
+)
+bundle_cargo_cache_with = contract.require_mapping(
+    bundle_cargo_cache.get("with"),
+    "release.yml.jobs.bundle-release.steps['Cache cargo directories'].with",
+)
+assert "release-src/target" in str(bundle_cargo_cache_with.get("path", ""))
+assert "release-src/Cargo.lock" in str(bundle_cargo_cache_with.get("key", ""))
+bundle_bun_cache = contract.uses_step_config(
+    bundle_job,
+    "Cache Bun dependencies",
+    "actions/cache@v4",
+    "release.yml.jobs.bundle-release",
+)
+bundle_bun_cache_with = contract.require_mapping(
+    bundle_bun_cache.get("with"),
+    "release.yml.jobs.bundle-release.steps['Cache Bun dependencies'].with",
+)
+assert "release-src/web/node_modules" in str(bundle_bun_cache_with.get("path", ""))
+assert "release-src/web/bun.lock" in str(bundle_bun_cache_with.get("key", ""))
 bundle_upload = contract.uses_step_config(
     bundle_job,
     "Upload release bundle artifact",
