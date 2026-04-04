@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 待实现
+- Status: 已完成
 - Created: 2026-04-04
 - Last: 2026-04-04
 
@@ -76,6 +76,6 @@
 
 ## 实现里程碑
 
-- [ ] M1: 新增 release PR 评论 helper，完成受控评论 upsert 行为。
-- [ ] M2: release workflow 接线完成，并将新测试纳入 CI。
-- [ ] M3: 真实 release run 回归确认 PR 评论幂等更新。
+- [x] M1: 新增 release PR 评论 helper，完成受控评论 upsert 行为。
+- [x] M2: release workflow 接线完成，并将新测试纳入 CI。
+- [x] M3: 真实 release run 回归确认 PR 评论幂等更新。
