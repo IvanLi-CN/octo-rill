@@ -86,3 +86,4 @@
 | g8p8z | 管理员任务中心 Tab 路由化 | 已完成 | `g8p8z-admin-jobs-tab-routing/SPEC.md` | 2026-03-27 | local implementation completed; pathname-driven primary tabs + translation `view` deep links + task drawer `from` restore |
 | epn56 | 管理员任务中心运行时 worker 数量设置 | 已完成 | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-03-28 | PR #42; checks green; review-loop clear; runtime config dialogs + persisted hot updates |
 | r8m4k | Dashboard 日报阅读流与详情弹窗修正 | 已完成 | `r8m4k-dashboard-brief-detail-auto-height/SPEC.md` | 2026-04-03 | PR #45; brief card grows with content and release detail now opens in a modal dialog |
+| qvewp | Release 成功后回写 PR 版本评论 | 待实现 | `qvewp-release-pr-version-comment/SPEC.md` | 2026-04-04 |  |

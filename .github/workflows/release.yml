@@ -213,3 +213,46 @@ jobs:
             APP_EFFECTIVE_VERSION=${{ env.APP_EFFECTIVE_VERSION }}
           cache-from: type=registry,ref=${{ steps.image.outputs.image }}:buildcache
           cache-to: type=registry,ref=${{ steps.image.outputs.image }}:buildcache,mode=max
+
+  pr-release-comment:
+    name: Comment PR with release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [prepare, docker-release]
+    if: ${{ needs.prepare.outputs.should_release == 'true' && needs.prepare.outputs.pr_number != '' }}
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RELEASE_HEAD_SHA: ${{ env.RELEASE_HEAD_SHA }}
+    steps:
+      - name: Checkout (workflow_run)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_HEAD_SHA }}
+
+      - name: Upsert PR release comment
+        id: comment
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHOULD_RELEASE: ${{ needs.prepare.outputs.should_release }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
+          APP_RELEASE_TAG: ${{ needs.prepare.outputs.app_release_tag }}
+        run: python3 ./.github/scripts/release_pr_comment.py
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Release PR comment"
+            echo "- pr: #${{ needs.prepare.outputs.pr_number }}"
+            echo "- action: ${{ steps.comment.outputs.comment_action }}"
+            echo "- tag: ${{ needs.prepare.outputs.app_release_tag }}"
+            echo "- release: ${{ steps.comment.outputs.release_url }}"
+            if [[ -n "${{ steps.comment.outputs.comment_url }}" ]]; then
+              echo "- comment: ${{ steps.comment.outputs.comment_url }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
