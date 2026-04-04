@@ -226,6 +226,8 @@ jobs:
     steps:
       - name: Checkout workflow revision
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
 
       - name: Upsert PR release comment
         id: comment

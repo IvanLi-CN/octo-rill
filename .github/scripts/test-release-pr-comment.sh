@@ -195,7 +195,8 @@ checkout_step = contract.uses_step_config(
     "actions/checkout@v4",
     "release.yml.jobs.pr-release-comment",
 )
-assert "with" not in checkout_step
+checkout = contract.require_mapping(checkout_step.get("with"), "release.yml.jobs.pr-release-comment.steps['Checkout workflow revision'].with")
+assert checkout.get("ref") == "${{ github.workflow_sha }}"
 comment_step = contract.step_config(comment_job, "Upsert PR release comment", "release.yml.jobs.pr-release-comment")
 assert "python3 ./.github/scripts/release_pr_comment.py" in contract.step_run(
     comment_step,
