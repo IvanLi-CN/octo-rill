@@ -19,7 +19,7 @@ bun install --frozen-lockfile
 bun run build
 popd >/dev/null
 
-cargo build --release --locked
+cargo build --release --locked --manifest-path "${repo_root}/Cargo.toml"
 
 cp "${repo_root}/target/release/${binary_name}" "${bundle_dir}/${binary_name}"
 cp "${repo_root}/.env.example" "${bundle_dir}/.env.example"

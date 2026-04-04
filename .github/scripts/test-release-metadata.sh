@@ -6,7 +6,8 @@ python3 - <<'PY' \
   "$repo_root/.github/scripts/release_metadata.py" \
   "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   "$repo_root/.github/workflows/release.yml" \
-  "$repo_root/.github/workflows/ci.yml"
+  "$repo_root/.github/workflows/ci.yml" \
+  "$repo_root/.github/scripts/build-release-bundle.sh"
 from __future__ import annotations
 
 import importlib.util
@@ -20,6 +21,7 @@ script_path = Path(sys.argv[1])
 contract_path = Path(sys.argv[2])
 release_workflow_path = Path(sys.argv[3])
 ci_workflow_path = Path(sys.argv[4])
+bundle_script_path = Path(sys.argv[5])
 
 
 def load_module(path: Path, name: str):
@@ -281,6 +283,9 @@ ci_workflow = contract.load_yaml(ci_workflow_path)
 build_job = contract.job_config(ci_workflow, "build", "ci.yml")
 build_step = contract.step_config(build_job, "Build release bundle", "ci.yml.jobs.build")
 assert "build-release-bundle.sh" in contract.step_run(build_step, "ci.yml.jobs.build.steps['Build release bundle']")
+
+bundle_script = bundle_script_path.read_text(encoding="utf-8")
+assert '--manifest-path "${repo_root}/Cargo.toml"' in bundle_script
 
 print("test-release-metadata: all checks passed")
 PY
