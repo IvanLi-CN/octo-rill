@@ -35,7 +35,7 @@
   - `Tag`: `APP_RELEASE_TAG`
   - `Release`: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${APP_RELEASE_TAG}`
 - 评论 job 必须依赖 `prepare` 与 `docker-release` 成功，确保“发版成功后”才回写。
-- 新 job 只授予最小权限：`issues: write`，不放大全局 workflow 权限。
+- 新 job 只授予评论所需的最小权限：`issues: write` 与 `pull-requests: write`，不放大全局 workflow 权限。
 
 ## 实现要求
 
