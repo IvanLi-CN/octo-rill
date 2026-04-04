@@ -223,13 +223,9 @@ jobs:
     permissions:
       contents: read
       issues: write
-    env:
-      RELEASE_HEAD_SHA: ${{ env.RELEASE_HEAD_SHA }}
     steps:
-      - name: Checkout (workflow_run)
+      - name: Checkout workflow revision
         uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_HEAD_SHA }}
 
       - name: Upsert PR release comment
         id: comment

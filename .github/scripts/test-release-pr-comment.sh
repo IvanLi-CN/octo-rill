@@ -189,8 +189,13 @@ assert "needs.prepare.outputs.should_release == 'true'" in comment_job.get("if",
 assert "needs.prepare.outputs.pr_number != ''" in comment_job.get("if", "")
 permissions = contract.require_mapping(comment_job.get("permissions"), "release.yml.jobs.pr-release-comment.permissions")
 assert permissions == {"contents": "read", "issues": "write"}
-checkout = contract.checkout_step(comment_job, "Checkout (workflow_run)", "release.yml.jobs.pr-release-comment")
-assert checkout.get("ref") == "${{ env.RELEASE_HEAD_SHA }}"
+checkout_step = contract.uses_step_config(
+    comment_job,
+    "Checkout workflow revision",
+    "actions/checkout@v4",
+    "release.yml.jobs.pr-release-comment",
+)
+assert "with" not in checkout_step
 comment_step = contract.step_config(comment_job, "Upsert PR release comment", "release.yml.jobs.pr-release-comment")
 assert "python3 ./.github/scripts/release_pr_comment.py" in contract.step_run(
     comment_step,
