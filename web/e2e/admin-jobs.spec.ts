@@ -1,5 +1,7 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+import { buildMockMeResponse } from "./mockApi";
+
 type MockRequestRule = {
 	pathname: string;
 	search?: string;
@@ -658,8 +660,9 @@ async function installAdminJobsMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me") {
-			return json(route, {
-				user: {
+			return json(
+				route,
+				buildMockMeResponse({
 					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "octo-admin",
@@ -667,8 +670,8 @@ async function installAdminJobsMocks(
 					avatar_url: null,
 					email: "admin@example.com",
 					is_admin: true,
-				},
-			});
+				}),
+			);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/overview") {

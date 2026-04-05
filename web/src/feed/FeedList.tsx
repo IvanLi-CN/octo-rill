@@ -7,22 +7,63 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
-export function FeedList(props: {
+export type FeedCardListProps = {
 	items: FeedItem[];
-	error: string | null;
-	loadingInitial: boolean;
-	loadingMore: boolean;
-	hasMore: boolean;
 	inFlightKeys: Set<string>;
 	registerItemRef: (item: FeedItem) => (el: HTMLElement | null) => void;
-	onLoadMore: () => void;
 	showOriginalByKey: Record<string, boolean>;
 	onToggleOriginal: (key: string) => void;
 	onTranslateNow: (item: FeedItem) => void;
 	reactionBusyKeys: Set<string>;
 	reactionErrorByKey: Record<string, string>;
 	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
-}) {
+};
+
+export function FeedItems(props: FeedCardListProps) {
+	const {
+		items,
+		inFlightKeys,
+		registerItemRef,
+		showOriginalByKey,
+		onToggleOriginal,
+		onTranslateNow,
+		reactionBusyKeys,
+		reactionErrorByKey,
+		onToggleReaction,
+	} = props;
+
+	return items.map((item) => {
+		const key = keyOf(item);
+		const showOriginal = Boolean(showOriginalByKey[key]);
+		const isTranslating = inFlightKeys.has(key);
+		const isReactionBusy = reactionBusyKeys.has(key);
+		const reactionError = reactionErrorByKey[key] ?? null;
+		return (
+			<div key={key} ref={registerItemRef(item)}>
+				<FeedItemCard
+					item={item}
+					showOriginal={showOriginal}
+					isTranslating={isTranslating}
+					isReactionBusy={isReactionBusy}
+					reactionError={reactionError}
+					onToggleOriginal={() => onToggleOriginal(key)}
+					onTranslateNow={() => onTranslateNow(item)}
+					onToggleReaction={(content) => onToggleReaction(item, content)}
+				/>
+			</div>
+		);
+	});
+}
+
+export function FeedList(
+	props: FeedCardListProps & {
+		error: string | null;
+		loadingInitial: boolean;
+		loadingMore: boolean;
+		hasMore: boolean;
+		onLoadMore: () => void;
+	},
+) {
 	const {
 		items,
 		error,
@@ -32,12 +73,7 @@ export function FeedList(props: {
 		inFlightKeys,
 		registerItemRef,
 		onLoadMore,
-		showOriginalByKey,
-		onToggleOriginal,
-		onTranslateNow,
-		reactionBusyKeys,
-		reactionErrorByKey,
-		onToggleReaction,
+		...feedCardProps
 	} = props;
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -79,27 +115,12 @@ export function FeedList(props: {
 				</div>
 			) : null}
 
-			{items.map((item) => {
-				const key = keyOf(item);
-				const showOriginal = Boolean(showOriginalByKey[key]);
-				const isTranslating = inFlightKeys.has(key);
-				const isReactionBusy = reactionBusyKeys.has(key);
-				const reactionError = reactionErrorByKey[key] ?? null;
-				return (
-					<div key={key} ref={registerItemRef(item)}>
-						<FeedItemCard
-							item={item}
-							showOriginal={showOriginal}
-							isTranslating={isTranslating}
-							isReactionBusy={isReactionBusy}
-							reactionError={reactionError}
-							onToggleOriginal={() => onToggleOriginal(key)}
-							onTranslateNow={() => onTranslateNow(item)}
-							onToggleReaction={(content) => onToggleReaction(item, content)}
-						/>
-					</div>
-				);
-			})}
+			<FeedItems
+				items={items}
+				inFlightKeys={inFlightKeys}
+				registerItemRef={registerItemRef}
+				{...feedCardProps}
+			/>
 
 			<div ref={sentinelRef} />
 

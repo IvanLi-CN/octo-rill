@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
@@ -15,7 +15,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { FeedList } from "@/feed/FeedList";
+import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type { FeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -38,6 +38,12 @@ type FeedMode =
 	| "sync-preheated";
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
+const STORYBOOK_DAILY_BOUNDARY = "08:00";
+const STORYBOOK_DAILY_BOUNDARY_TIME_ZONE = "Asia/Shanghai";
+const STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES = 8 * 60;
+const STORYBOOK_NOW = new Date("2026-04-04T12:00:00+08:00");
+const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
+const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 	return {
@@ -85,13 +91,15 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 function makeMockFeed(): FeedItem[] {
 	return [
 		buildFeedItem("10001", {
-			title: "v1.8.0",
-			html_url: "https://github.com/acme/rocket/releases/tag/v1.8.0",
+			ts: "2026-04-04T16:16:29+08:00",
+			title: "v2.63.0",
+			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
 			translated: {
 				lang: "zh-CN",
 				status: "ready",
-				title: "v1.8.0（稳定版）",
-				summary: "- 这是一个稳定版本\n- 包含性能改进\n- 建议升级并重新构建镜像",
+				title: "v2.63.0（稳定版）",
+				summary:
+					"- 发布稳定版本并更新构建链路\n- 补齐 smoke tests 与缓存策略\n- 建议升级后重新构建镜像",
 			},
 			reactions: {
 				counts: {
@@ -113,17 +121,42 @@ function makeMockFeed(): FeedItem[] {
 				status: "ready",
 			},
 		}),
-		buildFeedItem("10000", {
-			ts: "2026-02-21T06:20:00Z",
-			title: "v1.7.3",
-			body: "- Patch release\n- Fixes a regression in auth flow",
-			html_url: "https://github.com/acme/rocket/releases/tag/v1.7.3",
+		buildFeedItem("10002", {
+			ts: "2026-04-04T15:56:24+08:00",
+			repo_full_name: "lobehub/lobe-chat",
+			title: "桌面版 Canary v2.1.48-canary.31",
+			body: "- Canary 构建\n- 自动发布桌面包\n- 建议先在测试环境验证",
+			html_url:
+				"https://github.com/lobehub/lobe-chat/releases/tag/v2.1.48-canary.31",
 			translated: {
 				lang: "zh-CN",
 				status: "disabled",
 				title: null,
 				summary: null,
 			},
+		}),
+		buildFeedItem("10003", {
+			ts: "2026-04-04T07:10:00+08:00",
+			title: "nightly guardrails",
+			body: `- ${HISTORY_RAW_MARKER}\n- Tighten upload guardrails\n- Normalize rollout order`,
+			html_url:
+				"https://github.com/acme/rocket/releases/tag/nightly-guardrails",
+		}),
+		buildFeedItem("10004", {
+			ts: "2026-04-03T21:30:00+08:00",
+			repo_full_name: "acme/satellite",
+			title: "oauth action bubble polish",
+			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
+			html_url:
+				"https://github.com/acme/satellite/releases/tag/oauth-action-bubble",
+		}),
+		buildFeedItem("10005", {
+			ts: "2026-04-03T06:20:00+08:00",
+			repo_full_name: "acme/fleet",
+			title: "fallback lane release",
+			body: `- ${FALLBACK_RAW_MARKER}\n- no brief available for this day\n- keep original release cards visible`,
+			html_url:
+				"https://github.com/acme/fleet/releases/tag/fallback-lane-release",
 		}),
 	];
 }
@@ -221,20 +254,12 @@ function makeVisibleWindowInFlightKeys(
 
 const mockBriefs: BriefItem[] = [
 	{
-		date: "2026-02-21",
-		window_start: "2026-02-20T08:00:00+08:00",
-		window_end: "2026-02-21T08:00:00+08:00",
+		date: "2026-04-04",
+		window_start: "2026-04-03T08:00:00+08:00",
+		window_end: "2026-04-04T08:00:00+08:00",
 		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-02-20T08:00:00+08:00 → 2026-02-21T08:00:00+08:00\n- 更新项目：1 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.8.0](/?tab=briefs&release=10001) · 2026-02-21T08:05:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.8.0)\n  - 稳定版发布，包含性能优化。\n  - 建议升级后重新构建镜像。\n",
-		created_at: "2026-02-21T08:00:03Z",
-	},
-	{
-		date: "2026-02-20",
-		window_start: "2026-02-19T08:00:00+08:00",
-		window_end: "2026-02-20T08:00:00+08:00",
-		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-02-19T08:00:00+08:00 → 2026-02-20T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.7.3](/?tab=briefs&release=10000) · 2026-02-20T06:20:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.7.3)\n  - 修复认证回归问题。\n",
-		created_at: "2026-02-20T08:00:04Z",
+			"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：2 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)、[acme/satellite](https://github.com/acme/satellite)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n",
+		created_at: "2026-04-04T08:00:03+08:00",
 	},
 ];
 
@@ -274,14 +299,25 @@ const longBriefMarkdown = [
 
 const longBriefs: BriefItem[] = [
 	{
+		date: "2026-04-04",
+		window_start: "2026-04-03T08:00:00+08:00",
+		window_end: "2026-04-04T08:00:00+08:00",
+		content_markdown: longBriefMarkdown,
+		created_at: "2026-04-04T08:00:35+08:00",
+	},
+	mockBriefs[0],
+];
+
+const generatedBriefTemplates: Record<string, BriefItem> = {
+	"2026-04-03": {
 		date: "2026-04-03",
 		window_start: "2026-04-02T08:00:00+08:00",
 		window_end: "2026-04-03T08:00:00+08:00",
-		content_markdown: longBriefMarkdown,
-		created_at: "2026-04-03T08:00:35Z",
+		content_markdown:
+			"## 概览\n\n- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/fleet](https://github.com/acme/fleet)\n\n## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n",
+		created_at: "2026-04-03T08:00:03+08:00",
 	},
-	mockBriefs[1],
-];
+};
 
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
@@ -390,6 +426,10 @@ function DashboardPreview(props: {
 	emptyState?: "content" | "auto-sync" | "no-cache";
 	feedMode?: FeedMode;
 	briefs?: BriefItem[];
+	dailyBoundaryLocal?: string;
+	dailyBoundaryTimeZone?: string;
+	dailyBoundaryUtcOffsetMinutes?: number;
+	now?: Date;
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
 }) {
@@ -401,10 +441,20 @@ function DashboardPreview(props: {
 		emptyState = "content",
 		feedMode = "default",
 		briefs = mockBriefs,
+		dailyBoundaryLocal = STORYBOOK_DAILY_BOUNDARY,
+		dailyBoundaryTimeZone = STORYBOOK_DAILY_BOUNDARY_TIME_ZONE,
+		dailyBoundaryUtcOffsetMinutes = STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES,
+		now = STORYBOOK_NOW,
 		initialReleaseId = null,
 		releaseDetail = null,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
+	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
+
+	useEffect(() => {
+		setStoryBriefs(briefs);
+	}, [briefs]);
+
 	const items =
 		emptyState !== "content"
 			? []
@@ -439,7 +489,31 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 
-	const feedPanel =
+	const openReleaseDetail = (releaseId: string) => {
+		setTab("briefs");
+		setActiveReleaseId(releaseId);
+	};
+
+	const generateBriefForDate = async (date: string) => {
+		await new Promise((resolve) => window.setTimeout(resolve, 900));
+		const nextBrief =
+			generatedBriefTemplates[date] ??
+			({
+				date,
+				window_start: null,
+				window_end: null,
+				content_markdown:
+					"## 概览\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。",
+				created_at: `${date}T08:00:03+08:00`,
+			} satisfies BriefItem);
+		setStoryBriefs((current) =>
+			[nextBrief, ...current.filter((brief) => brief.date !== date)].sort(
+				(a, b) => b.date.localeCompare(a.date),
+			),
+		);
+	};
+
+	const renderFeedPanel = (mode: "all" | "releases") =>
 		items.length === 0 ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 				{emptyState === "auto-sync" ? (
@@ -469,8 +543,14 @@ function DashboardPreview(props: {
 				)}
 			</div>
 		) : (
-			<FeedList
+			<FeedGroupedList
+				mode={mode}
 				items={items}
+				briefs={storyBriefs}
+				dailyBoundaryLocal={dailyBoundaryLocal}
+				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+				now={now}
 				error={null}
 				loadingInitial={false}
 				loadingMore={false}
@@ -486,6 +566,10 @@ function DashboardPreview(props: {
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
+				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
+				onGenerateBriefForDate={
+					mode === "all" ? generateBriefForDate : undefined
+				}
 			/>
 		);
 
@@ -495,7 +579,7 @@ function DashboardPreview(props: {
 				<DashboardHeader
 					feedCount={items.length}
 					inboxCount={notifications.length}
-					briefCount={briefs.length}
+					briefCount={storyBriefs.length}
 					login="storybook-user"
 					isAdmin
 					aiDisabledHint={aiDisabledHint}
@@ -550,14 +634,14 @@ function DashboardPreview(props: {
 				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
 					<section className="min-w-0">
 						<TabsContent value="all" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("all")}
 						</TabsContent>
 						<TabsContent value="releases" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("releases")}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard
-								briefs={briefs}
+								briefs={storyBriefs}
 								selectedDate={selectedDate}
 								busy={false}
 								onGenerate={() => {}}
@@ -577,7 +661,7 @@ function DashboardPreview(props: {
 					<aside className="space-y-6">
 						{tab === "briefs" ? (
 							<BriefListCard
-								briefs={briefs}
+								briefs={storyBriefs}
 								selectedDate={selectedDate}
 								onSelectDate={(d) => setSelectedDate(d)}
 							/>
@@ -670,7 +754,7 @@ export const Default: Story = {
 		docs: {
 			description: {
 				story:
-					"主工作区默认入口，验证顶部只保留一个主同步按钮，Feed 与侧栏维持正常内容态。",
+					"主工作区默认入口，验证顶部只保留一个主同步按钮，且 `全部` tab 会把历史日组默认折叠为日报。",
 			},
 		},
 	},
@@ -691,6 +775,192 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const ReleasesGroupedByDay: Story = {
+	args: {
+		initialTab: "releases",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`Releases` tab 只在日组切换处显示弱化分隔线：首组不画前置分隔，历史日组继续用日期与当日 Release 数提示边界。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.queryByText(/^2026-04-04\s+·\s+2 条 Release$/),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.getByText(/^2026-04-03\s+·\s+2 条 Release$/),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(/^2026-04-02\s+·\s+1 条 Release$/),
+		).toBeVisible();
+		await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+	},
+};
+
+export const EvidenceReleasesGroupedByDay: Story = {
+	name: "Evidence / Releases Grouped By Day",
+	args: {
+		initialTab: "releases",
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const AllHistoryCollapsedToBriefs: Story = {
+	args: {
+		initialTab: "all",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到 releases 视图后只保留日期分界与原始列表。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText(/^2026-04-03\s+·\s+2 条 Release$/),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText(HISTORY_RAW_MARKER),
+		).not.toBeInTheDocument();
+		await step("expand historical releases", async () => {
+			const historicalGroup = canvasElement.querySelector<HTMLElement>(
+				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
+			);
+			expect(historicalGroup).toBeTruthy();
+			if (!historicalGroup) {
+				throw new Error("Expected 2026-04-04 historical group to exist");
+			}
+			const beforeSlot = historicalGroup.querySelector<HTMLElement>(
+				"[data-feed-day-action-slot]",
+			);
+			const expandButton =
+				beforeSlot?.querySelector<HTMLButtonElement>("button");
+			expect(beforeSlot).toBeTruthy();
+			expect(expandButton).toBeTruthy();
+			if (!beforeSlot || !expandButton) {
+				throw new Error("Expected action slot and expand button to exist");
+			}
+			expect(expandButton.textContent?.trim()).toBe("Releases");
+			const beforeSlotRect = beforeSlot.getBoundingClientRect();
+			const beforeButtonRect = expandButton.getBoundingClientRect();
+			await expandButton.click();
+			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+			await expect(
+				canvas.queryByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
+			).not.toBeInTheDocument();
+			const afterSlot = historicalGroup.querySelector<HTMLElement>(
+				"[data-feed-day-action-slot]",
+			);
+			const briefButton = afterSlot?.querySelector<HTMLButtonElement>("button");
+			expect(afterSlot).toBeTruthy();
+			expect(briefButton).toBeTruthy();
+			if (!afterSlot || !briefButton) {
+				throw new Error("Expected action slot and 日报 button after expand");
+			}
+			await expect(briefButton).toBeVisible();
+			const afterSlotRect = afterSlot.getBoundingClientRect();
+			const afterButtonRect = briefButton.getBoundingClientRect();
+			expect(
+				Math.abs(beforeSlotRect.top - afterSlotRect.top),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.left - afterSlotRect.left),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.width - afterSlotRect.width),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.height - afterSlotRect.height),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.top - afterButtonRect.top),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.left - afterButtonRect.left),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.width - afterButtonRect.width),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.height - afterButtonRect.height),
+			).toBeLessThanOrEqual(1);
+		});
+	},
+};
+
+export const EvidenceAllHistoryCollapsedToBriefs: Story = {
+	name: "Evidence / All History Collapsed To Briefs",
+	args: {
+		initialTab: "all",
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const AllHistoryFallbackToReleaseCards: Story = {
+	args: {
+		initialTab: "all",
+		briefs: [],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"历史日组没有对应日报时，`全部` tab 先显示日期分隔线 + 原始 Release 卡片；点击“生成日报”后进入 spinning + 占位日报，完成后切成真实日报。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("2026-04-02")).toBeVisible();
+		await expect(canvas.getByText(FALLBACK_RAW_MARKER)).toBeVisible();
+		await step("start generating fallback brief", async () => {
+			await canvas.getByRole("button", { name: "生成日报" }).click();
+			await expect(canvas.getByText("正在生成这一天的日报摘要…")).toBeVisible();
+			await expect(
+				canvas.getByRole("button", { name: "生成日报" }),
+			).toBeDisabled();
+			await expect(
+				canvas.queryByText(FALLBACK_RAW_MARKER),
+			).not.toBeInTheDocument();
+			await expect(
+				await canvas.findByText(/回补这一天的日报摘要/),
+			).toBeVisible();
+		});
+	},
+};
+
+export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
+	name: "Evidence / All History Fallback To Release Cards",
+	args: {
+		initialTab: "all",
+		briefs: [],
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 

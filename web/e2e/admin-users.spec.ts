@@ -1,5 +1,7 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+import { buildMockMeResponse } from "./mockApi";
+
 type MockUser = {
 	id: string;
 	github_user_id: number;
@@ -91,8 +93,9 @@ async function installBaseMocks(
 		const { pathname } = url;
 
 		if (req.method() === "GET" && pathname === "/api/me") {
-			return json(route, {
-				user: {
+			return json(
+				route,
+				buildMockMeResponse({
 					id: CURRENT_USER_ID,
 					github_user_id: 10,
 					login: "octo-admin",
@@ -100,8 +103,8 @@ async function installBaseMocks(
 					avatar_url: null,
 					email: "admin@example.com",
 					is_admin: currentUserIsAdmin,
-				},
-			});
+				}),
+			);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {

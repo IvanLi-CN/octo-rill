@@ -191,6 +191,11 @@ export type MeResponse = {
 		event_path: string | null;
 		reason: "first_visit" | "inactive_over_1h" | "reused_inflight" | "none";
 	};
+	dashboard: {
+		daily_boundary_local: string;
+		daily_boundary_time_zone: string | null;
+		daily_boundary_utc_offset_minutes: number;
+	};
 };
 export type AdminUserProfileResponse = {
 	user_id: LocalUserId;

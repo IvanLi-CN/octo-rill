@@ -1,5 +1,7 @@
 import { type Route, expect, test } from "@playwright/test";
 
+import { buildMockMeResponse } from "./mockApi";
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -117,23 +119,28 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			const { pathname, searchParams } = url;
 
 			if (req.method() === "GET" && pathname === "/api/me") {
-				return json(route, {
-					user: {
-						id: "2f4k7m9p3x6c8v2a",
-						github_user_id: 10,
-						login: "octo",
-						name: "Octo",
-						avatar_url: null,
-						email: null,
-						is_admin: false,
-					},
-					access_sync: {
-						task_id: "task-access-1",
-						task_type: "sync.access_refresh",
-						event_path: "/api/tasks/task-access-1/events",
-						reason: "inactive_over_1h",
-					},
-				});
+				return json(
+					route,
+					buildMockMeResponse(
+						{
+							id: "2f4k7m9p3x6c8v2a",
+							github_user_id: 10,
+							login: "octo",
+							name: "Octo",
+							avatar_url: null,
+							email: null,
+							is_admin: false,
+						},
+						{
+							access_sync: {
+								task_id: "task-access-1",
+								task_type: "sync.access_refresh",
+								event_path: "/api/tasks/task-access-1/events",
+								reason: "inactive_over_1h",
+							},
+						},
+					),
+				);
 			}
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
@@ -328,23 +335,28 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 			const { pathname, searchParams } = url;
 
 			if (req.method() === "GET" && pathname === "/api/me") {
-				return json(route, {
-					user: {
-						id: "2f4k7m9p3x6c8v2a",
-						github_user_id: 10,
-						login: "octo",
-						name: "Octo",
-						avatar_url: null,
-						email: null,
-						is_admin: false,
-					},
-					access_sync: {
-						task_id: null,
-						task_type: null,
-						event_path: null,
-						reason: "none",
-					},
-				});
+				return json(
+					route,
+					buildMockMeResponse(
+						{
+							id: "2f4k7m9p3x6c8v2a",
+							github_user_id: 10,
+							login: "octo",
+							name: "Octo",
+							avatar_url: null,
+							email: null,
+							is_admin: false,
+						},
+						{
+							access_sync: {
+								task_id: null,
+								task_type: null,
+								event_path: null,
+								reason: "none",
+							},
+						},
+					),
+				);
 			}
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
@@ -547,23 +559,28 @@ test("dashboard keeps inbox sync reachable when inbox is empty", async ({
 		const { pathname, searchParams } = url;
 
 		if (req.method() === "GET" && pathname === "/api/me") {
-			return json(route, {
-				user: {
-					id: "2f4k7m9p3x6c8v2a",
-					github_user_id: 10,
-					login: "octo",
-					name: "Octo",
-					avatar_url: null,
-					email: null,
-					is_admin: false,
-				},
-				access_sync: {
-					task_id: null,
-					task_type: null,
-					event_path: null,
-					reason: "none",
-				},
-			});
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: null,
+							task_type: null,
+							event_path: null,
+							reason: "none",
+						},
+					},
+				),
+			);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
