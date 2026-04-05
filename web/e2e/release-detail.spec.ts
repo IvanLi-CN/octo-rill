@@ -1,5 +1,7 @@
 import { type Page, type Route, expect, test } from "@playwright/test";
 
+import { buildMockMeResponse } from "./mockApi";
+
 type ApiOptions = {
 	releaseId: string;
 	detailTitle: string;
@@ -145,8 +147,9 @@ async function installApiMocks(
 		const { pathname } = url;
 
 		if (req.method() === "GET" && pathname === "/api/me") {
-			return json(route, {
-				user: {
+			return json(
+				route,
+				buildMockMeResponse({
 					id: "2f4k7m9p3x6c8v2a",
 					github_user_id: 10,
 					login: "octo",
@@ -154,8 +157,8 @@ async function installApiMocks(
 					avatar_url: null,
 					email: null,
 					is_admin: false,
-				},
-			});
+				}),
+			);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/feed") {
