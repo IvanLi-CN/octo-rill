@@ -126,6 +126,7 @@ pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, A
 pub struct MeResponse {
     user: UserSummary,
     access_sync: AccessSyncBootstrap,
+    dashboard: DashboardBootstrap,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,6 +159,13 @@ struct AccessSyncBootstrap {
     task_type: Option<String>,
     event_path: Option<String>,
     reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardBootstrap {
+    daily_boundary_local: String,
+    daily_boundary_time_zone: Option<String>,
+    daily_boundary_utc_offset_minutes: i32,
 }
 
 impl AccessSyncBootstrap {
@@ -214,6 +222,15 @@ pub async fn me(
 
     let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
     touch_user_last_active_at(state.as_ref(), &row.id).await?;
+    let daily_boundary_local = state
+        .config
+        .ai_daily_at_local
+        .unwrap_or_else(|| chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid daily boundary"))
+        .format("%H:%M")
+        .to_string();
+    let now_local = chrono::Local::now();
+    let daily_boundary_time_zone = iana_time_zone::get_timezone().ok();
+    let daily_boundary_utc_offset_minutes = now_local.offset().local_minus_utc() / 60;
 
     Ok(Json(MeResponse {
         user: UserSummary {
@@ -226,6 +243,11 @@ pub async fn me(
             is_admin: row.is_admin != 0,
         },
         access_sync,
+        dashboard: DashboardBootstrap {
+            daily_boundary_local,
+            daily_boundary_time_zone,
+            daily_boundary_utc_offset_minutes,
+        },
     }))
 }
 
@@ -3391,13 +3413,27 @@ pub struct BriefGenerateResponse {
     content_markdown: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BriefGenerateRequest {
+    date: Option<String>,
+}
+
 pub async fn generate_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
     Query(mode_query): Query<ReturnModeQuery>,
+    payload: Option<Json<BriefGenerateRequest>>,
 ) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
+    let requested_date = payload.and_then(|Json(body)| body.date);
+    let key_date = requested_date
+        .as_deref()
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map_err(|_| ApiError::bad_request("invalid date, expected YYYY-MM-DD"))
+        })
+        .transpose()?;
 
     if !matches!(mode, ReturnMode::Sync) {
         return enqueue_or_stream_task(
@@ -3405,7 +3441,10 @@ pub async fn generate_brief(
             mode,
             jobs::NewTask {
                 task_type: jobs::TASK_BRIEF_GENERATE.to_owned(),
-                payload: json!({ "user_id": user_id.clone() }),
+                payload: json!({
+                    "user_id": user_id.clone(),
+                    "key_date": key_date.map(|value| value.to_string()),
+                }),
                 source: "api.generate_brief".to_owned(),
                 requested_by: Some(user_id.clone()),
                 parent_task_id: None,
@@ -3414,13 +3453,23 @@ pub async fn generate_brief(
         .await;
     }
 
-    let content = run_with_api_llm_context(
-        "api.generate_brief.sync",
-        Some(user_id.clone()),
-        ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    let content = if let Some(key_date) = key_date {
+        run_with_api_llm_context(
+            "api.generate_brief.sync",
+            Some(user_id.clone()),
+            ai::generate_daily_brief_for_key_date(state.as_ref(), user_id.as_str(), key_date),
+        )
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        run_with_api_llm_context(
+            "api.generate_brief.sync",
+            Some(user_id.clone()),
+            ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
+        )
+        .await
+        .map_err(ApiError::internal)?
+    };
 
     // The brief row is keyed by date. Read the most recent one to include window hints.
     let row = sqlx::query_as::<_, (String,)>(
@@ -3438,9 +3487,11 @@ pub async fn generate_brief(
     .map_err(ApiError::internal)?;
 
     let at = state.config.ai_daily_at_local;
-    let date = row
-        .map(|r| r.0)
-        .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+    let date = row.map(|r| r.0).unwrap_or_else(|| {
+        key_date
+            .unwrap_or_else(|| chrono::Local::now().date_naive())
+            .to_string()
+    });
     let (window_start, window_end) = at
         .and_then(|at| {
             chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")

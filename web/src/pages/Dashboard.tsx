@@ -20,7 +20,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { FeedList } from "@/feed/FeedList";
+import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type {
 	FeedItem,
 	ReactionContent,
@@ -165,6 +165,10 @@ function firstPendingReactionContent(
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 	const isAdmin = me.user.is_admin;
+	const dailyBoundaryLocal = me.dashboard.daily_boundary_local;
+	const dailyBoundaryTimeZone = me.dashboard.daily_boundary_time_zone;
+	const dailyBoundaryUtcOffsetMinutes =
+		me.dashboard.daily_boundary_utc_offset_minutes;
 	const accessSync = me.access_sync ?? {
 		task_id: null,
 		task_type: null,
@@ -839,6 +843,16 @@ export function Dashboard(props: { me: MeResponse }) {
 			await refreshSidebar();
 		});
 	}, [refreshSidebar, run]);
+	const onGenerateBriefForDate = useCallback(
+		async (date: string) => {
+			setBootError(null);
+			await apiPostJson<BriefGenerateResponse>("/api/briefs/generate", {
+				date,
+			});
+			await refreshSidebar();
+		},
+		[refreshSidebar],
+	);
 	const onSyncStarred = useCallback(() => {
 		void run("Sync starred", async () => {
 			const task = await apiPost<TaskAcceptedResponse>(
@@ -916,7 +930,7 @@ export function Dashboard(props: { me: MeResponse }) {
 		setActiveReleaseId(null);
 	}, []);
 
-	const feedPanel = (
+	const renderFeedPanel = (mode: "all" | "releases") => (
 		<>
 			{!feed.loadingInitial && feed.items.length === 0 ? (
 				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
@@ -969,8 +983,13 @@ export function Dashboard(props: { me: MeResponse }) {
 				</div>
 			) : null}
 
-			<FeedList
+			<FeedGroupedList
+				mode={mode}
 				items={feed.items}
+				briefs={briefs}
+				dailyBoundaryLocal={dailyBoundaryLocal}
+				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
 				error={feed.error}
 				loadingInitial={feed.loadingInitial}
 				loadingMore={feed.loadingMore}
@@ -984,6 +1003,12 @@ export function Dashboard(props: { me: MeResponse }) {
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={reactionErrorByKey}
 				onToggleReaction={onToggleReaction}
+				onOpenReleaseFromBrief={
+					mode === "all" ? onOpenReleaseDetail : undefined
+				}
+				onGenerateBriefForDate={
+					mode === "all" ? onGenerateBriefForDate : undefined
+				}
 			/>
 		</>
 	);
@@ -1071,10 +1096,10 @@ export function Dashboard(props: { me: MeResponse }) {
 				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
 					<section className="min-w-0">
 						<TabsContent value="all" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("all")}
 						</TabsContent>
 						<TabsContent value="releases" className="mt-0 min-w-0">
-							{feedPanel}
+							{renderFeedPanel("releases")}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard

@@ -12,7 +12,7 @@ use axum::response::{
     IntoResponse, Response,
     sse::{Event, KeepAlive, Sse},
 };
-use chrono::{DateTime, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -1499,7 +1499,12 @@ async fn execute_task(
         }
         TASK_BRIEF_GENERATE => {
             let user_id = payload_local_id(payload, "user_id")?;
-            let content = ai::generate_daily_brief(state, user_id.as_str()).await?;
+            let key_date = payload_date(payload, "key_date")?;
+            let content = if let Some(key_date) = key_date {
+                ai::generate_daily_brief_for_key_date(state, user_id.as_str(), key_date).await?
+            } else {
+                ai::generate_daily_brief(state, user_id.as_str()).await?
+            };
             Ok(json!({"content_length": content.chars().count()}))
         }
         TASK_BRIEF_DAILY_SLOT => execute_daily_slot_task(state, task_id, payload).await,
@@ -1908,6 +1913,17 @@ fn payload_string(payload: &Value, key: &str) -> Result<String> {
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("payload missing string field: {key}"))?;
     Ok(value.to_owned())
+}
+
+fn payload_date(payload: &Value, key: &str) -> Result<Option<NaiveDate>> {
+    let Some(raw) = payload.get(key).and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(NaiveDate::parse_from_str(value, "%Y-%m-%d")?))
 }
 
 fn payload_i64_array(payload: &Value, key: &str) -> Result<Vec<i64>> {
