@@ -1,12 +1,19 @@
-import { ChevronDown, ChevronRight } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { List, LoaderCircle, Newspaper, Sparkles } from "lucide-react";
+import {
+	type HTMLAttributes,
+	type ReactNode,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import { FeedItems, type FeedCardListProps } from "@/feed/FeedList";
 import { groupFeedItemsByDay } from "@/feed/dayGroups";
 import type { FeedItem } from "@/feed/types";
-import { formatIsoShortLocal } from "@/lib/datetime";
+import { cn } from "@/lib/utils";
 
 type BriefLike = {
 	date: string;
@@ -14,49 +21,175 @@ type BriefLike = {
 	created_at: string;
 };
 
-function FeedDayDivider(props: {
+const FEED_DAY_ACTION_SLOT_CLASS =
+	"flex h-8 w-[152px] shrink-0 items-center justify-end";
+const FEED_DAY_ACTION_BUTTON_CLASS =
+	"h-auto min-h-0 w-full justify-end gap-1 rounded-none px-0 py-0 font-mono text-[15px] font-normal leading-none tracking-wide text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100";
+const FEED_DAY_GROUP_RAIL_CLASS = "px-5 py-[8px] sm:px-6";
+const FEED_DAY_GROUP_CARD_CLASS =
+	"bg-card/58 overflow-hidden rounded-[24px] shadow-sm ring-1 ring-inset ring-border/60";
+
+function FeedDayHeader(props: {
 	date: string;
 	releaseCount: number;
 	action?: ReactNode;
+	withDividerLines?: boolean;
+	className?: string;
+	actionSlotProps?: HTMLAttributes<HTMLDivElement> & {
+		"data-feed-day-action-slot"?: string;
+	};
 }) {
-	const { date, releaseCount, action } = props;
+	const {
+		date,
+		releaseCount,
+		action,
+		withDividerLines = true,
+		className,
+		actionSlotProps,
+	} = props;
+
+	const label = (
+		<p className="text-foreground/68 shrink-0 font-mono text-[15px] leading-none tracking-wide">
+			<span className="text-foreground/82">{date}</span>
+			{" · "}
+			{releaseCount} 条 Release
+		</p>
+	);
 
 	return (
-		<div className="flex flex-wrap items-center gap-3">
-			<div className="flex min-w-0 flex-1 items-center gap-3">
-				<div className="bg-border/60 h-px flex-1" />
-				<p className="text-muted-foreground shrink-0 font-mono text-[11px] tracking-wide">
-					<span className="text-foreground/80">{date}</span>
-					{" · "}
-					{releaseCount} 条 Release
-				</p>
-				<div className="bg-border/60 h-px flex-1" />
-			</div>
-			{action}
+		<div
+			className={cn(
+				"flex min-h-8 flex-wrap items-center gap-3 sm:min-h-8",
+				className,
+			)}
+		>
+			{withDividerLines ? (
+				<div className="flex min-w-0 flex-1 items-center gap-4">
+					<div className="bg-border/60 h-px flex-1" />
+					{label}
+					<div className="bg-border/60 h-px min-w-8 flex-1" />
+				</div>
+			) : (
+				<div className="flex min-w-0 flex-1 items-center">{label}</div>
+			)}
+			{action ? (
+				<div
+					{...actionSlotProps}
+					className={cn(FEED_DAY_ACTION_SLOT_CLASS, actionSlotProps?.className)}
+				>
+					{action}
+				</div>
+			) : null}
 		</div>
 	);
 }
 
-function FeedBriefSummary(props: {
-	brief: BriefLike;
+function FeedDayDivider(props: {
+	date: string;
+	releaseCount: number;
+	action?: ReactNode;
+	showDivider?: boolean;
+	className?: string;
+}) {
+	const { date, releaseCount, action, showDivider = true, className } = props;
+
+	if (!showDivider) {
+		return null;
+	}
+
+	return (
+		<FeedDayHeader
+			date={date}
+			releaseCount={releaseCount}
+			action={action}
+			className={cn("px-1", className)}
+		/>
+	);
+}
+
+function FeedBriefBody(props: {
+	brief: BriefLike | null;
 	onOpenRelease?: (releaseId: string) => void;
 }) {
 	const { brief, onOpenRelease } = props;
 
 	return (
-		<div className="bg-card/60 rounded-xl border border-dashed p-4 shadow-sm">
-			<div className="mb-3 flex items-center justify-between gap-3">
-				<span className="text-muted-foreground font-mono text-[11px] tracking-wide">
-					日报
-				</span>
-				<span className="text-muted-foreground font-mono text-[11px]">
-					{formatIsoShortLocal(brief.created_at)}
-				</span>
+		<div className="px-5 pb-4 pt-3 sm:px-6 sm:pb-5">
+			{brief ? (
+				<Markdown
+					content={brief.content_markdown}
+					onInternalReleaseClick={onOpenRelease}
+				/>
+			) : (
+				<div className="space-y-3">
+					<p className="text-muted-foreground text-sm">
+						正在生成这一天的日报摘要…
+					</p>
+					<div className="space-y-2">
+						<div className="bg-muted h-4 w-40 animate-pulse rounded" />
+						<div className="bg-muted h-3 w-full animate-pulse rounded" />
+						<div className="bg-muted h-3 w-11/12 animate-pulse rounded" />
+						<div className="bg-muted h-3 w-9/12 animate-pulse rounded" />
+					</div>
+				</div>
+			)}
+		</div>
+	);
+}
+
+function FeedHistoricalDayGroup(props: {
+	date: string;
+	releaseCount: number;
+	action: ReactNode;
+	showDivider: boolean;
+	showBriefPanel: boolean;
+	showReleases: boolean;
+	brief: BriefLike | null;
+	onOpenReleaseFromBrief?: (releaseId: string) => void;
+	items: FeedItem[];
+	feedCardProps: Omit<FeedCardListProps, "items">;
+}) {
+	const {
+		date,
+		releaseCount,
+		action,
+		showDivider,
+		showBriefPanel,
+		showReleases,
+		brief,
+		onOpenReleaseFromBrief,
+		items,
+		feedCardProps,
+	} = props;
+
+	return (
+		<div className="space-y-4">
+			<div className={cn(showBriefPanel && FEED_DAY_GROUP_CARD_CLASS)}>
+				<div
+					className={cn(
+						FEED_DAY_GROUP_RAIL_CLASS,
+						showBriefPanel && "border-b border-dashed border-border/55",
+					)}
+				>
+					<FeedDayHeader
+						date={date}
+						releaseCount={releaseCount}
+						action={action}
+						withDividerLines={showDivider}
+						actionSlotProps={{
+							"data-feed-day-action-slot": "true",
+						}}
+					/>
+				</div>
+				{showBriefPanel ? (
+					<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
+				) : null}
 			</div>
-			<Markdown
-				content={brief.content_markdown}
-				onInternalReleaseClick={onOpenRelease}
-			/>
+			{showReleases ? (
+				<div className="space-y-4">
+					<FeedItems items={items} {...feedCardProps} />
+				</div>
+			) : null}
 		</div>
 	);
 }
@@ -76,6 +209,7 @@ export function FeedGroupedList(
 		dailyBoundaryUtcOffsetMinutes: number | null | undefined;
 		now?: Date;
 		onOpenReleaseFromBrief?: (releaseId: string) => void;
+		onGenerateBriefForDate?: (date: string) => Promise<void>;
 	},
 ) {
 	const {
@@ -92,12 +226,16 @@ export function FeedGroupedList(
 		dailyBoundaryUtcOffsetMinutes,
 		now,
 		onOpenReleaseFromBrief,
+		onGenerateBriefForDate,
 		...feedCardProps
 	} = props;
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
 	const sentinelVisibleRef = useRef(false);
-	const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(
+	const [releaseOnlyGroupIds, setReleaseOnlyGroupIds] = useState<Set<string>>(
+		() => new Set<string>(),
+	);
+	const [pendingBriefDates, setPendingBriefDates] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
 
@@ -148,17 +286,32 @@ export function FeedGroupedList(
 	);
 
 	useEffect(() => {
-		setExpandedGroupIds((current) => {
+		setReleaseOnlyGroupIds((current) => {
 			const next = new Set<string>();
 			for (const group of groups) {
 				if (!current.has(group.id)) continue;
-				if (!group.isCurrent && briefByDate.has(group.briefDate)) {
-					next.add(group.id);
-				}
+				next.add(group.id);
 			}
 			if (
 				next.size === current.size &&
 				Array.from(next).every((groupId) => current.has(groupId))
+			) {
+				return current;
+			}
+			return next;
+		});
+		setPendingBriefDates((current) => {
+			const next = new Set<string>();
+			for (const date of current) {
+				const stillInFeed = groups.some((group) => group.briefDate === date);
+				if (!stillInFeed) continue;
+				if (!briefByDate.has(date)) {
+					next.add(date);
+				}
+			}
+			if (
+				next.size === current.size &&
+				Array.from(next).every((date) => current.has(date))
 			) {
 				return current;
 			}
@@ -187,66 +340,155 @@ export function FeedGroupedList(
 				</div>
 			) : null}
 
-			{groups.map((group) => {
+			{groups.map((group, index) => {
 				const brief = briefByDate.get(group.briefDate) ?? null;
-				const canCollapseToBrief =
-					mode === "all" && !group.isCurrent && Boolean(brief);
-				const expanded = canCollapseToBrief
-					? expandedGroupIds.has(group.id)
-					: true;
+				const isHistoricalAllGroup = mode === "all" && !group.isCurrent;
+				const pendingBrief = pendingBriefDates.has(group.briefDate);
+				const showBriefPanel =
+					isHistoricalAllGroup &&
+					(pendingBrief ||
+						(Boolean(brief) && !releaseOnlyGroupIds.has(group.id)));
+				const showReleases = !isHistoricalAllGroup || !showBriefPanel;
+				const showDivider = index > 0;
+				let groupAction: ReactNode = null;
+				if (isHistoricalAllGroup) {
+					if (pendingBrief) {
+						groupAction = (
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								disabled
+								className={FEED_DAY_ACTION_BUTTON_CLASS}
+							>
+								<LoaderCircle className="size-3.5 animate-spin" />
+								生成日报
+							</Button>
+						);
+					} else if (showBriefPanel && brief) {
+						groupAction = (
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={FEED_DAY_ACTION_BUTTON_CLASS}
+								onClick={() => {
+									setReleaseOnlyGroupIds((current) => {
+										const next = new Set(current);
+										next.add(group.id);
+										return next;
+									});
+								}}
+							>
+								<List className="size-4" />
+								Releases
+							</Button>
+						);
+					} else if (brief) {
+						groupAction = (
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={FEED_DAY_ACTION_BUTTON_CLASS}
+								onClick={() => {
+									setReleaseOnlyGroupIds((current) => {
+										if (!current.has(group.id)) return current;
+										const next = new Set(current);
+										next.delete(group.id);
+										return next;
+									});
+								}}
+							>
+								<Newspaper className="size-4" />
+								日报
+							</Button>
+						);
+					} else {
+						groupAction = (
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={FEED_DAY_ACTION_BUTTON_CLASS}
+								disabled={!onGenerateBriefForDate}
+								onClick={() => {
+									if (!onGenerateBriefForDate) return;
+									setPendingBriefDates((current) => {
+										if (current.has(group.briefDate)) return current;
+										const next = new Set(current);
+										next.add(group.briefDate);
+										return next;
+									});
+									setReleaseOnlyGroupIds((current) => {
+										if (!current.has(group.id)) return current;
+										const next = new Set(current);
+										next.delete(group.id);
+										return next;
+									});
+									void onGenerateBriefForDate(group.briefDate).catch(() => {
+										setPendingBriefDates((current) => {
+											if (!current.has(group.briefDate)) return current;
+											const next = new Set(current);
+											next.delete(group.briefDate);
+											return next;
+										});
+									});
+								}}
+							>
+								<Sparkles className="size-4" />
+								生成日报
+							</Button>
+						);
+					}
+				}
 
 				return (
-					<section key={group.id} className="space-y-4">
-						<FeedDayDivider
-							date={group.displayDate}
-							releaseCount={group.releaseCount}
-							action={
-								canCollapseToBrief ? (
-									<Button
-										type="button"
-										variant="ghost"
-										size="sm"
-										className="text-muted-foreground h-7 rounded-full px-2 font-mono text-[11px]"
-										onClick={() => {
-											setExpandedGroupIds((current) => {
-												const next = new Set(current);
-												if (next.has(group.id)) {
-													next.delete(group.id);
-												} else {
-													next.add(group.id);
-												}
-												return next;
-											});
-										}}
-									>
-										{expanded ? (
-											<ChevronDown className="size-3.5" />
-										) : (
-											<ChevronRight className="size-3.5" />
-										)}
-										{expanded ? "收起 Releases" : "展开 Releases"}
-									</Button>
-								) : null
-							}
-						/>
-
-						{canCollapseToBrief && brief ? (
-							<FeedBriefSummary
+					<section
+						key={group.id}
+						className="space-y-4"
+						data-feed-group-id={group.id}
+						data-feed-brief-date={group.briefDate}
+						data-feed-group-type={
+							isHistoricalAllGroup ? "historical" : "default"
+						}
+						data-feed-group-view={
+							isHistoricalAllGroup
+								? showBriefPanel
+									? "brief"
+									: "releases"
+								: "default"
+						}
+					>
+						{isHistoricalAllGroup ? (
+							<FeedHistoricalDayGroup
+								date={group.displayDate}
+								releaseCount={group.releaseCount}
+								action={groupAction}
+								showDivider={showDivider}
+								showBriefPanel={showBriefPanel}
+								showReleases={showReleases}
 								brief={brief}
-								onOpenRelease={onOpenReleaseFromBrief}
+								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
+								items={group.items}
+								feedCardProps={feedCardProps}
 							/>
-						) : null}
-
-						{expanded ? (
-							<div className="space-y-4">
-								{canCollapseToBrief ? (
-									<p className="text-muted-foreground font-mono text-[11px]">
-										原始 Releases
-									</p>
+						) : (
+							<>
+								<FeedDayDivider
+									date={group.displayDate}
+									releaseCount={group.releaseCount}
+									action={groupAction}
+									showDivider={showDivider}
+									className={undefined}
+								/>
+								{showReleases ? (
+									<div className="space-y-4">
+										<FeedItems items={group.items} {...feedCardProps} />
+									</div>
 								) : null}
-								<FeedItems items={group.items} {...feedCardProps} />
-							</div>
-						) : null}
+							</>
+						)}
 					</section>
 				);
 			})}

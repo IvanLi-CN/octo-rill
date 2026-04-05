@@ -843,6 +843,16 @@ export function Dashboard(props: { me: MeResponse }) {
 			await refreshSidebar();
 		});
 	}, [refreshSidebar, run]);
+	const onGenerateBriefForDate = useCallback(
+		async (date: string) => {
+			setBootError(null);
+			await apiPostJson<BriefGenerateResponse>("/api/briefs/generate", {
+				date,
+			});
+			await refreshSidebar();
+		},
+		[refreshSidebar],
+	);
 	const onSyncStarred = useCallback(() => {
 		void run("Sync starred", async () => {
 			const task = await apiPost<TaskAcceptedResponse>(
@@ -995,6 +1005,9 @@ export function Dashboard(props: { me: MeResponse }) {
 				onToggleReaction={onToggleReaction}
 				onOpenReleaseFromBrief={
 					mode === "all" ? onOpenReleaseDetail : undefined
+				}
+				onGenerateBriefForDate={
+					mode === "all" ? onGenerateBriefForDate : undefined
 				}
 			/>
 		</>

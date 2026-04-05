@@ -16,10 +16,11 @@
 
 ### Goals
 
-- 让 `Releases` tab 按统一日报边界分组，并在每个日组前显示弱化的日期分隔线。
+- 让 `Releases` tab 按统一日报边界分组，并仅在日组切换处显示弱化的日期分隔线。
 - 让 `全部` tab 保持“今天”直接展示原始 Release 卡片，而更早的日组优先以真实日报内容呈现。
-- 历史日组在命中对应日报时，允许用户手动展开该日所有原始 Release。
+- 历史日组在命中对应日报时，允许用户在“日报视图”和“日期分界 + 原始 Release 列表”之间来回切换。
 - 当历史日组没有对应日报时，退回为 `Releases` tab 同款的日期分隔线 + 原始 Release 卡片。
+- 当历史日组没有对应日报时，允许用户按天手动触发日报生成，并在生成中看到占位日报卡片。
 - 补齐 Dashboard 启动期可消费的日报边界配置，并同步更新 Storybook 与视觉证据。
 
 ### Non-goals
@@ -53,16 +54,19 @@
 
 - Dashboard 必须拿到稳定的“日报边界本地时间”配置，不依赖从已有 brief 样本反推。
 - `Releases` tab 的 feed 必须按日报边界切分成多个日组。
-- 每个日组的分隔线必须显示日期与当日 Release 数，视觉上弱化为结构分隔，而不是主标题。
+- 每个日组的分隔线必须显示日期与当日 Release 数，视觉上弱化为结构分隔，而不是主标题；首个可见日组不显示前置分隔。
 - `全部` tab 中，当前日组必须继续直接展示原始 Release 卡片。
-- `全部` tab 中，历史日组若有对应日报，默认只展示真实日报内容，并提供展开原始 Release 列表的入口。
+- `全部` tab 中，历史日组若有对应日报，默认只展示真实日报内容，并提供切换到原始 Release 列表的入口。
+- `全部` tab 中，历史日组若切换到原始 Release 列表，则不再同时显示日报卡片，且日期分界右侧必须提供返回日报视图的按钮。
 - `全部` tab 中，历史日组若无对应日报，必须直接展示原始 Release 列表，不显示伪摘要。
+- `全部` tab 中，历史日组若无对应日报，日期分界右侧必须提供“生成日报”按钮；触发后按钮进入 spinning 状态，同时显示占位日报卡片，待生成成功后替换为真实日报。
 - 历史日组的展开状态必须彼此独立，且不写入 URL 或本地持久化。
 
 ### SHOULD
 
 - 分组 helper 应该同时被运行时代码与 Storybook preview 复用，避免 mock 行为与真实页面分叉。
 - 历史日报容器应弱化样式层级，避免比原始 Release 卡片更抢眼。
+- 历史日报组应保留卡片形态，但卡头需要继承普通 divider 的线性视觉语言，避免分隔线悬浮在日报卡片之外。
 
 ### COULD
 
@@ -73,8 +77,10 @@
 ### Core flows
 
 - 用户进入 `Releases` tab 时，主列先按日报边界分组，再依序显示每个日组下的原始 Release 卡片。
-- 用户进入 `全部` tab 时，当前日组保持原始 Release feed；更早的日组若命中日报，则优先显示该日报 Markdown。
-- 用户点击历史日组的“展开 Releases”后，该组在保留日报内容的同时，展开该日的原始 Release 卡片。
+- 用户进入 `全部` tab 时，当前日组保持原始 Release feed；更早的日组若命中日报，则优先显示一个卡头继承 divider 语言的日报卡片。
+- 用户点击历史日组的“Releases”后，该组切换为“日期分界 + 原始 Release 列表”，不再同时显示日报卡片。
+- 用户点击历史日组分界右侧的“日报”后，该组重新切回日报卡片视图。
+- 用户点击历史日组分界右侧的“生成日报”后，按钮进入 spinning 状态，组内容切换为占位日报卡片；生成成功后占位内容被真实日报替换。
 - 用户点击嵌入日报中的内部 Release 链接时，沿用现有 Dashboard 行为：进入 `briefs` 上下文并打开 Release 详情弹窗。
 
 ### Edge cases / errors
@@ -106,7 +112,7 @@
 
 - Given `Releases` tab 存在跨多天的 Release 数据
   When 页面渲染完成
-  Then 每个日组顶部都会出现一个弱化分隔线，且分隔线文本包含日期与当日 Release 数。
+  Then 首个可见日组不显示前置分隔，后续日组都会出现一个弱化分隔线，且分隔线文本包含日期与当日 Release 数。
 
 - Given `全部` tab 中存在“今天”与至少一个历史日组
   When 页面渲染完成
@@ -114,15 +120,23 @@
 
 - Given 历史日组命中了对应日报
   When 用户尚未点击展开
-  Then 该日组默认展示真实日报 Markdown，并提供单独展开原始 Release 的入口。
+  Then 该日组默认展示一个卡头继承 divider 语言的真实日报卡片，并提供单独展开原始 Release 的入口。
 
 - Given 历史日组没有对应日报
   When 页面渲染完成
   Then 该日组直接退回为分隔线 + 原始 Release 卡片，不显示伪日报。
 
-- Given 用户在历史日报组中点击展开
-  When 展开完成
-  Then 该日组会显示原始 Release 卡片，且不会影响其他日组的展开状态。
+- Given 历史日组命中了对应日报
+  When 用户点击“Releases”
+  Then 该日组只显示日期分界与原始 Release 列表，日报卡片从当前组中移除，且分界右侧出现“日报”按钮。
+
+- Given 历史日组没有对应日报
+  When 用户点击“生成日报”
+  Then 分界右侧按钮进入 spinning 状态，组内容先显示占位日报卡片，并在生成完成后替换为真实日报。
+
+- Given 用户在某个历史日组中切换日报或 releases 视图
+  When 切换完成
+  Then 只影响当前日组，不会改动其他历史日组的显示状态。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -144,6 +158,7 @@
   - `Releases` tab 按日报边界分组
   - `全部` tab 历史日报折叠
   - `全部` tab 历史组缺日报 fallback
+  - `全部` tab 历史组手动生成日报
 - 最终视觉证据必须写入本 spec 的 `## Visual Evidence`。
 
 ## 文档更新（Docs to Update）
@@ -158,14 +173,19 @@
 
 ## Visual Evidence
 
+- 交互态细节（`Releases` 后切回原始列表、`生成日报` 的 spinning 与占位日报、生成完成后的替换）由 Storybook `play` 覆盖校验。
+
 - `Releases` tab 按日报边界分组
 ![Releases tab 按日报边界分组](./assets/dashboard-releases-grouped.png)
 
 - `全部` tab 历史日报默认折叠为日报摘要
 ![全部 tab 历史日报默认折叠](./assets/dashboard-all-history-collapsed.png)
 
-- `全部` tab 历史日组缺少日报时回退为原始 Release 卡片
-![全部 tab 历史日组 fallback](./assets/dashboard-all-history-fallback.png)
+- `全部` tab 历史日报切换到 release-only 视图后，右侧 action slot 位置保持不变
+![全部 tab 历史日报展开后 action slot 对齐](./assets/dashboard-all-history-expanded.png)
+
+- `全部` tab 历史日组缺少日报时显示“生成日报”入口并保留原始 Release 卡片流
+![全部 tab 历史日组生成入口](./assets/dashboard-all-history-fallback.png)
 
 ## 实现里程碑（Milestones / Delivery checklist）
 

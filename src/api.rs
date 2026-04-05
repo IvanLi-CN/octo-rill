@@ -3413,13 +3413,27 @@ pub struct BriefGenerateResponse {
     content_markdown: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BriefGenerateRequest {
+    date: Option<String>,
+}
+
 pub async fn generate_brief(
     State(state): State<Arc<AppState>>,
     session: Session,
     Query(mode_query): Query<ReturnModeQuery>,
+    payload: Option<Json<BriefGenerateRequest>>,
 ) -> Result<Response, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let mode = ReturnMode::from_query(&mode_query)?;
+    let requested_date = payload.and_then(|Json(body)| body.date);
+    let key_date = requested_date
+        .as_deref()
+        .map(|value| {
+            chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map_err(|_| ApiError::bad_request("invalid date, expected YYYY-MM-DD"))
+        })
+        .transpose()?;
 
     if !matches!(mode, ReturnMode::Sync) {
         return enqueue_or_stream_task(
@@ -3427,7 +3441,10 @@ pub async fn generate_brief(
             mode,
             jobs::NewTask {
                 task_type: jobs::TASK_BRIEF_GENERATE.to_owned(),
-                payload: json!({ "user_id": user_id.clone() }),
+                payload: json!({
+                    "user_id": user_id.clone(),
+                    "key_date": key_date.map(|value| value.to_string()),
+                }),
                 source: "api.generate_brief".to_owned(),
                 requested_by: Some(user_id.clone()),
                 parent_task_id: None,
@@ -3436,13 +3453,23 @@ pub async fn generate_brief(
         .await;
     }
 
-    let content = run_with_api_llm_context(
-        "api.generate_brief.sync",
-        Some(user_id.clone()),
-        ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
-    )
-    .await
-    .map_err(ApiError::internal)?;
+    let content = if let Some(key_date) = key_date {
+        run_with_api_llm_context(
+            "api.generate_brief.sync",
+            Some(user_id.clone()),
+            ai::generate_daily_brief_for_key_date(state.as_ref(), user_id.as_str(), key_date),
+        )
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        run_with_api_llm_context(
+            "api.generate_brief.sync",
+            Some(user_id.clone()),
+            ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
+        )
+        .await
+        .map_err(ApiError::internal)?
+    };
 
     // The brief row is keyed by date. Read the most recent one to include window hints.
     let row = sqlx::query_as::<_, (String,)>(
@@ -3460,9 +3487,11 @@ pub async fn generate_brief(
     .map_err(ApiError::internal)?;
 
     let at = state.config.ai_daily_at_local;
-    let date = row
-        .map(|r| r.0)
-        .unwrap_or_else(|| chrono::Local::now().date_naive().to_string());
+    let date = row.map(|r| r.0).unwrap_or_else(|| {
+        key_date
+            .unwrap_or_else(|| chrono::Local::now().date_naive())
+            .to_string()
+    });
     let (window_start, window_end) = at
         .and_then(|at| {
             chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")

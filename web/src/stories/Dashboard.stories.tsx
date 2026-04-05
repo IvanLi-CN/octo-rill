@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
@@ -308,6 +308,17 @@ const longBriefs: BriefItem[] = [
 	mockBriefs[0],
 ];
 
+const generatedBriefTemplates: Record<string, BriefItem> = {
+	"2026-04-03": {
+		date: "2026-04-03",
+		window_start: "2026-04-02T08:00:00+08:00",
+		window_end: "2026-04-03T08:00:00+08:00",
+		content_markdown:
+			"## 概览\n\n- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/fleet](https://github.com/acme/fleet)\n\n## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n",
+		created_at: "2026-04-03T08:00:03+08:00",
+	},
+};
+
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
 	repo_full_name: "acme/rocket",
@@ -438,6 +449,12 @@ function DashboardPreview(props: {
 		releaseDetail = null,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
+	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
+
+	useEffect(() => {
+		setStoryBriefs(briefs);
+	}, [briefs]);
+
 	const items =
 		emptyState !== "content"
 			? []
@@ -477,6 +494,25 @@ function DashboardPreview(props: {
 		setActiveReleaseId(releaseId);
 	};
 
+	const generateBriefForDate = async (date: string) => {
+		await new Promise((resolve) => window.setTimeout(resolve, 900));
+		const nextBrief =
+			generatedBriefTemplates[date] ??
+			({
+				date,
+				window_start: null,
+				window_end: null,
+				content_markdown:
+					"## 概览\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。",
+				created_at: `${date}T08:00:03+08:00`,
+			} satisfies BriefItem);
+		setStoryBriefs((current) =>
+			[nextBrief, ...current.filter((brief) => brief.date !== date)].sort(
+				(a, b) => b.date.localeCompare(a.date),
+			),
+		);
+	};
+
 	const renderFeedPanel = (mode: "all" | "releases") =>
 		items.length === 0 ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
@@ -510,7 +546,7 @@ function DashboardPreview(props: {
 			<FeedGroupedList
 				mode={mode}
 				items={items}
-				briefs={briefs}
+				briefs={storyBriefs}
 				dailyBoundaryLocal={dailyBoundaryLocal}
 				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
 				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
@@ -531,6 +567,9 @@ function DashboardPreview(props: {
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
 				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
+				onGenerateBriefForDate={
+					mode === "all" ? generateBriefForDate : undefined
+				}
 			/>
 		);
 
@@ -540,7 +579,7 @@ function DashboardPreview(props: {
 				<DashboardHeader
 					feedCount={items.length}
 					inboxCount={notifications.length}
-					briefCount={briefs.length}
+					briefCount={storyBriefs.length}
 					login="storybook-user"
 					isAdmin
 					aiDisabledHint={aiDisabledHint}
@@ -602,7 +641,7 @@ function DashboardPreview(props: {
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard
-								briefs={briefs}
+								briefs={storyBriefs}
 								selectedDate={selectedDate}
 								busy={false}
 								onGenerate={() => {}}
@@ -622,7 +661,7 @@ function DashboardPreview(props: {
 					<aside className="space-y-6">
 						{tab === "briefs" ? (
 							<BriefListCard
-								briefs={briefs}
+								briefs={storyBriefs}
 								selectedDate={selectedDate}
 								onSelectDate={(d) => setSelectedDate(d)}
 							/>
@@ -747,15 +786,34 @@ export const ReleasesGroupedByDay: Story = {
 		docs: {
 			description: {
 				story:
-					"`Releases` tab 需要把原始 Release 卡片按日报边界分组，并用弱化日期分隔线提示每天的 Release 数。",
+					"`Releases` tab 只在日组切换处显示弱化分隔线：首组不画前置分隔，历史日组继续用日期与当日 Release 数提示边界。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("2026-04-04")).toBeVisible();
-		await expect(canvas.getByText("2026-04-03")).toBeVisible();
+		await expect(
+			canvas.queryByText(/^2026-04-04\s+·\s+2 条 Release$/),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.getByText(/^2026-04-03\s+·\s+2 条 Release$/),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(/^2026-04-02\s+·\s+1 条 Release$/),
+		).toBeVisible();
 		await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+	},
+};
+
+export const EvidenceReleasesGroupedByDay: Story = {
+	name: "Evidence / Releases Grouped By Day",
+	args: {
+		initialTab: "releases",
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 
@@ -767,12 +825,15 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		docs: {
 			description: {
 				story:
-					"`全部` tab 中，今天保持原始 Release feed，历史日组默认折叠为真实日报，并允许用户单独展开查看原始 releases。",
+					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到 releases 视图后只保留日期分界与原始列表。",
 			},
 		},
 	},
 	play: async ({ canvasElement, step }) => {
 		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText(/^2026-04-03\s+·\s+2 条 Release$/),
+		).toBeVisible();
 		await expect(
 			canvas.getByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
 		).toBeVisible();
@@ -780,9 +841,80 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			canvas.queryByText(HISTORY_RAW_MARKER),
 		).not.toBeInTheDocument();
 		await step("expand historical releases", async () => {
-			await canvas.getByRole("button", { name: "展开 Releases" }).click();
+			const historicalGroup = canvasElement.querySelector<HTMLElement>(
+				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
+			);
+			expect(historicalGroup).toBeTruthy();
+			if (!historicalGroup) {
+				throw new Error("Expected 2026-04-04 historical group to exist");
+			}
+			const beforeSlot = historicalGroup.querySelector<HTMLElement>(
+				"[data-feed-day-action-slot]",
+			);
+			const expandButton =
+				beforeSlot?.querySelector<HTMLButtonElement>("button");
+			expect(beforeSlot).toBeTruthy();
+			expect(expandButton).toBeTruthy();
+			if (!beforeSlot || !expandButton) {
+				throw new Error("Expected action slot and expand button to exist");
+			}
+			expect(expandButton.textContent?.trim()).toBe("Releases");
+			const beforeSlotRect = beforeSlot.getBoundingClientRect();
+			const beforeButtonRect = expandButton.getBoundingClientRect();
+			await expandButton.click();
 			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+			await expect(
+				canvas.queryByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
+			).not.toBeInTheDocument();
+			const afterSlot = historicalGroup.querySelector<HTMLElement>(
+				"[data-feed-day-action-slot]",
+			);
+			const briefButton = afterSlot?.querySelector<HTMLButtonElement>("button");
+			expect(afterSlot).toBeTruthy();
+			expect(briefButton).toBeTruthy();
+			if (!afterSlot || !briefButton) {
+				throw new Error("Expected action slot and 日报 button after expand");
+			}
+			await expect(briefButton).toBeVisible();
+			const afterSlotRect = afterSlot.getBoundingClientRect();
+			const afterButtonRect = briefButton.getBoundingClientRect();
+			expect(
+				Math.abs(beforeSlotRect.top - afterSlotRect.top),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.left - afterSlotRect.left),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.width - afterSlotRect.width),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeSlotRect.height - afterSlotRect.height),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.top - afterButtonRect.top),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.left - afterButtonRect.left),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.width - afterButtonRect.width),
+			).toBeLessThanOrEqual(1);
+			expect(
+				Math.abs(beforeButtonRect.height - afterButtonRect.height),
+			).toBeLessThanOrEqual(1);
 		});
+	},
+};
+
+export const EvidenceAllHistoryCollapsedToBriefs: Story = {
+	name: "Evidence / All History Collapsed To Briefs",
+	args: {
+		initialTab: "all",
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 
@@ -795,17 +927,40 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 		docs: {
 			description: {
 				story:
-					"历史日组没有对应日报时，`全部` tab 不显示伪摘要，而是直接退回为日期分隔线 + 原始 Release 卡片。",
+					"历史日组没有对应日报时，`全部` tab 先显示日期分隔线 + 原始 Release 卡片；点击“生成日报”后进入 spinning + 占位日报，完成后切成真实日报。",
 			},
 		},
 	},
-	play: async ({ canvasElement }) => {
+	play: async ({ canvasElement, step }) => {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("2026-04-02")).toBeVisible();
 		await expect(canvas.getByText(FALLBACK_RAW_MARKER)).toBeVisible();
-		await expect(
-			canvas.queryByRole("button", { name: "展开 Releases" }),
-		).not.toBeInTheDocument();
+		await step("start generating fallback brief", async () => {
+			await canvas.getByRole("button", { name: "生成日报" }).click();
+			await expect(canvas.getByText("正在生成这一天的日报摘要…")).toBeVisible();
+			await expect(
+				canvas.getByRole("button", { name: "生成日报" }),
+			).toBeDisabled();
+			await expect(
+				canvas.queryByText(FALLBACK_RAW_MARKER),
+			).not.toBeInTheDocument();
+			await expect(
+				await canvas.findByText(/回补这一天的日报摘要/),
+			).toBeVisible();
+		});
+	},
+};
+
+export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
+	name: "Evidence / All History Fallback To Release Cards",
+	args: {
+		initialTab: "all",
+		briefs: [],
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 
