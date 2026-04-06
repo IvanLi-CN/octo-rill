@@ -113,14 +113,43 @@ def _extract_mascot() -> Image.Image:
     return crop.crop(bbox)
 
 
-def _png_bytes(image: Image.Image) -> bytes:
+def _prepared_png(
+    image: Image.Image,
+    *,
+    max_box: tuple[int, int] | int | None = None,
+    colors: int | None = None,
+) -> Image.Image:
+    prepared = image.copy()
+    if max_box is not None:
+        if isinstance(max_box, int):
+            max_box = (max_box, max_box)
+        prepared.thumbnail(max_box, Image.Resampling.LANCZOS)
+    if colors is not None:
+        prepared = prepared.quantize(colors=colors, method=Image.Quantize.FASTOCTREE)
+    return prepared
+
+
+def _png_bytes(
+    image: Image.Image,
+    *,
+    max_box: tuple[int, int] | int | None = None,
+    colors: int | None = None,
+) -> bytes:
+    prepared = _prepared_png(image, max_box=max_box, colors=colors)
     buffer = BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
+    prepared.save(buffer, format="PNG", optimize=True)
     return buffer.getvalue()
 
 
-def _data_uri(image: Image.Image) -> str:
-    return "data:image/png;base64," + base64.b64encode(_png_bytes(image)).decode("ascii")
+def _data_uri(
+    image: Image.Image,
+    *,
+    max_box: tuple[int, int] | int | None = None,
+    colors: int | None = None,
+) -> str:
+    return "data:image/png;base64," + base64.b64encode(
+        _png_bytes(image, max_box=max_box, colors=colors)
+    ).decode("ascii")
 
 
 def _image_tag(href: str, *, x: int, y: int, width: int, height: int) -> str:
@@ -199,14 +228,17 @@ def favicon_svg(mascot_uri: str) -> str:
 
 
 mascot_image = _extract_mascot()
-mascot_uri = _data_uri(mascot_image)
+mark_uri = _data_uri(mascot_image, max_box=288, colors=96)
+wordmark_uri = _data_uri(mascot_image, max_box=288, colors=96)
+favicon_uri = _data_uri(mascot_image, max_box=96, colors=64)
+app_icon_uri = _data_uri(mascot_image, max_box=512, colors=96)
 
 masters = {
-    "mark-master.svg": mark_svg(mascot_uri),
-    "favicon-master.svg": favicon_svg(mascot_uri),
-    "wordmark-light-master.svg": wordmark_svg(mascot_uri, WORDMARK_NAVY),
-    "wordmark-dark-master.svg": wordmark_svg(mascot_uri, WORDMARK_CREAM),
-    "app-icon-master.svg": app_icon_svg(mascot_uri),
+    "mark-master.svg": mark_svg(mark_uri),
+    "favicon-master.svg": favicon_svg(favicon_uri),
+    "wordmark-light-master.svg": wordmark_svg(wordmark_uri, WORDMARK_NAVY),
+    "wordmark-dark-master.svg": wordmark_svg(wordmark_uri, WORDMARK_CREAM),
+    "app-icon-master.svg": app_icon_svg(app_icon_uri),
 }
 
 for filename, content in masters.items():

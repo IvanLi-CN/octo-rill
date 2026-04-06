@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils";
+import { withBaseAssetPath } from "@/lib/asset-path";
 
 type BrandLogoProps = {
 	variant?: "mark" | "wordmark";
@@ -8,9 +9,9 @@ type BrandLogoProps = {
 	alt?: string;
 };
 
-const MARK_SRC = "/brand/mark.svg";
-const WORDMARK_LIGHT_SRC = "/brand/wordmark-light.svg";
-const WORDMARK_DARK_SRC = "/brand/wordmark-dark.svg";
+const MARK_SRC = withBaseAssetPath("brand/mark.svg");
+const WORDMARK_LIGHT_SRC = withBaseAssetPath("brand/wordmark-light.svg");
+const WORDMARK_DARK_SRC = withBaseAssetPath("brand/wordmark-dark.svg");
 
 export function BrandLogo({
 	variant = "wordmark",
@@ -53,25 +54,14 @@ export function BrandLogo({
 	}
 
 	return (
-		<span
-			aria-label={alt}
-			className={cn("inline-flex h-full items-center", className)}
-			role="img"
-		>
+		<picture className={cn("inline-flex h-full items-center", className)}>
+			<source media="(prefers-color-scheme: dark)" srcSet={WORDMARK_DARK_SRC} />
 			<img
-				alt=""
-				aria-hidden="true"
-				className={cn("block h-full w-auto dark:hidden", imgClassName)}
+				alt={alt}
+				className={cn("block h-full w-auto", imgClassName)}
 				loading="eager"
 				src={WORDMARK_LIGHT_SRC}
 			/>
-			<img
-				alt=""
-				aria-hidden="true"
-				className={cn("hidden h-full w-auto dark:block", imgClassName)}
-				loading="eager"
-				src={WORDMARK_DARK_SRC}
-			/>
-		</span>
+		</picture>
 	);
 }

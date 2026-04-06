@@ -25,7 +25,8 @@ export const Default: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "默认的未登录首屏状态，展示产品简介与 GitHub 登录入口。",
+				story:
+					"默认的未登录首屏状态：左侧是品牌与产品价值的 hero 区，右侧保留独立登录卡片，避免品牌与 CTA 互相挤压。",
 			},
 		},
 	},

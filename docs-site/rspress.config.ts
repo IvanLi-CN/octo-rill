@@ -7,12 +7,11 @@ function normalizeBase(base: string | undefined): string {
 	return withLeading.endsWith("/") ? withLeading : `${withLeading}/`;
 }
 
-
 const docsBase = normalizeBase(process.env.DOCS_BASE);
 const localStorybookDevOrigin =
 	process.env.VITE_STORYBOOK_DEV_ORIGIN?.trim() ?? "";
-const docsBrandMark = "/brand/mark.svg";
-const docsFavicon = "/favicon.ico";
+const docsBrandMark = `${docsBase}brand/mark.svg`;
+const docsFavicon = new URL("./docs/public/favicon.ico", import.meta.url);
 
 export default defineConfig({
 	root: "docs",

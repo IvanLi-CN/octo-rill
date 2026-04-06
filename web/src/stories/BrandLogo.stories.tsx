@@ -1,7 +1,10 @@
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { withBaseAssetPath } from "@/lib/asset-path";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+
+const FAVICON_SRC = withBaseAssetPath("brand/favicon.svg");
 
 function SurfaceGallery() {
 	return (
@@ -46,7 +49,7 @@ function SurfaceGallery() {
 							<img
 								alt="OctoRill favicon preview"
 								className="size-16"
-								src="/brand/favicon.svg"
+								src={FAVICON_SRC}
 							/>
 						</div>
 					</div>
@@ -55,13 +58,15 @@ function SurfaceGallery() {
 
 			<section className="rounded-2xl border bg-card p-4 shadow-sm">
 				<p className="text-muted-foreground mb-4 text-xs font-medium uppercase tracking-[0.2em]">
-					Landing badge
+					Landing hero cluster
 				</p>
-				<div className="inline-flex items-center gap-2 rounded-full border bg-card px-3 py-1 text-xs font-medium">
-					<BrandLogo variant="wordmark" className="h-5" />
-					<span className="text-muted-foreground">
-						GitHub 信息流 · 中文翻译
-					</span>
+				<div className="rounded-[30px] border bg-[linear-gradient(135deg,rgba(255,255,255,0.96),rgba(255,248,238,0.96),rgba(246,239,229,0.92))] p-6 shadow-sm">
+					<div className="inline-flex flex-col gap-3 rounded-[28px] bg-white/92 px-5 py-5 shadow-sm shadow-black/5 ring-1 ring-[#E9DECF]">
+						<BrandLogo variant="wordmark" className="h-9" />
+						<p className="text-sm font-medium text-muted-foreground">
+							GitHub 信息流 · AI 中文翻译 · Inbox 工作台
+						</p>
+					</div>
 				</div>
 			</section>
 
@@ -149,7 +154,7 @@ export const MarkOnly: Story = {
 				<img
 					alt="OctoRill favicon preview"
 					className="h-[72px] w-[72px]"
-					src="/brand/favicon.svg"
+					src={FAVICON_SRC}
 				/>
 			</div>
 		</div>
@@ -171,7 +176,7 @@ export const SurfaceGalleryStory: Story = {
 		docs: {
 			description: {
 				story:
-					"把独立资产、Landing badge、Dashboard header 与 Admin header 摆到同一个稳定 review 面里，用于本地视觉验收与后续截图复用。",
+					"把独立资产、Landing hero 品牌簇、Dashboard header 与 Admin header 摆到同一个稳定 review 面里，用于本地视觉验收与后续截图复用。",
 			},
 		},
 	},
