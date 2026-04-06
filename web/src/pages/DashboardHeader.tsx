@@ -1,5 +1,6 @@
 import { RefreshCcw } from "lucide-react";
 
+import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Button } from "@/components/ui/button";
 
 export type DashboardHeaderProps = {
@@ -31,7 +32,9 @@ export function DashboardHeader({
 		<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 			<div className="min-w-0">
 				<div className="flex flex-wrap items-center gap-2">
-					<h1 className="text-xl font-semibold tracking-tight">OctoRill</h1>
+					<h1 className="h-7 text-xl font-semibold tracking-tight">
+						<BrandLogo variant="wordmark" className="h-full" />
+					</h1>
 					<span className="text-muted-foreground font-mono text-xs">
 						Loaded {feedCount} · {inboxCount} inbox · {briefCount} briefs
 					</span>

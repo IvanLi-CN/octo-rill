@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { BrandLogo } from "@/components/brand/BrandLogo";
 import {
 	Card,
 	CardContent,
@@ -19,7 +20,7 @@ export function Landing({ bootError }: LandingProps) {
 			<div className="mx-auto max-w-3xl py-4 sm:py-8">
 				<div className="mb-8">
 					<div className="inline-flex items-center gap-2 rounded-full border bg-card px-3 py-1 text-xs font-medium">
-						<span className="font-mono text-muted-foreground">OctoRill</span>
+						<BrandLogo variant="wordmark" className="h-5" />
 						<span className="text-muted-foreground">
 							GitHub 信息流 · 中文翻译
 						</span>

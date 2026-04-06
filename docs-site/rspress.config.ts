@@ -7,13 +7,19 @@ function normalizeBase(base: string | undefined): string {
 	return withLeading.endsWith("/") ? withLeading : `${withLeading}/`;
 }
 
+
 const docsBase = normalizeBase(process.env.DOCS_BASE);
 const localStorybookDevOrigin =
 	process.env.VITE_STORYBOOK_DEV_ORIGIN?.trim() ?? "";
+const docsBrandMark = "/brand/mark.svg";
+const docsFavicon = "/favicon.ico";
 
 export default defineConfig({
 	root: "docs",
 	base: docsBase,
+	logo: docsBrandMark,
+	logoText: "OctoRill",
+	icon: docsFavicon,
 	builderConfig: {
 		source: {
 			define: {
