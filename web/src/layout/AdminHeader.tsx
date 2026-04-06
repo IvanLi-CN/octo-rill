@@ -1,3 +1,4 @@
+import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Home, LogOut } from "lucide-react";
@@ -29,9 +30,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 				<div className="flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6">
 					<div className="flex flex-wrap items-center gap-2">
 						<h1 className="text-lg font-semibold tracking-tight">管理后台</h1>
-						<span className="text-muted-foreground font-mono text-xs">
-							OctoRill
-						</span>
+						<BrandLogo variant="wordmark" className="h-5" />
 					</div>
 
 					<nav aria-label="管理员导航">

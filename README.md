@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="./brand/exports/wordmark-light.svg#gh-light-mode-only" alt="OctoRill" width="420" />
+  <img src="./brand/exports/wordmark-dark.svg#gh-dark-mode-only" alt="OctoRill" width="420" />
+</p>
+
 # OctoRill
 
 OctoRill 是一个 GitHub 信息聚合与阅读界面：把 Releases 整理成类似 GitHub dashboard 的信息流，并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 Release 日报与 Inbox 快捷入口。
