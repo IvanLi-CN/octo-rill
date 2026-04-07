@@ -239,43 +239,61 @@ export function FeedItemCard(props: {
 	const isVersionOnly = item.smart?.status === "insufficient";
 	const displayTitle = displayTitleForLane(item, activeLane);
 
-	return (
-		<Card
-			className={cn(
-				"group bg-card/80 shadow-sm transition-shadow hover:shadow-md",
-				isVersionOnly && "border-dashed",
-			)}
-		>
-			<CardHeader className={cn("pb-4", isVersionOnly && "pb-5")}>
-				<div className="flex items-start justify-between gap-3">
-					<div className="min-w-0">
-						<div className="flex flex-wrap items-center gap-2">
-							<Badge className="border-primary/20 bg-primary font-mono text-[11px] tracking-wide text-primary-foreground">
-								{kindLabel}
-							</Badge>
+	const header = (
+		<CardHeader className={cn("pb-4", isVersionOnly && "pb-5")}>
+			<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+				<div className="min-w-0">
+					<div className="flex flex-wrap items-center gap-2">
+						<Badge className="border-primary/20 bg-primary font-mono text-[11px] tracking-wide text-primary-foreground">
+							{kindLabel}
+						</Badge>
 
-							{item.unread ? (
-								<span className="inline-flex items-center gap-1 text-[11px] font-medium">
-									<span className="size-1.5 rounded-full bg-primary" />
-									<span className="text-muted-foreground">未读</span>
-								</span>
-							) : null}
+						{item.unread ? (
+							<span className="inline-flex items-center gap-1 text-[11px] font-medium">
+								<span className="size-1.5 rounded-full bg-primary" />
+								<span className="text-muted-foreground">未读</span>
+							</span>
+						) : null}
 
-							{item.repo_full_name ? (
-								<span className="truncate font-mono text-[11px] text-muted-foreground">
-									{item.repo_full_name}
-								</span>
-							) : null}
-						</div>
-
-						<CardTitle className="mt-3 text-balance text-lg">
-							{displayTitle}
-						</CardTitle>
-						<p className="mt-1 font-mono text-xs text-muted-foreground">
-							{formatIsoShortLocal(item.ts)}
-							{subtitle ? ` · ${subtitle}` : ""}
-						</p>
+						{item.repo_full_name ? (
+							<span className="truncate font-mono text-[11px] text-muted-foreground">
+								{item.repo_full_name}
+							</span>
+						) : null}
 					</div>
+
+					<CardTitle className="mt-3 text-balance text-lg">
+						{displayTitle}
+					</CardTitle>
+					<p className="mt-1 font-mono text-xs text-muted-foreground">
+						{formatIsoShortLocal(item.ts)}
+						{subtitle ? ` · ${subtitle}` : ""}
+					</p>
+				</div>
+
+				<div className="flex flex-wrap items-center gap-2 sm:justify-end">
+					{isVersionOnly ? null : (
+						<TabsList className="h-auto shrink-0 rounded-full bg-muted/45 p-1">
+							<TabsTrigger
+								value="original"
+								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
+							>
+								原文
+							</TabsTrigger>
+							<TabsTrigger
+								value="translated"
+								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
+							>
+								翻译
+							</TabsTrigger>
+							<TabsTrigger
+								value="smart"
+								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
+							>
+								智能
+							</TabsTrigger>
+						</TabsList>
+					)}
 
 					<Button
 						asChild
@@ -289,96 +307,97 @@ export function FeedItemCard(props: {
 						</a>
 					</Button>
 				</div>
-			</CardHeader>
+			</div>
+		</CardHeader>
+	);
 
-			{isVersionOnly ? null : (
-				<>
-					<CardContent className="pt-0">
-						<Tabs
-							value={activeLane}
-							onValueChange={(value) => onSelectLane(value as FeedLane)}
-							className="gap-4"
-						>
-							<TabsList className="h-auto w-full justify-start rounded-lg bg-muted/60 p-1">
-								<TabsTrigger value="original" className="font-mono text-xs">
-									原文
-								</TabsTrigger>
-								<TabsTrigger value="translated" className="font-mono text-xs">
-									翻译
-								</TabsTrigger>
-								<TabsTrigger value="smart" className="font-mono text-xs">
-									智能
-								</TabsTrigger>
-							</TabsList>
-
-							<TabsContent value="original" className="mt-0">
-								<OriginalLane item={item} />
-							</TabsContent>
-							<TabsContent value="translated" className="mt-0">
-								<TranslatedLane
-									item={item}
-									isTranslating={isTranslating}
-									onTranslateNow={onTranslateNow}
-								/>
-							</TabsContent>
-							<TabsContent value="smart" className="mt-0">
-								<SmartLane
-									item={item}
-									isSmartGenerating={isSmartGenerating}
-									onSmartNow={onSmartNow}
-								/>
-							</TabsContent>
-						</Tabs>
-					</CardContent>
-
-					{reactions ? (
-						<CardFooter className="border-border/70 flex flex-wrap items-center gap-2 border-t px-6 py-4">
-							{reactions.status === "ready"
-								? REACTION_ITEMS.map((reaction) => {
-										const active = reactions.viewer[reaction.content];
-										const count = reactions.counts[reaction.content];
-										return (
-											<Button
-												key={reaction.content}
-												type="button"
-												variant={active ? "secondary" : "outline"}
-												size="sm"
-												className={cn(
-													"group h-7 rounded-full px-2 font-mono text-xs transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
-													count > 0 && "gap-1",
-													active &&
-														"border-primary bg-primary/10 text-primary hover:bg-primary/15",
-													isReactionBusy && "opacity-80",
-												)}
-												onClick={() => onToggleReaction(reaction.content)}
-												title={reaction.label}
-												aria-pressed={active}
-											>
-												<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
-													{reaction.emoji}
-												</span>
-												{count > 0 ? <span>{count}</span> : null}
-											</Button>
-										);
-									})
-								: null}
-
-							{reactions.status === "sync_required" ? (
-								<span className="font-mono text-[11px] text-muted-foreground">
-									反馈表情尚未就绪，请先使用顶部的{" "}
-									<span className="font-mono">同步</span> 更新 releases。
+	const reactionsFooter = reactions ? (
+		<CardFooter className="border-border/70 flex flex-wrap items-center gap-2 border-t px-6 py-4">
+			{reactions.status === "ready"
+				? REACTION_ITEMS.map((reaction) => {
+						const active = reactions.viewer[reaction.content];
+						const count = reactions.counts[reaction.content];
+						return (
+							<Button
+								key={reaction.content}
+								type="button"
+								variant={active ? "secondary" : "outline"}
+								size="sm"
+								className={cn(
+									"group h-7 rounded-full px-2 font-mono text-xs transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
+									count > 0 && "gap-1",
+									active &&
+										"border-primary bg-primary/10 text-primary hover:bg-primary/15",
+									isReactionBusy && "opacity-80",
+								)}
+								onClick={() => onToggleReaction(reaction.content)}
+								title={reaction.label}
+								aria-pressed={active}
+							>
+								<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
+									{reaction.emoji}
 								</span>
-							) : null}
+								{count > 0 ? <span>{count}</span> : null}
+							</Button>
+						);
+					})
+				: null}
 
-							{reactionError ? (
-								<span className="text-destructive w-full font-mono text-[11px]">
-									{reactionError}
-								</span>
-							) : null}
-						</CardFooter>
-					) : null}
-				</>
+			{reactions.status === "sync_required" ? (
+				<span className="font-mono text-[11px] text-muted-foreground">
+					反馈表情尚未就绪，请先使用顶部的{" "}
+					<span className="font-mono">同步</span> 更新 releases。
+				</span>
+			) : null}
+
+			{reactionError ? (
+				<span className="text-destructive w-full font-mono text-[11px]">
+					{reactionError}
+				</span>
+			) : null}
+		</CardFooter>
+	) : null;
+
+	return (
+		<Card
+			className={cn(
+				"group bg-card/80 shadow-sm transition-shadow hover:shadow-md",
+				isVersionOnly && "border-dashed",
 			)}
+		>
+			{isVersionOnly ? (
+				header
+			) : (
+				<Tabs
+					value={activeLane}
+					onValueChange={(value) => onSelectLane(value as FeedLane)}
+					className="gap-0"
+				>
+					{header}
+
+					<CardContent className="pt-0">
+						<TabsContent value="original" className="mt-0">
+							<OriginalLane item={item} />
+						</TabsContent>
+						<TabsContent value="translated" className="mt-0">
+							<TranslatedLane
+								item={item}
+								isTranslating={isTranslating}
+								onTranslateNow={onTranslateNow}
+							/>
+						</TabsContent>
+						<TabsContent value="smart" className="mt-0">
+							<SmartLane
+								item={item}
+								isSmartGenerating={isSmartGenerating}
+								onSmartNow={onSmartNow}
+							/>
+						</TabsContent>
+					</CardContent>
+				</Tabs>
+			)}
+
+			{isVersionOnly ? null : reactionsFooter}
 		</Card>
 	);
 }

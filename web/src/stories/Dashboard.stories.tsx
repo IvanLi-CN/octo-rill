@@ -1437,8 +1437,7 @@ export const SmartLoading: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story:
-					"智能 tab 缺数据时显示呼吸态占位，明确告诉用户当前正在分析 release body / diff。",
+				story: "智能 tab 缺数据时显示呼吸态骨架，不额外暴露内部分析流程。",
 			},
 		},
 	},

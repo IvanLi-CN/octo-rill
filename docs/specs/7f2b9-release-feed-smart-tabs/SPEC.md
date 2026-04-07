@@ -40,6 +40,7 @@
 - compare diff 的按需精简 payload builder。
 - 翻译 tab 的按需生成态与呼吸态。
 - 仅版本号折叠卡片样式。
+- 本地 SQLite 运行时稳定性修复，避免 smart/translation 后台任务把桌面预览拖进 `database is locked` 自锁状态。
 - Storybook 状态覆盖、Playwright 回归、spec visual evidence。
 
 ### Out of scope
@@ -155,6 +156,7 @@
 - Web：通过 `bun run build` 与 `bun run storybook:build`。
 - E2E：扩展 `web/e2e/release-detail.spec.ts` 覆盖三 tabs 与 insufficient 卡片。
 - UI-affecting 变更必须补 Storybook 稳定场景，并提供视觉证据。
+- 本地开发运行时不得因为单进程内多个 SQLite pool 连接相互争抢写锁而频繁出现 `database is locked`；对桌面预览场景，SQLite 访问应串行化，保证 smart 生成与后台 worker 同时开启时页面仍可稳定打开。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
@@ -182,7 +184,7 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartLoading`
   state: `smart-loading`
-  evidence_note: 验证智能 lane 缺数据时立即进入呼吸态，提示先看正文、必要时再分析 diff。
+  evidence_note: 验证智能 lane 缺数据时立即进入呼吸态骨架，不在界面直接暴露内部分析流程。
 
   ![智能总结生成中](./assets/release-smart-loading-focused.png)
 
