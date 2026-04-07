@@ -1875,11 +1875,12 @@ async fn ensure_translation_result_for_item(
     retry_on_error: bool,
 ) -> Result<TranslationResultItem, ApiError> {
     let source_hash = build_source_hash(item);
-    if item.kind == "release_summary"
-        && matches!(item.variant.as_str(), "feed_card" | "feed_body")
-        && current_server_source_hash_for_item(tx, user_id, item)
-            .await?
-            .is_none()
+    if matches!(
+        (item.kind.as_str(), item.variant.as_str()),
+        ("release_summary", "feed_card" | "feed_body") | ("release_smart", "feed_card")
+    ) && current_server_source_hash_for_item(tx, user_id, item)
+        .await?
+        .is_none()
     {
         return Ok(missing_result(item));
     }
@@ -3356,6 +3357,7 @@ async fn resolve_batch_results(
     let mut out = Vec::with_capacity(batch.items.len());
 
     let mut release_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
+    let mut release_smart_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut detail_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
     let mut notification_groups: BTreeMap<String, Vec<&WorkItemRow>> = BTreeMap::new();
 
@@ -3363,6 +3365,12 @@ async fn resolve_batch_results(
         match item.kind.as_str() {
             "release_summary" => {
                 release_groups
+                    .entry(item.scope_user_id.clone())
+                    .or_default()
+                    .push(item);
+            }
+            "release_smart" => {
+                release_smart_groups
                     .entry(item.scope_user_id.clone())
                     .or_default()
                     .push(item);
@@ -3399,6 +3407,36 @@ async fn resolve_batch_results(
             .collect::<Vec<_>>();
         let response =
             api::translate_releases_batch_for_user(state, user_id.as_str(), &release_ids).await?;
+        let by_id = response
+            .items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        for item in items {
+            let result = if let Some(translated) = by_id.get(&item.entity_id) {
+                terminal_result_from_batch_item(item, translated)
+            } else {
+                TerminalWorkResult {
+                    work_item_id: item.id.clone(),
+                    result_status: "error".to_owned(),
+                    title_zh: None,
+                    summary_md: None,
+                    body_md: None,
+                    error: Some("translation result missing".to_owned()),
+                }
+            };
+            out.push(result);
+        }
+    }
+
+    for (user_id, items) in release_smart_groups {
+        let release_ids = items
+            .iter()
+            .filter_map(|item| item.entity_id.parse::<i64>().ok())
+            .collect::<Vec<_>>();
+        let response =
+            api::summarize_releases_smart_batch_for_user(state, user_id.as_str(), &release_ids)
+                .await?;
         let by_id = response
             .items
             .into_iter()
@@ -3498,7 +3536,7 @@ fn terminal_result_from_batch_item(
         body_md: None,
         error: translated.error.clone(),
     };
-    if item.kind == "release_detail" {
+    if matches!(item.kind.as_str(), "release_detail" | "release_smart") {
         out.body_md = translated.summary.clone();
     } else {
         out.summary_md = translated.summary.clone();
@@ -3518,7 +3556,7 @@ fn terminal_result_from_single_response(
         body_md: None,
         error: None,
     };
-    if item.kind == "release_detail" {
+    if matches!(item.kind.as_str(), "release_detail" | "release_smart") {
         out.body_md = translated.summary.clone();
     } else {
         out.summary_md = translated.summary.clone();
@@ -4314,7 +4352,10 @@ fn normalize_request_items(
                 "producer_ref, kind, variant, entity_id, target_lang are required",
             ));
         }
-        if !matches!(kind, "release_summary" | "release_detail" | "notification") {
+        if !matches!(
+            kind,
+            "release_summary" | "release_smart" | "release_detail" | "notification"
+        ) {
             return Err(ApiError::bad_request(format!(
                 "unsupported translation kind: {kind}"
             )));
@@ -4453,6 +4494,7 @@ fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
     }
     match (item.kind.as_str(), item.variant.as_str()) {
         ("release_summary", "feed_card" | "feed_body") => Some("feed.auto_translate".to_owned()),
+        ("release_smart", "feed_card") => Some("feed.smart".to_owned()),
         ("release_detail", _) => Some("release_detail".to_owned()),
         ("notification", _) => Some("notification".to_owned()),
         _ => Some(item.kind.clone()),
@@ -4470,6 +4512,7 @@ fn current_model_profile() -> String {
 fn map_entity_type(kind: &str) -> Option<&'static str> {
     match kind {
         "release_summary" => Some("release"),
+        "release_smart" => Some("release_smart"),
         "release_detail" => Some("release_detail"),
         "notification" => Some("notification"),
         _ => None,
@@ -4482,6 +4525,59 @@ struct CanonicalFeedReleaseRow {
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
+    previous_tag_name: Option<String>,
+}
+
+fn release_smart_metadata_text(
+    repo_full_name: &str,
+    tag_name: &str,
+    previous_tag_name: Option<&str>,
+) -> String {
+    let mut metadata = format!("repo={repo_full_name}\nhead_tag={tag_name}");
+    if let Some(previous_tag_name) = previous_tag_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.push('\n');
+        metadata.push_str("compare_base_tag=");
+        metadata.push_str(previous_tag_name);
+    }
+    metadata
+}
+
+pub(crate) fn release_smart_feed_source_hash(
+    entity_id: &str,
+    repo_full_name: &str,
+    title: &str,
+    body: Option<&str>,
+    tag_name: &str,
+    previous_tag_name: Option<&str>,
+) -> String {
+    let mut source_blocks = vec![TranslationSourceBlock {
+        slot: "title".to_owned(),
+        text: title.trim().to_owned(),
+    }];
+    if let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) {
+        source_blocks.push(TranslationSourceBlock {
+            slot: "body_markdown".to_owned(),
+            text: body.to_owned(),
+        });
+    }
+    source_blocks.push(TranslationSourceBlock {
+        slot: "metadata".to_owned(),
+        text: release_smart_metadata_text(repo_full_name, tag_name, previous_tag_name),
+    });
+
+    build_source_hash(&TranslationRequestItemInput {
+        producer_ref: format!("feed.smart:release:{entity_id}"),
+        kind: "release_smart".to_owned(),
+        variant: "feed_card".to_owned(),
+        entity_id: entity_id.to_owned(),
+        target_lang: "zh-CN".to_owned(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+    })
 }
 
 async fn build_canonical_feed_request_item(
@@ -4489,8 +4585,10 @@ async fn build_canonical_feed_request_item(
     user_id: &str,
     item: &TranslationRequestItemInput,
 ) -> Result<Option<TranslationRequestItemInput>, ApiError> {
-    if item.kind != "release_summary" || !matches!(item.variant.as_str(), "feed_card" | "feed_body")
-    {
+    if !matches!(
+        (item.kind.as_str(), item.variant.as_str()),
+        ("release_summary", "feed_card" | "feed_body") | ("release_smart", "feed_card")
+    ) {
         return Ok(None);
     }
 
@@ -4500,11 +4598,23 @@ async fn build_canonical_feed_request_item(
 
     let row = sqlx::query_as::<_, CanonicalFeedReleaseRow>(
         r#"
-        SELECT sr.full_name, r.tag_name, r.name, r.body
-        FROM repo_releases r
-        JOIN starred_repos sr
-          ON sr.user_id = ? AND sr.repo_id = r.repo_id
-        WHERE r.release_id = ?
+        SELECT full_name, tag_name, name, body, previous_tag_name
+        FROM (
+          SELECT
+            sr.full_name AS full_name,
+            r.tag_name AS tag_name,
+            r.name AS name,
+            r.body AS body,
+            r.release_id AS release_id,
+            LAG(r.tag_name) OVER (
+              PARTITION BY r.repo_id
+              ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
+            ) AS previous_tag_name
+          FROM repo_releases r
+          JOIN starred_repos sr
+            ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        )
+        WHERE release_id = ?
         LIMIT 1
         "#,
     )
@@ -4528,7 +4638,15 @@ async fn build_canonical_feed_request_item(
     let body = crate::api::release_feed_body(row.body.as_deref())
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let metadata = row.full_name.trim().to_owned();
+    let metadata = if item.kind == "release_smart" {
+        release_smart_metadata_text(
+            row.full_name.trim(),
+            row.tag_name.trim(),
+            row.previous_tag_name.as_deref(),
+        )
+    } else {
+        row.full_name.trim().to_owned()
+    };
 
     let mut source_blocks = vec![TranslationSourceBlock {
         slot: "title".to_owned(),

@@ -16,7 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
-import type { FeedItem } from "@/feed/types";
+import type { FeedItem, FeedLane } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -35,7 +35,11 @@ type FeedMode =
 	| "visible-window-queued"
 	| "visible-window-settling"
 	| "body-limit-error"
-	| "sync-preheated";
+	| "sync-preheated"
+	| "smart-ready-body"
+	| "smart-ready-diff"
+	| "smart-loading"
+	| "smart-insufficient";
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
 const STORYBOOK_DAILY_BOUNDARY = "08:00";
@@ -44,6 +48,17 @@ const STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES = 8 * 60;
 const STORYBOOK_NOW = new Date("2026-04-04T12:00:00+08:00");
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
+
+function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
+}
+
+function defaultLaneForItem(item: FeedItem): FeedLane {
+	if (item.smart?.status === "disabled") {
+		return "original";
+	}
+	return "smart";
+}
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 	return {
@@ -60,6 +75,12 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 		html_url: `https://github.com/acme/rocket/releases/tag/${id}`,
 		unread: null,
 		translated: {
+			lang: "zh-CN",
+			status: "missing",
+			title: null,
+			summary: null,
+		},
+		smart: {
 			lang: "zh-CN",
 			status: "missing",
 			title: null,
@@ -94,6 +115,13 @@ function makeMockFeed(): FeedItem[] {
 			ts: "2026-04-04T16:16:29+08:00",
 			title: "v2.63.0",
 			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v2.63.0 · 版本变化",
+				summary:
+					"- 收敛发布链路与 smoke tests，降低稳定版上线风险\n- 补齐缓存策略与构建链路，减少部署后手动修复",
+			},
 			translated: {
 				lang: "zh-CN",
 				status: "ready",
@@ -129,6 +157,12 @@ function makeMockFeed(): FeedItem[] {
 			html_url:
 				"https://github.com/lobehub/lobe-chat/releases/tag/v2.1.48-canary.31",
 			translated: {
+				lang: "zh-CN",
+				status: "disabled",
+				title: null,
+				summary: null,
+			},
+			smart: {
 				lang: "zh-CN",
 				status: "disabled",
 				title: null,
@@ -233,11 +267,93 @@ function makeSyncPreheatedFeed(): FeedItem[] {
 					"- 首次打开列表直接命中缓存结果",
 				].join("\n"),
 			},
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v4.1.0 · 后台智能预热",
+				summary: [
+					"- 后台同步已经预热智能版本摘要",
+					"- 首次打开 release feed 直接看到版本变化要点",
+				].join("\n"),
+			},
 		}),
 		buildFeedItem("40000", {
 			ts: "2026-02-21T05:40:00Z",
 			title: "v4.0.9",
 			body: "- Next release is still translating in background",
+		}),
+	];
+}
+
+function makeSmartReadyBodyFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50001", {
+			title: "v5.0.0",
+			body: [
+				"- Added signed desktop packages for macOS and Windows",
+				"- Fixed production webhook retry duplication",
+				"- Simplified release health checks for operators",
+			].join("\n"),
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v5.0.0 · 版本变化",
+				summary: [
+					"- 新增 macOS / Windows 已签名桌面包，交付链路更完整",
+					"- 修复生产环境 webhook 重试重复触发问题",
+					"- 收敛发布健康检查步骤，降低运维核对成本",
+				].join("\n"),
+			},
+		}),
+	];
+}
+
+function makeSmartReadyDiffFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50002", {
+			title: "v5.1.0",
+			body: "See compare view for details.",
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "v5.1.0 · 智能整理",
+				summary: [
+					"- 主要变更集中在认证中间件与上传流程，强化失败回退",
+					"- 补齐批处理调度与监控字段，方便排查运行中的任务状态",
+					"- 若干 UI 细节与错误提示被统一，减少发布后的人工确认步骤",
+				].join("\n"),
+			},
+		}),
+	];
+}
+
+function makeSmartLoadingFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50003", {
+			title: "v5.2.0",
+			body: "- Placeholder body for smart loading state",
+			smart: {
+				lang: "zh-CN",
+				status: "missing",
+				title: null,
+				summary: null,
+			},
+		}),
+	];
+}
+
+function makeSmartInsufficientFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50004", {
+			title: "v5.3.0",
+			body: "See assets below.",
+			smart: {
+				lang: "zh-CN",
+				status: "insufficient",
+				title: null,
+				summary: null,
+				auto_translate: false,
+			},
 		}),
 	];
 }
@@ -250,6 +366,10 @@ function makeVisibleWindowInFlightKeys(
 			? ["release:20001", "release:20002", "release:20003", "release:20004"]
 			: ["release:20005", "release:20006"],
 	);
+}
+
+function makeSmartInFlightKeys(mode: FeedMode) {
+	return new Set(mode === "smart-loading" ? ["release:50003"] : []);
 }
 
 const mockBriefs: BriefItem[] = [
@@ -464,23 +584,37 @@ function DashboardPreview(props: {
 					? makeBodyLimitErrorFeed()
 					: feedMode === "sync-preheated"
 						? makeSyncPreheatedFeed()
-						: makeVisibleWindowFeed(feedMode);
+						: feedMode === "smart-ready-body"
+							? makeSmartReadyBodyFeed()
+							: feedMode === "smart-ready-diff"
+								? makeSmartReadyDiffFeed()
+								: feedMode === "smart-loading"
+									? makeSmartLoadingFeed()
+									: feedMode === "smart-insufficient"
+										? makeSmartInsufficientFeed()
+										: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
-	const inFlightKeys =
+	const translationInFlightKeys =
 		emptyState !== "content" ||
 		feedMode === "default" ||
 		feedMode === "body-limit-error" ||
-		feedMode === "sync-preheated"
+		feedMode === "sync-preheated" ||
+		feedMode === "smart-ready-body" ||
+		feedMode === "smart-ready-diff" ||
+		feedMode === "smart-loading" ||
+		feedMode === "smart-insufficient"
 			? new Set<string>()
 			: makeVisibleWindowInFlightKeys(feedMode);
+	const smartInFlightKeys = makeSmartInFlightKeys(feedMode);
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
-		(it) => it.translated?.status === "disabled",
+		(it) =>
+			it.translated?.status === "disabled" || it.smart?.status === "disabled",
 	);
 	const [tab, setTab] = useState<Tab>(initialTab);
 	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
-	const [showOriginalByKey, setShowOriginalByKey] = useState<
-		Record<string, boolean>
+	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
+		Record<string, FeedLane>
 	>({});
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		briefs[0]?.date ?? null,
@@ -555,14 +689,24 @@ function DashboardPreview(props: {
 				loadingInitial={false}
 				loadingMore={false}
 				hasMore={false}
-				inFlightKeys={inFlightKeys}
+				translationInFlightKeys={translationInFlightKeys}
+				smartInFlightKeys={smartInFlightKeys}
 				registerItemRef={() => () => {}}
 				onLoadMore={() => {}}
-				showOriginalByKey={showOriginalByKey}
-				onToggleOriginal={(key) =>
-					setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }))
+				selectedLaneByKey={Object.fromEntries(
+					items.map((item) => [
+						feedItemKey(item),
+						selectedLaneByKey[feedItemKey(item)] ?? defaultLaneForItem(item),
+					]),
+				)}
+				onSelectLane={(item, lane) =>
+					setSelectedLaneByKey((prev) => ({
+						...prev,
+						[feedItemKey(item)]: lane,
+					}))
 				}
 				onTranslateNow={() => {}}
+				onSmartNow={() => {}}
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
@@ -1066,9 +1210,10 @@ export const VisibleWindowQueue: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "v2.0.01" }),
 		).toBeVisible();
+		await expect(canvas.getAllByRole("tab", { name: "智能" })).toHaveLength(12);
 		await expect(
-			canvas.getAllByRole("button", { name: "翻译中…" }),
-		).toHaveLength(4);
+			canvas.getAllByRole("button", { name: "生成智能版" }),
+		).toHaveLength(12);
 	},
 };
 
@@ -1088,11 +1233,16 @@ export const VisibleWindowSettling: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			canvas.getByRole("heading", { name: "v2.0.01（中文）" }),
+			canvas.getByRole("heading", { name: "v2.0.01" }),
 		).toBeVisible();
 		await expect(
-			canvas.getAllByRole("button", { name: "翻译中…" }),
-		).toHaveLength(2);
+			canvas.getAllByRole("button", { name: "生成智能版" }),
+		).toHaveLength(12);
+		canvas.getAllByRole("tab", { name: "翻译" })[0]?.click();
+		await expect(
+			canvas.getByRole("heading", { name: "v2.0.01（中文）" }),
+		).toBeVisible();
+		await expect(canvas.getByText(/中文摘要 1/)).toBeVisible();
 	},
 };
 
@@ -1191,9 +1341,12 @@ export const BodyLimitError: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText(/列表正文已截断显示/)).toBeVisible();
-		await expect(canvas.getByText(/自动翻译不可用/)).toBeVisible();
-		await expect(canvas.getByRole("button", { name: "翻译" })).toBeDisabled();
+		await expect(canvas.getByRole("heading", { name: "v3.0.0" })).toBeVisible();
+		await canvas.getByRole("tab", { name: "翻译" }).click();
+		await expect(canvas.getByText(/正文过长，无法直接翻译/)).toBeVisible();
+		await expect(
+			canvas.getByText(/建议直接打开 GitHub 阅读完整内容/),
+		).toBeVisible();
 	},
 };
 
@@ -1213,8 +1366,113 @@ export const SyncPreheated: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
+			canvas.getByRole("heading", { name: "v4.1.0 · 后台智能预热" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(/后台同步已经预热智能版本摘要/),
+		).toBeVisible();
+		await canvas.getByRole("tab", { name: "翻译" }).click();
+		await expect(
 			canvas.getByRole("heading", { name: "v4.1.0（后台预热）" }),
 		).toBeVisible();
 		await expect(canvas.getByText(/后台同步已经预热翻译/)).toBeVisible();
+	},
+};
+
+export const SmartReadyBody: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-ready-body",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"智能总结可直接从 release body 提炼版本变化时，默认 tab 应展示中文要点，而不是直译正文。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v5.0.0 · 版本变化" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(/新增 macOS \/ Windows 已签名桌面包/),
+		).toBeVisible();
+		await expect(canvas.getByRole("tab", { name: "智能" })).toHaveAttribute(
+			"data-state",
+			"active",
+		);
+	},
+};
+
+export const SmartReadyDiff: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-ready-diff",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"当 release body 没有价值时，智能总结回退到 compare diff，并输出适合人类阅读的版本变化要点。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v5.1.0 · 智能整理" }),
+		).toBeVisible();
+		await expect(canvas.getByText(/认证中间件与上传流程/)).toBeVisible();
+	},
+};
+
+export const SmartLoading: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-loading",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"智能 tab 缺数据时显示呼吸态占位，明确告诉用户当前正在分析 release body / diff。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("heading", { name: "v5.2.0" })).toBeVisible();
+		const generatingPanel = canvasElement.querySelector(
+			'[data-feed-generating-panel="智能整理中"]',
+		);
+		expect(generatingPanel).not.toBeNull();
+	},
+};
+
+export const SmartInsufficient: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-insufficient",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"如果 release body 与 compare diff 都缺乏有效版本说明，卡片退化为仅版本号的折叠态，不渲染 tabs 与正文区。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("heading", { name: "v5.3.0" })).toBeVisible();
+		await expect(
+			canvas.queryByRole("tab", { name: "智能" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByText(/还没有智能版本变化摘要/),
+		).not.toBeInTheDocument();
 	},
 };
