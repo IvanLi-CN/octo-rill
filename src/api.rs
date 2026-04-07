@@ -4091,6 +4091,14 @@ fn github_reauth_required_error() -> ApiError {
     )
 }
 
+fn github_private_repo_scope_required_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "reauth_required",
+        "private repository compare requires repo scope; re-login via GitHub OAuth",
+    )
+}
+
 fn github_rate_limited_error() -> ApiError {
     ApiError::new(
         StatusCode::TOO_MANY_REQUESTS,
@@ -4783,6 +4791,7 @@ fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartIt
             summary: None,
             auto_translate: Some(false),
         }),
+        "error" if smart_error_is_retryable(error_text) => Some(smart_missing_item(Some(true))),
         "missing" | "error" => Some(SmartItem {
             lang: "zh-CN".to_owned(),
             status: status.to_owned(),
@@ -4810,14 +4819,30 @@ fn smart_ready_item(
     })
 }
 
-fn smart_missing_item(auto_translate: bool) -> SmartItem {
+fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
     SmartItem {
         lang: "zh-CN".to_owned(),
         status: "missing".to_owned(),
         title: None,
         summary: None,
-        auto_translate: if auto_translate { None } else { Some(false) },
+        auto_translate,
     }
+}
+
+fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
+    let Some(raw) = error_text else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    normalized.contains("runtime_lease_expired")
+        || normalized.contains("repo scope required; re-login via github oauth")
+        || normalized.contains("database is locked")
+        || normalized.contains("busy")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("connection reset")
+        || normalized.contains("connection refused")
 }
 
 fn feed_item_from_row(
@@ -4954,16 +4979,16 @@ fn feed_item_from_row(
             } else {
                 let ready = smart_ready_item(r.smart_title.clone(), r.smart_summary.clone(), None);
                 if ready.is_none() {
-                    Some(smart_missing_item(true))
+                    Some(smart_missing_item(None))
                 } else {
                     ready
                 }
             }
         } else if refresh_in_flight {
             smart_ready_item(r.smart_title.clone(), r.smart_summary.clone(), Some(true))
-                .or_else(|| Some(smart_missing_item(false)))
+                .or_else(|| Some(smart_missing_item(Some(false))))
         } else {
-            Some(smart_missing_item(true))
+            Some(smart_missing_item(None))
         }
     };
 
@@ -7273,33 +7298,29 @@ fn github_rest_compare_http_error(
     ApiError::internal(format!("github compare returned {status}: {body}"))
 }
 
-async fn fetch_release_compare_digest(
+async fn fetch_release_compare_digest_request(
     state: &AppState,
-    user_id: &str,
     repo_full_name: &str,
     base_tag: &str,
     head_tag: &str,
+    access_token: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
-    let token = state
-        .load_access_token(user_id)
-        .await
-        .map_err(|err| ApiError::internal(format!("load access token failed: {err}")))?;
     let compare_ref = format!(
         "{}...{}",
         urlencoding::encode(base_tag),
         urlencoding::encode(head_tag)
     );
     let url = format!("https://api.github.com/repos/{repo_full_name}/compare/{compare_ref}");
-    let response = state
+    let mut request = state
         .http
         .get(url)
-        .bearer_auth(token)
         .header(reqwest::header::USER_AGENT, "OctoRill")
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .map_err(ApiError::internal)?;
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(ApiError::internal)?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
@@ -7311,6 +7332,50 @@ async fn fetch_release_compare_digest(
         .await
         .map_err(ApiError::internal)?;
     Ok(build_compare_digest(&payload))
+}
+
+async fn fetch_release_compare_digest(
+    state: &AppState,
+    user_id: &str,
+    repo_full_name: &str,
+    base_tag: &str,
+    head_tag: &str,
+) -> Result<Option<String>, ApiError> {
+    let token = state
+        .load_access_token(user_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load access token failed: {err}")))?;
+    match fetch_release_compare_digest_request(
+        state,
+        repo_full_name,
+        base_tag,
+        head_tag,
+        Some(token.as_str()),
+    )
+    .await
+    {
+        Ok(digest) => Ok(digest),
+        Err(auth_err) if auth_err.code() == "reauth_required" => {
+            match fetch_release_compare_digest_request(
+                state,
+                repo_full_name,
+                base_tag,
+                head_tag,
+                None,
+            )
+            .await
+            {
+                Ok(digest) => Ok(digest),
+                Err(public_err)
+                    if public_err.code() == "rate_limited" || public_err.code() == "forbidden" =>
+                {
+                    Err(public_err)
+                }
+                Err(_) => Err(github_private_repo_scope_required_error()),
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn summarize_release_smart_candidate_with_ai(
@@ -7502,10 +7567,24 @@ async fn prepare_release_smart_batch(
         if let Some(cache) = cache_by_entity.get(&item.entity_id)
             && cache.source_hash == item.source_hash
         {
-            if matches!(cache.status.as_str(), "disabled" | "error")
+            if cache.status == "disabled"
                 || (cache.status == "missing"
                     && cache.error_text.as_deref() == Some(SMART_NO_VALUABLE_VERSION_INFO))
             {
+                terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: cache.status.clone(),
+                        error: cache.error_text.clone(),
+                    },
+                );
+                continue;
+            }
+            if cache.status == "error" {
+                if smart_error_is_retryable(cache.error_text.as_deref()) {
+                    pending.push(item.clone());
+                    continue;
+                }
                 terminal.insert(
                     item.release_id,
                     ReleaseBatchTerminalState {
@@ -9381,8 +9460,9 @@ mod tests {
         preserve_chunk_trailing_newline, release_cache_entry_reusable, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_feed_body,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
-        split_markdown_chunks, sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
+        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use std::{fs, net::SocketAddr, sync::Arc};
@@ -12498,6 +12578,43 @@ mod tests {
         let smart = item.smart.expect("smart item");
         assert_eq!(smart.status, "insufficient");
         assert_eq!(smart.auto_translate, Some(false));
+        assert!(smart.title.is_none());
+        assert!(smart.summary.is_none());
+    }
+
+    #[test]
+    fn smart_error_is_retryable_for_public_scope_upgrade() {
+        assert!(smart_error_is_retryable(Some(
+            "repo scope required; re-login via GitHub OAuth",
+        )));
+        assert!(!smart_error_is_retryable(Some(
+            "private repository compare requires repo scope; re-login via GitHub OAuth",
+        )));
+    }
+
+    #[test]
+    fn feed_item_from_row_retries_retryable_smart_errors() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.release_tag_name = Some("v1.2.4".to_owned());
+        row.release_previous_tag_name = Some("v1.2.3".to_owned());
+        row.title = Some("Release v1.2.4".to_owned());
+        row.release_body = Some("See full changelog below.".to_owned());
+        row.smart_source_hash = Some(crate::translations::release_smart_feed_source_hash(
+            row.entity_id.as_str(),
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref(),
+            row.release_tag_name.as_deref().unwrap_or(""),
+            row.release_previous_tag_name.as_deref(),
+        ));
+        row.smart_status = Some("error".to_owned());
+        row.smart_error_text = Some("runtime_lease_expired".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let smart = item.smart.expect("smart item");
+        assert_eq!(smart.status, "missing");
+        assert_eq!(smart.auto_translate, Some(true));
         assert!(smart.title.is_none());
         assert!(smart.summary.is_none());
     }

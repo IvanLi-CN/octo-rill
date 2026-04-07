@@ -388,9 +388,9 @@ fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptio
 
 fn build_sqlite_pool_options() -> SqlitePoolOptions {
     // OctoRill runs against a single local SQLite file. Multiple pool connections inside the same
-    // process only increase self-contention because SQLite still serializes writes. Keeping one
-    // shared connection prevents background workers and heartbeats from fighting each other for a
-    // write lock while still allowing SQLx to queue operations fairly.
+    // process increase self-contention because SQLite still serializes writes. Keeping one shared
+    // connection avoids reintroducing `database is locked` during background workers + lease
+    // heartbeats, while retryable smart failures are now re-queued by the translation layer.
     SqlitePoolOptions::new()
         .max_connections(SQLITE_POOL_MAX_CONNECTIONS)
         .min_connections(1)

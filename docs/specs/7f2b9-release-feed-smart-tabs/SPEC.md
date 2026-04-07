@@ -103,6 +103,7 @@
   - changed files 概览
   - 受限 patch excerpts
 - 默认跳过 binary / lockfile / minified / generated 噪声文件。
+- GitHub OAuth 登录默认申请 `public_repo`；对于历史旧 token 触发的 public compare scope 错误，后端需先回退匿名 compare 再决定终态，避免把可恢复的公共仓库错误直接暴露成失败卡片。
 - 若 GitHub compare 拉取失败（鉴权 / 限流 / 网络 / 404），smart lane 进入 `error`，允许重试。
 
 ### 3. Collapse
@@ -117,7 +118,10 @@
 
 - 默认 tab：AI 可用时优先 `智能`；AI disabled 时回退 `原文`。
 - 智能 tab 缺数据：卡片进入可见区后自动展示呼吸态并排队生成。
-- sync 新写入的 release：后台同时预热 `翻译` 与 `智能` 两条 lane；若预热尚未完成，前端仍按现有呼吸态兜底。
+- sync 新写入的 release：后台同时预热 `翻译` 与 `智能` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
+- 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
+- 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `智能整理中`。
+- 本地 SQLite 运行时必须允许 feed 首屏查询、心跳与可见区智能预加载并存；不能因为连接池过小而让智能预加载长时间饥饿，看起来像“没有自动生成”。
 - 翻译 tab 缺数据：用户首次切入该 tab 时展示呼吸态并按需生成。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
 - 智能 ready 内容必须是纯要点列表，不得退化为原文直译。
@@ -131,6 +135,18 @@
 - Given sync 刚写入新的 release 且 AI 可用
   When 后台预热任务入队
   Then `翻译` 与 `智能` 两条 lane 都会按同一批 release ID 预生成；用户再次打开 feed 时优先命中 ready/terminal 缓存，而不是只预热翻译。
+
+- Given smart lane 之前落过可重试的瞬时错误
+  When 用户重新打开 feed 或再次触发 sync
+  Then 系统会把该卡片重新纳入智能预热/预加载，而不是继续展示陈旧错误态。
+
+- Given feed 首次加载完成且当前页里仍有 missing 的 smart 卡片
+  When 页面进入空闲态
+  Then 前端会主动 prime 最近一批 smart 请求，而不是必须等主人滚动到每张卡片才开始生成。
+
+- Given 首屏同时出现多张待整理的 release 卡片
+  When 页面完成 feed 请求并自动触发智能预加载
+  Then 卡片会先进入呼吸态 / `智能整理中`，随后持续回填结果；运行时不能长期卡在“还没有智能版本变化摘要”但实际上没有继续生成。
 
 - Given 用户点击 `翻译` tab 且当前没有翻译结果
   When tab 切换完成
@@ -147,6 +163,14 @@
 - Given release 正文与 diff 都没有有效版本信息
   When smart 终态返回
   Then 卡片切为仅版本号折叠样式，不显示正文区。
+
+- Given public release 之前因为旧 OAuth scope 落下 `repo scope required; re-login via GitHub OAuth` 错误
+  When 用户重新打开 feed 或 sync 再次触发 smart 预热
+  Then 系统会自动把它重新纳入生成，并优先尝试匿名 public compare，而不是继续展示旧错误卡片。
+
+- Given 调度器曾在 batch 已入库、但实际执行前中断
+  When 服务重启后下一个 translation scheduler tick 到来
+  Then 旧的 queued batch 会被重新接手并继续执行，卡片不会永久停在 `智能整理中`。
 
 - Given compare diff 拉取失败
   When smart 终态返回

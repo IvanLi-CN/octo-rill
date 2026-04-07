@@ -10,6 +10,7 @@ import type { FeedItem, SmartItem } from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
+const INITIAL_SMART_PREFETCH_COUNT = 12;
 const REQUEST_ERROR_RECOVERY_MAX_RETRIES = 3;
 const REQUEST_STATUS_POLL_INTERVAL_MS = 250;
 const AUTO_SMART_MAX_WAIT_MS = 500;
@@ -18,6 +19,22 @@ const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 const REQUEST_PENDING_MAX_AGE_MS =
 	REQUEST_STATUS_POLL_WINDOW_MS * REQUEST_RESUME_WINDOW_MAX_RETRIES;
 const SMART_INSUFFICIENT_REASON = "no_valuable_version_info";
+
+function smartErrorIsRetryable(error?: string | null) {
+	if (!error) return false;
+	const normalized = error.trim().toLowerCase();
+	return (
+		normalized.includes("runtime_lease_expired") ||
+		normalized.includes("repo scope required; re-login via github oauth") ||
+		normalized.includes("database is locked") ||
+		normalized.includes("busy") ||
+		normalized.includes("timeout") ||
+		normalized.includes("timed out") ||
+		normalized.includes("temporarily unavailable") ||
+		normalized.includes("connection reset") ||
+		normalized.includes("connection refused")
+	);
+}
 
 type SmartResolveResponse = {
 	lang: string;
@@ -85,10 +102,10 @@ function mapTranslationItemToFeedSmart(item: {
 		case "error":
 			return {
 				lang: "zh-CN",
-				status: "error",
+				status: smartErrorIsRetryable(item.error) ? "missing" : "error",
 				title: null,
 				summary: null,
-				auto_translate: false,
+				auto_translate: smartErrorIsRetryable(item.error),
 			};
 		default:
 			return null;
@@ -306,6 +323,34 @@ export function useAutoSmart(params: {
 	const scheduleViewportPlanRef = useRef<() => void>(() => {});
 	const schedulePendingPollRef = useRef<() => void>(() => {});
 
+	const buildQueuedCandidate = useCallback(
+		(item: FeedItem): TranslationCandidate | null => {
+			if (!shouldAutoSmart(item)) {
+				return null;
+			}
+			const key = keyOf(item);
+			itemByKeyRef.current.set(key, item);
+			const requestItem = buildReleaseSmartRequestItem(item);
+			const sourceKey = buildRequestSourceKey(requestItem);
+			const existing = requestTasksRef.current.get(key);
+			if (existing) {
+				if (existing.sourceKey === sourceKey) {
+					return null;
+				}
+				retireTask(key, existing);
+			}
+			return {
+				key,
+				item,
+				requestItem,
+				sourceKey,
+				top: 0,
+				bottom: 0,
+			};
+		},
+		[retireTask, shouldAutoSmart],
+	);
+
 	const settleTaskPromise = useCallback(
 		(
 			task: TranslationTask,
@@ -487,9 +532,14 @@ export function useAutoSmart(params: {
 			) {
 				const chunk = entries.slice(index, index + RESOLVE_RESULTS_MAX_ITEMS);
 				try {
+					const retryOnError =
+						options?.retryOnError ??
+						chunk.some(
+							({ candidate }) => candidate.item.smart?.auto_translate === true,
+						);
 					const response = await apiResolveTranslationResults({
 						items: chunk.map(({ candidate }) => candidate.requestItem),
-						retry_on_error: options?.retryOnError ?? false,
+						retry_on_error: retryOnError,
 					});
 					applyResolvedResults(chunk, response.items);
 				} catch (error) {
@@ -657,6 +707,28 @@ export function useAutoSmart(params: {
 		],
 	);
 
+	const prime = useCallback(
+		async (items: FeedItem[]) => {
+			if (!enabled || !mountedRef.current || items.length === 0) {
+				return;
+			}
+			const candidates: TranslationCandidate[] = [];
+			for (const item of items) {
+				const candidate = buildQueuedCandidate(item);
+				if (!candidate) continue;
+				candidates.push(candidate);
+				if (candidates.length >= INITIAL_SMART_PREFETCH_COUNT) {
+					break;
+				}
+			}
+			if (candidates.length === 0) {
+				return;
+			}
+			await submitCandidates(candidates);
+		},
+		[buildQueuedCandidate, enabled, submitCandidates],
+	);
+
 	const prepareCandidates = useCallback(() => {
 		const candidates: ViewportPlanEntry[] = [];
 		for (const [key, element] of keyToElementRef.current) {
@@ -664,22 +736,12 @@ export function useAutoSmart(params: {
 			if (!item) continue;
 			const rect = element.getBoundingClientRect();
 			if (rect.bottom <= 0) continue;
-			const existing = requestTasksRef.current.get(key);
 			let candidate: TranslationCandidate | null = null;
 			if (shouldAutoSmart(item)) {
-				const requestItem = buildReleaseSmartRequestItem(item);
-				const sourceKey = buildRequestSourceKey(requestItem);
-				if (existing) {
-					if (existing.sourceKey !== sourceKey) {
-						retireTask(key, existing);
-					}
-				}
-				if (!existing || existing.sourceKey !== sourceKey) {
+				const queued = buildQueuedCandidate(item);
+				if (queued) {
 					candidate = {
-						key,
-						item,
-						requestItem,
-						sourceKey,
+						...queued,
 						top: rect.top,
 						bottom: rect.bottom,
 					};
@@ -699,7 +761,7 @@ export function useAutoSmart(params: {
 			}
 			return left.bottom - right.bottom;
 		});
-	}, [retireTask, shouldAutoSmart]);
+	}, [buildQueuedCandidate, shouldAutoSmart]);
 
 	const runViewportPlan = useCallback(async () => {
 		if (!enabled || !mountedRef.current) return;
@@ -891,5 +953,5 @@ export function useAutoSmart(params: {
 
 	const inFlightKeys = new Set(requestTasksRef.current.keys());
 
-	return { register, smartNow, inFlightKeys };
+	return { prime, register, smartNow, inFlightKeys };
 }

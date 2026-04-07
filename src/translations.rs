@@ -571,6 +571,26 @@ fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'s
     }
 }
 
+fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
+    let Some(raw) = error_text else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    normalized.contains("runtime_lease_expired")
+        || normalized.contains("repo scope required; re-login via github oauth")
+        || normalized.contains("database is locked")
+        || normalized.contains("busy")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("connection reset")
+        || normalized.contains("connection refused")
+}
+
+fn should_retry_translation_terminal_error(retry_on_error: bool, error_text: Option<&str>) -> bool {
+    retry_on_error || translation_error_is_retryable(error_text)
+}
+
 fn queued_request_result(
     item: &TranslationRequestItemInput,
     work_item_id: Option<String>,
@@ -637,6 +657,18 @@ struct ClaimedBatch {
     request_count: i64,
     estimated_input_tokens: i64,
     items: Vec<WorkItemRow>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct QueuedBatchRow {
+    id: String,
+    partition_key: String,
+    target_lang: String,
+    protocol_version: String,
+    model_profile: String,
+    trigger_reason: String,
+    request_count: i64,
+    estimated_input_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1889,7 +1921,14 @@ async fn ensure_translation_result_for_item(
     {
         match existing.status.as_str() {
             "ready" | "disabled" | "missing" => return Ok(existing.to_result(item)),
-            "error" if !retry_on_error => return Ok(existing.to_result(item)),
+            "error"
+                if !should_retry_translation_terminal_error(
+                    retry_on_error,
+                    existing.error_text.as_deref(),
+                ) =>
+            {
+                return Ok(existing.to_result(item));
+            }
             _ => {}
         }
 
@@ -1922,7 +1961,12 @@ async fn ensure_translation_result_for_item(
                     now,
                 )
                 .await?;
-                if retry_on_error && result.status == "error" {
+                if result.status == "error"
+                    && should_retry_translation_terminal_error(
+                        retry_on_error,
+                        result.error.as_deref(),
+                    )
+                {
                     reset_retryable_terminal_work_item(tx, work_item.id.as_str(), now).await?;
                     let request_id = if let Some(existing_request_id) =
                         load_latest_request_id_for_work_item(
@@ -1983,7 +2027,12 @@ async fn ensure_translation_result_for_item(
             return Ok(pending);
         }
 
-        if existing.status == "error" && !retry_on_error {
+        if existing.status == "error"
+            && !should_retry_translation_terminal_error(
+                retry_on_error,
+                existing.error_text.as_deref(),
+            )
+        {
             return Ok(existing.to_result(item));
         }
     }
@@ -2252,7 +2301,9 @@ async fn ensure_translation_result_demand(
             now,
         )
         .await?;
-        if retry_on_error && result.status == "error" {
+        if result.status == "error"
+            && should_retry_translation_terminal_error(retry_on_error, result.error.as_deref())
+        {
             reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
             attach_request_to_work_item(tx, request_id, existing.id.as_str(), "queued", now)
                 .await?;
@@ -2993,6 +3044,9 @@ async fn claim_next_batch(
     {
         return Ok(None);
     }
+    if let Some(batch) = claim_existing_queued_batch(state, &worker).await? {
+        return Ok(Some(batch));
+    }
     let claim_origin_case = claim_origin_case_sql();
     let first_query = if worker.worker_kind == "user_dedicated" {
         format!(
@@ -3205,6 +3259,63 @@ async fn claim_next_batch(
     }))
 }
 
+async fn claim_existing_queued_batch(
+    state: &AppState,
+    worker: &TranslationWorkerProfile,
+) -> Result<Option<ClaimedBatch>> {
+    let queued_batch = sqlx::query_as::<_, QueuedBatchRow>(
+        r#"
+        SELECT
+          id,
+          partition_key,
+          target_lang,
+          protocol_version,
+          model_profile,
+          trigger_reason,
+          request_count,
+          estimated_input_tokens
+        FROM translation_batches
+        WHERE status = 'queued'
+          AND worker_kind = ?
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(worker.worker_kind.as_str())
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(queued_batch) = queued_batch else {
+        return Ok(None);
+    };
+
+    let mut tx = state.pool.begin().await?;
+    let items = load_batch_work_items(&mut tx, queued_batch.id.as_str()).await?;
+    tx.commit().await?;
+    if items.is_empty() {
+        warn!(
+            batch_id = queued_batch.id.as_str(),
+            worker_id = worker.worker_id.as_str(),
+            "queued translation batch has no work items; skipping reclaim"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(ClaimedBatch {
+        id: queued_batch.id,
+        worker_id: worker.worker_id.clone(),
+        worker_slot: worker.worker_slot,
+        worker_kind: worker.worker_kind.clone(),
+        partition_key: queued_batch.partition_key,
+        target_lang: queued_batch.target_lang,
+        protocol_version: queued_batch.protocol_version,
+        model_profile: queued_batch.model_profile,
+        trigger_reason: queued_batch.trigger_reason,
+        request_count: queued_batch.request_count,
+        estimated_input_tokens: queued_batch.estimated_input_tokens,
+        items,
+    }))
+}
+
 async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let worker = translation_worker_profile_from_runtime(
@@ -3217,6 +3328,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         UPDATE translation_batches
         SET status = 'running',
             started_at = ?,
+            worker_id = ?,
+            worker_slot = ?,
+            worker_kind = ?,
             runtime_owner_id = ?,
             lease_heartbeat_at = ?,
             updated_at = ?
@@ -3224,6 +3338,9 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         "#,
     )
     .bind(now.as_str())
+    .bind(batch.worker_id.as_str())
+    .bind(batch.worker_slot)
+    .bind(batch.worker_kind.as_str())
     .bind(state.runtime_owner_id.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
@@ -5570,6 +5687,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn translation_error_is_retryable_for_scope_upgrade_recovery() {
+        assert!(translation_error_is_retryable(Some(
+            "repo scope required; re-login via GitHub OAuth",
+        )));
+        assert!(!translation_error_is_retryable(Some(
+            "private repository compare requires repo scope; re-login via GitHub OAuth",
+        )));
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_retries_retryable_terminal_error_automatically() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = seed_canonical_release_item(&pool, "1", 145, 226).await;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'error',
+                error_text = 'runtime_lease_expired',
+                active_work_item_id = ?,
+                updated_at = ?
+            WHERE user_id = ? AND entity_type = 'release' AND entity_id = ? AND lang = 'zh-CN'
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .bind("2026-03-30T00:00:01Z")
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark cache error");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'runtime_lease_expired',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request failed");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'runtime_lease_expired',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("resolve retryable error without explicit retry");
+
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM translation_requests")
+            .fetch_one(&pool)
+            .await
+            .expect("count requests");
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+        let request_result_status: Option<String> = sqlx::query_scalar(
+            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request result status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+
+        assert_eq!(requests, 1);
+        assert_eq!(resolved[0].status, "queued");
+        assert_eq!(request_status, "queued");
+        assert_eq!(request_result_status, None);
+        assert_eq!(work_item_status, "queued");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn resolve_translation_results_retries_terminal_error_when_forced() {
         let pool = setup_pool().await;
@@ -6250,6 +6491,93 @@ mod tests {
         assert_eq!(request_status, "completed");
         assert_eq!(result_status, "disabled");
         assert_eq!(task_count, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_reclaims_queued_batch_left_before_execution() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("queued-batch-reclaim");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let work_item_id = batch.items[0].id.clone();
+
+        let queued_batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch.id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load queued batch");
+        assert_eq!(queued_batch_status, "queued");
+
+        run_translation_scheduler_once(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("scheduler tick reclaims queued batch");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT status, worker_id, worker_slot, worker_kind
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load reclaimed batch");
+        assert_eq!(batch_row.get::<String, _>("status"), "completed");
+        assert_eq!(
+            batch_row.get::<String, _>("worker_id"),
+            "translation-worker-general-1"
+        );
+        assert_eq!(batch_row.get::<i64, _>("worker_slot"), 1);
+        assert_eq!(batch_row.get::<String, _>("worker_kind"), "general");
+
+        let work_item_row = sqlx::query(
+            r#"
+            SELECT status, result_status
+            FROM translation_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load reclaimed work item");
+        assert_eq!(work_item_row.get::<String, _>("status"), "completed");
+        assert_eq!(
+            work_item_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("disabled")
+        );
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT status, result_status
+            FROM translation_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load reclaimed request");
+        assert_eq!(request_row.get::<String, _>("status"), "completed");
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("disabled")
+        );
     }
 
     #[tokio::test]

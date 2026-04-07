@@ -187,7 +187,7 @@ function SmartLane(props: {
 		return (
 			<EmptyPanel
 				title="智能整理失败"
-				description="可能是 compare diff 拉取失败，或者模型没有成功返回可用结果。"
+				description="这次智能整理没有成功完成，可以立即再试一次。"
 				actionLabel="重试智能整理"
 				onAction={onSmartNow}
 			/>

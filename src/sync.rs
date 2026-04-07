@@ -34,6 +34,7 @@ const REPO_RELEASE_WORKERS: usize = 5;
 const REPO_RELEASE_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(450);
 const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
+const SMART_PREHEAT_RECENT_RELEASE_LIMIT: usize = 30;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
 
@@ -622,6 +623,19 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
         .copied()
         .collect::<Vec<_>>();
     new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let smart_preheat_release_ids = merge_smart_preheat_release_ids(
+        &new_release_ids,
+        &load_recent_release_ids_for_user(state, user_id, SMART_PREHEAT_RECENT_RELEASE_LIMIT)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    "sync.releases: load recent release ids for smart preheat failed"
+                );
+                Vec::new()
+            }),
+    );
     if let Err(err) = enqueue_background_release_translation_task(
         state,
         user_id,
@@ -641,7 +655,7 @@ pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleas
     if let Err(err) = enqueue_background_release_smart_task(
         state,
         user_id,
-        &new_release_ids,
+        &smart_preheat_release_ids,
         "sync.releases.auto_smart",
         None,
         Some(user_id),
@@ -838,6 +852,64 @@ async fn load_user_relevant_release_ids(
         .fetch_all(&state.pool)
         .await
         .context("failed to query relevant release ids for user")
+}
+
+async fn load_recent_release_ids_for_user(
+    state: &AppState,
+    user_id: &str,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT DISTINCT r.release_id
+        FROM repo_releases r
+        JOIN starred_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) DESC, r.release_id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(limit as i64)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query recent release ids for user")
+}
+
+fn merge_smart_preheat_release_ids(
+    new_release_ids: &[i64],
+    recent_release_ids: &[i64],
+) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::with_capacity(
+        new_release_ids.len()
+            + recent_release_ids
+                .len()
+                .min(SMART_PREHEAT_RECENT_RELEASE_LIMIT),
+    );
+
+    for release_id in new_release_ids {
+        if seen.insert(*release_id) {
+            merged.push(*release_id);
+        }
+    }
+
+    let mut recent_added = 0usize;
+    for release_id in recent_release_ids {
+        if recent_added >= SMART_PREHEAT_RECENT_RELEASE_LIMIT {
+            break;
+        }
+        if seen.insert(*release_id) {
+            merged.push(*release_id);
+            recent_added += 1;
+        }
+    }
+
+    merged
 }
 
 async fn enqueue_background_release_translation_task(
@@ -1494,6 +1566,23 @@ pub async fn sync_subscriptions(
             let user_release_ids =
                 load_user_relevant_release_ids(state, user.user_id.as_str(), &new_release_ids)
                     .await?;
+            let smart_preheat_release_ids = merge_smart_preheat_release_ids(
+                &user_release_ids,
+                &load_recent_release_ids_for_user(
+                    state,
+                    user.user_id.as_str(),
+                    SMART_PREHEAT_RECENT_RELEASE_LIMIT,
+                )
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        ?err,
+                        user_id = user.user_id.as_str(),
+                        "sync.subscriptions: load recent release ids for smart preheat failed"
+                    );
+                    Vec::new()
+                }),
+            );
             if user_release_ids.is_empty() {
                 continue;
             }
@@ -1516,7 +1605,7 @@ pub async fn sync_subscriptions(
             if let Err(err) = enqueue_background_release_smart_task(
                 state,
                 user.user_id.as_str(),
-                &user_release_ids,
+                &smart_preheat_release_ids,
                 "sync.subscriptions.auto_smart",
                 Some(task_id),
                 None,
@@ -3678,6 +3767,13 @@ mod tests {
             serde_json::from_str(&rows[1].2).expect("parse smart payload");
         assert_eq!(first_payload, expected_payload);
         assert_eq!(second_payload, expected_payload);
+    }
+
+    #[test]
+    fn merge_smart_preheat_release_ids_keeps_newest_and_extends_recent_window() {
+        let merged =
+            super::merge_smart_preheat_release_ids(&[105, 104, 103], &[104, 103, 102, 101, 100]);
+        assert_eq!(merged, vec![105, 104, 103, 102, 101, 100]);
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {

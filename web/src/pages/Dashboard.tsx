@@ -392,6 +392,7 @@ export function Dashboard(props: { me: MeResponse }) {
 		onTranslated: feed.applyTranslation,
 	});
 	const {
+		prime: primeSmart,
 		register: registerSmart,
 		smartNow,
 		inFlightKeys: smartInFlightKeys,
@@ -409,6 +410,15 @@ export function Dashboard(props: { me: MeResponse }) {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
+
+	useEffect(() => {
+		if (feed.loadingInitial || feed.items.length === 0) {
+			return;
+		}
+		void primeSmart(feed.items).catch((err) => {
+			setBootError(err instanceof Error ? err.message : String(err));
+		});
+	}, [feed.items, feed.loadingInitial, primeSmart]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;
