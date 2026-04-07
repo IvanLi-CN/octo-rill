@@ -397,7 +397,7 @@ export function FeedItemCard(props: {
 				</Tabs>
 			)}
 
-			{isVersionOnly ? null : reactionsFooter}
+			{reactionsFooter}
 		</Card>
 	);
 }

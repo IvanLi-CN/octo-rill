@@ -16,6 +16,7 @@ type ApiOptions = {
 	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
+	withAutoTranslateReactions?: boolean;
 	autoTranslateFeedCount?: number;
 	autoTranslateInitialReadyIds?: string[];
 	autoTranslateDisabledIds?: string[];
@@ -54,6 +55,7 @@ function makeAutoTranslateFeedItems(
 		initialReadyIds?: string[];
 		smartInitialReadyIds?: string[];
 		autoTranslateDisabledIds?: string[];
+		withReactions?: boolean;
 	},
 ) {
 	const initialReadyIds = new Set(options?.initialReadyIds ?? []);
@@ -61,6 +63,7 @@ function makeAutoTranslateFeedItems(
 	const autoTranslateDisabledIds = new Set(
 		options?.autoTranslateDisabledIds ?? [],
 	);
+	const withReactions = options?.withReactions === true;
 	return Array.from({ length: count }, (_, index) => {
 		const releaseId = makeAutoTranslateReleaseId(index);
 		const initialReady = initialReadyIds.has(releaseId);
@@ -115,7 +118,27 @@ function makeAutoTranslateFeedItems(
 						title: null,
 						summary: null,
 					},
-			reactions: null,
+			reactions: withReactions
+				? {
+						counts: {
+							plus1: 2,
+							laugh: 0,
+							heart: 0,
+							hooray: 0,
+							rocket: 0,
+							eyes: 0,
+						},
+						viewer: {
+							plus1: false,
+							laugh: false,
+							heart: false,
+							hooray: false,
+							rocket: false,
+							eyes: false,
+						},
+						status: "ready",
+					}
+				: null,
 		};
 	});
 }
@@ -276,6 +299,7 @@ async function installApiMocks(
 							initialReadyIds: cfg.autoTranslateInitialReadyIds,
 							smartInitialReadyIds: cfg.smartInitialReadyIds,
 							autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
+							withReactions: cfg.withAutoTranslateReactions,
 						})
 					: [];
 			return json(route, { items, next_cursor: null });
@@ -767,6 +791,7 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 	const releaseId = makeAutoTranslateReleaseId(0);
 	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
+		withAutoTranslateReactions: true,
 		autoTranslateFeedCount: 1,
 		autoTranslateDisabledIds: [releaseId],
 		smartResolveStatuses: {
@@ -803,6 +828,7 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 		page.getByText("智能总结 release 20001 的主要版本变化。"),
 	).toHaveCount(0);
 	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
+	await expect(releaseCard.getByRole("button", { name: /👍/ })).toBeVisible();
 });
 
 test.describe("localized timestamps", () => {

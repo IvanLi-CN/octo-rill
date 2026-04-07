@@ -3326,7 +3326,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         batch.worker_kind.as_str(),
         batch.worker_slot,
     );
-    sqlx::query(
+    let rows_affected = sqlx::query(
         r#"
         UPDATE translation_batches
         SET status = 'running',
@@ -3338,6 +3338,7 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
             lease_heartbeat_at = ?,
             updated_at = ?
         WHERE id = ?
+          AND status = 'queued'
         "#,
     )
     .bind(now.as_str())
@@ -3349,7 +3350,34 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     .bind(now.as_str())
     .bind(batch.id.as_str())
     .execute(&state.pool)
-    .await?;
+    .await?
+    .rows_affected();
+    if rows_affected == 0 {
+        warn!(
+            batch_id = batch.id.as_str(),
+            worker_id = batch.worker_id.as_str(),
+            worker_kind = batch.worker_kind.as_str(),
+            "translation batch was already claimed elsewhere; skipping duplicate execution"
+        );
+        if state
+            .translation_scheduler
+            .worker_is_desired(worker.worker_id.as_str())
+            .await
+        {
+            update_translation_worker_runtime(
+                state,
+                &worker,
+                TranslationWorkerRuntimeUpdate::idle(),
+            )
+            .await;
+        } else {
+            state
+                .translation_scheduler
+                .remove_worker_runtime(&state.pool, worker.worker_id.as_str())
+                .await?;
+        }
+        return Ok(());
+    }
     update_translation_worker_runtime(
         state,
         &worker,
@@ -6646,6 +6674,59 @@ mod tests {
         .await
         .expect("load work item after skipped reclaim");
         assert_eq!(work_item_status, "batched");
+    }
+
+    #[tokio::test]
+    async fn execute_claimed_batch_skips_duplicate_execution_after_queue_claim_race() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("duplicate-claim-race");
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let batch_id = batch.id.clone();
+        let duplicate = batch.clone();
+
+        execute_claimed_batch(state.as_ref(), batch)
+            .await
+            .expect("first execution succeeds");
+        execute_claimed_batch(state.as_ref(), duplicate)
+            .await
+            .expect("second execution no-ops");
+
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load batch status");
+        assert_eq!(batch_status, "completed");
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT status, result_status
+            FROM translation_requests
+            WHERE id = ?
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request status");
+        assert_eq!(request_row.get::<String, _>("status"), "completed");
+        assert_eq!(
+            request_row
+                .get::<Option<String>, _>("result_status")
+                .as_deref(),
+            Some("disabled")
+        );
     }
 
     #[tokio::test]

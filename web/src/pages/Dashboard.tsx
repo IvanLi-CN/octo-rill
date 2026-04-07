@@ -640,8 +640,8 @@ export function Dashboard(props: { me: MeResponse }) {
 			if (
 				lane === "translated" &&
 				(item.translated?.status === "missing" ||
-					item.translated?.status === "error") &&
-				item.translated?.auto_translate !== false
+					(item.translated?.status === "error" &&
+						item.translated?.auto_translate !== false))
 			) {
 				void translateNow(item).catch((err) => {
 					setBootError(err instanceof Error ? err.message : String(err));
@@ -649,8 +649,9 @@ export function Dashboard(props: { me: MeResponse }) {
 			}
 			if (
 				lane === "smart" &&
-				(item.smart?.status === "missing" || item.smart?.status === "error") &&
-				item.smart?.auto_translate !== false
+				(item.smart?.status === "missing" ||
+					(item.smart?.status === "error" &&
+						item.smart?.auto_translate !== false))
 			) {
 				void smartNow(item).catch((err) => {
 					setBootError(err instanceof Error ? err.message : String(err));

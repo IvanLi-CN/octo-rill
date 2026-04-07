@@ -1583,18 +1583,16 @@ pub async fn sync_subscriptions(
                     Vec::new()
                 }),
             );
-            if user_release_ids.is_empty() {
-                continue;
-            }
-            if let Err(err) = enqueue_background_release_translation_task(
-                state,
-                user.user_id.as_str(),
-                &user_release_ids,
-                "sync.subscriptions.auto_translate",
-                Some(task_id),
-                None,
-            )
-            .await
+            if !user_release_ids.is_empty()
+                && let Err(err) = enqueue_background_release_translation_task(
+                    state,
+                    user.user_id.as_str(),
+                    &user_release_ids,
+                    "sync.subscriptions.auto_translate",
+                    Some(task_id),
+                    None,
+                )
+                .await
             {
                 tracing::warn!(
                     ?err,
@@ -1602,15 +1600,16 @@ pub async fn sync_subscriptions(
                     "sync.subscriptions: enqueue background translation failed"
                 );
             }
-            if let Err(err) = enqueue_background_release_smart_task(
-                state,
-                user.user_id.as_str(),
-                &smart_preheat_release_ids,
-                "sync.subscriptions.auto_smart",
-                Some(task_id),
-                None,
-            )
-            .await
+            if !smart_preheat_release_ids.is_empty()
+                && let Err(err) = enqueue_background_release_smart_task(
+                    state,
+                    user.user_id.as_str(),
+                    &smart_preheat_release_ids,
+                    "sync.subscriptions.auto_smart",
+                    Some(task_id),
+                    None,
+                )
+                .await
             {
                 tracing::warn!(
                     ?err,
