@@ -3263,6 +3263,7 @@ async fn claim_existing_queued_batch(
     state: &AppState,
     worker: &TranslationWorkerProfile,
 ) -> Result<Option<ClaimedBatch>> {
+    let stale_cutoff = runtime::stale_cutoff_timestamp(Utc::now());
     let queued_batch = sqlx::query_as::<_, QueuedBatchRow>(
         r#"
         SELECT
@@ -3277,11 +3278,13 @@ async fn claim_existing_queued_batch(
         FROM translation_batches
         WHERE status = 'queued'
           AND worker_kind = ?
+          AND julianday(COALESCE(updated_at, created_at)) <= julianday(?)
         ORDER BY created_at ASC, id ASC
         LIMIT 1
         "#,
     )
     .bind(worker.worker_kind.as_str())
+    .bind(stale_cutoff.as_str())
     .fetch_optional(&state.pool)
     .await?;
     let Some(queued_batch) = queued_batch else {
@@ -6518,6 +6521,21 @@ mod tests {
                 .expect("load queued batch");
         assert_eq!(queued_batch_status, "queued");
 
+        let stale_at = "2026-03-06T00:00:00Z";
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET created_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(stale_at)
+        .bind(stale_at)
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("age queued batch before reclaim");
+
         run_translation_scheduler_once(state.as_ref(), test_worker_profile(1, "general"))
             .await
             .expect("scheduler tick reclaims queued batch");
@@ -6578,6 +6596,56 @@ mod tests {
                 .as_deref(),
             Some("disabled")
         );
+    }
+
+    #[tokio::test]
+    async fn scheduler_does_not_reclaim_fresh_queued_batch_before_execution() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("fresh-queued-batch");
+        item.max_wait_ms = 0;
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let work_item_id = batch.items[0].id.clone();
+
+        run_translation_scheduler_once(state.as_ref(), test_worker_profile(2, "general"))
+            .await
+            .expect("scheduler tick skips fresh queued batch");
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT status, started_at, runtime_owner_id
+            FROM translation_batches
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load queued batch after skipped reclaim");
+        assert_eq!(batch_row.get::<String, _>("status"), "queued");
+        assert_eq!(batch_row.get::<Option<String>, _>("started_at"), None);
+        assert_eq!(batch_row.get::<Option<String>, _>("runtime_owner_id"), None);
+
+        let work_item_status: String = sqlx::query_scalar(
+            r#"
+            SELECT status
+            FROM translation_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind(work_item_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load work item after skipped reclaim");
+        assert_eq!(work_item_status, "batched");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-04-07
-- Last: 2026-04-07
+- Last: 2026-04-08
 
 ## 背景 / 问题陈述
 
@@ -121,8 +121,9 @@
 - sync 新写入的 release：后台同时预热 `翻译` 与 `智能` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
 - 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `智能整理中`。
+- queued batch recovery 只能接手**已经陈旧的遗留 batch**；刚创建、尚未进入执行阶段的 fresh batch 不能被第二个 scheduler tick 抢占重放。
 - 本地 SQLite 运行时必须允许 feed 首屏查询、心跳与可见区智能预加载并存；不能因为连接池过小而让智能预加载长时间饥饿，看起来像“没有自动生成”。
-- 翻译 tab 缺数据：用户首次切入该 tab 时展示呼吸态并按需生成。
+- 翻译 / 智能 tab 缺数据：用户首次切入该 tab 时仅在 lane 允许自动补算时展示呼吸态并按需生成；若 lane 已显式标记 `auto_translate=false`，tab 切换只能展示当前终态，不能偷偷再发一次无效请求。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
 - 智能 ready 内容必须是纯要点列表，不得退化为原文直译。
 
@@ -171,6 +172,14 @@
 - Given 调度器曾在 batch 已入库、但实际执行前中断
   When 服务重启后下一个 translation scheduler tick 到来
   Then 旧的 queued batch 会被重新接手并继续执行，卡片不会永久停在 `智能整理中`。
+
+- Given 一个 queued batch 刚被当前 worker 创建、但尚未进入执行阶段
+  When 另一个 scheduler tick 紧接着运行
+  Then 该 fresh queued batch 不会被当作遗留任务重复接手，避免同一批 work items 被并发重放。
+
+- Given 某个翻译或智能 lane 已明确返回 `auto_translate=false`
+  When 用户只是切换到对应 tab
+  Then 前端不会把 tab 切换当成新的自动补算信号，也不会静默发出明知无效的请求。
 
 - Given compare diff 拉取失败
   When smart 终态返回
