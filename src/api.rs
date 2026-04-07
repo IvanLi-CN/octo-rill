@@ -1779,7 +1779,7 @@ fn build_task_diagnostics(
     subscription_events: &[AdminSyncSubscriptionEventItem],
 ) -> Option<AdminTaskDiagnostics> {
     match task.task_type.as_str() {
-        jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+        jobs::TASK_TRANSLATE_RELEASE_BATCH | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let (business_outcome, diagnostics) =
                 build_translate_release_batch_diagnostics(task, events);
             Some(AdminTaskDiagnostics {
