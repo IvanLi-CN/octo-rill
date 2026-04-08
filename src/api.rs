@@ -7366,12 +7366,7 @@ async fn fetch_release_compare_digest(
             .await
             {
                 Ok(digest) => Ok(digest),
-                Err(public_err)
-                    if public_err.code() == "rate_limited" || public_err.code() == "forbidden" =>
-                {
-                    Err(public_err)
-                }
-                Err(_) => Err(github_private_repo_scope_required_error()),
+                Err(public_err) => Err(map_public_compare_fallback_error(auth_err, public_err)),
             }
         }
         Err(err) => Err(err),
@@ -7380,6 +7375,16 @@ async fn fetch_release_compare_digest(
 
 fn should_retry_public_compare_without_auth(err: &ApiError) -> bool {
     matches!(err.code(), "reauth_required" | "forbidden")
+}
+
+fn map_public_compare_fallback_error(auth_err: ApiError, public_err: ApiError) -> ApiError {
+    if public_err.code() == "rate_limited" || public_err.code() == "forbidden" {
+        return public_err;
+    }
+    if auth_err.code() == "reauth_required" {
+        return github_private_repo_scope_required_error();
+    }
+    auth_err
 }
 
 async fn summarize_release_smart_candidate_with_ai(
@@ -9456,7 +9461,8 @@ mod tests {
         github_reauth_required_error, guard_admin_user_update, has_repo_scope,
         last_active_is_stale, list_releases, llm_call_order_by_clause,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        mark_translation_requested, markdown_structure_preserved, me, normalize_translation_fields,
+        map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_positive_admin_concurrency, parse_release_id_param,
@@ -9470,6 +9476,7 @@ mod tests {
         translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
+    use crate::error::ApiError;
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
@@ -13193,6 +13200,27 @@ mod tests {
         assert!(!should_retry_public_compare_without_auth(
             &github_rate_limited_error(),
         ));
+    }
+
+    #[test]
+    fn public_compare_fallback_preserves_access_restricted_error_on_private_repo_failure() {
+        let auth_err = github_access_restricted_error();
+        let public_err = ApiError::new(StatusCode::NOT_FOUND, "not_found", "compare not found");
+        let mapped = map_public_compare_fallback_error(auth_err, public_err);
+        assert_eq!(mapped.code(), "forbidden");
+    }
+
+    #[test]
+    fn public_compare_fallback_maps_reauth_failure_to_private_scope_required() {
+        let auth_err = github_reauth_required_error();
+        let public_err = ApiError::new(StatusCode::NOT_FOUND, "not_found", "compare not found");
+        let mapped = map_public_compare_fallback_error(auth_err, public_err);
+        assert_eq!(mapped.code(), "reauth_required");
+        assert!(
+            mapped
+                .to_string()
+                .contains("private repository compare requires repo scope")
+        );
     }
 
     #[test]
