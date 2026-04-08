@@ -38,7 +38,7 @@ function smartErrorIsRetryable(error?: string | null) {
 
 type SmartResolveResponse = {
 	lang: string;
-	status: "ready" | "disabled";
+	status: "ready" | "disabled" | "insufficient";
 	title: string | null;
 	summary: string | null;
 };
@@ -115,12 +115,17 @@ function mapTranslationItemToFeedSmart(item: {
 function mapSmartToResolveResponse(
 	item: SmartItem | null,
 ): SmartResolveResponse | null {
-	if (!item || (item.status !== "ready" && item.status !== "disabled")) {
+	if (
+		!item ||
+		(item.status !== "ready" &&
+			item.status !== "disabled" &&
+			item.status !== "insufficient")
+	) {
 		return null;
 	}
 	return {
 		lang: "zh-CN",
-		status: item.status === "disabled" ? "disabled" : "ready",
+		status: item.status,
 		title: item.title,
 		summary: item.summary,
 	};
@@ -427,12 +432,13 @@ export function useAutoSmart(params: {
 			error?: unknown,
 		) => {
 			clearTask(candidate.key, task);
+			const mapped = mapSmartToResolveResponse(smart);
 			if (smart) {
 				onSmart({ kind: candidate.item.kind, id: candidate.item.id }, smart);
 			}
 			failedRef.current.add(candidate.key);
 			retryCountRef.current.delete(candidate.key);
-			settleTaskPromise(task, null, error);
+			settleTaskPromise(task, mapped, error);
 			scheduleViewportPlanRef.current();
 		},
 		[clearTask, onSmart, settleTaskPromise],

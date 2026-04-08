@@ -187,6 +187,10 @@
   When smart 终态返回
   Then smart lane 为 `error`，而不是 `insufficient`。
 
+- Given 用户在 `智能整理失败` 卡片上点击 `重试智能整理`
+  When 本次 smart 终态实际返回 `insufficient`
+  Then 卡片直接收敛为仅版本号折叠样式，不额外冒出全局 boot error。
+
 - Given 同一 release 同时存在 translated 与 smart 结果
   When feed 刷新
   Then 两者互不覆盖，分别保持独立缓存与状态。

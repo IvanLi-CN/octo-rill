@@ -24,6 +24,7 @@ type ApiOptions = {
 	autoTranslateResolveFailureCount?: number;
 	smartFeedCount?: number;
 	smartInitialReadyIds?: string[];
+	smartInitialErrorIds?: string[];
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	releaseDetailPendingPolls?: number;
 };
@@ -54,12 +55,14 @@ function makeAutoTranslateFeedItems(
 	options?: {
 		initialReadyIds?: string[];
 		smartInitialReadyIds?: string[];
+		smartInitialErrorIds?: string[];
 		autoTranslateDisabledIds?: string[];
 		withReactions?: boolean;
 	},
 ) {
 	const initialReadyIds = new Set(options?.initialReadyIds ?? []);
 	const smartInitialReadyIds = new Set(options?.smartInitialReadyIds ?? []);
+	const smartInitialErrorIds = new Set(options?.smartInitialErrorIds ?? []);
 	const autoTranslateDisabledIds = new Set(
 		options?.autoTranslateDisabledIds ?? [],
 	);
@@ -112,12 +115,20 @@ function makeAutoTranslateFeedItems(
 						summary: smartPayload.body_md,
 						auto_translate: true,
 					}
-				: {
-						lang: "zh-CN",
-						status: "missing",
-						title: null,
-						summary: null,
-					},
+				: smartInitialErrorIds.has(releaseId)
+					? {
+							lang: "zh-CN",
+							status: "error",
+							title: null,
+							summary: null,
+							auto_translate: false,
+						}
+					: {
+							lang: "zh-CN",
+							status: "missing",
+							title: null,
+							summary: null,
+						},
 			reactions: withReactions
 				? {
 						counts: {
@@ -298,6 +309,7 @@ async function installApiMocks(
 					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18, {
 							initialReadyIds: cfg.autoTranslateInitialReadyIds,
 							smartInitialReadyIds: cfg.smartInitialReadyIds,
+							smartInitialErrorIds: cfg.smartInitialErrorIds,
 							autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
 							withReactions: cfg.withAutoTranslateReactions,
 						})
@@ -829,6 +841,36 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 	).toHaveCount(0);
 	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
 	await expect(releaseCard.getByRole("button", { name: /👍/ })).toBeVisible();
+});
+
+test("feed smart retry treats insufficient result as a successful collapse", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartResolveStatuses: {
+			[releaseId]: "missing",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(page.getByText("智能整理失败", { exact: true })).toBeVisible();
+
+	await page.getByRole("button", { name: "重试智能整理" }).click();
+
+	await expect(page.getByText("no_valuable_version_info")).toHaveCount(0);
+	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
+	await expect(
+		page.getByRole("heading", { name: `Release ${releaseId}` }),
+	).toBeVisible();
+	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
 });
 
 test.describe("localized timestamps", () => {

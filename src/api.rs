@@ -7355,7 +7355,7 @@ async fn fetch_release_compare_digest(
     .await
     {
         Ok(digest) => Ok(digest),
-        Err(auth_err) if auth_err.code() == "reauth_required" => {
+        Err(auth_err) if should_retry_public_compare_without_auth(&auth_err) => {
             match fetch_release_compare_digest_request(
                 state,
                 repo_full_name,
@@ -7376,6 +7376,10 @@ async fn fetch_release_compare_digest(
         }
         Err(err) => Err(err),
     }
+}
+
+fn should_retry_public_compare_without_auth(err: &ApiError) -> bool {
+    matches!(err.code(), "reauth_required" | "forbidden")
 }
 
 async fn summarize_release_smart_candidate_with_ai(
@@ -9447,11 +9451,12 @@ mod tests {
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
         build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
-        feed_item_from_row, get_release_detail, github_graphql_errors_to_api_error,
-        github_graphql_http_error, guard_admin_user_update, has_repo_scope, last_active_is_stale,
-        list_releases, llm_call_order_by_clause, load_pending_access_sync_reason,
-        looks_like_json_blob, map_job_action_error, mark_translation_requested,
-        markdown_structure_preserved, me, normalize_translation_fields,
+        feed_item_from_row, get_release_detail, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_releases, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        mark_translation_requested, markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_positive_admin_concurrency, parse_release_id_param,
@@ -9460,9 +9465,9 @@ mod tests {
         preserve_chunk_trailing_newline, release_cache_entry_reusable, release_detail_source_hash,
         release_detail_translation_ready, release_excerpt, release_feed_body,
         release_reactions_status, require_active_user_id, resolve_release_full_name,
-        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_response_from_batch_item, upsert_translation,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use std::{fs, net::SocketAddr, sync::Arc};
@@ -13167,6 +13172,27 @@ mod tests {
         }];
         let err = github_graphql_errors_to_api_error(&errors).expect("expected mapped error");
         assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn public_compare_fallback_retries_on_reauth_required() {
+        assert!(should_retry_public_compare_without_auth(
+            &github_reauth_required_error(),
+        ));
+    }
+
+    #[test]
+    fn public_compare_fallback_retries_on_access_restricted() {
+        assert!(should_retry_public_compare_without_auth(
+            &github_access_restricted_error(),
+        ));
+    }
+
+    #[test]
+    fn public_compare_fallback_skips_other_terminal_errors() {
+        assert!(!should_retry_public_compare_without_auth(
+            &github_rate_limited_error(),
+        ));
     }
 
     #[test]
