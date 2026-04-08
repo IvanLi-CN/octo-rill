@@ -17,6 +17,7 @@ type ApiOptions = {
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
 	withAutoTranslateReactions?: boolean;
+	aiDisabledFeed?: boolean;
 	autoTranslateFeedCount?: number;
 	autoTranslateInitialReadyIds?: string[];
 	autoTranslateDisabledIds?: string[];
@@ -57,6 +58,7 @@ function makeAutoTranslateFeedItems(
 		smartInitialReadyIds?: string[];
 		smartInitialErrorIds?: string[];
 		autoTranslateDisabledIds?: string[];
+		aiDisabled?: boolean;
 		withReactions?: boolean;
 	},
 ) {
@@ -66,6 +68,7 @@ function makeAutoTranslateFeedItems(
 	const autoTranslateDisabledIds = new Set(
 		options?.autoTranslateDisabledIds ?? [],
 	);
+	const aiDisabled = options?.aiDisabled === true;
 	const withReactions = options?.withReactions === true;
 	return Array.from({ length: count }, (_, index) => {
 		const releaseId = makeAutoTranslateReleaseId(index);
@@ -90,45 +93,59 @@ function makeAutoTranslateFeedItems(
 			subject_type: null,
 			html_url: `https://github.com/owner/repo/releases/tag/v${releaseId}`,
 			unread: null,
-			translated: initialReady
+			translated: aiDisabled
 				? {
 						lang: "zh-CN",
-						status: "ready",
-						title: readyPayload.title_zh,
-						summary: readyPayload.summary_md,
-						auto_translate: true,
-					}
-				: {
-						lang: "zh-CN",
-						status: "missing",
+						status: "disabled",
 						title: null,
 						summary: null,
-						...(autoTranslateDisabledIds.has(releaseId)
-							? { auto_translate: false }
-							: {}),
-					},
-			smart: smartReady
-				? {
-						lang: "zh-CN",
-						status: "ready",
-						title: smartPayload.title_zh,
-						summary: smartPayload.body_md,
-						auto_translate: true,
 					}
-				: smartInitialErrorIds.has(releaseId)
+				: initialReady
 					? {
 							lang: "zh-CN",
-							status: "error",
-							title: null,
-							summary: null,
-							auto_translate: false,
+							status: "ready",
+							title: readyPayload.title_zh,
+							summary: readyPayload.summary_md,
+							auto_translate: true,
 						}
 					: {
 							lang: "zh-CN",
 							status: "missing",
 							title: null,
 							summary: null,
+							...(autoTranslateDisabledIds.has(releaseId)
+								? { auto_translate: false }
+								: {}),
 						},
+			smart: aiDisabled
+				? {
+						lang: "zh-CN",
+						status: "disabled",
+						title: null,
+						summary: null,
+					}
+				: smartReady
+					? {
+							lang: "zh-CN",
+							status: "ready",
+							title: smartPayload.title_zh,
+							summary: smartPayload.body_md,
+							auto_translate: true,
+						}
+					: smartInitialErrorIds.has(releaseId)
+						? {
+								lang: "zh-CN",
+								status: "error",
+								title: null,
+								summary: null,
+								auto_translate: false,
+							}
+						: {
+								lang: "zh-CN",
+								status: "missing",
+								title: null,
+								summary: null,
+							},
 			reactions: withReactions
 				? {
 						counts: {
@@ -311,6 +328,7 @@ async function installApiMocks(
 							smartInitialReadyIds: cfg.smartInitialReadyIds,
 							smartInitialErrorIds: cfg.smartInitialErrorIds,
 							autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
+							aiDisabled: cfg.aiDisabledFeed,
 							withReactions: cfg.withAutoTranslateReactions,
 						})
 					: [];
@@ -758,6 +776,195 @@ test("feed smart lane auto generates for visible cards by default", async ({
 		page.getByText("智能总结 release 20001 的主要版本变化。", {
 			exact: true,
 		}),
+	).toBeVisible();
+});
+
+test("feed page default selector switches current cards and persists after reload", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateInitialReadyIds: [releaseId],
+		smartInitialReadyIds: [releaseId],
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(
+		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+	).toBeVisible();
+
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
+
+	await page.reload();
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
+});
+
+test("feed persisted translated page default replays on-demand translation after reload", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateDisabledIds: [releaseId],
+		smartInitialReadyIds: [releaseId],
+	});
+
+	await page.addInitScript(() => {
+		window.localStorage.setItem(
+			"octo-rill.dashboard.releaseDefaultLane",
+			"translated",
+		);
+	});
+
+	await page.goto("/?tab=releases");
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_summary") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
+});
+
+test("feed page default selector triggers on-demand translation for manual lanes", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateDisabledIds: [releaseId],
+		smartInitialReadyIds: [releaseId],
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(
+		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+	).toBeVisible();
+
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
+	expect(
+		tracker.translationResolveRequests.some(
+			(request) =>
+				request.kinds.every((kind) => kind === "release_summary") &&
+				request.entityIds.includes(releaseId),
+		),
+	).toBe(true);
+});
+
+test("feed page default selector shows original when AI lanes are unavailable", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		aiDisabledFeed: true,
+	});
+
+	await page.addInitScript(() => {
+		window.localStorage.setItem(
+			"octo-rill.dashboard.releaseDefaultLane",
+			"smart",
+		);
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("button", { name: "原文" })).toHaveAttribute(
+		"aria-pressed",
+		"true",
+	);
+	await expect(page.getByRole("button", { name: "智能" })).toHaveAttribute(
+		"aria-pressed",
+		"false",
+	);
+	await expect(page.getByText("AI 未配置，将只显示原文")).toBeVisible();
+	await expect(
+		page.getByRole("heading", { name: "Release 20001" }),
+	).toBeVisible();
+});
+
+test("feed page default prefetch stays idle outside release tabs", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateDisabledIds: [releaseId],
+	});
+
+	await page.addInitScript(() => {
+		window.localStorage.setItem(
+			"octo-rill.dashboard.releaseDefaultLane",
+			"translated",
+		);
+	});
+
+	await page.goto("/?tab=inbox");
+	await expect(page.getByRole("tab", { name: "Inbox" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await page.waitForTimeout(500);
+	expect(
+		tracker.translationResolveRequests.some((request) =>
+			request.entityIds.includes(releaseId),
+		),
+	).toBe(false);
+});
+
+test("feed smart loading keeps original body visible while the smart option pulses", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+	});
+	let releaseSmartResults: (() => void) | null = null;
+	const releaseSmartResultsReady = new Promise<void>((resolve) => {
+		releaseSmartResults = resolve;
+	});
+	await page.route("**/api/translate/results", async (route) => {
+		const body = route.request().postDataJSON() as {
+			items?: Array<{ kind?: string }>;
+		};
+		if (body.items?.some((item) => item.kind === "release_smart")) {
+			await releaseSmartResultsReady;
+		}
+		await route.fallback();
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(
+		page.getByText("lane 1 keeps current-screen work first", { exact: false }),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-feed-lane-trigger="smart"]').first(),
+	).toHaveAttribute("data-feed-lane-loading", "true");
+	releaseSmartResults?.();
+	await expect(
+		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
 	).toBeVisible();
 });
 

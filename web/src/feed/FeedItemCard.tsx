@@ -11,6 +11,12 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
 import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
@@ -27,24 +33,6 @@ const REACTION_ITEMS: Array<{
 	{ content: "rocket", emoji: "🚀", label: "火箭" },
 	{ content: "eyes", emoji: "👀", label: "关注" },
 ];
-
-function GeneratingPanel(props: { label: string }) {
-	const { label } = props;
-	return (
-		<div
-			data-feed-generating-panel={label}
-			className="rounded-xl border border-dashed bg-muted/20 p-4"
-		>
-			<span className="sr-only">{label}</span>
-			<div className="animate-pulse space-y-2">
-				<div className="h-3 w-28 rounded bg-muted" />
-				<div className="h-3 w-full rounded bg-muted" />
-				<div className="h-3 w-11/12 rounded bg-muted" />
-				<div className="h-3 w-8/12 rounded bg-muted" />
-			</div>
-		</div>
-	);
-}
 
 function EmptyPanel(props: {
 	title: string;
@@ -107,15 +95,8 @@ function OriginalLane(props: { item: FeedItem }) {
 	);
 }
 
-function TranslatedLane(props: {
-	item: FeedItem;
-	isTranslating: boolean;
-	onTranslateNow: () => void;
-}) {
-	const { item, isTranslating, onTranslateNow } = props;
-	if (isTranslating) {
-		return <GeneratingPanel label="翻译生成中" />;
-	}
+function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
+	const { item, onTranslateNow } = props;
 
 	if (item.translated?.status === "ready" && item.translated.summary?.trim()) {
 		return <Markdown content={item.translated.summary} />;
@@ -150,25 +131,11 @@ function TranslatedLane(props: {
 		);
 	}
 
-	return (
-		<EmptyPanel
-			title="还没有翻译结果"
-			description="切到这个 tab 后会按需生成中文译文。"
-			actionLabel="生成翻译"
-			onAction={onTranslateNow}
-		/>
-	);
+	return <OriginalLane item={item} />;
 }
 
-function SmartLane(props: {
-	item: FeedItem;
-	isSmartGenerating: boolean;
-	onSmartNow: () => void;
-}) {
-	const { item, isSmartGenerating, onSmartNow } = props;
-	if (isSmartGenerating) {
-		return <GeneratingPanel label="智能整理中" />;
-	}
+function SmartLane(props: { item: FeedItem; onSmartNow: () => void }) {
+	const { item, onSmartNow } = props;
 
 	if (item.smart?.status === "ready" && item.smart.summary?.trim()) {
 		return <Markdown content={item.smart.summary} />;
@@ -194,13 +161,58 @@ function SmartLane(props: {
 		);
 	}
 
+	return <OriginalLane item={item} />;
+}
+
+function FeedCardLaneTabs(props: {
+	activeLane: FeedLane;
+	isTranslating: boolean;
+	isSmartGenerating: boolean;
+}) {
+	const { activeLane, isTranslating, isSmartGenerating } = props;
+
 	return (
-		<EmptyPanel
-			title="还没有智能版本变化摘要"
-			description="这里会生成更适合快速了解版本变化的中文要点列表。"
-			actionLabel="生成智能版"
-			onAction={onSmartNow}
-		/>
+		<TabsList className="h-8 shrink-0 gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm">
+			{FEED_LANE_OPTIONS.map((option) => {
+				const Icon = option.icon;
+				const active = option.lane === activeLane;
+				const isLoading =
+					(option.lane === "translated" && isTranslating) ||
+					(option.lane === "smart" && isSmartGenerating);
+				const loadingClass = isLoading
+					? active
+						? "animate-pulse ring-2 ring-foreground/15 ring-offset-1 ring-offset-background"
+						: "animate-pulse text-foreground/60 ring-1 ring-primary/20"
+					: null;
+				return (
+					<Tooltip key={option.lane}>
+						<TooltipTrigger asChild>
+							<TabsTrigger
+								value={option.lane}
+								aria-label={option.label}
+								title={option.label}
+								data-feed-lane-trigger={option.lane}
+								data-active={active ? "true" : "false"}
+								data-feed-lane-loading={isLoading ? "true" : "false"}
+								className={cn(
+									"h-7 w-7 flex-none rounded-full border px-0 shadow-none transition-all",
+									active
+										? "border-foreground bg-foreground text-background shadow-sm hover:bg-foreground hover:text-background"
+										: "border-transparent text-foreground/30 hover:text-foreground/60",
+									loadingClass,
+								)}
+							>
+								<Icon className="size-3.25" />
+								<span className="sr-only">{option.label}</span>
+							</TabsTrigger>
+						</TooltipTrigger>
+						<TooltipContent side="top" sideOffset={6}>
+							{option.label}
+						</TooltipContent>
+					</Tooltip>
+				);
+			})}
+		</TabsList>
 	);
 }
 
@@ -273,26 +285,11 @@ export function FeedItemCard(props: {
 
 				<div className="flex flex-wrap items-center gap-2 sm:justify-end">
 					{isVersionOnly ? null : (
-						<TabsList className="h-auto shrink-0 rounded-full bg-muted/45 p-1">
-							<TabsTrigger
-								value="original"
-								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
-							>
-								原文
-							</TabsTrigger>
-							<TabsTrigger
-								value="translated"
-								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
-							>
-								翻译
-							</TabsTrigger>
-							<TabsTrigger
-								value="smart"
-								className="h-7 flex-none rounded-full px-3 font-mono text-xs shadow-none data-[state=active]:shadow-sm"
-							>
-								智能
-							</TabsTrigger>
-						</TabsList>
+						<FeedCardLaneTabs
+							activeLane={activeLane}
+							isTranslating={isTranslating}
+							isSmartGenerating={isSmartGenerating}
+						/>
 					)}
 
 					<Button
@@ -380,18 +377,10 @@ export function FeedItemCard(props: {
 							<OriginalLane item={item} />
 						</TabsContent>
 						<TabsContent value="translated" className="mt-0">
-							<TranslatedLane
-								item={item}
-								isTranslating={isTranslating}
-								onTranslateNow={onTranslateNow}
-							/>
+							<TranslatedLane item={item} onTranslateNow={onTranslateNow} />
 						</TabsContent>
 						<TabsContent value="smart" className="mt-0">
-							<SmartLane
-								item={item}
-								isSmartGenerating={isSmartGenerating}
-								onSmartNow={onSmartNow}
-							/>
+							<SmartLane item={item} onSmartNow={onSmartNow} />
 						</TabsContent>
 					</CardContent>
 				</Tabs>
