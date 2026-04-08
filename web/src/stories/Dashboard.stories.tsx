@@ -16,6 +16,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
+import {
+	DEFAULT_PAGE_LANE,
+	resolveDisplayLaneForFeed,
+	resolvePreferredLaneForItem,
+} from "@/feed/laneOptions";
 import type { FeedItem, FeedLane } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -53,11 +59,11 @@ function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
-function defaultLaneForItem(item: FeedItem): FeedLane {
-	if (item.smart?.status === "disabled") {
-		return "original";
-	}
-	return "smart";
+function defaultLaneForItem(
+	item: FeedItem,
+	pageDefaultLane: FeedLane,
+): FeedLane {
+	return resolvePreferredLaneForItem(item, pageDefaultLane);
 }
 
 function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
@@ -616,6 +622,12 @@ function DashboardPreview(props: {
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
+	const [pageDefaultLane, setPageDefaultLane] =
+		useState<FeedLane>(DEFAULT_PAGE_LANE);
+	const effectivePageDefaultLane = resolveDisplayLaneForFeed(
+		items,
+		pageDefaultLane,
+	);
 	const [selectedDate, setSelectedDate] = useState<string | null>(
 		briefs[0]?.date ?? null,
 	);
@@ -696,7 +708,8 @@ function DashboardPreview(props: {
 				selectedLaneByKey={Object.fromEntries(
 					items.map((item) => [
 						feedItemKey(item),
-						selectedLaneByKey[feedItemKey(item)] ?? defaultLaneForItem(item),
+						selectedLaneByKey[feedItemKey(item)] ??
+							defaultLaneForItem(item, pageDefaultLane),
 					]),
 				)}
 				onSelectLane={(item, lane) =>
@@ -756,6 +769,15 @@ function DashboardPreview(props: {
 						</TabsTrigger>
 					</TabsList>
 					<div className="flex items-center gap-2">
+						{tab === "all" || tab === "releases" ? (
+							<FeedPageLaneSelector
+								value={effectivePageDefaultLane}
+								onValueChange={(lane) => {
+									setPageDefaultLane(lane);
+									setSelectedLaneByKey({});
+								}}
+							/>
+						) : null}
 						<Button
 							variant="outline"
 							size="sm"
@@ -1437,17 +1459,50 @@ export const SmartLoading: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "智能 tab 缺数据时显示呼吸态骨架，不额外暴露内部分析流程。",
+				story:
+					"智能 tab 缺数据时，正文继续回退显示原文，加载状态仅通过卡片内智能选项的呼吸效果表达。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByRole("heading", { name: "v5.2.0" })).toBeVisible();
-		const generatingPanel = canvasElement.querySelector(
-			'[data-feed-generating-panel="智能整理中"]',
+		await expect(
+			canvas.getByText(/Placeholder body for smart loading state/),
+		).toBeVisible();
+		const smartTrigger = canvasElement.querySelector(
+			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);
-		expect(generatingPanel).not.toBeNull();
+		expect(smartTrigger).not.toBeNull();
+	},
+};
+
+export const PageDefaultLaneSwitching: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "default",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"页面级默认显示模式切换器会立即切换当前 release feed 的所有卡片；之后仍允许单卡再单独覆盖。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		await canvas.getByRole("button", { name: "翻译" }).click();
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
+		).toBeVisible();
+		await canvas.getByRole("button", { name: "原文" }).click();
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0" }),
+		).toBeVisible();
 	},
 };
 

@@ -17,11 +17,14 @@
 ### Goals
 
 - Release feed 卡片改为 `原文 / 翻译 / 智能` 三 tabs。
-- AI 可用时默认打开 `智能`；缺数据时进入可见区即展示呼吸态并自动生成。
+- 顶部新增页面级默认显示模式控制器（原文 / 翻译 / 智能），用于决定当前 release feed 的全局默认阅读 lane，并持久化到浏览器。
+- AI 可用时页面级默认显示模式优先为 `智能`；缺数据时进入可见区即自动生成。
 - 新 release 在 sync 流程完成后，`智能` 需像 `翻译` 一样走后台预生成，优先命中缓存而不是等首次可见时才补算。
 - `智能` 内容专门服务于“帮助快速理解版本变化”，输出纯要点列表，不做长段落直译。
 - 智能工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 按需拉 compare diff`，`仍无价值 -> 折叠为仅版本号卡片`。
 - 新增独立的 `release_smart` 调度/缓存语义，与现有 release 翻译缓存隔离。
+- 卡片内 lane selector 改为 icon-only，但保留 tooltip 与可访问标签。
+- 当 `翻译` / `智能` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
 - 为 UI 改动补齐 Storybook 场景、视觉证据和回归测试，并推进到 PR merge-ready。
 
 ### Non-goals
@@ -36,10 +39,11 @@
 ### In scope
 
 - Dashboard release card header tabs 与卡片正文状态机。
+- Dashboard 顶部页面级 lane selector、`localStorage` 持久化与“立即切全页”切换语义。
 - `release_smart` 的请求校验、缓存映射、批处理解析与 `/api/feed` smart lane。
 - release body -> diff fallback -> insufficient collapse 的 LLM 工作流。
 - compare diff 的按需精简 payload builder。
-- 翻译 tab 的按需生成态与呼吸态。
+- 翻译 / 智能 lane 的原文回退展示与 option 呼吸态。
 - 仅版本号折叠卡片样式。
 - 本地 SQLite 运行时稳定性修复，避免 smart/translation 后台任务把桌面预览拖进 `database is locked` 自锁状态。
 - Storybook 状态覆盖、Playwright 回归、spec visual evidence。
@@ -117,8 +121,12 @@
 
 ## 前端行为规格
 
-- 默认 tab：AI 可用时优先 `智能`；AI disabled 时回退 `原文`。
-- 智能 tab 缺数据：卡片进入可见区后自动展示呼吸态并排队生成。
+- 顶部新增页面级默认显示模式控制器，仅作用于 `全部` / `Releases` 两个含 release feed 的顶层 tab。
+- 页面级默认显示模式持久化到 `localStorage`：`octo-rill.dashboard.releaseDefaultLane`；默认值为 `智能`，AI disabled 或 lane 不可用时按既有保护回退到 `原文`。
+- 页面级控制器切换时，当前已渲染的 release 卡片立即切到新 lane；切换后用户仍可通过单卡 selector 临时覆盖。
+- 页面级控制器切换到 `翻译` / `智能` 时，需要沿用单卡 selector 的按需生成语义：对当前 feed 中仍为 `missing` 的卡片立即触发对应请求，避免整页切换后长期停留在原文回退态。
+- 卡片内 selector 改为 icon-only；hover / focus 通过 tooltip 与 `aria-label` 暴露 `原文 / 翻译 / 智能`。
+- 智能 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
 - sync 新写入的 release：后台同时预热 `翻译` 与 `智能` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
 - 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
@@ -133,7 +141,11 @@
 
 - Given AI 可用且 release smart 结果缺失
   When 用户打开 release feed 且卡片进入可见区
-  Then 默认进入 `智能` tab，正文区立即显示呼吸态，并自动发起 `release_smart` 请求。
+  Then 页面级默认显示模式为 `智能`，卡片正文继续显示原文，`智能` option 显示呼吸态，并自动发起 `release_smart` 请求。
+
+- Given 用户在 `全部` 或 `Releases` 顶部切换页面级默认显示模式
+  When 用户选择 `原文` / `翻译` / `智能`
+  Then 当前已渲染的 release 卡片会立即切换到对应 lane；若目标 lane 仍缺数据，则沿用单卡 selector 的按需生成逻辑，刷新页面后仍沿用同一默认值。
 
 - Given sync 刚写入新的 release 且 AI 可用
   When 后台预热任务入队
@@ -153,7 +165,7 @@
 
 - Given 用户点击 `翻译` tab 且当前没有翻译结果
   When tab 切换完成
-  Then 卡片正文区显示呼吸态，随后回填翻译结果。
+  Then 卡片正文区继续显示原文，`翻译` option 进入呼吸态，随后回填翻译结果。
 
 - Given release 正文可直接说明版本变化
   When smart 生成完成
@@ -210,7 +222,19 @@
 - [x] M3: 前端三 tabs、呼吸态、折叠卡片与 on-demand 生成完成。
 - [ ] M4: Storybook / Playwright / visual evidence / PR merge-ready 收敛完成。
 
+## Change log
+
+- 2026-04-08：补齐页面级默认 lane selector、单卡 icon-only selector，以及翻译 / 智能加载时继续显示原文的交互口径与视觉证据。
+- 2026-04-08：补齐页面级切换复用单卡按需生成逻辑，并收紧 segmented selector 的选中 / 加载态层级。
+
 ## Visual Evidence
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/PageDefaultLaneSwitching`
+  state: `page-default-lane-switching`
+  evidence_note: 验证顶部页面级默认显示模式切换器采用图标+文本，切到 `翻译` 后当前 release feed 立即统一切换，同时卡片内 selector 已收敛为 icon-only。
+
+  ![页面级默认显示模式切换](./assets/release-page-default-lane-switching.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartReadyBody`
@@ -229,9 +253,9 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartLoading`
   state: `smart-loading`
-  evidence_note: 验证智能 lane 缺数据时立即进入呼吸态骨架，不在界面直接暴露内部分析流程。
+  evidence_note: 验证智能 lane 缺数据时正文继续显示原文，同时仅通过 selector option 的呼吸态表达加载状态，不再把正文区替换成空白加载面板。
 
-  ![智能总结生成中](./assets/release-smart-loading-focused.png)
+  ![智能总结加载时保留原文](./assets/release-smart-loading-original-fallback.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartInsufficient`
