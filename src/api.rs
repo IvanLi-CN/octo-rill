@@ -1779,7 +1779,7 @@ fn build_task_diagnostics(
     subscription_events: &[AdminSyncSubscriptionEventItem],
 ) -> Option<AdminTaskDiagnostics> {
     match task.task_type.as_str() {
-        jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+        jobs::TASK_TRANSLATE_RELEASE_BATCH | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let (business_outcome, diagnostics) =
                 build_translate_release_batch_diagnostics(task, events);
             Some(AdminTaskDiagnostics {
@@ -3855,6 +3855,7 @@ pub struct FeedItem {
     html_url: Option<String>,
     unread: Option<i64>,
     translated: Option<TranslatedItem>,
+    smart: Option<SmartItem>,
     reactions: Option<ReleaseReactions>,
 }
 
@@ -3862,6 +3863,16 @@ pub struct FeedItem {
 pub struct TranslatedItem {
     lang: String,
     status: String, // ready | missing | disabled | error
+    title: Option<String>,
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_translate: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SmartItem {
+    lang: String,
+    status: String, // ready | missing | disabled | error | insufficient
     title: Option<String>,
     summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3905,6 +3916,8 @@ struct FeedRow {
     release_id: Option<i64>,
     release_node_id: Option<String>,
     repo_full_name: Option<String>,
+    release_tag_name: Option<String>,
+    release_previous_tag_name: Option<String>,
     title: Option<String>,
     subtitle: Option<String>,
     reason: Option<String>,
@@ -3923,6 +3936,12 @@ struct FeedRow {
     trans_title: Option<String>,
     trans_summary: Option<String>,
     trans_work_status: Option<String>,
+    smart_source_hash: Option<String>,
+    smart_status: Option<String>,
+    smart_title: Option<String>,
+    smart_summary: Option<String>,
+    smart_error_text: Option<String>,
+    smart_work_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4069,6 +4088,14 @@ fn github_reauth_required_error() -> ApiError {
         StatusCode::FORBIDDEN,
         "reauth_required",
         "repo scope required; re-login via GitHub OAuth",
+    )
+}
+
+fn github_private_repo_scope_required_error() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "reauth_required",
+        "private repository compare requires repo scope; re-login via GitHub OAuth",
     )
 }
 
@@ -4314,44 +4341,85 @@ async fn fetch_feed_releases(
         WITH items AS (
           SELECT
             'release' AS kind,
-            COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
-            COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
-            printf('%020d', r.release_id) AS id_key,
-            CAST(r.release_id AS TEXT) AS entity_id,
-            r.release_id AS release_id,
-            r.node_id AS release_node_id,
-            sr.full_name AS repo_full_name,
-            COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
-            NULL AS subtitle,
-            NULL AS reason,
-            NULL AS subject_type,
-            r.html_url AS html_url,
-            NULL AS unread,
-            r.body AS release_body,
-            r.react_plus1 AS react_plus1,
-            r.react_laugh AS react_laugh,
-            r.react_heart AS react_heart,
-            r.react_hooray AS react_hooray,
-            r.react_rocket AS react_rocket,
-            r.react_eyes AS react_eyes
-          FROM repo_releases r
-          JOIN starred_repos sr
-            ON sr.user_id = ? AND sr.repo_id = r.repo_id
+            sort_ts,
+            ts,
+            id_key,
+            entity_id,
+            release_id,
+            release_node_id,
+            repo_full_name,
+            release_tag_name,
+            release_previous_tag_name,
+            title,
+            subtitle,
+            reason,
+            subject_type,
+            html_url,
+            unread,
+            release_body,
+            react_plus1,
+            react_laugh,
+            react_heart,
+            react_hooray,
+            react_rocket,
+            react_eyes
+          FROM (
+            SELECT
+              COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts,
+              COALESCE(r.published_at, r.created_at, r.updated_at) AS ts,
+              printf('%020d', r.release_id) AS id_key,
+              CAST(r.release_id AS TEXT) AS entity_id,
+              r.release_id AS release_id,
+              r.node_id AS release_node_id,
+              sr.full_name AS repo_full_name,
+              r.tag_name AS release_tag_name,
+              LAG(r.tag_name) OVER (
+                PARTITION BY r.repo_id
+                ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
+              ) AS release_previous_tag_name,
+              COALESCE(NULLIF(TRIM(r.name), ''), r.tag_name) AS title,
+              NULL AS subtitle,
+              NULL AS reason,
+              NULL AS subject_type,
+              r.html_url AS html_url,
+              NULL AS unread,
+              r.body AS release_body,
+              r.react_plus1 AS react_plus1,
+              r.react_laugh AS react_laugh,
+              r.react_heart AS react_heart,
+              r.react_hooray AS react_hooray,
+              r.react_rocket AS react_rocket,
+              r.react_eyes AS react_eyes
+            FROM repo_releases r
+            JOIN starred_repos sr
+              ON sr.user_id = ? AND sr.repo_id = r.repo_id
+          )
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
-          i.repo_full_name, i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
+          i.repo_full_name, i.release_tag_name, i.release_previous_tag_name,
+          i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
           i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
           t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary,
-          tw.status AS trans_work_status
+          tw.status AS trans_work_status,
+          s.source_hash AS smart_source_hash,
+          s.status AS smart_status,
+          s.title AS smart_title,
+          s.summary AS smart_summary,
+          s.error_text AS smart_error_text,
+          sw.status AS smart_work_status
         FROM items i
         LEFT JOIN ai_translations t
           ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
+        LEFT JOIN ai_translations s
+          ON s.user_id = ? AND s.entity_type = 'release_smart' AND s.entity_id = i.entity_id AND s.lang = 'zh-CN' AND s.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items sw
+          ON sw.id = s.active_work_item_id
     "#;
 
     let (sql, has_cursor) = if cursor.is_some() {
@@ -4383,6 +4451,7 @@ async fn fetch_feed_releases(
     };
 
     let mut qy = sqlx::query_as::<_, FeedRow>(&sql)
+        .bind(user_id)
         .bind(user_id)
         .bind(user_id);
     if has_cursor {
@@ -4656,6 +4725,8 @@ async fn persist_release_reaction_counts(
     Ok(())
 }
 
+const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
+
 fn translated_terminal_item(status: &str) -> Option<TranslatedItem> {
     match status {
         "disabled" => Some(TranslatedItem {
@@ -4704,6 +4775,76 @@ fn translated_missing_item(auto_translate: bool) -> TranslatedItem {
     }
 }
 
+fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartItem> {
+    match status {
+        "disabled" => Some(SmartItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: None,
+        }),
+        "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => Some(SmartItem {
+            lang: "zh-CN".to_owned(),
+            status: "insufficient".to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: Some(false),
+        }),
+        "error" if smart_error_is_retryable(error_text) => Some(smart_missing_item(Some(true))),
+        "missing" | "error" => Some(SmartItem {
+            lang: "zh-CN".to_owned(),
+            status: status.to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: Some(false),
+        }),
+        _ => None,
+    }
+}
+
+fn smart_ready_item(
+    raw_title: Option<String>,
+    raw_summary: Option<String>,
+    auto_translate: Option<bool>,
+) -> Option<SmartItem> {
+    let (title, summary) = normalize_translation_fields(raw_title, raw_summary);
+    summary.as_ref()?;
+    Some(SmartItem {
+        lang: "zh-CN".to_owned(),
+        status: "ready".to_owned(),
+        title,
+        summary,
+        auto_translate,
+    })
+}
+
+fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
+    SmartItem {
+        lang: "zh-CN".to_owned(),
+        status: "missing".to_owned(),
+        title: None,
+        summary: None,
+        auto_translate,
+    }
+}
+
+fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
+    let Some(raw) = error_text else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    normalized.contains("runtime_lease_expired")
+        || normalized.contains("repo scope required; re-login via github oauth")
+        || normalized.contains("database is locked")
+        || normalized.contains("busy")
+        || normalized.contains("timed out")
+        || normalized.contains("timeout")
+        || normalized.contains("temporarily unavailable")
+        || normalized.contains("connection reset")
+        || normalized.contains("connection refused")
+}
+
 fn feed_item_from_row(
     r: FeedRow,
     ai_enabled: bool,
@@ -4731,6 +4872,18 @@ fn feed_item_from_row(
             r.title.as_deref().unwrap_or(""),
             r.reason.as_deref().unwrap_or(""),
             r.subject_type.as_deref().unwrap_or(""),
+        ),
+        _ => String::new(),
+    };
+
+    let smart_current_hash = match r.kind.as_str() {
+        "release" => crate::translations::release_smart_feed_source_hash(
+            r.entity_id.as_str(),
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            body.as_deref(),
+            r.release_tag_name.as_deref().unwrap_or(""),
+            r.release_previous_tag_name.as_deref(),
         ),
         _ => String::new(),
     };
@@ -4803,6 +4956,42 @@ fn feed_item_from_row(
         }
     };
 
+    let smart = if !ai_enabled {
+        Some(SmartItem {
+            lang: "zh-CN".to_owned(),
+            status: "disabled".to_owned(),
+            title: None,
+            summary: None,
+            auto_translate: None,
+        })
+    } else {
+        let refresh_in_flight = r.smart_source_hash.as_deref() != Some(smart_current_hash.as_str())
+            && r.smart_status.as_deref() == Some("ready")
+            && matches!(
+                r.smart_work_status.as_deref(),
+                Some("queued" | "batched" | "running")
+            );
+        if r.smart_source_hash.as_deref() == Some(smart_current_hash.as_str()) {
+            if let Some(status) = r.smart_status.as_deref()
+                && status != "ready"
+            {
+                smart_terminal_item(status, r.smart_error_text.as_deref())
+            } else {
+                let ready = smart_ready_item(r.smart_title.clone(), r.smart_summary.clone(), None);
+                if ready.is_none() {
+                    Some(smart_missing_item(None))
+                } else {
+                    ready
+                }
+            }
+        } else if refresh_in_flight {
+            smart_ready_item(r.smart_title.clone(), r.smart_summary.clone(), Some(true))
+                .or_else(|| Some(smart_missing_item(Some(false))))
+        } else {
+            Some(smart_missing_item(None))
+        }
+    };
+
     let status = release_reactions_status(&r);
     let mut counts = release_counts_from_row(&r);
     let mut viewer = ReleaseReactionViewer::default();
@@ -4825,6 +5014,7 @@ fn feed_item_from_row(
         html_url: r.html_url,
         unread: r.unread,
         translated,
+        smart,
         reactions: Some(ReleaseReactions {
             counts,
             viewer,
@@ -6783,6 +6973,880 @@ pub async fn translate_releases_batch_for_user(
     Ok(TranslateBatchResponse { items })
 }
 
+#[derive(Debug, Clone)]
+struct ReleaseSmartBatchCandidate {
+    release_id: i64,
+    entity_id: String,
+    full_name: String,
+    tag_name: String,
+    previous_tag_name: Option<String>,
+    title: String,
+    body: String,
+    source_hash: String,
+}
+
+#[derive(Debug)]
+struct PreparedReleaseSmartBatch {
+    candidates: Vec<ReleaseSmartBatchCandidate>,
+    pending: Vec<ReleaseSmartBatchCandidate>,
+    smart: HashMap<i64, (Option<String>, Option<String>)>,
+    terminal: HashMap<i64, ReleaseBatchTerminalState>,
+    missing: HashSet<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseSmartBatchSourceRow {
+    release_id: i64,
+    full_name: String,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    previous_tag_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseSmartSummaryPayload {
+    valuable: bool,
+    title_zh: Option<String>,
+    summary_bullets: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCompareResponse {
+    status: Option<String>,
+    ahead_by: Option<i64>,
+    behind_by: Option<i64>,
+    total_commits: Option<i64>,
+    commits: Vec<GitHubCompareCommit>,
+    files: Vec<GitHubCompareFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCompareCommit {
+    sha: String,
+    commit: GitHubCompareCommitDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCompareCommitDetail {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubCompareFile {
+    filename: String,
+    status: Option<String>,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    changes: Option<i64>,
+    patch: Option<String>,
+}
+
+fn value_as_bool(raw: &serde_json::Value) -> Option<bool> {
+    raw.as_bool().or_else(|| match raw.as_str()?.trim() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => None,
+    })
+}
+
+fn sanitize_smart_bullet_text(raw: &str) -> String {
+    let normalized = raw.replace(['\r', '\n'], " ");
+    let mut out = Vec::new();
+    for token in normalized.split_whitespace() {
+        let candidate = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                ')' | '(' | '[' | ']' | '<' | '>' | ',' | ';' | '"' | '\'' | '.'
+            )
+        });
+        if candidate.starts_with("https://") || candidate.starts_with("http://") {
+            continue;
+        }
+        out.push(token.to_owned());
+    }
+    out.join(" ").trim().to_owned()
+}
+
+fn render_smart_summary_markdown(bullets: &[String]) -> Option<String> {
+    let lines = bullets
+        .iter()
+        .map(|bullet| sanitize_smart_bullet_text(bullet))
+        .map(|bullet| bullet.trim().to_owned())
+        .filter(|bullet| !bullet.is_empty())
+        .take(4)
+        .map(|bullet| format!("- {bullet}"))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn parse_release_smart_summary_payload(raw: &str) -> Option<ReleaseSmartSummaryPayload> {
+    let value = parse_json_value_relaxed(raw)?;
+    let obj = value.as_object()?;
+    let valuable = obj.get("valuable").and_then(value_as_bool)?;
+    let title_zh = object_field_as_string(obj, &["title_zh", "title", "title_cn"]);
+    let summary_bullets = obj
+        .get("summary_bullets")
+        .or_else(|| obj.get("bullets"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(value_as_id_string)
+                .map(|bullet| sanitize_smart_bullet_text(bullet.as_str()))
+                .filter(|bullet| !bullet.is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ReleaseSmartSummaryPayload {
+        valuable,
+        title_zh,
+        summary_bullets,
+    })
+}
+
+fn release_smart_body_prompt(item: &ReleaseSmartBatchCandidate) -> String {
+    format!(
+        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nSource: release body\n\nRelease body:\n{body}\n\n请判断这段 GitHub Release 正文是否足以生成“方便了解项目版本变化”的中文要点卡片。\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能根据输入证据，不得脑补；\n2) valuable=true 时，summary_bullets 必须是 1-4 条简洁中文要点，聚焦真实版本变化；\n3) valuable=false 时，summary_bullets 必须是空数组，title_zh 可为 null；\n4) 若正文只有模板、链接、空话、营销句、版本占位或“查看 commits”等无实质变更说明，必须返回 valuable=false；\n5) 不输出 URL，不写长段落，不逐句直译原文。",
+        repo = item.full_name,
+        title = item.title,
+        tag = item.tag_name,
+        body = item.body,
+    )
+}
+
+fn release_smart_diff_prompt(
+    item: &ReleaseSmartBatchCandidate,
+    compare_range: &str,
+    digest: &str,
+) -> String {
+    format!(
+        "Repo: {repo}\nRelease title: {title}\nRelease tag: {tag}\nCompare range: {compare_range}\nSource: compare digest\n\n说明：release body 已经被判定为不足以支撑版本变化摘要，请只根据下列 compare 摘要判断是否能提炼出对人类有用的版本变化。\n\nCompare digest:\n{digest}\n\n输出严格 JSON（不要 markdown code block）：\n{{\"valuable\":true,\"title_zh\":\"...\",\"summary_bullets\":[\"...\",\"...\"]}}\n\n硬性要求：\n1) 只能依据给定 compare digest，总结 1-4 条中文要点；\n2) 优先总结功能、修复、性能、兼容性、运维/构建变更等可读变化；\n3) 若 digest 只体现 lockfile、minified、generated、版本号或噪声文件，且无法说明实际版本变化，必须返回 valuable=false；\n4) valuable=false 时 summary_bullets 必须为空数组；\n5) 不输出 URL，不得臆测未提供的行为影响。",
+        repo = item.full_name,
+        title = item.title,
+        tag = item.tag_name,
+        compare_range = compare_range,
+        digest = digest,
+    )
+}
+
+fn compare_file_is_noise(file: &GitHubCompareFile) -> bool {
+    let name = file.filename.to_ascii_lowercase();
+    let lockfiles = [
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "yarn.lock",
+        "cargo.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "poetry.lock",
+        "pipfile.lock",
+        "bun.lock",
+        "bun.lockb",
+        "uv.lock",
+    ];
+    if lockfiles.iter().any(|suffix| name.ends_with(suffix)) {
+        return true;
+    }
+    if name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".map")
+        || name.contains("/dist/")
+        || name.contains("/build/")
+        || name.contains("/generated/")
+        || name.contains(".generated.")
+    {
+        return true;
+    }
+    let binary_exts = [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tar", ".jar",
+        ".wasm", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".mov",
+    ];
+    binary_exts.iter().any(|suffix| name.ends_with(suffix))
+        || file.patch.is_none() && name.ends_with(".svg")
+}
+
+fn summarize_patch_excerpt(patch: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    for line in patch.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.starts_with("@@") || trimmed.is_empty() {
+            continue;
+        }
+        if !(trimmed.starts_with('+') || trimmed.starts_with('-')) {
+            continue;
+        }
+        if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+            continue;
+        }
+        lines.push(trimmed.to_owned());
+        if lines.len() >= 12 {
+            break;
+        }
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(&lines.join("\n"), 800).into_owned())
+    }
+}
+
+fn build_compare_digest(compare: &GitHubCompareResponse) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(status) = compare.status.as_deref() {
+        lines.push(format!("compare_status: {status}"));
+    }
+    if let Some(ahead_by) = compare.ahead_by {
+        lines.push(format!("ahead_by: {ahead_by}"));
+    }
+    if let Some(behind_by) = compare.behind_by {
+        lines.push(format!("behind_by: {behind_by}"));
+    }
+    if let Some(total_commits) = compare.total_commits {
+        lines.push(format!("total_commits: {total_commits}"));
+    }
+
+    let commit_lines = compare
+        .commits
+        .iter()
+        .filter_map(|commit| {
+            let subject = commit.commit.message.lines().next()?.trim();
+            if subject.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "- {}: {}",
+                &commit.sha.chars().take(7).collect::<String>(),
+                truncate_chars(subject, 140).into_owned()
+            ))
+        })
+        .take(12)
+        .collect::<Vec<_>>();
+    if !commit_lines.is_empty() {
+        lines.push("commit_subjects:".to_owned());
+        lines.extend(commit_lines);
+    }
+
+    let mut file_lines = Vec::new();
+    let mut excerpt_lines = Vec::new();
+    for file in compare
+        .files
+        .iter()
+        .filter(|file| !compare_file_is_noise(file))
+        .take(8)
+    {
+        file_lines.push(format!(
+            "- {} [{}] (+{} / -{} / Δ{})",
+            file.filename,
+            file.status.as_deref().unwrap_or("modified"),
+            file.additions.unwrap_or(0),
+            file.deletions.unwrap_or(0),
+            file.changes.unwrap_or(0),
+        ));
+        if let Some(patch) = file.patch.as_deref().and_then(summarize_patch_excerpt) {
+            excerpt_lines.push(format!("### {}\n{}", file.filename, patch));
+        }
+    }
+    if !file_lines.is_empty() {
+        lines.push("changed_files:".to_owned());
+        lines.extend(file_lines);
+    }
+    if !excerpt_lines.is_empty() {
+        lines.push("patch_excerpts:".to_owned());
+        lines.extend(excerpt_lines);
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn github_rest_compare_http_error(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ApiError {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return github_reauth_required_error();
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim);
+        if remaining == Some("0") || is_rate_limit_message(body) {
+            return github_rate_limited_error();
+        }
+        if is_reauth_message(body) {
+            return github_reauth_required_error();
+        }
+        if is_access_restricted_message(body) {
+            return github_access_restricted_error();
+        }
+    }
+    ApiError::internal(format!("github compare returned {status}: {body}"))
+}
+
+async fn fetch_release_compare_digest_request(
+    state: &AppState,
+    repo_full_name: &str,
+    base_tag: &str,
+    head_tag: &str,
+    access_token: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let compare_ref = format!(
+        "{}...{}",
+        urlencoding::encode(base_tag),
+        urlencoding::encode(head_tag)
+    );
+    let url = format!("https://api.github.com/repos/{repo_full_name}/compare/{compare_ref}");
+    let mut request = state
+        .http
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "OctoRill")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = access_token {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(ApiError::internal)?;
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        return Err(github_rest_compare_http_error(status, &headers, &body));
+    }
+    let payload = response
+        .json::<GitHubCompareResponse>()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(build_compare_digest(&payload))
+}
+
+async fn fetch_release_compare_digest(
+    state: &AppState,
+    user_id: &str,
+    repo_full_name: &str,
+    base_tag: &str,
+    head_tag: &str,
+) -> Result<Option<String>, ApiError> {
+    let token = state
+        .load_access_token(user_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("load access token failed: {err}")))?;
+    match fetch_release_compare_digest_request(
+        state,
+        repo_full_name,
+        base_tag,
+        head_tag,
+        Some(token.as_str()),
+    )
+    .await
+    {
+        Ok(digest) => Ok(digest),
+        Err(auth_err) if should_retry_public_compare_without_auth(&auth_err) => {
+            match fetch_release_compare_digest_request(
+                state,
+                repo_full_name,
+                base_tag,
+                head_tag,
+                None,
+            )
+            .await
+            {
+                Ok(digest) => Ok(digest),
+                Err(public_err) => Err(map_public_compare_fallback_error(auth_err, public_err)),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn should_retry_public_compare_without_auth(err: &ApiError) -> bool {
+    matches!(err.code(), "reauth_required" | "forbidden")
+}
+
+fn map_public_compare_fallback_error(auth_err: ApiError, public_err: ApiError) -> ApiError {
+    if public_err.code() == "rate_limited" || public_err.code() == "forbidden" {
+        return public_err;
+    }
+    if auth_err.code() == "reauth_required" {
+        return github_private_repo_scope_required_error();
+    }
+    auth_err
+}
+
+async fn summarize_release_smart_candidate_with_ai(
+    state: &AppState,
+    user_id: &str,
+    item: &ReleaseSmartBatchCandidate,
+) -> Result<Option<(Option<String>, Option<String>)>, ApiError> {
+    let body_prompt = release_smart_body_prompt(item);
+    let raw = ai::chat_completion(
+        state,
+        "你是一个严谨的版本变化整理助手，专门把 GitHub Release 证据整理成便于人类快速理解的中文要点卡片。只能根据给定证据输出，不得脑补。",
+        &body_prompt,
+        700,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let parsed = parse_release_smart_summary_payload(&raw)
+        .ok_or_else(|| ApiError::internal("release smart body summary json decode failed"))?;
+    if parsed.valuable {
+        let summary = render_smart_summary_markdown(&parsed.summary_bullets)
+            .ok_or_else(|| ApiError::internal("release smart body summary bullets missing"))?;
+        return Ok(Some((parsed.title_zh, Some(summary))));
+    }
+
+    let Some(previous_tag_name) = item
+        .previous_tag_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let compare_range = format!("{previous_tag_name}...{}", item.tag_name);
+    let digest = fetch_release_compare_digest(
+        state,
+        user_id,
+        item.full_name.as_str(),
+        previous_tag_name,
+        item.tag_name.as_str(),
+    )
+    .await?;
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+
+    let diff_prompt = release_smart_diff_prompt(item, &compare_range, &digest);
+    let raw = ai::chat_completion(
+        state,
+        "你是一个严谨的版本变化整理助手，专门把 GitHub compare 摘要整理成便于人类快速理解的中文版本变化要点。只能根据给定证据输出，不得脑补。",
+        &diff_prompt,
+        700,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    let parsed = parse_release_smart_summary_payload(&raw)
+        .ok_or_else(|| ApiError::internal("release smart diff summary json decode failed"))?;
+    if !parsed.valuable {
+        return Ok(None);
+    }
+    let summary = render_smart_summary_markdown(&parsed.summary_bullets)
+        .ok_or_else(|| ApiError::internal("release smart diff summary bullets missing"))?;
+    Ok(Some((parsed.title_zh, Some(summary))))
+}
+
+async fn prepare_release_smart_batch(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<PreparedReleaseSmartBatch, ApiError> {
+    if state.config.ai.is_none() {
+        return Ok(PreparedReleaseSmartBatch {
+            candidates: Vec::new(),
+            pending: Vec::new(),
+            smart: HashMap::new(),
+            terminal: HashMap::new(),
+            missing: HashSet::new(),
+        });
+    }
+
+    let mut source_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT release_id, full_name, tag_name, name, body, previous_tag_name
+        FROM (
+          SELECT
+            r.release_id AS release_id,
+            sr.full_name AS full_name,
+            r.tag_name AS tag_name,
+            r.name AS name,
+            r.body AS body,
+            LAG(r.tag_name) OVER (
+              PARTITION BY r.repo_id
+              ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
+            ) AS previous_tag_name
+          FROM repo_releases r
+          JOIN starred_repos sr
+            ON sr.user_id = "#,
+    );
+    source_query.push_bind(user_id);
+    source_query.push(" AND sr.repo_id = r.repo_id");
+    source_query.push(") WHERE release_id IN (");
+    {
+        let mut separated = source_query.separated(", ");
+        for release_id in release_ids {
+            separated.push_bind(release_id);
+        }
+    }
+    source_query.push(")");
+
+    let source_rows = source_query
+        .build_query_as::<ReleaseSmartBatchSourceRow>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut source_by_id = HashMap::new();
+    for row in source_rows {
+        source_by_id.insert(row.release_id, row);
+    }
+
+    let mut candidates = Vec::new();
+    let mut missing = HashSet::new();
+    for release_id in release_ids {
+        let Some(row) = source_by_id.get(release_id) else {
+            missing.insert(*release_id);
+            continue;
+        };
+        let entity_id = release_id.to_string();
+        let title = row
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&row.tag_name)
+            .to_owned();
+        let body = release_feed_body(row.body.as_deref()).unwrap_or_default();
+        let source_hash = crate::translations::release_smart_feed_source_hash(
+            entity_id.as_str(),
+            row.full_name.as_str(),
+            title.as_str(),
+            Some(body.as_str()),
+            row.tag_name.as_str(),
+            row.previous_tag_name.as_deref(),
+        );
+        candidates.push(ReleaseSmartBatchCandidate {
+            release_id: *release_id,
+            entity_id,
+            full_name: row.full_name.clone(),
+            tag_name: row.tag_name.clone(),
+            previous_tag_name: row.previous_tag_name.clone(),
+            title,
+            body,
+            source_hash,
+        });
+    }
+
+    let mut cache_by_entity = HashMap::<String, TranslationCacheRow>::new();
+    if !candidates.is_empty() {
+        let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            r#"
+            SELECT entity_id, source_hash, status, title, summary, error_text
+            FROM ai_translations
+            WHERE user_id = "#,
+        );
+        cache_query.push_bind(user_id);
+        cache_query.push(" AND entity_type = 'release_smart' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
+        {
+            let mut separated = cache_query.separated(", ");
+            for item in &candidates {
+                separated.push_bind(&item.entity_id);
+            }
+        }
+        cache_query.push(")");
+
+        let cache_rows = cache_query
+            .build_query_as::<TranslationCacheRow>()
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+        for row in cache_rows {
+            cache_by_entity.insert(row.entity_id.clone(), row);
+        }
+    }
+
+    let mut pending = Vec::new();
+    let mut smart = HashMap::<i64, (Option<String>, Option<String>)>::new();
+    let mut terminal = HashMap::<i64, ReleaseBatchTerminalState>::new();
+
+    for item in &candidates {
+        if let Some(cache) = cache_by_entity.get(&item.entity_id)
+            && cache.source_hash == item.source_hash
+        {
+            if cache.status == "disabled"
+                || (cache.status == "missing"
+                    && cache.error_text.as_deref() == Some(SMART_NO_VALUABLE_VERSION_INFO))
+            {
+                terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: cache.status.clone(),
+                        error: cache.error_text.clone(),
+                    },
+                );
+                continue;
+            }
+            if cache.status == "error" {
+                if smart_error_is_retryable(cache.error_text.as_deref()) {
+                    pending.push(item.clone());
+                    continue;
+                }
+                terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: cache.status.clone(),
+                        error: cache.error_text.clone(),
+                    },
+                );
+                continue;
+            }
+            if cache.status == "ready" {
+                let ready = smart_ready_item(cache.title.clone(), cache.summary.clone(), None);
+                if let Some(ready) = ready {
+                    smart.insert(item.release_id, (ready.title, ready.summary));
+                    continue;
+                }
+            }
+        }
+        pending.push(item.clone());
+    }
+
+    Ok(PreparedReleaseSmartBatch {
+        candidates,
+        pending,
+        smart,
+        terminal,
+        missing,
+    })
+}
+
+async fn mark_release_smart_requested(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    candidates: &[ReleaseSmartBatchCandidate],
+) -> Result<(), ApiError> {
+    for item in candidates {
+        mark_translation_requested(
+            state,
+            user_id,
+            requested_at,
+            TranslationUpsert {
+                entity_type: "release_smart",
+                entity_id: &item.entity_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn upsert_release_smart_results(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    candidates: &[ReleaseSmartBatchCandidate],
+    smart: &HashMap<i64, (Option<String>, Option<String>)>,
+) -> Result<(), ApiError> {
+    for item in candidates {
+        if let Some((title, summary)) = smart.get(&item.release_id) {
+            upsert_translation(
+                state,
+                user_id,
+                requested_at,
+                TranslationUpsert {
+                    entity_type: "release_smart",
+                    entity_id: &item.entity_id,
+                    lang: "zh-CN",
+                    source_hash: &item.source_hash,
+                    title: title.as_deref(),
+                    summary: summary.as_deref(),
+                },
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn upsert_release_smart_terminal_states(
+    state: &AppState,
+    user_id: &str,
+    requested_at: &str,
+    candidates: &[ReleaseSmartBatchCandidate],
+    terminal: &HashMap<i64, ReleaseBatchTerminalState>,
+) -> Result<(), ApiError> {
+    for item in candidates {
+        let Some(terminal_state) = terminal.get(&item.release_id) else {
+            continue;
+        };
+        upsert_translation_terminal_status(
+            state,
+            user_id,
+            requested_at,
+            TranslationUpsert {
+                entity_type: "release_smart",
+                entity_id: &item.entity_id,
+                lang: "zh-CN",
+                source_hash: &item.source_hash,
+                title: None,
+                summary: None,
+            },
+            terminal_state.status.as_str(),
+            terminal_state.error.as_deref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn build_release_smart_batch_item(
+    release_id: i64,
+    missing: &HashSet<i64>,
+    terminal: &HashMap<i64, ReleaseBatchTerminalState>,
+    smart: &HashMap<i64, (Option<String>, Option<String>)>,
+) -> TranslateBatchItem {
+    if missing.contains(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: "missing".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("release not found".to_owned()),
+        };
+    }
+
+    if let Some(terminal_state) = terminal.get(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: terminal_state.status.clone(),
+            title: None,
+            summary: None,
+            error: terminal_state.error.clone().or_else(|| {
+                (terminal_state.status == "missing")
+                    .then_some("translation result missing".to_owned())
+            }),
+        };
+    }
+
+    if let Some((title, summary)) = smart.get(&release_id) {
+        return TranslateBatchItem {
+            id: release_id.to_string(),
+            lang: "zh-CN".to_owned(),
+            status: "ready".to_owned(),
+            title: title.clone(),
+            summary: summary.clone(),
+            error: None,
+        };
+    }
+
+    TranslateBatchItem {
+        id: release_id.to_string(),
+        lang: "zh-CN".to_owned(),
+        status: "error".to_owned(),
+        title: None,
+        summary: None,
+        error: Some("release smart summary failed".to_owned()),
+    }
+}
+
+async fn summarize_releases_smart_batch_internal(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<Vec<TranslateBatchItem>, ApiError> {
+    if state.config.ai.is_none() {
+        return Ok(release_ids
+            .iter()
+            .map(|release_id| TranslateBatchItem {
+                id: release_id.to_string(),
+                lang: "zh-CN".to_owned(),
+                status: "disabled".to_owned(),
+                title: None,
+                summary: None,
+                error: None,
+            })
+            .collect());
+    }
+
+    let requested_at = chrono::Utc::now().to_rfc3339();
+    let mut prepared = prepare_release_smart_batch(state, user_id, release_ids).await?;
+    mark_release_smart_requested(state, user_id, requested_at.as_str(), &prepared.pending).await?;
+
+    for item in &prepared.pending {
+        match summarize_release_smart_candidate_with_ai(state, user_id, item).await {
+            Ok(Some(result)) => {
+                prepared.smart.insert(item.release_id, result);
+            }
+            Ok(None) => {
+                prepared.terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: "missing".to_owned(),
+                        error: Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned()),
+                    },
+                );
+            }
+            Err(err) => {
+                prepared.terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: "error".to_owned(),
+                        error: Some(err.to_string()),
+                    },
+                );
+            }
+        }
+    }
+
+    upsert_release_smart_results(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.candidates,
+        &prepared.smart,
+    )
+    .await?;
+    upsert_release_smart_terminal_states(
+        state,
+        user_id,
+        requested_at.as_str(),
+        &prepared.candidates,
+        &prepared.terminal,
+    )
+    .await?;
+
+    Ok(release_ids
+        .iter()
+        .map(|release_id| {
+            build_release_smart_batch_item(
+                *release_id,
+                &prepared.missing,
+                &prepared.terminal,
+                &prepared.smart,
+            )
+        })
+        .collect())
+}
+
+pub async fn summarize_releases_smart_batch_for_user(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<TranslateBatchResponse, ApiError> {
+    let items = summarize_releases_smart_batch_internal(state, user_id, release_ids).await?;
+    Ok(TranslateBatchResponse { items })
+}
+
 #[allow(dead_code)]
 async fn translate_releases_batch_stream_worker(
     state: Arc<AppState>,
@@ -8383,29 +9447,36 @@ mod tests {
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallListScope,
         AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery,
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
-        AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, TranslateBatchItem, TranslationCacheRow,
-        TranslationUpsert, admin_download_realtime_task_log, admin_get_llm_call_detail,
+        AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GitHubCompareCommit,
+        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
+        LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO,
+        TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, brief_contains_release_link, build_task_diagnostics,
-        ensure_account_enabled, extract_translation_fields, feed_item_from_row, get_release_detail,
-        github_graphql_errors_to_api_error, github_graphql_http_error, guard_admin_user_update,
-        has_repo_scope, last_active_is_stale, list_releases, llm_call_order_by_clause,
+        ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
+        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
+        feed_item_from_row, get_release_detail, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_releases, llm_call_order_by_clause,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        mark_translation_requested, markdown_structure_preserved, me, normalize_translation_fields,
+        map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_positive_admin_concurrency, parse_release_id_param,
-        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
-        parse_unique_thread_ids, preserve_chunk_trailing_newline, release_cache_entry_reusable,
-        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
-        release_feed_body, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_response_from_batch_item, upsert_translation,
+        parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
+        parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
+        preserve_chunk_trailing_newline, release_cache_entry_reusable, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_feed_body,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
+    use crate::error::ApiError;
     use std::{fs, net::SocketAddr, sync::Arc};
 
     use crate::{
@@ -8443,6 +9514,8 @@ mod tests {
             release_id: Some(1),
             release_node_id: node_id.map(str::to_owned),
             repo_full_name: None,
+            release_tag_name: None,
+            release_previous_tag_name: None,
             title: None,
             subtitle: None,
             reason: None,
@@ -8461,6 +9534,12 @@ mod tests {
             trans_title: None,
             trans_summary: None,
             trans_work_status: None,
+            smart_source_hash: None,
+            smart_status: None,
+            smart_title: None,
+            smart_summary: None,
+            smart_error_text: None,
+            smart_work_status: None,
         }
     }
 
@@ -11489,6 +12568,161 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_maps_smart_insufficient_to_terminal_state() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.release_tag_name = Some("v1.2.4".to_owned());
+        row.release_previous_tag_name = Some("v1.2.3".to_owned());
+        row.title = Some("Release v1.2.4".to_owned());
+        row.release_body = Some("See full changelog below.".to_owned());
+        row.smart_source_hash = Some(crate::translations::release_smart_feed_source_hash(
+            row.entity_id.as_str(),
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref(),
+            row.release_tag_name.as_deref().unwrap_or(""),
+            row.release_previous_tag_name.as_deref(),
+        ));
+        row.smart_status = Some("missing".to_owned());
+        row.smart_error_text = Some(SMART_NO_VALUABLE_VERSION_INFO.to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let smart = item.smart.expect("smart item");
+        assert_eq!(smart.status, "insufficient");
+        assert_eq!(smart.auto_translate, Some(false));
+        assert!(smart.title.is_none());
+        assert!(smart.summary.is_none());
+    }
+
+    #[test]
+    fn smart_error_is_retryable_for_public_scope_upgrade() {
+        assert!(smart_error_is_retryable(Some(
+            "repo scope required; re-login via GitHub OAuth",
+        )));
+        assert!(!smart_error_is_retryable(Some(
+            "private repository compare requires repo scope; re-login via GitHub OAuth",
+        )));
+    }
+
+    #[test]
+    fn feed_item_from_row_retries_retryable_smart_errors() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.release_tag_name = Some("v1.2.4".to_owned());
+        row.release_previous_tag_name = Some("v1.2.3".to_owned());
+        row.title = Some("Release v1.2.4".to_owned());
+        row.release_body = Some("See full changelog below.".to_owned());
+        row.smart_source_hash = Some(crate::translations::release_smart_feed_source_hash(
+            row.entity_id.as_str(),
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref(),
+            row.release_tag_name.as_deref().unwrap_or(""),
+            row.release_previous_tag_name.as_deref(),
+        ));
+        row.smart_status = Some("error".to_owned());
+        row.smart_error_text = Some("runtime_lease_expired".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let smart = item.smart.expect("smart item");
+        assert_eq!(smart.status, "missing");
+        assert_eq!(smart.auto_translate, Some(true));
+        assert!(smart.title.is_none());
+        assert!(smart.summary.is_none());
+    }
+
+    #[test]
+    fn parse_release_smart_summary_payload_accepts_relaxed_payload_and_sanitizes_bullets() {
+        let raw = r#"
+        {
+          "valuable": "yes",
+          "title_cn": "版本变化速览",
+          "bullets": [
+            "新增 CLI 子命令",
+            "修复日志链接换行\n问题",
+            "详情见 https://example.com/changelog"
+          ]
+        }
+        "#;
+
+        let payload = parse_release_smart_summary_payload(raw).expect("smart payload");
+
+        assert!(payload.valuable);
+        assert_eq!(payload.title_zh.as_deref(), Some("版本变化速览"));
+        assert_eq!(
+            payload.summary_bullets,
+            vec![
+                "新增 CLI 子命令".to_owned(),
+                "修复日志链接换行 问题".to_owned(),
+                "详情见".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_compare_digest_filters_noise_and_keeps_meaningful_patch_excerpt() {
+        let digest = build_compare_digest(&GitHubCompareResponse {
+            status: Some("ahead".to_owned()),
+            ahead_by: Some(2),
+            behind_by: Some(0),
+            total_commits: Some(2),
+            commits: vec![
+                GitHubCompareCommit {
+                    sha: "abcdef123456".to_owned(),
+                    commit: GitHubCompareCommitDetail {
+                        message: "feat: add release smart fallback\n\nextra".to_owned(),
+                    },
+                },
+                GitHubCompareCommit {
+                    sha: "fedcba654321".to_owned(),
+                    commit: GitHubCompareCommitDetail {
+                        message: "fix: keep markdown bullets readable".to_owned(),
+                    },
+                },
+            ],
+            files: vec![
+                GitHubCompareFile {
+                    filename: "web/bun.lock".to_owned(),
+                    status: Some("modified".to_owned()),
+                    additions: Some(10),
+                    deletions: Some(2),
+                    changes: Some(12),
+                    patch: Some("+lockfileVersion: 1".to_owned()),
+                },
+                GitHubCompareFile {
+                    filename: "src/api.rs".to_owned(),
+                    status: Some("modified".to_owned()),
+                    additions: Some(12),
+                    deletions: Some(3),
+                    changes: Some(15),
+                    patch: Some(
+                        "@@ -1,3 +1,6 @@\n-use old\n+use new\n context\n+let digest = build();\n-http://example.com\n+summary.push(\"ok\");\n".to_owned(),
+                    ),
+                },
+                GitHubCompareFile {
+                    filename: "dist/app.min.js".to_owned(),
+                    status: Some("modified".to_owned()),
+                    additions: Some(100),
+                    deletions: Some(40),
+                    changes: Some(140),
+                    patch: Some("+compiled".to_owned()),
+                },
+            ],
+        })
+        .expect("compare digest");
+
+        assert!(digest.contains("compare_status: ahead"));
+        assert!(digest.contains("commit_subjects:"));
+        assert!(digest.contains("feat: add release smart fallback"));
+        assert!(digest.contains("changed_files:"));
+        assert!(digest.contains("src/api.rs [modified]"));
+        assert!(digest.contains("patch_excerpts:"));
+        assert!(digest.contains("### src/api.rs"));
+        assert!(!digest.contains("web/bun.lock"));
+        assert!(!digest.contains("dist/app.min.js"));
+    }
+
+    #[test]
     fn release_detail_translation_ready_requires_summary_for_non_empty_body() {
         let body = "- item";
         assert!(!release_detail_translation_ready(Some(body), None));
@@ -11945,6 +13179,48 @@ mod tests {
         }];
         let err = github_graphql_errors_to_api_error(&errors).expect("expected mapped error");
         assert_eq!(err.code(), "forbidden");
+    }
+
+    #[test]
+    fn public_compare_fallback_retries_on_reauth_required() {
+        assert!(should_retry_public_compare_without_auth(
+            &github_reauth_required_error(),
+        ));
+    }
+
+    #[test]
+    fn public_compare_fallback_retries_on_access_restricted() {
+        assert!(should_retry_public_compare_without_auth(
+            &github_access_restricted_error(),
+        ));
+    }
+
+    #[test]
+    fn public_compare_fallback_skips_other_terminal_errors() {
+        assert!(!should_retry_public_compare_without_auth(
+            &github_rate_limited_error(),
+        ));
+    }
+
+    #[test]
+    fn public_compare_fallback_preserves_access_restricted_error_on_private_repo_failure() {
+        let auth_err = github_access_restricted_error();
+        let public_err = ApiError::new(StatusCode::NOT_FOUND, "not_found", "compare not found");
+        let mapped = map_public_compare_fallback_error(auth_err, public_err);
+        assert_eq!(mapped.code(), "forbidden");
+    }
+
+    #[test]
+    fn public_compare_fallback_maps_reauth_failure_to_private_scope_required() {
+        let auth_err = github_reauth_required_error();
+        let public_err = ApiError::new(StatusCode::NOT_FOUND, "not_found", "compare not found");
+        let mapped = map_public_compare_fallback_error(auth_err, public_err);
+        assert_eq!(mapped.code(), "reauth_required");
+        assert!(
+            mapped
+                .to_string()
+                .contains("private repository compare requires repo scope")
+        );
     }
 
     #[test]

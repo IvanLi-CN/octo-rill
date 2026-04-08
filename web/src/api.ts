@@ -545,7 +545,7 @@ export type TranslationSourceBlock = {
 };
 export type TranslationRequestItemInput = {
 	producer_ref: string;
-	kind: "release_summary" | "release_detail" | "notification";
+	kind: "release_summary" | "release_smart" | "release_detail" | "notification";
 	variant: string;
 	entity_id: string;
 	target_lang: string;

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import { FeedItemCard } from "@/feed/FeedItemCard";
-import type { FeedItem, ReactionContent } from "@/feed/types";
+import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -9,11 +9,13 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 
 export type FeedCardListProps = {
 	items: FeedItem[];
-	inFlightKeys: Set<string>;
+	translationInFlightKeys: Set<string>;
+	smartInFlightKeys: Set<string>;
 	registerItemRef: (item: FeedItem) => (el: HTMLElement | null) => void;
-	showOriginalByKey: Record<string, boolean>;
-	onToggleOriginal: (key: string) => void;
+	selectedLaneByKey: Record<string, FeedLane>;
+	onSelectLane: (item: FeedItem, lane: FeedLane) => void;
 	onTranslateNow: (item: FeedItem) => void;
+	onSmartNow: (item: FeedItem) => void;
 	reactionBusyKeys: Set<string>;
 	reactionErrorByKey: Record<string, string>;
 	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
@@ -22,11 +24,13 @@ export type FeedCardListProps = {
 export function FeedItems(props: FeedCardListProps) {
 	const {
 		items,
-		inFlightKeys,
+		translationInFlightKeys,
+		smartInFlightKeys,
 		registerItemRef,
-		showOriginalByKey,
-		onToggleOriginal,
+		selectedLaneByKey,
+		onSelectLane,
 		onTranslateNow,
+		onSmartNow,
 		reactionBusyKeys,
 		reactionErrorByKey,
 		onToggleReaction,
@@ -34,20 +38,23 @@ export function FeedItems(props: FeedCardListProps) {
 
 	return items.map((item) => {
 		const key = keyOf(item);
-		const showOriginal = Boolean(showOriginalByKey[key]);
-		const isTranslating = inFlightKeys.has(key);
+		const activeLane = selectedLaneByKey[key] ?? "original";
+		const isTranslating = translationInFlightKeys.has(key);
+		const isSmartGenerating = smartInFlightKeys.has(key);
 		const isReactionBusy = reactionBusyKeys.has(key);
 		const reactionError = reactionErrorByKey[key] ?? null;
 		return (
 			<div key={key} ref={registerItemRef(item)}>
 				<FeedItemCard
 					item={item}
-					showOriginal={showOriginal}
+					activeLane={activeLane}
 					isTranslating={isTranslating}
+					isSmartGenerating={isSmartGenerating}
 					isReactionBusy={isReactionBusy}
 					reactionError={reactionError}
-					onToggleOriginal={() => onToggleOriginal(key)}
+					onSelectLane={(lane) => onSelectLane(item, lane)}
 					onTranslateNow={() => onTranslateNow(item)}
+					onSmartNow={() => onSmartNow(item)}
 					onToggleReaction={(content) => onToggleReaction(item, content)}
 				/>
 			</div>
@@ -70,7 +77,8 @@ export function FeedList(
 		loadingInitial,
 		loadingMore,
 		hasMore,
-		inFlightKeys,
+		translationInFlightKeys,
+		smartInFlightKeys,
 		registerItemRef,
 		onLoadMore,
 		...feedCardProps
@@ -117,7 +125,8 @@ export function FeedList(
 
 			<FeedItems
 				items={items}
-				inFlightKeys={inFlightKeys}
+				translationInFlightKeys={translationInFlightKeys}
+				smartInFlightKeys={smartInFlightKeys}
 				registerItemRef={registerItemRef}
 				{...feedCardProps}
 			/>

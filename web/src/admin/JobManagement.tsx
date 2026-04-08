@@ -782,6 +782,8 @@ function taskTypeLabel(taskType: string) {
 			return "翻译 Release";
 		case "translate.release.batch":
 			return "批量翻译 Release";
+		case "summarize.release.smart.batch":
+			return "批量智能整理 Release";
 		case "translate.release_detail":
 			return "翻译 Release 详情";
 		case "translate.notification":
