@@ -20,7 +20,15 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import {
+	DEFAULT_PAGE_LANE,
+	isFeedLane,
+	PAGE_DEFAULT_LANE_STORAGE_KEY,
+	resolveDisplayLaneForFeed,
+	resolvePreferredLaneForItem,
+} from "@/feed/laneOptions";
 import type {
 	FeedItem,
 	FeedLane,
@@ -64,28 +72,16 @@ function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
-function defaultLaneForItem(item: FeedItem): FeedLane {
-	if (item.smart?.status === "disabled") {
-		return "original";
-	}
-	return "smart";
-}
-
 function resolveLaneForItem(
 	item: FeedItem,
 	selectedLaneByKey: Record<string, FeedLane>,
+	pageDefaultLane: FeedLane,
 ): FeedLane {
-	if (item.smart?.status === "insufficient") {
-		return "smart";
-	}
 	const selected = selectedLaneByKey[feedItemKey(item)];
-	if (selected === "translated" && item.translated?.status === "disabled") {
-		return "original";
+	if (selected) {
+		return resolvePreferredLaneForItem(item, selected);
 	}
-	if (selected === "smart" && item.smart?.status === "disabled") {
-		return "original";
-	}
-	return selected ?? defaultLaneForItem(item);
+	return resolvePreferredLaneForItem(item, pageDefaultLane);
 }
 
 type TaskEventPayload = {
@@ -149,6 +145,14 @@ function parseDashboardQuery() {
 			? rawTab
 			: "all";
 	return { tab, releaseId };
+}
+
+function readStoredPageDefaultLane() {
+	if (typeof window === "undefined") {
+		return DEFAULT_PAGE_LANE;
+	}
+	const stored = window.localStorage.getItem(PAGE_DEFAULT_LANE_STORAGE_KEY);
+	return isFeedLane(stored) ? stored : DEFAULT_PAGE_LANE;
 }
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
@@ -247,6 +251,13 @@ export function Dashboard(props: { me: MeResponse }) {
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
+	const [pageDefaultLane, setPageDefaultLane] = useState<FeedLane>(
+		readStoredPageDefaultLane,
+	);
+	const effectivePageDefaultLane = useMemo(
+		() => resolveDisplayLaneForFeed(feed.items, pageDefaultLane),
+		[feed.items, pageDefaultLane],
+	);
 	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
 		null,
 	);
@@ -412,13 +423,20 @@ export function Dashboard(props: { me: MeResponse }) {
 	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
 
 	useEffect(() => {
+		window.localStorage.setItem(PAGE_DEFAULT_LANE_STORAGE_KEY, pageDefaultLane);
+	}, [pageDefaultLane]);
+
+	useEffect(() => {
+		if (tab !== "all" && tab !== "releases") {
+			return;
+		}
 		if (feed.loadingInitial || feed.items.length === 0) {
 			return;
 		}
 		void primeSmart(feed.items).catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [feed.items, feed.loadingInitial, primeSmart]);
+	}, [feed.items, feed.loadingInitial, primeSmart, tab]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;
@@ -633,10 +651,8 @@ export function Dashboard(props: { me: MeResponse }) {
 		},
 		[smartNow],
 	);
-	const onSelectLane = useCallback(
+	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
-			const key = feedItemKey(item);
-			setSelectedLaneByKey((prev) => ({ ...prev, [key]: lane }));
 			if (
 				lane === "translated" &&
 				(item.translated?.status === "missing" ||
@@ -660,6 +676,18 @@ export function Dashboard(props: { me: MeResponse }) {
 		},
 		[smartNow, translateNow],
 	);
+	const onSelectLane = useCallback(
+		(item: FeedItem, lane: FeedLane) => {
+			const key = feedItemKey(item);
+			setSelectedLaneByKey((prev) => ({ ...prev, [key]: lane }));
+			requestLaneIfNeeded(item, lane);
+		},
+		[requestLaneIfNeeded],
+	);
+	const onSelectPageDefaultLane = useCallback((lane: FeedLane) => {
+		setPageDefaultLane(lane);
+		setSelectedLaneByKey({});
+	}, []);
 	const registerFeedItem = useCallback(
 		(item: FeedItem) => (element: HTMLElement | null) => {
 			registerTranslate(item)(element);
@@ -1022,6 +1050,7 @@ export function Dashboard(props: { me: MeResponse }) {
 	const onCloseReleaseDetail = useCallback(() => {
 		setActiveReleaseId(null);
 	}, []);
+	const showPageLaneSelector = tab === "all" || tab === "releases";
 
 	const renderFeedPanel = (mode: "all" | "releases") => (
 		<>
@@ -1094,7 +1123,7 @@ export function Dashboard(props: { me: MeResponse }) {
 				selectedLaneByKey={Object.fromEntries(
 					feed.items.map((item) => [
 						feedItemKey(item),
-						resolveLaneForItem(item, selectedLaneByKey),
+						resolveLaneForItem(item, selectedLaneByKey, pageDefaultLane),
 					]),
 				)}
 				onSelectLane={onSelectLane}
@@ -1131,6 +1160,31 @@ export function Dashboard(props: { me: MeResponse }) {
 			window.history.replaceState({}, "", nextUrl);
 		}
 	}, [tab, activeReleaseId]);
+
+	useEffect(() => {
+		if (tab !== "all" && tab !== "releases") {
+			return;
+		}
+		if (feed.loadingInitial || feed.items.length === 0) {
+			return;
+		}
+		for (const item of feed.items) {
+			if (selectedLaneByKey[feedItemKey(item)]) {
+				continue;
+			}
+			requestLaneIfNeeded(
+				item,
+				resolvePreferredLaneForItem(item, pageDefaultLane),
+			);
+		}
+	}, [
+		feed.items,
+		feed.loadingInitial,
+		pageDefaultLane,
+		requestLaneIfNeeded,
+		selectedLaneByKey,
+		tab,
+	]);
 
 	return (
 		<AppShell
@@ -1175,6 +1229,12 @@ export function Dashboard(props: { me: MeResponse }) {
 					</TabsList>
 
 					<div className="flex items-center gap-2">
+						{showPageLaneSelector ? (
+							<FeedPageLaneSelector
+								value={effectivePageDefaultLane}
+								onValueChange={onSelectPageDefaultLane}
+							/>
+						) : null}
 						{busy ? (
 							<span className="text-muted-foreground font-mono text-xs">
 								{busy}…
