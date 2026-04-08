@@ -16,15 +16,24 @@ type ApiOptions = {
 	briefCreatedAt: string;
 	withReactionFeed?: boolean;
 	withAutoTranslateFeed?: boolean;
+	withAutoTranslateReactions?: boolean;
 	autoTranslateFeedCount?: number;
 	autoTranslateInitialReadyIds?: string[];
+	autoTranslateDisabledIds?: string[];
 	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	autoTranslateResolveFailureCount?: number;
+	smartFeedCount?: number;
+	smartInitialReadyIds?: string[];
+	smartInitialErrorIds?: string[];
+	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	releaseDetailPendingPolls?: number;
 };
 
 type MockApiTracker = {
-	translationResolveEntityIds: string[][];
+	translationResolveRequests: Array<{
+		entityIds: string[];
+		kinds: string[];
+	}>;
 	translationBatchEntityIds: string[][];
 	translationSingleEntityIds: string[];
 };
@@ -45,13 +54,25 @@ function makeAutoTranslateFeedItems(
 	count: number,
 	options?: {
 		initialReadyIds?: string[];
+		smartInitialReadyIds?: string[];
+		smartInitialErrorIds?: string[];
+		autoTranslateDisabledIds?: string[];
+		withReactions?: boolean;
 	},
 ) {
 	const initialReadyIds = new Set(options?.initialReadyIds ?? []);
+	const smartInitialReadyIds = new Set(options?.smartInitialReadyIds ?? []);
+	const smartInitialErrorIds = new Set(options?.smartInitialErrorIds ?? []);
+	const autoTranslateDisabledIds = new Set(
+		options?.autoTranslateDisabledIds ?? [],
+	);
+	const withReactions = options?.withReactions === true;
 	return Array.from({ length: count }, (_, index) => {
 		const releaseId = makeAutoTranslateReleaseId(index);
 		const initialReady = initialReadyIds.has(releaseId);
+		const smartReady = smartInitialReadyIds.has(releaseId);
 		const readyPayload = makeFeedTranslationPayload(releaseId);
+		const smartPayload = makeFeedSmartPayload(releaseId);
 		return {
 			kind: "release",
 			ts: `2026-02-22T${`${(index % 10) + 10}`.padStart(2, "0")}:22:33Z`,
@@ -82,8 +103,53 @@ function makeAutoTranslateFeedItems(
 						status: "missing",
 						title: null,
 						summary: null,
+						...(autoTranslateDisabledIds.has(releaseId)
+							? { auto_translate: false }
+							: {}),
 					},
-			reactions: null,
+			smart: smartReady
+				? {
+						lang: "zh-CN",
+						status: "ready",
+						title: smartPayload.title_zh,
+						summary: smartPayload.body_md,
+						auto_translate: true,
+					}
+				: smartInitialErrorIds.has(releaseId)
+					? {
+							lang: "zh-CN",
+							status: "error",
+							title: null,
+							summary: null,
+							auto_translate: false,
+						}
+					: {
+							lang: "zh-CN",
+							status: "missing",
+							title: null,
+							summary: null,
+						},
+			reactions: withReactions
+				? {
+						counts: {
+							plus1: 2,
+							laugh: 0,
+							heart: 0,
+							hooray: 0,
+							rocket: 0,
+							eyes: 0,
+						},
+						viewer: {
+							plus1: false,
+							laugh: false,
+							heart: false,
+							hooray: false,
+							rocket: false,
+							eyes: false,
+						},
+						status: "ready",
+					}
+				: null,
 		};
 	});
 }
@@ -105,6 +171,34 @@ function makeFeedTranslationPayload(
 		error: status === "error" ? `translate returned ${status}` : null,
 		work_item_id: `work-feed-${releaseId}`,
 		batch_id: `batch-feed-${releaseId}`,
+	};
+}
+
+function makeFeedSmartPayload(
+	releaseId: string,
+	status: "ready" | "missing" | "error" = "ready",
+) {
+	const insufficient = status === "missing";
+	return {
+		producer_ref: `feed.smart:release:${releaseId}`,
+		entity_id: releaseId,
+		kind: "release_smart",
+		variant: "feed_card",
+		status,
+		title_zh: status === "ready" ? `智能摘要 ${releaseId}` : null,
+		summary_md: null,
+		body_md:
+			status === "ready"
+				? `- 智能总结 release ${releaseId} 的主要版本变化。\n- 方便快速理解这次发布的重点。`
+				: null,
+		error:
+			status === "error"
+				? "smart summary failed"
+				: insufficient
+					? "no_valuable_version_info"
+					: null,
+		work_item_id: `work-smart-${releaseId}`,
+		batch_id: `batch-smart-${releaseId}`,
 	};
 }
 
@@ -136,7 +230,7 @@ async function installApiMocks(
 	let autoTranslateResolveFailureCount =
 		cfg.autoTranslateResolveFailureCount ?? 0;
 	const tracker: MockApiTracker = {
-		translationResolveEntityIds: [],
+		translationResolveRequests: [],
 		translationBatchEntityIds: [],
 		translationSingleEntityIds: [],
 	};
@@ -183,6 +277,13 @@ async function installApiMocks(
 								title: cfg.translatedTitle,
 								summary: cfg.translatedSummary,
 							},
+							smart: {
+								lang: "zh-CN",
+								status: "ready",
+								title: "智能摘要 123",
+								summary:
+									"- 这一版主要聚焦 feed 卡片体验与版本阅读效率。\n- 同步补齐反馈按钮与浏览器端交互状态。",
+							},
 							reactions: {
 								counts: {
 									plus1: 2,
@@ -207,6 +308,10 @@ async function installApiMocks(
 				: cfg.withAutoTranslateFeed
 					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18, {
 							initialReadyIds: cfg.autoTranslateInitialReadyIds,
+							smartInitialReadyIds: cfg.smartInitialReadyIds,
+							smartInitialErrorIds: cfg.smartInitialErrorIds,
+							autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
+							withReactions: cfg.withAutoTranslateReactions,
 						})
 					: [];
 			return json(route, { items, next_cursor: null });
@@ -268,8 +373,10 @@ async function installApiMocks(
 			const body = req.postDataJSON() as {
 				items?: Array<{ entity_id?: string }>;
 			};
-			const entityIds = (body.items ?? []).map((item) => item.entity_id ?? "");
-			tracker.translationResolveEntityIds.push(entityIds);
+			const items = body.items ?? [];
+			const entityIds = items.map((item) => item.entity_id ?? "");
+			const kinds = items.map((item) => item.kind ?? "");
+			tracker.translationResolveRequests.push({ entityIds, kinds });
 			if (autoTranslateResolveFailureCount > 0) {
 				autoTranslateResolveFailureCount -= 1;
 				return json(
@@ -279,12 +386,19 @@ async function installApiMocks(
 				);
 			}
 			return json(route, {
-				items: entityIds.map((entityId) =>
-					makeFeedTranslationPayload(
+				items: items.map((item) => {
+					const entityId = item.entity_id ?? "";
+					if (item.kind === "release_smart") {
+						return makeFeedSmartPayload(
+							entityId,
+							cfg.smartResolveStatuses?.[entityId] ?? "ready",
+						);
+					}
+					return makeFeedTranslationPayload(
 						entityId,
 						cfg.autoTranslateResolveStatuses?.[entityId] ?? "ready",
-					),
-				),
+					);
+				}),
 			});
 		}
 
@@ -324,27 +438,45 @@ async function installApiMocks(
 							item.producer_ref ??
 							(item.kind === "release_detail"
 								? `release_detail:${cfg.releaseId}`
-								: `feed.auto_translate:release:${cfg.releaseId}`),
+								: item.kind === "release_smart"
+									? `feed.smart:release:${cfg.releaseId}`
+									: `feed.auto_translate:release:${cfg.releaseId}`),
 						entity_id: cfg.releaseId,
 						kind: item.kind ?? "release_summary",
-						variant: item.variant ?? "feed_body",
+						variant:
+							item.variant ??
+							(item.kind === "release_smart" ? "feed_card" : "feed_body"),
 						status: isPendingReleaseDetail ? "running" : "ready",
-						title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
+						title_zh: isPendingReleaseDetail
+							? null
+							: item.kind === "release_smart"
+								? `智能摘要 ${cfg.releaseId}`
+								: cfg.translatedTitle,
 						summary_md:
-							item.kind === "release_detail" || isPendingReleaseDetail
+							item.kind === "release_detail" ||
+							item.kind === "release_smart" ||
+							isPendingReleaseDetail
 								? null
 								: cfg.translatedSummary,
 						body_md:
 							item.kind === "release_detail" && !isPendingReleaseDetail
 								? cfg.translatedSummary
-								: null,
+								: item.kind === "release_smart" && !isPendingReleaseDetail
+									? `- 智能总结 ${cfg.releaseId} 的版本变化。\n- 方便主人快速读懂 release。`
+									: null,
 						error: null,
 						work_item_id:
-							item.kind === "release_detail" ? "work-detail-1" : "work-feed-1",
+							item.kind === "release_detail"
+								? "work-detail-1"
+								: item.kind === "release_smart"
+									? "work-smart-1"
+									: "work-feed-1",
 						batch_id:
 							item.kind === "release_detail"
 								? "batch-detail-1"
-								: "batch-feed-1",
+								: item.kind === "release_smart"
+									? "batch-smart-1"
+									: "batch-feed-1",
 					},
 				});
 			}
@@ -357,10 +489,14 @@ async function installApiMocks(
 						status: "queued",
 						producer_ref:
 							item.producer_ref ??
-							`feed.auto_translate:release:${item.entity_id ?? ""}`,
+							(item.kind === "release_smart"
+								? `feed.smart:release:${item.entity_id ?? ""}`
+								: `feed.auto_translate:release:${item.entity_id ?? ""}`),
 						entity_id: item.entity_id ?? "",
 						kind: item.kind ?? "release_summary",
-						variant: item.variant ?? "feed_body",
+						variant:
+							item.variant ??
+							(item.kind === "release_smart" ? "feed_card" : "feed_body"),
 					})),
 				});
 			}
@@ -385,12 +521,19 @@ async function installApiMocks(
 									work_item_id: "work-detail-1",
 									batch_id: "batch-detail-1",
 								}
-							: {
-									...makeFeedTranslationPayload(entityId),
-									status: "queued",
-									title_zh: null,
-									summary_md: null,
-								},
+							: body.item.kind === "release_smart"
+								? {
+										...makeFeedSmartPayload(entityId),
+										status: "queued",
+										title_zh: null,
+										body_md: null,
+									}
+								: {
+										...makeFeedTranslationPayload(entityId),
+										status: "queued",
+										title_zh: null,
+										summary_md: null,
+									},
 				});
 			}
 			return json(
@@ -419,6 +562,17 @@ async function installApiMocks(
 					request_id: requestId,
 					status: "completed",
 					result: makeFeedTranslationPayload(releaseId),
+				});
+			}
+			if (requestId.startsWith("req-smart-")) {
+				const releaseId = requestId.replace("req-smart-", "");
+				return json(route, {
+					request_id: requestId,
+					status: "completed",
+					result: makeFeedSmartPayload(
+						releaseId,
+						cfg.smartResolveStatuses?.[releaseId] ?? "ready",
+					),
 				});
 			}
 			return json(route, {
@@ -568,12 +722,12 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await expect(page.getByText("#123")).toBeVisible();
 });
 
-test("feed auto translate resolves visible cards and the next 10 through results aggregation", async ({
+test("feed smart lane auto generates for visible cards by default", async ({
 	page,
 }) => {
 	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
-		autoTranslateFeedCount: 18,
+		autoTranslateFeedCount: 12,
 	});
 
 	await page.goto("/?tab=releases");
@@ -582,40 +736,40 @@ test("feed auto translate resolves visible cards and the next 10 through results
 		"true",
 	);
 	await expect
-		.poll(() => tracker.translationResolveEntityIds.length)
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.every((kind) => kind === "release_smart"),
+				).length,
+		)
 		.toBeGreaterThan(0);
 
-	const firstWindow = tracker.translationResolveEntityIds[0];
-	expect(firstWindow.length).toBeGreaterThan(0);
-	expect(firstWindow).toEqual(
-		Array.from({ length: firstWindow.length }, (_, index) =>
-			makeAutoTranslateReleaseId(index),
+	expect(
+		tracker.translationResolveRequests.some(
+			(request) =>
+				request.kinds.every((kind) => kind === "release_smart") &&
+				request.entityIds.includes(makeAutoTranslateReleaseId(0)),
 		),
-	);
-
-	expect(new Set(firstWindow).size).toBe(firstWindow.length);
-	expect(tracker.translationBatchEntityIds).toHaveLength(0);
-	expect(tracker.translationSingleEntityIds).toHaveLength(0);
-
+	).toBe(true);
 	await expect(
-		page.getByRole("heading", { name: "发布说明 20001" }),
+		page.getByRole("heading", { name: "智能摘要 20001" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("这是 release 20001 的中文摘要。", { exact: true }),
+		page.getByText("智能总结 release 20001 的主要版本变化。", {
+			exact: true,
+		}),
 	).toBeVisible();
 });
 
-test("feed auto translate clears stale ready cards when aggregation returns missing", async ({
+test("feed translated tab triggers on-demand translation when data was not preheated", async ({
 	page,
 }) => {
 	const releaseId = makeAutoTranslateReleaseId(0);
 	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
-		autoTranslateFeedCount: 12,
-		autoTranslateInitialReadyIds: [releaseId],
-		autoTranslateResolveStatuses: {
-			[releaseId]: "missing",
-		},
+		autoTranslateFeedCount: 6,
+		autoTranslateDisabledIds: [releaseId],
+		smartInitialReadyIds: [releaseId],
 	});
 
 	await page.goto("/?tab=releases");
@@ -624,37 +778,37 @@ test("feed auto translate clears stale ready cards when aggregation returns miss
 		"true",
 	);
 	await expect(
-		page.getByRole("heading", { name: `Release ${releaseId}` }),
+		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
 	).toBeVisible();
+
+	await page.getByRole("tab", { name: "翻译" }).first().click();
 	await expect(
 		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
-	).toHaveCount(0);
+	).toBeVisible();
 	await expect(
 		page.getByText(`这是 release ${releaseId} 的中文摘要。`, { exact: true }),
-	).toHaveCount(0);
-
-	const translateButton = page.getByRole("button", { name: "翻译" }).first();
-	await expect(translateButton).toBeDisabled();
-	await expect
-		.poll(() => tracker.translationResolveEntityIds.length)
-		.toBeGreaterThan(0);
+	).toBeVisible();
 	expect(
-		tracker.translationResolveEntityIds.some((ids) => ids.includes(releaseId)),
+		tracker.translationResolveRequests.some(
+			(request) =>
+				request.kinds.every((kind) => kind === "release_summary") &&
+				request.entityIds.includes(releaseId),
+		),
 	).toBe(true);
 });
 
-test("feed auto translate keeps retrying stale ready refreshes after transient resolve failures", async ({
+test("feed smart insufficient result collapses the card to version-only mode", async ({
 	page,
 }) => {
 	const releaseId = makeAutoTranslateReleaseId(0);
 	const tracker = await installApiMocks(page, {
 		withAutoTranslateFeed: true,
-		autoTranslateFeedCount: 12,
-		autoTranslateInitialReadyIds: [releaseId],
-		autoTranslateResolveStatuses: {
+		withAutoTranslateReactions: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateDisabledIds: [releaseId],
+		smartResolveStatuses: {
 			[releaseId]: "missing",
 		},
-		autoTranslateResolveFailureCount: 3,
 	});
 
 	await page.goto("/?tab=releases");
@@ -663,18 +817,60 @@ test("feed auto translate keeps retrying stale ready refreshes after transient r
 		"true",
 	);
 	await expect
-		.poll(() => tracker.translationResolveEntityIds.length)
-		.toBeGreaterThan(3);
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_smart") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
 
 	await expect(
 		page.getByRole("heading", { name: `Release ${releaseId}` }),
 	).toBeVisible();
+	const releaseCard = page
+		.locator('[data-slot="card"]')
+		.filter({
+			has: page.getByRole("heading", { name: `Release ${releaseId}` }),
+		})
+		.first();
+	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
 	await expect(
-		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+		page.getByText("智能总结 release 20001 的主要版本变化。"),
 	).toHaveCount(0);
+	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
+	await expect(releaseCard.getByRole("button", { name: /👍/ })).toBeVisible();
+});
+
+test("feed smart retry treats insufficient result as a successful collapse", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartResolveStatuses: {
+			[releaseId]: "missing",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect(page.getByText("智能整理失败", { exact: true })).toBeVisible();
+
+	await page.getByRole("button", { name: "重试智能整理" }).click();
+
+	await expect(page.getByText("no_valuable_version_info")).toHaveCount(0);
+	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
 	await expect(
-		page.getByText(`这是 release ${releaseId} 的中文摘要。`, { exact: true }),
-	).toHaveCount(0);
+		page.getByRole("heading", { name: `Release ${releaseId}` }),
+	).toBeVisible();
+	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
 });
 
 test.describe("localized timestamps", () => {

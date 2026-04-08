@@ -1,4 +1,10 @@
 export type TranslatedStatus = "ready" | "missing" | "disabled" | "error";
+export type SmartStatus =
+	| "ready"
+	| "missing"
+	| "disabled"
+	| "error"
+	| "insufficient";
 
 export type TranslatedItem = {
 	lang: string;
@@ -7,6 +13,16 @@ export type TranslatedItem = {
 	summary: string | null;
 	auto_translate?: boolean;
 };
+
+export type SmartItem = {
+	lang: string;
+	status: SmartStatus;
+	title: string | null;
+	summary: string | null;
+	auto_translate?: boolean;
+};
+
+export type FeedLane = "original" | "translated" | "smart";
 
 // Feed is releases-only (Inbox has its own API + UI tab).
 export type FeedItemKind = "release";
@@ -57,6 +73,7 @@ export type FeedItem = {
 	html_url: string | null;
 	unread: number | null;
 	translated: TranslatedItem | null;
+	smart: SmartItem | null;
 	reactions: ReleaseReactions | null;
 };
 

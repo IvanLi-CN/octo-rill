@@ -23,10 +23,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import type {
 	FeedItem,
+	FeedLane,
 	ReactionContent,
 	ReleaseReactions,
 	ToggleReleaseReactionResponse,
 } from "@/feed/types";
+import { useAutoSmart } from "@/feed/useAutoSmart";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
 import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
@@ -57,6 +59,34 @@ type TaskStreamState = {
 	taskId: string;
 	eventPath: string;
 };
+
+function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
+}
+
+function defaultLaneForItem(item: FeedItem): FeedLane {
+	if (item.smart?.status === "disabled") {
+		return "original";
+	}
+	return "smart";
+}
+
+function resolveLaneForItem(
+	item: FeedItem,
+	selectedLaneByKey: Record<string, FeedLane>,
+): FeedLane {
+	if (item.smart?.status === "insufficient") {
+		return "smart";
+	}
+	const selected = selectedLaneByKey[feedItemKey(item)];
+	if (selected === "translated" && item.translated?.status === "disabled") {
+		return "original";
+	}
+	if (selected === "smart" && item.smart?.status === "disabled") {
+		return "original";
+	}
+	return selected ?? defaultLaneForItem(item);
+}
 
 type TaskEventPayload = {
 	stage?: string;
@@ -214,8 +244,8 @@ export function Dashboard(props: { me: MeResponse }) {
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
 
-	const [showOriginalByKey, setShowOriginalByKey] = useState<
-		Record<string, boolean>
+	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
+		Record<string, FeedLane>
 	>({});
 	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
 		null,
@@ -353,9 +383,22 @@ export function Dashboard(props: { me: MeResponse }) {
 		}
 	}, []);
 
-	const { register, translateNow, inFlightKeys } = useAutoTranslate({
+	const {
+		register: registerTranslate,
+		translateNow,
+		inFlightKeys: translationInFlightKeys,
+	} = useAutoTranslate({
 		enabled: true,
 		onTranslated: feed.applyTranslation,
+	});
+	const {
+		prime: primeSmart,
+		register: registerSmart,
+		smartNow,
+		inFlightKeys: smartInFlightKeys,
+	} = useAutoSmart({
+		enabled: true,
+		onSmart: feed.applySmart,
 	});
 
 	useEffect(() => {
@@ -367,6 +410,15 @@ export function Dashboard(props: { me: MeResponse }) {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
+
+	useEffect(() => {
+		if (feed.loadingInitial || feed.items.length === 0) {
+			return;
+		}
+		void primeSmart(feed.items).catch((err) => {
+			setBootError(err instanceof Error ? err.message : String(err));
+		});
+	}, [feed.items, feed.loadingInitial, primeSmart]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;
@@ -565,10 +617,6 @@ export function Dashboard(props: { me: MeResponse }) {
 		};
 	}, []);
 
-	const onToggleOriginal = useCallback((key: string) => {
-		setShowOriginalByKey((prev) => ({ ...prev, [key]: !prev[key] }));
-	}, []);
-
 	const onTranslateNow = useCallback(
 		(item: FeedItem) => {
 			void translateNow(item).catch((err) => {
@@ -576,6 +624,48 @@ export function Dashboard(props: { me: MeResponse }) {
 			});
 		},
 		[translateNow],
+	);
+	const onSmartNow = useCallback(
+		(item: FeedItem) => {
+			void smartNow(item).catch((err) => {
+				setBootError(err instanceof Error ? err.message : String(err));
+			});
+		},
+		[smartNow],
+	);
+	const onSelectLane = useCallback(
+		(item: FeedItem, lane: FeedLane) => {
+			const key = feedItemKey(item);
+			setSelectedLaneByKey((prev) => ({ ...prev, [key]: lane }));
+			if (
+				lane === "translated" &&
+				(item.translated?.status === "missing" ||
+					(item.translated?.status === "error" &&
+						item.translated?.auto_translate !== false))
+			) {
+				void translateNow(item).catch((err) => {
+					setBootError(err instanceof Error ? err.message : String(err));
+				});
+			}
+			if (
+				lane === "smart" &&
+				(item.smart?.status === "missing" ||
+					(item.smart?.status === "error" &&
+						item.smart?.auto_translate !== false))
+			) {
+				void smartNow(item).catch((err) => {
+					setBootError(err instanceof Error ? err.message : String(err));
+				});
+			}
+		},
+		[smartNow, translateNow],
+	);
+	const registerFeedItem = useCallback(
+		(item: FeedItem) => (element: HTMLElement | null) => {
+			registerTranslate(item)(element);
+			registerSmart(item)(element);
+		},
+		[registerSmart, registerTranslate],
 	);
 
 	const flushPendingReactions = useCallback(
@@ -892,7 +982,10 @@ export function Dashboard(props: { me: MeResponse }) {
 	const syncingInbox = busy === "Sync inbox";
 
 	const aiDisabledHint = useMemo(() => {
-		const any = feed.items.find((it) => it.translated?.status === "disabled");
+		const any = feed.items.find(
+			(it) =>
+				it.translated?.status === "disabled" || it.smart?.status === "disabled",
+		);
 		return Boolean(any);
 	}, [feed.items]);
 
@@ -994,12 +1087,19 @@ export function Dashboard(props: { me: MeResponse }) {
 				loadingInitial={feed.loadingInitial}
 				loadingMore={feed.loadingMore}
 				hasMore={feed.hasMore}
-				inFlightKeys={inFlightKeys}
-				registerItemRef={register}
+				translationInFlightKeys={translationInFlightKeys}
+				smartInFlightKeys={smartInFlightKeys}
+				registerItemRef={registerFeedItem}
 				onLoadMore={feed.loadMore}
-				showOriginalByKey={showOriginalByKey}
-				onToggleOriginal={onToggleOriginal}
+				selectedLaneByKey={Object.fromEntries(
+					feed.items.map((item) => [
+						feedItemKey(item),
+						resolveLaneForItem(item, selectedLaneByKey),
+					]),
+				)}
+				onSelectLane={onSelectLane}
 				onTranslateNow={onTranslateNow}
+				onSmartNow={onSmartNow}
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={reactionErrorByKey}
 				onToggleReaction={onToggleReaction}

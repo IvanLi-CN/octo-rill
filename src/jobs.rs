@@ -35,6 +35,7 @@ pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
+pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
 
@@ -1524,6 +1525,17 @@ async fn execute_task(
                 .map_err(|err| anyhow!("translate_releases_batch failed: {}", err.code()))?;
             Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
         }
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
+            let user_id = payload_local_id(payload, "user_id")?;
+            let release_ids = payload_i64_array(payload, "release_ids")?;
+            let res =
+                api::summarize_releases_smart_batch_for_user(state, user_id.as_str(), &release_ids)
+                    .await
+                    .map_err(|err| {
+                        anyhow!("summarize_releases_smart_batch failed: {}", err.code())
+                    })?;
+            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
+        }
         TASK_TRANSLATE_RELEASE_DETAIL => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
@@ -1950,11 +1962,11 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_SYNC_RELEASES,
-        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
-        current_subscription_schedule_key, is_scheduled_task_type, load_translation_stream_cursor,
-        load_translation_stream_rows, next_llm_scheduler_stream_event, recover_runtime_state,
-        recover_runtime_state_on_startup,
+        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS,
+        TranslationStreamCursor, claim_next_queued_task, current_subscription_schedule_key,
+        is_scheduled_task_type, load_translation_stream_cursor, load_translation_stream_rows,
+        next_llm_scheduler_stream_event, recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
     use sqlx::{
@@ -1995,6 +2007,7 @@ mod tests {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
         assert!(!is_scheduled_task_type("translate.release"));
+        assert!(!is_scheduled_task_type(TASK_SUMMARIZE_RELEASE_SMART_BATCH));
     }
 
     #[test]

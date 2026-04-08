@@ -5,6 +5,7 @@ import type {
 	FeedItem,
 	FeedResponse,
 	ReleaseReactions,
+	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
 
@@ -107,6 +108,22 @@ export function useFeed() {
 		[],
 	);
 
+	const applySmart = useCallback(
+		(item: Pick<FeedItem, "kind" | "id">, smart: SmartItem) => {
+			const key = itemKey(item);
+			setItems((prev) =>
+				prev.map((it) => {
+					if (itemKey(it) !== key) return it;
+					return {
+						...it,
+						smart: { ...smart },
+					};
+				}),
+			);
+		},
+		[],
+	);
+
 	const applyReactions = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, reactions: ReleaseReactions) => {
 			const key = itemKey(item);
@@ -141,6 +158,7 @@ export function useFeed() {
 		loadMore,
 		refresh,
 		applyTranslation,
+		applySmart,
 		applyReactions,
 	};
 }

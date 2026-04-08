@@ -454,7 +454,8 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
-		case "translate.release.batch": {
+		case "translate.release.batch":
+		case "summarize.release.smart.batch": {
 			const diagnostics = detail.diagnostics?.translate_release_batch ?? null;
 			const releaseIds = readIdArray(payload, "release_ids");
 			const summary = summarizeTranslateBatchResult(result);
@@ -472,9 +473,14 @@ function buildTaskDetailPageModel(
 						? `#${userId}`
 						: null;
 			return {
-				pageTitle: "批量翻译 Release 详情页",
+				pageTitle:
+					task.task_type === "summarize.release.smart.batch"
+						? "批量智能整理 Release 详情页"
+						: "批量翻译 Release 详情页",
 				pageSummary:
-					"展示批量翻译任务的目标 Release 数量、进度与 ready/missing/error 结果分布。",
+					task.task_type === "summarize.release.smart.batch"
+						? "展示批量智能整理任务的目标 Release 数量、进度与 ready/missing/error 结果分布。"
+						: "展示批量翻译任务的目标 Release 数量、进度与 ready/missing/error 结果分布。",
 				fields: buildFields(
 					field("目标用户", targetUser),
 					field(

@@ -30,14 +30,15 @@ use crate::{
     version,
 };
 
+const SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
+
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
     ensure_dir_exists(&config.task_log_dir)?;
 
     let connect_opts = build_sqlite_connect_options(&config.database_url)?;
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+    let pool = build_sqlite_pool_options()
         .connect_with(connect_opts)
         .await
         .context("failed to open sqlite database")?;
@@ -56,6 +57,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         journal_mode = %pragmas.journal_mode,
         busy_timeout_ms = pragmas.busy_timeout_ms,
         synchronous = pragmas.synchronous,
+        pool_max_connections = SQLITE_POOL_MAX_CONNECTIONS,
         "sqlite runtime pragmas active"
     );
 
@@ -384,6 +386,16 @@ fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptio
     Ok(connect_opts)
 }
 
+fn build_sqlite_pool_options() -> SqlitePoolOptions {
+    // OctoRill runs against a single local SQLite file. Multiple pool connections inside the same
+    // process increase self-contention because SQLite still serializes writes. Keeping one shared
+    // connection avoids reintroducing `database is locked` during background workers + lease
+    // heartbeats, while retryable smart failures are now re-queued by the translation layer.
+    SqlitePoolOptions::new()
+        .max_connections(SQLITE_POOL_MAX_CONNECTIONS)
+        .min_connections(1)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SqliteRuntimePragmas {
     journal_mode: String,
@@ -482,9 +494,9 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_health, api_version, build_sqlite_connect_options, read_sqlite_runtime_pragmas,
+        SQLITE_POOL_MAX_CONNECTIONS, api_health, api_version, build_sqlite_connect_options,
+        build_sqlite_pool_options, read_sqlite_runtime_pragmas,
     };
-    use sqlx::sqlite::SqlitePoolOptions;
 
     #[tokio::test]
     async fn api_version_reports_non_empty_version_and_source() {
@@ -527,8 +539,7 @@ mod tests {
             crate::local_id::generate_local_id(),
         ));
         let database_url = format!("sqlite:{}", database_path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+        let pool = build_sqlite_pool_options()
             .connect_with(
                 build_sqlite_connect_options(&database_url).expect("build sqlite connect options"),
             )
@@ -542,5 +553,11 @@ mod tests {
         assert_eq!(pragmas.journal_mode, "wal");
         assert_eq!(pragmas.busy_timeout_ms, 5000);
         assert_eq!(pragmas.synchronous, 1);
+    }
+
+    #[test]
+    fn sqlite_pool_uses_single_connection_to_avoid_self_contention() {
+        let _ = build_sqlite_pool_options();
+        assert_eq!(SQLITE_POOL_MAX_CONNECTIONS, 1);
     }
 }
