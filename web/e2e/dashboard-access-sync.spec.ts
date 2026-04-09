@@ -512,7 +512,10 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 						reason: "review_requested",
 						updated_at: "2026-02-22T11:22:33Z",
 						unread: inboxPhase === "fresh" ? 1 : 0,
-						html_url: null,
+						html_url:
+							inboxPhase === "fresh"
+								? "https://github.com/owner/repo/pull/77"
+								: "https://github.com/owner/repo/pull/42",
 					},
 				]);
 			}
@@ -572,6 +575,9 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 		await expect(syncInboxButton).toBeDisabled();
 
 		await expect(page.getByText("Fresh inbox thread").first()).toBeVisible();
+		await expect(
+			page.getByRole("link", { name: /Fresh inbox thread/i }).first(),
+		).toHaveAttribute("href", "https://github.com/owner/repo/pull/77");
 		await expect(syncInboxButton).toBeEnabled();
 
 		expect(syncInboxCalls).toBe(1);
@@ -774,9 +780,196 @@ test("dashboard keeps inbox sync reachable when inbox is empty", async ({
 	await expect(
 		page.getByText("暂无通知。可以点击 Sync inbox 拉取最新数据。"),
 	).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "GitHub" }).first(),
+	).toHaveAttribute("href", "https://github.com/notifications");
 
 	await syncInboxButton.click();
 	await expect(syncInboxButton).toBeDisabled();
 	await expect(syncInboxButton).toBeEnabled();
 	expect(syncInboxCalls).toBe(1);
+});
+
+test("dashboard inbox cards fall back to GitHub per-thread pages when html_url is missing", async ({
+	page,
+}) => {
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname, searchParams } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: null,
+							task_type: null,
+							event_path: null,
+							reason: "none",
+						},
+					},
+				),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			expect(searchParams.get("limit")).toBe("30");
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, [
+				{
+					thread_id: "90003",
+					repo_full_name: "owner/repo",
+					subject_title: "Fallback inbox thread",
+					subject_type: "CheckSuite",
+					reason: "ci_activity",
+					updated_at: "2026-02-22T11:22:33Z",
+					unread: 1,
+					html_url: null,
+				},
+			]);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/?tab=inbox");
+
+	await expect(
+		page.getByRole("link", { name: /Fallback inbox thread/i }).first(),
+	).toHaveAttribute("href", "https://github.com/notifications/threads/90003");
+});
+
+test("dashboard inbox cards ignore stale repo-homepage html_url values until repair rewrites them", async ({
+	page,
+}) => {
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname, searchParams } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse(
+					{
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					},
+					{
+						access_sync: {
+							task_id: null,
+							task_type: null,
+							event_path: null,
+							reason: "none",
+						},
+					},
+				),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			expect(searchParams.get("limit")).toBe("30");
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, [
+				{
+					thread_id: "90004",
+					repo_full_name: "owner/repo",
+					subject_title: "Stale repo homepage link",
+					subject_type: "PullRequest",
+					reason: "review_requested",
+					updated_at: "2026-02-22T11:22:33Z",
+					unread: 1,
+					html_url: "https://github.com/owner/repo/",
+				},
+			]);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/?tab=inbox");
+
+	await expect(
+		page.getByRole("link", { name: /Stale repo homepage link/i }).first(),
+	).toHaveAttribute("href", "https://github.com/notifications/threads/90004");
 });
