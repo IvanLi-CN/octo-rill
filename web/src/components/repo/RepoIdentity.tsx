@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { RepoVisual } from "@/lib/repoVisual";
 import { resolveRepoVisualCandidates } from "@/lib/repoVisual";
@@ -58,9 +58,49 @@ function RepoIdentityContent(props: {
 		() => resolveRepoVisualCandidates(repoVisual),
 		[repoVisual],
 	);
-	const [candidateIndex, setCandidateIndex] = useState(0);
+	const [failedCandidateKeys, setFailedCandidateKeys] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const autoRetryPendingRef = useRef(true);
 
-	const candidate = candidates[candidateIndex] ?? null;
+	useEffect(() => {
+		if (failedCandidateKeys.size === 0) return;
+
+		const resetFallbacks = () => {
+			setFailedCandidateKeys((current) =>
+				current.size === 0 ? current : new Set(),
+			);
+		};
+		const handleVisibilityChange = () => {
+			if (document.visibilityState === "visible") {
+				resetFallbacks();
+			}
+		};
+
+		const retryTimer = autoRetryPendingRef.current
+			? window.setTimeout(() => {
+					autoRetryPendingRef.current = false;
+					resetFallbacks();
+				}, 15_000)
+			: null;
+
+		window.addEventListener("focus", resetFallbacks);
+		window.addEventListener("online", resetFallbacks);
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+		return () => {
+			if (retryTimer !== null) {
+				window.clearTimeout(retryTimer);
+			}
+			window.removeEventListener("focus", resetFallbacks);
+			window.removeEventListener("online", resetFallbacks);
+			document.removeEventListener("visibilitychange", handleVisibilityChange);
+		};
+	}, [failedCandidateKeys]);
+
+	const candidate =
+		candidates.find(
+			(entry) => !failedCandidateKeys.has(`${entry.kind}:${entry.src}`),
+		) ?? null;
 	const kind = candidate?.kind ?? "text_only";
 
 	return (
@@ -85,13 +125,15 @@ function RepoIdentityContent(props: {
 						referrerPolicy="no-referrer"
 						className="size-full object-cover"
 						data-repo-visual-image={candidate.kind}
-						onError={() =>
-							setCandidateIndex((current) =>
-								current < candidates.length - 1
-									? current + 1
-									: candidates.length,
-							)
-						}
+						onError={() => {
+							const failedKey = `${candidate.kind}:${candidate.src}`;
+							setFailedCandidateKeys((current) => {
+								if (current.has(failedKey)) return current;
+								const next = new Set(current);
+								next.add(failedKey);
+								return next;
+							});
+						}}
 					/>
 				</span>
 			) : null}
