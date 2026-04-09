@@ -41,6 +41,7 @@ import { VersionMonitorStateProvider } from "@/version/versionMonitor";
 type Tab = "all" | "releases" | "briefs" | "inbox";
 type FeedMode =
 	| "default"
+	| "reaction-polish"
 	| "visible-window-queued"
 	| "visible-window-settling"
 	| "body-limit-error"
@@ -250,6 +251,52 @@ function makeMockFeed(): FeedItem[] {
 	];
 }
 
+function makeReactionPolishFeed(): FeedItem[] {
+	return [
+		buildFeedItem("60001", {
+			ts: "2026-04-03T21:30:00+08:00",
+			repo_full_name: "acme/satellite",
+			title: "oauth action bubble polish",
+			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
+			html_url:
+				"https://github.com/acme/satellite/releases/tag/oauth-action-bubble",
+			reactions: {
+				counts: {
+					plus1: 12,
+					laugh: 0,
+					heart: 4,
+					hooray: 0,
+					rocket: 2,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: true,
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: true,
+					eyes: false,
+				},
+				status: "ready",
+			},
+			smart: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "oauth action bubble polish",
+				summary:
+					"- 收敛 release reaction 泡泡样式\n- 统一 hover / active / busy 的视觉层级",
+			},
+			translated: {
+				lang: "zh-CN",
+				status: "ready",
+				title: "oauth action bubble polish",
+				summary:
+					"- 收敛 release reaction 泡泡样式\n- 统一 hover / active / busy 的视觉层级",
+			},
+		}),
+	];
+}
+
 function makeVisibleWindowFeed(
 	mode: "visible-window-queued" | "visible-window-settling",
 ): FeedItem[] {
@@ -439,6 +486,12 @@ function makeVisibleWindowInFlightKeys(
 	);
 }
 
+function isVisibleWindowFeedMode(
+	mode: FeedMode,
+): mode is "visible-window-queued" | "visible-window-settling" {
+	return mode === "visible-window-queued" || mode === "visible-window-settling";
+}
+
 function makeSmartInFlightKeys(mode: FeedMode) {
 	return new Set(
 		mode === "smart-loading"
@@ -447,6 +500,10 @@ function makeSmartInFlightKeys(mode: FeedMode) {
 				? []
 				: [],
 	);
+}
+
+function makeReactionBusyKeys(mode: FeedMode) {
+	return new Set(mode === "reaction-polish" ? ["release:60001"] : []);
 }
 
 const mockBriefs: BriefItem[] = [
@@ -656,27 +713,36 @@ function DashboardPreview(props: {
 	const items =
 		emptyState !== "content"
 			? []
-			: feedMode === "default"
-				? makeMockFeed()
-				: feedMode === "body-limit-error"
-					? makeBodyLimitErrorFeed()
-					: feedMode === "sync-preheated"
-						? makeSyncPreheatedFeed()
-						: feedMode === "smart-ready-body"
-							? makeSmartReadyBodyFeed()
-							: feedMode === "smart-ready-diff"
-								? makeSmartReadyDiffFeed()
-								: feedMode === "smart-loading"
-									? makeSmartLoadingFeed()
-									: feedMode === "smart-retry-error"
-										? makeSmartRetryErrorFeed()
-										: feedMode === "smart-insufficient"
-											? makeSmartInsufficientFeed()
-											: makeVisibleWindowFeed(feedMode);
+			: (() => {
+					switch (feedMode) {
+						case "default":
+							return makeMockFeed();
+						case "reaction-polish":
+							return makeReactionPolishFeed();
+						case "body-limit-error":
+							return makeBodyLimitErrorFeed();
+						case "sync-preheated":
+							return makeSyncPreheatedFeed();
+						case "smart-ready-body":
+							return makeSmartReadyBodyFeed();
+						case "smart-ready-diff":
+							return makeSmartReadyDiffFeed();
+						case "smart-loading":
+							return makeSmartLoadingFeed();
+						case "smart-retry-error":
+							return makeSmartRetryErrorFeed();
+						case "smart-insufficient":
+							return makeSmartInsufficientFeed();
+						case "visible-window-queued":
+						case "visible-window-settling":
+							return makeVisibleWindowFeed(feedMode);
+					}
+				})();
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const translationInFlightKeys =
 		emptyState !== "content" ||
 		feedMode === "default" ||
+		feedMode === "reaction-polish" ||
 		feedMode === "body-limit-error" ||
 		feedMode === "sync-preheated" ||
 		feedMode === "smart-ready-body" ||
@@ -685,11 +751,13 @@ function DashboardPreview(props: {
 		feedMode === "smart-retry-error" ||
 		feedMode === "smart-insufficient"
 			? new Set<string>()
-			: makeVisibleWindowInFlightKeys(feedMode);
+			: isVisibleWindowFeedMode(feedMode)
+				? makeVisibleWindowInFlightKeys(feedMode)
+				: new Set<string>();
 	const [smartInFlightKeys, setSmartInFlightKeys] = useState<Set<string>>(() =>
 		makeSmartInFlightKeys(feedMode),
 	);
-	const reactionBusyKeys = new Set<string>();
+	const reactionBusyKeys = makeReactionBusyKeys(feedMode);
 	const aiDisabledHint = items.some(
 		(it) =>
 			it.translated?.status === "disabled" || it.smart?.status === "disabled",
@@ -1515,6 +1583,81 @@ export const PatDialogOpen: Story = {
 			description: {
 				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
 			},
+		},
+	},
+};
+
+export const ReactionBubblePolish: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "reaction-polish",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Reaction footer 使用本地 Fluent Flat SVG 与真圆按钮；有计数时 badge 浮在按钮外侧，零计数项保持无 badge，busy 态继续弱化透明度。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const releaseHeading = canvas.getByRole("heading", {
+			name: "oauth action bubble polish",
+		});
+		const releaseCard = releaseHeading
+			.closest('[data-slot="card"]')
+			?.querySelector<HTMLElement>('[data-reaction-footer="true"]');
+		expect(releaseCard).not.toBeNull();
+		if (!releaseCard) {
+			throw new Error("Expected release reaction footer to exist");
+		}
+
+		const plusOneChip = releaseCard.querySelector<HTMLElement>(
+			'[data-reaction-chip="plus1"]',
+		);
+		const plusOneButton = releaseCard.querySelector<HTMLButtonElement>(
+			'[data-reaction-trigger="plus1"]',
+		);
+		const plusOneBadge = releaseCard.querySelector<HTMLElement>(
+			'[data-reaction-count-badge="plus1"]',
+		);
+		const laughBadge = releaseCard.querySelector(
+			'[data-reaction-count-badge="laugh"]',
+		);
+		expect(plusOneChip).not.toBeNull();
+		expect(plusOneButton).not.toBeNull();
+		expect(plusOneBadge).not.toBeNull();
+		expect(laughBadge).toBeNull();
+		if (!plusOneChip || !plusOneButton || !plusOneBadge) {
+			throw new Error("Expected plus1 reaction button and external badge");
+		}
+
+		await expect(canvas.getByRole("button", { name: "赞 12" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "笑" })).toBeVisible();
+		expect(plusOneButton.contains(plusOneBadge)).toBe(false);
+		expect(plusOneButton.classList.contains("rounded-full")).toBe(true);
+		expect(window.getComputedStyle(plusOneButton).opacity).toBe("0.8");
+
+		const buttonRect = plusOneButton.getBoundingClientRect();
+		expect(Math.abs(buttonRect.width - buttonRect.height)).toBeLessThanOrEqual(
+			1,
+		);
+		expect(plusOneBadge.getBoundingClientRect().right).toBeGreaterThan(
+			buttonRect.right - 1,
+		);
+	},
+};
+
+export const EvidenceReactionBubblePolish: Story = {
+	name: "Evidence / Reaction Bubble Polish",
+	args: {
+		initialTab: "releases",
+		feedMode: "reaction-polish",
+	},
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };

@@ -443,7 +443,9 @@ async function installApiMocks(
 				cfg.smartResolveDelayMs &&
 				items.some((item) => item.kind === "release_smart")
 			) {
-				await page.waitForTimeout(cfg.smartResolveDelayMs);
+				await new Promise((resolve) =>
+					setTimeout(resolve, cfg.smartResolveDelayMs),
+				);
 			}
 			return json(route, {
 				items: items.map((item) => {
@@ -759,14 +761,52 @@ test("reaction fallback opens PAT dialog with accessible controls", async ({
 	});
 	await expect(patDialog).toBeVisible();
 	await expect(patDialog.getByLabel("GitHub PAT")).toBeVisible();
-	await expect(
-		patDialog.getByRole("button", { name: "稍后再说" }),
-	).toBeVisible();
-	await expect(
-		patDialog.getByRole("button", { name: "保存并继续" }),
-	).toBeDisabled();
-	await patDialog.getByRole("button", { name: "稍后再说" }).click();
+	await expect(page.getByRole("button", { name: "稍后再说" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "保存并继续" })).toBeDisabled();
+	await page.getByRole("button", { name: "稍后再说" }).click();
 	await expect(patDialog).toHaveCount(0);
+});
+
+test("reaction buttons stay circular and render count badges outside the trigger", async ({
+	page,
+}) => {
+	await installApiMocks(page, { withReactionFeed: true });
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+
+	const reactionFooter = page.locator('[data-reaction-footer="true"]').first();
+	const plusOneButton = reactionFooter.locator(
+		'[data-reaction-trigger="plus1"]',
+	);
+	const plusOneBadge = reactionFooter.locator(
+		'[data-reaction-count-badge="plus1"]',
+	);
+	const laughButton = reactionFooter.getByRole("button", { name: "笑" });
+
+	await expect(plusOneButton).toBeVisible();
+	await expect(plusOneBadge).toHaveText("2");
+	await expect(laughButton).toBeVisible();
+	await expect(
+		reactionFooter.locator('[data-reaction-count-badge="laugh"]'),
+	).toHaveCount(0);
+	await expect(plusOneButton.getByText("2")).toHaveCount(0);
+
+	const shape = await plusOneButton.evaluate((element) => {
+		const button = element as HTMLButtonElement;
+		const style = window.getComputedStyle(button);
+		const rect = button.getBoundingClientRect();
+		return {
+			borderRadius: style.borderRadius,
+			height: rect.height,
+			width: rect.width,
+		};
+	});
+	expect(Math.abs(shape.width - shape.height)).toBeLessThanOrEqual(1);
+	expect(Number.parseFloat(shape.borderRadius)).toBeGreaterThanOrEqual(999);
 });
 
 test("deep link with zero-padded release id still resolves detail", async ({
@@ -1095,7 +1135,7 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 		page.getByText("智能总结 release 20001 的主要版本变化。"),
 	).toHaveCount(0);
 	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
-	await expect(releaseCard.getByRole("button", { name: /👍/ })).toBeVisible();
+	await expect(releaseCard.getByRole("button", { name: /赞/ })).toBeVisible();
 });
 
 test("feed smart retry treats insufficient result as a successful collapse", async ({

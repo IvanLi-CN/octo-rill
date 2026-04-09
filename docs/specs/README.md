@@ -92,3 +92,4 @@
 | 7f2b9 | Release Feed 三 Tabs 与智能版本变化卡片 | 已完成 | `7f2b9-release-feed-smart-tabs/SPEC.md` | 2026-04-08 | PR #53; page-level lane selector, segmented selector polish, and visual evidence refreshed |
 | h4yvc | 服务端版本更新轮询轻提示 | 已完成 | `h4yvc-version-update-polling-notice/SPEC.md` | 2026-04-10 | PR #57; version polling notice + visual evidence + regression coverage |
 | crzva | Release 视图仓库图标补齐 | 已完成 | `crzva-release-repo-visuals/SPEC.md` | 2026-04-10 | local implementation completed; review-loop clear; release repo visuals shipped with aligned repo identity polish |
+| zcp33 | Release reaction 扁平化重绘与圆形按钮收敛 | 部分完成（3/4） | `zcp33-release-reaction-bubble-polish/SPEC.md` | 2026-04-10 | Fluent Flat SVG assets + circular reaction trigger + external badge shipped locally; awaiting screenshot push approval |
