@@ -1,4 +1,5 @@
-import { ArrowUpRight, RefreshCcw } from "lucide-react";
+import { ArrowUpRight, RefreshCcw, Star, UserPlus } from "lucide-react";
+import { useMemo, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
@@ -17,7 +18,16 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
-import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
+import {
+	isReleaseFeedItem,
+	isSocialFeedItem,
+	type FeedActor,
+	type FeedItem,
+	type FeedLane,
+	type ReactionContent,
+	type ReleaseFeedItem,
+	type SocialFeedItem,
+} from "@/feed/types";
 import { withBaseAssetPath } from "@/lib/asset-path";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
@@ -101,7 +111,7 @@ function EmptyPanel(props: {
 	);
 }
 
-function displayTitleForLane(item: FeedItem, lane: FeedLane) {
+function displayTitleForLane(item: ReleaseFeedItem, lane: FeedLane) {
 	const originalTitle = item.title ?? "(no title)";
 	if (lane === "translated") {
 		return item.translated?.title?.trim() || originalTitle;
@@ -112,7 +122,7 @@ function displayTitleForLane(item: FeedItem, lane: FeedLane) {
 	return originalTitle;
 }
 
-function OriginalLane(props: { item: FeedItem }) {
+function OriginalLane(props: { item: ReleaseFeedItem }) {
 	const { item } = props;
 	if (item.body?.trim()) {
 		return (
@@ -134,7 +144,10 @@ function OriginalLane(props: { item: FeedItem }) {
 	);
 }
 
-function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
+function TranslatedLane(props: {
+	item: ReleaseFeedItem;
+	onTranslateNow: () => void;
+}) {
 	const { item, onTranslateNow } = props;
 
 	if (item.translated?.status === "ready" && item.translated.summary?.trim()) {
@@ -174,7 +187,7 @@ function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
 }
 
 function SmartLane(props: {
-	item: FeedItem;
+	item: ReleaseFeedItem;
 	onSmartNow: () => void;
 	isSmartGenerating: boolean;
 }) {
@@ -261,8 +274,105 @@ function FeedCardLaneTabs(props: {
 	);
 }
 
-export function FeedItemCard(props: {
-	item: FeedItem;
+function SocialActorAvatar(props: { actor: FeedActor; className?: string }) {
+	const { actor, className } = props;
+	const [failed, setFailed] = useState(false);
+	const fallbackLabel = useMemo(() => {
+		const raw = actor.login.trim();
+		return raw ? raw.slice(0, 1).toUpperCase() : "?";
+	}, [actor.login]);
+
+	return (
+		<div
+			className={cn(
+				"bg-muted text-muted-foreground flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-full border font-mono text-sm font-semibold",
+				className,
+			)}
+		>
+			{actor.avatar_url && !failed ? (
+				<img
+					src={actor.avatar_url}
+					alt={`${actor.login} avatar`}
+					className="size-full object-cover"
+					onError={() => setFailed(true)}
+				/>
+			) : (
+				<span data-social-avatar-fallback="true">{fallbackLabel}</span>
+			)}
+		</div>
+	);
+}
+
+function SocialActivityCard(props: { item: SocialFeedItem }) {
+	const { item } = props;
+	const actor = item.actor;
+	const isRepoStar = item.kind === "repo_star_received";
+	const BadgeIcon = isRepoStar ? Star : UserPlus;
+	const kindLabel = isRepoStar ? "STAR" : "FOLLOW";
+	const title = isRepoStar
+		? `${actor.login} 给你的仓库加了星标`
+		: `${actor.login} 关注了你`;
+	const ctaHref = item.html_url ?? actor.html_url ?? "#";
+
+	return (
+		<Card className="group bg-card/80 shadow-sm transition-shadow hover:shadow-md">
+			<CardHeader className="pb-4">
+				<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+					<div className="flex min-w-0 items-start gap-3">
+						<SocialActorAvatar actor={actor} />
+						<div className="min-w-0">
+							<div className="flex flex-wrap items-center gap-2">
+								<Badge className="border-primary/20 bg-primary font-mono text-[11px] tracking-wide text-primary-foreground">
+									<BadgeIcon className="size-3.5" />
+									{kindLabel}
+								</Badge>
+								{item.repo_full_name ? (
+									<span className="truncate font-mono text-[11px] text-muted-foreground">
+										{item.repo_full_name}
+									</span>
+								) : null}
+							</div>
+							<CardTitle className="mt-3 text-balance text-lg">
+								{title}
+							</CardTitle>
+							<p className="mt-1 font-mono text-xs text-muted-foreground">
+								{formatIsoShortLocal(item.ts)}
+							</p>
+						</div>
+					</div>
+
+					<Button
+						asChild
+						variant="outline"
+						size="sm"
+						className="shrink-0 font-mono text-xs"
+					>
+						<a href={ctaHref} target="_blank" rel="noreferrer">
+							<ArrowUpRight className="size-4" />
+							GitHub
+						</a>
+					</Button>
+				</div>
+			</CardHeader>
+
+			<CardContent className="pt-0">
+				<div className="rounded-xl border border-dashed bg-muted/20 p-4">
+					<p className="font-mono text-sm text-foreground">@{actor.login}</p>
+					<p className="mt-1 text-sm text-muted-foreground">
+						{isRepoStar
+							? item.repo_full_name
+								? `这位用户刚刚给你的仓库 ${item.repo_full_name} 加了星标。`
+								: "这位用户刚刚给你的仓库加了星标。"
+							: "这位用户刚刚关注了你的 GitHub 账号。"}
+					</p>
+				</div>
+			</CardContent>
+		</Card>
+	);
+}
+
+function ReleaseFeedCard(props: {
+	item: ReleaseFeedItem;
 	activeLane: FeedLane;
 	isTranslating: boolean;
 	isSmartGenerating: boolean;
@@ -285,7 +395,6 @@ export function FeedItemCard(props: {
 		onSmartNow,
 		onToggleReaction,
 	} = props;
-
 	const subtitleBits = [
 		item.reason || item.subtitle,
 		item.subject_type ? item.subject_type : null,
@@ -466,4 +575,29 @@ export function FeedItemCard(props: {
 			{reactionsFooter}
 		</Card>
 	);
+}
+
+export function FeedItemCard(props: {
+	item: FeedItem;
+	activeLane: FeedLane;
+	isTranslating: boolean;
+	isSmartGenerating: boolean;
+	isReactionBusy: boolean;
+	reactionError: string | null;
+	onSelectLane: (lane: FeedLane) => void;
+	onTranslateNow: () => void;
+	onSmartNow: () => void;
+	onToggleReaction: (content: ReactionContent) => void;
+}) {
+	const { item } = props;
+
+	if (isSocialFeedItem(item)) {
+		return <SocialActivityCard item={item} />;
+	}
+
+	if (!isReleaseFeedItem(item)) {
+		return null;
+	}
+
+	return <ReleaseFeedCard {...props} item={item} />;
 }

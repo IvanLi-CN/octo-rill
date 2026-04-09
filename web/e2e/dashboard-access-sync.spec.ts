@@ -165,12 +165,9 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 	let notificationCalls = 0;
 	let briefCalls = 0;
 	let feedPhase: "initial" | "cached" | "fresh" = "initial";
-	const cachedTimer = setTimeout(() => {
-		feedPhase = "cached";
-	}, 180);
-	const freshTimer = setTimeout(() => {
-		feedPhase = "fresh";
-	}, 3000);
+	let cachedTimer: ReturnType<typeof setTimeout> | null = null;
+	let freshTimer: ReturnType<typeof setTimeout> | null = null;
+	let phaseTimersStarted = false;
 
 	try {
 		await page.addInitScript(
@@ -265,6 +262,20 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			const req = route.request();
 			const url = new URL(req.url());
 			const { pathname, searchParams } = url;
+
+			if (
+				!phaseTimersStarted &&
+				req.method() === "GET" &&
+				pathname === "/api/me"
+			) {
+				phaseTimersStarted = true;
+				cachedTimer = setTimeout(() => {
+					feedPhase = "cached";
+				}, 150);
+				freshTimer = setTimeout(() => {
+					feedPhase = "fresh";
+				}, 3000);
+			}
 
 			if (req.method() === "GET" && pathname === "/api/me") {
 				return json(
@@ -373,8 +384,12 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		expect(notificationCalls).toBeGreaterThanOrEqual(3);
 		expect(briefCalls).toBeGreaterThanOrEqual(3);
 	} finally {
-		clearTimeout(cachedTimer);
-		clearTimeout(freshTimer);
+		if (cachedTimer) {
+			clearTimeout(cachedTimer);
+		}
+		if (freshTimer) {
+			clearTimeout(freshTimer);
+		}
 	}
 });
 
@@ -385,9 +400,7 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 	let notificationCalls = 0;
 	let syncInboxCalls = 0;
 	let inboxPhase: "cached" | "fresh" = "cached";
-	const freshTimer = setTimeout(() => {
-		inboxPhase = "fresh";
-	}, 2500);
+	let freshTimer: ReturnType<typeof setTimeout> | null = null;
 
 	try {
 		await page.addInitScript(
@@ -561,6 +574,11 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 
 			if (req.method() === "POST" && pathname === "/api/sync/notifications") {
 				syncInboxCalls += 1;
+				if (!freshTimer) {
+					freshTimer = setTimeout(() => {
+						inboxPhase = "fresh";
+					}, 1500);
+				}
 				return json(route, {
 					mode: "task_id",
 					task_id: "task-inbox-1",
@@ -619,7 +637,9 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 		expect(feedCalls).toBeGreaterThanOrEqual(2);
 		expect(notificationCalls).toBeGreaterThanOrEqual(2);
 	} finally {
-		clearTimeout(freshTimer);
+		if (freshTimer) {
+			clearTimeout(freshTimer);
+		}
 	}
 });
 
