@@ -530,7 +530,7 @@ const mockNotifs: NotificationItem[] = [
 		reason: "ci_activity",
 		updated_at: "2026-02-21T07:40:00Z",
 		unread: 1,
-		html_url: null,
+		html_url: "https://github.com/notifications?query=repo%3Aacme%2Frocket",
 	},
 	{
 		thread_id: "90000",
@@ -540,7 +540,7 @@ const mockNotifs: NotificationItem[] = [
 		reason: "review_requested",
 		updated_at: "2026-02-21T06:50:00Z",
 		unread: 0,
-		html_url: null,
+		html_url: "https://github.com/acme/rocket/pull/42",
 	},
 ];
 
@@ -1317,6 +1317,41 @@ export const InboxEmpty: Story = {
 			canvas.getByRole("button", { name: "Sync inbox" }),
 		).toBeVisible();
 		await expect(canvas.getByText(/暂无通知。可以点击/)).toBeVisible();
+	},
+};
+
+export const InboxLinksResolved: Story = {
+	args: {
+		initialTab: "inbox",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Inbox 通知项直接消费后端给出的 html_url；缺失时由前端回退到 GitHub Inbox 或 repo 过滤页，不再拼接 thread URL。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const inboxLinks = canvas.getAllByRole("link");
+		await expect(
+			inboxLinks.some((link) =>
+				link.getAttribute("href")?.includes("/notifications/thread/"),
+			),
+		).toBe(false);
+		await expect(
+			inboxLinks.some((link) =>
+				link.getAttribute("href")?.includes("/pull/42"),
+			),
+		).toBe(true);
+		await expect(
+			inboxLinks.some((link) =>
+				link
+					.getAttribute("href")
+					?.includes("/notifications?query=repo%3Aacme%2Frocket"),
+			),
+		).toBe(true);
 	},
 };
 
