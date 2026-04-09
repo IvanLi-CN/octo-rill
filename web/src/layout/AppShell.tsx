@@ -4,11 +4,12 @@ import { cn } from "@/lib/utils";
 
 type AppShellProps = {
 	header?: React.ReactNode;
+	notice?: React.ReactNode;
 	footer?: React.ReactNode;
 	children: React.ReactNode;
 };
 
-export function AppShell({ header, footer, children }: AppShellProps) {
+export function AppShell({ header, notice, footer, children }: AppShellProps) {
 	return (
 		<div className="min-h-screen">
 			{header ? (
@@ -16,6 +17,7 @@ export function AppShell({ header, footer, children }: AppShellProps) {
 					<div className={cn("mx-auto max-w-6xl px-6 py-4")}>{header}</div>
 				</header>
 			) : null}
+			{notice}
 
 			<main
 				className={cn("mx-auto max-w-6xl px-6 py-8", footer ? "pb-16" : null)}

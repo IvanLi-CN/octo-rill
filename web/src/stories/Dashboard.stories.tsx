@@ -26,6 +26,7 @@ import type { FeedItem, FeedLane } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -34,6 +35,7 @@ import {
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
+import { VersionMonitorStateProvider } from "@/version/versionMonitor";
 
 type Tab = "all" | "releases" | "briefs" | "inbox";
 type FeedMode =
@@ -55,6 +57,12 @@ const STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES = 8 * 60;
 const STORYBOOK_NOW = new Date("2026-04-04T12:00:00+08:00");
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
+const STORYBOOK_VERSION_STATE = {
+	loadedVersion: "v2.4.6",
+	availableVersion: null,
+	hasUpdate: false,
+	refreshPage: () => {},
+} as const;
 
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -774,161 +782,164 @@ function DashboardPreview(props: {
 		);
 
 	return (
-		<AppShell
-			header={
-				<DashboardHeader
-					feedCount={items.length}
-					inboxCount={notifications.length}
-					briefCount={storyBriefs.length}
-					login="storybook-user"
-					isAdmin
-					aiDisabledHint={aiDisabledHint}
-					busy={syncingAll}
-					syncingAll={syncingAll}
-					onSyncAll={() => {}}
-					logoutHref="#"
-				/>
-			}
-			footer={<AppMetaFooter />}
-		>
-			<Tabs
-				value={tab}
-				onValueChange={(nextTab) => setTab(nextTab as Tab)}
-				className="gap-6"
+		<VersionMonitorStateProvider value={STORYBOOK_VERSION_STATE}>
+			<AppShell
+				header={
+					<DashboardHeader
+						feedCount={items.length}
+						inboxCount={notifications.length}
+						briefCount={storyBriefs.length}
+						login="storybook-user"
+						isAdmin
+						aiDisabledHint={aiDisabledHint}
+						busy={syncingAll}
+						syncingAll={syncingAll}
+						onSyncAll={() => {}}
+						logoutHref="#"
+					/>
+				}
+				notice={<VersionUpdateNotice />}
+				footer={<AppMetaFooter />}
 			>
-				<div className="flex flex-wrap items-center justify-between gap-2">
-					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-						<TabsTrigger value="all" className="font-mono text-xs">
-							全部
-						</TabsTrigger>
-						<TabsTrigger value="releases" className="font-mono text-xs">
-							Releases
-						</TabsTrigger>
-						<TabsTrigger value="briefs" className="font-mono text-xs">
-							日报
-						</TabsTrigger>
-						<TabsTrigger value="inbox" className="font-mono text-xs">
-							Inbox
-						</TabsTrigger>
-					</TabsList>
-					<div
-						className="flex items-center gap-2"
-						data-dashboard-secondary-controls
-					>
-						{tab === "all" || tab === "releases" ? (
-							<FeedPageLaneSelector
-								value={effectivePageDefaultLane}
-								onValueChange={(lane) => {
-									setPageDefaultLane(lane);
-									setSelectedLaneByKey({});
-								}}
-							/>
-						) : null}
-						<Button
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-							onClick={() => setPatDialogOpen(true)}
-						>
-							打开 PAT 配置
-						</Button>
-						<Button
-							asChild
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-						>
-							<a href="/admin">管理员面板</a>
-						</Button>
-					</div>
-				</div>
-
-				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
-					<section className="min-w-0">
-						<TabsContent value="all" className="mt-0 min-w-0">
-							{renderFeedPanel("all")}
-						</TabsContent>
-						<TabsContent value="releases" className="mt-0 min-w-0">
-							{renderFeedPanel("releases")}
-						</TabsContent>
-						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<ReleaseDailyCard
-								briefs={storyBriefs}
-								selectedDate={selectedDate}
-								busy={false}
-								onGenerate={() => {}}
-								onOpenRelease={setActiveReleaseId}
-							/>
-						</TabsContent>
-						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList
-								notifications={notifications}
-								busy={syncingAll}
-								syncing={syncingAll}
-								onSync={tab === "inbox" ? () => {} : undefined}
-							/>
-						</TabsContent>
-					</section>
-
-					<aside className="space-y-6">
-						{tab === "briefs" ? (
-							<BriefListCard
-								briefs={storyBriefs}
-								selectedDate={selectedDate}
-								onSelectDate={(d) => setSelectedDate(d)}
-							/>
-						) : null}
-						<InboxQuickList notifications={notifications} />
-					</aside>
-				</div>
-			</Tabs>
-
-			<ReleaseDetailCard
-				releaseId={activeReleaseId}
-				onClose={() => setActiveReleaseId(null)}
-			/>
-
-			<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
-				<DialogContent
-					showCloseButton={false}
-					className="max-w-2xl"
-					onInteractOutside={(event) => event.preventDefault()}
+				<Tabs
+					value={tab}
+					onValueChange={(nextTab) => setTab(nextTab as Tab)}
+					className="gap-6"
 				>
-					<DialogHeader>
-						<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
-						<DialogDescription>
-							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
-						</DialogDescription>
-					</DialogHeader>
-					<div className="bg-muted/40 rounded-lg border p-3">
-						<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-						<p className="text-muted-foreground mt-1 font-mono text-xs">
-							Settings → Developer settings → Personal access tokens → Tokens
-							(classic)
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
+							<TabsTrigger value="all" className="font-mono text-xs">
+								全部
+							</TabsTrigger>
+							<TabsTrigger value="releases" className="font-mono text-xs">
+								Releases
+							</TabsTrigger>
+							<TabsTrigger value="briefs" className="font-mono text-xs">
+								日报
+							</TabsTrigger>
+							<TabsTrigger value="inbox" className="font-mono text-xs">
+								Inbox
+							</TabsTrigger>
+						</TabsList>
+						<div
+							className="flex items-center gap-2"
+							data-dashboard-secondary-controls
+						>
+							{tab === "all" || tab === "releases" ? (
+								<FeedPageLaneSelector
+									value={effectivePageDefaultLane}
+									onValueChange={(lane) => {
+										setPageDefaultLane(lane);
+										setSelectedLaneByKey({});
+									}}
+								/>
+							) : null}
+							<Button
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+								onClick={() => setPatDialogOpen(true)}
+							>
+								打开 PAT 配置
+							</Button>
+							<Button
+								asChild
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+							>
+								<a href="/admin">管理员面板</a>
+							</Button>
+						</div>
+					</div>
+
+					<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+						<section className="min-w-0">
+							<TabsContent value="all" className="mt-0 min-w-0">
+								{renderFeedPanel("all")}
+							</TabsContent>
+							<TabsContent value="releases" className="mt-0 min-w-0">
+								{renderFeedPanel("releases")}
+							</TabsContent>
+							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<ReleaseDailyCard
+									briefs={storyBriefs}
+									selectedDate={selectedDate}
+									busy={false}
+									onGenerate={() => {}}
+									onOpenRelease={setActiveReleaseId}
+								/>
+							</TabsContent>
+							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<InboxList
+									notifications={notifications}
+									busy={syncingAll}
+									syncing={syncingAll}
+									onSync={tab === "inbox" ? () => {} : undefined}
+								/>
+							</TabsContent>
+						</section>
+
+						<aside className="space-y-6">
+							{tab === "briefs" ? (
+								<BriefListCard
+									briefs={storyBriefs}
+									selectedDate={selectedDate}
+									onSelectDate={(d) => setSelectedDate(d)}
+								/>
+							) : null}
+							<InboxQuickList notifications={notifications} />
+						</aside>
+					</div>
+				</Tabs>
+
+				<ReleaseDetailCard
+					releaseId={activeReleaseId}
+					onClose={() => setActiveReleaseId(null)}
+				/>
+
+				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
+					<DialogContent
+						showCloseButton={false}
+						className="max-w-2xl"
+						onInteractOutside={(event) => event.preventDefault()}
+					>
+						<DialogHeader>
+							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogDescription>
+								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+							</DialogDescription>
+						</DialogHeader>
+						<div className="bg-muted/40 rounded-lg border p-3">
+							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+							<p className="text-muted-foreground mt-1 font-mono text-xs">
+								Settings → Developer settings → Personal access tokens → Tokens
+								(classic)
+							</p>
+						</div>
+						<div className="space-y-2">
+							<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
+							<Input
+								id="storybook-reaction-pat"
+								type="password"
+								value="ghp_mock_dashboard_storybook_token"
+								readOnly
+								className="font-mono text-sm"
+							/>
+						</div>
+						<p className="text-xs text-emerald-600">
+							Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
 						</p>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
-						<Input
-							id="storybook-reaction-pat"
-							type="password"
-							value="ghp_mock_dashboard_storybook_token"
-							readOnly
-							className="font-mono text-sm"
-						/>
-					</div>
-					<p className="text-xs text-emerald-600">
-						Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
-					</p>
-					<DialogFooter>
-						<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
-							稍后再说
-						</Button>
-						<Button>保存并继续</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
-		</AppShell>
+						<DialogFooter>
+							<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
+								稍后再说
+							</Button>
+							<Button>保存并继续</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+			</AppShell>
+		</VersionMonitorStateProvider>
 	);
 }
 

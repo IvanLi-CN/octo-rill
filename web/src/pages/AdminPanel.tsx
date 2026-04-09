@@ -6,6 +6,7 @@ import type { MeResponse } from "@/api";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 
 export function AdminPanel(props: {
 	me: MeResponse;
@@ -16,6 +17,7 @@ export function AdminPanel(props: {
 	return (
 		<AppShell
 			header={<AdminHeader user={me.user} activeNav="users" />}
+			notice={<VersionUpdateNotice />}
 			footer={<AppMetaFooter />}
 		>
 			<div className="space-y-4">

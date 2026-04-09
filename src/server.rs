@@ -3,7 +3,10 @@ use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    extract::Request,
     http::{HeaderValue, Method},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, patch, post, put},
 };
 use serde_json::json;
@@ -109,8 +112,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .with_same_site(SameSite::Lax);
 
     let api_router = Router::new()
-        .route("/health", get(api_health))
-        .route("/version", get(api_version))
+        .route(
+            "/health",
+            get(api_health).layer(middleware::from_fn(version_no_store_cache)),
+        )
+        .route(
+            "/version",
+            get(api_version).layer(middleware::from_fn(version_no_store_cache)),
+        )
         .route("/me", get(api::me))
         .route("/tasks/{task_id}/events", get(api::task_events_sse))
         .route("/starred", get(api::list_starred))
@@ -473,6 +482,24 @@ async fn api_version() -> axum::Json<serde_json::Value> {
     }))
 }
 
+fn apply_no_store_headers(headers: &mut axum::http::HeaderMap) {
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(axum::http::header::EXPIRES, HeaderValue::from_static("0"));
+}
+
+async fn version_no_store_cache(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    apply_no_store_headers(response.headers_mut());
+    response
+}
+
 fn build_session_cookie_name(config: &AppConfig) -> String {
     let host = config.public_base_url.host_str().unwrap_or("localhost");
     let port = config
@@ -494,9 +521,10 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SQLITE_POOL_MAX_CONNECTIONS, api_health, api_version, build_sqlite_connect_options,
-        build_sqlite_pool_options, read_sqlite_runtime_pragmas,
+        SQLITE_POOL_MAX_CONNECTIONS, api_health, api_version, apply_no_store_headers,
+        build_sqlite_connect_options, build_sqlite_pool_options, read_sqlite_runtime_pragmas,
     };
+    use axum::http::{HeaderMap, HeaderValue, header};
 
     #[tokio::test]
     async fn api_version_reports_non_empty_version_and_source() {
@@ -529,6 +557,27 @@ mod tests {
             health_payload.get("version"),
             version_payload.get("version"),
             "health/version endpoints should agree on effective version"
+        );
+    }
+
+    #[test]
+    fn version_endpoints_disable_cache_storage() {
+        let mut headers = HeaderMap::new();
+        apply_no_store_headers(&mut headers);
+
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static(
+                "no-store, no-cache, must-revalidate"
+            ))
+        );
+        assert_eq!(
+            headers.get(header::PRAGMA),
+            Some(&HeaderValue::from_static("no-cache"))
+        );
+        assert_eq!(
+            headers.get(header::EXPIRES),
+            Some(&HeaderValue::from_static("0"))
         );
     }
 
