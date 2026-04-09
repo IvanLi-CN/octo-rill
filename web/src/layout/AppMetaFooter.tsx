@@ -1,87 +1,11 @@
 import { Github } from "lucide-react";
-import { useEffect, useState } from "react";
 
-type HealthResponse = {
-	ok: boolean;
-	version: string;
-};
-
-type VersionResponse = {
-	ok: boolean;
-	version: string;
-	source: string;
-};
+import { useVersionMonitor } from "@/version/versionMonitor";
 
 const REPOSITORY_URL = "https://github.com/IvanLi-CN/octo-rill";
-const VERSION_LOADING = "loading...";
-const VERSION_UNKNOWN = "unknown";
-
-function normalizeVersion(raw: string): string {
-	const trimmed = raw.trim();
-	if (!trimmed) return VERSION_UNKNOWN;
-	if (
-		/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(trimmed)
-	) {
-		return `v${trimmed}`;
-	}
-	return trimmed;
-}
-
-async function fetchVersionFromEndpoint(
-	endpoint: string,
-	signal: AbortSignal,
-): Promise<string> {
-	const response = await fetch(endpoint, {
-		credentials: "include",
-		signal,
-	});
-	if (!response.ok) {
-		throw new Error(`version request failed (${endpoint}): ${response.status}`);
-	}
-
-	const payload = (await response.json()) as
-		| Partial<HealthResponse>
-		| Partial<VersionResponse>;
-	if (typeof payload.version !== "string") {
-		throw new Error(`version payload missing version field (${endpoint})`);
-	}
-	return normalizeVersion(payload.version);
-}
-
-async function fetchVersion(signal: AbortSignal): Promise<string> {
-	try {
-		return await fetchVersionFromEndpoint("/api/version", signal);
-	} catch {
-		return fetchVersionFromEndpoint("/api/health", signal);
-	}
-}
 
 export function AppMetaFooter() {
-	const [version, setVersion] = useState(VERSION_LOADING);
-
-	useEffect(() => {
-		const abortController = new AbortController();
-		let active = true;
-
-		void (async () => {
-			try {
-				const nextVersion = await fetchVersion(abortController.signal);
-				if (active) {
-					setVersion(nextVersion);
-				}
-			} catch {
-				if (active && !abortController.signal.aborted) {
-					setVersion(VERSION_UNKNOWN);
-				}
-			}
-		})();
-
-		return () => {
-			active = false;
-			abortController.abort();
-		};
-	}, []);
-
+	const { loadedVersion } = useVersionMonitor();
 	const currentYear = new Date().getFullYear();
 
 	return (
@@ -100,7 +24,7 @@ export function AppMetaFooter() {
 					GitHub
 				</a>
 				<span className="text-muted-foreground font-mono">
-					Version {version}
+					Version {loadedVersion}
 				</span>
 			</div>
 		</footer>
