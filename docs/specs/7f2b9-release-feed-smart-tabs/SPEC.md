@@ -134,6 +134,7 @@
 - queued batch recovery 只能接手**已经陈旧的遗留 batch**；刚创建、尚未进入执行阶段的 fresh batch 不能被第二个 scheduler tick 抢占重放。
 - 本地 SQLite 运行时必须允许 feed 首屏查询、心跳与可见区智能预加载并存；不能因为连接池过小而让智能预加载长时间饥饿，看起来像“没有自动生成”。
 - 翻译 / 智能 tab 缺数据：用户首次切入该 tab 时，`missing` lane 仍允许按需补算；但若 lane 已明确是 `error + auto_translate=false`，tab 切换只能展示当前终态，不能偷偷再发一次无效重试请求。
+- 若 smart lane 处于 `error` 且用户点击 `重试智能整理`，错误态 action 按钮必须立刻进入 spinning/loading，并在请求完成前保持 disabled，避免重复点击。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
 - 智能 ready 内容必须是纯要点列表，不得退化为原文直译。
 
@@ -203,6 +204,10 @@
   When 本次 smart 终态实际返回 `insufficient`
   Then 卡片直接收敛为仅版本号折叠样式，不额外冒出全局 boot error。
 
+- Given 用户在 `智能整理失败` 卡片上点击 `重试智能整理`
+  When 请求仍在进行中
+  Then 按钮会立即显示 spinning/loading 并保持 disabled，直到本次 smart 请求结束，期间不会出现第二次有效触发。
+
 - Given 同一 release 同时存在 translated 与 smart 结果
   When feed 刷新
   Then 两者互不覆盖，分别保持独立缓存与状态。
@@ -256,6 +261,13 @@
   evidence_note: 验证智能 lane 缺数据时正文继续显示原文，同时仅通过 selector option 的呼吸态表达加载状态，不再把正文区替换成空白加载面板。
 
   ![智能总结加载时保留原文](./assets/release-smart-loading-original-fallback.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/SmartRetryActionLoading`
+  state: `smart-retry-action-loading`
+  evidence_note: 验证错误态卡片点击“重试智能整理”后，按钮立即进入旋转 loading，并在 smart 请求进行期间保持禁用，避免重复点击。
+
+  ![重试智能整理按钮加载中](./assets/release-smart-retry-action-loading-focused.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartInsufficient`
