@@ -9,6 +9,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { resolveNotificationHref } from "@/inbox/notificationLink";
 
 export type NotificationItem = {
 	thread_id: string;
@@ -20,10 +21,6 @@ export type NotificationItem = {
 	unread: number;
 	html_url: string | null;
 };
-
-function threadUrl(threadId: string) {
-	return `https://github.com/notifications/thread/${threadId}`;
-}
 
 export function InboxQuickList(props: { notifications: NotificationItem[] }) {
 	const { notifications } = props;
@@ -69,7 +66,7 @@ export function InboxQuickList(props: { notifications: NotificationItem[] }) {
 							<a
 								key={n.thread_id}
 								className="group block rounded-lg border bg-background/40 px-3 py-2 transition-colors hover:bg-background"
-								href={threadUrl(n.thread_id)}
+								href={resolveNotificationHref(n)}
 								target="_blank"
 								rel="noreferrer"
 							>

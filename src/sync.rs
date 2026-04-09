@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     future::Future,
+    pin::Pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -37,6 +38,12 @@ const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
 const SMART_PREHEAT_RECENT_RELEASE_LIMIT: usize = 30;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
+const GITHUB_WEB_BASE: &str = "https://github.com";
+const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
+const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
+const NOTIFICATION_OPEN_URL_REPAIR_KEY: &str = "notifications_open_url_repair_v2";
+const NOTIFICATION_OPEN_URL_REPAIR_PENDING: &str = "pending";
+const NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE: usize = 100;
 
 static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -341,7 +348,6 @@ struct NotificationSubject {
 #[derive(Debug, Deserialize)]
 struct NotificationRepo {
     full_name: Option<String>,
-    html_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2927,41 +2933,172 @@ pub async fn sync_notifications(
     user_id: &str,
 ) -> Result<SyncNotificationsResult> {
     let token = state.load_access_token(user_id).await?;
+    sync_notifications_with_fetch(
+        state,
+        user_id,
+        |since, before, page| {
+            let client = state.http.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                let mut url = format!(
+                    "{REST_API_BASE}/notifications?all=true&per_page={GITHUB_NOTIFICATIONS_PAGE_SIZE}"
+                );
+                if let Some(ref since) = since {
+                    url.push_str("&since=");
+                    url.push_str(&urlencoding::encode(since));
+                }
+                if let Some(ref before) = before {
+                    url.push_str("&before=");
+                    url.push_str(&urlencoding::encode(before));
+                }
+                url.push_str("&page=");
+                url.push_str(&page.to_string());
 
-    let since_key = "notifications_since";
-    let since = sqlx::query_scalar::<_, String>(
-        r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+                client
+                    .get(url)
+                    .bearer_auth(&token)
+                    .header(USER_AGENT, "OctoRill")
+                    .header(ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()
+                    .await
+                    .context("github notifications request failed")?
+                    .error_for_status()
+                    .context("github notifications returned error")?
+                    .json::<Vec<GitHubNotification>>()
+                    .await
+                    .context("github notifications json decode failed")
+            }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
+        },
+        |thread_id| {
+            let client = state.http.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                let url = format!("{REST_API_BASE}/notifications/threads/{thread_id}");
+                let response = client
+                    .get(url)
+                    .bearer_auth(&token)
+                    .header(USER_AGENT, "OctoRill")
+                    .header(ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()
+                    .await
+                    .context("github notification thread request failed")?;
+                let status = response.status();
+                if status.is_success() {
+                    return response
+                        .json::<GitHubNotification>()
+                        .await
+                        .map(Some)
+                        .context("github notification thread json decode failed");
+                }
+                let headers = response.headers().clone();
+                let body = response
+                    .text()
+                    .await
+                    .context("github notification thread error body decode failed")?;
+                let error =
+                    classify_github_http_error("github notification thread", status, &headers, &body);
+                if is_terminal_notification_thread_error(&error) {
+                    return Ok(None);
+                }
+                Err(error.into_anyhow())
+            }) as Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>
+        },
     )
-    .bind(user_id)
-    .bind(since_key)
-    .fetch_optional(&state.pool)
     .await
-    .context("failed to query notifications since")?;
+}
 
-    let mut url = format!("{REST_API_BASE}/notifications?all=true&per_page=50");
-    if let Some(ref since) = since {
-        url.push_str("&since=");
-        url.push_str(&urlencoding::encode(since));
+async fn sync_notifications_with_fetch<F, G>(
+    state: &AppState,
+    user_id: &str,
+    mut fetch_page: F,
+    mut fetch_thread: G,
+) -> Result<SyncNotificationsResult>
+where
+    F: FnMut(
+        Option<String>,
+        Option<String>,
+        usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>,
+    G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
+{
+    let repair_state = load_sync_state_value(state, user_id, NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .await
+        .context("failed to query notification open-url repair state")?;
+    let since = load_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY)
+        .await
+        .context("failed to query notifications since")?;
+    let fetch_since = if repair_state.is_none() {
+        None
+    } else {
+        since.clone()
+    };
+
+    let sync_started_at = chrono::Utc::now().to_rfc3339();
+    let mut notifications = 0usize;
+    let before = Some(sync_started_at.clone());
+    let mut page = 1usize;
+    loop {
+        let res = fetch_page(fetch_since.clone(), before.clone(), page).await?;
+        if res.is_empty() {
+            break;
+        }
+        notifications += res.len();
+        upsert_notifications(state, user_id, &res, &sync_started_at).await?;
+        if res.len() < GITHUB_NOTIFICATIONS_PAGE_SIZE {
+            break;
+        }
+        let Some(next_page) = page.checked_add(1) else {
+            break;
+        };
+        page = next_page;
     }
 
-    let res = state
-        .http
-        .get(url)
-        .bearer_auth(&token)
-        .header(USER_AGENT, "OctoRill")
-        .header(ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", API_VERSION)
-        .send()
-        .await
-        .context("github notifications request failed")?
-        .error_for_status()
-        .context("github notifications returned error")?
-        .json::<Vec<GitHubNotification>>()
-        .await
-        .context("github notifications json decode failed")?;
+    let repair_complete =
+        repair_cached_notification_open_urls(state, user_id, &sync_started_at, &mut fetch_thread)
+            .await?;
+    let repair_state_value = if repair_complete {
+        sync_started_at.as_str()
+    } else {
+        NOTIFICATION_OPEN_URL_REPAIR_PENDING
+    };
+    store_sync_state_value(
+        state,
+        user_id,
+        NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        repair_state_value,
+    )
+    .await
+    .context("failed to update notification open-url repair state")?;
 
-    let now = chrono::Utc::now().to_rfc3339();
-    for n in &res {
+    store_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY, &sync_started_at)
+        .await
+        .context("failed to update notifications since")?;
+
+    Ok(SyncNotificationsResult {
+        notifications,
+        since,
+    })
+}
+
+async fn upsert_notifications(
+    state: &AppState,
+    user_id: &str,
+    notifications: &[GitHubNotification],
+    now: &str,
+) -> Result<()> {
+    for notification in notifications {
+        let api_url = notification
+            .subject
+            .url
+            .as_deref()
+            .or(notification.url.as_deref());
+        let html_url = resolve_notification_open_url(
+            api_url,
+            notification.repository.full_name.as_deref(),
+            Some(notification.id.as_str()),
+        );
         sqlx::query(
             r#"
             INSERT INTO notifications (
@@ -2981,21 +3118,249 @@ pub async fn sync_notifications(
         )
         .bind(local_id::generate_local_id())
         .bind(user_id)
-        .bind(&n.id)
-        .bind(n.repository.full_name.as_deref())
-        .bind(n.subject.title.as_deref())
-        .bind(n.subject.subject_type.as_deref())
-        .bind(n.reason.as_deref())
-        .bind(n.updated_at.as_deref())
-        .bind(n.unread as i64)
-        .bind(n.url.as_deref().or(n.subject.url.as_deref()))
-        .bind(n.repository.html_url.as_deref())
-        .bind(&now)
+        .bind(&notification.id)
+        .bind(notification.repository.full_name.as_deref())
+        .bind(notification.subject.title.as_deref())
+        .bind(notification.subject.subject_type.as_deref())
+        .bind(notification.reason.as_deref())
+        .bind(notification.updated_at.as_deref())
+        .bind(notification.unread as i64)
+        .bind(api_url)
+        .bind(html_url)
+        .bind(now)
         .execute(&state.pool)
         .await
         .context("failed to upsert notification")?;
     }
 
+    Ok(())
+}
+
+async fn repair_cached_notification_open_urls<G>(
+    state: &AppState,
+    user_id: &str,
+    now: &str,
+    fetch_thread: &mut G,
+) -> Result<bool>
+where
+    G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
+{
+    enum ThreadRefresh {
+        NotNeeded,
+        Refreshed(Option<GitHubNotification>),
+        Failed,
+    }
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        ),
+    >(
+        r#"
+        SELECT
+          thread_id,
+          repo_full_name,
+          subject_title,
+          subject_type,
+          reason,
+          updated_at,
+          url,
+          unread,
+          html_url
+        FROM notifications
+        WHERE user_id = ?
+          AND (
+            url LIKE 'https://api.github.com/notifications/threads/%'
+            OR html_url IS NULL
+          )
+        ORDER BY updated_at DESC, thread_id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE as i64)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load cached notifications for open-url repair")?;
+
+    if rows.is_empty() {
+        return Ok(true);
+    }
+
+    for (
+        thread_id,
+        repo_full_name,
+        subject_title,
+        subject_type,
+        reason,
+        updated_at,
+        url,
+        unread,
+        html_url,
+    ) in rows
+    {
+        let needs_thread_lookup =
+            url.as_deref().is_some_and(is_notification_thread_api_url) || html_url.is_none();
+
+        let thread_refresh = if needs_thread_lookup {
+            match (*fetch_thread)(thread_id.clone()).await {
+                Ok(thread) => ThreadRefresh::Refreshed(thread),
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        thread_id,
+                        error = ?error,
+                        "failed to refresh notification thread during open-url repair"
+                    );
+                    ThreadRefresh::Failed
+                }
+            }
+        } else {
+            ThreadRefresh::NotNeeded
+        };
+        let thread = match &thread_refresh {
+            ThreadRefresh::Refreshed(thread) => thread.as_ref(),
+            ThreadRefresh::NotNeeded | ThreadRefresh::Failed => None,
+        };
+
+        let resolved_repo_full_name = thread
+            .as_ref()
+            .and_then(|item| item.repository.full_name.clone())
+            .or(repo_full_name.clone());
+        let resolved_subject_title = thread
+            .as_ref()
+            .and_then(|item| item.subject.title.clone())
+            .or(subject_title.clone());
+        let resolved_subject_type = thread
+            .as_ref()
+            .and_then(|item| item.subject.subject_type.clone())
+            .or(subject_type.clone());
+        let resolved_reason = thread
+            .as_ref()
+            .and_then(|item| item.reason.clone())
+            .or(reason.clone());
+        let resolved_updated_at = thread
+            .as_ref()
+            .and_then(|item| item.updated_at.clone())
+            .or(updated_at.clone());
+        let resolved_unread = thread
+            .as_ref()
+            .map(|item| item.unread as i64)
+            .unwrap_or(unread);
+        let resolved_api_url = match (&thread_refresh, thread) {
+            (_, Some(item)) => item
+                .subject
+                .url
+                .as_deref()
+                .and_then(non_thread_notification_api_url)
+                .or_else(|| {
+                    item.url
+                        .as_deref()
+                        .and_then(non_thread_notification_api_url)
+                })
+                .or_else(|| url.as_deref().and_then(non_thread_notification_api_url)),
+            (ThreadRefresh::Failed, _) => url.clone(),
+            (ThreadRefresh::Refreshed(None), _) if needs_thread_lookup => {
+                url.as_deref().and_then(non_thread_notification_api_url)
+            }
+            _ => url.clone(),
+        };
+        let resolved_html_url = match thread_refresh {
+            ThreadRefresh::Failed => html_url.unwrap_or_else(|| {
+                resolve_notification_open_url(
+                    url.as_deref(),
+                    resolved_repo_full_name.as_deref(),
+                    Some(thread_id.as_str()),
+                )
+            }),
+            ThreadRefresh::NotNeeded | ThreadRefresh::Refreshed(_) => {
+                resolve_notification_open_url(
+                    resolved_api_url.as_deref(),
+                    resolved_repo_full_name.as_deref(),
+                    Some(thread_id.as_str()),
+                )
+            }
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE notifications
+            SET
+              repo_full_name = ?,
+              subject_title = ?,
+              subject_type = ?,
+              reason = ?,
+              updated_at = ?,
+              unread = ?,
+              url = ?,
+              html_url = ?,
+              last_seen_at = ?
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(resolved_repo_full_name)
+        .bind(resolved_subject_title)
+        .bind(resolved_subject_type)
+        .bind(resolved_reason)
+        .bind(resolved_updated_at)
+        .bind(resolved_unread)
+        .bind(resolved_api_url)
+        .bind(resolved_html_url)
+        .bind(now)
+        .bind(user_id)
+        .bind(thread_id)
+        .execute(&state.pool)
+        .await
+        .context("failed to repair cached notification open url")?;
+    }
+
+    let remaining = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM notifications
+        WHERE user_id = ?
+          AND (
+            url LIKE 'https://api.github.com/notifications/threads/%'
+            OR html_url IS NULL
+          )
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to count remaining cached notifications for open-url repair")?;
+
+    Ok(remaining == 0)
+}
+
+async fn load_sync_state_value(
+    state: &AppState,
+    user_id: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#)
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(&state.pool)
+        .await
+        .context("failed to query sync_state")
+}
+
+async fn store_sync_state_value(
+    state: &AppState,
+    user_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     sqlx::query(
         r#"
         INSERT INTO sync_state (id, user_id, key, value, updated_at)
@@ -3007,17 +3372,82 @@ pub async fn sync_notifications(
     )
     .bind(local_id::generate_local_id())
     .bind(user_id)
-    .bind(since_key)
-    .bind(&now)
-    .bind(&now)
+    .bind(key)
+    .bind(value)
+    .bind(value)
     .execute(&state.pool)
     .await
-    .context("failed to update notifications since")?;
+    .context("failed to upsert sync_state")?;
 
-    Ok(SyncNotificationsResult {
-        notifications: res.len(),
-        since,
-    })
+    Ok(())
+}
+
+fn resolve_notification_open_url(
+    api_url: Option<&str>,
+    repo_full_name: Option<&str>,
+    thread_id: Option<&str>,
+) -> String {
+    api_url
+        .and_then(resolve_github_api_resource_html_url)
+        .unwrap_or_else(|| fallback_notification_open_url(thread_id, repo_full_name))
+}
+
+fn is_notification_thread_api_url(api_url: &str) -> bool {
+    api_url.starts_with("https://api.github.com/notifications/threads/")
+}
+
+fn non_thread_notification_api_url(api_url: &str) -> Option<String> {
+    (!is_notification_thread_api_url(api_url)).then(|| api_url.to_owned())
+}
+
+fn is_terminal_notification_thread_error(error: &SyncRequestError) -> bool {
+    matches!(
+        error.reason_code,
+        "scope_insufficient" | "credentials_forbidden" | "repo_inaccessible"
+    )
+}
+
+fn resolve_github_api_resource_html_url(api_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(api_url).ok()?;
+    if parsed.host_str() == Some("github.com") {
+        return Some(parsed.to_string());
+    }
+    if parsed.host_str() != Some("api.github.com") {
+        return None;
+    }
+
+    let segments = parsed.path_segments()?.collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["repos", owner, repo, "issues", number] => {
+            Some(format!("{GITHUB_WEB_BASE}/{owner}/{repo}/issues/{number}"))
+        }
+        ["repos", owner, repo, "pulls", number] => {
+            Some(format!("{GITHUB_WEB_BASE}/{owner}/{repo}/pull/{number}"))
+        }
+        ["repos", owner, repo, "discussions", number] => Some(format!(
+            "{GITHUB_WEB_BASE}/{owner}/{repo}/discussions/{number}"
+        )),
+        ["repos", owner, repo, "commits", sha] => {
+            Some(format!("{GITHUB_WEB_BASE}/{owner}/{repo}/commit/{sha}"))
+        }
+        _ => None,
+    }
+}
+
+fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Option<&str>) -> String {
+    match thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+    {
+        Some(thread_id) => format!("{GITHUB_WEB_BASE}/notifications/threads/{thread_id}"),
+        None => match repo_full_name {
+            Some(repo_full_name) if !repo_full_name.trim().is_empty() => format!(
+                "{GITHUB_WEB_BASE}/notifications?query={}",
+                urlencoding::encode(&format!("repo:{repo_full_name}"))
+            ),
+            _ => format!("{GITHUB_WEB_BASE}/notifications"),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -3039,19 +3469,24 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, ReleaseDemandRepo, RepoReleaseOrigin, StarPhaseSuccess,
-        StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        attach_and_wait_for_user_release_demand, attach_release_demand, cmp_last_active_desc,
-        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
+        EligibleUserRow, GitHubNotification, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
+        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
+        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, ReleaseDemandRepo,
+        RepoReleaseOrigin, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, attach_and_wait_for_user_release_demand,
+        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
+        is_terminal_notification_thread_error, recover_repo_release_runtime_state_on_startup,
+        repo_release_deadline_at, resolve_notification_open_url,
         subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_starred_for_user_with_fetch, wait_for_release_demand,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
-        jobs,
+        jobs, local_id,
         state::{AppState, build_oauth_client},
     };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     fn test_user_id(seed: &str) -> String {
         crate::local_id::test_local_id(seed)
@@ -3133,6 +3568,764 @@ mod tests {
         assert!(err.retryable);
         assert_eq!(err.reason_code, "timeout");
         assert!(err.message.contains("timed out after"));
+    }
+
+    #[test]
+    fn resolve_notification_open_url_maps_common_targets_and_safe_fallbacks() {
+        assert_eq!(
+            resolve_notification_open_url(
+                Some("https://api.github.com/repos/octo/alpha/issues/12"),
+                Some("octo/alpha"),
+                Some("thread-12"),
+            ),
+            "https://github.com/octo/alpha/issues/12"
+        );
+        assert_eq!(
+            resolve_notification_open_url(
+                Some("https://api.github.com/repos/octo/alpha/pulls/34"),
+                Some("octo/alpha"),
+                Some("thread-34"),
+            ),
+            "https://github.com/octo/alpha/pull/34"
+        );
+        assert_eq!(
+            resolve_notification_open_url(
+                Some("https://api.github.com/repos/octo/alpha/discussions/56"),
+                Some("octo/alpha"),
+                Some("thread-56"),
+            ),
+            "https://github.com/octo/alpha/discussions/56"
+        );
+        assert_eq!(
+            resolve_notification_open_url(
+                Some("https://api.github.com/repos/octo/alpha/check-suites/78"),
+                Some("octo/alpha"),
+                Some("thread-78"),
+            ),
+            "https://github.com/notifications/threads/thread-78"
+        );
+        assert_eq!(
+            resolve_notification_open_url(None, Some("octo/alpha"), None),
+            "https://github.com/notifications?query=repo%3Aocto%2Falpha"
+        );
+        assert_eq!(
+            resolve_notification_open_url(None, None, None),
+            "https://github.com/notifications"
+        );
+    }
+
+    #[test]
+    fn notification_thread_error_distinguishes_terminal_forbidden_from_rate_limits() {
+        let forbidden = classify_github_http_error(
+            "github notification thread",
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            "resource not accessible by integration",
+        );
+        assert!(is_terminal_notification_thread_error(&forbidden));
+
+        let not_found = classify_github_http_error(
+            "github notification thread",
+            StatusCode::NOT_FOUND,
+            &HeaderMap::new(),
+            "",
+        );
+        assert!(is_terminal_notification_thread_error(&not_found));
+
+        let mut rate_limited_headers = HeaderMap::new();
+        rate_limited_headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let rate_limited = classify_github_http_error(
+            "github notification thread",
+            StatusCode::FORBIDDEN,
+            &rate_limited_headers,
+            "secondary rate limit",
+        );
+        assert!(rate_limited.retryable);
+        assert!(!is_terminal_notification_thread_error(&rate_limited));
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repairs_cached_urls_uses_subject_targets_and_paginates() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notif-sync");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let existing_since = "2026-03-05T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (id, user_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .bind(existing_since)
+        .bind(existing_since)
+        .execute(&pool)
+        .await
+        .expect("seed notifications since");
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .bind("octo/alpha")
+        .bind("Old cached notification")
+        .bind("PullRequest")
+        .bind("state_change")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(1_i64)
+        .bind("https://api.github.com/notifications/threads/123")
+        .bind("https://github.com/octo/alpha")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale notification");
+
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::<(
+            Option<String>,
+            Option<String>,
+            usize,
+        )>::new()));
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let observed = observed.clone();
+                move |since, before, page| {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        observed
+                            .lock()
+                            .await
+                            .push((since.clone(), before.clone(), page));
+                        let items = match page {
+                            1 => {
+                                let mut items = vec![
+                                    mock_notification(
+                                        "cached-thread",
+                                        None,
+                                        Some("octo/alpha"),
+                                        Some("PullRequest"),
+                                        "2026-03-06T03:30:00Z",
+                                    ),
+                                    mock_notification(
+                                        "thread-1",
+                                        Some("https://api.github.com/repos/octo/alpha/issues/12"),
+                                        Some("octo/alpha"),
+                                        Some("Issue"),
+                                        "2026-03-06T03:00:00Z",
+                                    ),
+                                    mock_notification(
+                                        "thread-2",
+                                        Some("https://api.github.com/repos/octo/alpha/check-suites/99"),
+                                        Some("octo/alpha"),
+                                        Some("CheckSuite"),
+                                        "2026-03-06T02:00:00Z",
+                                    ),
+                                ];
+                                for index in 0..47 {
+                                    items.push(mock_notification(
+                                        &format!("filler-{index}"),
+                                        Some(&format!(
+                                            "https://api.github.com/repos/octo/alpha/issues/{}",
+                                            100 + index
+                                        )),
+                                        Some("octo/alpha"),
+                                        Some("Issue"),
+                                        "2026-03-06T02:30:00Z",
+                                    ));
+                                }
+                                items
+                            }
+                            2 => vec![mock_notification(
+                                "thread-3",
+                                Some("https://api.github.com/repos/octo/beta/pulls/34"),
+                                Some("octo/beta"),
+                                Some("PullRequest"),
+                                "2026-03-06T01:00:00Z",
+                            )],
+                            _ => vec![],
+                        };
+                        Ok(items)
+                    })
+                }
+            },
+            move |thread_id| {
+                Box::pin(async move {
+                    Ok(match thread_id.as_str() {
+                        "cached-thread" => Some(mock_notification(
+                            "cached-thread",
+                            Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                            Some("octo/alpha"),
+                            Some("PullRequest"),
+                            "2026-03-06T03:30:00Z",
+                        )),
+                        _ => None,
+                    })
+                })
+            },
+        )
+        .await
+        .expect("sync notifications");
+
+        assert_eq!(result.notifications, 51);
+        assert_eq!(result.since.as_deref(), Some(existing_since));
+
+        let observed = observed.lock().await.clone();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, None);
+        assert_eq!(observed[0].2, 1);
+        assert_eq!(observed[1].0, None);
+        assert_eq!(observed[1].2, 2);
+        assert_eq!(observed[0].1, observed[1].1);
+        assert!(observed[0].1.is_some());
+
+        let stored = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            r#"
+            SELECT thread_id, url, html_url
+            FROM notifications
+            WHERE user_id = ?
+            ORDER BY thread_id
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load notifications");
+        assert_eq!(stored.len(), 51);
+        assert!(stored.contains(&(
+            "cached-thread".to_owned(),
+            Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
+            Some("https://github.com/octo/alpha/pull/120".to_owned()),
+        )));
+        assert!(stored.contains(&(
+            "thread-1".to_owned(),
+            Some("https://api.github.com/repos/octo/alpha/issues/12".to_owned()),
+            Some("https://github.com/octo/alpha/issues/12".to_owned()),
+        )));
+        assert!(stored.contains(&(
+            "thread-2".to_owned(),
+            Some("https://api.github.com/repos/octo/alpha/check-suites/99".to_owned()),
+            Some("https://github.com/notifications/threads/thread-2".to_owned()),
+        )));
+        assert!(stored.contains(&(
+            "thread-3".to_owned(),
+            Some("https://api.github.com/repos/octo/beta/pulls/34".to_owned()),
+            Some("https://github.com/octo/beta/pull/34".to_owned()),
+        )));
+
+        let repair_marker = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair marker");
+        assert!(!repair_marker.is_empty());
+
+        let since_value = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read notifications since");
+        assert!(!since_value.is_empty());
+
+        let observed_second = Arc::new(tokio::sync::Mutex::new(Vec::<(
+            Option<String>,
+            Option<String>,
+            usize,
+        )>::new()));
+        let second = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let observed_second = observed_second.clone();
+                move |since, before, page| {
+                    let observed_second = observed_second.clone();
+                    Box::pin(async move {
+                        observed_second
+                            .lock()
+                            .await
+                            .push((since.clone(), before.clone(), page));
+                        if page == 1 {
+                            Ok(vec![mock_notification(
+                                "thread-4",
+                                Some("https://api.github.com/repos/octo/gamma/issues/88"),
+                                Some("octo/gamma"),
+                                Some("Issue"),
+                                "2026-03-06T04:00:00Z",
+                            )])
+                        } else {
+                            Ok(vec![])
+                        }
+                    })
+                }
+            },
+            move |_thread_id| Box::pin(async { Ok(None) }),
+        )
+        .await
+        .expect("second sync notifications");
+        assert_eq!(second.notifications, 1);
+        assert!(second.since.is_some());
+        let second_calls = observed_second.lock().await.clone();
+        assert_eq!(second_calls.len(), 1);
+        assert_eq!(second_calls[0].2, 1);
+        assert!(second_calls[0].1.is_some());
+        assert!(second_calls[0].0.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_ignores_thread_lookup_failures() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-repair-ignore-errors");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            move |since, before, page| {
+                Box::pin(async move {
+                    assert_eq!(since, None);
+                    assert!(before.is_some());
+                    Ok(if page == 1 {
+                        vec![mock_notification(
+                            "thread-lookup-fails",
+                            None,
+                            Some("octo/alpha"),
+                            Some("PullRequest"),
+                            "2026-03-06T03:00:00Z",
+                        )]
+                    } else {
+                        vec![]
+                    })
+                })
+            },
+            move |thread_id| Box::pin(async move { anyhow::bail!("boom for {thread_id}") }),
+        )
+        .await
+        .expect("sync notifications");
+
+        assert_eq!(result.notifications, 1);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-lookup-fails")
+        .fetch_one(&pool)
+        .await
+        .expect("load notification");
+        assert_eq!(
+            stored,
+            (
+                Some("https://api.github.com/notifications/threads/thread-lookup-fails".to_owned()),
+                Some("https://github.com/notifications/threads/thread-lookup-fails".to_owned()),
+            )
+        );
+
+        let repair_marker = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair marker");
+        assert_eq!(repair_marker, NOTIFICATION_OPEN_URL_REPAIR_PENDING);
+
+        let since_value = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read notifications since");
+        assert!(!since_value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_batches_old_rows_before_marking_complete() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-repair-batch-state");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let existing_since = "2026-03-05T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (id, user_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .bind(existing_since)
+        .bind(existing_since)
+        .execute(&pool)
+        .await
+        .expect("seed notifications since");
+
+        for index in 0..=(NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE as i64) {
+            let thread_id = format!("stale-{index:03}");
+            sqlx::query(
+                r#"
+                INSERT INTO notifications (
+                  id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+                  updated_at, unread, url, html_url, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(user_id.as_str())
+            .bind(&thread_id)
+            .bind("octo/alpha")
+            .bind(format!("Stale {thread_id}"))
+            .bind("PullRequest")
+            .bind("state_change")
+            .bind(format!("2026-03-06T00:{:02}:00Z", index % 60))
+            .bind(1_i64)
+            .bind(format!(
+                "https://api.github.com/notifications/threads/{thread_id}"
+            ))
+            .bind("https://github.com/notifications?query=repo%3Aocto%2Falpha")
+            .bind("2026-03-06T00:00:00Z")
+            .execute(&pool)
+            .await
+            .expect("seed stale notification");
+        }
+
+        let observed = Arc::new(tokio::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let first = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let observed = observed.clone();
+                move |since, _before, page| {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        observed.lock().await.push(since.clone());
+                        assert_eq!(page, 1);
+                        Ok(Vec::new())
+                    })
+                }
+            },
+            move |thread_id| {
+                Box::pin(async move {
+                    Ok(Some(mock_notification(
+                        &thread_id,
+                        Some(&format!(
+                            "https://api.github.com/repos/octo/alpha/pulls/{thread_id}"
+                        )),
+                        Some("octo/alpha"),
+                        Some("PullRequest"),
+                        "2026-03-06T03:30:00Z",
+                    )))
+                })
+            },
+        )
+        .await
+        .expect("first sync notifications");
+
+        assert_eq!(first.notifications, 0);
+        let observed = observed.lock().await.clone();
+        assert_eq!(observed.as_slice(), &[None]);
+
+        let repair_state = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair state");
+        assert_eq!(repair_state, NOTIFICATION_OPEN_URL_REPAIR_PENDING);
+
+        let remaining = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM notifications
+            WHERE user_id = ?
+              AND url LIKE 'https://api.github.com/notifications/threads/%'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining stale notifications");
+        assert_eq!(remaining, 1);
+
+        let observed_second = Arc::new(tokio::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let second = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let observed_second = observed_second.clone();
+                move |since, _before, page| {
+                    let observed_second = observed_second.clone();
+                    Box::pin(async move {
+                        observed_second.lock().await.push(since.clone());
+                        assert_eq!(page, 1);
+                        Ok(Vec::new())
+                    })
+                }
+            },
+            move |thread_id| {
+                Box::pin(async move {
+                    Ok(Some(mock_notification(
+                        &thread_id,
+                        Some(&format!(
+                            "https://api.github.com/repos/octo/alpha/pulls/{thread_id}"
+                        )),
+                        Some("octo/alpha"),
+                        Some("PullRequest"),
+                        "2026-03-06T03:30:00Z",
+                    )))
+                })
+            },
+        )
+        .await
+        .expect("second sync notifications");
+
+        assert_eq!(second.notifications, 0);
+        let observed_second = observed_second.lock().await.clone();
+        assert_eq!(observed_second.len(), 1);
+        assert!(observed_second[0].is_some());
+
+        let final_remaining = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM notifications
+            WHERE user_id = ?
+              AND url LIKE 'https://api.github.com/notifications/threads/%'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count final stale notifications");
+        assert_eq!(final_remaining, 0);
+
+        let final_repair_state = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read final repair state");
+        assert_ne!(final_repair_state, NOTIFICATION_OPEN_URL_REPAIR_PENDING);
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repairs_new_thread_backed_rows_after_backfill_complete() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-repair-fresh-after-backfill");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let existing_since = "2026-03-05T00:00:00Z";
+        let completed_repair_at = "2026-03-05T12:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (id, user_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .bind(existing_since)
+        .bind(existing_since)
+        .execute(&pool)
+        .await
+        .expect("seed notifications since");
+        sqlx::query(
+            r#"
+            INSERT INTO sync_state (id, user_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .bind(completed_repair_at)
+        .bind(completed_repair_at)
+        .execute(&pool)
+        .await
+        .expect("seed repair state");
+
+        let thread_calls = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            move |since, before, page| {
+                Box::pin(async move {
+                    assert_eq!(since.as_deref(), Some(existing_since));
+                    assert!(before.is_some());
+                    assert_eq!(page, 1);
+                    Ok(if page == 1 {
+                        vec![mock_notification(
+                            "fresh-thread",
+                            None,
+                            Some("octo/alpha"),
+                            Some("PullRequest"),
+                            "2026-03-06T03:00:00Z",
+                        )]
+                    } else {
+                        vec![]
+                    })
+                })
+            },
+            {
+                let thread_calls = thread_calls.clone();
+                move |thread_id| {
+                    let thread_calls = thread_calls.clone();
+                    Box::pin(async move {
+                        thread_calls.lock().await.push(thread_id.clone());
+                        Ok(Some(mock_notification(
+                            &thread_id,
+                            Some("https://api.github.com/repos/octo/alpha/pulls/99"),
+                            Some("octo/alpha"),
+                            Some("PullRequest"),
+                            "2026-03-06T03:00:00Z",
+                        )))
+                    })
+                }
+            },
+        )
+        .await
+        .expect("sync notifications");
+
+        assert_eq!(result.notifications, 1);
+        assert_eq!(thread_calls.lock().await.as_slice(), ["fresh-thread"]);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("fresh-thread")
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired notification");
+        assert_eq!(
+            stored,
+            (
+                Some("https://api.github.com/repos/octo/alpha/pulls/99".to_owned()),
+                Some("https://github.com/octo/alpha/pull/99".to_owned()),
+            )
+        );
+
+        let repair_marker = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair marker");
+        assert_ne!(repair_marker, NOTIFICATION_OPEN_URL_REPAIR_PENDING);
+        assert_ne!(repair_marker, completed_repair_at);
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_clears_thread_urls_when_refreshed_target_is_missing() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-repair-clears-thread-url");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            move |since, before, page| {
+                Box::pin(async move {
+                    assert_eq!(since, None);
+                    assert!(before.is_some());
+                    assert_eq!(page, 1);
+                    Ok(if page == 1 {
+                        vec![mock_notification(
+                            "target-missing",
+                            None,
+                            Some("octo/alpha"),
+                            Some("Release"),
+                            "2026-03-06T03:00:00Z",
+                        )]
+                    } else {
+                        vec![]
+                    })
+                })
+            },
+            move |thread_id| {
+                Box::pin(async move {
+                    Ok(Some(mock_notification(
+                        &thread_id,
+                        None,
+                        Some("octo/alpha"),
+                        Some("Release"),
+                        "2026-03-06T03:00:00Z",
+                    )))
+                })
+            },
+        )
+        .await
+        .expect("sync notifications");
+
+        assert_eq!(result.notifications, 1);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("target-missing")
+        .fetch_one(&pool)
+        .await
+        .expect("load notification");
+        assert_eq!(
+            stored,
+            (
+                None,
+                Some("https://github.com/notifications/threads/target-missing".to_owned()),
+            )
+        );
+
+        let repair_marker = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair marker");
+        assert_ne!(repair_marker, NOTIFICATION_OPEN_URL_REPAIR_PENDING);
     }
 
     #[tokio::test]
@@ -3898,5 +5091,29 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed user");
+    }
+
+    fn mock_notification(
+        id: &str,
+        subject_url: Option<&str>,
+        repo_full_name: Option<&str>,
+        subject_type: Option<&str>,
+        updated_at: &str,
+    ) -> GitHubNotification {
+        GitHubNotification {
+            id: id.to_owned(),
+            unread: true,
+            reason: Some("state_change".to_owned()),
+            updated_at: Some(updated_at.to_owned()),
+            url: Some(format!("https://api.github.com/notifications/threads/{id}")),
+            subject: NotificationSubject {
+                title: Some(format!("Notification {id}")),
+                subject_type: subject_type.map(str::to_owned),
+                url: subject_url.map(str::to_owned),
+            },
+            repository: NotificationRepo {
+                full_name: repo_full_name.map(str::to_owned),
+            },
+        }
     }
 }
