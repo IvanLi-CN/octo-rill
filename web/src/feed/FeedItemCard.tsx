@@ -371,7 +371,7 @@ export function FeedItemCard(props: {
 									variant="outline"
 									size="icon"
 									className={cn(
-										"group size-10 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
+										"group relative size-10 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
 										active
 											? "border-primary/45 bg-primary/10 hover:bg-primary/14"
 											: "border-border/70 bg-background hover:border-foreground/15 hover:bg-accent/70",
@@ -392,21 +392,22 @@ export function FeedItemCard(props: {
 										draggable={false}
 										src={reaction.iconSrc}
 									/>
+									{count > 0 ? (
+										<span
+											aria-hidden="true"
+											className={cn(
+												"absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1 font-mono text-[11px] leading-none shadow-sm ring-2 ring-background",
+												active
+													? "bg-primary text-primary-foreground"
+													: "border border-border/70 bg-background text-foreground/80",
+											)}
+											data-reaction-count-badge={reaction.content}
+											data-reaction-count-position="outside"
+										>
+											{count}
+										</span>
+									) : null}
 								</Button>
-								{count > 0 ? (
-									<span
-										className={cn(
-											"pointer-events-none absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1 font-mono text-[11px] leading-none shadow-sm ring-2 ring-background",
-											active
-												? "bg-primary text-primary-foreground"
-												: "border border-border/70 bg-background text-foreground/80",
-										)}
-										data-reaction-count-badge={reaction.content}
-										data-reaction-count-position="outside"
-									>
-										{count}
-									</span>
-								) : null}
 							</div>
 						);
 					})

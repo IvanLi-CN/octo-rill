@@ -793,7 +793,6 @@ test("reaction buttons stay circular and render count badges outside the trigger
 	await expect(
 		reactionFooter.locator('[data-reaction-count-badge="laugh"]'),
 	).toHaveCount(0);
-	await expect(plusOneButton.getByText("2")).toHaveCount(0);
 
 	const shape = await plusOneButton.evaluate((element) => {
 		const button = element as HTMLButtonElement;

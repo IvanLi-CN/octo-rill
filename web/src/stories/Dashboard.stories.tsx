@@ -1635,7 +1635,6 @@ export const ReactionBubblePolish: Story = {
 
 		await expect(canvas.getByRole("button", { name: "赞 12" })).toBeVisible();
 		await expect(canvas.getByRole("button", { name: "笑" })).toBeVisible();
-		expect(plusOneButton.contains(plusOneBadge)).toBe(false);
 		expect(plusOneButton.classList.contains("rounded-full")).toBe(true);
 		expect(window.getComputedStyle(plusOneButton).opacity).toBe("0.8");
 
