@@ -2,7 +2,6 @@ import { ArrowUpRight, RefreshCcw } from "lucide-react";
 
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -258,7 +257,6 @@ export function FeedItemCard(props: {
 		onToggleReaction,
 	} = props;
 
-	const kindLabel = "RELEASE";
 	const subtitleBits = [
 		item.reason || item.subtitle,
 		item.subject_type ? item.subject_type : null,
@@ -273,10 +271,6 @@ export function FeedItemCard(props: {
 			<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
 				<div className="min-w-0">
 					<div className="flex flex-wrap items-center gap-2">
-						<Badge className="border-primary/20 bg-primary font-mono text-[11px] tracking-wide text-primary-foreground">
-							{kindLabel}
-						</Badge>
-
 						{item.unread ? (
 							<span className="inline-flex items-center gap-1 text-[11px] font-medium">
 								<span className="size-1.5 rounded-full bg-primary" />
@@ -288,12 +282,12 @@ export function FeedItemCard(props: {
 							repoFullName={item.repo_full_name}
 							repoVisual={item.repo_visual}
 							className="min-w-0"
-							labelClassName="font-mono text-[11px] text-muted-foreground"
-							visualClassName="size-5"
+							labelClassName="font-mono text-sm text-muted-foreground"
+							visualClassName="size-6"
 						/>
 					</div>
 
-					<CardTitle className="mt-3 text-balance text-lg">
+					<CardTitle className="mt-2.5 text-balance text-lg">
 						{displayTitle}
 					</CardTitle>
 					<p className="mt-1 font-mono text-xs text-muted-foreground">
