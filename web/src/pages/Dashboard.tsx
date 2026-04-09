@@ -42,6 +42,7 @@ import { useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { normalizeReleaseId } from "@/lib/releaseId";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
@@ -1201,6 +1202,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					onSyncAll={onSyncAll}
 				/>
 			}
+			notice={<VersionUpdateNotice />}
 			footer={<AppMetaFooter />}
 		>
 			{bootError ? (

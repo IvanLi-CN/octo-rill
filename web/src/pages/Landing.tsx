@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/card";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
+import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 
 type LandingProps = {
 	bootError?: string | null;
@@ -31,7 +32,7 @@ const heroHighlights = [
 
 export function Landing({ bootError }: LandingProps) {
 	return (
-		<AppShell footer={<AppMetaFooter />}>
+		<AppShell notice={<VersionUpdateNotice />} footer={<AppMetaFooter />}>
 			<div className="mx-auto max-w-6xl py-4 sm:py-8">
 				<div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-start xl:grid-cols-[minmax(0,1fr)_400px] xl:gap-10">
 					<section className="space-y-6">
