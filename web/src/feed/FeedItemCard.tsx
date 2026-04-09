@@ -281,9 +281,9 @@ export function FeedItemCard(props: {
 						<RepoIdentity
 							repoFullName={item.repo_full_name}
 							repoVisual={item.repo_visual}
-							className="min-w-0"
-							labelClassName="font-mono text-sm text-muted-foreground"
-							visualClassName="size-6"
+							className="min-w-0 min-h-8"
+							labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+							visualClassName="size-8"
 						/>
 					</div>
 

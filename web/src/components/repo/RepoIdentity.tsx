@@ -65,7 +65,7 @@ function RepoIdentityContent(props: {
 
 	return (
 		<div
-			className={cn("inline-flex min-w-0 items-center gap-2", className)}
+			className={cn("inline-flex min-w-0 items-center gap-2.5", className)}
 			data-repo-visual-kind={kind}
 		>
 			{candidate ? (
@@ -95,7 +95,11 @@ function RepoIdentityContent(props: {
 					/>
 				</span>
 			) : null}
-			<span className={cn("truncate", labelClassName)}>{repoFullName}</span>
+			<span className="flex min-w-0 self-stretch items-center">
+				<span className={cn("block truncate", labelClassName)}>
+					{repoFullName}
+				</span>
+			</span>
 		</div>
 	);
 }

@@ -318,8 +318,8 @@ export function ReleaseDetailCard(props: {
 								repoFullName={activeDetail?.repo_full_name ?? null}
 								repoVisual={activeDetail?.repo_visual ?? null}
 								className="max-w-full"
-								labelClassName="font-mono text-sm text-muted-foreground"
-								visualClassName="size-7"
+								labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+								visualClassName="size-8"
 							/>
 							{display.body ? (
 								<div className="bg-muted/10 rounded-lg border p-4">

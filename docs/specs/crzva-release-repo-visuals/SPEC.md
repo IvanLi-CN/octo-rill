@@ -133,12 +133,12 @@ Feed release item 与 Release detail response 都新增：
 ## Visual Evidence
 
 - Storybook canvas：`pages-dashboard--release-repo-visuals`
-  - 验证 Feed 在同一组稳定 mock 中同时覆盖 `social preview -> owner avatar -> text-only` 三态。
+  - 验证 Feed 头部已移除类型 badge，repo icon 与右侧按钮高度对齐，repo 名文本沿整行垂直居中；`social preview -> owner avatar -> text-only` fallback 继续由 story play 与 e2e 覆盖。
 
 ![Release Feed repo visual gallery](./assets/release-repo-visuals.png)
 
 - Storybook canvas：`pages-dashboard--briefs-long-content-with-detail`
-  - 验证从 brief 打开的 Release 详情在有 metadata 时显示 owner avatar fallback。
+  - 验证从 brief 打开的 Release 详情沿用同一 repo identity 样式，在有 metadata 时显示 owner avatar fallback，且标题区 repo 名保持垂直居中。
 
 ![Release detail owner avatar fallback](./assets/release-detail-avatar.png)
 
