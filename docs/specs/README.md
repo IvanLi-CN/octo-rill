@@ -90,3 +90,4 @@
 | xaycu | Dashboard 按日报边界分组与历史日报折叠 | 已完成 | `xaycu-dashboard-day-grouping/SPEC.md` | 2026-04-04 | local implementation completed; PR pending |
 | tvujt | 品牌刷新：生成图接管 favicon / Web / Docs | 已完成 | `tvujt-brand-generated-icon-refresh/SPEC.md` | 2026-04-06 | local implementation completed; PR pending screenshot push approval |
 | 7f2b9 | Release Feed 三 Tabs 与智能版本变化卡片 | 已完成 | `7f2b9-release-feed-smart-tabs/SPEC.md` | 2026-04-08 | PR #53; page-level lane selector, segmented selector polish, and visual evidence refreshed |
+| h4yvc | 服务端版本更新轮询轻提示 | 已完成 | `h4yvc-version-update-polling-notice/SPEC.md` | 2026-04-10 | local implementation completed; PR pending screenshot push approval |

@@ -2,6 +2,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
 
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
+import { VersionMonitorProvider } from "@/version/versionMonitor";
 
 type FooterPreviewProps = {
 	delayMs: number;
@@ -81,7 +82,11 @@ function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
 					AppMetaFooter component preview
 				</p>
 			</div>
-			{mockReady ? <AppMetaFooter /> : null}
+			{mockReady ? (
+				<VersionMonitorProvider>
+					<AppMetaFooter />
+				</VersionMonitorProvider>
+			) : null}
 		</div>
 	);
 }
@@ -94,7 +99,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Footer 负责展示版本号、构建来源与健康检查回退策略。适合在这里确认版本元信息在成功、回退与失败三种场景下的可见性。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
+					"Footer 负责展示当前页实际加载版本，并复用统一版本监视状态；当 `/api/version` 不可用时，会回退到 `/api/health`。适合在这里确认成功、回退与失败三种基础文案。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
 			},
 		},
 	},
@@ -124,7 +129,7 @@ export const Default: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "正常从健康检查拿到版本信息时的默认展示。",
+				story: "正常从版本接口拿到当前页实际加载版本时的默认展示。",
 			},
 		},
 	},
