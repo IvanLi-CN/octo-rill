@@ -1228,7 +1228,10 @@ export function Dashboard(props: { me: MeResponse }) {
 						</TabsTrigger>
 					</TabsList>
 
-					<div className="flex items-center gap-2">
+					<div
+						className="flex items-center gap-2"
+						data-dashboard-secondary-controls
+					>
 						{showPageLaneSelector ? (
 							<FeedPageLaneSelector
 								value={effectivePageDefaultLane}
