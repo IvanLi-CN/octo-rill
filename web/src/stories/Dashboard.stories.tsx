@@ -811,7 +811,10 @@ function DashboardPreview(props: {
 							Inbox
 						</TabsTrigger>
 					</TabsList>
-					<div className="flex items-center gap-2">
+					<div
+						className="flex items-center gap-2"
+						data-dashboard-secondary-controls
+					>
 						{tab === "all" || tab === "releases" ? (
 							<FeedPageLaneSelector
 								value={effectivePageDefaultLane}
@@ -969,9 +972,22 @@ export const Default: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		expect(secondaryControls).not.toBeNull();
 		await expect(
 			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
 		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
+		).toHaveLength(1);
+		expect(
+			secondaryControls?.querySelector(
+				'button[aria-label="同步"], a[aria-label="同步"]',
+			),
+		).toBeNull();
+		expect(secondaryControls?.textContent).not.toContain(SYNC_ALL_LABEL);
 		await expect(
 			canvas.queryByRole("button", { name: "Refresh" }),
 		).not.toBeInTheDocument();
@@ -1249,7 +1265,15 @@ export const Syncing: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		expect(secondaryControls).not.toBeNull();
 		const syncButton = canvas.getByRole("button", { name: SYNC_ALL_LABEL });
+		await expect(
+			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
+		).toHaveLength(1);
+		expect(secondaryControls?.textContent).not.toContain(SYNC_ALL_LABEL);
 		await expect(syncButton).toBeDisabled();
 		const icon = syncButton.querySelector("svg");
 		expect(icon).not.toBeNull();
