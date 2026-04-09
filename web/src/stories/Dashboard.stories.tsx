@@ -1406,7 +1406,7 @@ export const InboxLinksResolved: Story = {
 		docs: {
 			description: {
 				story:
-					"Inbox 通知项直接消费后端给出的 html_url；缺失时由前端回退到 GitHub Inbox 或 repo 过滤页，不再拼接 thread URL。",
+					"Inbox 通知项优先使用后端给出的目标页；遇到缺失或退化链接时，前端回退到 GitHub 的 per-thread 页面 `/notifications/threads/{id}`，不再拼错成单数 `/notifications/thread/{id}`。",
 			},
 		},
 	},
@@ -1420,14 +1420,12 @@ export const InboxLinksResolved: Story = {
 		).toBe(false);
 		await expect(
 			inboxLinks.some((link) =>
-				link.getAttribute("href")?.includes("/pull/42"),
+				link.getAttribute("href")?.includes("/notifications/threads/90001"),
 			),
 		).toBe(true);
 		await expect(
 			inboxLinks.some((link) =>
-				link
-					.getAttribute("href")
-					?.includes("/notifications?query=repo%3Aacme%2Frocket"),
+				link.getAttribute("href")?.includes("/pull/42"),
 			),
 		).toBe(true);
 	},

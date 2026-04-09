@@ -3094,8 +3094,11 @@ async fn upsert_notifications(
             .url
             .as_deref()
             .or(notification.url.as_deref());
-        let html_url =
-            resolve_notification_open_url(api_url, notification.repository.full_name.as_deref());
+        let html_url = resolve_notification_open_url(
+            api_url,
+            notification.repository.full_name.as_deref(),
+            Some(notification.id.as_str()),
+        );
         sqlx::query(
             r#"
             INSERT INTO notifications (
@@ -3273,12 +3276,17 @@ where
         };
         let resolved_html_url = match thread_refresh {
             ThreadRefresh::Failed => html_url.unwrap_or_else(|| {
-                resolve_notification_open_url(url.as_deref(), resolved_repo_full_name.as_deref())
+                resolve_notification_open_url(
+                    url.as_deref(),
+                    resolved_repo_full_name.as_deref(),
+                    Some(thread_id.as_str()),
+                )
             }),
             ThreadRefresh::NotNeeded | ThreadRefresh::Refreshed(_) => {
                 resolve_notification_open_url(
                     resolved_api_url.as_deref(),
                     resolved_repo_full_name.as_deref(),
+                    Some(thread_id.as_str()),
                 )
             }
         };
@@ -3374,10 +3382,14 @@ async fn store_sync_state_value(
     Ok(())
 }
 
-fn resolve_notification_open_url(api_url: Option<&str>, repo_full_name: Option<&str>) -> String {
+fn resolve_notification_open_url(
+    api_url: Option<&str>,
+    repo_full_name: Option<&str>,
+    thread_id: Option<&str>,
+) -> String {
     api_url
         .and_then(resolve_github_api_resource_html_url)
-        .unwrap_or_else(|| fallback_notification_open_url(repo_full_name))
+        .unwrap_or_else(|| fallback_notification_open_url(thread_id, repo_full_name))
 }
 
 fn is_notification_thread_api_url(api_url: &str) -> bool {
@@ -3422,13 +3434,19 @@ fn resolve_github_api_resource_html_url(api_url: &str) -> Option<String> {
     }
 }
 
-fn fallback_notification_open_url(repo_full_name: Option<&str>) -> String {
-    match repo_full_name {
-        Some(repo_full_name) if !repo_full_name.trim().is_empty() => format!(
-            "{GITHUB_WEB_BASE}/notifications?query={}",
-            urlencoding::encode(&format!("repo:{repo_full_name}"))
-        ),
-        _ => format!("{GITHUB_WEB_BASE}/notifications"),
+fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Option<&str>) -> String {
+    match thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+    {
+        Some(thread_id) => format!("{GITHUB_WEB_BASE}/notifications/threads/{thread_id}"),
+        None => match repo_full_name {
+            Some(repo_full_name) if !repo_full_name.trim().is_empty() => format!(
+                "{GITHUB_WEB_BASE}/notifications?query={}",
+                urlencoding::encode(&format!("repo:{repo_full_name}"))
+            ),
+            _ => format!("{GITHUB_WEB_BASE}/notifications"),
+        },
     }
 }
 
@@ -3558,6 +3576,7 @@ mod tests {
             resolve_notification_open_url(
                 Some("https://api.github.com/repos/octo/alpha/issues/12"),
                 Some("octo/alpha"),
+                Some("thread-12"),
             ),
             "https://github.com/octo/alpha/issues/12"
         );
@@ -3565,6 +3584,7 @@ mod tests {
             resolve_notification_open_url(
                 Some("https://api.github.com/repos/octo/alpha/pulls/34"),
                 Some("octo/alpha"),
+                Some("thread-34"),
             ),
             "https://github.com/octo/alpha/pull/34"
         );
@@ -3572,6 +3592,7 @@ mod tests {
             resolve_notification_open_url(
                 Some("https://api.github.com/repos/octo/alpha/discussions/56"),
                 Some("octo/alpha"),
+                Some("thread-56"),
             ),
             "https://github.com/octo/alpha/discussions/56"
         );
@@ -3579,11 +3600,16 @@ mod tests {
             resolve_notification_open_url(
                 Some("https://api.github.com/repos/octo/alpha/check-suites/78"),
                 Some("octo/alpha"),
+                Some("thread-78"),
             ),
+            "https://github.com/notifications/threads/thread-78"
+        );
+        assert_eq!(
+            resolve_notification_open_url(None, Some("octo/alpha"), None),
             "https://github.com/notifications?query=repo%3Aocto%2Falpha"
         );
         assert_eq!(
-            resolve_notification_open_url(None, None),
+            resolve_notification_open_url(None, None, None),
             "https://github.com/notifications"
         );
     }
@@ -3790,7 +3816,7 @@ mod tests {
         assert!(stored.contains(&(
             "thread-2".to_owned(),
             Some("https://api.github.com/repos/octo/alpha/check-suites/99".to_owned()),
-            Some("https://github.com/notifications?query=repo%3Aocto%2Falpha".to_owned()),
+            Some("https://github.com/notifications/threads/thread-2".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-3".to_owned(),
@@ -3912,7 +3938,7 @@ mod tests {
             stored,
             (
                 Some("https://api.github.com/notifications/threads/thread-lookup-fails".to_owned()),
-                Some("https://github.com/notifications?query=repo%3Aocto%2Falpha".to_owned()),
+                Some("https://github.com/notifications/threads/thread-lookup-fails".to_owned()),
             )
         );
 
@@ -4287,7 +4313,7 @@ mod tests {
             stored,
             (
                 None,
-                Some("https://github.com/notifications?query=repo%3Aocto%2Falpha".to_owned()),
+                Some("https://github.com/notifications/threads/target-missing".to_owned()),
             )
         );
 

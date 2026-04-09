@@ -790,7 +790,7 @@ test("dashboard keeps inbox sync reachable when inbox is empty", async ({
 	expect(syncInboxCalls).toBe(1);
 });
 
-test("dashboard inbox cards fall back to repo-filtered GitHub notifications when html_url is missing", async ({
+test("dashboard inbox cards fall back to GitHub per-thread pages when html_url is missing", async ({
 	page,
 }) => {
 	await page.route("**/api/**", async (route) => {
@@ -879,10 +879,7 @@ test("dashboard inbox cards fall back to repo-filtered GitHub notifications when
 
 	await expect(
 		page.getByRole("link", { name: /Fallback inbox thread/i }).first(),
-	).toHaveAttribute(
-		"href",
-		"https://github.com/notifications?query=repo%3Aowner%2Frepo",
-	);
+	).toHaveAttribute("href", "https://github.com/notifications/threads/90003");
 });
 
 test("dashboard inbox cards ignore stale repo-homepage html_url values until repair rewrites them", async ({
@@ -974,8 +971,5 @@ test("dashboard inbox cards ignore stale repo-homepage html_url values until rep
 
 	await expect(
 		page.getByRole("link", { name: /Stale repo homepage link/i }).first(),
-	).toHaveAttribute(
-		"href",
-		"https://github.com/notifications?query=repo%3Aowner%2Frepo",
-	);
+	).toHaveAttribute("href", "https://github.com/notifications/threads/90004");
 });
