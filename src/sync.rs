@@ -2984,16 +2984,25 @@ pub async fn sync_notifications(
                     .send()
                     .await
                     .context("github notification thread request failed")?;
-                if is_non_retryable_notification_thread_status(response.status()) {
+                let status = response.status();
+                if status.is_success() {
+                    return response
+                        .json::<GitHubNotification>()
+                        .await
+                        .map(Some)
+                        .context("github notification thread json decode failed");
+                }
+                let headers = response.headers().clone();
+                let body = response
+                    .text()
+                    .await
+                    .context("github notification thread error body decode failed")?;
+                let error =
+                    classify_github_http_error("github notification thread", status, &headers, &body);
+                if is_terminal_notification_thread_error(&error) {
                     return Ok(None);
                 }
-                response
-                    .error_for_status()
-                    .context("github notification thread returned error")?
-                    .json::<GitHubNotification>()
-                    .await
-                    .map(Some)
-                    .context("github notification thread json decode failed")
+                Err(error.into_anyhow())
             }) as Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>
         },
     )
@@ -3379,8 +3388,11 @@ fn non_thread_notification_api_url(api_url: &str) -> Option<String> {
     (!is_notification_thread_api_url(api_url)).then(|| api_url.to_owned())
 }
 
-fn is_non_retryable_notification_thread_status(status: StatusCode) -> bool {
-    matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
+fn is_terminal_notification_thread_error(error: &SyncRequestError) -> bool {
+    matches!(
+        error.reason_code,
+        "scope_insufficient" | "credentials_forbidden" | "repo_inaccessible"
+    )
 }
 
 fn resolve_github_api_resource_html_url(api_url: &str) -> Option<String> {
@@ -3444,11 +3456,11 @@ mod tests {
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, ReleaseDemandRepo,
         RepoReleaseOrigin, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
         SyncRequestError, aggregate_repos, attach_and_wait_for_user_release_demand,
-        attach_release_demand, cmp_last_active_desc, is_non_retryable_notification_thread_status,
-        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
-        resolve_notification_open_url, subscription_event_counts_as_critical,
-        subscription_timeout_error, sync_notifications_with_fetch,
-        sync_starred_for_user_with_fetch, wait_for_release_demand,
+        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
+        is_terminal_notification_thread_error, recover_repo_release_runtime_state_on_startup,
+        repo_release_deadline_at, resolve_notification_open_url,
+        subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -3456,7 +3468,7 @@ mod tests {
         jobs, local_id,
         state::{AppState, build_oauth_client},
     };
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
 
     fn test_user_id(seed: &str) -> String {
         crate::local_id::test_local_id(seed)
@@ -3577,16 +3589,33 @@ mod tests {
     }
 
     #[test]
-    fn notification_thread_status_marks_forbidden_and_not_found_non_retryable() {
-        assert!(is_non_retryable_notification_thread_status(
-            StatusCode::FORBIDDEN
-        ));
-        assert!(is_non_retryable_notification_thread_status(
-            StatusCode::NOT_FOUND
-        ));
-        assert!(!is_non_retryable_notification_thread_status(
-            StatusCode::TOO_MANY_REQUESTS
-        ));
+    fn notification_thread_error_distinguishes_terminal_forbidden_from_rate_limits() {
+        let forbidden = classify_github_http_error(
+            "github notification thread",
+            StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+            "resource not accessible by integration",
+        );
+        assert!(is_terminal_notification_thread_error(&forbidden));
+
+        let not_found = classify_github_http_error(
+            "github notification thread",
+            StatusCode::NOT_FOUND,
+            &HeaderMap::new(),
+            "",
+        );
+        assert!(is_terminal_notification_thread_error(&not_found));
+
+        let mut rate_limited_headers = HeaderMap::new();
+        rate_limited_headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let rate_limited = classify_github_http_error(
+            "github notification thread",
+            StatusCode::FORBIDDEN,
+            &rate_limited_headers,
+            "secondary rate limit",
+        );
+        assert!(rate_limited.retryable);
+        assert!(!is_terminal_notification_thread_error(&rate_limited));
     }
 
     #[tokio::test]
