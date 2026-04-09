@@ -2887,10 +2887,11 @@ pub async fn list_releases(
     Ok(Json(items))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct ReleaseDetailResponse {
     release_id: String,
     repo_full_name: Option<String>,
+    repo_visual: Option<RepoVisual>,
     tag_name: String,
     name: Option<String>,
     body: Option<String>,
@@ -2914,6 +2915,9 @@ pub async fn get_release_detail(
         repo_id: i64,
         release_id: i64,
         repo_full_name: Option<String>,
+        owner_avatar_url: Option<String>,
+        open_graph_image_url: Option<String>,
+        uses_custom_open_graph_image: Option<i64>,
         tag_name: String,
         name: Option<String>,
         body: Option<String>,
@@ -2934,6 +2938,9 @@ pub async fn get_release_detail(
           r.repo_id,
           r.release_id,
           sr.full_name AS repo_full_name,
+          sr.owner_avatar_url AS owner_avatar_url,
+          sr.open_graph_image_url AS open_graph_image_url,
+          sr.uses_custom_open_graph_image AS uses_custom_open_graph_image,
           r.tag_name,
           r.name,
           r.body,
@@ -3040,9 +3047,16 @@ pub async fn get_release_detail(
         }
     };
 
+    let repo_visual = repo_visual_from_parts(
+        row.owner_avatar_url,
+        row.open_graph_image_url,
+        row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
+
     Ok(Json(ReleaseDetailResponse {
         release_id: row.release_id.to_string(),
         repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
+        repo_visual,
         tag_name: row.tag_name,
         name: row.name,
         body: row.body,
@@ -3840,12 +3854,20 @@ pub struct FeedResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct RepoVisual {
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FeedItem {
     kind: String,
     ts: String,
     id: String,
     repo_full_name: Option<String>,
+    repo_visual: Option<RepoVisual>,
     title: Option<String>,
     body: Option<String>,
     body_truncated: bool,
@@ -3916,6 +3938,9 @@ struct FeedRow {
     release_id: Option<i64>,
     release_node_id: Option<String>,
     repo_full_name: Option<String>,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
     release_tag_name: Option<String>,
     release_previous_tag_name: Option<String>,
     title: Option<String>,
@@ -4036,6 +4061,36 @@ fn parse_release_id_param(raw: &str) -> Result<i64, ApiError> {
     release_id_raw
         .parse::<i64>()
         .map_err(|_| ApiError::bad_request("release_id must be an integer string"))
+}
+
+fn normalize_visual_url(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn repo_visual_from_parts(
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
+) -> Option<RepoVisual> {
+    let owner_avatar_url = normalize_visual_url(owner_avatar_url);
+    let open_graph_image_url = normalize_visual_url(open_graph_image_url);
+    if owner_avatar_url.is_none() && open_graph_image_url.is_none() && !uses_custom_open_graph_image
+    {
+        return None;
+    }
+
+    Some(RepoVisual {
+        owner_avatar_url,
+        open_graph_image_url,
+        uses_custom_open_graph_image,
+    })
 }
 
 fn release_detail_source_hash(
@@ -4348,6 +4403,9 @@ async fn fetch_feed_releases(
             release_id,
             release_node_id,
             repo_full_name,
+            owner_avatar_url,
+            open_graph_image_url,
+            uses_custom_open_graph_image,
             release_tag_name,
             release_previous_tag_name,
             title,
@@ -4372,6 +4430,9 @@ async fn fetch_feed_releases(
               r.release_id AS release_id,
               r.node_id AS release_node_id,
               sr.full_name AS repo_full_name,
+              sr.owner_avatar_url AS owner_avatar_url,
+              sr.open_graph_image_url AS open_graph_image_url,
+              sr.uses_custom_open_graph_image AS uses_custom_open_graph_image,
               r.tag_name AS release_tag_name,
               LAG(r.tag_name) OVER (
                 PARTITION BY r.repo_id
@@ -4397,7 +4458,8 @@ async fn fetch_feed_releases(
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
-          i.repo_full_name, i.release_tag_name, i.release_previous_tag_name,
+          i.repo_full_name, i.owner_avatar_url, i.open_graph_image_url, i.uses_custom_open_graph_image,
+          i.release_tag_name, i.release_previous_tag_name,
           i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
           i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
@@ -5000,11 +5062,18 @@ fn feed_item_from_row(
         viewer = live.viewer.clone();
     }
 
+    let repo_visual = repo_visual_from_parts(
+        r.owner_avatar_url.clone(),
+        r.open_graph_image_url.clone(),
+        r.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
+
     FeedItem {
         kind: r.kind,
         ts: r.ts,
         id: r.entity_id,
         repo_full_name: r.repo_full_name,
+        repo_visual,
         title: r.title,
         body,
         body_truncated,
@@ -9514,6 +9583,9 @@ mod tests {
             release_id: Some(1),
             release_node_id: node_id.map(str::to_owned),
             repo_full_name: None,
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: None,
             release_tag_name: None,
             release_previous_tag_name: None,
             title: None,
@@ -10183,9 +10255,10 @@ mod tests {
             r#"
             INSERT INTO starred_repos (
               id, user_id, repo_id, full_name, owner_login, name,
-              description, html_url, stargazed_at, is_private, updated_at
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             "#,
         )
         .bind(format!("star-{repo_id}"))
@@ -10198,6 +10271,9 @@ mod tests {
         .bind("https://github.com/openai/codex")
         .bind(now)
         .bind(now)
+        .bind("https://avatars.githubusercontent.com/u/14957082")
+        .bind("https://repository-images.githubusercontent.com/14957082/codex")
+        .bind(1_i64)
         .execute(pool)
         .await
         .expect("seed starred");
@@ -12632,6 +12708,37 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_exposes_repo_visual_metadata() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.owner_avatar_url = Some("https://avatars.githubusercontent.com/u/14957082".to_owned());
+        row.open_graph_image_url =
+            Some("https://repository-images.githubusercontent.com/14957082/codex".to_owned());
+        row.uses_custom_open_graph_image = Some(1);
+
+        let item = feed_item_from_row(row, true, None);
+        let repo_visual = item.repo_visual.expect("repo visual");
+        assert_eq!(
+            repo_visual.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            repo_visual.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert!(repo_visual.uses_custom_open_graph_image);
+    }
+
+    #[test]
+    fn feed_item_from_row_omits_repo_visual_when_metadata_missing() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        assert!(item.repo_visual.is_none());
+    }
+
+    #[test]
     fn parse_release_smart_summary_payload_accepts_relaxed_payload_and_sanitizes_bullets() {
         let raw = r#"
         {
@@ -12920,6 +13027,16 @@ mod tests {
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        let repo_visual = detail.repo_visual.expect("repo visual");
+        assert_eq!(
+            repo_visual.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            repo_visual.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert!(repo_visual.uses_custom_open_graph_image);
         assert_eq!(detail.tag_name, "v1.2.3");
         assert_eq!(detail.name.as_deref(), Some("Release v1.2.3"));
         assert_eq!(detail.body.as_deref(), Some("- item"));
@@ -12950,6 +13067,7 @@ mod tests {
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        assert!(detail.repo_visual.is_none());
     }
 
     #[tokio::test]

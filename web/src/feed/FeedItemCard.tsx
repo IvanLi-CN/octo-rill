@@ -1,6 +1,7 @@
 import { ArrowUpRight, RefreshCcw } from "lucide-react";
 
 import { Markdown } from "@/components/Markdown";
+import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -283,11 +284,13 @@ export function FeedItemCard(props: {
 							</span>
 						) : null}
 
-						{item.repo_full_name ? (
-							<span className="truncate font-mono text-[11px] text-muted-foreground">
-								{item.repo_full_name}
-							</span>
-						) : null}
+						<RepoIdentity
+							repoFullName={item.repo_full_name}
+							repoVisual={item.repo_visual}
+							className="min-w-0"
+							labelClassName="font-mono text-[11px] text-muted-foreground"
+							visualClassName="size-5"
+						/>
 					</div>
 
 					<CardTitle className="mt-3 text-balance text-lg">

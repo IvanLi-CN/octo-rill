@@ -2,6 +2,18 @@ import { type Page, type Route, expect, test } from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
+function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="36" fill="${background}"/><text x="120" y="132" font-family="Inter,Arial,sans-serif" font-size="44" font-weight="700" text-anchor="middle" fill="${foreground}">${label}</text></svg>`,
+	)}`;
+}
+
+function socialPreviewDataUrl(title: string, accent: string, body: string) {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${accent}"/><stop offset="100%" stop-color="#0f172a"/></linearGradient></defs><rect width="1280" height="640" rx="48" fill="url(#g)"/><text x="112" y="224" font-family="Inter,Arial,sans-serif" font-size="82" font-weight="800" fill="#ffffff">${title}</text><text x="112" y="328" font-family="Inter,Arial,sans-serif" font-size="40" font-weight="600" fill="rgba(255,255,255,0.82)">${body}</text></svg>`,
+	)}`;
+}
+
 type ApiOptions = {
 	releaseId: string;
 	detailTitle: string;
@@ -82,6 +94,15 @@ function makeAutoTranslateFeedItems(
 			ts: `2026-02-22T${`${(index % 10) + 10}`.padStart(2, "0")}:22:33Z`,
 			id: releaseId,
 			repo_full_name: "owner/repo",
+			repo_visual: {
+				owner_avatar_url: svgDataUrl("OR", "#2563eb"),
+				open_graph_image_url: socialPreviewDataUrl(
+					"Owner Repo",
+					"#1d4ed8",
+					"feed social preview",
+				),
+				uses_custom_open_graph_image: true,
+			},
 			title: `Release ${releaseId}`,
 			body: [
 				`- lane ${index + 1} keeps current-screen work first`,
@@ -281,6 +302,15 @@ async function installApiMocks(
 							ts: cfg.feedTimestamp,
 							id: cfg.releaseId,
 							repo_full_name: "owner/repo",
+							repo_visual: {
+								owner_avatar_url: svgDataUrl("OR", "#2563eb"),
+								open_graph_image_url: socialPreviewDataUrl(
+									"Owner Repo",
+									"#1d4ed8",
+									"feed social preview",
+								),
+								uses_custom_open_graph_image: true,
+							},
 							title: cfg.detailTitle,
 							body: "- fix A\n- fix B",
 							body_truncated: false,
@@ -371,6 +401,11 @@ async function installApiMocks(
 			return json(route, {
 				release_id: cfg.releaseId,
 				repo_full_name: "owner/repo",
+				repo_visual: {
+					owner_avatar_url: svgDataUrl("OR", "#2563eb"),
+					open_graph_image_url: null,
+					uses_custom_open_graph_image: false,
+				},
 				tag_name: "v1.2.3",
 				name: cfg.detailTitle,
 				body: "- fix A\n- fix B",
@@ -649,6 +684,9 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	await expect(
 		detailDialog.getByRole("heading", { name: "Release 289513858" }),
 	).toBeVisible();
+	await expect(
+		detailDialog.locator('[data-repo-visual-kind="owner_avatar"]').first(),
+	).toBeVisible();
 
 	await detailDialog.getByRole("button", { name: "关闭" }).click();
 	await expect(page).toHaveURL(/tab=briefs/);
@@ -711,6 +749,9 @@ test("reaction fallback opens PAT dialog with accessible controls", async ({
 		"aria-selected",
 		"true",
 	);
+	await expect(
+		page.locator('[data-repo-visual-kind="social_preview"]').first(),
+	).toBeVisible();
 	await page.getByTitle("赞").click();
 
 	const patDialog = page.getByRole("dialog", {
