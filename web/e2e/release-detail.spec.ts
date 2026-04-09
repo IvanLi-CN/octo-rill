@@ -27,6 +27,7 @@ type ApiOptions = {
 	smartInitialReadyIds?: string[];
 	smartInitialErrorIds?: string[];
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
+	smartResolveDelayMs?: number;
 	releaseDetailPendingPolls?: number;
 };
 
@@ -389,7 +390,7 @@ async function installApiMocks(
 
 		if (req.method() === "POST" && pathname === "/api/translate/results") {
 			const body = req.postDataJSON() as {
-				items?: Array<{ entity_id?: string }>;
+				items?: Array<{ entity_id?: string; kind?: string }>;
 			};
 			const items = body.items ?? [];
 			const entityIds = items.map((item) => item.entity_id ?? "");
@@ -402,6 +403,12 @@ async function installApiMocks(
 					{ error: { message: "transient translate results failure" } },
 					503,
 				);
+			}
+			if (
+				cfg.smartResolveDelayMs &&
+				items.some((item) => item.kind === "release_smart")
+			) {
+				await page.waitForTimeout(cfg.smartResolveDelayMs);
 			}
 			return json(route, {
 				items: items.map((item) => {
@@ -1078,6 +1085,46 @@ test("feed smart retry treats insufficient result as a successful collapse", asy
 		page.getByRole("heading", { name: `Release ${releaseId}` }),
 	).toBeVisible();
 	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
+});
+
+test("feed smart retry button spins and disables while request is in flight", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartResolveStatuses: {
+			[releaseId]: "ready",
+		},
+		smartResolveDelayMs: 600,
+	});
+
+	await page.goto("/?tab=releases");
+	const retryButton = page.getByRole("button", { name: "重试智能整理" });
+	await expect(retryButton).toBeVisible();
+	await expect(retryButton).toBeEnabled();
+
+	await retryButton.dblclick();
+
+	await expect(retryButton).toBeDisabled();
+	await expect(retryButton).toHaveAttribute("aria-busy", "true");
+	await expect(retryButton.locator("svg").first()).toHaveClass(/animate-spin/);
+	await expect(retryButton).toHaveText("重试智能整理");
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter((request) =>
+					request.kinds.includes("release_smart"),
+				).length,
+		)
+		.toBe(1);
+
+	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
+	await expect(
+		page.getByText(`智能总结 release ${releaseId} 的主要版本变化。`),
+	).toBeVisible();
 });
 
 test.describe("localized timestamps", () => {
