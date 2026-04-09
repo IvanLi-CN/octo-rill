@@ -71,7 +71,8 @@ Feed release item 与 Release detail response 都新增：
 
 ### Feed 卡片
 
-- repo badge 行在 `RELEASE` / `未读` 之后显示统一 repo visual。
+- 顶部元信息行保留 `未读` 标记（若存在）与统一 repo visual，不再额外显示 `RELEASE` 类型 badge。
+- repo 名文本与 repo visual 相比原始文本-only 版本放大一档，保证头部视觉锚点更明显。
 - custom social preview 使用固定尺寸、圆角裁切的小图块，保持头部布局稳定。
 - social preview 加载失败时自动切回 owner/org avatar；avatar 再失败则只保留仓库名文本。
 
