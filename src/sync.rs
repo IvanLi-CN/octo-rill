@@ -3016,18 +3016,21 @@ where
     let since = load_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY)
         .await
         .context("failed to query notifications since")?;
+    let fetch_since = if repair_needed { None } else { since.clone() };
 
     let sync_started_at = chrono::Utc::now().to_rfc3339();
     let mut notifications = 0usize;
     let before = Some(sync_started_at.clone());
     let mut page = 1usize;
+    let mut repaired_thread_ids = Vec::new();
 
     loop {
-        let res = fetch_page(since.clone(), before.clone(), page).await?;
+        let res = fetch_page(fetch_since.clone(), before.clone(), page).await?;
         if res.is_empty() {
             break;
         }
         notifications += res.len();
+        repaired_thread_ids.extend(res.iter().map(|item| item.id.clone()));
         upsert_notifications(state, user_id, &res, &sync_started_at).await?;
         if res.len() < GITHUB_NOTIFICATIONS_PAGE_SIZE {
             break;
@@ -3039,8 +3042,14 @@ where
     }
 
     if repair_needed {
-        repair_cached_notification_open_urls(state, user_id, &sync_started_at, &mut fetch_thread)
-            .await?;
+        repair_cached_notification_open_urls(
+            state,
+            user_id,
+            &sync_started_at,
+            &repaired_thread_ids,
+            &mut fetch_thread,
+        )
+        .await?;
     }
 
     store_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY, &sync_started_at)
@@ -3118,25 +3127,27 @@ async fn repair_cached_notification_open_urls<G>(
     state: &AppState,
     user_id: &str,
     now: &str,
+    thread_ids: &[String],
     fetch_thread: &mut G,
 ) -> Result<()>
 where
     G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
 {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-            Option<String>,
-        ),
-    >(
+    let mut unique_thread_ids = thread_ids
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    unique_thread_ids.sort();
+    unique_thread_ids.dedup();
+    if unique_thread_ids.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = std::iter::repeat_n("?", unique_thread_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
         r#"
         SELECT
           thread_id,
@@ -3149,13 +3160,31 @@ where
           unread,
           html_url
         FROM notifications
-        WHERE user_id = ?
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to load cached notifications for open-url repair")?;
+        WHERE user_id = ? AND thread_id IN ({placeholders})
+        "#
+    );
+    let mut query = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        ),
+    >(&query)
+    .bind(user_id.to_owned());
+    for thread_id in &unique_thread_ids {
+        query = query.bind(thread_id.clone());
+    }
+    let rows = query
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to load cached notifications for open-url repair")?;
 
     for (
         thread_id,
@@ -3178,7 +3207,18 @@ where
             });
 
         let thread = if needs_thread_lookup {
-            (*fetch_thread)(thread_id.clone()).await?
+            match (*fetch_thread)(thread_id.clone()).await {
+                Ok(thread) => thread,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        thread_id,
+                        error = ?error,
+                        "failed to refresh notification thread during open-url repair"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -3556,6 +3596,13 @@ mod tests {
                             1 => {
                                 let mut items = vec![
                                     mock_notification(
+                                        "cached-thread",
+                                        None,
+                                        Some("octo/alpha"),
+                                        Some("PullRequest"),
+                                        "2026-03-06T03:30:00Z",
+                                    ),
+                                    mock_notification(
                                         "thread-1",
                                         Some("https://api.github.com/repos/octo/alpha/issues/12"),
                                         Some("octo/alpha"),
@@ -3570,7 +3617,7 @@ mod tests {
                                         "2026-03-06T02:00:00Z",
                                     ),
                                 ];
-                                for index in 0..48 {
+                                for index in 0..47 {
                                     items.push(mock_notification(
                                         &format!("filler-{index}"),
                                         Some(&format!(
@@ -3620,9 +3667,9 @@ mod tests {
 
         let observed = observed.lock().await.clone();
         assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0].0.as_deref(), Some(existing_since));
+        assert_eq!(observed[0].0, None);
         assert_eq!(observed[0].2, 1);
-        assert_eq!(observed[1].0.as_deref(), Some(existing_since));
+        assert_eq!(observed[1].0, None);
         assert_eq!(observed[1].2, 2);
         assert_eq!(observed[0].1, observed[1].1);
         assert!(observed[0].1.is_some());
@@ -3639,7 +3686,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("load notifications");
-        assert_eq!(stored.len(), 52);
+        assert_eq!(stored.len(), 51);
         assert!(stored.contains(&(
             "cached-thread".to_owned(),
             Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
@@ -3723,6 +3770,81 @@ mod tests {
         assert_eq!(second_calls[0].2, 1);
         assert!(second_calls[0].1.is_some());
         assert!(second_calls[0].0.is_some());
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_ignores_thread_lookup_failures() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-repair-ignore-errors");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            move |since, before, page| {
+                Box::pin(async move {
+                    assert_eq!(since, None);
+                    assert!(before.is_some());
+                    Ok(if page == 1 {
+                        vec![mock_notification(
+                            "thread-lookup-fails",
+                            None,
+                            Some("octo/alpha"),
+                            Some("PullRequest"),
+                            "2026-03-06T03:00:00Z",
+                        )]
+                    } else {
+                        vec![]
+                    })
+                })
+            },
+            move |thread_id| Box::pin(async move { anyhow::bail!("boom for {thread_id}") }),
+        )
+        .await
+        .expect("sync notifications");
+
+        assert_eq!(result.notifications, 1);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-lookup-fails")
+        .fetch_one(&pool)
+        .await
+        .expect("load notification");
+        assert_eq!(
+            stored,
+            (
+                Some("https://api.github.com/notifications/threads/thread-lookup-fails".to_owned()),
+                Some("https://github.com/notifications?query=repo%3Aocto%2Falpha".to_owned()),
+            )
+        );
+
+        let repair_marker = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATION_OPEN_URL_REPAIR_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read repair marker");
+        assert!(!repair_marker.is_empty());
+
+        let since_value = sqlx::query_scalar::<_, String>(
+            r#"SELECT value FROM sync_state WHERE user_id = ? AND key = ?"#,
+        )
+        .bind(user_id.as_str())
+        .bind(NOTIFICATIONS_SINCE_KEY)
+        .fetch_one(&pool)
+        .await
+        .expect("read notifications since");
+        assert!(!since_value.is_empty());
     }
 
     #[tokio::test]
