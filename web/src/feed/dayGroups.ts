@@ -1,4 +1,4 @@
-import type { FeedItem } from "@/feed/types";
+import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 
 const DEFAULT_DAILY_BOUNDARY = "08:00";
 const timeZoneFormatterCache = new Map<string, Intl.DateTimeFormat>();
@@ -14,7 +14,9 @@ export type FeedDayGroup = {
 	displayDate: string;
 	briefDate: string;
 	items: FeedItem[];
+	itemCount: number;
 	releaseCount: number;
+	activityCount: number;
 	isCurrent: boolean;
 };
 
@@ -185,7 +187,12 @@ export function groupFeedItemsByDay(
 			const existing = groups.get(unknownKey);
 			if (existing) {
 				existing.items.push(item);
-				existing.releaseCount += 1;
+				existing.itemCount += 1;
+				if (isReleaseFeedItem(item)) {
+					existing.releaseCount += 1;
+				} else {
+					existing.activityCount += 1;
+				}
 				continue;
 			}
 			groups.set(unknownKey, {
@@ -193,7 +200,9 @@ export function groupFeedItemsByDay(
 				displayDate: "未知日期",
 				briefDate: "",
 				items: [item],
-				releaseCount: 1,
+				itemCount: 1,
+				releaseCount: isReleaseFeedItem(item) ? 1 : 0,
+				activityCount: isReleaseFeedItem(item) ? 0 : 1,
 				isCurrent: false,
 			});
 			continue;
@@ -209,7 +218,12 @@ export function groupFeedItemsByDay(
 		const existing = groups.get(groupId);
 		if (existing) {
 			existing.items.push(item);
-			existing.releaseCount += 1;
+			existing.itemCount += 1;
+			if (isReleaseFeedItem(item)) {
+				existing.releaseCount += 1;
+			} else {
+				existing.activityCount += 1;
+			}
 			continue;
 		}
 
@@ -218,7 +232,9 @@ export function groupFeedItemsByDay(
 			displayDate: windowStartKey,
 			briefDate: shiftDateKey(windowStartKey, 1),
 			items: [item],
-			releaseCount: 1,
+			itemCount: 1,
+			releaseCount: isReleaseFeedItem(item) ? 1 : 0,
+			activityCount: isReleaseFeedItem(item) ? 0 : 1,
 			isCurrent: groupId === currentGroupId,
 		});
 	}
