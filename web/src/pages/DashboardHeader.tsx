@@ -47,7 +47,7 @@ export function DashboardHeader({
 				</p>
 			</div>
 
-			<div className="flex flex-wrap gap-2">
+			<div className="flex flex-wrap gap-2" data-dashboard-primary-actions>
 				<Button disabled={busy} onClick={onSyncAll}>
 					<RefreshCcw
 						className={syncingAll ? "size-4 animate-spin" : "size-4"}
