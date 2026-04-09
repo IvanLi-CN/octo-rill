@@ -40,8 +40,16 @@ function EmptyPanel(props: {
 	actionLabel?: string;
 	onAction?: () => void;
 	disabled?: boolean;
+	loading?: boolean;
 }) {
-	const { title, description, actionLabel, onAction, disabled = false } = props;
+	const {
+		title,
+		description,
+		actionLabel,
+		onAction,
+		disabled = false,
+		loading = false,
+	} = props;
 	return (
 		<div className="rounded-xl border border-dashed bg-muted/20 p-4">
 			<p className="text-sm font-medium">{title}</p>
@@ -52,9 +60,11 @@ function EmptyPanel(props: {
 					size="sm"
 					className="mt-3 font-mono text-xs"
 					onClick={onAction}
-					disabled={disabled}
+					disabled={disabled || loading}
+					aria-busy={loading ? "true" : undefined}
+					data-empty-panel-action-loading={loading ? "true" : "false"}
 				>
-					<RefreshCcw className="size-4" />
+					<RefreshCcw className={cn("size-4", loading && "animate-spin")} />
 					{actionLabel}
 				</Button>
 			) : null}
@@ -134,8 +144,12 @@ function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
 	return <OriginalLane item={item} />;
 }
 
-function SmartLane(props: { item: FeedItem; onSmartNow: () => void }) {
-	const { item, onSmartNow } = props;
+function SmartLane(props: {
+	item: FeedItem;
+	onSmartNow: () => void;
+	isSmartGenerating: boolean;
+}) {
+	const { item, onSmartNow, isSmartGenerating } = props;
 
 	if (item.smart?.status === "ready" && item.smart.summary?.trim()) {
 		return <Markdown content={item.smart.summary} />;
@@ -157,6 +171,8 @@ function SmartLane(props: { item: FeedItem; onSmartNow: () => void }) {
 				description="这次智能整理没有成功完成，可以立即再试一次。"
 				actionLabel="重试智能整理"
 				onAction={onSmartNow}
+				disabled={isSmartGenerating}
+				loading={isSmartGenerating}
 			/>
 		);
 	}
@@ -380,7 +396,11 @@ export function FeedItemCard(props: {
 							<TranslatedLane item={item} onTranslateNow={onTranslateNow} />
 						</TabsContent>
 						<TabsContent value="smart" className="mt-0">
-							<SmartLane item={item} onSmartNow={onSmartNow} />
+							<SmartLane
+								item={item}
+								onSmartNow={onSmartNow}
+								isSmartGenerating={isSmartGenerating}
+							/>
 						</TabsContent>
 					</CardContent>
 				</Tabs>

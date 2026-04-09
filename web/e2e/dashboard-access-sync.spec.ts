@@ -10,6 +10,119 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
+test("dashboard keeps sync as a single header action for admins", async ({
+	page,
+}) => {
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo-admin",
+					name: "Octo Admin",
+					avatar_url: null,
+					email: "admin@example.com",
+					is_admin: true,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, {
+				items: [
+					{
+						kind: "release",
+						ts: "2026-04-09T08:00:00Z",
+						id: "20001",
+						repo_full_name: "owner/repo",
+						title: "Release 20001",
+						body: "hello",
+						body_truncated: false,
+						subtitle: null,
+						reason: null,
+						subject_type: null,
+						html_url: "https://github.com/owner/repo/releases/tag/v20001",
+						unread: null,
+						translated: null,
+						smart: null,
+						reactions: null,
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+
+	await expect(page.getByRole("button", { name: "同步" })).toHaveCount(1);
+	await expect(
+		page.locator("[data-dashboard-primary-actions]").getByRole("button", {
+			name: "同步",
+		}),
+	).toBeVisible();
+	const secondaryControls = page.locator("[data-dashboard-secondary-controls]");
+	await expect(
+		secondaryControls.getByRole("button", { name: "同步" }),
+	).toHaveCount(0);
+	await expect(
+		secondaryControls.getByRole("link", { name: "同步" }),
+	).toHaveCount(0);
+	await expect(
+		secondaryControls.getByRole("button", { name: "原文" }),
+	).toBeVisible();
+	await expect(
+		secondaryControls.getByRole("button", { name: "翻译" }),
+	).toBeVisible();
+	await expect(
+		secondaryControls.getByRole("button", { name: "智能" }),
+	).toBeVisible();
+	await expect(
+		secondaryControls.getByRole("link", { name: "管理员面板" }),
+	).toBeVisible();
+});
+
 test("dashboard refreshes cached and fresh feed data across access sync stages", async ({
 	page,
 }) => {

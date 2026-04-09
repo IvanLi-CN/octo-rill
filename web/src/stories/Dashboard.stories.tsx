@@ -45,6 +45,7 @@ type FeedMode =
 	| "smart-ready-body"
 	| "smart-ready-diff"
 	| "smart-loading"
+	| "smart-retry-error"
 	| "smart-insufficient";
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
@@ -348,6 +349,22 @@ function makeSmartLoadingFeed(): FeedItem[] {
 	];
 }
 
+function makeSmartRetryErrorFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50005", {
+			title: "v5.2.1",
+			body: "- Placeholder body for smart retry state",
+			smart: {
+				lang: "zh-CN",
+				status: "error",
+				title: null,
+				summary: null,
+				auto_translate: false,
+			},
+		}),
+	];
+}
+
 function makeSmartInsufficientFeed(): FeedItem[] {
 	return [
 		buildFeedItem("50004", {
@@ -375,7 +392,13 @@ function makeVisibleWindowInFlightKeys(
 }
 
 function makeSmartInFlightKeys(mode: FeedMode) {
-	return new Set(mode === "smart-loading" ? ["release:50003"] : []);
+	return new Set(
+		mode === "smart-loading"
+			? ["release:50003"]
+			: mode === "smart-retry-error"
+				? []
+				: [],
+	);
 }
 
 const mockBriefs: BriefItem[] = [
@@ -596,9 +619,11 @@ function DashboardPreview(props: {
 								? makeSmartReadyDiffFeed()
 								: feedMode === "smart-loading"
 									? makeSmartLoadingFeed()
-									: feedMode === "smart-insufficient"
-										? makeSmartInsufficientFeed()
-										: makeVisibleWindowFeed(feedMode);
+									: feedMode === "smart-retry-error"
+										? makeSmartRetryErrorFeed()
+										: feedMode === "smart-insufficient"
+											? makeSmartInsufficientFeed()
+											: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const translationInFlightKeys =
 		emptyState !== "content" ||
@@ -608,10 +633,13 @@ function DashboardPreview(props: {
 		feedMode === "smart-ready-body" ||
 		feedMode === "smart-ready-diff" ||
 		feedMode === "smart-loading" ||
+		feedMode === "smart-retry-error" ||
 		feedMode === "smart-insufficient"
 			? new Set<string>()
 			: makeVisibleWindowInFlightKeys(feedMode);
-	const smartInFlightKeys = makeSmartInFlightKeys(feedMode);
+	const [smartInFlightKeys, setSmartInFlightKeys] = useState<Set<string>>(() =>
+		makeSmartInFlightKeys(feedMode),
+	);
 	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) =>
@@ -635,6 +663,10 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 
+	useEffect(() => {
+		setSmartInFlightKeys(makeSmartInFlightKeys(feedMode));
+	}, [feedMode]);
+
 	const openReleaseDetail = (releaseId: string) => {
 		setTab("briefs");
 		setActiveReleaseId(releaseId);
@@ -657,6 +689,17 @@ function DashboardPreview(props: {
 				(a, b) => b.date.localeCompare(a.date),
 			),
 		);
+	};
+
+	const triggerSmartNow = (item: FeedItem) => {
+		if (feedMode !== "smart-retry-error") return;
+		const key = feedItemKey(item);
+		setSmartInFlightKeys((current) => {
+			if (current.has(key)) return current;
+			const next = new Set(current);
+			next.add(key);
+			return next;
+		});
 	};
 
 	const renderFeedPanel = (mode: "all" | "releases") =>
@@ -719,7 +762,7 @@ function DashboardPreview(props: {
 					}))
 				}
 				onTranslateNow={() => {}}
-				onSmartNow={() => {}}
+				onSmartNow={triggerSmartNow}
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={{}}
 				onToggleReaction={() => {}}
@@ -768,7 +811,10 @@ function DashboardPreview(props: {
 							Inbox
 						</TabsTrigger>
 					</TabsList>
-					<div className="flex items-center gap-2">
+					<div
+						className="flex items-center gap-2"
+						data-dashboard-secondary-controls
+					>
 						{tab === "all" || tab === "releases" ? (
 							<FeedPageLaneSelector
 								value={effectivePageDefaultLane}
@@ -926,9 +972,22 @@ export const Default: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		expect(secondaryControls).not.toBeNull();
 		await expect(
 			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
 		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
+		).toHaveLength(1);
+		expect(
+			secondaryControls?.querySelector(
+				'button[aria-label="同步"], a[aria-label="同步"]',
+			),
+		).toBeNull();
+		expect(secondaryControls?.textContent).not.toContain(SYNC_ALL_LABEL);
 		await expect(
 			canvas.queryByRole("button", { name: "Refresh" }),
 		).not.toBeInTheDocument();
@@ -1206,7 +1265,15 @@ export const Syncing: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		expect(secondaryControls).not.toBeNull();
 		const syncButton = canvas.getByRole("button", { name: SYNC_ALL_LABEL });
+		await expect(
+			canvas.getAllByRole("button", { name: SYNC_ALL_LABEL }),
+		).toHaveLength(1);
+		expect(secondaryControls?.textContent).not.toContain(SYNC_ALL_LABEL);
 		await expect(syncButton).toBeDisabled();
 		const icon = syncButton.querySelector("svg");
 		expect(icon).not.toBeNull();
@@ -1509,6 +1576,35 @@ export const SmartLoading: Story = {
 			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);
 		expect(smartTrigger).not.toBeNull();
+	},
+};
+
+export const SmartRetryActionLoading: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-retry-error",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"智能整理失败时点击重试，错误态按钮会立即进入旋转 loading，并在动作完成前保持禁用，避免重复点击。",
+			},
+		},
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const retryButton = canvas.getByRole("button", { name: "重试智能整理" });
+		await expect(retryButton).toBeEnabled();
+		await userEvent.click(retryButton);
+		await expect(retryButton).toBeDisabled();
+		await expect(retryButton).toHaveAttribute("aria-busy", "true");
+		const icon = retryButton.querySelector("svg");
+		expect(icon).not.toBeNull();
+		expect(icon?.classList.contains("animate-spin")).toBe(true);
+		await expect(
+			canvas.getByText("智能整理失败", { exact: true }),
+		).toBeVisible();
 	},
 };
 
