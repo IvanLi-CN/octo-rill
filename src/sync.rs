@@ -2931,47 +2931,74 @@ pub async fn sync_notifications(
     user_id: &str,
 ) -> Result<SyncNotificationsResult> {
     let token = state.load_access_token(user_id).await?;
-    sync_notifications_with_fetch(state, user_id, |since, before, page| {
-        let client = state.http.clone();
-        let token = token.clone();
-        Box::pin(async move {
-            let mut url = format!(
-                "{REST_API_BASE}/notifications?all=true&per_page={GITHUB_NOTIFICATIONS_PAGE_SIZE}"
-            );
-            if let Some(ref since) = since {
-                url.push_str("&since=");
-                url.push_str(&urlencoding::encode(since));
-            }
-            if let Some(ref before) = before {
-                url.push_str("&before=");
-                url.push_str(&urlencoding::encode(before));
-            }
-            url.push_str("&page=");
-            url.push_str(&page.to_string());
+    sync_notifications_with_fetch(
+        state,
+        user_id,
+        |since, before, page| {
+            let client = state.http.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                let mut url = format!(
+                    "{REST_API_BASE}/notifications?all=true&per_page={GITHUB_NOTIFICATIONS_PAGE_SIZE}"
+                );
+                if let Some(ref since) = since {
+                    url.push_str("&since=");
+                    url.push_str(&urlencoding::encode(since));
+                }
+                if let Some(ref before) = before {
+                    url.push_str("&before=");
+                    url.push_str(&urlencoding::encode(before));
+                }
+                url.push_str("&page=");
+                url.push_str(&page.to_string());
 
-            client
-                .get(url)
-                .bearer_auth(&token)
-                .header(USER_AGENT, "OctoRill")
-                .header(ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", API_VERSION)
-                .send()
-                .await
-                .context("github notifications request failed")?
-                .error_for_status()
-                .context("github notifications returned error")?
-                .json::<Vec<GitHubNotification>>()
-                .await
-                .context("github notifications json decode failed")
-        }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
-    })
+                client
+                    .get(url)
+                    .bearer_auth(&token)
+                    .header(USER_AGENT, "OctoRill")
+                    .header(ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()
+                    .await
+                    .context("github notifications request failed")?
+                    .error_for_status()
+                    .context("github notifications returned error")?
+                    .json::<Vec<GitHubNotification>>()
+                    .await
+                    .context("github notifications json decode failed")
+            }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
+        },
+        |thread_id| {
+            let client = state.http.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                let url = format!("{REST_API_BASE}/notifications/threads/{thread_id}");
+                client
+                    .get(url)
+                    .bearer_auth(&token)
+                    .header(USER_AGENT, "OctoRill")
+                    .header(ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", API_VERSION)
+                    .send()
+                    .await
+                    .context("github notification thread request failed")?
+                    .error_for_status()
+                    .context("github notification thread returned error")?
+                    .json::<GitHubNotification>()
+                    .await
+                    .map(Some)
+                    .context("github notification thread json decode failed")
+            }) as Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>
+        },
+    )
     .await
 }
 
-async fn sync_notifications_with_fetch<F>(
+async fn sync_notifications_with_fetch<F, G>(
     state: &AppState,
     user_id: &str,
     mut fetch_page: F,
+    mut fetch_thread: G,
 ) -> Result<SyncNotificationsResult>
 where
     F: FnMut(
@@ -2979,6 +3006,7 @@ where
         Option<String>,
         usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>,
+    G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
 {
     let repair_completed_at =
         load_sync_state_value(state, user_id, NOTIFICATION_OPEN_URL_REPAIR_KEY)
@@ -3011,7 +3039,8 @@ where
     }
 
     if repair_needed {
-        repair_cached_notification_open_urls(state, user_id, &sync_started_at).await?;
+        repair_cached_notification_open_urls(state, user_id, &sync_started_at, &mut fetch_thread)
+            .await?;
     }
 
     store_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY, &sync_started_at)
@@ -3085,14 +3114,40 @@ async fn upsert_notifications(
     Ok(())
 }
 
-async fn repair_cached_notification_open_urls(
+async fn repair_cached_notification_open_urls<G>(
     state: &AppState,
     user_id: &str,
     now: &str,
-) -> Result<()> {
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+    fetch_thread: &mut G,
+) -> Result<()>
+where
+    G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
+{
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            Option<String>,
+        ),
+    >(
         r#"
-        SELECT thread_id, url, repo_full_name
+        SELECT
+          thread_id,
+          repo_full_name,
+          subject_title,
+          subject_type,
+          reason,
+          updated_at,
+          url,
+          unread,
+          html_url
         FROM notifications
         WHERE user_id = ?
         "#,
@@ -3102,16 +3157,90 @@ async fn repair_cached_notification_open_urls(
     .await
     .context("failed to load cached notifications for open-url repair")?;
 
-    for (thread_id, url, repo_full_name) in rows {
-        let html_url = resolve_notification_open_url(url.as_deref(), repo_full_name.as_deref());
+    for (
+        thread_id,
+        repo_full_name,
+        subject_title,
+        subject_type,
+        reason,
+        updated_at,
+        url,
+        unread,
+        html_url,
+    ) in rows
+    {
+        let needs_thread_lookup = url
+            .as_deref()
+            .and_then(resolve_github_api_resource_html_url)
+            .is_none()
+            || html_url.as_deref().is_none_or(|value| {
+                value == fallback_notification_open_url(repo_full_name.as_deref())
+            });
+
+        let thread = if needs_thread_lookup {
+            (*fetch_thread)(thread_id.clone()).await?
+        } else {
+            None
+        };
+
+        let resolved_repo_full_name = thread
+            .as_ref()
+            .and_then(|item| item.repository.full_name.clone())
+            .or(repo_full_name.clone());
+        let resolved_subject_title = thread
+            .as_ref()
+            .and_then(|item| item.subject.title.clone())
+            .or(subject_title.clone());
+        let resolved_subject_type = thread
+            .as_ref()
+            .and_then(|item| item.subject.subject_type.clone())
+            .or(subject_type.clone());
+        let resolved_reason = thread
+            .as_ref()
+            .and_then(|item| item.reason.clone())
+            .or(reason.clone());
+        let resolved_updated_at = thread
+            .as_ref()
+            .and_then(|item| item.updated_at.clone())
+            .or(updated_at.clone());
+        let resolved_unread = thread
+            .as_ref()
+            .map(|item| item.unread as i64)
+            .unwrap_or(unread);
+        let resolved_api_url = thread
+            .as_ref()
+            .and_then(|item| item.subject.url.as_deref().or(item.url.as_deref()))
+            .map(ToOwned::to_owned)
+            .or(url.clone());
+        let resolved_html_url = resolve_notification_open_url(
+            resolved_api_url.as_deref(),
+            resolved_repo_full_name.as_deref(),
+        );
+
         sqlx::query(
             r#"
             UPDATE notifications
-            SET html_url = ?, last_seen_at = ?
+            SET
+              repo_full_name = ?,
+              subject_title = ?,
+              subject_type = ?,
+              reason = ?,
+              updated_at = ?,
+              unread = ?,
+              url = ?,
+              html_url = ?,
+              last_seen_at = ?
             WHERE user_id = ? AND thread_id = ?
             "#,
         )
-        .bind(html_url)
+        .bind(resolved_repo_full_name)
+        .bind(resolved_subject_title)
+        .bind(resolved_subject_type)
+        .bind(resolved_reason)
+        .bind(resolved_updated_at)
+        .bind(resolved_unread)
+        .bind(resolved_api_url)
+        .bind(resolved_html_url)
         .bind(now)
         .bind(user_id)
         .bind(thread_id)
@@ -3411,60 +3540,78 @@ mod tests {
             Option<String>,
             usize,
         )>::new()));
-        let result = sync_notifications_with_fetch(state.as_ref(), user_id.as_str(), {
-            let observed = observed.clone();
-            move |since, before, page| {
+        let result = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
                 let observed = observed.clone();
-                Box::pin(async move {
-                    observed
-                        .lock()
-                        .await
-                        .push((since.clone(), before.clone(), page));
-                    let items = match page {
-                        1 => {
-                            let mut items = vec![
-                                mock_notification(
-                                    "thread-1",
-                                    Some("https://api.github.com/repos/octo/alpha/issues/12"),
-                                    Some("octo/alpha"),
-                                    Some("Issue"),
-                                    "2026-03-06T03:00:00Z",
-                                ),
-                                mock_notification(
-                                    "thread-2",
-                                    Some("https://api.github.com/repos/octo/alpha/check-suites/99"),
-                                    Some("octo/alpha"),
-                                    Some("CheckSuite"),
-                                    "2026-03-06T02:00:00Z",
-                                ),
-                            ];
-                            for index in 0..48 {
-                                items.push(mock_notification(
-                                    &format!("filler-{index}"),
-                                    Some(&format!(
-                                        "https://api.github.com/repos/octo/alpha/issues/{}",
-                                        100 + index
-                                    )),
-                                    Some("octo/alpha"),
-                                    Some("Issue"),
-                                    "2026-03-06T02:30:00Z",
-                                ));
+                move |since, before, page| {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        observed
+                            .lock()
+                            .await
+                            .push((since.clone(), before.clone(), page));
+                        let items = match page {
+                            1 => {
+                                let mut items = vec![
+                                    mock_notification(
+                                        "thread-1",
+                                        Some("https://api.github.com/repos/octo/alpha/issues/12"),
+                                        Some("octo/alpha"),
+                                        Some("Issue"),
+                                        "2026-03-06T03:00:00Z",
+                                    ),
+                                    mock_notification(
+                                        "thread-2",
+                                        Some("https://api.github.com/repos/octo/alpha/check-suites/99"),
+                                        Some("octo/alpha"),
+                                        Some("CheckSuite"),
+                                        "2026-03-06T02:00:00Z",
+                                    ),
+                                ];
+                                for index in 0..48 {
+                                    items.push(mock_notification(
+                                        &format!("filler-{index}"),
+                                        Some(&format!(
+                                            "https://api.github.com/repos/octo/alpha/issues/{}",
+                                            100 + index
+                                        )),
+                                        Some("octo/alpha"),
+                                        Some("Issue"),
+                                        "2026-03-06T02:30:00Z",
+                                    ));
+                                }
+                                items
                             }
-                            items
-                        }
-                        2 => vec![mock_notification(
-                            "thread-3",
-                            Some("https://api.github.com/repos/octo/beta/pulls/34"),
-                            Some("octo/beta"),
+                            2 => vec![mock_notification(
+                                "thread-3",
+                                Some("https://api.github.com/repos/octo/beta/pulls/34"),
+                                Some("octo/beta"),
+                                Some("PullRequest"),
+                                "2026-03-06T01:00:00Z",
+                            )],
+                            _ => vec![],
+                        };
+                        Ok(items)
+                    })
+                }
+            },
+            move |thread_id| {
+                Box::pin(async move {
+                    Ok(match thread_id.as_str() {
+                        "cached-thread" => Some(mock_notification(
+                            "cached-thread",
+                            Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                            Some("octo/alpha"),
                             Some("PullRequest"),
-                            "2026-03-06T01:00:00Z",
-                        )],
-                        _ => vec![],
-                    };
-                    Ok(items)
+                            "2026-03-06T03:30:00Z",
+                        )),
+                        _ => None,
+                    })
                 })
-            }
-        })
+            },
+        )
         .await
         .expect("sync notifications");
 
@@ -3495,8 +3642,8 @@ mod tests {
         assert_eq!(stored.len(), 52);
         assert!(stored.contains(&(
             "cached-thread".to_owned(),
-            Some("https://api.github.com/notifications/threads/123".to_owned()),
-            Some("https://github.com/notifications?query=repo%3Aocto%2Falpha".to_owned()),
+            Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
+            Some("https://github.com/octo/alpha/pull/120".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-1".to_owned(),
@@ -3539,29 +3686,34 @@ mod tests {
             Option<String>,
             usize,
         )>::new()));
-        let second = sync_notifications_with_fetch(state.as_ref(), user_id.as_str(), {
-            let observed_second = observed_second.clone();
-            move |since, before, page| {
+        let second = sync_notifications_with_fetch(
+            state.as_ref(),
+            user_id.as_str(),
+            {
                 let observed_second = observed_second.clone();
-                Box::pin(async move {
-                    observed_second
-                        .lock()
-                        .await
-                        .push((since.clone(), before.clone(), page));
-                    if page == 1 {
-                        Ok(vec![mock_notification(
-                            "thread-4",
-                            Some("https://api.github.com/repos/octo/gamma/issues/88"),
-                            Some("octo/gamma"),
-                            Some("Issue"),
-                            "2026-03-06T04:00:00Z",
-                        )])
-                    } else {
-                        Ok(vec![])
-                    }
-                })
-            }
-        })
+                move |since, before, page| {
+                    let observed_second = observed_second.clone();
+                    Box::pin(async move {
+                        observed_second
+                            .lock()
+                            .await
+                            .push((since.clone(), before.clone(), page));
+                        if page == 1 {
+                            Ok(vec![mock_notification(
+                                "thread-4",
+                                Some("https://api.github.com/repos/octo/gamma/issues/88"),
+                                Some("octo/gamma"),
+                                Some("Issue"),
+                                "2026-03-06T04:00:00Z",
+                            )])
+                        } else {
+                            Ok(vec![])
+                        }
+                    })
+                }
+            },
+            move |_thread_id| Box::pin(async { Ok(None) }),
+        )
         .await
         .expect("second sync notifications");
         assert_eq!(second.notifications, 1);
