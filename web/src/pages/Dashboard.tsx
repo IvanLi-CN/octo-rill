@@ -1240,6 +1240,11 @@ export function Dashboard(props: { me: MeResponse }) {
 								onValueChange={onSelectPageDefaultLane}
 							/>
 						) : null}
+						{aiDisabledHint ? (
+							<span className="text-muted-foreground font-mono text-xs">
+								AI 未配置，将只显示原文
+							</span>
+						) : null}
 						{busy ? (
 							<span className="text-muted-foreground font-mono text-xs">
 								{busy}…
