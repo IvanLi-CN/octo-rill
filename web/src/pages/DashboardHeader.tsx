@@ -153,7 +153,7 @@ function DashboardUserMenu(props: {
 	const { login, name, avatarUrl, email, isAdmin, aiDisabledHint, logoutHref } =
 		props;
 	const cardId = useId();
-	const wrapperRef = useRef<HTMLDivElement | null>(null);
+	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
 	const [hoverOpen, setHoverOpen] = useState(false);
 	const [pinnedOpen, setPinnedOpen] = useState(false);
 	const open = hoverOpen || pinnedOpen;
