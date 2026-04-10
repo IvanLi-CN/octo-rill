@@ -1,3 +1,5 @@
+import type { RepoVisual } from "@/lib/repoVisual";
+
 export class ApiError extends Error {
 	public status: number;
 	public code: string;
@@ -523,6 +525,7 @@ export type ReleaseDetailTranslated = {
 export type ReleaseDetailResponse = {
 	release_id: string;
 	repo_full_name: string | null;
+	repo_visual: RepoVisual | null;
 	tag_name: string;
 	name: string | null;
 	body: string | null;

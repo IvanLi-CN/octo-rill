@@ -1,3 +1,5 @@
+import type { RepoVisual } from "@/lib/repoVisual";
+
 export type TranslatedStatus = "ready" | "missing" | "disabled" | "error";
 export type SmartStatus =
 	| "ready"
@@ -64,6 +66,7 @@ export type FeedItem = {
 	ts: string;
 	id: string;
 	repo_full_name: string | null;
+	repo_visual: RepoVisual | null;
 	title: string | null;
 	body: string | null;
 	body_truncated: boolean;

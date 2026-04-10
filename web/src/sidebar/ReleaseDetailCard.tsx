@@ -12,6 +12,7 @@ import {
 	mapTranslationResultToReleaseDetailTranslated,
 } from "@/api";
 import { Markdown } from "@/components/Markdown";
+import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -313,11 +314,13 @@ export function ReleaseDetailCard(props: {
 							<h3 className="text-sm font-semibold tracking-tight">
 								{display.title}
 							</h3>
-							{activeDetail?.repo_full_name ? (
-								<p className="text-muted-foreground font-mono text-xs">
-									{activeDetail.repo_full_name}
-								</p>
-							) : null}
+							<RepoIdentity
+								repoFullName={activeDetail?.repo_full_name ?? null}
+								repoVisual={activeDetail?.repo_visual ?? null}
+								className="max-w-full"
+								labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+								visualClassName="size-8"
+							/>
 							{display.body ? (
 								<div className="bg-muted/10 rounded-lg border p-4">
 									<Markdown content={display.body} />

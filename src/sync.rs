@@ -280,12 +280,16 @@ struct RepoNode {
     description: Option<String>,
     url: String,
     is_private: bool,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
     owner: RepoOwner,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoOwner {
     login: String,
+    avatar_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +302,9 @@ struct StarredRepoSnapshot {
     html_url: String,
     stargazed_at: String,
     is_private: bool,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2762,7 +2769,12 @@ async fn fetch_starred_snapshot(
                 description
                 url
                 isPrivate
-                owner { login }
+                openGraphImageUrl
+                usesCustomOpenGraphImage
+                owner {
+                  login
+                  avatarUrl(size: 80)
+                }
               }
             }
           }
@@ -2821,6 +2833,9 @@ async fn fetch_starred_snapshot(
                 html_url: edge.node.url,
                 stargazed_at: edge.starred_at,
                 is_private: edge.node.is_private,
+                owner_avatar_url: edge.node.owner.avatar_url,
+                open_graph_image_url: edge.node.open_graph_image_url,
+                uses_custom_open_graph_image: edge.node.uses_custom_open_graph_image,
             });
         }
         if !page.page_info.has_next_page {
@@ -2856,8 +2871,10 @@ async fn replace_starred_repos(
         sqlx::query(
             r#"
             INSERT INTO starred_repos (
-              id, user_id, repo_id, full_name, owner_login, name, description, html_url, stargazed_at, is_private, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              id, user_id, repo_id, full_name, owner_login, name, description, html_url,
+              stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url,
+              uses_custom_open_graph_image
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(local_id::generate_local_id())
@@ -2871,6 +2888,9 @@ async fn replace_starred_repos(
         .bind(&repo.stargazed_at)
         .bind(repo.is_private as i64)
         .bind(&now)
+        .bind(repo.owner_avatar_url.as_deref())
+        .bind(repo.open_graph_image_url.as_deref())
+        .bind(repo.uses_custom_open_graph_image as i64)
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to insert starred repo {}", repo.full_name))?;
@@ -3518,6 +3538,9 @@ mod tests {
                         html_url: "https://github.com/octo/beta".to_owned(),
                         stargazed_at: "2026-03-06T12:00:00Z".to_owned(),
                         is_private: false,
+                        owner_avatar_url: None,
+                        open_graph_image_url: None,
+                        uses_custom_open_graph_image: false,
                     },
                     StarredRepoSnapshot {
                         repo_id: 1,
@@ -3528,6 +3551,9 @@ mod tests {
                         html_url: "https://github.com/octo/alpha".to_owned(),
                         stargazed_at: "2026-03-06T12:00:00Z".to_owned(),
                         is_private: false,
+                        owner_avatar_url: None,
+                        open_graph_image_url: None,
+                        uses_custom_open_graph_image: false,
                     },
                 ],
             },
@@ -3543,6 +3569,9 @@ mod tests {
                     html_url: "https://github.com/octo/alpha".to_owned(),
                     stargazed_at: "2026-03-06T13:00:00Z".to_owned(),
                     is_private: false,
+                    owner_avatar_url: None,
+                    open_graph_image_url: None,
+                    uses_custom_open_graph_image: false,
                 }],
             },
         ];
@@ -4347,6 +4376,11 @@ mod tests {
             html_url: "https://github.com/octo/alpha".to_owned(),
             stargazed_at: "2026-03-06T13:00:00Z".to_owned(),
             is_private: false,
+            owner_avatar_url: Some("https://avatars.githubusercontent.com/u/100".to_owned()),
+            open_graph_image_url: Some(
+                "https://repository-images.githubusercontent.com/100/alpha".to_owned(),
+            ),
+            uses_custom_open_graph_image: true,
         }];
 
         let result = sync_starred_for_user_with_fetch(
@@ -4394,6 +4428,29 @@ mod tests {
                 .await
                 .expect("count starred repos");
         assert_eq!(stored_repos, 1);
+
+        let visual_row = sqlx::query_as::<_, (Option<String>, Option<String>, i64)>(
+            r#"
+            SELECT owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            FROM starred_repos
+            WHERE user_id = ? AND repo_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(test_user_id("7"))
+        .bind(100_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load stored repo visual metadata");
+        assert_eq!(
+            visual_row.0.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/100")
+        );
+        assert_eq!(
+            visual_row.1.as_deref(),
+            Some("https://repository-images.githubusercontent.com/100/alpha")
+        );
+        assert_eq!(visual_row.2, 1);
 
         let event_rows = sqlx::query_as::<_, (String, String, i64, i64)>(
             r#"
