@@ -18,21 +18,50 @@ import {
 } from "@/components/ui/tooltip";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
 import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
+import { withBaseAssetPath } from "@/lib/asset-path";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
 
 const REACTION_ITEMS: Array<{
 	content: ReactionContent;
-	emoji: string;
+	iconSrc: string;
 	label: string;
 }> = [
-	{ content: "plus1", emoji: "👍", label: "赞" },
-	{ content: "laugh", emoji: "😄", label: "笑" },
-	{ content: "heart", emoji: "❤️", label: "爱心" },
-	{ content: "hooray", emoji: "🎉", label: "庆祝" },
-	{ content: "rocket", emoji: "🚀", label: "火箭" },
-	{ content: "eyes", emoji: "👀", label: "关注" },
+	{
+		content: "plus1",
+		iconSrc: withBaseAssetPath("reactions/plus1.svg"),
+		label: "赞",
+	},
+	{
+		content: "laugh",
+		iconSrc: withBaseAssetPath("reactions/laugh.svg"),
+		label: "笑",
+	},
+	{
+		content: "heart",
+		iconSrc: withBaseAssetPath("reactions/heart.svg"),
+		label: "爱心",
+	},
+	{
+		content: "hooray",
+		iconSrc: withBaseAssetPath("reactions/hooray.svg"),
+		label: "庆祝",
+	},
+	{
+		content: "rocket",
+		iconSrc: withBaseAssetPath("reactions/rocket.svg"),
+		label: "火箭",
+	},
+	{
+		content: "eyes",
+		iconSrc: withBaseAssetPath("reactions/eyes.svg"),
+		label: "关注",
+	},
 ];
+
+function reactionAriaLabel(label: string, count: number) {
+	return count > 0 ? `${label} ${count}` : label;
+}
 
 function EmptyPanel(props: {
 	title: string;
@@ -322,33 +351,64 @@ export function FeedItemCard(props: {
 	);
 
 	const reactionsFooter = reactions ? (
-		<CardFooter className="border-border/70 flex flex-wrap items-center gap-2 border-t px-6 py-4">
+		<CardFooter
+			className="border-border/70 flex flex-wrap items-center gap-3 border-t px-6 py-4"
+			data-reaction-footer="true"
+		>
 			{reactions.status === "ready"
 				? REACTION_ITEMS.map((reaction) => {
 						const active = reactions.viewer[reaction.content];
 						const count = reactions.counts[reaction.content];
+						const label = reactionAriaLabel(reaction.label, count);
 						return (
-							<Button
+							<div
 								key={reaction.content}
-								type="button"
-								variant={active ? "secondary" : "outline"}
-								size="sm"
-								className={cn(
-									"group h-7 rounded-full px-2 font-mono text-xs transition-all duration-200 ease-out hover:-translate-y-0.5 hover:shadow-sm active:translate-y-0 active:scale-95",
-									count > 0 && "gap-1",
-									active &&
-										"border-primary bg-primary/10 text-primary hover:bg-primary/15",
-									isReactionBusy && "opacity-80",
-								)}
-								onClick={() => onToggleReaction(reaction.content)}
-								title={reaction.label}
-								aria-pressed={active}
+								className="relative inline-flex"
+								data-reaction-chip={reaction.content}
 							>
-								<span className="transition-transform duration-200 group-hover:scale-110 group-active:scale-95">
-									{reaction.emoji}
-								</span>
-								{count > 0 ? <span>{count}</span> : null}
-							</Button>
+								<Button
+									type="button"
+									variant="outline"
+									size="icon"
+									className={cn(
+										"group relative size-10 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
+										active
+											? "border-primary/45 bg-primary/10 hover:bg-primary/14"
+											: "border-border/70 bg-background hover:border-foreground/15 hover:bg-accent/70",
+										isReactionBusy && "opacity-80",
+									)}
+									onClick={() => onToggleReaction(reaction.content)}
+									title={reaction.label}
+									aria-label={label}
+									aria-pressed={active}
+									data-reaction-trigger={reaction.content}
+									data-reaction-shape="round"
+									data-reaction-count={count}
+								>
+									<img
+										alt=""
+										aria-hidden="true"
+										className="size-[1.35rem] select-none transition-transform duration-200 group-hover:scale-105 group-active:scale-95"
+										draggable={false}
+										src={reaction.iconSrc}
+									/>
+									{count > 0 ? (
+										<span
+											aria-hidden="true"
+											className={cn(
+												"absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1 font-mono text-[11px] leading-none shadow-sm ring-2 ring-background",
+												active
+													? "bg-primary text-primary-foreground"
+													: "border border-border/70 bg-background text-foreground/80",
+											)}
+											data-reaction-count-badge={reaction.content}
+											data-reaction-count-position="outside"
+										>
+											{count}
+										</span>
+									) : null}
+								</Button>
+							</div>
 						);
 					})
 				: null}
