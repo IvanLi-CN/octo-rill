@@ -752,8 +752,11 @@ test("reaction fallback opens PAT dialog with accessible controls", async ({
 		"true",
 	);
 	await expect(
-		page.locator('[data-repo-visual-kind="social_preview"]').first(),
+		page.locator('[data-repo-visual-kind="owner_avatar"]').first(),
 	).toBeVisible();
+	await expect(
+		page.locator('[data-repo-visual-kind="social_preview"]'),
+	).toHaveCount(0);
 	await page.getByTitle("赞").click();
 
 	const patDialog = page.getByRole("dialog", {
