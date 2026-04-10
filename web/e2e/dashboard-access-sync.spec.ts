@@ -10,6 +10,16 @@ function json(route: Route, payload: unknown, status = 200) {
 	});
 }
 
+function svgAvatarDataUrl(
+	label: string,
+	background: string,
+	foreground = "#ffffff",
+) {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="120" fill="${background}"/><text x="120" y="132" font-family="Inter,Arial,sans-serif" font-size="44" font-weight="700" text-anchor="middle" fill="${foreground}">${label}</text></svg>`,
+	)}`;
+}
+
 test("dashboard keeps sync as a single header action for admins", async ({
 	page,
 }) => {
@@ -26,7 +36,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 					github_user_id: 10,
 					login: "octo-admin",
 					name: "Octo Admin",
-					avatar_url: null,
+					avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
 					email: "admin@example.com",
 					is_admin: true,
 				}),
@@ -97,9 +107,34 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	await page.goto("/");
 
 	await expect(page.getByRole("button", { name: "同步" })).toHaveCount(1);
+	await expect(page.locator("[data-dashboard-brand-heading]")).toHaveCount(1);
+	await expect(
+		page.getByRole("heading", { level: 1, name: "OctoRill" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
+	).toBeVisible();
+	await expect(page.getByText(/Logged in as\s+octo-admin/)).toHaveCount(0);
+	await expect(page.getByText(/Loaded\s+\d+/)).toHaveCount(0);
 	await expect(
 		page.locator("[data-dashboard-primary-actions]").getByRole("button", {
 			name: "同步",
+		}),
+	).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: "查看账号信息" }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "查看账号信息" }).click();
+	await expect(page.locator("[data-dashboard-user-card]")).toBeVisible();
+	await expect(page.getByText("Octo Admin")).toBeVisible();
+	await expect(page.getByText("@octo-admin")).toBeVisible();
+	await expect(page.getByText("admin@example.com")).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-user-card]").getByLabel("管理员"),
+	).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-user-card]").getByRole("link", {
+			name: "退出登录",
 		}),
 	).toBeVisible();
 	const secondaryControls = page.locator("[data-dashboard-secondary-controls]");

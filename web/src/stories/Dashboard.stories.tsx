@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useLayoutEffect, useState } from "react";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -65,6 +65,7 @@ const STORYBOOK_VERSION_STATE = {
 	hasUpdate: false,
 	refreshPage: () => {},
 } as const;
+const STORYBOOK_USER_AVATAR = svgDataUrl("SU", "#4f6a98");
 
 function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -895,10 +896,10 @@ function DashboardPreview(props: {
 			<AppShell
 				header={
 					<DashboardHeader
-						feedCount={items.length}
-						inboxCount={notifications.length}
-						briefCount={storyBriefs.length}
+						avatarUrl={STORYBOOK_USER_AVATAR}
+						email="storybook-user@example.com"
 						login="storybook-user"
+						name="Storybook User"
 						isAdmin
 						aiDisabledHint={aiDisabledHint}
 						busy={syncingAll}
@@ -1120,6 +1121,22 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
+		expect(
+			canvasElement.querySelector("[data-dashboard-brand-heading]"),
+		).not.toBeNull();
+		await expect(
+			canvas.getByRole("heading", { name: "OctoRill" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
+		).toBeVisible();
+		await expect(canvas.queryByText(/Loaded\s+\d+/)).not.toBeInTheDocument();
+		await expect(canvas.queryByText(/Logged in as/)).not.toBeInTheDocument();
+		const profileButton = canvas.getByRole("button", { name: "查看账号信息" });
+		await userEvent.click(profileButton);
+		await expect(canvas.getByText("Storybook User")).toBeVisible();
+		await expect(canvas.getByText("@storybook-user")).toBeVisible();
+		await expect(canvas.getByRole("link", { name: "退出登录" })).toBeVisible();
 	},
 };
 
