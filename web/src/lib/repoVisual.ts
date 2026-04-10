@@ -5,7 +5,7 @@ export type RepoVisual = {
 };
 
 export type RepoVisualCandidate = {
-	kind: "social_preview" | "owner_avatar";
+	kind: "owner_avatar";
 	src: string;
 };
 
@@ -27,12 +27,8 @@ export function resolveRepoVisualCandidates(
 		candidates.push({ kind, src });
 	};
 
-	const openGraphImageUrl = normalizeVisualUrl(repoVisual.open_graph_image_url);
 	const ownerAvatarUrl = normalizeVisualUrl(repoVisual.owner_avatar_url);
 
-	if (repoVisual.uses_custom_open_graph_image) {
-		push("social_preview", openGraphImageUrl);
-	}
 	push("owner_avatar", ownerAvatarUrl);
 
 	return candidates;

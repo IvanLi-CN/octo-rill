@@ -1385,14 +1385,11 @@ export const ReleaseRepoVisuals: Story = {
 		docs: {
 			description: {
 				story:
-					"Release 卡片仓库视觉优先显示 custom social preview，缺失时回退 owner/avatar，再回退为纯文本仓库名。",
+					"Release 卡片仓库视觉固定优先显示 owner/avatar；即使 metadata 里带有 custom social preview，也只作为兼容字段保留，不参与前端展示。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
-		expect(
-			canvasElement.querySelector('[data-repo-visual-kind="social_preview"]'),
-		).not.toBeNull();
 		expect(
 			canvasElement.querySelectorAll('[data-repo-visual-kind="owner_avatar"]')
 				.length,
@@ -1401,6 +1398,9 @@ export const ReleaseRepoVisuals: Story = {
 			canvasElement.querySelectorAll('[data-repo-visual-kind="text_only"]')
 				.length,
 		).toBeGreaterThan(0);
+		expect(
+			canvasElement.querySelector('[data-repo-visual-kind="social_preview"]'),
+		).toBeNull();
 	},
 };
 
