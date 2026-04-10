@@ -27,6 +27,7 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import type { RepoVisual } from "@/lib/repoVisual";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -64,6 +65,39 @@ const STORYBOOK_VERSION_STATE = {
 	refreshPage: () => {},
 } as const;
 
+function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="36" fill="${background}"/><text x="120" y="132" font-family="Inter,Arial,sans-serif" font-size="44" font-weight="700" text-anchor="middle" fill="${foreground}">${label}</text></svg>`,
+	)}`;
+}
+
+function socialPreviewDataUrl(title: string, accent: string, body: string) {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${accent}"/><stop offset="100%" stop-color="#0f172a"/></linearGradient></defs><rect width="1280" height="640" rx="48" fill="url(#g)"/><rect x="72" y="72" width="1136" height="496" rx="36" fill="rgba(15,23,42,0.18)" stroke="rgba(255,255,255,0.18)" stroke-width="4"/><text x="120" y="228" font-family="Inter,Arial,sans-serif" font-size="84" font-weight="800" fill="#ffffff">${title}</text><text x="120" y="334" font-family="Inter,Arial,sans-serif" font-size="40" font-weight="600" fill="rgba(255,255,255,0.84)">${body}</text></svg>`,
+	)}`;
+}
+
+const repoVisualFixtures: Record<
+	"social" | "avatar" | "text",
+	RepoVisual | null
+> = {
+	social: {
+		owner_avatar_url: svgDataUrl("AR", "#1d4ed8"),
+		open_graph_image_url: socialPreviewDataUrl(
+			"Rocket Release",
+			"#2563eb",
+			"custom social preview",
+		),
+		uses_custom_open_graph_image: true,
+	},
+	avatar: {
+		owner_avatar_url: svgDataUrl("LC", "#7c3aed"),
+		open_graph_image_url: null,
+		uses_custom_open_graph_image: false,
+	},
+	text: null,
+};
+
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
@@ -81,6 +115,7 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 		ts: "2026-02-21T08:05:00Z",
 		id,
 		repo_full_name: "acme/rocket",
+		repo_visual: repoVisualFixtures.social,
 		title: `v${id}`,
 		body: "- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
 		body_truncated: false,
@@ -130,6 +165,7 @@ function makeMockFeed(): FeedItem[] {
 			ts: "2026-04-04T16:16:29+08:00",
 			title: "v2.63.0",
 			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
+			repo_visual: repoVisualFixtures.social,
 			smart: {
 				lang: "zh-CN",
 				status: "ready",
@@ -167,6 +203,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10002", {
 			ts: "2026-04-04T15:56:24+08:00",
 			repo_full_name: "lobehub/lobe-chat",
+			repo_visual: repoVisualFixtures.avatar,
 			title: "桌面版 Canary v2.1.48-canary.31",
 			body: "- Canary 构建\n- 自动发布桌面包\n- 建议先在测试环境验证",
 			html_url:
@@ -186,6 +223,7 @@ function makeMockFeed(): FeedItem[] {
 		}),
 		buildFeedItem("10003", {
 			ts: "2026-04-04T07:10:00+08:00",
+			repo_visual: repoVisualFixtures.text,
 			title: "nightly guardrails",
 			body: `- ${HISTORY_RAW_MARKER}\n- Tighten upload guardrails\n- Normalize rollout order`,
 			html_url:
@@ -194,6 +232,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10004", {
 			ts: "2026-04-03T21:30:00+08:00",
 			repo_full_name: "acme/satellite",
+			repo_visual: repoVisualFixtures.avatar,
 			title: "oauth action bubble polish",
 			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
 			html_url:
@@ -202,6 +241,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10005", {
 			ts: "2026-04-03T06:20:00+08:00",
 			repo_full_name: "acme/fleet",
+			repo_visual: repoVisualFixtures.text,
 			title: "fallback lane release",
 			body: `- ${FALLBACK_RAW_MARKER}\n- no brief available for this day\n- keep original release cards visible`,
 			html_url:
@@ -479,6 +519,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
 	repo_full_name: "acme/rocket",
+	repo_visual: repoVisualFixtures.avatar,
 	tag_name: "v3.4.0",
 	name: "v3.4.0 · release train",
 	body: [
@@ -1254,11 +1295,44 @@ export const BriefsLongContentWithDetail: Story = {
 		await expect(await body.findByRole("dialog")).toBeVisible();
 		await expect(await body.findByText(/翻译总览/)).toBeVisible();
 		await expect(body.getByText(/变更波次 10/)).toBeVisible();
+		expect(
+			canvasElement.ownerDocument.body.querySelector(
+				'[data-repo-visual-kind="owner_avatar"]',
+			),
+		).not.toBeNull();
 		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
 		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
 		await expect(
 			canvas.queryByRole("heading", { name: "Release 详情" }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const ReleaseRepoVisuals: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "default",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Release 卡片仓库视觉优先显示 custom social preview，缺失时回退 owner/avatar，再回退为纯文本仓库名。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		expect(
+			canvasElement.querySelector('[data-repo-visual-kind="social_preview"]'),
+		).not.toBeNull();
+		expect(
+			canvasElement.querySelectorAll('[data-repo-visual-kind="owner_avatar"]')
+				.length,
+		).toBeGreaterThan(0);
+		expect(
+			canvasElement.querySelectorAll('[data-repo-visual-kind="text_only"]')
+				.length,
+		).toBeGreaterThan(0);
 	},
 };
 
