@@ -1191,10 +1191,10 @@ export function Dashboard(props: { me: MeResponse }) {
 		<AppShell
 			header={
 				<DashboardHeader
-					feedCount={feed.items.length}
-					inboxCount={notifications.length}
-					briefCount={briefs.length}
 					login={me.user.login}
+					name={me.user.name}
+					avatarUrl={me.user.avatar_url}
+					email={me.user.email}
 					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
