@@ -75,12 +75,11 @@ function SurfaceGallery() {
 					Dashboard header
 				</p>
 				<DashboardHeader
-					briefCount={6}
+					avatarUrl="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240' viewBox='0 0 240 240'%3E%3Crect width='240' height='240' rx='120' fill='%234f6a98'/%3E%3Ctext x='120' y='132' font-family='Inter,Arial,sans-serif' font-size='44' font-weight='700' text-anchor='middle' fill='white'%3ESA%3C/text%3E%3C/svg%3E"
 					busy={false}
-					feedCount={24}
-					inboxCount={8}
 					isAdmin
 					login="storybook-admin"
+					name="Storybook Admin"
 					logoutHref="#"
 				/>
 			</section>
