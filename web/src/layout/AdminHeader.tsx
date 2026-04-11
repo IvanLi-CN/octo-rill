@@ -1,4 +1,5 @@
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Home, LogOut } from "lucide-react";
@@ -59,6 +60,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 				</div>
 
 				<div className="flex items-center gap-2 self-start lg:self-auto">
+					<ThemeToggle />
 					<Button asChild variant="outline" size="sm" className="mr-2 h-8 px-2">
 						<a href="/" aria-label="返回前台首页" title="返回前台首页">
 							<Home className="size-4" />

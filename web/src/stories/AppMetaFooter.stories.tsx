@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useState } from "react";
+import { expect, within } from "storybook/test";
 
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { VersionMonitorProvider } from "@/version/versionMonitor";
@@ -94,12 +95,13 @@ function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
 const meta = {
 	title: "Layout/App Meta Footer",
 	component: FooterPreview,
+	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
 		docs: {
 			description: {
 				component:
-					"Footer 负责展示当前页实际加载版本，并复用统一版本监视状态；当 `/api/version` 不可用时，会回退到 `/api/health`。适合在这里确认成功、回退与失败三种基础文案。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
+					"Footer 负责展示当前页实际加载版本，并保留 GitHub 仓库入口；当 `/api/version` 不可用时，会回退到 `/api/health`。适合在这里确认版本文案、外链与降级状态。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
 			},
 		},
 	},
@@ -126,6 +128,11 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const Default: Story = {
+	play: async ({ canvasElement }) => {
+		const storyRoot = within(canvasElement.ownerDocument.body);
+		await expect(storyRoot.getByText("Version 0.1.0")).toBeVisible();
+		await expect(storyRoot.getByRole("link", { name: "GitHub" })).toBeVisible();
+	},
 	parameters: {
 		docs: {
 			description: {

@@ -1,9 +1,11 @@
 import { Landing } from "@/pages/Landing";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { expect, within } from "storybook/test";
 
 const meta = {
 	title: "Pages/Landing",
 	component: Landing,
+	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
 		docs: {
@@ -22,6 +24,20 @@ export const Default: Story = {
 	args: {
 		bootError: null,
 	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "把 GitHub 的更新变成可读的信息流",
+			}),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "使用 GitHub 登录" }),
+		).toBeVisible();
+		await expect(
+			canvasElement.ownerDocument.body.querySelector("[data-theme-toggle]"),
+		).not.toBeNull();
+	},
 	parameters: {
 		docs: {
 			description: {
@@ -35,6 +51,10 @@ export const Default: Story = {
 export const WithError: Story = {
 	args: {
 		bootError: "Example error: unauthorized",
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Example error: unauthorized")).toBeVisible();
 	},
 	parameters: {
 		docs: {
