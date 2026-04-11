@@ -1,6 +1,6 @@
 import { FileText, type LucideIcon, Languages, Sparkles } from "lucide-react";
 
-import type { FeedItem, FeedLane } from "@/feed/types";
+import { isReleaseFeedItem, type FeedItem, type FeedLane } from "@/feed/types";
 
 export const PAGE_DEFAULT_LANE_STORAGE_KEY =
 	"octo-rill.dashboard.releaseDefaultLane";
@@ -25,6 +25,9 @@ export function resolvePreferredLaneForItem(
 	item: FeedItem,
 	preferredLane: FeedLane,
 ): FeedLane {
+	if (!isReleaseFeedItem(item)) {
+		return "original";
+	}
 	if (item.smart?.status === "insufficient") {
 		return "smart";
 	}

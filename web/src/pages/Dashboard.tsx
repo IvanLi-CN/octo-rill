@@ -36,9 +36,10 @@ import type {
 	ReleaseReactions,
 	ToggleReleaseReactionResponse,
 } from "@/feed/types";
+import { isReleaseFeedItem } from "@/feed/types";
 import { useAutoSmart } from "@/feed/useAutoSmart";
 import { useAutoTranslate } from "@/feed/useAutoTranslate";
-import { useFeed } from "@/feed/useFeed";
+import { type FeedRequestType, useFeed } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -53,7 +54,7 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 
-type Tab = "all" | "releases" | "briefs" | "inbox";
+type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 
 type TaskAcceptedResponse = {
 	mode: "task_id";
@@ -83,6 +84,22 @@ function resolveLaneForItem(
 		return resolvePreferredLaneForItem(item, selected);
 	}
 	return resolvePreferredLaneForItem(item, pageDefaultLane);
+}
+
+function filterFeedItemsForTab(
+	items: FeedItem[],
+	tab: "all" | "releases" | "stars" | "followers",
+) {
+	switch (tab) {
+		case "releases":
+			return items.filter((item) => item.kind === "release");
+		case "stars":
+			return items.filter((item) => item.kind === "repo_star_received");
+		case "followers":
+			return items.filter((item) => item.kind === "follower_received");
+		default:
+			return items;
+	}
 }
 
 type TaskEventPayload = {
@@ -142,7 +159,11 @@ function parseDashboardQuery() {
 
 	const rawTab = params.get("tab");
 	const tab: Tab =
-		rawTab === "releases" || rawTab === "briefs" || rawTab === "inbox"
+		rawTab === "releases" ||
+		rawTab === "stars" ||
+		rawTab === "followers" ||
+		rawTab === "briefs" ||
+		rawTab === "inbox"
 			? rawTab
 			: "all";
 	return { tab, releaseId };
@@ -245,7 +266,16 @@ export function Dashboard(props: { me: MeResponse }) {
 		() => parseDashboardQuery().releaseId,
 	);
 
-	const feed = useFeed();
+	const feedRequestType: FeedRequestType =
+		tab === "releases"
+			? "releases"
+			: tab === "stars"
+				? "stars"
+				: tab === "followers"
+					? "followers"
+					: "all";
+
+	const feed = useFeed(feedRequestType);
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
 
@@ -654,6 +684,9 @@ export function Dashboard(props: { me: MeResponse }) {
 	);
 	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
+			if (!isReleaseFeedItem(item)) {
+				return;
+			}
 			if (
 				lane === "translated" &&
 				(item.translated?.status === "missing" ||
@@ -691,6 +724,9 @@ export function Dashboard(props: { me: MeResponse }) {
 	}, []);
 	const registerFeedItem = useCallback(
 		(item: FeedItem) => (element: HTMLElement | null) => {
+			if (!isReleaseFeedItem(item)) {
+				return;
+			}
 			registerTranslate(item)(element);
 			registerSmart(item)(element);
 		},
@@ -830,6 +866,9 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const performReactionToggle = useCallback(
 		(item: FeedItem, content: ReactionContent) => {
+			if (!isReleaseFeedItem(item)) {
+				return;
+			}
 			const key = itemKey(item);
 			const current =
 				reactionDesiredByKeyRef.current.get(key) ??
@@ -972,24 +1011,6 @@ export function Dashboard(props: { me: MeResponse }) {
 		},
 		[refreshSidebar],
 	);
-	const onSyncStarred = useCallback(() => {
-		void run("Sync starred", async () => {
-			const task = await apiPost<TaskAcceptedResponse>(
-				"/api/sync/starred?return_mode=task_id",
-			);
-			await trackTaskStream(task, "refresh");
-		});
-	}, [run, trackTaskStream]);
-
-	const onSyncReleases = useCallback(() => {
-		void run("Sync releases", async () => {
-			const task = await apiPost<TaskAcceptedResponse>(
-				"/api/sync/releases?return_mode=task_id",
-			);
-			await trackTaskStream(task, "refresh");
-		});
-	}, [run, trackTaskStream]);
-
 	const onSyncInbox = useCallback(() => {
 		void run("Sync inbox", async () => {
 			const task = await apiPost<TaskAcceptedResponse>(
@@ -1053,95 +1074,85 @@ export function Dashboard(props: { me: MeResponse }) {
 	}, []);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
 
-	const renderFeedPanel = (mode: "all" | "releases") => (
-		<>
-			{!feed.loadingInitial && feed.items.length === 0 ? (
-				<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-					{accessSyncStage === "waiting" ||
-					accessSyncStage === "star_refreshed" ? (
-						<>
-							<h2 className="text-base font-semibold tracking-tight">
-								正在同步你的 Star / Release
-							</h2>
-							<p className="text-muted-foreground mt-1 text-sm">
-								先展示服务端已有缓存，再补齐最新仓库数据；完成后这里会自动刷新。
-							</p>
-						</>
-					) : (
-						<>
-							<h2 className="text-base font-semibold tracking-tight">
-								还没有缓存内容
-							</h2>
-							<p className="text-muted-foreground mt-1 text-sm">
-								可以先同步 Star / Release；Inbox 仍然单独同步。
-							</p>
-							<div className="mt-4 flex flex-wrap gap-2">
-								<Button disabled={Boolean(busy)} onClick={onSyncAll}>
-									{SYNC_ALL_LABEL}
-								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncStarred}
-								>
-									Sync starred
-								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncReleases}
-								>
-									Sync releases
-								</Button>
-								<Button
-									variant="outline"
-									disabled={Boolean(busy)}
-									onClick={onSyncInbox}
-								>
-									Sync inbox
-								</Button>
-							</div>
-						</>
-					)}
-				</div>
-			) : null}
+	const renderFeedPanel = (
+		mode: "all" | "releases" | "stars" | "followers",
+	) => {
+		const filteredItems = filterFeedItemsForTab(feed.items, mode);
+		return (
+			<>
+				{!feed.loadingInitial && filteredItems.length === 0 ? (
+					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+						{accessSyncStage === "waiting" ||
+						accessSyncStage === "star_refreshed" ? (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									正在同步你的 GitHub 动态
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm">
+									先展示服务端已有缓存，再补齐最新
+									release、被加星和被关注记录；完成后这里会自动刷新。
+								</p>
+							</>
+						) : (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									还没有缓存内容
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm">
+									可以先同步一次，把 release、被加星和被关注记录都拉下来喵。
+								</p>
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button disabled={Boolean(busy)} onClick={onSyncAll}>
+										{SYNC_ALL_LABEL}
+									</Button>
+								</div>
+							</>
+						)}
+					</div>
+				) : null}
 
-			<FeedGroupedList
-				mode={mode}
-				items={feed.items}
-				briefs={briefs}
-				dailyBoundaryLocal={dailyBoundaryLocal}
-				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
-				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-				error={feed.error}
-				loadingInitial={feed.loadingInitial}
-				loadingMore={feed.loadingMore}
-				hasMore={feed.hasMore}
-				translationInFlightKeys={translationInFlightKeys}
-				smartInFlightKeys={smartInFlightKeys}
-				registerItemRef={registerFeedItem}
-				onLoadMore={feed.loadMore}
-				selectedLaneByKey={Object.fromEntries(
-					feed.items.map((item) => [
-						feedItemKey(item),
-						resolveLaneForItem(item, selectedLaneByKey, pageDefaultLane),
-					]),
-				)}
-				onSelectLane={onSelectLane}
-				onTranslateNow={onTranslateNow}
-				onSmartNow={onSmartNow}
-				reactionBusyKeys={reactionBusyKeys}
-				reactionErrorByKey={reactionErrorByKey}
-				onToggleReaction={onToggleReaction}
-				onOpenReleaseFromBrief={
-					mode === "all" ? onOpenReleaseDetail : undefined
-				}
-				onGenerateBriefForDate={
-					mode === "all" ? onGenerateBriefForDate : undefined
-				}
-			/>
-		</>
-	);
+				<FeedGroupedList
+					mode={mode}
+					items={filteredItems}
+					currentViewer={{
+						login: me.user.login,
+						avatar_url: me.user.avatar_url,
+						html_url: `https://github.com/${me.user.login}`,
+					}}
+					briefs={briefs}
+					dailyBoundaryLocal={dailyBoundaryLocal}
+					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+					error={feed.error}
+					loadingInitial={feed.loadingInitial}
+					loadingMore={feed.loadingMore}
+					hasMore={feed.hasMore}
+					translationInFlightKeys={translationInFlightKeys}
+					smartInFlightKeys={smartInFlightKeys}
+					registerItemRef={registerFeedItem}
+					onLoadMore={feed.loadMore}
+					selectedLaneByKey={Object.fromEntries(
+						filteredItems.map((item) => [
+							feedItemKey(item),
+							resolveLaneForItem(item, selectedLaneByKey, pageDefaultLane),
+						]),
+					)}
+					onSelectLane={onSelectLane}
+					onTranslateNow={onTranslateNow}
+					onSmartNow={onSmartNow}
+					reactionBusyKeys={reactionBusyKeys}
+					reactionErrorByKey={reactionErrorByKey}
+					onToggleReaction={onToggleReaction}
+					onOpenReleaseFromBrief={
+						mode === "all" ? onOpenReleaseDetail : undefined
+					}
+					onGenerateBriefForDate={
+						mode === "all" ? onGenerateBriefForDate : undefined
+					}
+				/>
+			</>
+		);
+	};
 
 	useEffect(() => {
 		const params = new URLSearchParams(window.location.search);
@@ -1222,6 +1233,12 @@ export function Dashboard(props: { me: MeResponse }) {
 						<TabsTrigger value="releases" className="font-mono text-xs">
 							Releases
 						</TabsTrigger>
+						<TabsTrigger value="stars" className="font-mono text-xs">
+							被加星
+						</TabsTrigger>
+						<TabsTrigger value="followers" className="font-mono text-xs">
+							被关注
+						</TabsTrigger>
 						<TabsTrigger value="briefs" className="font-mono text-xs">
 							日报
 						</TabsTrigger>
@@ -1270,6 +1287,12 @@ export function Dashboard(props: { me: MeResponse }) {
 						</TabsContent>
 						<TabsContent value="releases" className="mt-0 min-w-0">
 							{renderFeedPanel("releases")}
+						</TabsContent>
+						<TabsContent value="stars" className="mt-0 min-w-0">
+							{renderFeedPanel("stars")}
+						</TabsContent>
+						<TabsContent value="followers" className="mt-0 min-w-0">
+							{renderFeedPanel("followers")}
 						</TabsContent>
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard

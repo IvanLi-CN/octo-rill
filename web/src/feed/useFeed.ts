@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiGet } from "@/api";
 import type {
@@ -8,6 +8,9 @@ import type {
 	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
+import { isReleaseFeedItem } from "@/feed/types";
+
+export type FeedRequestType = "all" | "releases" | "stars" | "followers";
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -27,13 +30,55 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 			indexByKey.set(key, out.length);
 			out.push(n);
 		} else {
-			out[idx] = { ...out[idx], ...n };
+			const current = out[idx];
+			if (current.kind !== n.kind) {
+				out[idx] = n;
+				continue;
+			}
+			if (current.kind === "release" && n.kind === "release") {
+				out[idx] = {
+					...current,
+					...n,
+					actor: null,
+				};
+				continue;
+			}
+			if (
+				(current.kind === "repo_star_received" ||
+					current.kind === "follower_received") &&
+				(n.kind === "repo_star_received" || n.kind === "follower_received")
+			) {
+				out[idx] = {
+					...current,
+					...n,
+					actor: n.actor ?? current.actor,
+				};
+				continue;
+			}
+			out[idx] = n;
 		}
 	}
 	return out;
 }
 
-export function useFeed() {
+function buildFeedUrl(
+	limit: number,
+	type: FeedRequestType,
+	cursor?: string | null,
+) {
+	const params = new URLSearchParams();
+	params.set("limit", String(limit));
+	if (type !== "all") {
+		params.set("types", type);
+	}
+	if (cursor) {
+		params.set("cursor", cursor);
+	}
+	return `/api/feed?${params.toString()}`;
+}
+
+export function useFeed(type: FeedRequestType = "all") {
+	const [dataType, setDataType] = useState<FeedRequestType>(type);
 	const [items, setItems] = useState<FeedItem[]>([]);
 	const [nextCursor, setNextCursor] = useState<string | null>(null);
 	const [loadingInitial, setLoadingInitial] = useState(false);
@@ -41,8 +86,22 @@ export function useFeed() {
 	const [error, setError] = useState<string | null>(null);
 
 	const reqIdRef = useRef(0);
+	const isCurrentType = dataType === type;
+	const currentItems = isCurrentType ? items : [];
+	const currentNextCursor = isCurrentType ? nextCursor : null;
+	const currentError = isCurrentType ? error : null;
+	const currentLoadingInitial = !isCurrentType || loadingInitial;
+	const hasMore = Boolean(currentNextCursor);
 
-	const hasMore = Boolean(nextCursor);
+	useEffect(() => {
+		reqIdRef.current += 1;
+		setDataType(type);
+		setItems([]);
+		setNextCursor(null);
+		setLoadingInitial(false);
+		setLoadingMore(false);
+		setError(null);
+	}, [type]);
 
 	const loadInitial = useCallback(async () => {
 		reqIdRef.current += 1;
@@ -54,8 +113,9 @@ export function useFeed() {
 		setLoadingInitial(true);
 		setError(null);
 		try {
-			const res = await apiGet<FeedResponse>("/api/feed?limit=30");
+			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type));
 			if (reqId !== reqIdRef.current) return;
+			setDataType(type);
 			setItems(res.items);
 			setNextCursor(res.next_cursor);
 		} catch (err) {
@@ -66,27 +126,30 @@ export function useFeed() {
 				setLoadingInitial(false);
 			}
 		}
-	}, []);
+	}, [type]);
 
 	const loadMore = useCallback(async () => {
-		if (!nextCursor || loadingMore || loadingInitial) return;
+		if (!currentNextCursor || loadingMore || currentLoadingInitial) return;
 		const reqId = reqIdRef.current;
 		setLoadingMore(true);
 		setError(null);
 		try {
 			const res = await apiGet<FeedResponse>(
-				`/api/feed?limit=30&cursor=${encodeURIComponent(nextCursor)}`,
+				buildFeedUrl(30, type, currentNextCursor),
 			);
 			if (reqId !== reqIdRef.current) return;
+			setDataType(type);
 			setItems((prev) => mergeByKey(prev, res.items));
 			setNextCursor(res.next_cursor);
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
 			setError(err instanceof Error ? err.message : String(err));
 		} finally {
-			setLoadingMore(false);
+			if (reqId === reqIdRef.current) {
+				setLoadingMore(false);
+			}
 		}
-	}, [nextCursor, loadingMore, loadingInitial]);
+	}, [currentLoadingInitial, currentNextCursor, loadingMore, type]);
 
 	const refresh = useCallback(async () => {
 		await loadInitial();
@@ -98,6 +161,7 @@ export function useFeed() {
 			setItems((prev) =>
 				prev.map((it) => {
 					if (itemKey(it) !== key) return it;
+					if (!isReleaseFeedItem(it)) return it;
 					return {
 						...it,
 						translated: { ...translated },
@@ -114,6 +178,7 @@ export function useFeed() {
 			setItems((prev) =>
 				prev.map((it) => {
 					if (itemKey(it) !== key) return it;
+					if (!isReleaseFeedItem(it)) return it;
 					return {
 						...it,
 						smart: { ...smart },
@@ -130,6 +195,7 @@ export function useFeed() {
 			setItems((prev) =>
 				prev.map((it) => {
 					if (itemKey(it) !== key) return it;
+					if (!isReleaseFeedItem(it)) return it;
 					return {
 						...it,
 						reactions,
@@ -141,18 +207,25 @@ export function useFeed() {
 	);
 
 	const stats = useMemo(() => {
-		// Feed is releases-only; keep stats for header/debug UI.
-		const releases = items.length;
-		return { releases, total: items.length };
-	}, [items]);
+		const releases = currentItems.filter(
+			(item) => item.kind === "release",
+		).length;
+		const stars = currentItems.filter(
+			(item) => item.kind === "repo_star_received",
+		).length;
+		const followers = currentItems.filter(
+			(item) => item.kind === "follower_received",
+		).length;
+		return { releases, stars, followers, total: currentItems.length };
+	}, [currentItems]);
 
 	return {
-		items,
-		nextCursor,
+		items: currentItems,
+		nextCursor: currentNextCursor,
 		hasMore,
-		loadingInitial,
+		loadingInitial: currentLoadingInitial,
 		loadingMore,
-		error,
+		error: currentError,
 		stats,
 		loadInitial,
 		loadMore,

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -9,7 +10,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -3334,17 +3335,21 @@ pub async fn sync_all(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let starred = sync::sync_starred(state.as_ref(), user_id.as_str())
-            .await
-            .map_err(ApiError::internal)?;
-        let releases = sync::sync_releases(state.as_ref(), user_id.as_str())
-            .await
-            .map_err(ApiError::internal)?;
-        return Ok(Json(json!({
-            "starred": starred,
-            "releases": releases,
-        }))
-        .into_response());
+        let body = execute_sync_all_sync_with(
+            state.as_ref(),
+            user_id.as_str(),
+            |state, user_id| Box::pin(sync::sync_starred(state, user_id)),
+            |state, user_id| Box::pin(sync::sync_releases(state, user_id)),
+            |state, user_id| {
+                Box::pin(async move {
+                    sync::sync_social_activity_best_effort(state, user_id, "api.sync_all.sync")
+                        .await
+                })
+            },
+            |state, user_id| Box::pin(sync::sync_notifications(state, user_id)),
+        )
+        .await;
+        return Ok(Json(body?).into_response());
     }
 
     enqueue_singleton_or_stream_task(
@@ -3359,6 +3364,49 @@ pub async fn sync_all(
         },
     )
     .await
+}
+
+type SyncAllApiFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+type SyncAllSocialFuture<'a> =
+    Pin<Box<dyn Future<Output = (sync::SyncSocialActivityResult, Option<String>)> + Send + 'a>>;
+
+async fn execute_sync_all_sync_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
+    state: &AppState,
+    user_id: &str,
+    sync_starred: SyncStarred,
+    sync_releases: SyncReleases,
+    sync_social: SyncSocial,
+    sync_notifications: SyncNotifications,
+) -> Result<Value, ApiError>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncStarredResult>,
+    SyncReleases:
+        for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncReleasesResult>,
+    SyncSocial: for<'a> Fn(&'a AppState, &'a str) -> SyncAllSocialFuture<'a>,
+    SyncNotifications:
+        for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncNotificationsResult>,
+{
+    let starred = sync_starred(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let releases = sync_releases(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let (social, social_error) = sync_social(state, user_id).await;
+    let notifications = sync_notifications(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut body = json!({
+        "starred": starred,
+        "releases": releases,
+        "social": social,
+        "notifications": notifications,
+    });
+    if let Some(error) = social_error {
+        body["social_error"] = Value::String(error);
+    }
+    Ok(body)
 }
 
 pub async fn sync_releases(
@@ -3862,6 +3910,13 @@ pub struct RepoVisual {
 }
 
 #[derive(Debug, Serialize)]
+pub struct FeedActor {
+    login: String,
+    avatar_url: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct FeedItem {
     kind: String,
     ts: String,
@@ -3876,6 +3931,8 @@ pub struct FeedItem {
     subject_type: Option<String>,
     html_url: Option<String>,
     unread: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actor: Option<FeedActor>,
     translated: Option<TranslatedItem>,
     smart: Option<SmartItem>,
     reactions: Option<ReleaseReactions>,
@@ -3949,6 +4006,9 @@ struct FeedRow {
     subject_type: Option<String>,
     html_url: Option<String>,
     unread: Option<i64>,
+    actor_login: Option<String>,
+    actor_avatar_url: Option<String>,
+    actor_html_url: Option<String>,
     release_body: Option<String>,
     react_plus1: Option<i64>,
     react_laugh: Option<i64>,
@@ -4025,32 +4085,70 @@ fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
         return Err(ApiError::bad_request("invalid cursor"));
     }
 
-    let kind_rank = match kind.as_str() {
-        "release" => 1,
-        "notification" => 0,
-        _ => return Err(ApiError::bad_request("invalid cursor kind")),
-    };
+    let kind_rank = feed_kind_rank(kind.as_str())
+        .ok_or_else(|| ApiError::bad_request("invalid cursor kind"))?;
 
     Ok((sort_ts, kind_rank, id_key))
 }
 
-fn validate_feed_types(types: Option<&str>) -> Result<(), ApiError> {
-    // Feed is releases-only. Inbox belongs to its own API (`/api/notifications`) and UI tab.
+fn feed_kind_rank(kind: &str) -> Option<i64> {
+    match kind {
+        "release" => Some(3),
+        "repo_star_received" => Some(2),
+        "follower_received" => Some(1),
+        "notification" => Some(0),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeedTypeSelection {
+    releases: bool,
+    stars: bool,
+    followers: bool,
+}
+
+impl FeedTypeSelection {
+    fn all() -> Self {
+        Self {
+            releases: true,
+            stars: true,
+            followers: true,
+        }
+    }
+}
+
+fn parse_feed_types(types: Option<&str>) -> Result<FeedTypeSelection, ApiError> {
     let Some(types) = types else {
-        return Ok(());
+        return Ok(FeedTypeSelection::all());
     };
+
+    let mut selection = FeedTypeSelection {
+        releases: false,
+        stars: false,
+        followers: false,
+    };
+    let mut saw_any = false;
     for part in types.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        saw_any = true;
         match part {
-            "releases" | "release" => {}
+            "releases" | "release" => selection.releases = true,
+            "stars" | "star" => selection.stars = true,
+            "followers" | "follower" => selection.followers = true,
             "notifications" | "notification" | "inbox" => {
                 return Err(ApiError::bad_request(
-                    "feed only supports releases; use /api/notifications for inbox items",
+                    "feed does not include inbox items; use /api/notifications for inbox",
                 ));
             }
             _ => return Err(ApiError::bad_request(format!("invalid types: {part}"))),
         }
     }
-    Ok(())
+
+    if !saw_any {
+        return Ok(FeedTypeSelection::all());
+    }
+
+    Ok(selection)
 }
 
 fn parse_release_id_param(raw: &str) -> Result<i64, ApiError> {
@@ -4325,77 +4423,31 @@ pub(crate) fn release_excerpt(body: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone)]
 struct StreamCursor {
     sort_ts: String,
+    kind_rank: i64,
     id_key: String,
 }
 
-fn parse_stream_cursor(raw: &str) -> Result<StreamCursor, ApiError> {
-    let mut it = raw.split('|');
-    let sort_ts = it
-        .next()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::bad_request("invalid mixed cursor"))?;
-    let id_key = it
-        .next()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::bad_request("invalid mixed cursor"))?;
-    if it.next().is_some() {
-        return Err(ApiError::bad_request("invalid mixed cursor"));
-    }
-    Ok(StreamCursor { sort_ts, id_key })
-}
-
-fn parse_release_cursor(cursor: &str) -> Result<Option<StreamCursor>, ApiError> {
-    let mut recognized = false;
-    let mut release: Option<StreamCursor> = None;
-
-    for part in cursor
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(v) = part.strip_prefix("r=") {
-            release = Some(parse_stream_cursor(v)?);
-            recognized = true;
-            continue;
-        }
-        if let Some(v) = part.strip_prefix("release=") {
-            release = Some(parse_stream_cursor(v)?);
-            recognized = true;
-            continue;
-        }
-
-        // Ignore notification parts from legacy mixed cursors; feed is releases-only.
-        if part.starts_with("n=") || part.starts_with("notification=") {
-            recognized = true;
-            continue;
-        }
-    }
-
-    if recognized {
-        return Ok(release);
-    }
-
-    // Backward-compat: previous cursor format was "<sort_ts>|<kind>|<id_key>".
+fn parse_feed_cursor(cursor: &str) -> Result<StreamCursor, ApiError> {
     let (sort_ts, kind_rank, id_key) = parse_cursor(cursor)?;
-    match kind_rank {
-        1 => Ok(Some(StreamCursor { sort_ts, id_key })),
-        0 => Ok(None),
-        _ => Ok(None),
-    }
+    Ok(StreamCursor {
+        sort_ts,
+        kind_rank,
+        id_key,
+    })
 }
 
-async fn fetch_feed_releases(
+async fn fetch_feed_items(
     state: &AppState,
     user_id: &str,
     cursor: Option<&StreamCursor>,
+    types: FeedTypeSelection,
     limit: i64,
 ) -> Result<Vec<FeedRow>, ApiError> {
-    let base_sql = r#"
+    let sql = r#"
         WITH items AS (
           SELECT
             'release' AS kind,
+            3 AS kind_rank,
             sort_ts,
             ts,
             id_key,
@@ -4414,6 +4466,9 @@ async fn fetch_feed_releases(
             subject_type,
             html_url,
             unread,
+            actor_login,
+            actor_avatar_url,
+            actor_html_url,
             release_body,
             react_plus1,
             react_laugh,
@@ -4444,6 +4499,9 @@ async fn fetch_feed_releases(
               NULL AS subject_type,
               r.html_url AS html_url,
               NULL AS unread,
+              NULL AS actor_login,
+              NULL AS actor_avatar_url,
+              NULL AS actor_html_url,
               r.body AS release_body,
               r.react_plus1 AS react_plus1,
               r.react_laugh AS react_laugh,
@@ -4455,12 +4513,56 @@ async fn fetch_feed_releases(
             JOIN starred_repos sr
               ON sr.user_id = ? AND sr.repo_id = r.repo_id
           )
+          UNION ALL
+          SELECT
+            e.kind AS kind,
+            CASE e.kind
+              WHEN 'repo_star_received' THEN 2
+              WHEN 'follower_received' THEN 1
+              ELSE 0
+            END AS kind_rank,
+            e.occurred_at AS sort_ts,
+            e.occurred_at AS ts,
+            e.id AS id_key,
+            e.id AS entity_id,
+            NULL AS release_id,
+            NULL AS release_node_id,
+            e.repo_full_name AS repo_full_name,
+            COALESCE(e.repo_owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
+            COALESCE(e.repo_open_graph_image_url, ob.open_graph_image_url) AS open_graph_image_url,
+            COALESCE(
+              e.repo_uses_custom_open_graph_image,
+              ob.uses_custom_open_graph_image
+            ) AS uses_custom_open_graph_image,
+            NULL AS release_tag_name,
+            NULL AS release_previous_tag_name,
+            NULL AS title,
+            NULL AS subtitle,
+            NULL AS reason,
+            NULL AS subject_type,
+            COALESCE(e.actor_html_url, 'https://github.com/' || e.actor_login) AS html_url,
+            NULL AS unread,
+            e.actor_login AS actor_login,
+            e.actor_avatar_url AS actor_avatar_url,
+            e.actor_html_url AS actor_html_url,
+            NULL AS release_body,
+            NULL AS react_plus1,
+            NULL AS react_laugh,
+            NULL AS react_heart,
+            NULL AS react_hooray,
+            NULL AS react_rocket,
+            NULL AS react_eyes
+          FROM social_activity_events e
+          LEFT JOIN owned_repo_star_baselines ob
+            ON ob.user_id = e.user_id AND ob.repo_id = e.repo_id
+          WHERE e.user_id = ?
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
           i.repo_full_name, i.owner_avatar_url, i.open_graph_image_url, i.uses_custom_open_graph_image,
           i.release_tag_name, i.release_previous_tag_name,
           i.title, i.subtitle, i.reason, i.subject_type, i.html_url, i.unread,
+          i.actor_login, i.actor_avatar_url, i.actor_html_url,
           i.release_body, i.react_plus1, i.react_laugh, i.react_heart, i.react_hooray, i.react_rocket, i.react_eyes,
           t.source_hash AS trans_source_hash,
           t.status AS trans_status,
@@ -4482,47 +4584,43 @@ async fn fetch_feed_releases(
           ON s.user_id = ? AND s.entity_type = 'release_smart' AND s.entity_id = i.entity_id AND s.lang = 'zh-CN' AND s.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items sw
           ON sw.id = s.active_work_item_id
+        WHERE (
+          (? = 1 AND i.kind = 'release')
+          OR (? = 1 AND i.kind = 'repo_star_received')
+          OR (? = 1 AND i.kind = 'follower_received')
+        )
+          AND (
+            ? = 0
+            OR i.sort_ts < ?
+            OR (i.sort_ts = ? AND i.kind_rank < ?)
+            OR (i.sort_ts = ? AND i.kind_rank = ? AND i.id_key < ?)
+          )
+        ORDER BY i.sort_ts DESC, i.kind_rank DESC, i.id_key DESC
+        LIMIT ?
     "#;
 
-    let (sql, has_cursor) = if cursor.is_some() {
-        (
-            format!(
-                r#"
-                {base_sql}
-                WHERE (
-                  i.sort_ts < ?
-                  OR (i.sort_ts = ? AND i.id_key < ?)
-                )
-                ORDER BY i.sort_ts DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            true,
-        )
-    } else {
-        (
-            format!(
-                r#"
-                {base_sql}
-                ORDER BY i.sort_ts DESC, i.id_key DESC
-                LIMIT ?
-                "#
-            ),
-            false,
-        )
-    };
+    let has_cursor = cursor.is_some();
+    let cursor = cursor.cloned();
 
-    let mut qy = sqlx::query_as::<_, FeedRow>(&sql)
+    let qy = sqlx::query_as::<_, FeedRow>(sql)
+        .bind(user_id)
         .bind(user_id)
         .bind(user_id)
         .bind(user_id);
-    if has_cursor {
-        let c = cursor.expect("cursor");
-        qy = qy.bind(&c.sort_ts).bind(&c.sort_ts).bind(&c.id_key);
-    }
-    qy = qy.bind(limit);
-
-    qy.fetch_all(&state.pool).await.map_err(ApiError::internal)
+    qy.bind(if types.releases { 1_i64 } else { 0_i64 })
+        .bind(if types.stars { 1_i64 } else { 0_i64 })
+        .bind(if types.followers { 1_i64 } else { 0_i64 })
+        .bind(if has_cursor { 1_i64 } else { 0_i64 })
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.kind_rank))
+        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+        .bind(cursor.as_ref().map(|c| c.kind_rank))
+        .bind(cursor.as_ref().map(|c| c.id_key.as_str()))
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)
 }
 
 fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
@@ -4912,6 +5010,39 @@ fn feed_item_from_row(
     ai_enabled: bool,
     live_reactions: Option<&LiveReleaseReactions>,
 ) -> FeedItem {
+    let actor = r.actor_login.as_ref().map(|login| FeedActor {
+        login: login.clone(),
+        avatar_url: r.actor_avatar_url.clone(),
+        html_url: r.actor_html_url.clone(),
+    });
+    let repo_visual = repo_visual_from_parts(
+        r.owner_avatar_url.clone(),
+        r.open_graph_image_url.clone(),
+        r.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
+
+    if r.kind != "release" {
+        return FeedItem {
+            kind: r.kind,
+            ts: r.ts,
+            id: r.entity_id,
+            repo_full_name: r.repo_full_name,
+            repo_visual,
+            title: r.title,
+            body: None,
+            body_truncated: false,
+            subtitle: r.subtitle,
+            reason: r.reason,
+            subject_type: r.subject_type,
+            html_url: r.html_url,
+            unread: r.unread,
+            actor,
+            translated: None,
+            smart: None,
+            reactions: None,
+        };
+    }
+
     let (body, body_truncated) = match r.kind.as_str() {
         "release" => {
             let body = release_feed_body(r.release_body.as_deref());
@@ -5062,12 +5193,6 @@ fn feed_item_from_row(
         viewer = live.viewer.clone();
     }
 
-    let repo_visual = repo_visual_from_parts(
-        r.owner_avatar_url.clone(),
-        r.open_graph_image_url.clone(),
-        r.uses_custom_open_graph_image.unwrap_or(0) != 0,
-    );
-
     FeedItem {
         kind: r.kind,
         ts: r.ts,
@@ -5082,6 +5207,7 @@ fn feed_item_from_row(
         subject_type: r.subject_type,
         html_url: r.html_url,
         unread: r.unread,
+        actor: None,
         translated,
         smart,
         reactions: Some(ReleaseReactions {
@@ -5098,20 +5224,17 @@ pub async fn list_feed(
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<FeedResponse>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    validate_feed_types(q.types.as_deref())?;
+    let types = parse_feed_types(q.types.as_deref())?;
 
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
-    // Accept legacy cursors from the previous "mixed feed" implementation, but only use the
-    // release stream cursor since feed is now releases-only.
-    let release_cursor = match cursor {
-        Some(c) => parse_release_cursor(c)?,
+    let feed_cursor = match cursor {
+        Some(c) => Some(parse_feed_cursor(c)?),
         None => None,
     };
 
     let rows =
-        fetch_feed_releases(state.as_ref(), &user_id, release_cursor.as_ref(), limit).await?;
+        fetch_feed_items(state.as_ref(), &user_id, feed_cursor.as_ref(), types, limit).await?;
     let ai_enabled = state.config.ai.is_some();
 
     let mut node_ids: Vec<String> = Vec::new();
@@ -5153,8 +5276,7 @@ pub async fn list_feed(
     let mut next_cursor: Option<String> = None;
     for (idx, r) in rows.into_iter().enumerate() {
         if idx == limit.saturating_sub(1) as usize {
-            // Cursor format: "<sort_ts>|release|<id_key>" (backward compatible with parse_cursor).
-            next_cursor = Some(format!("{}|release|{}", r.sort_ts, r.id_key));
+            next_cursor = Some(format!("{}|{}|{}", r.sort_ts, r.kind, r.id_key));
         }
         let live = r
             .release_node_id
@@ -9511,12 +9633,33 @@ pub(crate) async fn require_admin_user_id(
 }
 
 #[cfg(test)]
+pub(crate) async fn ensure_owned_repo_visual_columns(
+    pool: &sqlx::SqlitePool,
+) -> Result<(), sqlx::Error> {
+    for statement in [
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN owner_avatar_url TEXT"#,
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN open_graph_image_url TEXT"#,
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN uses_custom_open_graph_image INTEGER NOT NULL DEFAULT 0"#,
+    ] {
+        match sqlx::query(statement).execute(pool).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(err))
+                if err.message().contains("duplicate column name")
+                    || err.message().contains("no such table") => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallListScope,
         AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery,
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
-        AdminUserUpdateGuard, AdminUsersQuery, FeedRow, GitHubCompareCommit,
+        AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow, GitHubCompareCommit,
         GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
         LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO,
         TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
@@ -9524,17 +9667,17 @@ mod tests {
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
-        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
-        feed_item_from_row, get_release_detail, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_releases, llm_call_order_by_clause,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        map_public_compare_fallback_error, mark_translation_requested,
+        build_task_diagnostics, ensure_account_enabled, execute_sync_all_sync_with,
+        extract_translation_fields, feed_item_from_row, get_release_detail,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
+        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
+        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
-        parse_positive_admin_concurrency, parse_release_id_param,
+        parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
         parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
         parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
         preserve_chunk_trailing_newline, release_cache_entry_reusable, release_detail_source_hash,
@@ -9553,6 +9696,7 @@ mod tests {
         crypto::EncryptionKey,
         jobs,
         state::{AppState, build_oauth_client},
+        sync,
     };
     use axum::{
         Json,
@@ -9562,6 +9706,7 @@ mod tests {
         response::{IntoResponse, Response},
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
     use sqlx::{
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -9594,6 +9739,9 @@ mod tests {
             subject_type: None,
             html_url: None,
             unread: None,
+            actor_login: None,
+            actor_avatar_url: None,
+            actor_html_url: None,
             release_body: None,
             react_plus1: None,
             react_laugh: None,
@@ -9684,6 +9832,9 @@ mod tests {
             .run(&pool)
             .await
             .expect("run migrations");
+        super::ensure_owned_repo_visual_columns(&pool)
+            .await
+            .expect("ensure owned repo visual columns");
 
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -9962,6 +10113,55 @@ mod tests {
         .await
         .expect("count access refresh tasks");
         assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_all_sync_mode_includes_notifications_and_social_error() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let body = execute_sync_all_sync_with(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            |_state, _user_id| Box::pin(async { Ok(sync::SyncStarredResult { repos: 2 }) }),
+            |_state, _user_id| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 3,
+                        releases: 5,
+                    })
+                })
+            },
+            |_state, _user_id| {
+                Box::pin(async {
+                    (
+                        sync::SyncSocialActivityResult::default(),
+                        Some("social boom".to_owned()),
+                    )
+                })
+            },
+            |_state, _user_id| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-04-11T11:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect("sync all sync body");
+
+        assert_eq!(body["starred"]["repos"], json!(2));
+        assert_eq!(body["releases"]["repos"], json!(3));
+        assert_eq!(body["releases"]["releases"], json!(5));
+        assert_eq!(body["social"]["events"], json!(0));
+        assert_eq!(body["notifications"]["notifications"], json!(7));
+        assert_eq!(
+            body["notifications"]["since"],
+            json!("2026-04-11T11:00:00Z")
+        );
+        assert_eq!(body["social_error"], json!("social boom"));
     }
 
     async fn task_id_from_response(response: Response) -> String {
@@ -10277,6 +10477,66 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed starred");
+    }
+
+    struct SeedSocialEventArgs<'a> {
+        kind: &'a str,
+        event_id: &'a str,
+        repo_id: Option<i64>,
+        repo_full_name: Option<&'a str>,
+        repo_owner_avatar_url: Option<&'a str>,
+        repo_open_graph_image_url: Option<&'a str>,
+        repo_uses_custom_open_graph_image: Option<bool>,
+        actor_login: &'a str,
+        occurred_at: &'a str,
+    }
+
+    async fn seed_social_event(pool: &SqlitePool, user_id: &str, args: SeedSocialEventArgs<'_>) {
+        sqlx::query(
+            r#"
+            INSERT INTO social_activity_events (
+              id,
+              user_id,
+              kind,
+              repo_id,
+              repo_full_name,
+              repo_owner_avatar_url,
+              repo_open_graph_image_url,
+              repo_uses_custom_open_graph_image,
+              actor_github_user_id,
+              actor_login,
+              actor_avatar_url,
+              actor_html_url,
+              occurred_at,
+              detected_at,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(args.event_id)
+        .bind(user_id)
+        .bind(args.kind)
+        .bind(args.repo_id)
+        .bind(args.repo_full_name)
+        .bind(args.repo_owner_avatar_url)
+        .bind(args.repo_open_graph_image_url)
+        .bind(
+            args.repo_uses_custom_open_graph_image
+                .map(|uses_custom| if uses_custom { 1_i64 } else { 0_i64 }),
+        )
+        .bind(90_000_i64 + i64::from(args.actor_login.bytes().map(i16::from).sum::<i16>()))
+        .bind(args.actor_login)
+        .bind(format!("https://avatars.example/{}.png", args.actor_login))
+        .bind(format!("https://github.com/{}", args.actor_login))
+        .bind(args.occurred_at)
+        .bind(args.occurred_at)
+        .bind(args.occurred_at)
+        .bind(args.occurred_at)
+        .execute(pool)
+        .await
+        .expect("seed social activity event");
     }
 
     async fn seed_brief(pool: &SqlitePool, user_id: &str, date: &str, content_markdown: &str) {
@@ -12739,6 +12999,45 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_maps_social_actor_payload() {
+        let mut row = test_feed_row(None);
+        row.kind = "repo_star_received".to_owned();
+        row.release_id = None;
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.entity_id = "star-event-1".to_owned();
+        row.id_key = "star-event-1".to_owned();
+        row.actor_login = Some("octocat".to_owned());
+        row.actor_avatar_url = Some("https://avatars.example/octocat.png".to_owned());
+        row.actor_html_url = Some("https://github.com/octocat".to_owned());
+        row.html_url = Some("https://github.com/octocat".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        assert_eq!(item.kind, "repo_star_received");
+        assert!(item.translated.is_none());
+        assert!(item.smart.is_none());
+        assert!(item.reactions.is_none());
+        let actor = item.actor.expect("social actor");
+        assert_eq!(actor.login, "octocat");
+        assert_eq!(
+            actor.avatar_url.as_deref(),
+            Some("https://avatars.example/octocat.png")
+        );
+        assert_eq!(
+            actor.html_url.as_deref(),
+            Some("https://github.com/octocat")
+        );
+        assert_eq!(item.html_url.as_deref(), Some("https://github.com/octocat"));
+    }
+
+    #[test]
+    fn parse_feed_types_accepts_social_variants() {
+        let selection = parse_feed_types(Some("release,stars,follower")).expect("selection");
+        assert!(selection.releases);
+        assert!(selection.stars);
+        assert!(selection.followers);
+    }
+
+    #[test]
     fn parse_release_smart_summary_payload_accepts_relaxed_payload_and_sanitizes_bullets() {
         let raw = r#"
         {
@@ -12994,6 +13293,143 @@ mod tests {
         .await
         .expect("count releases with star");
         assert_eq!(count_with_star, 1);
+    }
+
+    #[tokio::test]
+    async fn list_feed_returns_mixed_items_and_supports_social_filters() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "social-star-1",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                actor_login: "octocat",
+                occurred_at: "2026-02-23T10:00:00Z",
+            },
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "follower_received",
+                event_id: "social-follow-1",
+                repo_id: None,
+                repo_full_name: None,
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                actor_login: "monalisa",
+                occurred_at: "2026-02-23T09:00:00Z",
+            },
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(feed) = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: None,
+            }),
+        )
+        .await
+        .expect("list mixed feed");
+
+        let kinds = feed
+            .items
+            .iter()
+            .map(|item| item.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec!["repo_star_received", "follower_received", "release"]
+        );
+        assert_eq!(
+            feed.items[0]
+                .actor
+                .as_ref()
+                .expect("social actor")
+                .login
+                .as_str(),
+            "octocat"
+        );
+
+        let Json(stars_only) = list_feed(
+            State(state),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("stars".to_owned()),
+            }),
+        )
+        .await
+        .expect("list stars feed");
+
+        assert_eq!(stars_only.items.len(), 1);
+        assert_eq!(stars_only.items[0].kind, "repo_star_received");
+    }
+
+    #[tokio::test]
+    async fn list_feed_preserves_repo_visuals_for_historical_social_events_without_baseline() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "social-star-history-1",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: Some("https://avatars.githubusercontent.com/u/14957082"),
+                repo_open_graph_image_url: Some(
+                    "https://repository-images.githubusercontent.com/14957082/codex",
+                ),
+                repo_uses_custom_open_graph_image: Some(true),
+                actor_login: "octocat",
+                occurred_at: "2026-02-23T10:00:00Z",
+            },
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("stars".to_owned()),
+            }),
+        )
+        .await
+        .expect("list stars feed");
+
+        let item = feed.items.first().expect("historical social item");
+        assert_eq!(item.kind, "repo_star_received");
+        let repo_visual = item.repo_visual.as_ref().expect("repo visual");
+        assert_eq!(
+            repo_visual.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            repo_visual.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert!(repo_visual.uses_custom_open_graph_image);
     }
 
     #[tokio::test]

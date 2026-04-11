@@ -1,7 +1,12 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import { FeedItemCard } from "@/feed/FeedItemCard";
-import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
+import type {
+	FeedItem,
+	FeedLane,
+	FeedViewer,
+	ReactionContent,
+} from "@/feed/types";
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -9,6 +14,7 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 
 export type FeedCardListProps = {
 	items: FeedItem[];
+	currentViewer?: FeedViewer | null;
 	translationInFlightKeys: Set<string>;
 	smartInFlightKeys: Set<string>;
 	registerItemRef: (item: FeedItem) => (el: HTMLElement | null) => void;
@@ -24,6 +30,7 @@ export type FeedCardListProps = {
 export function FeedItems(props: FeedCardListProps) {
 	const {
 		items,
+		currentViewer,
 		translationInFlightKeys,
 		smartInFlightKeys,
 		registerItemRef,
@@ -47,6 +54,7 @@ export function FeedItems(props: FeedCardListProps) {
 			<div key={key} ref={registerItemRef(item)}>
 				<FeedItemCard
 					item={item}
+					currentViewer={currentViewer}
 					activeLane={activeLane}
 					isTranslating={isTranslating}
 					isSmartGenerating={isSmartGenerating}
@@ -73,6 +81,7 @@ export function FeedList(
 ) {
 	const {
 		items,
+		currentViewer,
 		error,
 		loadingInitial,
 		loadingMore,
@@ -125,6 +134,7 @@ export function FeedList(
 
 			<FeedItems
 				items={items}
+				currentViewer={currentViewer}
 				translationInFlightKeys={translationInFlightKeys}
 				smartInFlightKeys={smartInFlightKeys}
 				registerItemRef={registerItemRef}

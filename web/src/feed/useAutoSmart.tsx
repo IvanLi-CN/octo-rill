@@ -6,7 +6,7 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
-import type { FeedItem, SmartItem } from "@/feed/types";
+import { isReleaseFeedItem, type FeedItem, type SmartItem } from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
@@ -298,6 +298,7 @@ export function useAutoSmart(params: {
 	const shouldAutoSmart = useCallback(
 		(item: FeedItem) =>
 			enabled &&
+			isReleaseFeedItem(item) &&
 			((item.smart?.status === "missing" &&
 				item.smart.auto_translate !== false) ||
 				(item.smart?.status === "ready" &&
@@ -844,6 +845,9 @@ export function useAutoSmart(params: {
 
 	const smartNow = useCallback(
 		async (item: FeedItem) => {
+			if (!isReleaseFeedItem(item)) {
+				return null;
+			}
 			const key = keyOf(item);
 			const requestItem = buildReleaseSmartRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);

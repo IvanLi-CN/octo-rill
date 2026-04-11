@@ -25,9 +25,18 @@ export type SmartItem = {
 };
 
 export type FeedLane = "original" | "translated" | "smart";
+export type FeedItemKind =
+	| "release"
+	| "repo_star_received"
+	| "follower_received";
 
-// Feed is releases-only (Inbox has its own API + UI tab).
-export type FeedItemKind = "release";
+export type FeedActor = {
+	login: string;
+	avatar_url?: string | null;
+	html_url?: string | null;
+};
+
+export type FeedViewer = FeedActor;
 
 export type ReactionContent =
 	| "plus1"
@@ -61,7 +70,7 @@ export type ReleaseReactions = {
 	status: "ready" | "sync_required";
 };
 
-export type FeedItem = {
+type FeedItemBase = {
 	kind: FeedItemKind;
 	ts: string;
 	id: string;
@@ -75,10 +84,35 @@ export type FeedItem = {
 	subject_type: string | null;
 	html_url: string | null;
 	unread: number | null;
+};
+
+export type ReleaseFeedItem = FeedItemBase & {
+	kind: "release";
+	actor?: null | undefined;
 	translated: TranslatedItem | null;
 	smart: SmartItem | null;
 	reactions: ReleaseReactions | null;
 };
+
+export type SocialFeedItem = FeedItemBase & {
+	kind: "repo_star_received" | "follower_received";
+	actor: FeedActor;
+	translated: null;
+	smart: null;
+	reactions: null;
+};
+
+export type FeedItem = ReleaseFeedItem | SocialFeedItem;
+
+export function isReleaseFeedItem(item: FeedItem): item is ReleaseFeedItem {
+	return item.kind === "release";
+}
+
+export function isSocialFeedItem(item: FeedItem): item is SocialFeedItem {
+	return (
+		item.kind === "repo_star_received" || item.kind === "follower_received"
+	);
+}
 
 export type FeedResponse = {
 	items: FeedItem[];

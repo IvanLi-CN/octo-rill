@@ -6,7 +6,12 @@ import {
 	type TranslationResultItem,
 	isPendingTranslationResultStatus,
 } from "@/api";
-import type { FeedItem, TranslatedItem, TranslateResponse } from "@/feed/types";
+import {
+	isReleaseFeedItem,
+	type FeedItem,
+	type TranslatedItem,
+	type TranslateResponse,
+} from "@/feed/types";
 
 const RESOLVE_RESULTS_MAX_ITEMS = 60;
 const SECONDARY_PREFETCH_COUNT = 10;
@@ -269,6 +274,7 @@ export function useAutoTranslate(params: {
 	const shouldAutoTranslate = useCallback(
 		(item: FeedItem) =>
 			enabled &&
+			isReleaseFeedItem(item) &&
 			((item.translated?.status === "missing" &&
 				item.translated.auto_translate !== false) ||
 				(item.translated?.status === "ready" &&
@@ -775,6 +781,9 @@ export function useAutoTranslate(params: {
 
 	const translateNow = useCallback(
 		async (item: FeedItem) => {
+			if (!isReleaseFeedItem(item)) {
+				return null;
+			}
 			const key = keyOf(item);
 			const requestItem = buildReleaseSummaryRequestItem(item);
 			const sourceKey = buildRequestSourceKey(requestItem);
