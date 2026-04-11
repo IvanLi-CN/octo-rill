@@ -411,9 +411,8 @@ function SocialActivityCard(props: {
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
 		: null;
-	const viewerHref =
-		currentViewer?.html_url ??
-		(currentViewer?.login ? `https://github.com/${currentViewer.login}` : null);
+	const actorCardHref = isRepoStar && repoHref ? null : actorHref;
+	const targetCardHref = isRepoStar ? repoHref : null;
 	const targetViewer: FeedActor = currentViewer ?? {
 		login: "你",
 		avatar_url: null,
@@ -421,13 +420,13 @@ function SocialActivityCard(props: {
 	};
 
 	return (
-		<div className="space-y-0 px-1 py-1">
+		<div className="space-y-0 px-1 py-1" data-social-card-kind={item.kind}>
 			<p className="mb-0.5 font-mono text-xs leading-none text-muted-foreground">
 				{formatIsoShortLocal(item.ts)}
 			</p>
 			<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)] md:items-center">
 				<SocialEntityCard
-					href={actorHref}
+					href={actorCardHref}
 					avatar={
 						<SocialActorAvatar
 							key={actor.avatar_url ?? actor.login}
@@ -443,7 +442,7 @@ function SocialActivityCard(props: {
 				/>
 				{isRepoStar ? (
 					<SocialEntityCard
-						href={repoHref}
+						href={targetCardHref}
 						avatar={
 							<SocialRepoAvatar
 								key={[
@@ -461,7 +460,7 @@ function SocialActivityCard(props: {
 					/>
 				) : (
 					<SocialEntityCard
-						href={viewerHref}
+						href={null}
 						avatar={
 							<SocialActorAvatar
 								key={targetViewer.avatar_url ?? targetViewer.login}
