@@ -1128,6 +1128,18 @@ async fn apply_social_activity_snapshot_partial(
     .await
     .context("query follower sync baseline")?
         > 0;
+    let repo_tracking_baseline_exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM repo_star_sync_baselines
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("query repo star sync baseline")?
+        > 0;
     let repo_baselines = sqlx::query_as::<_, OwnedRepoStarBaselineRow>(
         r#"
         SELECT repo_id, members_snapshot_initialized
@@ -1139,7 +1151,7 @@ async fn apply_social_activity_snapshot_partial(
     .fetch_all(&mut *tx)
     .await
     .context("query repo star baselines")?;
-    let repo_tracking_initialized = !repo_baselines.is_empty();
+    let repo_tracking_initialized = repo_tracking_baseline_exists;
     let repo_snapshot_initialized_ids = repo_baselines
         .iter()
         .filter(|row| row.members_snapshot_initialized != 0)
@@ -1411,6 +1423,22 @@ async fn apply_social_activity_snapshot_partial(
                     format!("mark repo star snapshot initialized for {}", repo.full_name)
                 })?;
         }
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_star_sync_baselines (id, user_id, initialized_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE
+            SET updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("upsert repo star sync baseline")?;
     }
 
     tx.commit()
@@ -6492,6 +6520,79 @@ mod tests {
         .expect("load new repo star event");
         assert_eq!(row.0, "octo/beta");
         assert_eq!(row.1, "new-star");
+    }
+
+    #[tokio::test]
+    async fn social_activity_zero_repo_bootstrap_allows_first_repo_star_events() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-zero-repo-bootstrap");
+        seed_user(&pool, user_id.as_str()).await;
+
+        apply_social_activity_snapshot(state.as_ref(), user_id.as_str(), &[], &[], &[])
+            .await
+            .expect("seed zero-repo baseline");
+
+        let repo_tracking_baseline_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_sync_baselines
+            WHERE user_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count repo star sync baseline");
+        assert_eq!(repo_tracking_baseline_count, 1);
+
+        let first_repo = OwnedRepoSnapshot {
+            repo_id: 44,
+            full_name: "octo/first".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&first_repo),
+            &[(
+                first_repo.clone(),
+                vec![RepoStargazerSnapshot {
+                    repo_id: first_repo.repo_id,
+                    repo_full_name: first_repo.full_name.clone(),
+                    actor: GitHubActor {
+                        id: 901,
+                        login: "first-star".to_owned(),
+                        avatar_url: Some("https://avatars.example/first-star.png".to_owned()),
+                        html_url: Some("https://github.com/first-star".to_owned()),
+                    },
+                    starred_at: Some("2026-03-06T14:45:00Z".to_owned()),
+                }],
+            )],
+            &[],
+        )
+        .await
+        .expect("emit first repo star event after zero-repo bootstrap");
+
+        assert_eq!(events, 1);
+
+        let row: (String, String) = sqlx::query_as(
+            r#"
+            SELECT repo_full_name, actor_login
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'repo_star_received'
+            ORDER BY occurred_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load first repo star event");
+        assert_eq!(row.0, "octo/first");
+        assert_eq!(row.1, "first-star");
     }
 
     #[tokio::test]
