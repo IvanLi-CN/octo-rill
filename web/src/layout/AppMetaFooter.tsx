@@ -14,18 +14,20 @@ export function AppMetaFooter() {
 				<span className="text-muted-foreground font-mono">
 					© {currentYear} Ivan Li
 				</span>
-				<a
-					className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 font-mono underline-offset-4 hover:underline"
-					href={REPOSITORY_URL}
-					target="_blank"
-					rel="noreferrer"
-				>
-					<Github className="size-3.5" aria-hidden="true" />
-					GitHub
-				</a>
-				<span className="text-muted-foreground font-mono">
-					Version {loadedVersion}
-				</span>
+				<div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
+					<a
+						className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1 font-mono underline-offset-4 hover:underline"
+						href={REPOSITORY_URL}
+						target="_blank"
+						rel="noreferrer"
+					>
+						<Github className="size-3.5" aria-hidden="true" />
+						GitHub
+					</a>
+					<span className="text-muted-foreground font-mono">
+						Version {loadedVersion}
+					</span>
+				</div>
 			</div>
 		</footer>
 	);

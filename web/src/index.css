@@ -32,6 +32,8 @@
 	--border: oklch(0.9 0.01 95);
 	--input: oklch(0.9 0.01 95);
 	--ring: oklch(0.7 0.05 240);
+	--surface-radial: rgb(0 0 0 / 3%);
+	--surface-grid-line: rgb(0 0 0 / 3%);
 }
 
 .dark {
@@ -53,6 +55,8 @@
 	--border: oklch(1 0 0 / 10%);
 	--input: oklch(1 0 0 / 15%);
 	--ring: oklch(0.556 0 0);
+	--surface-radial: rgb(147 197 253 / 10%);
+	--surface-grid-line: rgb(255 255 255 / 5%);
 }
 
 @theme inline {
@@ -90,11 +94,11 @@
 		background-image:
 			radial-gradient(
 				1200px circle at 15% 10%,
-				rgb(0 0 0 / 3%),
+				var(--surface-radial),
 				transparent 60%
 			),
-			linear-gradient(to right, rgb(0 0 0 / 3%) 1px, transparent 1px),
-			linear-gradient(to bottom, rgb(0 0 0 / 3%) 1px, transparent 1px);
+			linear-gradient(to right, var(--surface-grid-line) 1px, transparent 1px),
+			linear-gradient(to bottom, var(--surface-grid-line) 1px, transparent 1px);
 		background-size:
 			auto,
 			32px 32px,

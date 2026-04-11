@@ -5,6 +5,41 @@
     <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <link rel="alternate icon" href="%BASE_URL%favicon.ico" sizes="32x32" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (() => {
+        const STORAGE_KEY = "octo-rill.theme-preference";
+        const MEDIA_QUERY = "(prefers-color-scheme: dark)";
+        const root = document.documentElement;
+        const normalizePreference = (value) =>
+          value === "light" || value === "dark" || value === "system"
+            ? value
+            : "system";
+
+        let storedPreference = "system";
+        try {
+          storedPreference = normalizePreference(
+            window.localStorage.getItem(STORAGE_KEY),
+          );
+        } catch {
+          storedPreference = "system";
+        }
+
+        const systemResolvedTheme =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia(MEDIA_QUERY).matches
+            ? "dark"
+            : "light";
+        const resolvedTheme =
+          storedPreference === "system"
+            ? systemResolvedTheme
+            : storedPreference;
+
+        root.classList.toggle("dark", resolvedTheme === "dark");
+        root.dataset.themePreference = storedPreference;
+        root.dataset.theme = resolvedTheme;
+        root.style.colorScheme = resolvedTheme;
+      })();
+    </script>
     <title>OctoRill</title>
   </head>
   <body>
