@@ -149,12 +149,27 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 	).toBeVisible();
 	await expect(page.getByText("标星", { exact: true })).toBeVisible();
 	await expect(page.getByText("关注", { exact: true })).toBeVisible();
+	await expect(
+		page.locator(
+			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]',
+		),
+	).toHaveCount(2);
+	await expect(
+		page.locator(
+			'[data-social-card-kind="follower_received"] a[href^="https://github.com/"]',
+		),
+	).toHaveCount(1);
 
 	await page.getByRole("tab", { name: "被加星" }).click();
 	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
 	await expect(page.getByText("monalisa", { exact: true })).toHaveCount(0);
 	await expect(page.getByText("owner/repo", { exact: true })).toBeVisible();
 	await expect(page.getByText("标星", { exact: true })).toBeVisible();
+	await expect(
+		page.locator(
+			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]',
+		),
+	).toHaveCount(2);
 
 	await page.getByRole("tab", { name: "被关注" }).click();
 	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
@@ -164,6 +179,11 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		page.getByRole("heading", { name: "Release 20001" }),
 	).toHaveCount(0);
 	await expect(page.getByText("octocat", { exact: true })).toHaveCount(0);
+	await expect(
+		page.locator(
+			'[data-social-card-kind="follower_received"] a[href^="https://github.com/"]',
+		),
+	).toHaveCount(1);
 });
 
 test("social activity cards fall back to placeholder avatar when image fails", async ({

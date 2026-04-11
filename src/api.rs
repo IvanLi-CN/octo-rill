@@ -4502,11 +4502,7 @@ async fn fetch_feed_items(
             NULL AS subtitle,
             NULL AS reason,
             NULL AS subject_type,
-            CASE
-              WHEN e.kind = 'repo_star_received'
-                THEN COALESCE(e.actor_html_url, 'https://github.com/' || e.repo_full_name || '/stargazers')
-              ELSE e.actor_html_url
-            END AS html_url,
+            COALESCE(e.actor_html_url, 'https://github.com/' || e.actor_login) AS html_url,
             NULL AS unread,
             e.actor_login AS actor_login,
             e.actor_avatar_url AS actor_avatar_url,
@@ -12937,6 +12933,11 @@ mod tests {
             actor.avatar_url.as_deref(),
             Some("https://avatars.example/octocat.png")
         );
+        assert_eq!(
+            actor.html_url.as_deref(),
+            Some("https://github.com/octocat")
+        );
+        assert_eq!(item.html_url.as_deref(), Some("https://github.com/octocat"));
     }
 
     #[test]

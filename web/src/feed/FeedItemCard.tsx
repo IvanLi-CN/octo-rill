@@ -411,7 +411,7 @@ function SocialActivityCard(props: {
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
 		: null;
-	const actorCardHref = isRepoStar && repoHref ? null : actorHref;
+	const actorCardHref = actorHref;
 	const targetCardHref = isRepoStar ? repoHref : null;
 	const targetViewer: FeedActor = currentViewer ?? {
 		login: "你",

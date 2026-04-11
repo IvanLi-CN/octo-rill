@@ -184,7 +184,6 @@ function FeedHistoricalDayGroup(props: {
 	action: ReactNode;
 	showDivider: boolean;
 	showBriefPanel: boolean;
-	releaseOnly: boolean;
 	brief: BriefLike | null;
 	onOpenReleaseFromBrief?: (releaseId: string) => void;
 	items: FeedItem[];
@@ -197,13 +196,11 @@ function FeedHistoricalDayGroup(props: {
 		action,
 		showDivider,
 		showBriefPanel,
-		releaseOnly,
 		brief,
 		onOpenReleaseFromBrief,
 		items,
 		feedCardProps,
 	} = props;
-	const releaseItems = items.filter((item) => isReleaseFeedItem(item));
 
 	if (!showBriefPanel) {
 		return (
@@ -215,10 +212,7 @@ function FeedHistoricalDayGroup(props: {
 					action={action}
 					showDivider={showDivider}
 				/>
-				<FeedItems
-					items={releaseOnly ? releaseItems : items}
-					{...feedCardProps}
-				/>
+				<FeedItems items={items} {...feedCardProps} />
 			</div>
 		);
 	}
@@ -303,7 +297,7 @@ export function FeedGroupedList(
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
 	const sentinelVisibleRef = useRef(false);
-	const [releaseOnlyGroupIds, setReleaseOnlyGroupIds] = useState<Set<string>>(
+	const [rawListGroupIds, setRawListGroupIds] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
 	const [pendingBriefDates, setPendingBriefDates] = useState<Set<string>>(
@@ -357,7 +351,7 @@ export function FeedGroupedList(
 	);
 
 	useEffect(() => {
-		setReleaseOnlyGroupIds((current) => {
+		setRawListGroupIds((current) => {
 			const next = new Set<string>();
 			for (const group of groups) {
 				if (!current.has(group.id)) continue;
@@ -419,8 +413,7 @@ export function FeedGroupedList(
 				const pendingBrief = pendingBriefDates.has(group.briefDate);
 				const showBriefPanel =
 					isHistoricalAllGroup &&
-					(pendingBrief ||
-						(Boolean(brief) && !releaseOnlyGroupIds.has(group.id)));
+					(pendingBrief || (Boolean(brief) && !rawListGroupIds.has(group.id)));
 				const showDivider = index > 0;
 				let groupAction: ReactNode = null;
 
@@ -438,7 +431,7 @@ export function FeedGroupedList(
 								生成日报
 							</Button>
 						);
-					} else if (brief && !releaseOnlyGroupIds.has(group.id)) {
+					} else if (brief && !rawListGroupIds.has(group.id)) {
 						groupAction = (
 							<Button
 								type="button"
@@ -446,7 +439,7 @@ export function FeedGroupedList(
 								size="sm"
 								className={FEED_DAY_ACTION_BUTTON_CLASS}
 								onClick={() => {
-									setReleaseOnlyGroupIds((current) => {
+									setRawListGroupIds((current) => {
 										const next = new Set(current);
 										next.add(group.id);
 										return next;
@@ -454,7 +447,7 @@ export function FeedGroupedList(
 								}}
 							>
 								<List className="size-4" />
-								Releases
+								列表
 							</Button>
 						);
 					} else if (brief) {
@@ -465,7 +458,7 @@ export function FeedGroupedList(
 								size="sm"
 								className={FEED_DAY_ACTION_BUTTON_CLASS}
 								onClick={() => {
-									setReleaseOnlyGroupIds((current) => {
+									setRawListGroupIds((current) => {
 										const next = new Set(current);
 										next.delete(group.id);
 										return next;
@@ -518,7 +511,7 @@ export function FeedGroupedList(
 							isHistoricalAllGroup
 								? showBriefPanel
 									? "brief"
-									: "releases"
+									: "raw"
 								: "default"
 						}
 					>
@@ -530,7 +523,6 @@ export function FeedGroupedList(
 								action={groupAction}
 								showDivider={showDivider}
 								showBriefPanel={showBriefPanel}
-								releaseOnly={brief != null && releaseOnlyGroupIds.has(group.id)}
 								brief={pendingBrief ? null : brief}
 								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
 								items={group.items}
