@@ -37,6 +37,7 @@
 - 当某个历史 target SHA 的 `CI Pipeline` 结论为阻断态时，本次 run 不能发布该 SHA，但仍要继续评估并 dispatch 更靠后的 pending release，避免整个 backfill 队列永久卡死。
 - 对同一 target SHA 重跑 release 时，版本号必须复用该提交上已存在的 release tag，而不是继续向后 bump。
 - 当 target SHA 不是当前 `main` HEAD 且对应 release tag 尚不存在时，workflow 必须在创建 release 前显式校验 `RELEASE_TOKEN` 是否可用；若不可用，需给出可执行的 fallback（预先推送目标 tag 后再重跑）。
+- 当目标 tag 已经存在时，workflow 必须复用现有 tag 创建/更新 GitHub Release，而不是继续传入会触发历史 tag 创建的参数。
 - 当前确定的补发顺序固定为：
   1. `28c3ff8f919d881f8e4bdc63c9bb9aae1543cfe9`（PR #63）
   2. `991bee71b861c7b1be0038fc0909928186c369e2`（PR #62）
