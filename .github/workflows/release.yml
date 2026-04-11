@@ -234,8 +234,18 @@ jobs:
             exit 1
           fi
 
-      - name: Create GitHub Release
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
+      - name: Create GitHub Release for existing tag
+        if: ${{ steps.intent.outputs.should_release == 'true' && steps.release-auth.outputs.tag_exists == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.export.outputs.app_release_tag }}
+          name: ${{ steps.export.outputs.app_release_tag }}
+          prerelease: ${{ steps.intent.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Create GitHub Release for missing tag
+        if: ${{ steps.intent.outputs.should_release == 'true' && steps.release-auth.outputs.tag_exists != 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.export.outputs.app_release_tag }}
