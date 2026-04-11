@@ -63,6 +63,7 @@
 
 | ID | Title | Status | Spec | Last | Notes |
 | --- | --- | --- | --- | --- | --- |
+| fvh8d | Release 失败 Telegram 告警接入 | 已完成 | `fvh8d-release-failure-telegram-alerts/SPEC.md` | 2026-04-11 | fast-track / shared github-workflows notifier rollout / smoke test target |
 | apras | 翻译请求单条记录制重建 | 已完成 | `apras-translation-request-single-record/SPEC.md` | 2026-03-09 | PR #35; checks green; review-loop clear; single-request contract live |
 | nbz5z | Translation worker board follow-up | 已完成 | `nbz5z-translation-worker-board/SPEC.md` | 2026-03-27 | PR #32, PR #38; 3 general + 1 user_dedicated worker board + runtime lease recovery |
 | gh3tz | 可配置 LLM 并行调度（取消固定限流） | 已完成 | `gh3tz-llm-max-concurrency/SPEC.md` | 2026-03-10 | PR #34; 24h summary-only UI; retry backoff requeues as queued with floor; main-list-only status grouping; non-blocking observable overrides |
