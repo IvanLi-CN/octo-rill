@@ -95,3 +95,4 @@
 | 76bxs | Dashboard 页头品牌优先重设计 | 已完成 | `76bxs-dashboard-header-brand-layout/SPEC.md` | 2026-04-10 | PR #61; brand-first header, avatar popover, and refreshed visual evidence assets |
 | g63t8 | Release 视图固定 owner/org avatar | 已完成 | `g63t8-release-avatar-only-visuals/SPEC.md` | 2026-04-10 | local implementation completed; avatar-only repo identity follow-up for PR #58 behavior |
 | zcp33 | Release reaction 扁平化重绘与圆形按钮收敛 | 已完成 | `zcp33-release-reaction-bubble-polish/SPEC.md` | 2026-04-10 | PR #59; Fluent Flat SVG assets + circular reaction trigger + external badge + Storybook evidence landed |
+| u6b32 | Web 暗色模式接通 | 已完成 | `u6b32-web-dark-mode/SPEC.md` | 2026-04-11 | local implementation completed; review-loop clear; Storybook evidence ready; pending screenshot push approval |

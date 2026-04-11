@@ -93,6 +93,7 @@ export const Default: Story = {
 		await expect(
 			canvas.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
 		).toBeVisible();
+		await expect(canvas.getByRole("group", { name: "主题模式" })).toBeVisible();
 		await expect(canvas.queryByText(/Logged in as/)).not.toBeInTheDocument();
 		await expect(canvas.getByText(/Loaded\s+\d+/)).not.toBeInTheDocument();
 		await expect(canvas.getByRole("button", { name: "同步" })).toBeVisible();

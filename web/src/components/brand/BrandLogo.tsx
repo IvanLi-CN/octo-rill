@@ -1,5 +1,6 @@
 import { cn } from "@/lib/utils";
 import { withBaseAssetPath } from "@/lib/asset-path";
+import { useTheme } from "@/theme/ThemeProvider";
 
 type BrandLogoProps = {
 	variant?: "mark" | "wordmark";
@@ -20,6 +21,8 @@ export function BrandLogo({
 	imgClassName,
 	alt = "OctoRill",
 }: BrandLogoProps) {
+	const { resolvedTheme } = useTheme();
+
 	if (variant === "mark") {
 		return (
 			<img
@@ -31,37 +34,18 @@ export function BrandLogo({
 		);
 	}
 
-	if (theme === "light") {
-		return (
-			<img
-				alt={alt}
-				className={cn("h-full w-auto", className, imgClassName)}
-				loading="eager"
-				src={WORDMARK_LIGHT_SRC}
-			/>
-		);
-	}
-
-	if (theme === "dark") {
-		return (
-			<img
-				alt={alt}
-				className={cn("h-full w-auto", className, imgClassName)}
-				loading="eager"
-				src={WORDMARK_DARK_SRC}
-			/>
-		);
-	}
+	const resolvedWordmarkTheme = theme === "auto" ? resolvedTheme : theme;
 
 	return (
-		<picture className={cn("inline-flex h-full items-center", className)}>
-			<source media="(prefers-color-scheme: dark)" srcSet={WORDMARK_DARK_SRC} />
-			<img
-				alt={alt}
-				className={cn("block h-full w-auto", imgClassName)}
-				loading="eager"
-				src={WORDMARK_LIGHT_SRC}
-			/>
-		</picture>
+		<img
+			alt={alt}
+			className={cn("h-full w-auto", className, imgClassName)}
+			loading="eager"
+			src={
+				resolvedWordmarkTheme === "dark"
+					? WORDMARK_DARK_SRC
+					: WORDMARK_LIGHT_SRC
+			}
+		/>
 	);
 }

@@ -1,6 +1,8 @@
 import type { Preview } from "@storybook/react-vite";
 import { createElement } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ThemeProvider } from "@/theme/ThemeProvider";
+import { normalizeThemePreference } from "@/theme/theme";
 import "../src/index.css";
 
 const STORYBOOK_HEALTH_VERSION = "0.1.0";
@@ -238,14 +240,43 @@ installDocsLinkSync();
 
 const preview: Preview = {
 	tags: ["autodocs"],
+	globalTypes: {
+		theme: {
+			description: "Global theme for previewed components and pages",
+			toolbar: {
+				title: "Theme",
+				icon: "mirror",
+				items: [
+					{ value: "light", title: "Light" },
+					{ value: "dark", title: "Dark" },
+					{ value: "system", title: "System" },
+				],
+				dynamicTitle: true,
+			},
+		},
+	},
+	initialGlobals: {
+		theme: "light",
+	},
 	decorators: [
-		(Story) => {
+		(Story, context) => {
+			const previewTheme = normalizeThemePreference(
+				String(context.globals.theme ?? "light"),
+			);
 			if (typeof document !== "undefined") {
 				document.body.style.backgroundImage = "none";
-				document.body.style.backgroundColor = "#f7f4ed";
+				document.body.style.backgroundColor = "var(--background)";
 				installDocsLinkSync();
 			}
-			return createElement(TooltipProvider, null, Story());
+			return createElement(
+				ThemeProvider,
+				{
+					defaultPreference: previewTheme,
+					key: `storybook-theme-${previewTheme}`,
+					persist: false,
+				},
+				createElement(TooltipProvider, null, Story()),
+			);
 		},
 	],
 	parameters: {
@@ -280,6 +311,10 @@ const preview: Preview = {
 				{
 					name: "solid-paper",
 					value: "#f7f4ed",
+				},
+				{
+					name: "night-ink",
+					value: "#0f172a",
 				},
 			],
 		},
