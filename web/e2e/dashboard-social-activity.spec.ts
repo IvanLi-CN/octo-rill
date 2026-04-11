@@ -142,32 +142,28 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 
 	await expect(page.getByRole("tab", { name: "被加星" })).toBeVisible();
 	await expect(page.getByRole("tab", { name: "被关注" })).toBeVisible();
+	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
+	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
 	await expect(
-		page.getByRole("heading", { name: "octocat 给你的仓库加了星标" }),
+		page.getByText("owner/repo", { exact: true }).nth(1),
 	).toBeVisible();
-	await expect(
-		page.getByRole("heading", { name: "monalisa 关注了你" }),
-	).toBeVisible();
+	await expect(page.getByText("标星", { exact: true })).toBeVisible();
+	await expect(page.getByText("关注", { exact: true })).toBeVisible();
 
 	await page.getByRole("tab", { name: "被加星" }).click();
-	await expect(
-		page.getByRole("heading", { name: "octocat 给你的仓库加了星标" }),
-	).toBeVisible();
-	await expect(
-		page.getByRole("heading", { name: "monalisa 关注了你" }),
-	).toHaveCount(0);
+	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
+	await expect(page.getByText("monalisa", { exact: true })).toHaveCount(0);
 	await expect(page.getByText("owner/repo", { exact: true })).toBeVisible();
+	await expect(page.getByText("标星", { exact: true })).toBeVisible();
 
 	await page.getByRole("tab", { name: "被关注" }).click();
-	await expect(
-		page.getByRole("heading", { name: "monalisa 关注了你" }),
-	).toBeVisible();
+	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
+	await expect(page.getByText("octo", { exact: true })).toBeVisible();
+	await expect(page.getByText("关注", { exact: true })).toBeVisible();
 	await expect(
 		page.getByRole("heading", { name: "Release 20001" }),
 	).toHaveCount(0);
-	await expect(
-		page.getByRole("heading", { name: "octocat 给你的仓库加了星标" }),
-	).toHaveCount(0);
+	await expect(page.getByText("octocat", { exact: true })).toHaveCount(0);
 });
 
 test("social activity cards fall back to placeholder avatar when image fails", async ({
@@ -259,7 +255,7 @@ test("social activity cards fall back to placeholder avatar when image fails", a
 
 	await page.goto("/?tab=followers");
 	await expect(
-		page.locator('[data-social-avatar-fallback="true"]'),
+		page.locator('[data-social-avatar-fallback="true"]').first(),
 	).toBeVisible();
 });
 
@@ -403,18 +399,12 @@ test("switching social tabs clears stale feed items before the next dataset reso
 
 	await page.goto("/");
 
-	await expect(
-		page.getByRole("heading", { name: "octocat-old 给你的仓库加了星标" }),
-	).toBeVisible();
+	await expect(page.getByText("octocat-old", { exact: true })).toBeVisible();
 
 	await page.getByRole("tab", { name: "被加星" }).click();
-	await expect(
-		page.getByRole("heading", { name: "octocat-old 给你的仓库加了星标" }),
-	).toHaveCount(0);
+	await expect(page.getByText("octocat-old", { exact: true })).toHaveCount(0);
 
 	releaseStarsResponse();
 
-	await expect(
-		page.getByRole("heading", { name: "octocat-new 给你的仓库加了星标" }),
-	).toBeVisible();
+	await expect(page.getByText("octocat-new", { exact: true })).toBeVisible();
 });
