@@ -260,6 +260,11 @@ struct StarredData {
 }
 
 #[derive(Debug, Deserialize)]
+struct OwnedRepoData {
+    viewer: OwnedRepoViewer,
+}
+
+#[derive(Debug, Deserialize)]
 struct Viewer {
     #[serde(rename = "starredRepositories")]
     starred_repositories: StarredRepositories,
@@ -267,9 +272,23 @@ struct Viewer {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct OwnedRepoViewer {
+    login: String,
+    repositories: OwnedRepositories,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StarredRepositories {
     page_info: PageInfo,
     edges: Vec<StarredEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnedRepositories {
+    page_info: PageInfo,
+    nodes: Vec<RepoNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,18 +347,6 @@ struct GitHubActor {
     login: String,
     avatar_url: Option<String>,
     html_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubOwnedRepo {
-    id: i64,
-    full_name: String,
-    #[serde(default)]
-    owner: RepoOwner,
-    #[serde(default)]
-    open_graph_image_url: Option<String>,
-    #[serde(default)]
-    uses_custom_open_graph_image: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3615,40 +3622,112 @@ async fn fetch_owned_repo_snapshot(
     state: &AppState,
     access_token: &str,
 ) -> Result<Vec<OwnedRepoSnapshot>, SyncRequestError> {
-    let mut page = 1usize;
+    let query = r#"
+      query($after: String) {
+        viewer {
+          login
+          repositories(
+            first: 100
+            after: $after
+            ownerAffiliations: [OWNER]
+            orderBy: {field: UPDATED_AT, direction: DESC}
+          ) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              databaseId
+              nameWithOwner
+              openGraphImageUrl
+              usesCustomOpenGraphImage
+              owner {
+                login
+                avatarUrl(size: 80)
+              }
+            }
+          }
+        }
+      }
+    "#;
+
+    let mut after: Option<String> = None;
     let mut repos = Vec::new();
 
     loop {
-        let operation = format!("sync social owned repos page {page}");
-        let url =
-            format!("{REST_API_BASE}/user/repos?type=owner&sort=updated&per_page=100&page={page}");
-        let items = fetch_github_rest_page::<Vec<GitHubOwnedRepo>>(
-            state,
-            access_token,
-            url.as_str(),
-            "application/vnd.github+json",
-            operation.as_str(),
-        )
+        let payload = with_subscription_timeout("sync social owned repos graphql", async {
+            let response = state
+                .http
+                .post(GRAPHQL_URL)
+                .bearer_auth(access_token)
+                .header(USER_AGENT, "OctoRill")
+                .header(ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", API_VERSION)
+                .json(&json!({
+                    "query": query,
+                    "variables": { "after": after },
+                }))
+                .send()
+                .await
+                .map_err(|err| classify_reqwest_error("sync social owned repos graphql", err))?;
+
+            fetch_json_response::<GraphQlResponse<OwnedRepoData>>(
+                response,
+                "sync social owned repos graphql",
+            )
+            .await
+        })
         .await?;
 
-        let count = items.len();
-        repos.extend(items.into_iter().map(|repo| OwnedRepoSnapshot {
-            repo_id: repo.id,
-            full_name: repo.full_name,
-            owner_avatar_url: repo.owner.avatar_url,
-            open_graph_image_url: repo.open_graph_image_url,
-            uses_custom_open_graph_image: repo.uses_custom_open_graph_image,
-        }));
+        if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+            return Err(classify_graphql_errors(
+                "sync social owned repos graphql",
+                errors,
+            ));
+        }
 
-        if count < 100 {
+        let viewer = payload
+            .data
+            .ok_or_else(|| {
+                SyncRequestError::non_retryable(
+                    "graphql_missing_data",
+                    "sync social owned repos graphql: missing graphql data",
+                    None,
+                )
+            })?
+            .viewer;
+        let viewer_login = viewer.login;
+        let page = viewer.repositories;
+        for node in page.nodes {
+            if let Some(repo) = owned_repo_snapshot_from_node(node, viewer_login.as_str()) {
+                repos.push(repo);
+            }
+        }
+
+        if !page.page_info.has_next_page {
             break;
         }
-        page += 1;
+        after = page.page_info.end_cursor;
+        if after.is_none() {
+            break;
+        }
     }
 
     repos.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
     repos.dedup_by(|left, right| left.repo_id == right.repo_id);
     Ok(repos)
+}
+
+fn owned_repo_snapshot_from_node(node: RepoNode, viewer_login: &str) -> Option<OwnedRepoSnapshot> {
+    let repo_id = node.database_id?;
+    if !node.owner.login.eq_ignore_ascii_case(viewer_login) {
+        return None;
+    }
+
+    Some(OwnedRepoSnapshot {
+        repo_id,
+        full_name: node.name_with_owner,
+        owner_avatar_url: node.owner.avatar_url,
+        open_graph_image_url: node.open_graph_image_url,
+        uses_custom_open_graph_image: node.uses_custom_open_graph_image,
+    })
 }
 
 async fn fetch_followers_snapshot(
@@ -4467,13 +4546,14 @@ mod tests {
         EligibleUserRow, FollowerSnapshot, GitHubActor, GitHubNotification,
         NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
         NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
-        NotificationSubject, OwnedRepoSnapshot, ReleaseDemandRepo, RepoReleaseOrigin,
-        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
-        SubscriptionRunContext, SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
-        apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
-        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, insert_social_activity_event_tx,
-        is_terminal_notification_thread_error, recover_repo_release_runtime_state_on_startup,
+        NotificationSubject, OwnedRepoSnapshot, ReleaseDemandRepo, RepoNode, RepoOwner,
+        RepoReleaseOrigin, RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess,
+        StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
+        attach_and_wait_for_user_release_demand, attach_release_demand, classify_github_http_error,
+        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        insert_social_activity_event_tx, is_terminal_notification_thread_error,
+        owned_repo_snapshot_from_node, recover_repo_release_runtime_state_on_startup,
         repo_release_deadline_at, resolve_notification_open_url,
         subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
@@ -4498,6 +4578,67 @@ mod tests {
         assert!(cmp_last_active_desc(stale, recent).is_gt());
         assert!(cmp_last_active_desc(recent, None).is_lt());
         assert!(cmp_last_active_desc(None, recent).is_gt());
+    }
+
+    #[test]
+    fn owned_repo_snapshot_from_node_preserves_visuals_for_viewer_owned_repo() {
+        let snapshot = owned_repo_snapshot_from_node(
+            RepoNode {
+                database_id: Some(42),
+                name_with_owner: "octo/rocket".to_owned(),
+                name: "rocket".to_owned(),
+                description: None,
+                url: "https://github.com/octo/rocket".to_owned(),
+                is_private: false,
+                open_graph_image_url: Some(
+                    "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
+                ),
+                uses_custom_open_graph_image: true,
+                owner: RepoOwner {
+                    login: "octo".to_owned(),
+                    avatar_url: Some("https://avatars.githubusercontent.com/u/42".to_owned()),
+                },
+            },
+            "octo",
+        )
+        .expect("viewer-owned repo snapshot");
+
+        assert_eq!(snapshot.repo_id, 42);
+        assert_eq!(snapshot.full_name, "octo/rocket");
+        assert_eq!(
+            snapshot.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/42")
+        );
+        assert_eq!(
+            snapshot.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/42/rocket")
+        );
+        assert!(snapshot.uses_custom_open_graph_image);
+    }
+
+    #[test]
+    fn owned_repo_snapshot_from_node_skips_non_viewer_owned_repo() {
+        let snapshot = owned_repo_snapshot_from_node(
+            RepoNode {
+                database_id: Some(99),
+                name_with_owner: "acme/shared".to_owned(),
+                name: "shared".to_owned(),
+                description: None,
+                url: "https://github.com/acme/shared".to_owned(),
+                is_private: false,
+                open_graph_image_url: Some(
+                    "https://repository-images.githubusercontent.com/99/shared".to_owned(),
+                ),
+                uses_custom_open_graph_image: true,
+                owner: RepoOwner {
+                    login: "acme".to_owned(),
+                    avatar_url: Some("https://avatars.githubusercontent.com/u/99".to_owned()),
+                },
+            },
+            "octo",
+        );
+
+        assert!(snapshot.is_none());
     }
 
     #[test]
