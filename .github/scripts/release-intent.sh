@@ -4,7 +4,7 @@ set -euo pipefail
 api_root="${GITHUB_API_URL:-https://api.github.com}"
 repo="${GITHUB_REPOSITORY:-}"
 token="${GITHUB_TOKEN:-}"
-sha="${WORKFLOW_RUN_SHA:-${GITHUB_SHA:-}}"
+sha="${RELEASE_HEAD_SHA:-${WORKFLOW_RUN_SHA:-${GITHUB_SHA:-}}}"
 
 if [[ -z "${repo}" ]]; then
   echo "release-intent: missing GITHUB_REPOSITORY" >&2
@@ -12,7 +12,7 @@ if [[ -z "${repo}" ]]; then
 fi
 
 if [[ -z "${sha}" ]]; then
-  echo "release-intent: missing WORKFLOW_RUN_SHA (or GITHUB_SHA)" >&2
+  echo "release-intent: missing RELEASE_HEAD_SHA (or WORKFLOW_RUN_SHA / GITHUB_SHA)" >&2
   exit 2
 fi
 
@@ -129,18 +129,7 @@ channel=""
 prerelease=""
 release_intent_label=""
 reason=""
-while IFS='=' read -r key value; do
-  case "${key}" in
-    status) status="${value}" ;;
-    message) message="${value}" ;;
-    should_release) should_release="${value}" ;;
-    bump_level) bump_level="${value}" ;;
-    channel) channel="${value}" ;;
-    prerelease) prerelease="${value}" ;;
-    release_intent_label) release_intent_label="${value}" ;;
-    reason) reason="${value}" ;;
-  esac
-done < <(
+intent_lines="$(
   python3 - <<'PY'
 from __future__ import annotations
 
@@ -215,7 +204,19 @@ print(f"prerelease={is_prerelease}")
 print(f"release_intent_label={type_label}")
 print("reason=intent_release")
 PY
-)
+)"
+while IFS='=' read -r key value; do
+  case "${key}" in
+    status) status="${value}" ;;
+    message) message="${value}" ;;
+    should_release) should_release="${value}" ;;
+    bump_level) bump_level="${value}" ;;
+    channel) channel="${value}" ;;
+    prerelease) prerelease="${value}" ;;
+    release_intent_label) release_intent_label="${value}" ;;
+    reason) reason="${value}" ;;
+  esac
+done <<< "${intent_lines}"
 
 if [[ "${status}" != "ok" ]]; then
   echo "::error::release-intent: ${message:-invalid_labels}"
