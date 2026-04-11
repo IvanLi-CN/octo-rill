@@ -1342,7 +1342,8 @@ async fn apply_social_activity_snapshot_partial(
         for repo in owned_repos {
             let was_known_repo = known_repo_ids.contains(&repo.repo_id);
             let fetched_snapshot_this_run = successful_repo_snapshot_ids.contains(&repo.repo_id);
-            let should_persist_baseline = was_known_repo || fetched_snapshot_this_run;
+            let should_persist_baseline =
+                !repo_tracking_initialized || was_known_repo || fetched_snapshot_this_run;
 
             if !should_persist_baseline {
                 continue;
@@ -6369,7 +6370,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn social_activity_failed_repo_bootstrap_emits_current_stars_after_recovery() {
+    async fn social_activity_failed_repo_bootstrap_seeds_members_without_backfilling_history() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-failed-repo-bootstrap");
@@ -6400,7 +6401,21 @@ mod tests {
         .await
         .expect("seed partial bootstrap state");
 
-        let events = apply_social_activity_snapshot(
+        let seeded_baseline_state: i64 = sqlx::query_scalar(
+            r#"
+            SELECT members_snapshot_initialized
+            FROM owned_repo_star_baselines
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(skipped_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load skipped repo baseline after partial bootstrap");
+        assert_eq!(seeded_baseline_state, 0);
+
+        let recovery_events = apply_social_activity_snapshot(
             state.as_ref(),
             user_id.as_str(),
             &[stable_repo.clone(), skipped_repo.clone()],
@@ -6428,7 +6443,7 @@ mod tests {
         .await
         .expect("recover skipped repo snapshot");
 
-        assert_eq!(events, 1);
+        assert_eq!(recovery_events, 0);
 
         let baseline_state: i64 = sqlx::query_scalar(
             r#"
@@ -6443,6 +6458,73 @@ mod tests {
         .await
         .expect("load skipped repo baseline state");
         assert_eq!(baseline_state, 1);
+
+        let history_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM social_activity_events
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(skipped_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count skipped repo history");
+        assert_eq!(history_count, 0);
+
+        let current_member_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_current_members
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(skipped_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count skipped repo current members after recovery");
+        assert_eq!(current_member_count, 1);
+
+        let new_star_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&skipped_repo),
+            &[(
+                skipped_repo.clone(),
+                vec![
+                    RepoStargazerSnapshot {
+                        repo_id: skipped_repo.repo_id,
+                        repo_full_name: skipped_repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 801,
+                            login: "existing-star".to_owned(),
+                            avatar_url: Some(
+                                "https://avatars.example/existing-star.png".to_owned(),
+                            ),
+                            html_url: Some("https://github.com/existing-star".to_owned()),
+                        },
+                        starred_at: Some("2026-03-06T15:30:00Z".to_owned()),
+                    },
+                    RepoStargazerSnapshot {
+                        repo_id: skipped_repo.repo_id,
+                        repo_full_name: skipped_repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 802,
+                            login: "fresh-star".to_owned(),
+                            avatar_url: Some("https://avatars.example/fresh-star.png".to_owned()),
+                            html_url: Some("https://github.com/fresh-star".to_owned()),
+                        },
+                        starred_at: Some("2026-03-06T16:00:00Z".to_owned()),
+                    },
+                ],
+            )],
+            &[],
+        )
+        .await
+        .expect("record fresh star after recovery");
+        assert_eq!(new_star_events, 1);
 
         let row: (String, String) = sqlx::query_as(
             r#"
@@ -6459,7 +6541,7 @@ mod tests {
         .await
         .expect("load skipped repo history");
         assert_eq!(row.0, "octo/beta");
-        assert_eq!(row.1, "existing-star");
+        assert_eq!(row.1, "fresh-star");
     }
 
     #[tokio::test]
