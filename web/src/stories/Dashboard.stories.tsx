@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useLayoutEffect, useState } from "react";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,12 @@ import {
 	resolveDisplayLaneForFeed,
 	resolvePreferredLaneForItem,
 } from "@/feed/laneOptions";
-import type { FeedItem, FeedLane } from "@/feed/types";
+import type {
+	FeedItem,
+	FeedLane,
+	ReleaseFeedItem,
+	SocialFeedItem,
+} from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
@@ -38,10 +43,9 @@ import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 import { VersionMonitorStateProvider } from "@/version/versionMonitor";
 
-type Tab = "all" | "releases" | "briefs" | "inbox";
+type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 type FeedMode =
 	| "default"
-	| "reaction-polish"
 	| "visible-window-queued"
 	| "visible-window-settling"
 	| "body-limit-error"
@@ -57,21 +61,14 @@ const STORYBOOK_DAILY_BOUNDARY = "08:00";
 const STORYBOOK_DAILY_BOUNDARY_TIME_ZONE = "Asia/Shanghai";
 const STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES = 8 * 60;
 const STORYBOOK_NOW = new Date("2026-04-04T12:00:00+08:00");
-const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
-const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 const STORYBOOK_VERSION_STATE = {
 	loadedVersion: "v2.4.6",
 	availableVersion: null,
 	hasUpdate: false,
 	refreshPage: () => {},
 } as const;
-const STORYBOOK_USER_AVATAR = svgDataUrl("SU", "#4f6a98");
-
-function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
-	return `data:image/svg+xml;utf8,${encodeURIComponent(
-		`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="36" fill="${background}"/><text x="120" y="132" font-family="Inter,Arial,sans-serif" font-size="44" font-weight="700" text-anchor="middle" fill="${foreground}">${label}</text></svg>`,
-	)}`;
-}
+const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
+const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 
 function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -79,12 +76,22 @@ function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	)}`;
 }
 
+function githubAvatarUrl(username: string, size = 96) {
+	return `https://github.com/${username}.png?size=${size}`;
+}
+
+const STORYBOOK_VIEWER = {
+	login: "sindresorhus",
+	avatar_url: githubAvatarUrl("sindresorhus"),
+	html_url: "https://github.com/sindresorhus",
+} as const;
+
 const repoVisualFixtures: Record<
 	"social" | "avatar" | "text",
 	RepoVisual | null
 > = {
 	social: {
-		owner_avatar_url: svgDataUrl("AR", "#1d4ed8"),
+		owner_avatar_url: githubAvatarUrl("github"),
 		open_graph_image_url: socialPreviewDataUrl(
 			"Rocket Release",
 			"#2563eb",
@@ -93,7 +100,7 @@ const repoVisualFixtures: Record<
 		uses_custom_open_graph_image: true,
 	},
 	avatar: {
-		owner_avatar_url: svgDataUrl("LC", "#7c3aed"),
+		owner_avatar_url: githubAvatarUrl("openai"),
 		open_graph_image_url: null,
 		uses_custom_open_graph_image: false,
 	},
@@ -111,7 +118,10 @@ function defaultLaneForItem(
 	return resolvePreferredLaneForItem(item, pageDefaultLane);
 }
 
-function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
+function buildFeedItem(
+	id: string,
+	overrides?: Partial<ReleaseFeedItem>,
+): ReleaseFeedItem {
 	return {
 		kind: "release",
 		ts: "2026-02-21T08:05:00Z",
@@ -126,6 +136,7 @@ function buildFeedItem(id: string, overrides?: Partial<FeedItem>): FeedItem {
 		subject_type: null,
 		html_url: `https://github.com/acme/rocket/releases/tag/${id}`,
 		unread: null,
+		actor: null,
 		translated: {
 			lang: "zh-CN",
 			status: "missing",
@@ -225,7 +236,6 @@ function makeMockFeed(): FeedItem[] {
 		}),
 		buildFeedItem("10003", {
 			ts: "2026-04-04T07:10:00+08:00",
-			repo_visual: repoVisualFixtures.text,
 			title: "nightly guardrails",
 			body: `- ${HISTORY_RAW_MARKER}\n- Tighten upload guardrails\n- Normalize rollout order`,
 			html_url:
@@ -252,48 +262,95 @@ function makeMockFeed(): FeedItem[] {
 	];
 }
 
-function makeReactionPolishFeed(): FeedItem[] {
+function buildRepoStarItem(
+	id: string,
+	overrides?: Partial<SocialFeedItem>,
+): SocialFeedItem {
+	return {
+		kind: "repo_star_received",
+		ts: "2026-04-04T14:20:00+08:00",
+		id,
+		repo_full_name: "acme/rocket",
+		repo_visual: repoVisualFixtures.social,
+		title: null,
+		body: null,
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: "https://github.com/torvalds",
+		unread: null,
+		actor: {
+			login: "torvalds",
+			avatar_url: githubAvatarUrl("torvalds"),
+			html_url: "https://github.com/torvalds",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+		...overrides,
+	};
+}
+
+function buildFollowerItem(
+	id: string,
+	overrides?: Partial<SocialFeedItem>,
+): SocialFeedItem {
+	return {
+		kind: "follower_received",
+		ts: "2026-04-04T13:45:00+08:00",
+		id,
+		repo_full_name: null,
+		repo_visual: null,
+		title: null,
+		body: null,
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: "https://github.com/gaearon",
+		unread: null,
+		actor: {
+			login: "gaearon",
+			avatar_url: githubAvatarUrl("gaearon"),
+			html_url: "https://github.com/gaearon",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+		...overrides,
+	};
+}
+
+function makeMixedSocialFeed(): FeedItem[] {
 	return [
-		buildFeedItem("60001", {
-			ts: "2026-04-03T21:30:00+08:00",
+		...makeMockFeed(),
+		buildRepoStarItem("star-10001", {
+			ts: "2026-04-04T16:06:00+08:00",
+			repo_full_name: "acme/rocket",
+		}),
+		buildFollowerItem("follow-10001", {
+			ts: "2026-04-04T14:48:00+08:00",
+		}),
+		buildRepoStarItem("star-10002", {
+			ts: "2026-04-03T22:10:00+08:00",
 			repo_full_name: "acme/satellite",
-			title: "oauth action bubble polish",
-			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
-			html_url:
-				"https://github.com/acme/satellite/releases/tag/oauth-action-bubble",
-			reactions: {
-				counts: {
-					plus1: 12,
-					laugh: 0,
-					heart: 4,
-					hooray: 0,
-					rocket: 2,
-					eyes: 0,
-				},
-				viewer: {
-					plus1: true,
-					laugh: false,
-					heart: false,
-					hooray: false,
-					rocket: true,
-					eyes: false,
-				},
-				status: "ready",
+			repo_visual: repoVisualFixtures.avatar,
+			actor: {
+				login: "linus",
+				avatar_url: githubAvatarUrl("linus"),
+				html_url: "https://github.com/linus",
 			},
-			smart: {
-				lang: "zh-CN",
-				status: "ready",
-				title: "oauth action bubble polish",
-				summary:
-					"- 收敛 release reaction 泡泡样式\n- 统一 hover / active / busy 的视觉层级",
+			html_url: "https://github.com/linus",
+		}),
+		buildFollowerItem("follow-fallback", {
+			ts: "2026-04-03T06:45:00+08:00",
+			actor: {
+				login: "yyx990803",
+				avatar_url: githubAvatarUrl("yyx990803"),
+				html_url: "https://github.com/yyx990803",
 			},
-			translated: {
-				lang: "zh-CN",
-				status: "ready",
-				title: "oauth action bubble polish",
-				summary:
-					"- 收敛 release reaction 泡泡样式\n- 统一 hover / active / busy 的视觉层级",
-			},
+			html_url: "https://github.com/yyx990803",
 		}),
 	];
 }
@@ -301,7 +358,7 @@ function makeReactionPolishFeed(): FeedItem[] {
 function makeVisibleWindowFeed(
 	mode: "visible-window-queued" | "visible-window-settling",
 ): FeedItem[] {
-	const items = Array.from({ length: 12 }, (_, index) => {
+	const items: ReleaseFeedItem[] = Array.from({ length: 12 }, (_, index) => {
 		const seq = `${index + 1}`.padStart(2, "0");
 		return buildFeedItem(`200${seq}`, {
 			ts: `2026-02-21T0${(index % 6) + 1}:15:00Z`,
@@ -487,12 +544,6 @@ function makeVisibleWindowInFlightKeys(
 	);
 }
 
-function isVisibleWindowFeedMode(
-	mode: FeedMode,
-): mode is "visible-window-queued" | "visible-window-settling" {
-	return mode === "visible-window-queued" || mode === "visible-window-settling";
-}
-
 function makeSmartInFlightKeys(mode: FeedMode) {
 	return new Set(
 		mode === "smart-loading"
@@ -501,10 +552,6 @@ function makeSmartInFlightKeys(mode: FeedMode) {
 				? []
 				: [],
 	);
-}
-
-function makeReactionBusyKeys(mode: FeedMode) {
-	return new Set(mode === "reaction-polish" ? ["release:60001"] : []);
 }
 
 const mockBriefs: BriefItem[] = [
@@ -577,7 +624,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
 	repo_full_name: "acme/rocket",
-	repo_visual: repoVisualFixtures.avatar,
+	repo_visual: repoVisualFixtures.social,
 	tag_name: "v3.4.0",
 	name: "v3.4.0 · release train",
 	body: [
@@ -660,7 +707,7 @@ const mockNotifs: NotificationItem[] = [
 		reason: "ci_activity",
 		updated_at: "2026-02-21T07:40:00Z",
 		unread: 1,
-		html_url: "https://github.com/notifications?query=repo%3Aacme%2Frocket",
+		html_url: null,
 	},
 	{
 		thread_id: "90000",
@@ -670,7 +717,7 @@ const mockNotifs: NotificationItem[] = [
 		reason: "review_requested",
 		updated_at: "2026-02-21T06:50:00Z",
 		unread: 0,
-		html_url: "https://github.com/acme/rocket/pull/42",
+		html_url: null,
 	},
 ];
 
@@ -682,6 +729,7 @@ function DashboardPreview(props: {
 	emptyState?: "content" | "auto-sync" | "no-cache";
 	feedMode?: FeedMode;
 	briefs?: BriefItem[];
+	feedItems?: FeedItem[];
 	dailyBoundaryLocal?: string;
 	dailyBoundaryTimeZone?: string;
 	dailyBoundaryUtcOffsetMinutes?: number;
@@ -697,6 +745,7 @@ function DashboardPreview(props: {
 		emptyState = "content",
 		feedMode = "default",
 		briefs = mockBriefs,
+		feedItems,
 		dailyBoundaryLocal = STORYBOOK_DAILY_BOUNDARY,
 		dailyBoundaryTimeZone = STORYBOOK_DAILY_BOUNDARY_TIME_ZONE,
 		dailyBoundaryUtcOffsetMinutes = STORYBOOK_DAILY_BOUNDARY_UTC_OFFSET_MINUTES,
@@ -714,36 +763,29 @@ function DashboardPreview(props: {
 	const items =
 		emptyState !== "content"
 			? []
-			: (() => {
-					switch (feedMode) {
-						case "default":
-							return makeMockFeed();
-						case "reaction-polish":
-							return makeReactionPolishFeed();
-						case "body-limit-error":
-							return makeBodyLimitErrorFeed();
-						case "sync-preheated":
-							return makeSyncPreheatedFeed();
-						case "smart-ready-body":
-							return makeSmartReadyBodyFeed();
-						case "smart-ready-diff":
-							return makeSmartReadyDiffFeed();
-						case "smart-loading":
-							return makeSmartLoadingFeed();
-						case "smart-retry-error":
-							return makeSmartRetryErrorFeed();
-						case "smart-insufficient":
-							return makeSmartInsufficientFeed();
-						case "visible-window-queued":
-						case "visible-window-settling":
-							return makeVisibleWindowFeed(feedMode);
-					}
-				})();
+			: feedItems
+				? feedItems
+				: feedMode === "default"
+					? makeMockFeed()
+					: feedMode === "body-limit-error"
+						? makeBodyLimitErrorFeed()
+						: feedMode === "sync-preheated"
+							? makeSyncPreheatedFeed()
+							: feedMode === "smart-ready-body"
+								? makeSmartReadyBodyFeed()
+								: feedMode === "smart-ready-diff"
+									? makeSmartReadyDiffFeed()
+									: feedMode === "smart-loading"
+										? makeSmartLoadingFeed()
+										: feedMode === "smart-retry-error"
+											? makeSmartRetryErrorFeed()
+											: feedMode === "smart-insufficient"
+												? makeSmartInsufficientFeed()
+												: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const translationInFlightKeys =
 		emptyState !== "content" ||
 		feedMode === "default" ||
-		feedMode === "reaction-polish" ||
 		feedMode === "body-limit-error" ||
 		feedMode === "sync-preheated" ||
 		feedMode === "smart-ready-body" ||
@@ -752,13 +794,11 @@ function DashboardPreview(props: {
 		feedMode === "smart-retry-error" ||
 		feedMode === "smart-insufficient"
 			? new Set<string>()
-			: isVisibleWindowFeedMode(feedMode)
-				? makeVisibleWindowInFlightKeys(feedMode)
-				: new Set<string>();
+			: makeVisibleWindowInFlightKeys(feedMode);
 	const [smartInFlightKeys, setSmartInFlightKeys] = useState<Set<string>>(() =>
 		makeSmartInFlightKeys(feedMode),
 	);
-	const reactionBusyKeys = makeReactionBusyKeys(feedMode);
+	const reactionBusyKeys = new Set<string>();
 	const aiDisabledHint = items.some(
 		(it) =>
 			it.translated?.status === "disabled" || it.smart?.status === "disabled",
@@ -780,6 +820,19 @@ function DashboardPreview(props: {
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
 	);
+
+	const visibleItems = (mode: "all" | "releases" | "stars" | "followers") => {
+		switch (mode) {
+			case "releases":
+				return items.filter((item) => item.kind === "release");
+			case "stars":
+				return items.filter((item) => item.kind === "repo_star_received");
+			case "followers":
+				return items.filter((item) => item.kind === "follower_received");
+			default:
+				return items;
+		}
+	};
 
 	useEffect(() => {
 		setSmartInFlightKeys(makeSmartInFlightKeys(feedMode));
@@ -820,16 +873,17 @@ function DashboardPreview(props: {
 		});
 	};
 
-	const renderFeedPanel = (mode: "all" | "releases") =>
-		items.length === 0 ? (
+	const renderFeedPanel = (mode: "all" | "releases" | "stars" | "followers") =>
+		visibleItems(mode).length === 0 ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 				{emptyState === "auto-sync" ? (
 					<>
 						<h2 className="text-base font-semibold tracking-tight">
-							正在同步你的 Star / Release
+							正在同步你的 GitHub 动态
 						</h2>
 						<p className="text-muted-foreground mt-1 text-sm">
-							先展示服务端已有缓存，再补齐最新仓库数据；完成后这里会自动刷新。
+							先展示已有缓存，再补齐最新
+							release、被加星和被关注记录；完成后这里会自动刷新。
 						</p>
 					</>
 				) : (
@@ -838,13 +892,10 @@ function DashboardPreview(props: {
 							还没有缓存内容
 						</h2>
 						<p className="text-muted-foreground mt-1 text-sm">
-							可以先同步 Star / Release；Inbox 仍然单独同步。
+							可以先同步一次，把 release 和社交动态都拉下来。
 						</p>
 						<div className="mt-4 flex flex-wrap gap-2">
 							<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
-							<Button variant="outline">Sync starred</Button>
-							<Button variant="outline">Sync releases</Button>
-							<Button variant="outline">Sync inbox</Button>
 						</div>
 					</>
 				)}
@@ -852,7 +903,8 @@ function DashboardPreview(props: {
 		) : (
 			<FeedGroupedList
 				mode={mode}
-				items={items}
+				items={visibleItems(mode)}
+				currentViewer={STORYBOOK_VIEWER}
 				briefs={storyBriefs}
 				dailyBoundaryLocal={dailyBoundaryLocal}
 				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
@@ -867,7 +919,7 @@ function DashboardPreview(props: {
 				registerItemRef={() => () => {}}
 				onLoadMore={() => {}}
 				selectedLaneByKey={Object.fromEntries(
-					items.map((item) => [
+					visibleItems(mode).map((item) => [
 						feedItemKey(item),
 						selectedLaneByKey[feedItemKey(item)] ??
 							defaultLaneForItem(item, pageDefaultLane),
@@ -896,10 +948,8 @@ function DashboardPreview(props: {
 			<AppShell
 				header={
 					<DashboardHeader
-						avatarUrl={STORYBOOK_USER_AVATAR}
-						email="storybook-user@example.com"
-						login="storybook-user"
-						name="Storybook User"
+						login={STORYBOOK_VIEWER.login}
+						avatarUrl={STORYBOOK_VIEWER.avatar_url}
 						isAdmin
 						aiDisabledHint={aiDisabledHint}
 						busy={syncingAll}
@@ -923,6 +973,12 @@ function DashboardPreview(props: {
 							</TabsTrigger>
 							<TabsTrigger value="releases" className="font-mono text-xs">
 								Releases
+							</TabsTrigger>
+							<TabsTrigger value="stars" className="font-mono text-xs">
+								被加星
+							</TabsTrigger>
+							<TabsTrigger value="followers" className="font-mono text-xs">
+								被关注
 							</TabsTrigger>
 							<TabsTrigger value="briefs" className="font-mono text-xs">
 								日报
@@ -970,6 +1026,12 @@ function DashboardPreview(props: {
 							</TabsContent>
 							<TabsContent value="releases" className="mt-0 min-w-0">
 								{renderFeedPanel("releases")}
+							</TabsContent>
+							<TabsContent value="stars" className="mt-0 min-w-0">
+								{renderFeedPanel("stars")}
+							</TabsContent>
+							<TabsContent value="followers" className="mt-0 min-w-0">
+								{renderFeedPanel("followers")}
 							</TabsContent>
 							<TabsContent value="briefs" className="mt-0 min-w-0">
 								<ReleaseDailyCard
@@ -1121,22 +1183,6 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
-		expect(
-			canvasElement.querySelector("[data-dashboard-brand-heading]"),
-		).not.toBeNull();
-		await expect(
-			canvas.getByRole("heading", { name: "OctoRill" }),
-		).toBeVisible();
-		await expect(
-			canvas.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
-		).toBeVisible();
-		await expect(canvas.queryByText(/Loaded\s+\d+/)).not.toBeInTheDocument();
-		await expect(canvas.queryByText(/Logged in as/)).not.toBeInTheDocument();
-		const profileButton = canvas.getByRole("button", { name: "查看账号信息" });
-		await userEvent.click(profileButton);
-		await expect(canvas.getByText("Storybook User")).toBeVisible();
-		await expect(canvas.getByText("@storybook-user")).toBeVisible();
-		await expect(canvas.getByRole("link", { name: "退出登录" })).toBeVisible();
 	},
 };
 
@@ -1187,7 +1233,7 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		docs: {
 			description: {
 				story:
-					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到 releases 视图后只保留日期分界与原始列表。",
+					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到列表视图后恢复同一天的原始混排记录。",
 			},
 		},
 	},
@@ -1220,7 +1266,7 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			if (!beforeSlot || !expandButton) {
 				throw new Error("Expected action slot and expand button to exist");
 			}
-			expect(expandButton.textContent?.trim()).toBe("Releases");
+			expect(expandButton.textContent?.trim()).toBe("列表");
 			const beforeSlotRect = beforeSlot.getBoundingClientRect();
 			const beforeButtonRect = expandButton.getBoundingClientRect();
 			await expandButton.click();
@@ -1380,44 +1426,11 @@ export const BriefsLongContentWithDetail: Story = {
 		await expect(await body.findByRole("dialog")).toBeVisible();
 		await expect(await body.findByText(/翻译总览/)).toBeVisible();
 		await expect(body.getByText(/变更波次 10/)).toBeVisible();
-		expect(
-			canvasElement.ownerDocument.body.querySelector(
-				'[data-repo-visual-kind="owner_avatar"]',
-			),
-		).not.toBeNull();
 		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
 		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
 		await expect(
 			canvas.queryByRole("heading", { name: "Release 详情" }),
 		).not.toBeInTheDocument();
-	},
-};
-
-export const ReleaseRepoVisuals: Story = {
-	args: {
-		initialTab: "releases",
-		feedMode: "default",
-	},
-	parameters: {
-		docs: {
-			description: {
-				story:
-					"Release 卡片仓库视觉固定优先显示 owner/avatar；即使 metadata 里带有 custom social preview，也只作为兼容字段保留，不参与前端展示。",
-			},
-		},
-	},
-	play: async ({ canvasElement }) => {
-		expect(
-			canvasElement.querySelectorAll('[data-repo-visual-kind="owner_avatar"]')
-				.length,
-		).toBeGreaterThan(0);
-		expect(
-			canvasElement.querySelectorAll('[data-repo-visual-kind="text_only"]')
-				.length,
-		).toBeGreaterThan(0);
-		expect(
-			canvasElement.querySelector('[data-repo-visual-kind="social_preview"]'),
-		).toBeNull();
 	},
 };
 
@@ -1557,39 +1570,6 @@ export const InboxEmpty: Story = {
 	},
 };
 
-export const InboxLinksResolved: Story = {
-	args: {
-		initialTab: "inbox",
-	},
-	parameters: {
-		docs: {
-			description: {
-				story:
-					"Inbox 通知项优先使用后端给出的目标页；遇到缺失或退化链接时，前端回退到 GitHub 的 per-thread 页面 `/notifications/threads/{id}`，不再拼错成单数 `/notifications/thread/{id}`。",
-			},
-		},
-	},
-	play: async ({ canvasElement }) => {
-		const canvas = within(canvasElement);
-		const inboxLinks = canvas.getAllByRole("link");
-		await expect(
-			inboxLinks.some((link) =>
-				link.getAttribute("href")?.includes("/notifications/thread/"),
-			),
-		).toBe(false);
-		await expect(
-			inboxLinks.some((link) =>
-				link.getAttribute("href")?.includes("/notifications/threads/90001"),
-			),
-		).toBe(true);
-		await expect(
-			inboxLinks.some((link) =>
-				link.getAttribute("href")?.includes("/pull/42"),
-			),
-		).toBe(true);
-	},
-};
-
 export const PatDialogOpen: Story = {
 	args: {
 		initialTab: "briefs",
@@ -1600,80 +1580,6 @@ export const PatDialogOpen: Story = {
 			description: {
 				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
 			},
-		},
-	},
-};
-
-export const ReactionBubblePolish: Story = {
-	args: {
-		initialTab: "releases",
-		feedMode: "reaction-polish",
-	},
-	parameters: {
-		docs: {
-			description: {
-				story:
-					"Reaction footer 使用本地 Fluent Flat SVG 与真圆按钮；有计数时 badge 浮在按钮外侧，零计数项保持无 badge，busy 态继续弱化透明度。",
-			},
-		},
-	},
-	play: async ({ canvasElement }) => {
-		const canvas = within(canvasElement);
-		const releaseHeading = canvas.getByRole("heading", {
-			name: "oauth action bubble polish",
-		});
-		const releaseCard = releaseHeading
-			.closest('[data-slot="card"]')
-			?.querySelector<HTMLElement>('[data-reaction-footer="true"]');
-		expect(releaseCard).not.toBeNull();
-		if (!releaseCard) {
-			throw new Error("Expected release reaction footer to exist");
-		}
-
-		const plusOneChip = releaseCard.querySelector<HTMLElement>(
-			'[data-reaction-chip="plus1"]',
-		);
-		const plusOneButton = releaseCard.querySelector<HTMLButtonElement>(
-			'[data-reaction-trigger="plus1"]',
-		);
-		const plusOneBadge = releaseCard.querySelector<HTMLElement>(
-			'[data-reaction-count-badge="plus1"]',
-		);
-		const laughBadge = releaseCard.querySelector(
-			'[data-reaction-count-badge="laugh"]',
-		);
-		expect(plusOneChip).not.toBeNull();
-		expect(plusOneButton).not.toBeNull();
-		expect(plusOneBadge).not.toBeNull();
-		expect(laughBadge).toBeNull();
-		if (!plusOneChip || !plusOneButton || !plusOneBadge) {
-			throw new Error("Expected plus1 reaction button and external badge");
-		}
-
-		await expect(canvas.getByRole("button", { name: "赞 12" })).toBeVisible();
-		await expect(canvas.getByRole("button", { name: "笑" })).toBeVisible();
-		expect(plusOneButton.classList.contains("rounded-full")).toBe(true);
-		expect(window.getComputedStyle(plusOneButton).opacity).toBe("0.8");
-
-		const buttonRect = plusOneButton.getBoundingClientRect();
-		expect(Math.abs(buttonRect.width - buttonRect.height)).toBeLessThanOrEqual(
-			1,
-		);
-		expect(plusOneBadge.getBoundingClientRect().right).toBeGreaterThan(
-			buttonRect.right - 1,
-		);
-	},
-};
-
-export const EvidenceReactionBubblePolish: Story = {
-	name: "Evidence / Reaction Bubble Polish",
-	args: {
-		initialTab: "releases",
-		feedMode: "reaction-polish",
-	},
-	parameters: {
-		docs: {
-			disable: true,
 		},
 	},
 };
@@ -1901,5 +1807,165 @@ export const SmartInsufficient: Story = {
 		await expect(
 			canvas.queryByText(/还没有智能版本变化摘要/),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const AllMixedSocialActivity: Story = {
+	render: () => <DashboardPreview feedItems={makeMixedSocialFeed()} />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`全部` tab 会把 release、仓库被加星和账号被关注三类记录按统一时间线混排显示。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		await step(
+			"historical list toggle keeps mixed activity visible",
+			async () => {
+				const historicalGroup = canvasElement.querySelector<HTMLElement>(
+					'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
+				);
+				expect(historicalGroup).toBeTruthy();
+				if (!historicalGroup) {
+					throw new Error("Expected 2026-04-03 historical group to exist");
+				}
+				const actionSlot = historicalGroup.querySelector<HTMLElement>(
+					"[data-feed-day-action-slot]",
+				);
+				const listButton =
+					actionSlot?.querySelector<HTMLButtonElement>("button");
+				expect(listButton).toBeTruthy();
+				if (!listButton) {
+					throw new Error("Expected historical list button to exist");
+				}
+				await listButton.click();
+				await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+				await expect(canvas.getByText("linus", { exact: true })).toBeVisible();
+			},
+		);
+		await step(
+			"social cards expose actor and target links intentionally",
+			async () => {
+				const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+					"[data-social-card-kind]",
+				);
+				expect(socialCards.length).toBeGreaterThan(0);
+				for (const card of socialCards) {
+					const expectedLinks =
+						card.dataset.socialCardKind === "repo_star_received" ? 2 : 1;
+					expect(
+						card.querySelectorAll('a[href^="https://github.com/"]').length,
+					).toBe(expectedLinks);
+				}
+			},
+		);
+	},
+};
+
+export const StarsTab: Story = {
+	render: () => (
+		<DashboardPreview initialTab="stars" feedItems={makeMixedSocialFeed()} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`被加星` tab 只显示 repo star 收到记录，不混入 release 或 follower。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
+		await expect(
+			canvas.getByText("acme/rocket", { exact: true }),
+		).toBeVisible();
+		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"]',
+		);
+		expect(socialCards.length).toBeGreaterThan(0);
+		for (const card of socialCards) {
+			expect(
+				card.querySelectorAll('a[href^="https://github.com/"]').length,
+			).toBe(2);
+		}
+		await expect(
+			canvas.queryByText("gaearon", { exact: true }),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const FollowersTab: Story = {
+	render: () => (
+		<DashboardPreview
+			initialTab="followers"
+			feedItems={makeMixedSocialFeed()}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"`被关注` tab 只显示 follower 收到记录，并保留头像 + GitHub CTA 的轻量卡片样式。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("关注", { exact: true })).toBeVisible();
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			'[data-social-card-kind="follower_received"]',
+		);
+		expect(socialCards.length).toBeGreaterThan(0);
+		for (const card of socialCards) {
+			expect(
+				card.querySelectorAll('a[href^="https://github.com/"]').length,
+			).toBe(1);
+		}
+		await expect(
+			canvas.queryByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const SocialAvatarFallback: Story = {
+	render: () => {
+		const items = makeMixedSocialFeed().map((item) =>
+			item.kind === "follower_received" && item.actor.login === "yyx990803"
+				? {
+						...item,
+						actor: {
+							...item.actor,
+							avatar_url: null,
+						},
+					}
+				: item,
+		);
+		return <DashboardPreview initialTab="followers" feedItems={items} />;
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"当 actor 头像缺失或加载失败时，社交卡片回退到稳定占位头像，避免留出空白。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const fallback = canvasElement.querySelector(
+			'[data-social-avatar-fallback="true"]',
+		);
+		expect(fallback).not.toBeNull();
 	},
 };

@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -1473,26 +1475,16 @@ async fn execute_task(
         }
         TASK_SYNC_ALL => {
             let user_id = payload_local_id(payload, "user_id")?;
-            let starred = sync::sync_starred(state, user_id.as_str()).await?;
-            if is_task_cancel_requested(state, task_id)
-                .await
-                .unwrap_or(false)
-            {
-                return Ok(json!({"canceled": true}));
-            }
-            let releases = sync::sync_releases(state, user_id.as_str()).await?;
-            if is_task_cancel_requested(state, task_id)
-                .await
-                .unwrap_or(false)
-            {
-                return Ok(json!({"canceled": true}));
-            }
-            let notifications = sync::sync_notifications(state, user_id.as_str()).await?;
-            Ok(json!({
-                "starred": starred,
-                "releases": releases,
-                "notifications": notifications,
-            }))
+            execute_sync_all_task_with(
+                state,
+                task_id,
+                user_id.as_str(),
+                |state, user_id| Box::pin(sync::sync_starred(state, user_id)),
+                |state, user_id| Box::pin(sync::sync_releases(state, user_id)),
+                |state, user_id| Box::pin(sync::sync_social_activity(state, user_id)),
+                |state, user_id| Box::pin(sync::sync_notifications(state, user_id)),
+            )
+            .await
         }
         TASK_SYNC_SUBSCRIPTIONS => {
             let res = sync::sync_subscriptions(state, task_id, payload).await?;
@@ -1554,6 +1546,75 @@ async fn execute_task(
         }
         _ => Err(anyhow!("unsupported task_type: {task_type}")),
     }
+}
+
+type TaskStepFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
+
+async fn execute_sync_all_task_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+    sync_starred: SyncStarred,
+    sync_releases: SyncReleases,
+    sync_social: SyncSocial,
+    sync_notifications: SyncNotifications,
+) -> Result<Value>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> TaskStepFuture<'a, sync::SyncStarredResult>,
+    SyncReleases: for<'a> Fn(&'a AppState, &'a str) -> TaskStepFuture<'a, sync::SyncReleasesResult>,
+    SyncSocial:
+        for<'a> Fn(&'a AppState, &'a str) -> TaskStepFuture<'a, sync::SyncSocialActivityResult>,
+    SyncNotifications:
+        for<'a> Fn(&'a AppState, &'a str) -> TaskStepFuture<'a, sync::SyncNotificationsResult>,
+{
+    let starred = sync_starred(state, user_id).await?;
+    if is_task_cancel_requested(state, task_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(json!({"canceled": true}));
+    }
+
+    let releases = sync_releases(state, user_id).await?;
+    if is_task_cancel_requested(state, task_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(json!({"canceled": true}));
+    }
+
+    let (social, social_error) = match sync_social(state, user_id).await {
+        Ok(result) => (result, None),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "task sync_all: social activity sync failed, continuing with notifications"
+            );
+            (
+                sync::SyncSocialActivityResult::default(),
+                Some(err.to_string()),
+            )
+        }
+    };
+    if is_task_cancel_requested(state, task_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(json!({"canceled": true}));
+    }
+
+    let notifications = sync_notifications(state, user_id).await?;
+    let mut result = json!({
+        "starred": starred,
+        "releases": releases,
+        "social": social,
+        "notifications": notifications,
+    });
+    if let Some(error) = social_error {
+        result["social_error"] = Value::String(error);
+    }
+    Ok(result)
 }
 
 async fn execute_daily_slot_task(
@@ -1963,12 +2024,14 @@ mod tests {
 
     use super::{
         STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS,
-        TranslationStreamCursor, claim_next_queued_task, current_subscription_schedule_key,
-        is_scheduled_task_type, load_translation_stream_cursor, load_translation_stream_rows,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
+        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
+        current_subscription_schedule_key, execute_sync_all_task_with, is_scheduled_task_type,
+        load_translation_stream_cursor, load_translation_stream_rows,
         next_llm_scheduler_stream_event, recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
+    use serde_json::json;
     use sqlx::{
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -1979,6 +2042,7 @@ mod tests {
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         state::{AppState, build_oauth_client},
+        sync,
     };
 
     #[test]
@@ -2427,6 +2491,52 @@ mod tests {
 
         assert_eq!(ids, vec!["req-2", "req-3"]);
         assert_eq!(statuses, vec!["running", "completed"]);
+    }
+
+    #[tokio::test]
+    async fn execute_sync_all_task_continues_notifications_when_social_sync_fails() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_task(
+            &pool,
+            "task-sync-all-social-fail",
+            TASK_SYNC_ALL,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let result = execute_sync_all_task_with(
+            state.as_ref(),
+            "task-sync-all-social-fail",
+            "1",
+            |_, _| Box::pin(async { Ok(sync::SyncStarredResult { repos: 4 }) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 2,
+                        releases: 5,
+                    })
+                })
+            },
+            |_, _| Box::pin(async { Err(anyhow::anyhow!("social unavailable")) }),
+            |_, _| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-03-07T00:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect("sync_all result");
+
+        assert_eq!(result["starred"]["repos"], json!(4));
+        assert_eq!(result["releases"]["releases"], json!(5));
+        assert_eq!(result["social"]["events"], json!(0));
+        assert_eq!(result["notifications"]["notifications"], json!(7));
+        assert_eq!(result["social_error"], json!("social unavailable"));
     }
 
     async fn setup_pool() -> SqlitePool {

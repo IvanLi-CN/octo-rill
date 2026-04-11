@@ -1,4 +1,12 @@
-import { ArrowUpRight, RefreshCcw } from "lucide-react";
+import {
+	ArrowUpRight,
+	FolderGit2,
+	RefreshCcw,
+	Star,
+	UserPlus,
+	UserRound,
+} from "lucide-react";
+import { type ReactNode, useState } from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
@@ -17,9 +25,20 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
-import type { FeedItem, FeedLane, ReactionContent } from "@/feed/types";
+import {
+	isReleaseFeedItem,
+	isSocialFeedItem,
+	type FeedActor,
+	type FeedItem,
+	type FeedLane,
+	type FeedViewer,
+	type ReactionContent,
+	type ReleaseFeedItem,
+	type SocialFeedItem,
+} from "@/feed/types";
 import { withBaseAssetPath } from "@/lib/asset-path";
 import { formatIsoShortLocal } from "@/lib/datetime";
+import { resolveRepoVisualCandidates, type RepoVisual } from "@/lib/repoVisual";
 import { cn } from "@/lib/utils";
 
 const REACTION_ITEMS: Array<{
@@ -101,7 +120,7 @@ function EmptyPanel(props: {
 	);
 }
 
-function displayTitleForLane(item: FeedItem, lane: FeedLane) {
+function displayTitleForLane(item: ReleaseFeedItem, lane: FeedLane) {
 	const originalTitle = item.title ?? "(no title)";
 	if (lane === "translated") {
 		return item.translated?.title?.trim() || originalTitle;
@@ -112,7 +131,7 @@ function displayTitleForLane(item: FeedItem, lane: FeedLane) {
 	return originalTitle;
 }
 
-function OriginalLane(props: { item: FeedItem }) {
+function OriginalLane(props: { item: ReleaseFeedItem }) {
 	const { item } = props;
 	if (item.body?.trim()) {
 		return (
@@ -134,7 +153,10 @@ function OriginalLane(props: { item: FeedItem }) {
 	);
 }
 
-function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
+function TranslatedLane(props: {
+	item: ReleaseFeedItem;
+	onTranslateNow: () => void;
+}) {
 	const { item, onTranslateNow } = props;
 
 	if (item.translated?.status === "ready" && item.translated.summary?.trim()) {
@@ -174,7 +196,7 @@ function TranslatedLane(props: { item: FeedItem; onTranslateNow: () => void }) {
 }
 
 function SmartLane(props: {
-	item: FeedItem;
+	item: ReleaseFeedItem;
 	onSmartNow: () => void;
 	isSmartGenerating: boolean;
 }) {
@@ -261,8 +283,201 @@ function FeedCardLaneTabs(props: {
 	);
 }
 
-export function FeedItemCard(props: {
-	item: FeedItem;
+function SocialActorAvatar(props: { actor: FeedActor; className?: string }) {
+	const { actor, className } = props;
+	const [failed, setFailed] = useState(false);
+
+	return (
+		<div
+			className={cn(
+				"bg-muted text-muted-foreground flex size-11 shrink-0 items-center justify-center overflow-hidden rounded-full border",
+				className,
+			)}
+		>
+			{actor.avatar_url && !failed ? (
+				<img
+					src={actor.avatar_url}
+					alt={`${actor.login} avatar`}
+					className="size-full object-cover"
+					onError={() => setFailed(true)}
+				/>
+			) : (
+				<UserRound className="size-5" data-social-avatar-fallback="true" />
+			)}
+		</div>
+	);
+}
+
+function SocialRepoAvatar(props: {
+	repoVisual: RepoVisual | null | undefined;
+	className?: string;
+}) {
+	const { repoVisual, className } = props;
+	const [failed, setFailed] = useState(false);
+	const candidates = resolveRepoVisualCandidates(repoVisual);
+	const preferredCandidate =
+		candidates.find((entry) => entry.kind === "owner_avatar") ?? null;
+	const candidate = preferredCandidate ?? candidates[0] ?? null;
+
+	return (
+		<span
+			className={cn(
+				"bg-muted text-muted-foreground inline-flex size-4 shrink-0 items-center justify-center overflow-hidden border",
+				"rounded-full",
+				className,
+			)}
+		>
+			{candidate && !failed ? (
+				<img
+					src={candidate.src}
+					alt=""
+					className="size-full object-cover"
+					onError={() => setFailed(true)}
+				/>
+			) : (
+				<FolderGit2 className="size-3" />
+			)}
+		</span>
+	);
+}
+
+function SocialEntityCard(props: {
+	href?: string | null;
+	avatar: ReactNode;
+	primary: string;
+	mono?: boolean;
+}) {
+	const { href, avatar, primary, mono = false } = props;
+	return (
+		<div className="relative z-10 flex min-w-0 items-center gap-3 rounded-2xl border border-border/65 bg-background/78 px-3 py-3 shadow-sm">
+			<div className="shrink-0">{avatar}</div>
+			<div className="min-w-0">
+				<div className="flex min-w-0 items-center gap-0.5">
+					<p
+						className={cn(
+							"truncate text-sm font-semibold text-foreground sm:text-[15px]",
+							mono && "font-mono font-medium",
+						)}
+					>
+						{primary}
+					</p>
+					{href ? (
+						<a
+							href={href}
+							target="_blank"
+							rel="noreferrer"
+							aria-label={`打开 ${primary}`}
+							className="inline-flex size-3.5 shrink-0 -translate-x-px translate-y-px items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+						>
+							<ArrowUpRight className="size-3" />
+						</a>
+					) : null}
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function SocialActionBridge(props: {
+	icon: typeof Star;
+	title: string;
+	subtitle?: string;
+}) {
+	const { icon: Icon, title, subtitle } = props;
+
+	return (
+		<div className="flex flex-col items-center justify-center gap-2 text-center">
+			<div className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border/65 bg-background shadow-sm">
+				<Icon className="size-5 text-foreground/80" />
+			</div>
+			<div className="space-y-0.5">
+				<p className="text-sm font-semibold text-foreground">{title}</p>
+				{subtitle ? (
+					<p className="text-xs text-muted-foreground">{subtitle}</p>
+				) : null}
+			</div>
+		</div>
+	);
+}
+
+function SocialActivityCard(props: {
+	item: SocialFeedItem;
+	currentViewer?: FeedViewer | null;
+}) {
+	const { item, currentViewer } = props;
+	const actor = item.actor;
+	const isRepoStar = item.kind === "repo_star_received";
+	const actorHref = actor.html_url ?? `https://github.com/${actor.login}`;
+	const repoHref = item.repo_full_name
+		? `https://github.com/${item.repo_full_name}`
+		: null;
+	const actorCardHref = actorHref;
+	const targetCardHref = isRepoStar ? repoHref : null;
+	const targetViewer: FeedActor = currentViewer ?? {
+		login: "你",
+		avatar_url: null,
+		html_url: null,
+	};
+
+	return (
+		<div className="space-y-0 px-1 py-1" data-social-card-kind={item.kind}>
+			<p className="mb-0.5 font-mono text-xs leading-none text-muted-foreground">
+				{formatIsoShortLocal(item.ts)}
+			</p>
+			<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)] md:items-center">
+				<SocialEntityCard
+					href={actorCardHref}
+					avatar={
+						<SocialActorAvatar
+							key={actor.avatar_url ?? actor.login}
+							actor={actor}
+							className="size-11"
+						/>
+					}
+					primary={actor.login}
+				/>
+				<SocialActionBridge
+					icon={isRepoStar ? Star : UserPlus}
+					title={isRepoStar ? "标星" : "关注"}
+				/>
+				{isRepoStar ? (
+					<SocialEntityCard
+						href={targetCardHref}
+						avatar={
+							<SocialRepoAvatar
+								key={[
+									item.repo_visual?.owner_avatar_url ?? "",
+									item.repo_visual?.open_graph_image_url ?? "",
+									item.repo_visual?.uses_custom_open_graph_image ? "1" : "0",
+									item.repo_full_name ?? "",
+								].join("|")}
+								repoVisual={item.repo_visual}
+								className="size-11 border-border/60"
+							/>
+						}
+						primary={item.repo_full_name ?? "你的仓库"}
+						mono
+					/>
+				) : (
+					<SocialEntityCard
+						href={null}
+						avatar={
+							<SocialActorAvatar
+								key={targetViewer.avatar_url ?? targetViewer.login}
+								actor={targetViewer}
+								className="size-11"
+							/>
+						}
+						primary={targetViewer.login}
+					/>
+				)}
+			</div>
+		</div>
+	);
+}
+
+function ReleaseFeedCard(props: {
+	item: ReleaseFeedItem;
 	activeLane: FeedLane;
 	isTranslating: boolean;
 	isSmartGenerating: boolean;
@@ -285,7 +500,6 @@ export function FeedItemCard(props: {
 		onSmartNow,
 		onToggleReaction,
 	} = props;
-
 	const subtitleBits = [
 		item.reason || item.subtitle,
 		item.subject_type ? item.subject_type : null,
@@ -466,4 +680,30 @@ export function FeedItemCard(props: {
 			{reactionsFooter}
 		</Card>
 	);
+}
+
+export function FeedItemCard(props: {
+	item: FeedItem;
+	currentViewer?: FeedViewer | null;
+	activeLane: FeedLane;
+	isTranslating: boolean;
+	isSmartGenerating: boolean;
+	isReactionBusy: boolean;
+	reactionError: string | null;
+	onSelectLane: (lane: FeedLane) => void;
+	onTranslateNow: () => void;
+	onSmartNow: () => void;
+	onToggleReaction: (content: ReactionContent) => void;
+}) {
+	const { item, currentViewer } = props;
+
+	if (isSocialFeedItem(item)) {
+		return <SocialActivityCard item={item} currentViewer={currentViewer} />;
+	}
+
+	if (!isReleaseFeedItem(item)) {
+		return null;
+	}
+
+	return <ReleaseFeedCard {...props} item={item} />;
 }
