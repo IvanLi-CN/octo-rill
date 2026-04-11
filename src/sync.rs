@@ -1326,8 +1326,7 @@ async fn apply_social_activity_snapshot_partial(
         for repo in owned_repos {
             let was_known_repo = known_repo_ids.contains(&repo.repo_id);
             let fetched_snapshot_this_run = successful_repo_snapshot_ids.contains(&repo.repo_id);
-            let should_persist_baseline =
-                was_known_repo || !repo_tracking_initialized || fetched_snapshot_this_run;
+            let should_persist_baseline = was_known_repo || fetched_snapshot_this_run;
 
             if !should_persist_baseline {
                 continue;
@@ -6354,7 +6353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn social_activity_failed_repo_bootstrap_does_not_backfill_existing_stars() {
+    async fn social_activity_failed_repo_bootstrap_emits_current_stars_after_recovery() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-failed-repo-bootstrap");
@@ -6413,7 +6412,7 @@ mod tests {
         .await
         .expect("recover skipped repo snapshot");
 
-        assert_eq!(events, 0);
+        assert_eq!(events, 1);
 
         let baseline_state: i64 = sqlx::query_scalar(
             r#"
@@ -6429,19 +6428,22 @@ mod tests {
         .expect("load skipped repo baseline state");
         assert_eq!(baseline_state, 1);
 
-        let history_count: i64 = sqlx::query_scalar(
+        let row: (String, String) = sqlx::query_as(
             r#"
-            SELECT COUNT(*)
+            SELECT repo_full_name, actor_login
             FROM social_activity_events
             WHERE user_id = ? AND repo_id = ?
+            ORDER BY occurred_at DESC
+            LIMIT 1
             "#,
         )
         .bind(user_id.as_str())
         .bind(skipped_repo.repo_id)
         .fetch_one(&pool)
         .await
-        .expect("count skipped repo history");
-        assert_eq!(history_count, 0);
+        .expect("load skipped repo history");
+        assert_eq!(row.0, "octo/beta");
+        assert_eq!(row.1, "existing-star");
     }
 
     #[tokio::test]
