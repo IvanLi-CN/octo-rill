@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -3334,27 +3335,21 @@ pub async fn sync_all(
     let mode = ReturnMode::from_query(&mode_query)?;
 
     if matches!(mode, ReturnMode::Sync) {
-        let starred = sync::sync_starred(state.as_ref(), user_id.as_str())
-            .await
-            .map_err(ApiError::internal)?;
-        let releases = sync::sync_releases(state.as_ref(), user_id.as_str())
-            .await
-            .map_err(ApiError::internal)?;
-        let (social, social_error) = sync::sync_social_activity_best_effort(
+        let body = execute_sync_all_sync_with(
             state.as_ref(),
             user_id.as_str(),
-            "api.sync_all.sync",
+            |state, user_id| Box::pin(sync::sync_starred(state, user_id)),
+            |state, user_id| Box::pin(sync::sync_releases(state, user_id)),
+            |state, user_id| {
+                Box::pin(async move {
+                    sync::sync_social_activity_best_effort(state, user_id, "api.sync_all.sync")
+                        .await
+                })
+            },
+            |state, user_id| Box::pin(sync::sync_notifications(state, user_id)),
         )
         .await;
-        let mut body = json!({
-            "starred": starred,
-            "releases": releases,
-            "social": social,
-        });
-        if let Some(error) = social_error {
-            body["social_error"] = Value::String(error);
-        }
-        return Ok(Json(body).into_response());
+        return Ok(Json(body?).into_response());
     }
 
     enqueue_singleton_or_stream_task(
@@ -3369,6 +3364,49 @@ pub async fn sync_all(
         },
     )
     .await
+}
+
+type SyncAllApiFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+type SyncAllSocialFuture<'a> =
+    Pin<Box<dyn Future<Output = (sync::SyncSocialActivityResult, Option<String>)> + Send + 'a>>;
+
+async fn execute_sync_all_sync_with<SyncStarred, SyncReleases, SyncSocial, SyncNotifications>(
+    state: &AppState,
+    user_id: &str,
+    sync_starred: SyncStarred,
+    sync_releases: SyncReleases,
+    sync_social: SyncSocial,
+    sync_notifications: SyncNotifications,
+) -> Result<Value, ApiError>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncStarredResult>,
+    SyncReleases:
+        for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncReleasesResult>,
+    SyncSocial: for<'a> Fn(&'a AppState, &'a str) -> SyncAllSocialFuture<'a>,
+    SyncNotifications:
+        for<'a> Fn(&'a AppState, &'a str) -> SyncAllApiFuture<'a, sync::SyncNotificationsResult>,
+{
+    let starred = sync_starred(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let releases = sync_releases(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    let (social, social_error) = sync_social(state, user_id).await;
+    let notifications = sync_notifications(state, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let mut body = json!({
+        "starred": starred,
+        "releases": releases,
+        "social": social,
+        "notifications": notifications,
+    });
+    if let Some(error) = social_error {
+        body["social_error"] = Value::String(error);
+    }
+    Ok(body)
 }
 
 pub async fn sync_releases(
@@ -9629,13 +9667,13 @@ mod tests {
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
         ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
-        build_task_diagnostics, ensure_account_enabled, extract_translation_fields,
-        feed_item_from_row, get_release_detail, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_feed, list_releases, llm_call_order_by_clause,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        map_public_compare_fallback_error, mark_translation_requested,
+        build_task_diagnostics, ensure_account_enabled, execute_sync_all_sync_with,
+        extract_translation_fields, feed_item_from_row, get_release_detail,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
+        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
+        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -9658,6 +9696,7 @@ mod tests {
         crypto::EncryptionKey,
         jobs,
         state::{AppState, build_oauth_client},
+        sync,
     };
     use axum::{
         Json,
@@ -9667,6 +9706,7 @@ mod tests {
         response::{IntoResponse, Response},
     };
     use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
     use sqlx::{
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -10073,6 +10113,55 @@ mod tests {
         .await
         .expect("count access refresh tasks");
         assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn sync_all_sync_mode_includes_notifications_and_social_error() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let body = execute_sync_all_sync_with(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            |_state, _user_id| Box::pin(async { Ok(sync::SyncStarredResult { repos: 2 }) }),
+            |_state, _user_id| {
+                Box::pin(async {
+                    Ok(sync::SyncReleasesResult {
+                        repos: 3,
+                        releases: 5,
+                    })
+                })
+            },
+            |_state, _user_id| {
+                Box::pin(async {
+                    (
+                        sync::SyncSocialActivityResult::default(),
+                        Some("social boom".to_owned()),
+                    )
+                })
+            },
+            |_state, _user_id| {
+                Box::pin(async {
+                    Ok(sync::SyncNotificationsResult {
+                        notifications: 7,
+                        since: Some("2026-04-11T11:00:00Z".to_owned()),
+                    })
+                })
+            },
+        )
+        .await
+        .expect("sync all sync body");
+
+        assert_eq!(body["starred"]["repos"], json!(2));
+        assert_eq!(body["releases"]["repos"], json!(3));
+        assert_eq!(body["releases"]["releases"], json!(5));
+        assert_eq!(body["social"]["events"], json!(0));
+        assert_eq!(body["notifications"]["notifications"], json!(7));
+        assert_eq!(
+            body["notifications"]["since"],
+            json!("2026-04-11T11:00:00Z")
+        );
+        assert_eq!(body["social_error"], json!("social boom"));
     }
 
     async fn task_id_from_response(response: Response) -> String {
