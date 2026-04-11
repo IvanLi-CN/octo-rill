@@ -32,6 +32,7 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import type { RepoVisual } from "@/lib/repoVisual";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -69,6 +70,43 @@ const STORYBOOK_VERSION_STATE = {
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 
+function socialPreviewDataUrl(title: string, accent: string, body: string) {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${accent}"/><stop offset="100%" stop-color="#0f172a"/></linearGradient></defs><rect width="1280" height="640" rx="48" fill="url(#g)"/><rect x="72" y="72" width="1136" height="496" rx="36" fill="rgba(15,23,42,0.18)" stroke="rgba(255,255,255,0.18)" stroke-width="4"/><text x="120" y="228" font-family="Inter,Arial,sans-serif" font-size="84" font-weight="800" fill="#ffffff">${title}</text><text x="120" y="334" font-family="Inter,Arial,sans-serif" font-size="40" font-weight="600" fill="rgba(255,255,255,0.84)">${body}</text></svg>`,
+	)}`;
+}
+
+function githubAvatarUrl(username: string, size = 96) {
+	return `https://github.com/${username}.png?size=${size}`;
+}
+
+const STORYBOOK_VIEWER = {
+	login: "sindresorhus",
+	avatar_url: githubAvatarUrl("sindresorhus"),
+	html_url: "https://github.com/sindresorhus",
+} as const;
+
+const repoVisualFixtures: Record<
+	"social" | "avatar" | "text",
+	RepoVisual | null
+> = {
+	social: {
+		owner_avatar_url: githubAvatarUrl("github"),
+		open_graph_image_url: socialPreviewDataUrl(
+			"Rocket Release",
+			"#2563eb",
+			"custom social preview",
+		),
+		uses_custom_open_graph_image: true,
+	},
+	avatar: {
+		owner_avatar_url: githubAvatarUrl("openai"),
+		open_graph_image_url: null,
+		uses_custom_open_graph_image: false,
+	},
+	text: null,
+};
+
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
@@ -89,6 +127,7 @@ function buildFeedItem(
 		ts: "2026-02-21T08:05:00Z",
 		id,
 		repo_full_name: "acme/rocket",
+		repo_visual: repoVisualFixtures.social,
 		title: `v${id}`,
 		body: "- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
 		body_truncated: false,
@@ -139,6 +178,7 @@ function makeMockFeed(): FeedItem[] {
 			ts: "2026-04-04T16:16:29+08:00",
 			title: "v2.63.0",
 			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
+			repo_visual: repoVisualFixtures.social,
 			smart: {
 				lang: "zh-CN",
 				status: "ready",
@@ -176,6 +216,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10002", {
 			ts: "2026-04-04T15:56:24+08:00",
 			repo_full_name: "lobehub/lobe-chat",
+			repo_visual: repoVisualFixtures.avatar,
 			title: "桌面版 Canary v2.1.48-canary.31",
 			body: "- Canary 构建\n- 自动发布桌面包\n- 建议先在测试环境验证",
 			html_url:
@@ -203,6 +244,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10004", {
 			ts: "2026-04-03T21:30:00+08:00",
 			repo_full_name: "acme/satellite",
+			repo_visual: repoVisualFixtures.avatar,
 			title: "oauth action bubble polish",
 			body: "- stabilize oauth actions\n- dedupe previews\n- align hover states",
 			html_url:
@@ -211,17 +253,13 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10005", {
 			ts: "2026-04-03T06:20:00+08:00",
 			repo_full_name: "acme/fleet",
+			repo_visual: repoVisualFixtures.text,
 			title: "fallback lane release",
 			body: `- ${FALLBACK_RAW_MARKER}\n- no brief available for this day\n- keep original release cards visible`,
 			html_url:
 				"https://github.com/acme/fleet/releases/tag/fallback-lane-release",
 		}),
 	];
-}
-
-function makeAvatarDataUrl(label: string, fill = "#1d4ed8") {
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96"><rect width="96" height="96" rx="48" fill="${fill}"/><text x="50%" y="50%" text-anchor="middle" dominant-baseline="central" font-family="ui-monospace, SFMono-Regular, monospace" font-size="40" fill="#ffffff">${label}</text></svg>`;
-	return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
 function buildRepoStarItem(
@@ -233,18 +271,19 @@ function buildRepoStarItem(
 		ts: "2026-04-04T14:20:00+08:00",
 		id,
 		repo_full_name: "acme/rocket",
+		repo_visual: repoVisualFixtures.social,
 		title: null,
 		body: null,
 		body_truncated: false,
 		subtitle: null,
 		reason: null,
 		subject_type: null,
-		html_url: "https://github.com/octocat",
+		html_url: "https://github.com/torvalds",
 		unread: null,
 		actor: {
-			login: "octocat",
-			avatar_url: makeAvatarDataUrl("O"),
-			html_url: "https://github.com/octocat",
+			login: "torvalds",
+			avatar_url: githubAvatarUrl("torvalds"),
+			html_url: "https://github.com/torvalds",
 		},
 		translated: null,
 		smart: null,
@@ -262,18 +301,19 @@ function buildFollowerItem(
 		ts: "2026-04-04T13:45:00+08:00",
 		id,
 		repo_full_name: null,
+		repo_visual: null,
 		title: null,
 		body: null,
 		body_truncated: false,
 		subtitle: null,
 		reason: null,
 		subject_type: null,
-		html_url: "https://github.com/monalisa",
+		html_url: "https://github.com/gaearon",
 		unread: null,
 		actor: {
-			login: "monalisa",
-			avatar_url: makeAvatarDataUrl("M", "#7c3aed"),
-			html_url: "https://github.com/monalisa",
+			login: "gaearon",
+			avatar_url: githubAvatarUrl("gaearon"),
+			html_url: "https://github.com/gaearon",
 		},
 		translated: null,
 		smart: null,
@@ -295,9 +335,10 @@ function makeMixedSocialFeed(): FeedItem[] {
 		buildRepoStarItem("star-10002", {
 			ts: "2026-04-03T22:10:00+08:00",
 			repo_full_name: "acme/satellite",
+			repo_visual: repoVisualFixtures.avatar,
 			actor: {
 				login: "linus",
-				avatar_url: makeAvatarDataUrl("L", "#ea580c"),
+				avatar_url: githubAvatarUrl("linus"),
 				html_url: "https://github.com/linus",
 			},
 			html_url: "https://github.com/linus",
@@ -305,11 +346,11 @@ function makeMixedSocialFeed(): FeedItem[] {
 		buildFollowerItem("follow-fallback", {
 			ts: "2026-04-03T06:45:00+08:00",
 			actor: {
-				login: "ghost",
-				avatar_url: null,
-				html_url: "https://github.com/ghost",
+				login: "yyx990803",
+				avatar_url: githubAvatarUrl("yyx990803"),
+				html_url: "https://github.com/yyx990803",
 			},
-			html_url: "https://github.com/ghost",
+			html_url: "https://github.com/yyx990803",
 		}),
 	];
 }
@@ -583,6 +624,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
 	repo_full_name: "acme/rocket",
+	repo_visual: repoVisualFixtures.social,
 	tag_name: "v3.4.0",
 	name: "v3.4.0 · release train",
 	body: [
@@ -862,6 +904,7 @@ function DashboardPreview(props: {
 			<FeedGroupedList
 				mode={mode}
 				items={visibleItems(mode)}
+				currentViewer={STORYBOOK_VIEWER}
 				briefs={storyBriefs}
 				dailyBoundaryLocal={dailyBoundaryLocal}
 				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
@@ -903,173 +946,171 @@ function DashboardPreview(props: {
 	return (
 		<VersionMonitorStateProvider value={STORYBOOK_VERSION_STATE}>
 			<AppShell
-			header={
-				<DashboardHeader
-					feedCount={items.length}
-					inboxCount={notifications.length}
-					briefCount={storyBriefs.length}
-					login="storybook-user"
-					isAdmin
-					aiDisabledHint={aiDisabledHint}
-					busy={syncingAll}
-					syncingAll={syncingAll}
-					onSyncAll={() => {}}
-					logoutHref="#"
-				/>
-			}
-			notice={<VersionUpdateNotice />}
-			footer={<AppMetaFooter />}
-		>
-			<Tabs
-				value={tab}
-				onValueChange={(nextTab) => setTab(nextTab as Tab)}
-				className="gap-6"
+				header={
+					<DashboardHeader
+						login={STORYBOOK_VIEWER.login}
+						avatarUrl={STORYBOOK_VIEWER.avatar_url}
+						isAdmin
+						aiDisabledHint={aiDisabledHint}
+						busy={syncingAll}
+						syncingAll={syncingAll}
+						onSyncAll={() => {}}
+						logoutHref="#"
+					/>
+				}
+				notice={<VersionUpdateNotice />}
+				footer={<AppMetaFooter />}
 			>
-				<div className="flex flex-wrap items-center justify-between gap-2">
-					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-						<TabsTrigger value="all" className="font-mono text-xs">
-							全部
-						</TabsTrigger>
-						<TabsTrigger value="releases" className="font-mono text-xs">
-							Releases
-						</TabsTrigger>
-						<TabsTrigger value="stars" className="font-mono text-xs">
-							被加星
-						</TabsTrigger>
-						<TabsTrigger value="followers" className="font-mono text-xs">
-							被关注
-						</TabsTrigger>
-						<TabsTrigger value="briefs" className="font-mono text-xs">
-							日报
-						</TabsTrigger>
-						<TabsTrigger value="inbox" className="font-mono text-xs">
-							Inbox
-						</TabsTrigger>
-					</TabsList>
-					<div
-						className="flex items-center gap-2"
-						data-dashboard-secondary-controls
-					>
-						{tab === "all" || tab === "releases" ? (
-							<FeedPageLaneSelector
-								value={effectivePageDefaultLane}
-								onValueChange={(lane) => {
-									setPageDefaultLane(lane);
-									setSelectedLaneByKey({});
-								}}
-							/>
-						) : null}
-						<Button
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-							onClick={() => setPatDialogOpen(true)}
-						>
-							打开 PAT 配置
-						</Button>
-						<Button
-							asChild
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-						>
-							<a href="/admin">管理员面板</a>
-						</Button>
-					</div>
-				</div>
-
-				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
-					<section className="min-w-0">
-						<TabsContent value="all" className="mt-0 min-w-0">
-							{renderFeedPanel("all")}
-						</TabsContent>
-						<TabsContent value="releases" className="mt-0 min-w-0">
-							{renderFeedPanel("releases")}
-						</TabsContent>
-						<TabsContent value="stars" className="mt-0 min-w-0">
-							{renderFeedPanel("stars")}
-						</TabsContent>
-						<TabsContent value="followers" className="mt-0 min-w-0">
-							{renderFeedPanel("followers")}
-						</TabsContent>
-						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<ReleaseDailyCard
-								briefs={storyBriefs}
-								selectedDate={selectedDate}
-								busy={false}
-								onGenerate={() => {}}
-								onOpenRelease={setActiveReleaseId}
-							/>
-						</TabsContent>
-						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList
-								notifications={notifications}
-								busy={syncingAll}
-								syncing={syncingAll}
-								onSync={tab === "inbox" ? () => {} : undefined}
-							/>
-						</TabsContent>
-					</section>
-
-					<aside className="space-y-6">
-						{tab === "briefs" ? (
-							<BriefListCard
-								briefs={storyBriefs}
-								selectedDate={selectedDate}
-								onSelectDate={(d) => setSelectedDate(d)}
-							/>
-						) : null}
-						<InboxQuickList notifications={notifications} />
-					</aside>
-				</div>
-			</Tabs>
-
-			<ReleaseDetailCard
-				releaseId={activeReleaseId}
-				onClose={() => setActiveReleaseId(null)}
-			/>
-
-			<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
-				<DialogContent
-					showCloseButton={false}
-					className="max-w-2xl"
-					onInteractOutside={(event) => event.preventDefault()}
+				<Tabs
+					value={tab}
+					onValueChange={(nextTab) => setTab(nextTab as Tab)}
+					className="gap-6"
 				>
-					<DialogHeader>
-						<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
-						<DialogDescription>
-							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
-						</DialogDescription>
-					</DialogHeader>
-					<div className="bg-muted/40 rounded-lg border p-3">
-						<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-						<p className="text-muted-foreground mt-1 font-mono text-xs">
-							Settings → Developer settings → Personal access tokens → Tokens
-							(classic)
+					<div className="flex flex-wrap items-center justify-between gap-2">
+						<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
+							<TabsTrigger value="all" className="font-mono text-xs">
+								全部
+							</TabsTrigger>
+							<TabsTrigger value="releases" className="font-mono text-xs">
+								Releases
+							</TabsTrigger>
+							<TabsTrigger value="stars" className="font-mono text-xs">
+								被加星
+							</TabsTrigger>
+							<TabsTrigger value="followers" className="font-mono text-xs">
+								被关注
+							</TabsTrigger>
+							<TabsTrigger value="briefs" className="font-mono text-xs">
+								日报
+							</TabsTrigger>
+							<TabsTrigger value="inbox" className="font-mono text-xs">
+								Inbox
+							</TabsTrigger>
+						</TabsList>
+						<div
+							className="flex items-center gap-2"
+							data-dashboard-secondary-controls
+						>
+							{tab === "all" || tab === "releases" ? (
+								<FeedPageLaneSelector
+									value={effectivePageDefaultLane}
+									onValueChange={(lane) => {
+										setPageDefaultLane(lane);
+										setSelectedLaneByKey({});
+									}}
+								/>
+							) : null}
+							<Button
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+								onClick={() => setPatDialogOpen(true)}
+							>
+								打开 PAT 配置
+							</Button>
+							<Button
+								asChild
+								variant="outline"
+								size="sm"
+								className="font-mono text-xs"
+							>
+								<a href="/admin">管理员面板</a>
+							</Button>
+						</div>
+					</div>
+
+					<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+						<section className="min-w-0">
+							<TabsContent value="all" className="mt-0 min-w-0">
+								{renderFeedPanel("all")}
+							</TabsContent>
+							<TabsContent value="releases" className="mt-0 min-w-0">
+								{renderFeedPanel("releases")}
+							</TabsContent>
+							<TabsContent value="stars" className="mt-0 min-w-0">
+								{renderFeedPanel("stars")}
+							</TabsContent>
+							<TabsContent value="followers" className="mt-0 min-w-0">
+								{renderFeedPanel("followers")}
+							</TabsContent>
+							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<ReleaseDailyCard
+									briefs={storyBriefs}
+									selectedDate={selectedDate}
+									busy={false}
+									onGenerate={() => {}}
+									onOpenRelease={setActiveReleaseId}
+								/>
+							</TabsContent>
+							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<InboxList
+									notifications={notifications}
+									busy={syncingAll}
+									syncing={syncingAll}
+									onSync={tab === "inbox" ? () => {} : undefined}
+								/>
+							</TabsContent>
+						</section>
+
+						<aside className="space-y-6">
+							{tab === "briefs" ? (
+								<BriefListCard
+									briefs={storyBriefs}
+									selectedDate={selectedDate}
+									onSelectDate={(d) => setSelectedDate(d)}
+								/>
+							) : null}
+							<InboxQuickList notifications={notifications} />
+						</aside>
+					</div>
+				</Tabs>
+
+				<ReleaseDetailCard
+					releaseId={activeReleaseId}
+					onClose={() => setActiveReleaseId(null)}
+				/>
+
+				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
+					<DialogContent
+						showCloseButton={false}
+						className="max-w-2xl"
+						onInteractOutside={(event) => event.preventDefault()}
+					>
+						<DialogHeader>
+							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogDescription>
+								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+							</DialogDescription>
+						</DialogHeader>
+						<div className="bg-muted/40 rounded-lg border p-3">
+							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+							<p className="text-muted-foreground mt-1 font-mono text-xs">
+								Settings → Developer settings → Personal access tokens → Tokens
+								(classic)
+							</p>
+						</div>
+						<div className="space-y-2">
+							<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
+							<Input
+								id="storybook-reaction-pat"
+								type="password"
+								value="ghp_mock_dashboard_storybook_token"
+								readOnly
+								className="font-mono text-sm"
+							/>
+						</div>
+						<p className="text-xs text-emerald-600">
+							Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
 						</p>
-					</div>
-					<div className="space-y-2">
-						<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
-						<Input
-							id="storybook-reaction-pat"
-							type="password"
-							value="ghp_mock_dashboard_storybook_token"
-							readOnly
-							className="font-mono text-sm"
-						/>
-					</div>
-					<p className="text-xs text-emerald-600">
-						Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
-					</p>
-					<DialogFooter>
-						<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
-							稍后再说
-						</Button>
-						<Button>保存并继续</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
-		</AppShell>
+						<DialogFooter>
+							<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
+								稍后再说
+							</Button>
+							<Button>保存并继续</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+			</AppShell>
 		</VersionMonitorStateProvider>
 	);
 }
@@ -1844,12 +1885,20 @@ export const FollowersTab: Story = {
 };
 
 export const SocialAvatarFallback: Story = {
-	render: () => (
-		<DashboardPreview
-			initialTab="followers"
-			feedItems={makeMixedSocialFeed()}
-		/>
-	),
+	render: () => {
+		const items = makeMixedSocialFeed().map((item) =>
+			item.kind === "follower_received" && item.actor.login === "yyx990803"
+				? {
+						...item,
+						actor: {
+							...item.actor,
+							avatar_url: null,
+						},
+					}
+				: item,
+		);
+		return <DashboardPreview initialTab="followers" feedItems={items} />;
+	},
 	parameters: {
 		docs: {
 			description: {

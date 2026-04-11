@@ -36,6 +36,8 @@ export type FeedActor = {
 	html_url?: string | null;
 };
 
+export type FeedViewer = FeedActor;
+
 export type ReactionContent =
 	| "plus1"
 	| "laugh"

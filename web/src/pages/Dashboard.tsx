@@ -1114,6 +1114,11 @@ export function Dashboard(props: { me: MeResponse }) {
 				<FeedGroupedList
 					mode={mode}
 					items={filteredItems}
+					currentViewer={{
+						login: me.user.login,
+						avatar_url: me.user.avatar_url,
+						html_url: `https://github.com/${me.user.login}`,
+					}}
 					briefs={briefs}
 					dailyBoundaryLocal={dailyBoundaryLocal}
 					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
