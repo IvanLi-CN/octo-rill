@@ -428,7 +428,13 @@ function SocialActivityCard(props: {
 			<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)] md:items-center">
 				<SocialEntityCard
 					href={actorHref}
-					avatar={<SocialActorAvatar actor={actor} className="size-11" />}
+					avatar={
+						<SocialActorAvatar
+							key={actor.avatar_url ?? actor.login}
+							actor={actor}
+							className="size-11"
+						/>
+					}
 					primary={actor.login}
 				/>
 				<SocialActionBridge
@@ -440,6 +446,12 @@ function SocialActivityCard(props: {
 						href={repoHref}
 						avatar={
 							<SocialRepoAvatar
+								key={[
+									item.repo_visual?.owner_avatar_url ?? "",
+									item.repo_visual?.open_graph_image_url ?? "",
+									item.repo_visual?.uses_custom_open_graph_image ? "1" : "0",
+									item.repo_full_name ?? "",
+								].join("|")}
 								repoVisual={item.repo_visual}
 								className="size-11 border-border/60"
 							/>
@@ -451,7 +463,11 @@ function SocialActivityCard(props: {
 					<SocialEntityCard
 						href={viewerHref}
 						avatar={
-							<SocialActorAvatar actor={targetViewer} className="size-11" />
+							<SocialActorAvatar
+								key={targetViewer.avatar_url ?? targetViewer.login}
+								actor={targetViewer}
+								className="size-11"
+							/>
 						}
 						primary={targetViewer.login}
 					/>
