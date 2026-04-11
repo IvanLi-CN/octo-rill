@@ -66,6 +66,7 @@ pub struct SyncAccessRefreshResult {
     pub social: SyncSocialActivityResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub social_error: Option<String>,
+    pub notifications: SyncNotificationsResult,
 }
 
 #[derive(Debug, Serialize)]
@@ -1025,11 +1026,26 @@ pub async fn sync_access_refresh(
     )
     .await?;
 
+    let notifications = sync_notifications(state, user_id).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "notifications_summary",
+            "notifications": notifications.notifications,
+            "since": notifications.since,
+        }),
+    )
+    .await?;
+
     Ok(SyncAccessRefreshResult {
         starred,
         release,
         social,
         social_error,
+        notifications,
     })
 }
 
