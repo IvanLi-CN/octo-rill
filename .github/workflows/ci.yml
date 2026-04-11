@@ -139,6 +139,7 @@ jobs:
       - name: Check quality-gates scripts
         run: |
           python3 -m py_compile \
+            .github/scripts/release_backfill.py \
             .github/scripts/release_pr_comment.py \
             .github/scripts/metadata_gate.py \
             .github/scripts/check_live_quality_gates.py \
@@ -237,6 +238,7 @@ jobs:
           bash .github/scripts/test-quality-gates-contract.sh
           bash .github/scripts/test-live-quality-gates.sh
           bash .github/scripts/test-inline-metadata-workflows.sh
+          bash .github/scripts/test-release-automation.sh
           bash .github/scripts/test-release-pr-comment.sh
 
   unit-tests:

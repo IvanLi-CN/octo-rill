@@ -63,6 +63,62 @@ if [[ "${channel}" == "rc" && -z "${commit_sha}" ]]; then
   exit 1
 fi
 
+matching_existing_tag=""
+if [[ -n "${commit_sha}" ]]; then
+  existing_release_tags="$(
+    git tag --points-at "${commit_sha}" \
+      | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9a-f]{7})?$' \
+      || true
+  )"
+
+  case "${channel}" in
+    stable)
+      matching_existing_tag="$(
+        printf '%s\n' "${existing_release_tags}" \
+          | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+          | sort -V \
+          | tail -n 1 \
+          || true
+      )"
+      ;;
+    rc)
+      matching_existing_tag="$(
+        printf '%s\n' "${existing_release_tags}" \
+          | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9a-f]{7}$' \
+          | sort -V \
+          | tail -n 1 \
+          || true
+      )"
+      ;;
+  esac
+
+  if [[ -n "${matching_existing_tag}" ]]; then
+    normalized_tag="${matching_existing_tag#v}"
+    app_release_tag="${matching_existing_tag}"
+    if [[ "${channel}" == "stable" ]]; then
+      app_effective_version="${normalized_tag}"
+      app_is_prerelease="false"
+    else
+      app_effective_version="${normalized_tag%-rc.*}"
+      app_is_prerelease="true"
+    fi
+
+    {
+      echo "APP_EFFECTIVE_VERSION=${app_effective_version}"
+      echo "APP_RELEASE_TAG=${app_release_tag}"
+      echo "APP_IS_PRERELEASE=${app_is_prerelease}"
+    } >> "${GITHUB_ENV:-/dev/stdout}"
+
+    echo "Reusing existing release tag on commit"
+    echo "  commit_sha=${commit_sha}"
+    echo "  channel=${channel}"
+    echo "  APP_EFFECTIVE_VERSION=${app_effective_version}"
+    echo "  APP_RELEASE_TAG=${app_release_tag}"
+    echo "  APP_IS_PRERELEASE=${app_is_prerelease}"
+    exit 0
+  fi
+fi
+
 max_stable_tag="$(
   git tag -l \
     | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \

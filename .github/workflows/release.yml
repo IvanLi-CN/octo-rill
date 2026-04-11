@@ -1,9 +1,7 @@
 name: Release
 
 on:
-  workflow_run:
-    workflows: ["CI Pipeline"]
-    types: [completed]
+  push:
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -21,22 +19,132 @@ permissions:
 env:
   REGISTRY: ghcr.io
   PLATFORMS: linux/amd64
-  RELEASE_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.workflow_run.head_sha }}
+  REQUESTED_HEAD_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event.workflow_run.head_sha }}
+  group: release-main
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Plan release target
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      release_head_sha: ${{ steps.plan.outputs.release_head_sha }}
+      release_pr_number: ${{ steps.plan.outputs.release_pr_number }}
+      release_pr_url: ${{ steps.plan.outputs.release_pr_url }}
+      selection_reason: ${{ steps.plan.outputs.selection_reason }}
+      selection_pending_reason: ${{ steps.plan.outputs.selection_pending_reason }}
+      next_pending_head_sha: ${{ steps.plan.outputs.next_pending_head_sha }}
+      next_pending_pr_number: ${{ steps.plan.outputs.next_pending_pr_number }}
+      next_pending_reason: ${{ steps.plan.outputs.next_pending_reason }}
+      pending_unpublished_count: ${{ steps.plan.outputs.pending_unpublished_count }}
+      pending_repair_count: ${{ steps.plan.outputs.pending_repair_count }}
+    steps:
+      - name: Checkout main history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Determine release target
+        id: plan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REQUESTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || '' }}
+        run: |
+          set -euo pipefail
+          python3 ./.github/scripts/release_backfill.py plan \
+            --repo-root "$PWD" \
+            --head-ref HEAD \
+            --default-sha "${REQUESTED_HEAD_SHA}"
+
+      - name: Write summary
+        shell: bash
+        run: |
+          {
+            echo "### Release target plan"
+            echo "- requested_head_sha: ${REQUESTED_HEAD_SHA}"
+            echo "- release_head_sha: ${{ steps.plan.outputs.release_head_sha }}"
+            echo "- selection_reason: ${{ steps.plan.outputs.selection_reason }}"
+            echo "- selection_pending_reason: ${{ steps.plan.outputs.selection_pending_reason }}"
+            echo "- release_pr: #${{ steps.plan.outputs.release_pr_number }}"
+            echo "- next_pending_head_sha: ${{ steps.plan.outputs.next_pending_head_sha }}"
+            echo "- pending_unpublished_count: ${{ steps.plan.outputs.pending_unpublished_count }}"
+            echo "- pending_repair_count: ${{ steps.plan.outputs.pending_repair_count }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  await-ci:
+    name: Await current push CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: [plan]
+    outputs:
+      allow_release: ${{ steps.gate.outputs.allow_release }}
+      backfill_head_sha: ${{ steps.gate.outputs.backfill_head_sha }}
+      blocked_ci_head_sha: ${{ steps.gate.outputs.blocked_ci_head_sha }}
+      ci_run_id: ${{ steps.gate.outputs.ci_run_id }}
+      ci_status: ${{ steps.gate.outputs.ci_status }}
+      ci_conclusion: ${{ steps.gate.outputs.ci_conclusion }}
+      ci_reason: ${{ steps.gate.outputs.ci_reason }}
+    steps:
+      - name: Gate current push release against CI
+        id: gate
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${{ needs.plan.outputs.release_pr_number }}" ]]; then
+            echo "allow_release=true" >> "$GITHUB_OUTPUT"
+            echo "backfill_head_sha=" >> "$GITHUB_OUTPUT"
+            echo "blocked_ci_head_sha=" >> "$GITHUB_OUTPUT"
+            echo "ci_run_id=" >> "$GITHUB_OUTPUT"
+            echo "ci_status=skipped" >> "$GITHUB_OUTPUT"
+            echo "ci_conclusion=skipped" >> "$GITHUB_OUTPUT"
+            echo "ci_reason=no_release_candidate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          timeout_seconds=1800
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ needs.plan.outputs.release_head_sha }}" != "${REQUESTED_HEAD_SHA}" ]]; then
+            timeout_seconds=120
+          fi
+
+          python3 ./.github/scripts/release_backfill.py await-ci \
+            --head-sha "${{ needs.plan.outputs.release_head_sha }}" \
+            --workflow-id ci.yml \
+            --event push \
+            --poll-interval 10 \
+            --timeout-seconds "${timeout_seconds}"
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Current push CI gate"
+            echo "- requested_head_sha: ${REQUESTED_HEAD_SHA}"
+            echo "- release_head_sha: ${{ needs.plan.outputs.release_head_sha }}"
+            echo "- allow_release: ${{ steps.gate.outputs.allow_release }}"
+            echo "- ci_reason: ${{ steps.gate.outputs.ci_reason }}"
+            echo "- ci_run_id: ${{ steps.gate.outputs.ci_run_id }}"
+            echo "- ci_status: ${{ steps.gate.outputs.ci_status }}"
+            echo "- ci_conclusion: ${{ steps.gate.outputs.ci_conclusion }}"
+            echo "- backfill_head_sha: ${{ steps.gate.outputs.backfill_head_sha }}"
+            echo "- blocked_ci_head_sha: ${{ steps.gate.outputs.blocked_ci_head_sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   prepare:
     name: Prepare release metadata
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: >-
-      (github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push') ||
-      github.event_name == 'workflow_dispatch'
+    needs: [plan, await-ci]
+    if: ${{ needs.await-ci.outputs.allow_release == 'true' }}
+    env:
+      RELEASE_HEAD_SHA: ${{ needs.plan.outputs.release_head_sha }}
     outputs:
       should_release: ${{ steps.intent.outputs.should_release }}
       bump_level: ${{ steps.intent.outputs.bump_level }}
@@ -50,18 +158,17 @@ jobs:
       app_release_tag: ${{ steps.export.outputs.app_release_tag }}
       app_is_prerelease: ${{ steps.export.outputs.app_is_prerelease }}
     steps:
-      - name: Checkout (workflow_run)
+      - name: Checkout main history
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ env.RELEASE_HEAD_SHA }}
+          ref: main
 
       - name: Determine release intent
         id: intent
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WORKFLOW_RUN_SHA: ${{ env.RELEASE_HEAD_SHA }}
         run: bash ./.github/scripts/release-intent.sh
 
       - name: Compute effective version
@@ -109,8 +216,8 @@ jobs:
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
             echo "Tag ${tag} already exists. Skipping push."
           else
-            git tag -a "${tag}" -m "${tag}"
-            git push origin "${tag}"
+            git tag -a "${tag}" "${RELEASE_HEAD_SHA}" -m "${tag}"
+            git push origin "refs/tags/${tag}"
           fi
 
       - name: Create GitHub Release
@@ -134,6 +241,9 @@ jobs:
           fi
           {
             echo "### Release decision"
+            echo "- requested_head_sha: ${REQUESTED_HEAD_SHA}"
+            echo "- release_head_sha: ${RELEASE_HEAD_SHA}"
+            echo "- selection_reason: ${{ needs.plan.outputs.selection_reason }}"
             echo "- should_release: ${{ steps.intent.outputs.should_release }}"
             echo "- reason: ${{ steps.intent.outputs.reason }}"
             echo "- release_intent_label: ${{ steps.intent.outputs.release_intent_label }}"
@@ -147,17 +257,18 @@ jobs:
     name: Build and push Docker image
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [prepare]
+    needs: [plan, prepare]
     if: ${{ needs.prepare.outputs.should_release == 'true' }}
     permissions:
       contents: read
       packages: write
     env:
+      RELEASE_HEAD_SHA: ${{ needs.plan.outputs.release_head_sha }}
       APP_EFFECTIVE_VERSION: ${{ needs.prepare.outputs.app_effective_version }}
       APP_RELEASE_TAG: ${{ needs.prepare.outputs.app_release_tag }}
       APP_IS_PRERELEASE: ${{ needs.prepare.outputs.app_is_prerelease }}
     steps:
-      - name: Checkout (workflow_run)
+      - name: Checkout release revision
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_HEAD_SHA }}
@@ -254,4 +365,69 @@ jobs:
             if [[ -n "${{ steps.comment.outputs.comment_url }}" ]]; then
               echo "- comment: ${{ steps.comment.outputs.comment_url }}"
             fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  audit-backfill:
+    name: Dispatch next backfill
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [plan, await-ci, prepare, docker-release, pr-release-comment]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.plan.result == 'success' &&
+      needs.await-ci.result == 'success' &&
+      (needs.prepare.result == 'success' || needs.await-ci.outputs.allow_release == 'false') &&
+      (needs.docker-release.result == 'success' || needs.docker-release.result == 'skipped') &&
+      (needs.pr-release-comment.result == 'success' || needs.pr-release-comment.result == 'skipped')
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: write
+    steps:
+      - name: Checkout main history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Resolve next dispatch target
+        id: target
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 ./.github/scripts/release_backfill.py plan \
+            --repo-root "$PWD" \
+            --head-ref HEAD \
+            --default-sha '' \
+            --exclude-sha "${{ needs.plan.outputs.release_head_sha }}" \
+            --exclude-sha "${{ needs.await-ci.outputs.blocked_ci_head_sha }}"
+
+      - name: Dispatch next release backfill
+        if: ${{ steps.target.outputs.release_head_sha != '' }}
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 ./.github/scripts/release_backfill.py dispatch \
+            --head-sha "${{ steps.target.outputs.release_head_sha }}" \
+            --workflow-id release.yml \
+            --ref main
+
+      - name: Write summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Release backfill audit"
+            echo "- current_release_head_sha: ${{ needs.plan.outputs.release_head_sha }}"
+            echo "- ci_reason: ${{ needs.await-ci.outputs.ci_reason }}"
+            echo "- blocked_ci_head_sha: ${{ needs.await-ci.outputs.blocked_ci_head_sha }}"
+            echo "- next_pending_head_sha: ${{ steps.target.outputs.release_head_sha }}"
+            echo "- next_pending_reason: ${{ steps.target.outputs.selection_pending_reason }}"
+            echo "- next_pending_pr_number: ${{ steps.target.outputs.release_pr_number }}"
           } >> "$GITHUB_STEP_SUMMARY"
