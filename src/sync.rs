@@ -1184,6 +1184,7 @@ async fn apply_social_activity_snapshot_partial(
                         kind: "follower_received",
                         repo_id: None,
                         repo_full_name: None,
+                        repo_visual: None,
                         actor: &follower.actor,
                         occurred_at: now.as_str(),
                         detected_at: now.as_str(),
@@ -1362,6 +1363,7 @@ async fn apply_social_activity_snapshot_partial(
                             kind: "repo_star_received",
                             repo_id: Some(repo.repo_id),
                             repo_full_name: Some(repo.full_name.as_str()),
+                            repo_visual: Some(repo),
                             actor: &member.actor,
                             occurred_at,
                             detected_at: now.as_str(),
@@ -1467,6 +1469,7 @@ struct SocialActivityEventInsert<'a> {
     kind: &'a str,
     repo_id: Option<i64>,
     repo_full_name: Option<&'a str>,
+    repo_visual: Option<&'a OwnedRepoSnapshot>,
     actor: &'a GitHubActor,
     occurred_at: &'a str,
     detected_at: &'a str,
@@ -1476,6 +1479,19 @@ async fn insert_social_activity_event_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     event: SocialActivityEventInsert<'_>,
 ) -> Result<bool> {
+    let repo_owner_avatar_url = event
+        .repo_visual
+        .and_then(|repo| repo.owner_avatar_url.as_deref());
+    let repo_open_graph_image_url = event
+        .repo_visual
+        .and_then(|repo| repo.open_graph_image_url.as_deref());
+    let repo_uses_custom_open_graph_image = event.repo_visual.map(|repo| {
+        if repo.uses_custom_open_graph_image {
+            1_i64
+        } else {
+            0_i64
+        }
+    });
     let result = sqlx::query(
         r#"
         INSERT INTO social_activity_events (
@@ -1484,6 +1500,9 @@ async fn insert_social_activity_event_tx(
           kind,
           repo_id,
           repo_full_name,
+          repo_owner_avatar_url,
+          repo_open_graph_image_url,
+          repo_uses_custom_open_graph_image,
           actor_github_user_id,
           actor_login,
           actor_avatar_url,
@@ -1493,7 +1512,7 @@ async fn insert_social_activity_event_tx(
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT DO NOTHING
         "#,
     )
@@ -1502,6 +1521,9 @@ async fn insert_social_activity_event_tx(
     .bind(event.kind)
     .bind(event.repo_id)
     .bind(event.repo_full_name)
+    .bind(repo_owner_avatar_url)
+    .bind(repo_open_graph_image_url)
+    .bind(repo_uses_custom_open_graph_image)
     .bind(event.actor.id)
     .bind(event.actor.login.as_str())
     .bind(event.actor.avatar_url.as_deref())
@@ -6005,6 +6027,7 @@ mod tests {
                     kind: "follower_received",
                     repo_id: None,
                     repo_full_name: None,
+                    repo_visual: None,
                     actor: &actor,
                     occurred_at,
                     detected_at,
@@ -6026,6 +6049,7 @@ mod tests {
                     kind: "follower_received",
                     repo_id: None,
                     repo_full_name: None,
+                    repo_visual: None,
                     actor: &actor,
                     occurred_at,
                     detected_at,

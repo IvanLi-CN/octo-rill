@@ -4490,9 +4490,12 @@ async fn fetch_feed_items(
             NULL AS release_id,
             NULL AS release_node_id,
             e.repo_full_name AS repo_full_name,
-            ob.owner_avatar_url AS owner_avatar_url,
-            ob.open_graph_image_url AS open_graph_image_url,
-            ob.uses_custom_open_graph_image AS uses_custom_open_graph_image,
+            COALESCE(e.repo_owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
+            COALESCE(e.repo_open_graph_image_url, ob.open_graph_image_url) AS open_graph_image_url,
+            COALESCE(
+              e.repo_uses_custom_open_graph_image,
+              ob.uses_custom_open_graph_image
+            ) AS uses_custom_open_graph_image,
             NULL AS release_tag_name,
             NULL AS release_previous_tag_name,
             NULL AS title,
@@ -10396,6 +10399,9 @@ mod tests {
         event_id: &'a str,
         repo_id: Option<i64>,
         repo_full_name: Option<&'a str>,
+        repo_owner_avatar_url: Option<&'a str>,
+        repo_open_graph_image_url: Option<&'a str>,
+        repo_uses_custom_open_graph_image: Option<bool>,
         actor_login: &'a str,
         occurred_at: &'a str,
     }
@@ -10409,6 +10415,9 @@ mod tests {
               kind,
               repo_id,
               repo_full_name,
+              repo_owner_avatar_url,
+              repo_open_graph_image_url,
+              repo_uses_custom_open_graph_image,
               actor_github_user_id,
               actor_login,
               actor_avatar_url,
@@ -10418,7 +10427,7 @@ mod tests {
               created_at,
               updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(args.event_id)
@@ -10426,6 +10435,12 @@ mod tests {
         .bind(args.kind)
         .bind(args.repo_id)
         .bind(args.repo_full_name)
+        .bind(args.repo_owner_avatar_url)
+        .bind(args.repo_open_graph_image_url)
+        .bind(
+            args.repo_uses_custom_open_graph_image
+                .map(|uses_custom| if uses_custom { 1_i64 } else { 0_i64 }),
+        )
         .bind(90_000_i64 + i64::from(args.actor_login.bytes().map(i16::from).sum::<i16>()))
         .bind(args.actor_login)
         .bind(format!("https://avatars.example/{}.png", args.actor_login))
@@ -13204,6 +13219,9 @@ mod tests {
                 event_id: "social-star-1",
                 repo_id: Some(42),
                 repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
                 actor_login: "octocat",
                 occurred_at: "2026-02-23T10:00:00Z",
             },
@@ -13217,6 +13235,9 @@ mod tests {
                 event_id: "social-follow-1",
                 repo_id: None,
                 repo_full_name: None,
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
                 actor_login: "monalisa",
                 occurred_at: "2026-02-23T09:00:00Z",
             },
@@ -13269,6 +13290,56 @@ mod tests {
 
         assert_eq!(stars_only.items.len(), 1);
         assert_eq!(stars_only.items[0].kind, "repo_star_received");
+    }
+
+    #[tokio::test]
+    async fn list_feed_preserves_repo_visuals_for_historical_social_events_without_baseline() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "social-star-history-1",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: Some("https://avatars.githubusercontent.com/u/14957082"),
+                repo_open_graph_image_url: Some(
+                    "https://repository-images.githubusercontent.com/14957082/codex",
+                ),
+                repo_uses_custom_open_graph_image: Some(true),
+                actor_login: "octocat",
+                occurred_at: "2026-02-23T10:00:00Z",
+            },
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("stars".to_owned()),
+            }),
+        )
+        .await
+        .expect("list stars feed");
+
+        let item = feed.items.first().expect("historical social item");
+        assert_eq!(item.kind, "repo_star_received");
+        let repo_visual = item.repo_visual.as_ref().expect("repo visual");
+        assert_eq!(
+            repo_visual.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/14957082")
+        );
+        assert_eq!(
+            repo_visual.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/14957082/codex")
+        );
+        assert!(repo_visual.uses_custom_open_graph_image);
     }
 
     #[tokio::test]
