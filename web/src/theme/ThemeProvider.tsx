@@ -145,3 +145,7 @@ export function useTheme() {
 	}
 	return value;
 }
+
+export function useOptionalTheme() {
+	return useContext(ThemeContext);
+}

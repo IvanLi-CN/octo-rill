@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils";
 import { withBaseAssetPath } from "@/lib/asset-path";
-import { useTheme } from "@/theme/ThemeProvider";
+import { useOptionalTheme } from "@/theme/ThemeProvider";
+import { getSystemResolvedTheme } from "@/theme/theme";
 
 type BrandLogoProps = {
 	variant?: "mark" | "wordmark";
@@ -21,7 +22,7 @@ export function BrandLogo({
 	imgClassName,
 	alt = "OctoRill",
 }: BrandLogoProps) {
-	const { resolvedTheme } = useTheme();
+	const optionalTheme = useOptionalTheme();
 
 	if (variant === "mark") {
 		return (
@@ -34,18 +35,26 @@ export function BrandLogo({
 		);
 	}
 
-	const resolvedWordmarkTheme = theme === "auto" ? resolvedTheme : theme;
+	if (theme === "light" || theme === "dark") {
+		return (
+			<img
+				alt={alt}
+				className={cn("h-full w-auto", className, imgClassName)}
+				loading="eager"
+				src={theme === "dark" ? WORDMARK_DARK_SRC : WORDMARK_LIGHT_SRC}
+			/>
+		);
+	}
+
+	const resolvedTheme =
+		optionalTheme?.resolvedTheme ?? getSystemResolvedTheme();
 
 	return (
 		<img
 			alt={alt}
 			className={cn("h-full w-auto", className, imgClassName)}
 			loading="eager"
-			src={
-				resolvedWordmarkTheme === "dark"
-					? WORDMARK_DARK_SRC
-					: WORDMARK_LIGHT_SRC
-			}
+			src={resolvedTheme === "dark" ? WORDMARK_DARK_SRC : WORDMARK_LIGHT_SRC}
 		/>
 	);
 }
