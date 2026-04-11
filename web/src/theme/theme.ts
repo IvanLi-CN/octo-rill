@@ -33,15 +33,14 @@ export function resolveTheme(
 	return preference === "system" ? systemTheme : preference;
 }
 
-export function readStoredThemePreference(
-	storage: Storage | undefined = typeof window !== "undefined"
-		? window.localStorage
-		: undefined,
-): ThemePreference {
-	if (!storage) return "system";
-
+export function readStoredThemePreference(storage?: Storage): ThemePreference {
 	try {
-		return normalizeThemePreference(storage.getItem(THEME_STORAGE_KEY));
+		const targetStorage =
+			storage ??
+			(typeof window !== "undefined" ? window.localStorage : undefined);
+		if (!targetStorage) return "system";
+
+		return normalizeThemePreference(targetStorage.getItem(THEME_STORAGE_KEY));
 	} catch {
 		return "system";
 	}
@@ -49,14 +48,15 @@ export function readStoredThemePreference(
 
 export function persistThemePreference(
 	preference: ThemePreference,
-	storage: Storage | undefined = typeof window !== "undefined"
-		? window.localStorage
-		: undefined,
+	storage?: Storage,
 ): void {
-	if (!storage) return;
-
 	try {
-		storage.setItem(THEME_STORAGE_KEY, preference);
+		const targetStorage =
+			storage ??
+			(typeof window !== "undefined" ? window.localStorage : undefined);
+		if (!targetStorage) return;
+
+		targetStorage.setItem(THEME_STORAGE_KEY, preference);
 	} catch {
 		// ignore storage failures
 	}
