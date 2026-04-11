@@ -2,6 +2,7 @@ import { LogOut, RefreshCcw, ShieldCheck, Sparkles } from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
 
 export type DashboardHeaderProps = {
@@ -77,7 +78,7 @@ function DashboardUserInfoCard(props: {
 
 	return (
 		<div
-			className="absolute top-full right-0 z-50 mt-2 w-64 rounded-3xl border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur"
+			className="absolute top-full right-0 z-50 mt-2 w-64 rounded-3xl border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur dark:ring-white/10"
 			data-dashboard-user-card
 			role="dialog"
 			aria-label="账号信息"
@@ -279,6 +280,7 @@ export function DashboardHeader({
 				className="flex flex-wrap items-center gap-2 self-start lg:justify-end"
 				data-dashboard-primary-actions
 			>
+				<ThemeToggle />
 				<Button disabled={busy} onClick={onSyncAll}>
 					<RefreshCcw
 						className={syncingAll ? "size-4 animate-spin" : "size-4"}
