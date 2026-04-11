@@ -1148,6 +1148,11 @@ async fn apply_social_activity_snapshot_partial(
         .filter(|repo| !known_repo_ids.contains(&repo.repo_id))
         .map(|repo| repo.repo_id)
         .collect::<HashSet<_>>();
+    let successful_repo_snapshot_ids = repo_members
+        .unwrap_or(&[])
+        .iter()
+        .map(|(repo, _)| repo.repo_id)
+        .collect::<HashSet<_>>();
 
     if let Some(followers) = followers {
         let current_follower_rows = sqlx::query_as::<_, FollowerCurrentMemberRow>(
@@ -1228,7 +1233,17 @@ async fn apply_social_activity_snapshot_partial(
 
     if let Some(owned_repos) = owned_repos {
         for repo in owned_repos {
-            let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
+            let was_known_repo = known_repo_ids.contains(&repo.repo_id);
+            let fetched_snapshot_this_run = successful_repo_snapshot_ids.contains(&repo.repo_id);
+            let should_persist_baseline =
+                was_known_repo || !repo_tracking_initialized || fetched_snapshot_this_run;
+
+            if !should_persist_baseline {
+                continue;
+            }
+
+            let snapshot_initialized =
+                repo_snapshot_initialized_ids.contains(&repo.repo_id) || fetched_snapshot_this_run;
             upsert_owned_repo_star_baseline_tx(
                 &mut tx,
                 user_id,
@@ -6241,6 +6256,110 @@ mod tests {
         .expect("load new repo star event");
         assert_eq!(row.0, "octo/beta");
         assert_eq!(row.1, "new-star");
+    }
+
+    #[tokio::test]
+    async fn social_activity_new_repo_retry_after_failed_first_fetch_emits_current_star_events() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-new-repo-retry");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let initial_repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let new_repo = OwnedRepoSnapshot {
+            repo_id: 43,
+            full_name: "octo/beta".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&initial_repo),
+            &[(initial_repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("seed initial repo baseline");
+
+        let failed_retry_events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            Some(&[initial_repo.clone(), new_repo.clone()]),
+            Some(&[(initial_repo.clone(), vec![])]),
+            Some(&[]),
+        )
+        .await
+        .expect("record post-baseline repo fetch failure");
+        assert_eq!(failed_retry_events, 0);
+
+        let pending_repo_baseline_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM owned_repo_star_baselines
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(new_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count pending repo baseline");
+        assert_eq!(pending_repo_baseline_count, 0);
+
+        let recovered_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            &[initial_repo.clone(), new_repo.clone()],
+            &[
+                (initial_repo, vec![]),
+                (
+                    new_repo.clone(),
+                    vec![RepoStargazerSnapshot {
+                        repo_id: new_repo.repo_id,
+                        repo_full_name: new_repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 701,
+                            login: "recovered-star".to_owned(),
+                            avatar_url: Some(
+                                "https://avatars.example/recovered-star.png".to_owned(),
+                            ),
+                            html_url: Some("https://github.com/recovered-star".to_owned()),
+                        },
+                        starred_at: Some("2026-03-06T14:30:00Z".to_owned()),
+                    }],
+                ),
+            ],
+            &[],
+        )
+        .await
+        .expect("emit recovered new repo star event");
+
+        assert_eq!(recovered_events, 1);
+
+        let row: (String, String) = sqlx::query_as(
+            r#"
+            SELECT repo_full_name, actor_login
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'repo_star_received'
+            ORDER BY occurred_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered repo star event");
+        assert_eq!(row.0, "octo/beta");
+        assert_eq!(row.1, "recovered-star");
     }
 
     #[tokio::test]

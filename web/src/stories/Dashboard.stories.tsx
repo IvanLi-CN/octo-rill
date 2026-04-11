@@ -1851,6 +1851,17 @@ export const AllMixedSocialActivity: Story = {
 				canvas.queryByText("linus", { exact: true }),
 			).not.toBeInTheDocument();
 		});
+		await step("social cards keep a single outbound CTA", async () => {
+			const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+				"[data-social-card-kind]",
+			);
+			expect(socialCards.length).toBeGreaterThan(0);
+			for (const card of socialCards) {
+				expect(
+					card.querySelectorAll('a[href^="https://github.com/"]').length,
+				).toBe(1);
+			}
+		});
 	},
 };
 
@@ -1873,6 +1884,15 @@ export const StarsTab: Story = {
 			canvas.getByText("acme/rocket", { exact: true }),
 		).toBeVisible();
 		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"]',
+		);
+		expect(socialCards.length).toBeGreaterThan(0);
+		for (const card of socialCards) {
+			expect(
+				card.querySelectorAll('a[href^="https://github.com/"]').length,
+			).toBe(1);
+		}
 		await expect(
 			canvas.queryByText("gaearon", { exact: true }),
 		).not.toBeInTheDocument();
@@ -1898,6 +1918,15 @@ export const FollowersTab: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
 		await expect(canvas.getByText("关注", { exact: true })).toBeVisible();
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			'[data-social-card-kind="follower_received"]',
+		);
+		expect(socialCards.length).toBeGreaterThan(0);
+		for (const card of socialCards) {
+			expect(
+				card.querySelectorAll('a[href^="https://github.com/"]').length,
+			).toBe(1);
+		}
 		await expect(
 			canvas.queryByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).not.toBeInTheDocument();
