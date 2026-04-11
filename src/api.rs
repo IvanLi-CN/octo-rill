@@ -3356,7 +3356,7 @@ pub async fn sync_all(
         state,
         mode,
         jobs::NewTask {
-            task_type: jobs::TASK_SYNC_ACCESS_REFRESH.to_owned(),
+            task_type: jobs::TASK_SYNC_ALL.to_owned(),
             payload: json!({ "user_id": user_id.clone() }),
             source: "api.sync_all".to_owned(),
             requested_by: Some(user_id.clone()),
@@ -10053,7 +10053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_all_task_id_reuses_inflight_access_refresh_task() {
+    async fn sync_all_task_id_reuses_inflight_sync_all_task() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id(1);
@@ -10108,10 +10108,10 @@ mod tests {
             "#,
         )
         .bind(user_id.as_str())
-        .bind(jobs::TASK_SYNC_ACCESS_REFRESH)
+        .bind(jobs::TASK_SYNC_ALL)
         .fetch_one(&pool)
         .await
-        .expect("count access refresh tasks");
+        .expect("count sync all tasks");
         assert_eq!(queued, 1);
     }
 
