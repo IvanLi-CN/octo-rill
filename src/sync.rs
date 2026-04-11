@@ -298,7 +298,7 @@ struct RepoNode {
     owner: RepoOwner,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RepoOwner {
     login: String,
@@ -332,12 +332,21 @@ struct GitHubActor {
 struct GitHubOwnedRepo {
     id: i64,
     full_name: String,
+    #[serde(default)]
+    owner: RepoOwner,
+    #[serde(default)]
+    open_graph_image_url: Option<String>,
+    #[serde(default)]
+    uses_custom_open_graph_image: bool,
 }
 
 #[derive(Debug, Clone)]
 struct OwnedRepoSnapshot {
     repo_id: i64,
     full_name: String,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1263,13 +1272,19 @@ async fn upsert_owned_repo_star_baseline_tx(
           user_id,
           repo_id,
           repo_full_name,
+          owner_avatar_url,
+          open_graph_image_url,
+          uses_custom_open_graph_image,
           members_snapshot_initialized,
           initialized_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id, repo_id) DO UPDATE
         SET repo_full_name = excluded.repo_full_name,
+            owner_avatar_url = excluded.owner_avatar_url,
+            open_graph_image_url = excluded.open_graph_image_url,
+            uses_custom_open_graph_image = excluded.uses_custom_open_graph_image,
             members_snapshot_initialized = excluded.members_snapshot_initialized,
             updated_at = excluded.updated_at
         "#,
@@ -1278,6 +1293,9 @@ async fn upsert_owned_repo_star_baseline_tx(
     .bind(user_id)
     .bind(repo.repo_id)
     .bind(repo.full_name.as_str())
+    .bind(repo.owner_avatar_url.as_deref())
+    .bind(repo.open_graph_image_url.as_deref())
+    .bind(repo.uses_custom_open_graph_image as i64)
     .bind(if members_snapshot_initialized {
         1_i64
     } else {
@@ -3443,6 +3461,9 @@ async fn fetch_owned_repo_snapshot(
         repos.extend(items.into_iter().map(|repo| OwnedRepoSnapshot {
             repo_id: repo.id,
             full_name: repo.full_name,
+            owner_avatar_url: repo.owner.avatar_url,
+            open_graph_image_url: repo.open_graph_image_url,
+            uses_custom_open_graph_image: repo.uses_custom_open_graph_image,
         }));
 
         if count < 100 {
@@ -4269,19 +4290,19 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, GitHubNotification, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
-        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
-        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, ReleaseDemandRepo,
-        RepoReleaseOrigin, RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess,
-        StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        apply_social_activity_snapshot, attach_and_wait_for_user_release_demand,
-        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, insert_social_activity_event_tx,
-        is_terminal_notification_thread_error, recover_repo_release_runtime_state_on_startup,
-        repo_release_deadline_at, resolve_notification_open_url,
-        subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
-        FollowerSnapshot, GitHubActor, OwnedRepoSnapshot,
+        EligibleUserRow, FollowerSnapshot, GitHubActor, GitHubNotification,
+        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
+        NotificationSubject, OwnedRepoSnapshot, ReleaseDemandRepo, RepoReleaseOrigin,
+        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
+        SubscriptionRunContext, SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
+        attach_and_wait_for_user_release_demand, attach_release_demand, classify_github_http_error,
+        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        insert_social_activity_event_tx, is_terminal_notification_thread_error,
+        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
+        resolve_notification_open_url, subscription_event_counts_as_critical,
+        subscription_timeout_error, sync_notifications_with_fetch,
+        sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -5406,11 +5427,17 @@ mod tests {
             &[OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/alpha".to_owned(),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
             }],
             &[(
                 OwnedRepoSnapshot {
                     repo_id: 42,
                     full_name: "octo/alpha".to_owned(),
+                    owner_avatar_url: None,
+                    open_graph_image_url: None,
+                    uses_custom_open_graph_image: false,
                 },
                 vec![RepoStargazerSnapshot {
                     repo_id: 42,
@@ -5465,6 +5492,9 @@ mod tests {
         let repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
         };
 
         apply_social_activity_snapshot(
@@ -5638,10 +5668,16 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/fail".to_owned(),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
             },
             OwnedRepoSnapshot {
                 repo_id: 43,
                 full_name: "octo/pass".to_owned(),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
             },
         ];
 
@@ -5681,10 +5717,16 @@ mod tests {
             OwnedRepoSnapshot {
                 repo_id: 42,
                 full_name: "octo/alpha".to_owned(),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
             },
             OwnedRepoSnapshot {
                 repo_id: 43,
                 full_name: "octo/beta".to_owned(),
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
             },
         ];
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
@@ -5741,10 +5783,16 @@ mod tests {
         let stable_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
         };
         let skipped_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/beta".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
         };
 
         apply_social_activity_snapshot(
@@ -5826,10 +5874,16 @@ mod tests {
         let initial_repo = OwnedRepoSnapshot {
             repo_id: 42,
             full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
         };
         let new_repo = OwnedRepoSnapshot {
             repo_id: 43,
             full_name: "octo/beta".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
         };
         let initial_repos = vec![initial_repo.clone()];
         let initial_repo_members = vec![(initial_repo, vec![])];
@@ -6365,6 +6419,9 @@ mod tests {
             .run(&pool)
             .await
             .expect("run migrations");
+        crate::api::ensure_owned_repo_visual_columns(&pool)
+            .await
+            .expect("ensure owned repo visual columns");
         pool
     }
 

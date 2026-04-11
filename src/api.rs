@@ -4490,6 +4490,9 @@ async fn fetch_feed_items(
             NULL AS release_id,
             NULL AS release_node_id,
             e.repo_full_name AS repo_full_name,
+            ob.owner_avatar_url AS owner_avatar_url,
+            ob.open_graph_image_url AS open_graph_image_url,
+            ob.uses_custom_open_graph_image AS uses_custom_open_graph_image,
             NULL AS release_tag_name,
             NULL AS release_previous_tag_name,
             NULL AS title,
@@ -4513,6 +4516,8 @@ async fn fetch_feed_items(
             NULL AS react_rocket,
             NULL AS react_eyes
           FROM social_activity_events e
+          LEFT JOIN owned_repo_star_baselines ob
+            ON ob.user_id = e.user_id AND ob.repo_id = e.repo_id
           WHERE e.user_id = ?
         )
         SELECT
@@ -4973,6 +4978,11 @@ fn feed_item_from_row(
         avatar_url: r.actor_avatar_url.clone(),
         html_url: r.actor_html_url.clone(),
     });
+    let repo_visual = repo_visual_from_parts(
+        r.owner_avatar_url.clone(),
+        r.open_graph_image_url.clone(),
+        r.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
 
     if r.kind != "release" {
         return FeedItem {
@@ -4980,6 +4990,7 @@ fn feed_item_from_row(
             ts: r.ts,
             id: r.entity_id,
             repo_full_name: r.repo_full_name,
+            repo_visual,
             title: r.title,
             body: None,
             body_truncated: false,
@@ -5144,12 +5155,6 @@ fn feed_item_from_row(
         counts = live.counts.clone();
         viewer = live.viewer.clone();
     }
-
-    let repo_visual = repo_visual_from_parts(
-        r.owner_avatar_url.clone(),
-        r.open_graph_image_url.clone(),
-        r.uses_custom_open_graph_image.unwrap_or(0) != 0,
-    );
 
     FeedItem {
         kind: r.kind,
@@ -9591,6 +9596,27 @@ pub(crate) async fn require_admin_user_id(
 }
 
 #[cfg(test)]
+pub(crate) async fn ensure_owned_repo_visual_columns(
+    pool: &sqlx::SqlitePool,
+) -> Result<(), sqlx::Error> {
+    for statement in [
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN owner_avatar_url TEXT"#,
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN open_graph_image_url TEXT"#,
+        r#"ALTER TABLE owned_repo_star_baselines ADD COLUMN uses_custom_open_graph_image INTEGER NOT NULL DEFAULT 0"#,
+    ] {
+        match sqlx::query(statement).execute(pool).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(err))
+                if err.message().contains("duplicate column name")
+                    || err.message().contains("no such table") => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallListScope,
@@ -9767,6 +9793,9 @@ mod tests {
             .run(&pool)
             .await
             .expect("run migrations");
+        super::ensure_owned_repo_visual_columns(&pool)
+            .await
+            .expect("ensure owned repo visual columns");
 
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
