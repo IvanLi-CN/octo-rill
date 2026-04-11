@@ -13,6 +13,7 @@
   - PR #63 / `28c3ff8f919d881f8e4bdc63c9bb9aae1543cfe9`
   - PR #62 / `991bee71b861c7b1be0038fc0909928186c369e2`
 - 现状缺少自动 audit/backfill：一旦主干 CI 被取消，后续没有机制补发 tag / GitHub Release / Docker image / PR release comment。
+- GitHub Actions 默认 `GITHUB_TOKEN` 无法为历史提交创建缺失的 release tag；当 backfill target 不是当前 `main` HEAD 且目标 tag 尚不存在时，workflow 需要仓库 secret `RELEASE_TOKEN`（具备创建历史 release tag 的 GitHub token），否则只能先手动把目标 tag 推到远端再重跑 release。
 
 ## 目标
 
@@ -35,6 +36,7 @@
 - 无论本次要发布的是当前 push 还是更早的 backfill 目标，都必须校验该 target SHA 自己的 `CI Pipeline` push run 已进入终态；`success` 与 `cancelled` 允许继续发布，`failure`/`timed_out` 必须阻断发布。
 - 当某个历史 target SHA 的 `CI Pipeline` 结论为阻断态时，本次 run 不能发布该 SHA，但仍要继续评估并 dispatch 更靠后的 pending release，避免整个 backfill 队列永久卡死。
 - 对同一 target SHA 重跑 release 时，版本号必须复用该提交上已存在的 release tag，而不是继续向后 bump。
+- 当 target SHA 不是当前 `main` HEAD 且对应 release tag 尚不存在时，workflow 必须在创建 release 前显式校验 `RELEASE_TOKEN` 是否可用；若不可用，需给出可执行的 fallback（预先推送目标 tag 后再重跑）。
 - 当前确定的补发顺序固定为：
   1. `28c3ff8f919d881f8e4bdc63c9bb9aae1543cfe9`（PR #63）
   2. `991bee71b861c7b1be0038fc0909928186c369e2`（PR #62）
@@ -45,6 +47,7 @@
   - 改为监听 `push.branches=[main]` 与 `workflow_dispatch(head_sha)`。
   - 新增 release target planning / audit 步骤，按 first-parent merge 顺序选择最早的漏发提交。
   - 对 push 触发完成当前补发后，如仍存在后续漏项，自动 dispatch 下一次 backfill。
+  - 对历史 backfill target 的缺失 tag，优先使用仓库 secret `RELEASE_TOKEN` 创建 release；若 secret 缺失，则在 workflow 内明确阻断并提示先推送 tag 再重跑。
 - Release helper scripts:
   - `/Users/ivan/.codex/worktrees/607d/octo-rill/.github/scripts/release-intent.sh` 需要接受 `RELEASE_HEAD_SHA` 作为 push/backfill 的统一输入。
   - `/Users/ivan/.codex/worktrees/607d/octo-rill/.github/scripts/compute-version.sh` 需要在目标提交已有 release tag 时复用既有版本/tag，保证 rerun/backfill 幂等。

@@ -230,6 +230,7 @@ assert explicit.selection_reason == "explicit_head_sha"
 assert explicit.next_candidate == missing_sixty_three
 
 release_workflow = contract.load_yaml(release_workflow_path)
+release_workflow_text = release_workflow_path.read_text(encoding="utf-8")
 on_section = contract.require_mapping(contract.mapping_get(release_workflow, "on"), "release.yml.on")
 assert "workflow_run" not in on_section
 push_config = contract.event_config(release_workflow, "push", "release.yml")
@@ -273,9 +274,26 @@ assert "bash ./.github/scripts/release-intent.sh" in contract.step_run(
     intent_step,
     "release.yml.jobs.prepare.steps['Determine release intent']",
 )
-tag_step = contract.step_config(prepare_job, "Create and push tag (if missing)", "release.yml.jobs.prepare")
-tag_run = contract.step_run(tag_step, "release.yml.jobs.prepare.steps['Create and push tag (if missing)']")
-assert 'git tag -a "${tag}" "${RELEASE_HEAD_SHA}" -m "${tag}"' in tag_run
+release_step = contract.step_config(prepare_job, "Create GitHub Release", "release.yml.jobs.prepare")
+release_with = contract.require_mapping(
+    release_step.get("with"),
+    "release.yml.jobs.prepare.steps['Create GitHub Release'].with",
+)
+auth_step = contract.step_config(
+    prepare_job,
+    "Validate historical release credentials",
+    "release.yml.jobs.prepare",
+)
+auth_run = contract.step_run(
+    auth_step,
+    "release.yml.jobs.prepare.steps['Validate historical release credentials']",
+)
+assert 'git rev-parse -q --verify "refs/tags/${tag}"' in auth_run
+assert "needs RELEASE_TOKEN to create missing tag" in auth_run
+assert release_with.get("tag_name") == "${{ steps.export.outputs.app_release_tag }}"
+assert release_with.get("target_commitish") == "${{ env.RELEASE_HEAD_SHA }}"
+assert release_with.get("token") == "${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}"
+assert 'git push origin "refs/tags/${tag}"' not in release_workflow_text
 
 audit_job = contract.job_config(release_workflow, "audit-backfill", "release.yml")
 assert "github.event_name == 'push'" in audit_job.get("if", "")
