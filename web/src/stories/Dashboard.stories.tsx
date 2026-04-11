@@ -1233,7 +1233,7 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		docs: {
 			description: {
 				story:
-					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到 releases 视图后只保留日期分界与原始列表。",
+					"`全部` tab 中，今天保持原始 Release feed；历史日组默认展示日报卡片，切到列表视图后恢复同一天的原始混排记录。",
 			},
 		},
 	},
@@ -1266,7 +1266,7 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			if (!beforeSlot || !expandButton) {
 				throw new Error("Expected action slot and expand button to exist");
 			}
-			expect(expandButton.textContent?.trim()).toBe("Releases");
+			expect(expandButton.textContent?.trim()).toBe("列表");
 			const beforeSlotRect = beforeSlot.getBoundingClientRect();
 			const beforeButtonRect = expandButton.getBoundingClientRect();
 			await expandButton.click();
@@ -1828,40 +1828,46 @@ export const AllMixedSocialActivity: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).toBeVisible();
-		await step("historical Releases toggle hides social items", async () => {
-			const historicalGroup = canvasElement.querySelector<HTMLElement>(
-				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
-			);
-			expect(historicalGroup).toBeTruthy();
-			if (!historicalGroup) {
-				throw new Error("Expected 2026-04-03 historical group to exist");
-			}
-			const actionSlot = historicalGroup.querySelector<HTMLElement>(
-				"[data-feed-day-action-slot]",
-			);
-			const releasesButton =
-				actionSlot?.querySelector<HTMLButtonElement>("button");
-			expect(releasesButton).toBeTruthy();
-			if (!releasesButton) {
-				throw new Error("Expected historical Releases button to exist");
-			}
-			await releasesButton.click();
-			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
-			await expect(
-				canvas.queryByText("linus", { exact: true }),
-			).not.toBeInTheDocument();
-		});
-		await step("social cards keep a single outbound CTA", async () => {
-			const socialCards = canvasElement.querySelectorAll<HTMLElement>(
-				"[data-social-card-kind]",
-			);
-			expect(socialCards.length).toBeGreaterThan(0);
-			for (const card of socialCards) {
-				expect(
-					card.querySelectorAll('a[href^="https://github.com/"]').length,
-				).toBe(1);
-			}
-		});
+		await step(
+			"historical list toggle keeps mixed activity visible",
+			async () => {
+				const historicalGroup = canvasElement.querySelector<HTMLElement>(
+					'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
+				);
+				expect(historicalGroup).toBeTruthy();
+				if (!historicalGroup) {
+					throw new Error("Expected 2026-04-03 historical group to exist");
+				}
+				const actionSlot = historicalGroup.querySelector<HTMLElement>(
+					"[data-feed-day-action-slot]",
+				);
+				const listButton =
+					actionSlot?.querySelector<HTMLButtonElement>("button");
+				expect(listButton).toBeTruthy();
+				if (!listButton) {
+					throw new Error("Expected historical list button to exist");
+				}
+				await listButton.click();
+				await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+				await expect(canvas.getByText("linus", { exact: true })).toBeVisible();
+			},
+		);
+		await step(
+			"social cards expose actor and target links intentionally",
+			async () => {
+				const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+					"[data-social-card-kind]",
+				);
+				expect(socialCards.length).toBeGreaterThan(0);
+				for (const card of socialCards) {
+					const expectedLinks =
+						card.dataset.socialCardKind === "repo_star_received" ? 2 : 1;
+					expect(
+						card.querySelectorAll('a[href^="https://github.com/"]').length,
+					).toBe(expectedLinks);
+				}
+			},
+		);
 	},
 };
 
@@ -1891,7 +1897,7 @@ export const StarsTab: Story = {
 		for (const card of socialCards) {
 			expect(
 				card.querySelectorAll('a[href^="https://github.com/"]').length,
-			).toBe(1);
+			).toBe(2);
 		}
 		await expect(
 			canvas.queryByText("gaearon", { exact: true }),
