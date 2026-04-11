@@ -184,6 +184,7 @@ function FeedHistoricalDayGroup(props: {
 	action: ReactNode;
 	showDivider: boolean;
 	showBriefPanel: boolean;
+	releaseOnly: boolean;
 	brief: BriefLike | null;
 	onOpenReleaseFromBrief?: (releaseId: string) => void;
 	items: FeedItem[];
@@ -196,11 +197,13 @@ function FeedHistoricalDayGroup(props: {
 		action,
 		showDivider,
 		showBriefPanel,
+		releaseOnly,
 		brief,
 		onOpenReleaseFromBrief,
 		items,
 		feedCardProps,
 	} = props;
+	const releaseItems = items.filter((item) => isReleaseFeedItem(item));
 
 	if (!showBriefPanel) {
 		return (
@@ -212,7 +215,10 @@ function FeedHistoricalDayGroup(props: {
 					action={action}
 					showDivider={showDivider}
 				/>
-				<FeedItems items={items} {...feedCardProps} />
+				<FeedItems
+					items={releaseOnly ? releaseItems : items}
+					{...feedCardProps}
+				/>
 			</div>
 		);
 	}
@@ -499,35 +505,50 @@ export function FeedGroupedList(
 					}
 				}
 
-				if (isHistoricalAllGroup) {
-					return (
-						<FeedHistoricalDayGroup
-							key={group.id}
-							date={group.displayDate}
-							releaseCount={group.releaseCount}
-							activityCount={group.activityCount}
-							action={groupAction}
-							showDivider={showDivider}
-							showBriefPanel={showBriefPanel}
-							brief={pendingBrief ? null : brief}
-							onOpenReleaseFromBrief={onOpenReleaseFromBrief}
-							items={group.items}
-							feedCardProps={feedCardProps}
-						/>
-					);
-				}
-
 				return (
-					<div key={group.id} className="space-y-4">
-						<FeedDayDivider
-							date={group.displayDate}
-							releaseCount={group.releaseCount}
-							activityCount={group.activityCount}
-							action={groupAction}
-							showDivider={showDivider}
-						/>
-						<FeedItems items={group.items} {...feedCardProps} />
-					</div>
+					<section
+						key={group.id}
+						className="space-y-4"
+						data-feed-group-id={group.id}
+						data-feed-brief-date={group.briefDate}
+						data-feed-group-type={
+							isHistoricalAllGroup ? "historical" : "default"
+						}
+						data-feed-group-view={
+							isHistoricalAllGroup
+								? showBriefPanel
+									? "brief"
+									: "releases"
+								: "default"
+						}
+					>
+						{isHistoricalAllGroup ? (
+							<FeedHistoricalDayGroup
+								date={group.displayDate}
+								releaseCount={group.releaseCount}
+								activityCount={group.activityCount}
+								action={groupAction}
+								showDivider={showDivider}
+								showBriefPanel={showBriefPanel}
+								releaseOnly={brief != null && releaseOnlyGroupIds.has(group.id)}
+								brief={pendingBrief ? null : brief}
+								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
+								items={group.items}
+								feedCardProps={feedCardProps}
+							/>
+						) : (
+							<>
+								<FeedDayDivider
+									date={group.displayDate}
+									releaseCount={group.releaseCount}
+									activityCount={group.activityCount}
+									action={groupAction}
+									showDivider={showDivider}
+								/>
+								<FeedItems items={group.items} {...feedCardProps} />
+							</>
+						)}
+					</section>
 				);
 			})}
 

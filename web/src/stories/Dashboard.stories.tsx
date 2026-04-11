@@ -1820,17 +1820,37 @@ export const AllMixedSocialActivity: Story = {
 			},
 		},
 	},
-	play: async ({ canvasElement }) => {
+	play: async ({ canvasElement, step }) => {
 		const canvas = within(canvasElement);
-		await expect(
-			canvas.getByRole("heading", { name: "octocat 给你的仓库加了星标" }),
-		).toBeVisible();
-		await expect(
-			canvas.getByRole("heading", { name: "monalisa 关注了你" }),
-		).toBeVisible();
+		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
 		await expect(
 			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).toBeVisible();
+		await step("historical Releases toggle hides social items", async () => {
+			const historicalGroup = canvasElement.querySelector<HTMLElement>(
+				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
+			);
+			expect(historicalGroup).toBeTruthy();
+			if (!historicalGroup) {
+				throw new Error("Expected 2026-04-03 historical group to exist");
+			}
+			const actionSlot = historicalGroup.querySelector<HTMLElement>(
+				"[data-feed-day-action-slot]",
+			);
+			const releasesButton =
+				actionSlot?.querySelector<HTMLButtonElement>("button");
+			expect(releasesButton).toBeTruthy();
+			if (!releasesButton) {
+				throw new Error("Expected historical Releases button to exist");
+			}
+			await releasesButton.click();
+			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
+			await expect(
+				canvas.queryByText("linus", { exact: true }),
+			).not.toBeInTheDocument();
+		});
 	},
 };
 
@@ -1848,12 +1868,13 @@ export const StarsTab: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
+		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
 		await expect(
-			canvas.getByRole("heading", { name: "octocat 给你的仓库加了星标" }),
+			canvas.getByText("acme/rocket", { exact: true }),
 		).toBeVisible();
-		await expect(canvas.getByText("acme/rocket")).toBeVisible();
+		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
 		await expect(
-			canvas.queryByRole("heading", { name: "monalisa 关注了你" }),
+			canvas.queryByText("gaearon", { exact: true }),
 		).not.toBeInTheDocument();
 	},
 };
@@ -1875,9 +1896,8 @@ export const FollowersTab: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(
-			canvas.getByRole("heading", { name: "monalisa 关注了你" }),
-		).toBeVisible();
+		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("关注", { exact: true })).toBeVisible();
 		await expect(
 			canvas.queryByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).not.toBeInTheDocument();

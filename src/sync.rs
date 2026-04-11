@@ -81,6 +81,8 @@ pub struct SyncSocialActivityResult {
     pub events: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_repos: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -773,28 +775,68 @@ pub async fn sync_social_activity(
         .await
         .map_err(SyncRequestError::into_anyhow)?;
 
-    let owned_repos = fetch_owned_repo_snapshot(state, &token)
-        .await
-        .map_err(SyncRequestError::into_anyhow)?;
-    let followers = fetch_followers_snapshot(state, &token)
-        .await
-        .map_err(SyncRequestError::into_anyhow)?;
-    let repo_collection = collect_repo_stargazer_snapshots(state, &token, &owned_repos).await;
+    let mut source_errors = Vec::new();
+    let owned_repos = match fetch_owned_repo_snapshot(state, &token).await {
+        Ok(repos) => Some(repos),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "sync social activity: skip owned repo snapshot"
+            );
+            source_errors.push(format!("owned_repos({}): {}", err.reason_code, err.message));
+            None
+        }
+    };
+    let followers = match fetch_followers_snapshot(state, &token).await {
+        Ok(followers) => Some(followers),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "sync social activity: skip followers snapshot"
+            );
+            source_errors.push(format!("followers({}): {}", err.reason_code, err.message));
+            None
+        }
+    };
+    let repo_collection = if let Some(owned_repos) = owned_repos.as_deref() {
+        collect_repo_stargazer_snapshots(state, &token, owned_repos).await
+    } else {
+        RepoStargazerCollectionResult::default()
+    };
 
-    let events = apply_social_activity_snapshot(
-        state,
-        user_id,
-        &owned_repos,
-        &repo_collection.repo_members,
-        &followers,
-    )
-    .await?;
+    let events = match (owned_repos.as_deref(), followers.as_deref()) {
+        (Some(owned_repos), Some(followers)) => {
+            apply_social_activity_snapshot(
+                state,
+                user_id,
+                owned_repos,
+                repo_collection.repo_members.as_slice(),
+                followers,
+            )
+            .await?
+        }
+        _ => {
+            apply_social_activity_snapshot_partial(
+                state,
+                user_id,
+                owned_repos.as_deref(),
+                owned_repos
+                    .as_ref()
+                    .map(|_| repo_collection.repo_members.as_slice()),
+                followers.as_deref(),
+            )
+            .await?
+        }
+    };
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
-        followers: followers.len(),
+        followers: followers.as_ref().map_or(0, Vec::len),
         events,
         failed_repos: repo_collection.failed_repos,
+        source_errors,
     })
 }
 
@@ -1040,6 +1082,25 @@ async fn apply_social_activity_snapshot(
     repo_members: &[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)],
     followers: &[FollowerSnapshot],
 ) -> Result<usize> {
+    apply_social_activity_snapshot_partial(
+        state,
+        user_id,
+        Some(owned_repos),
+        Some(repo_members),
+        Some(followers),
+    )
+    .await
+}
+
+async fn apply_social_activity_snapshot_partial(
+    state: &AppState,
+    user_id: &str,
+    owned_repos: Option<&[OwnedRepoSnapshot]>,
+    repo_members: Option<&[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)]>,
+    followers: Option<&[FollowerSnapshot]>,
+) -> Result<usize> {
+    debug_assert_eq!(owned_repos.is_some(), repo_members.is_some());
+
     let now = Utc::now().to_rfc3339();
     let mut tx = state
         .pool
@@ -1071,7 +1132,7 @@ async fn apply_social_activity_snapshot(
     .fetch_all(&mut *tx)
     .await
     .context("query repo star baselines")?;
-    let repo_tracking_initialized = follower_baseline_exists || !repo_baselines.is_empty();
+    let repo_tracking_initialized = !repo_baselines.is_empty();
     let repo_snapshot_initialized_ids = repo_baselines
         .iter()
         .filter(|row| row.members_snapshot_initialized != 0)
@@ -1082,137 +1143,44 @@ async fn apply_social_activity_snapshot(
         .map(|row| row.repo_id)
         .collect::<HashSet<_>>();
     let newly_discovered_repo_ids = owned_repos
+        .unwrap_or(&[])
         .iter()
         .filter(|repo| !known_repo_ids.contains(&repo.repo_id))
         .map(|repo| repo.repo_id)
         .collect::<HashSet<_>>();
 
-    let current_follower_rows = sqlx::query_as::<_, FollowerCurrentMemberRow>(
-        r#"
-        SELECT actor_github_user_id
-        FROM follower_current_members
-        WHERE user_id = ?
-        "#,
-    )
-    .bind(user_id)
-    .fetch_all(&mut *tx)
-    .await
-    .context("query follower current members")?;
-    let current_follower_ids = current_follower_rows
-        .into_iter()
-        .map(|row| row.actor_github_user_id)
-        .collect::<HashSet<_>>();
-    let next_follower_ids = followers
-        .iter()
-        .map(|item| item.actor.id)
-        .collect::<HashSet<_>>();
-
-    for follower in followers {
-        if follower_baseline_exists && !current_follower_ids.contains(&follower.actor.id) {
-            let inserted = insert_social_activity_event_tx(
-                &mut tx,
-                SocialActivityEventInsert {
-                    user_id,
-                    kind: "follower_received",
-                    repo_id: None,
-                    repo_full_name: None,
-                    actor: &follower.actor,
-                    occurred_at: now.as_str(),
-                    detected_at: now.as_str(),
-                },
-            )
-            .await?;
-            if inserted {
-                events_written += 1;
-            }
-        }
-
-        upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
-    }
-
-    for current_id in current_follower_ids.difference(&next_follower_ids) {
-        sqlx::query(
-            r#"
-            DELETE FROM follower_current_members
-            WHERE user_id = ? AND actor_github_user_id = ?
-            "#,
-        )
-        .bind(user_id)
-        .bind(*current_id)
-        .execute(&mut *tx)
-        .await
-        .context("delete stale follower current member")?;
-    }
-
-    if !follower_baseline_exists {
-        sqlx::query(
-            r#"
-            INSERT INTO follower_sync_baselines (id, user_id, initialized_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE
-            SET updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(local_id::generate_local_id())
-        .bind(user_id)
-        .bind(now.as_str())
-        .bind(now.as_str())
-        .execute(&mut *tx)
-        .await
-        .context("upsert follower sync baseline")?;
-    }
-
-    for repo in owned_repos {
-        let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
-        upsert_owned_repo_star_baseline_tx(
-            &mut tx,
-            user_id,
-            repo,
-            snapshot_initialized,
-            now.as_str(),
-        )
-        .await
-        .with_context(|| format!("upsert repo star baseline for {}", repo.full_name))?;
-    }
-
-    for (repo, members) in repo_members {
-        let repo_snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
-        let emit_current_members = repo_snapshot_initialized
-            || (repo_tracking_initialized && newly_discovered_repo_ids.contains(&repo.repo_id));
-
-        let current_rows = sqlx::query_as::<_, RepoStarCurrentMemberRow>(
+    if let Some(followers) = followers {
+        let current_follower_rows = sqlx::query_as::<_, FollowerCurrentMemberRow>(
             r#"
             SELECT actor_github_user_id
-            FROM repo_star_current_members
-            WHERE user_id = ? AND repo_id = ?
+            FROM follower_current_members
+            WHERE user_id = ?
             "#,
         )
         .bind(user_id)
-        .bind(repo.repo_id)
         .fetch_all(&mut *tx)
         .await
-        .with_context(|| format!("query repo star members for {}", repo.full_name))?;
-        let current_ids = current_rows
+        .context("query follower current members")?;
+        let current_follower_ids = current_follower_rows
             .into_iter()
             .map(|row| row.actor_github_user_id)
             .collect::<HashSet<_>>();
-        let next_ids = members
+        let next_follower_ids = followers
             .iter()
             .map(|item| item.actor.id)
             .collect::<HashSet<_>>();
 
-        for member in members {
-            if emit_current_members && !current_ids.contains(&member.actor.id) {
-                let occurred_at = member.starred_at.as_deref().unwrap_or(now.as_str());
+        for follower in followers {
+            if follower_baseline_exists && !current_follower_ids.contains(&follower.actor.id) {
                 let inserted = insert_social_activity_event_tx(
                     &mut tx,
                     SocialActivityEventInsert {
                         user_id,
-                        kind: "repo_star_received",
-                        repo_id: Some(repo.repo_id),
-                        repo_full_name: Some(repo.full_name.as_str()),
-                        actor: &member.actor,
-                        occurred_at,
+                        kind: "follower_received",
+                        repo_id: None,
+                        repo_full_name: None,
+                        actor: &follower.actor,
+                        occurred_at: now.as_str(),
                         detected_at: now.as_str(),
                     },
                 )
@@ -1222,34 +1190,132 @@ async fn apply_social_activity_snapshot(
                 }
             }
 
-            upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str()).await?;
+            upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
         }
 
-        for current_id in current_ids.difference(&next_ids) {
+        for current_id in current_follower_ids.difference(&next_follower_ids) {
             sqlx::query(
                 r#"
-                DELETE FROM repo_star_current_members
-                WHERE user_id = ? AND repo_id = ? AND actor_github_user_id = ?
+                DELETE FROM follower_current_members
+                WHERE user_id = ? AND actor_github_user_id = ?
+                "#,
+            )
+            .bind(user_id)
+            .bind(*current_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete stale follower current member")?;
+        }
+
+        if !follower_baseline_exists {
+            sqlx::query(
+                r#"
+                INSERT INTO follower_sync_baselines (id, user_id, initialized_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE
+                SET updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(user_id)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&mut *tx)
+            .await
+            .context("upsert follower sync baseline")?;
+        }
+    }
+
+    if let Some(owned_repos) = owned_repos {
+        for repo in owned_repos {
+            let snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
+            upsert_owned_repo_star_baseline_tx(
+                &mut tx,
+                user_id,
+                repo,
+                snapshot_initialized,
+                now.as_str(),
+            )
+            .await
+            .with_context(|| format!("upsert repo star baseline for {}", repo.full_name))?;
+        }
+
+        for (repo, members) in repo_members.unwrap_or(&[]) {
+            let repo_snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
+            let emit_current_members = repo_snapshot_initialized
+                || (repo_tracking_initialized && newly_discovered_repo_ids.contains(&repo.repo_id));
+
+            let current_rows = sqlx::query_as::<_, RepoStarCurrentMemberRow>(
+                r#"
+                SELECT actor_github_user_id
+                FROM repo_star_current_members
+                WHERE user_id = ? AND repo_id = ?
                 "#,
             )
             .bind(user_id)
             .bind(repo.repo_id)
-            .bind(*current_id)
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await
-            .with_context(|| {
-                format!(
-                    "delete stale repo star current member for {}",
-                    repo.full_name
-                )
-            })?;
-        }
+            .with_context(|| format!("query repo star members for {}", repo.full_name))?;
+            let current_ids = current_rows
+                .into_iter()
+                .map(|row| row.actor_github_user_id)
+                .collect::<HashSet<_>>();
+            let next_ids = members
+                .iter()
+                .map(|item| item.actor.id)
+                .collect::<HashSet<_>>();
 
-        upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
-            .await
-            .with_context(|| {
-                format!("mark repo star snapshot initialized for {}", repo.full_name)
-            })?;
+            for member in members {
+                if emit_current_members && !current_ids.contains(&member.actor.id) {
+                    let occurred_at = member.starred_at.as_deref().unwrap_or(now.as_str());
+                    let inserted = insert_social_activity_event_tx(
+                        &mut tx,
+                        SocialActivityEventInsert {
+                            user_id,
+                            kind: "repo_star_received",
+                            repo_id: Some(repo.repo_id),
+                            repo_full_name: Some(repo.full_name.as_str()),
+                            actor: &member.actor,
+                            occurred_at,
+                            detected_at: now.as_str(),
+                        },
+                    )
+                    .await?;
+                    if inserted {
+                        events_written += 1;
+                    }
+                }
+
+                upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str()).await?;
+            }
+
+            for current_id in current_ids.difference(&next_ids) {
+                sqlx::query(
+                    r#"
+                    DELETE FROM repo_star_current_members
+                    WHERE user_id = ? AND repo_id = ? AND actor_github_user_id = ?
+                    "#,
+                )
+                .bind(user_id)
+                .bind(repo.repo_id)
+                .bind(*current_id)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| {
+                    format!(
+                        "delete stale repo star current member for {}",
+                        repo.full_name
+                    )
+                })?;
+            }
+
+            upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
+                .await
+                .with_context(|| {
+                    format!("mark repo star snapshot initialized for {}", repo.full_name)
+                })?;
+        }
     }
 
     tx.commit()
@@ -4296,13 +4362,13 @@ mod tests {
         NotificationSubject, OwnedRepoSnapshot, ReleaseDemandRepo, RepoReleaseOrigin,
         RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
         SubscriptionRunContext, SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
-        attach_and_wait_for_user_release_demand, attach_release_demand, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        insert_social_activity_event_tx, is_terminal_notification_thread_error,
-        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
-        resolve_notification_open_url, subscription_event_counts_as_critical,
-        subscription_timeout_error, sync_notifications_with_fetch,
-        sync_starred_for_user_with_fetch, wait_for_release_demand,
+        apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
+        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, insert_social_activity_event_tx,
+        is_terminal_notification_thread_error, recover_repo_release_runtime_state_on_startup,
+        repo_release_deadline_at, resolve_notification_open_url,
+        subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -5591,6 +5657,241 @@ mod tests {
                 .await
                 .expect("count social history");
         assert_eq!(history_count, 2);
+    }
+
+    #[tokio::test]
+    async fn social_activity_partial_snapshot_only_updates_available_sources() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-partial-snapshot");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 201,
+                login: "monalisa".to_owned(),
+                avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                html_url: Some("https://github.com/monalisa".to_owned()),
+            },
+        };
+
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![])],
+            std::slice::from_ref(&follower),
+        )
+        .await
+        .expect("seed initial social baseline");
+
+        let repo_members = vec![(
+            repo.clone(),
+            vec![RepoStargazerSnapshot {
+                repo_id: repo.repo_id,
+                repo_full_name: repo.full_name.clone(),
+                actor: GitHubActor {
+                    id: 301,
+                    login: "octocat".to_owned(),
+                    avatar_url: Some("https://avatars.example/octocat.png".to_owned()),
+                    html_url: Some("https://github.com/octocat".to_owned()),
+                },
+                starred_at: Some("2026-03-06T11:00:00Z".to_owned()),
+            }],
+        )];
+        let repo_only_events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            Some(std::slice::from_ref(&repo)),
+            Some(repo_members.as_slice()),
+            None,
+        )
+        .await
+        .expect("apply repo-only snapshot");
+        assert_eq!(repo_only_events, 1);
+
+        let follower_members_after_repo_only: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM follower_current_members
+            WHERE user_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count follower members after repo-only snapshot");
+        assert_eq!(follower_members_after_repo_only, 1);
+
+        let repo_members_after_repo_only: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_current_members
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count repo members after repo-only snapshot");
+        assert_eq!(repo_members_after_repo_only, 1);
+
+        let followers = vec![
+            follower.clone(),
+            FollowerSnapshot {
+                actor: GitHubActor {
+                    id: 202,
+                    login: "gaearon".to_owned(),
+                    avatar_url: Some("https://avatars.example/gaearon.png".to_owned()),
+                    html_url: Some("https://github.com/gaearon".to_owned()),
+                },
+            },
+        ];
+        let follower_only_events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(followers.as_slice()),
+        )
+        .await
+        .expect("apply follower-only snapshot");
+        assert_eq!(follower_only_events, 1);
+
+        let follower_members_after_follower_only: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM follower_current_members
+            WHERE user_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count follower members after follower-only snapshot");
+        assert_eq!(follower_members_after_follower_only, 2);
+
+        let repo_members_after_follower_only: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_current_members
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count repo members after follower-only snapshot");
+        assert_eq!(repo_members_after_follower_only, 1);
+
+        let event_kinds = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT kind
+            FROM social_activity_events
+            WHERE user_id = ?
+            ORDER BY kind ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load social activity event kinds");
+        assert_eq!(
+            event_kinds,
+            vec![
+                "follower_received".to_owned(),
+                "repo_star_received".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn social_activity_repo_bootstrap_does_not_backfill_after_follower_only_baseline() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-repo-bootstrap-after-follower-only");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 201,
+                login: "monalisa".to_owned(),
+                avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                html_url: Some("https://github.com/monalisa".to_owned()),
+            },
+        };
+        apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(std::slice::from_ref(&follower)),
+        )
+        .await
+        .expect("seed follower-only baseline");
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let repo_members = vec![(
+            repo.clone(),
+            vec![RepoStargazerSnapshot {
+                repo_id: repo.repo_id,
+                repo_full_name: repo.full_name.clone(),
+                actor: GitHubActor {
+                    id: 301,
+                    login: "octocat".to_owned(),
+                    avatar_url: Some("https://avatars.example/octocat.png".to_owned()),
+                    html_url: Some("https://github.com/octocat".to_owned()),
+                },
+                starred_at: Some("2026-03-06T11:00:00Z".to_owned()),
+            }],
+        )];
+        let events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            Some(std::slice::from_ref(&repo)),
+            Some(repo_members.as_slice()),
+            None,
+        )
+        .await
+        .expect("apply first repo snapshot after follower-only baseline");
+        assert_eq!(events, 0);
+
+        let history_count: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM social_activity_events WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count social history");
+        assert_eq!(history_count, 0);
+
+        let baseline_state: i64 = sqlx::query_scalar(
+            r#"
+            SELECT members_snapshot_initialized
+            FROM owned_repo_star_baselines
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load repo baseline state");
+        assert_eq!(baseline_state, 1);
     }
 
     #[tokio::test]
