@@ -205,24 +205,33 @@ jobs:
           fi
           echo "APP_EFFECTIVE_VERSION=${APP_EFFECTIVE_VERSION}"
 
-      - name: Configure Git user
+      - name: Validate historical release credentials
         if: ${{ steps.intent.outputs.should_release == 'true' }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Create and push tag (if missing)
-        if: ${{ steps.intent.outputs.should_release == 'true' }}
+        id: release-auth
         shell: bash
+        env:
+          RELEASE_TOKEN_PRESENT: ${{ secrets.RELEASE_TOKEN != '' && 'true' || 'false' }}
         run: |
           set -euo pipefail
           tag="${APP_RELEASE_TAG}"
-          echo "target tag: ${tag}"
+          tag_exists=false
+          main_head_sha="$(git rev-parse HEAD)"
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            echo "Tag ${tag} already exists. Skipping push."
-          else
-            git tag -a "${tag}" "${RELEASE_HEAD_SHA}" -m "${tag}"
-            git push origin "refs/tags/${tag}"
+            tag_exists=true
+          fi
+
+          requires_elevated_token=false
+          if [[ "${RELEASE_HEAD_SHA}" != "${main_head_sha}" && "${tag_exists}" != "true" ]]; then
+            requires_elevated_token=true
+          fi
+
+          echo "tag_exists=${tag_exists}" >> "$GITHUB_OUTPUT"
+          echo "requires_elevated_token=${requires_elevated_token}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${requires_elevated_token}" == "true" && "${RELEASE_TOKEN_PRESENT}" != "true" ]]; then
+            echo "Historical release target ${RELEASE_HEAD_SHA} needs RELEASE_TOKEN to create missing tag ${tag}." >&2
+            echo "Add repo secret RELEASE_TOKEN with a workflow-capable GitHub token, or pre-push refs/tags/${tag} to ${RELEASE_HEAD_SHA} before rerunning release." >&2
+            exit 1
           fi
 
       - name: Create GitHub Release
@@ -230,11 +239,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.export.outputs.app_release_tag }}
+          target_commitish: ${{ env.RELEASE_HEAD_SHA }}
           name: ${{ steps.export.outputs.app_release_tag }}
           prerelease: ${{ steps.intent.outputs.prerelease == 'true' }}
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}
 
       - name: Write summary
         if: always()
@@ -255,6 +264,8 @@ jobs:
             echo "- channel: ${{ steps.intent.outputs.channel }}"
             echo "- prerelease: ${{ steps.intent.outputs.prerelease }}"
             echo "- app_release_tag: ${APP_RELEASE_TAG:-<none>}"
+            echo "- release_tag_exists: ${{ steps.release-auth.outputs.tag_exists }}"
+            echo "- release_requires_elevated_token: ${{ steps.release-auth.outputs.requires_elevated_token }}"
             echo "- pr: ${pr_url}"
           } >> "$GITHUB_STEP_SUMMARY"
 
