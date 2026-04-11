@@ -249,6 +249,13 @@ assert "python3 ./.github/scripts/release_backfill.py plan" in contract.step_run
 
 prepare_job = contract.job_config(release_workflow, "prepare", "release.yml")
 await_ci_job = contract.job_config(release_workflow, "await-ci", "release.yml")
+await_ci_checkout = contract.step_config(await_ci_job, "Checkout workflow revision", "release.yml.jobs.await-ci")
+await_ci_checkout_with = contract.require_mapping(
+    await_ci_checkout.get("with"),
+    "release.yml.jobs.await-ci.steps['Checkout workflow revision'].with",
+)
+assert await_ci_checkout.get("uses") == "actions/checkout@v4"
+assert await_ci_checkout_with.get("ref") == "${{ github.workflow_sha }}"
 await_ci_step = contract.step_config(await_ci_job, "Gate current push release against CI", "release.yml.jobs.await-ci")
 assert "python3 ./.github/scripts/release_backfill.py await-ci" in contract.step_run(
     await_ci_step,

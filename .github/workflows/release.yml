@@ -90,6 +90,11 @@ jobs:
       ci_conclusion: ${{ steps.gate.outputs.ci_conclusion }}
       ci_reason: ${{ steps.gate.outputs.ci_reason }}
     steps:
+      - name: Checkout workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+
       - name: Gate current push release against CI
         id: gate
         shell: bash
