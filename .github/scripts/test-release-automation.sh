@@ -279,8 +279,20 @@ release_with = contract.require_mapping(
     release_step.get("with"),
     "release.yml.jobs.prepare.steps['Create GitHub Release'].with",
 )
+auth_step = contract.step_config(
+    prepare_job,
+    "Validate historical release credentials",
+    "release.yml.jobs.prepare",
+)
+auth_run = contract.step_run(
+    auth_step,
+    "release.yml.jobs.prepare.steps['Validate historical release credentials']",
+)
+assert 'git rev-parse -q --verify "refs/tags/${tag}"' in auth_run
+assert "needs RELEASE_TOKEN to create missing tag" in auth_run
 assert release_with.get("tag_name") == "${{ steps.export.outputs.app_release_tag }}"
 assert release_with.get("target_commitish") == "${{ env.RELEASE_HEAD_SHA }}"
+assert release_with.get("token") == "${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}"
 assert 'git push origin "refs/tags/${tag}"' not in release_workflow_text
 
 audit_job = contract.job_config(release_workflow, "audit-backfill", "release.yml")
