@@ -301,9 +301,9 @@ struct RepoNode {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 struct RepoOwner {
     login: String,
+    #[serde(alias = "avatarUrl")]
     avatar_url: Option<String>,
 }
 
@@ -1232,6 +1232,77 @@ async fn apply_social_activity_snapshot_partial(
     }
 
     if let Some(owned_repos) = owned_repos {
+        let current_owned_repo_ids = owned_repos
+            .iter()
+            .map(|repo| repo.repo_id)
+            .collect::<HashSet<_>>();
+
+        if current_owned_repo_ids.is_empty() {
+            sqlx::query(
+                r#"
+                DELETE FROM repo_star_current_members
+                WHERE user_id = ?
+                "#,
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete repo star current members for no-longer-owned repos")?;
+
+            sqlx::query(
+                r#"
+                DELETE FROM owned_repo_star_baselines
+                WHERE user_id = ?
+                "#,
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .context("delete repo star baselines for no-longer-owned repos")?;
+        } else {
+            let mut delete_members = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                r#"
+                    DELETE FROM repo_star_current_members
+                    WHERE user_id = 
+                    "#,
+            );
+            delete_members.push_bind(user_id);
+            delete_members.push(" AND repo_id NOT IN (");
+            {
+                let mut separated = delete_members.separated(", ");
+                for repo_id in &current_owned_repo_ids {
+                    separated.push_bind(repo_id);
+                }
+            }
+            delete_members.push(")");
+            delete_members
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("delete stale repo star current members")?;
+
+            let mut delete_baselines = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                r#"
+                    DELETE FROM owned_repo_star_baselines
+                    WHERE user_id = 
+                    "#,
+            );
+            delete_baselines.push_bind(user_id);
+            delete_baselines.push(" AND repo_id NOT IN (");
+            {
+                let mut separated = delete_baselines.separated(", ");
+                for repo_id in &current_owned_repo_ids {
+                    separated.push_bind(repo_id);
+                }
+            }
+            delete_baselines.push(")");
+            delete_baselines
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("delete stale repo star baselines")?;
+        }
+
         for repo in owned_repos {
             let was_known_repo = known_repo_ids.contains(&repo.repo_id);
             let fetched_snapshot_this_run = successful_repo_snapshot_ids.contains(&repo.repo_id);
@@ -6360,6 +6431,106 @@ mod tests {
         .expect("load recovered repo star event");
         assert_eq!(row.0, "octo/beta");
         assert_eq!(row.1, "recovered-star");
+    }
+
+    #[tokio::test]
+    async fn social_activity_drops_tracking_for_repos_that_are_no_longer_owned() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-reowned-repo");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let stable_repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/stable".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let churn_repo = OwnedRepoSnapshot {
+            repo_id: 43,
+            full_name: "octo/churn".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let churn_member = RepoStargazerSnapshot {
+            repo_id: churn_repo.repo_id,
+            repo_full_name: churn_repo.full_name.clone(),
+            actor: GitHubActor {
+                id: 901,
+                login: "returning-star".to_owned(),
+                avatar_url: Some("https://avatars.example/returning-star.png".to_owned()),
+                html_url: Some("https://github.com/returning-star".to_owned()),
+            },
+            starred_at: Some("2026-03-06T16:00:00Z".to_owned()),
+        };
+
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            &[stable_repo.clone(), churn_repo.clone()],
+            &[
+                (stable_repo.clone(), vec![]),
+                (churn_repo.clone(), vec![churn_member.clone()]),
+            ],
+            &[],
+        )
+        .await
+        .expect("seed initial repo ownership");
+
+        let removed_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&stable_repo),
+            &[(stable_repo.clone(), vec![])],
+            &[],
+        )
+        .await
+        .expect("remove churn repo from ownership");
+        assert_eq!(removed_events, 0);
+
+        let churn_baseline_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM owned_repo_star_baselines
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(churn_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count removed churn baseline");
+        assert_eq!(churn_baseline_count, 0);
+
+        let churn_member_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_current_members
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(churn_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count removed churn current members");
+        assert_eq!(churn_member_count, 0);
+
+        let reacquired_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            &[stable_repo.clone(), churn_repo.clone()],
+            &[
+                (stable_repo, vec![]),
+                (churn_repo.clone(), vec![churn_member]),
+            ],
+            &[],
+        )
+        .await
+        .expect("reacquire churn repo with fresh tracking");
+        assert_eq!(reacquired_events, 1);
     }
 
     #[tokio::test]
