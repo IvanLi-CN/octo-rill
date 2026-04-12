@@ -98,3 +98,4 @@
 | zcp33 | Release reaction 扁平化重绘与圆形按钮收敛 | 已完成 | `zcp33-release-reaction-bubble-polish/SPEC.md` | 2026-04-10 | PR #59; Fluent Flat SVG assets + circular reaction trigger + external badge + Storybook evidence landed |
 | u6b32 | Web 暗色模式接通 | 已完成 | `u6b32-web-dark-mode/SPEC.md` | 2026-04-11 | PR #63; header-based theme toggle, Storybook evidence, and review-loop clear |
 | at76w | 修复 Release 自动发版断链并补齐漏发版本 | 待实现 | `at76w-release-reliability-backfill/SPEC.md` | 2026-04-11 | release trigger cut over to push@main + backfill queue planned |
+| 2nsc2 | Landing 登录页重做：降噪文案、重构布局、修复移动端 CTA | 部分完成（2/3） | `2nsc2-landing-login-refresh/SPEC.md` | 2026-04-12 | fast-track / storybook canvas evidence / mobile CTA above the fold |
