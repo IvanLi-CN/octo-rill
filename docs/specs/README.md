@@ -98,3 +98,4 @@
 | zcp33 | Release reaction 扁平化重绘与圆形按钮收敛 | 已完成 | `zcp33-release-reaction-bubble-polish/SPEC.md` | 2026-04-10 | PR #59; Fluent Flat SVG assets + circular reaction trigger + external badge + Storybook evidence landed |
 | u6b32 | Web 暗色模式接通 | 已完成 | `u6b32-web-dark-mode/SPEC.md` | 2026-04-11 | PR #63; header-based theme toggle, Storybook evidence, and review-loop clear |
 | at76w | 修复 Release 自动发版断链并补齐漏发版本 | 待实现 | `at76w-release-reliability-backfill/SPEC.md` | 2026-04-11 | release trigger cut over to push@main + backfill queue planned |
+| jfkcf | Release reaction 反馈图标轻量收敛 | 已完成 | `jfkcf-release-reaction-compact-size/SPEC.md` | 2026-04-12 | local implementation completed; compact reaction trigger + Storybook canvas evidence |
