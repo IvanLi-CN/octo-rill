@@ -112,7 +112,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 		page.getByRole("heading", { level: 1, name: "OctoRill" }),
 	).toBeVisible();
 	await expect(
-		page.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
+		page.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
 	).toBeVisible();
 	await expect(page.getByText(/Logged in as\s+octo-admin/)).toHaveCount(0);
 	await expect(page.getByText(/Loaded\s+\d+/)).toHaveCount(0);
