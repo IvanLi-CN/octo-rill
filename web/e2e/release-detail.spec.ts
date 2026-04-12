@@ -785,30 +785,69 @@ test("reaction buttons stay circular and render count badges outside the trigger
 	const plusOneButton = reactionFooter.locator(
 		'[data-reaction-trigger="plus1"]',
 	);
+	const plusOneIcon = reactionFooter.locator('[data-reaction-icon="plus1"]');
 	const plusOneBadge = reactionFooter.locator(
 		'[data-reaction-count-badge="plus1"]',
 	);
 	const laughButton = reactionFooter.getByRole("button", { name: "笑" });
 
 	await expect(plusOneButton).toBeVisible();
+	await expect(plusOneIcon).toBeVisible();
 	await expect(plusOneBadge).toHaveText("2");
 	await expect(laughButton).toBeVisible();
 	await expect(
 		reactionFooter.locator('[data-reaction-count-badge="laugh"]'),
 	).toHaveCount(0);
 
-	const shape = await plusOneButton.evaluate((element) => {
-		const button = element as HTMLButtonElement;
+	const shape = await reactionFooter.evaluate((element) => {
+		const footer = element as HTMLElement;
+		const button = footer.querySelector<HTMLButtonElement>(
+			'[data-reaction-trigger="plus1"]',
+		);
+		const badge = footer.querySelector<HTMLElement>(
+			'[data-reaction-count-badge="plus1"]',
+		);
+		const icon = footer.querySelector<HTMLImageElement>(
+			'[data-reaction-icon="plus1"]',
+		);
+		if (!button || !badge || !icon) {
+			throw new Error("Expected reaction button, badge, and icon");
+		}
 		const style = window.getComputedStyle(button);
-		const rect = button.getBoundingClientRect();
+		const buttonRect = button.getBoundingClientRect();
+		const badgeRect = badge.getBoundingClientRect();
+		const iconRect = icon.getBoundingClientRect();
 		return {
 			borderRadius: style.borderRadius,
-			height: rect.height,
-			width: rect.width,
+			buttonHeight: buttonRect.height,
+			buttonWidth: buttonRect.width,
+			badgeHeight: badgeRect.height,
+			badgeWidth: badgeRect.width,
+			badgeRight: badgeRect.right,
+			badgeTop: badgeRect.top,
+			buttonRight: buttonRect.right,
+			buttonTop: buttonRect.top,
+			iconHeight: iconRect.height,
+			iconWidth: iconRect.width,
 		};
 	});
-	expect(Math.abs(shape.width - shape.height)).toBeLessThanOrEqual(1);
+	expect(shape.buttonWidth).toBeGreaterThanOrEqual(35);
+	expect(shape.buttonWidth).toBeLessThanOrEqual(37);
+	expect(shape.buttonHeight).toBeGreaterThanOrEqual(35);
+	expect(shape.buttonHeight).toBeLessThanOrEqual(37);
+	expect(Math.abs(shape.buttonWidth - shape.buttonHeight)).toBeLessThanOrEqual(
+		1,
+	);
 	expect(Number.parseFloat(shape.borderRadius)).toBeGreaterThanOrEqual(999);
+	expect(shape.iconWidth).toBeGreaterThanOrEqual(17);
+	expect(shape.iconWidth).toBeLessThanOrEqual(19);
+	expect(shape.iconHeight).toBeGreaterThanOrEqual(17);
+	expect(shape.iconHeight).toBeLessThanOrEqual(19);
+	expect(shape.badgeHeight).toBeGreaterThanOrEqual(17);
+	expect(shape.badgeHeight).toBeLessThanOrEqual(19.5);
+	expect(shape.badgeWidth).toBeLessThanOrEqual(24);
+	expect(shape.badgeRight).toBeGreaterThan(shape.buttonRight);
+	expect(shape.badgeTop).toBeLessThan(shape.buttonTop + 2);
 });
 
 test("deep link with zero-padded release id still resolves detail", async ({
