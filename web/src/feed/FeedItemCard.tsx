@@ -566,7 +566,7 @@ function ReleaseFeedCard(props: {
 
 	const reactionsFooter = reactions ? (
 		<CardFooter
-			className="border-border/70 flex flex-wrap items-center gap-3 border-t px-6 py-4"
+			className="border-border/70 flex flex-wrap items-center gap-2.5 border-t px-6 py-4"
 			data-reaction-footer="true"
 		>
 			{reactions.status === "ready"
@@ -585,7 +585,7 @@ function ReleaseFeedCard(props: {
 									variant="outline"
 									size="icon"
 									className={cn(
-										"group relative size-10 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
+										"group relative size-9 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
 										active
 											? "border-primary/45 bg-primary/10 hover:bg-primary/14"
 											: "border-border/70 bg-background hover:border-foreground/15 hover:bg-accent/70",
@@ -602,7 +602,8 @@ function ReleaseFeedCard(props: {
 									<img
 										alt=""
 										aria-hidden="true"
-										className="size-[1.35rem] select-none transition-transform duration-200 group-hover:scale-105 group-active:scale-95"
+										className="size-[1.125rem] select-none transition-transform duration-200 group-hover:scale-105 group-active:scale-95"
+										data-reaction-icon={reaction.content}
 										draggable={false}
 										src={reaction.iconSrc}
 									/>
@@ -610,7 +611,7 @@ function ReleaseFeedCard(props: {
 										<span
 											aria-hidden="true"
 											className={cn(
-												"absolute -right-1 -top-1 inline-flex h-5 min-w-5 items-center justify-center rounded-full px-1 font-mono text-[11px] leading-none shadow-sm ring-2 ring-background",
+												"absolute -right-0.5 -top-0.5 inline-flex h-[1.125rem] min-w-[1.125rem] items-center justify-center rounded-full px-1 font-mono text-[10px] leading-none shadow-sm ring-1 ring-background",
 												active
 													? "bg-primary text-primary-foreground"
 													: "border border-border/70 bg-background text-foreground/80",
