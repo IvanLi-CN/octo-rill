@@ -44,7 +44,7 @@ export const Default: Story = {
 		const canvas = within(canvasElement);
 		await expect(
 			canvas.getByRole("heading", {
-				name: "把和你有关的 GitHub 动态放到一个首页里",
+				name: "集中查看与你相关的 GitHub 动态",
 			}),
 		).toBeVisible();
 		await expect(
@@ -52,9 +52,11 @@ export const Default: Story = {
 		).toBeVisible();
 		await expect(
 			canvas.getByText(
-				"这里集中看 Releases、被加星、被关注和 Inbox；Release 默认提供中文翻译。",
+				"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。",
 			),
 		).toBeVisible();
+		await expect(canvas.getByText("查看获星与关注变化")).toBeVisible();
+		await expect(canvas.getByText("查看发布译文与要点")).toBeVisible();
 		await expect(
 			canvasElement.ownerDocument.body.querySelector("[data-theme-toggle]"),
 		).not.toBeNull();
@@ -63,7 +65,7 @@ export const Default: Story = {
 		docs: {
 			description: {
 				story:
-					"默认的未登录首屏状态：桌面保留品牌说明区 + 独立登录卡，首屏只剩标题、短说明、三条卖点和一个主 CTA。",
+					"默认的未登录首屏状态：桌面保留品牌说明区 + 独立登录卡，首屏明确说明 OctoRill 面向前台用户提供发布更新阅读、社交动态、日报与通知入口。",
 			},
 		},
 	},
@@ -105,7 +107,8 @@ export const MobilePriority: Story = {
 		await expect(
 			canvas.getByRole("link", { name: "连接到 GitHub" }),
 		).toBeVisible();
-		await expect(canvas.getByText("Releases 信息流")).toBeVisible();
+		await expect(canvas.getByText("发布更新", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("查看日报与通知入口")).toBeVisible();
 	},
 	parameters: {
 		docs: {

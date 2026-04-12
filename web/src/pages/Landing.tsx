@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { Inbox, Package2, Users } from "lucide-react";
 import {
 	Card,
 	CardContent,
@@ -16,10 +17,28 @@ type LandingProps = {
 	bootError?: string | null;
 };
 
+const heroTitle = "集中查看与你相关的 GitHub 动态";
+const heroDescription =
+	"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。";
+const loginCardDescription =
+	"连接后即可同步你的 GitHub 动态，并在站内查看译文、日报与通知。";
+
 const heroHighlights = [
-	"Releases 信息流",
-	"被加星 / 被关注",
-	"日报 + Inbox 入口",
+	{
+		title: "发布更新",
+		description: "查看发布译文与要点",
+		icon: Package2,
+	},
+	{
+		title: "社交动态",
+		description: "查看获星与关注变化",
+		icon: Users,
+	},
+	{
+		title: "日报通知",
+		description: "查看日报与通知入口",
+		icon: Inbox,
+	},
 ] as const;
 
 export function Landing({ bootError }: LandingProps) {
@@ -37,28 +56,37 @@ export function Landing({ bootError }: LandingProps) {
 							<div className="max-w-3xl space-y-6">
 								<div className="space-y-4">
 									<h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight sm:text-5xl lg:text-6xl">
-										把和你有关的 GitHub 动态放到一个首页里
+										{heroTitle}
 									</h1>
 									<p className="text-muted-foreground max-w-2xl text-pretty text-base leading-7 sm:text-lg">
-										这里集中看 Releases、被加星、被关注和 Inbox；Release
-										默认提供中文翻译。
+										{heroDescription}
 									</p>
 								</div>
 
 								<ul className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
-									{heroHighlights.map((item, index) => (
-										<li
-											key={item}
-											className="flex items-start gap-3 rounded-2xl border border-border/70 bg-background/72 px-4 py-4 shadow-sm"
-										>
-											<span className="text-muted-foreground font-mono text-xs leading-6">
-												0{index + 1}
-											</span>
-											<span className="text-sm font-medium leading-6 sm:text-[15px]">
-												{item}
-											</span>
-										</li>
-									))}
+									{heroHighlights.map(
+										({ title, description, icon: Icon }, index) => (
+											<li
+												key={title}
+												className="flex min-h-32 flex-col rounded-2xl border border-border/70 bg-background/72 px-5 py-5 shadow-sm"
+											>
+												<div className="mb-5 flex items-center justify-between gap-3">
+													<span className="text-muted-foreground font-mono text-xs leading-6">
+														0{index + 1}
+													</span>
+													<Icon className="text-muted-foreground size-4" />
+												</div>
+												<div className="space-y-2">
+													<p className="text-lg font-semibold tracking-tight">
+														{title}
+													</p>
+													<p className="text-muted-foreground text-sm leading-6">
+														{description}
+													</p>
+												</div>
+											</li>
+										),
+									)}
 								</ul>
 							</div>
 						</div>
@@ -75,7 +103,7 @@ export function Landing({ bootError }: LandingProps) {
 										连接到 GitHub
 									</CardTitle>
 									<CardDescription className="text-sm leading-6 sm:text-base">
-										连接后开始同步 Releases、被加星、被关注和 Inbox。
+										{loginCardDescription}
 									</CardDescription>
 								</div>
 							</CardHeader>

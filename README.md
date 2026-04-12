@@ -5,7 +5,7 @@
 
 # OctoRill
 
-OctoRill 是一个 GitHub 信息聚合与阅读界面：把 Releases 整理成类似 GitHub dashboard 的信息流，并用 AI 自动翻译成用户语言（当前默认中文）；同时提供 Release 日报与 Inbox 快捷入口。
+OctoRill 是一个面向个人 GitHub 动态的聚合与阅读界面：在同一工作区集中展示发布更新、个人仓库获星、账号被关注等动态；发布内容支持中文翻译与要点整理，并提供日报与 Inbox 快捷入口。
 
 更多产品与交互说明见：`docs/product.md`。
 
@@ -96,7 +96,7 @@ Then open `http://127.0.0.1:50885`.
 
 ## Auth model
 
-- OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases）。
+- OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases / Followers / owned repo stargazers）。
 - OAuth scope 策略：采用最小授权，默认不为站内反馈申请额外写权限。
 - Release 反馈（👍 😄 ❤️ 🎉 🚀 👀）写操作：要求用户额外提供 GitHub PAT（Personal Access Token）。
   - Fine-grained PAT：按 GitHub Reactions 文档可不额外申请 repository permissions，但 token 仍需覆盖目标仓库。

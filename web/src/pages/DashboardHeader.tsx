@@ -271,7 +271,7 @@ export function DashboardHeader({
 					</h1>
 
 					<p className="text-muted-foreground text-sm font-medium leading-snug">
-						GitHub 信息流 · AI 中文翻译 · Inbox 工作台
+						GitHub 动态 · 中文翻译 · 日报与 Inbox
 					</p>
 				</div>
 			</div>
