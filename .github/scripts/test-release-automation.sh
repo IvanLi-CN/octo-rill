@@ -178,12 +178,37 @@ assert skip_intent.reason == "intent_skip"
 assert module.select_matching_tag(["v2.11.0", "v2.11.0-rc.28c3ff8"], "stable") == "v2.11.0"
 assert module.select_matching_tag(["v2.11.0", "v2.11.0-rc.28c3ff8"], "rc") == "v2.11.0-rc.28c3ff8"
 
-repair_candidate = module.ReleaseCandidate(
-    sha="repair000000000000000000000000000000000000",
+legacy_repair_candidate = module.ReleaseCandidate(
+    sha="legacy00000000000000000000000000000000000",
+    pr_number=6,
+    pr_url="https://github.com/IvanLi-CN/octo-rill/pull/6",
+    intent=module.ReleaseIntent(
+        should_release=True,
+        bump_level="patch",
+        channel="stable",
+        prerelease=False,
+        release_intent_label="type:patch",
+        reason="intent_release",
+    ),
+    matching_tag="v0.1.4",
+    release_exists=True,
+    comment_exists=False,
+)
+latest_published_candidate = module.ReleaseCandidate(
+    sha="published000000000000000000000000000000000",
     pr_number=61,
     pr_url="https://github.com/IvanLi-CN/octo-rill/pull/61",
     intent=stable_intent,
     matching_tag="v2.10.0",
+    release_exists=True,
+    comment_exists=True,
+)
+recent_repair_candidate = module.ReleaseCandidate(
+    sha="repair000000000000000000000000000000000000",
+    pr_number=64,
+    pr_url="https://github.com/IvanLi-CN/octo-rill/pull/64",
+    intent=stable_intent,
+    matching_tag="v2.10.1",
     release_exists=True,
     comment_exists=False,
 )
@@ -206,7 +231,7 @@ missing_sixty_two = module.ReleaseCandidate(
     comment_exists=False,
 )
 
-candidates = [repair_candidate, missing_sixty_three, missing_sixty_two]
+candidates = [legacy_repair_candidate, latest_published_candidate, missing_sixty_three, missing_sixty_two]
 selected = module.select_release_candidate(
     candidates,
     default_sha=missing_sixty_two.sha,
@@ -217,7 +242,19 @@ assert selected.selected_sha == missing_sixty_three.sha
 assert selected.selected_candidate == missing_sixty_three
 assert selected.next_candidate == missing_sixty_two
 assert selected.unpublished_count == 2
-assert selected.repair_count == 1
+assert selected.repair_count == 0
+
+repair_only = module.select_release_candidate(
+    [legacy_repair_candidate, latest_published_candidate, recent_repair_candidate],
+    default_sha=recent_repair_candidate.sha,
+    requested_sha=None,
+    exclude_shas=set(),
+)
+assert repair_only.selected_sha == recent_repair_candidate.sha
+assert repair_only.selected_candidate == recent_repair_candidate
+assert repair_only.selection_reason == "oldest_repair"
+assert repair_only.unpublished_count == 0
+assert repair_only.repair_count == 1
 
 explicit = module.select_release_candidate(
     candidates,
