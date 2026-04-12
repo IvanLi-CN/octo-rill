@@ -1090,6 +1090,24 @@ pub struct AdminSyncSubscriptionReleaseDiagnostics {
     candidate_failures: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionSocialDiagnostics {
+    total_users: i64,
+    succeeded_users: i64,
+    failed_users: i64,
+    repo_stars: i64,
+    followers: i64,
+    events: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSyncSubscriptionNotificationsDiagnostics {
+    total_users: i64,
+    succeeded_users: i64,
+    failed_users: i64,
+    notifications: i64,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct AdminSyncSubscriptionEventItem {
     id: String,
@@ -1115,6 +1133,8 @@ pub struct AdminSyncSubscriptionsDiagnostics {
     log_download_path: Option<String>,
     star: AdminSyncSubscriptionStarDiagnostics,
     release: AdminSyncSubscriptionReleaseDiagnostics,
+    social: AdminSyncSubscriptionSocialDiagnostics,
+    notifications: AdminSyncSubscriptionNotificationsDiagnostics,
     releases_written: i64,
     critical_events: i64,
     recent_events: Vec<AdminSyncSubscriptionEventItem>,
@@ -1675,6 +1695,8 @@ fn build_sync_subscriptions_diagnostics(
     let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
     let star_object = json_object_get_object(result_object, "star");
     let release_object = json_object_get_object(result_object, "release");
+    let social_object = json_object_get_object(result_object, "social");
+    let notifications_object = json_object_get_object(result_object, "notifications");
 
     let skipped = json_object_get_bool(result_object, "skipped").unwrap_or(false);
     let skip_reason = json_object_get_string(result_object, "skip_reason");
@@ -1691,6 +1713,20 @@ fn build_sync_subscriptions_diagnostics(
         succeeded_repos: json_object_get_i64(release_object, "succeeded_repos").unwrap_or(0),
         failed_repos: json_object_get_i64(release_object, "failed_repos").unwrap_or(0),
         candidate_failures: json_object_get_i64(release_object, "candidate_failures").unwrap_or(0),
+    };
+    let social = AdminSyncSubscriptionSocialDiagnostics {
+        total_users: json_object_get_i64(social_object, "total_users").unwrap_or(0),
+        succeeded_users: json_object_get_i64(social_object, "succeeded_users").unwrap_or(0),
+        failed_users: json_object_get_i64(social_object, "failed_users").unwrap_or(0),
+        repo_stars: json_object_get_i64(social_object, "repo_stars").unwrap_or(0),
+        followers: json_object_get_i64(social_object, "followers").unwrap_or(0),
+        events: json_object_get_i64(social_object, "events").unwrap_or(0),
+    };
+    let notifications = AdminSyncSubscriptionNotificationsDiagnostics {
+        total_users: json_object_get_i64(notifications_object, "total_users").unwrap_or(0),
+        succeeded_users: json_object_get_i64(notifications_object, "succeeded_users").unwrap_or(0),
+        failed_users: json_object_get_i64(notifications_object, "failed_users").unwrap_or(0),
+        notifications: json_object_get_i64(notifications_object, "notifications").unwrap_or(0),
     };
     let releases_written = json_object_get_i64(result_object, "releases_written").unwrap_or(0);
     let critical_events = json_object_get_i64(result_object, "critical_events").unwrap_or(0);
@@ -1740,7 +1776,12 @@ fn build_sync_subscriptions_diagnostics(
             "业务失败",
             "Release 阶段全部失败，未能写入任何仓库结果。",
         )
-    } else if star.failed_users > 0 || release.failed_repos > 0 || critical_events > 0 {
+    } else if star.failed_users > 0
+        || release.failed_repos > 0
+        || social.failed_users > 0
+        || notifications.failed_users > 0
+        || critical_events > 0
+    {
         business_outcome(
             "partial",
             "部分成功",
@@ -1767,6 +1808,8 @@ fn build_sync_subscriptions_diagnostics(
             log_download_path,
             star,
             release,
+            social,
+            notifications,
             releases_written,
             critical_events,
             recent_events: recent_events.to_vec(),
@@ -12358,7 +12401,7 @@ mod tests {
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
             Some(
-                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":8,"failed_repos":0,"candidate_failures":2},"releases_written":42,"critical_events":0}"#,
+                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":8,"failed_repos":0,"candidate_failures":2},"social":{"total_users":12,"succeeded_users":12,"failed_users":0,"repo_stars":18,"followers":4,"events":22},"notifications":{"total_users":12,"succeeded_users":12,"failed_users":0,"notifications":35},"releases_written":42,"critical_events":0}"#,
             ),
             None,
         );
@@ -12384,6 +12427,8 @@ mod tests {
             .sync_subscriptions
             .expect("sync subscriptions diagnostics");
         assert_eq!(sync_diag.critical_events, 0);
+        assert_eq!(sync_diag.social.succeeded_users, 12);
+        assert_eq!(sync_diag.notifications.notifications, 35);
         assert_eq!(sync_diag.recent_events.len(), 1);
         assert_eq!(sync_diag.recent_events[0].severity, "warning");
     }
@@ -12408,7 +12453,7 @@ mod tests {
             jobs::STATUS_SUCCEEDED,
             r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#,
             Some(
-                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":10,"failed_users":2,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":7,"failed_repos":1,"candidate_failures":3},"releases_written":42,"critical_events":2}"#,
+                r#"{"skipped":false,"skip_reason":null,"star":{"total_users":12,"succeeded_users":10,"failed_users":2,"total_repos":8},"release":{"total_repos":8,"succeeded_repos":7,"failed_repos":1,"candidate_failures":3},"social":{"total_users":10,"succeeded_users":9,"failed_users":1,"repo_stars":48,"followers":19,"events":67},"notifications":{"total_users":10,"succeeded_users":8,"failed_users":2,"notifications":192},"releases_written":42,"critical_events":2}"#,
             ),
             None,
         );
@@ -12457,6 +12502,8 @@ mod tests {
         );
         assert_eq!(sync_diag.star.succeeded_users, 10);
         assert_eq!(sync_diag.release.failed_repos, 1);
+        assert_eq!(sync_diag.social.failed_users, 1);
+        assert_eq!(sync_diag.notifications.failed_users, 2);
         assert_eq!(sync_diag.releases_written, 42);
         assert_eq!(sync_diag.critical_events, 2);
         assert_eq!(sync_diag.recent_events.len(), 2);
@@ -12631,7 +12678,7 @@ mod tests {
         .bind(test_user_id(2))
         .bind(Option::<String>::None)
         .bind(r#"{"trigger":"schedule","schedule_key":"2026-03-06T14:30"}"#)
-        .bind(r#"{"skipped":false,"star":{"total_users":1,"succeeded_users":1,"failed_users":0,"total_repos":1},"release":{"total_repos":1,"succeeded_repos":1,"failed_repos":0,"candidate_failures":0},"releases_written":1,"critical_events":1}"#)
+        .bind(r#"{"skipped":false,"star":{"total_users":1,"succeeded_users":1,"failed_users":0,"total_repos":1},"release":{"total_repos":1,"succeeded_repos":1,"failed_repos":0,"candidate_failures":0},"social":{"total_users":1,"succeeded_users":1,"failed_users":0,"repo_stars":2,"followers":1,"events":3},"notifications":{"total_users":1,"succeeded_users":1,"failed_users":0,"notifications":4},"releases_written":1,"critical_events":1}"#)
         .bind(Option::<String>::None)
         .bind(0_i64)
         .bind(now)
@@ -12701,6 +12748,8 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "latest-event")
         );
+        assert_eq!(sync.social.events, 3);
+        assert_eq!(sync.notifications.notifications, 4);
     }
 
     #[tokio::test]

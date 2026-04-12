@@ -968,6 +968,20 @@ async function installAdminJobsMocks(
 								failed_repos: 5,
 								candidate_failures: 7,
 							},
+							social: {
+								total_users: 11,
+								succeeded_users: 9,
+								failed_users: 2,
+								repo_stars: 48,
+								followers: 19,
+								events: 67,
+							},
+							notifications: {
+								total_users: 11,
+								succeeded_users: 10,
+								failed_users: 1,
+								notifications: 192,
+							},
 							releases_written: 1840,
 							critical_events: 6,
 						}),
@@ -1004,6 +1018,20 @@ async function installAdminJobsMocks(
 								failed_repos: 5,
 								candidate_failures: 7,
 							},
+							social: {
+								total_users: 11,
+								succeeded_users: 9,
+								failed_users: 2,
+								repo_stars: 48,
+								followers: 19,
+								events: 67,
+							},
+							notifications: {
+								total_users: 11,
+								succeeded_users: 10,
+								failed_users: 1,
+								notifications: 192,
+							},
 							releases_written: 1840,
 							critical_events: 6,
 							recent_events: [
@@ -1020,6 +1048,34 @@ async function installAdminJobsMocks(
 									message:
 										"release sync candidate failed for octo/private-repo with user #4h6p9s3t5z8e2x4c",
 									created_at: "2026-02-26T14:31:40Z",
+								},
+								{
+									id: "evt-sync-41",
+									stage: "social",
+									event_type: "social_sync_failed",
+									severity: "error",
+									recoverable: false,
+									attempt: 1,
+									user_id: RECENT_EVENT_USER_ID,
+									repo_id: null,
+									repo_full_name: null,
+									message:
+										"failed to refresh social activity for user #4h6p9s3t5z8e2x4c",
+									created_at: "2026-02-26T14:32:10Z",
+								},
+								{
+									id: "evt-sync-40",
+									stage: "notifications",
+									event_type: "notifications_sync_failed",
+									severity: "error",
+									recoverable: false,
+									attempt: 1,
+									user_id: RECENT_EVENT_USER_ID,
+									repo_id: null,
+									repo_full_name: null,
+									message:
+										"failed to refresh inbox notifications for user #4h6p9s3t5z8e2x4c",
+									created_at: "2026-02-26T14:32:40Z",
 								},
 							],
 						},
@@ -1059,6 +1115,32 @@ async function installAdminJobsMocks(
 						},
 						{
 							id: "evt-task-34",
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "social_summary",
+								total_users: 11,
+								succeeded_users: 9,
+								failed_users: 2,
+								repo_stars: 48,
+								followers: 19,
+								events: 67,
+							}),
+							created_at: "2026-02-26T14:38:02Z",
+						},
+						{
+							id: "evt-task-35",
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "notifications_summary",
+								total_users: 11,
+								succeeded_users: 10,
+								failed_users: 1,
+								notifications: 192,
+							}),
+							created_at: "2026-02-26T14:38:06Z",
+						},
+						{
+							id: "evt-task-36",
 							event_type: "task.completed",
 							payload_json: JSON.stringify({ status: "succeeded" }),
 							created_at: "2026-02-26T14:38:10Z",
@@ -1438,6 +1520,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page).toHaveURL(
 		/\/admin\/jobs\/tasks\/task-subscriptions-1\?from=scheduled$/,
 	);
+	await expect(page.getByText("Social 成功/总计")).toBeVisible();
+	await expect(page.getByText("9/11", { exact: true })).toBeVisible();
+	await expect(page.getByText("Inbox 成功/总计")).toBeVisible();
+	await expect(page.getByText("10/11", { exact: true })).toBeVisible();
 	await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
 	await expect(page.getByRole("link", { name: "下载日志" })).toBeVisible();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();

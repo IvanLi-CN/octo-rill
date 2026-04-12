@@ -22,20 +22,21 @@
 - 引入共享 `repo_releases` 缓存，所有用户从 `starred_repos + repo_releases` 读取 Release。
 - 引入全局 `repo_release_work_items` / `repo_release_watchers`，把访问触发、手动同步、定时订阅同步统一汇聚到 repo 级共享队列。
 - 新增 `sync.access_refresh`：
-  - 仅覆盖 `Star + Release`
+  - 覆盖 `Star + Release + social + Inbox`
   - 首访或超过 1 小时未访问时自动触发
   - `star_refreshed` 后立即让前端刷新可见缓存
-  - Release work 完成后再刷新一次
+  - Release work 完成后再刷新一次，并在 social / Inbox 阶段结束后收口
+  - social / Inbox 失败保持 best-effort，不把整轮访问刷新降级成硬失败
 - `sync.subscriptions` 改成：
   - 刷新用户 Star
   - 聚合 repo demand
   - 挂到共享 repo release queue
-  - 等待关联 outcome 并输出摘要
+  - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
 
 ### Non-goals
 
-- 不把访问触发同步扩展到 Inbox。
+- 不改定时任务的半小时 bucket 调度频率。
 - 不引入跨实例分布式锁或 leader election。
 - 不引入 GitHub webhook / upstream push 模式。
 
@@ -108,8 +109,11 @@
   4. 触发 `task.progress(stage=release_attached)`
   5. 等待关联 work item 满足“已有新鲜缓存或本轮完成”
   6. 触发 `task.progress(stage=release_summary)`
-  7. `task.completed`
-- 访问自动刷新只覆盖 `Star + Release`，不自动同步 Inbox。
+  7. 触发 `task.progress(stage=social_summary)`
+  8. 触发 `task.progress(stage=notifications_summary)`
+  9. `task.completed`
+- 访问自动刷新会继续补齐 `social + Inbox`，但 `star_refreshed` 仍然是前端第一次刷新缓存的关键节点。
+- social 或 Inbox 若失败，访问刷新任务仍返回成功，并把对应错误附带到阶段事件 / 结果 JSON 中。
 
 ### 共享 repo release queue
 
@@ -136,6 +140,10 @@
   - 挂到共享 repo release queue
   - 等待共享 queue 结果
   - 在任务结果里输出 repo 级摘要
+- Release 结束后继续按 Star 成功用户 fan-out：
+  - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
+  - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数
+- social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
 
 ### 读模型与可见性
 
@@ -177,6 +185,14 @@
   When feed / release detail / brief / translation / reaction 读取 Release
   Then 只依赖“当前用户 star 可见 + 共享 repo release 缓存”，不依赖用户私有 `releases`。
 
+- Given `sync.subscriptions` 被 scheduler 在半小时槽触发
+  When 本轮 Star / Release 摘要已经完成
+  Then 同一 task 还会继续发出 `social_summary` 与 `notifications_summary`，并在 `result_json` 中包含四段聚合摘要。
+
+- Given 某个用户的 social 或 Inbox 拉取失败
+  When `sync.subscriptions` 结束
+  Then 整轮任务仍可完成，但 Admin Jobs 详情页会展示 partial outcome，并能从 `recent_events` 看到对应失败线索。
+
 ## Visual Evidence
 
 source_type=storybook_canvas  
@@ -189,3 +205,15 @@ state=auto-sync-empty-state
 evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
 
 ![Access sync empty state](./assets/access-sync-empty-state.png)
+
+source_type=storybook_canvas  
+target_program=mock-only  
+capture_scope=browser-viewport  
+sensitive_exclusion=N/A  
+submission_gate=approved  
+story_id_or_title=Admin/Task Type Detail/SyncSubscriptions  
+state=scheduler-social-and-inbox-summary  
+evidence_note=验证 Admin Jobs 的 sync.subscriptions 详情页已展示 Star、Release、Social、Inbox 四阶段摘要与最近关键事件。
+
+PR: include
+![Admin sync subscriptions detail](./assets/admin-sync-subscriptions-detail.png)
