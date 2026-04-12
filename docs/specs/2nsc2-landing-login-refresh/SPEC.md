@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（2/3）
+- Status: 已完成
 - Created: 2026-04-12
 - Last: 2026-04-12
 
@@ -165,7 +165,7 @@ None
 
 - [x] M1: Landing 首屏文案与布局重做完成，移动端 CTA 优先单栏落地。
 - [x] M2: Storybook 默认态、错误态与移动端审阅入口更新完成，并将卖点卡统一为标题 + 说明结构。
-- [ ] M3: Playwright 回归、视觉证据与快车道交付收口完成。
+- [x] M3: Playwright 回归、视觉证据与快车道交付收口完成。
 
 ## 方案概述（Approach, high-level）
 
