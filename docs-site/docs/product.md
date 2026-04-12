@@ -1,57 +1,55 @@
 ---
 title: 产品说明
-description: OctoRill 的页面结构、核心体验与数据边界。
+description: OctoRill 的前台用户功能、页面结构与数据边界。
 ---
 
 # 产品说明
 
-本文档用于帮助协作者快速理解 OctoRill 的核心信息架构。
+OctoRill 面向需要持续查看 GitHub 动态的个人用户。它不替代 GitHub，而是把与“我”相关的发布更新、获星与关注动态集中到一个更适合阅读的工作区里，并补上中文翻译、要点整理、日报与通知入口。
 
-## 核心体验
+## 前台用户可以做什么
 
-OctoRill 的目标不是替代 GitHub，而是把 GitHub 上分散的更新整理成一个更适合阅读的工作台：
-
-- Feed：以 Release 为主的信息流，支持无限滚动与中文翻译。
-- 日报：汇总过去一天值得关注的 Release 更新。
-- Inbox：快速回看 GitHub 通知，减少在原生通知页来回跳转。
-- Admin：观察后台同步、翻译与任务调度状态。
+- **集中查看 GitHub 动态**：在一个 Dashboard 里统一浏览发布更新、个人仓库获星与账号被关注三类动态。
+- **切换发布阅读模式**：Release 条目支持 `原文 / 翻译 / 智能` 三种阅读模式；中文译文与要点整理都在站内完成。
+- **查看日报**：按固定时间边界生成“昨日更新”日报，用项目分组方式回顾最近一轮发布变化。
+- **查看通知入口**：侧栏提供 Inbox 快捷入口，主列提供完整 Inbox 列表，方便从站内继续跳回 GitHub 处理线程。
+- **打开发布详情**：从日报或列表进入 Release 详情弹窗，在站内继续阅读完整译文，再决定是否跳回 GitHub。
+- **使用反馈表情**：Release 卡片会显示 GitHub 同款反馈计数；如需在站内点按反馈，需要额外配置 GitHub PAT。
 
 ## 页面结构
 
 ### Landing
 
-Landing 页面承担登录入口和产品定位介绍：未登录用户先在这里完成 GitHub OAuth。
+- 未登录用户的公开入口页。
+- 负责说明产品定位，并承接 GitHub OAuth 登录。
 
 ### Dashboard
 
-Dashboard 是登录后的主工作区，包含：
+Dashboard 是普通用户登录后的主工作区，包含 6 个主标签：
 
-- Header 与全局切换。
-- Release Feed 主列。
-- 右侧 Brief / Inbox / Release Detail 辅助区块。
-- Footer 中的构建版本与元信息展示。
+- `全部`：按统一时间线混排发布更新、获星与关注动态。
+- `Releases`：只看发布更新，并支持按日报边界分组阅读。
+- `被加星`：只看“谁给我的个人仓库加了星”。
+- `被关注`：只看“谁关注了我”。
+- `日报`：查看或手动生成 Release 日报。
+- `Inbox`：查看 GitHub 通知列表。
 
-### Admin Panel
+除主列外，右侧侧栏常驻 Inbox 快捷入口；在 `日报` 标签下还会显示日报列表。
 
-Admin Panel 聚焦用户管理：查看用户、搜索筛选、启停用户、管理员身份确认等。
+### 管理页面
 
-### Admin Jobs
+- `Admin Panel`：管理员用户管理入口。
+- `Admin Jobs`：后台同步、翻译与任务调度的观测入口。
 
-Admin Jobs 聚焦后台任务可观测性：实时任务、计划任务、LLM 调用、任务详情与日志入口。
+这两部分属于管理功能，不是普通前台用户的主工作流。
 
-## AI 翻译策略
+## 数据来源与边界
 
-- 默认把 Release 内容翻译成中文。
-- 翻译与日报属于增强能力，不应阻塞主阅读流程。
-- 翻译内容以“共享事实语义”处理，不因 Star 取消而抹掉已有历史上下文。
-
-## 数据来源与同步
-
-- OAuth 负责登录、读取 Feed / Notifications / Starred / Releases。
-- PAT 只用于 Release 反馈等额外写操作。
-- 本地 SQLite 负责缓存与派生数据，不直接替代 GitHub 作为事实源。
+- **GitHub OAuth**：负责登录、读取与同步前台所需数据，包括 Feed、Notifications、Starred、Releases、Followers 与 owned repo stargazers。
+- **GitHub PAT**：仅用于 Release 反馈等额外写操作，不参与日常登录。
+- **本地 SQLite**：负责缓存与派生数据，不替代 GitHub 作为事实源。
 
 ## 非目标
 
-- 不在站内直接取代 GitHub 的完整交互能力。
-- 不把所有 GitHub 通知与发布管理行为都闭环在本项目内。
+- 不在站内替代 GitHub 的完整交互能力。
+- 不把评论、合并、通知已读等完整 GitHub 工作流都迁入本项目。

@@ -64,7 +64,7 @@ function SurfaceGallery() {
 					<div className="inline-flex flex-col gap-3 rounded-[28px] bg-white/92 px-5 py-5 shadow-sm shadow-black/5 ring-1 ring-[#E9DECF]">
 						<BrandLogo variant="wordmark" className="h-9" />
 						<p className="text-sm font-medium text-muted-foreground">
-							GitHub 信息流 · AI 中文翻译 · Inbox 工作台
+							GitHub 动态 · 中文翻译 · 日报与 Inbox
 						</p>
 					</div>
 				</div>
