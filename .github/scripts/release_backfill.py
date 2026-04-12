@@ -62,6 +62,10 @@ class ReleaseCandidate:
             return "missing_pr_comment"
         return ""
 
+    @property
+    def is_fully_published(self) -> bool:
+        return bool(self.matching_tag and self.release_exists and self.comment_exists)
+
 
 @dataclass(frozen=True)
 class SelectionResult:
@@ -471,6 +475,16 @@ def pick_next_pending_candidate(
     return None
 
 
+def limit_candidates_to_active_frontier(candidates: list[ReleaseCandidate]) -> list[ReleaseCandidate]:
+    last_published_index = -1
+    for index, candidate in enumerate(candidates):
+        if candidate.is_fully_published:
+            last_published_index = index
+    if last_published_index < 0:
+        return list(candidates)
+    return candidates[last_published_index + 1 :]
+
+
 def select_release_candidate(
     candidates: list[ReleaseCandidate],
     *,
@@ -478,12 +492,13 @@ def select_release_candidate(
     requested_sha: str | None,
     exclude_shas: set[str],
 ) -> SelectionResult:
-    unpublished_count = sum(1 for candidate in candidates if candidate.pending_kind == "unpublished")
-    repair_count = sum(1 for candidate in candidates if candidate.pending_kind == "repair")
+    active_candidates = limit_candidates_to_active_frontier(candidates)
+    unpublished_count = sum(1 for candidate in active_candidates if candidate.pending_kind == "unpublished")
+    repair_count = sum(1 for candidate in active_candidates if candidate.pending_kind == "repair")
 
     if requested_sha:
         selected_candidate = next((candidate for candidate in candidates if candidate.sha == requested_sha), None)
-        next_candidate = pick_next_pending_candidate(candidates, exclude_shas=exclude_shas | {requested_sha})
+        next_candidate = pick_next_pending_candidate(active_candidates, exclude_shas=exclude_shas | {requested_sha})
         return SelectionResult(
             selected_sha=requested_sha,
             selected_candidate=selected_candidate,
@@ -493,9 +508,12 @@ def select_release_candidate(
             repair_count=repair_count,
         )
 
-    pending_candidate = pick_next_pending_candidate(candidates, exclude_shas=exclude_shas)
+    pending_candidate = pick_next_pending_candidate(active_candidates, exclude_shas=exclude_shas)
     if pending_candidate is not None:
-        next_candidate = pick_next_pending_candidate(candidates, exclude_shas=exclude_shas | {pending_candidate.sha})
+        next_candidate = pick_next_pending_candidate(
+            active_candidates,
+            exclude_shas=exclude_shas | {pending_candidate.sha},
+        )
         return SelectionResult(
             selected_sha=pending_candidate.sha,
             selected_candidate=pending_candidate,
