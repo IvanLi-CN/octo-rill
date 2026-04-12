@@ -28,6 +28,8 @@ const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2022-11-28";
 const SUBSCRIPTION_STAR_WORKERS: usize = 5;
+const SUBSCRIPTION_SOCIAL_WORKERS: usize = 4;
+const SUBSCRIPTION_NOTIFICATION_WORKERS: usize = 5;
 const SUBSCRIPTION_RETRY_LIMIT: usize = 3;
 const SUBSCRIPTION_RETRY_BACKOFF_MS: [u64; 3] = [500, 1_000, 2_000];
 const SUBSCRIPTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,6 +69,8 @@ pub struct SyncAccessRefreshResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub social_error: Option<String>,
     pub notifications: SyncNotificationsResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,12 +106,32 @@ pub struct SyncSubscriptionReleaseSummary {
     pub candidate_failures: usize,
 }
 
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SyncSubscriptionSocialSummary {
+    pub total_users: usize,
+    pub succeeded_users: usize,
+    pub failed_users: usize,
+    pub repo_stars: usize,
+    pub followers: usize,
+    pub events: usize,
+}
+
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct SyncSubscriptionNotificationsSummary {
+    pub total_users: usize,
+    pub succeeded_users: usize,
+    pub failed_users: usize,
+    pub notifications: usize,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct SyncSubscriptionsResult {
     pub skipped: bool,
     pub skip_reason: Option<String>,
     pub star: SyncSubscriptionStarSummary,
     pub release: SyncSubscriptionReleaseSummary,
+    pub social: SyncSubscriptionSocialSummary,
+    pub notifications: SyncSubscriptionNotificationsSummary,
     pub releases_written: usize,
     pub critical_events: usize,
 }
@@ -118,6 +142,8 @@ pub fn skipped_subscription_result(_schedule_key: &str, skip_reason: &str) -> Va
         "skip_reason": skip_reason,
         "star": SyncSubscriptionStarSummary::default(),
         "release": SyncSubscriptionReleaseSummary::default(),
+        "social": SyncSubscriptionSocialSummary::default(),
+        "notifications": SyncSubscriptionNotificationsSummary::default(),
         "releases_written": 0,
         "critical_events": 0,
     })
@@ -1026,7 +1052,23 @@ pub async fn sync_access_refresh(
     )
     .await?;
 
-    let notifications = sync_notifications(state, user_id).await?;
+    let (notifications, notifications_error) = match sync_notifications(state, user_id).await {
+        Ok(result) => (result, None),
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                user_id,
+                "sync.access_refresh: notifications sync failed, completing with partial data"
+            );
+            (
+                SyncNotificationsResult {
+                    notifications: 0,
+                    since: None,
+                },
+                Some(err.to_string()),
+            )
+        }
+    };
     jobs::append_task_event(
         state,
         task_id,
@@ -1036,6 +1078,7 @@ pub async fn sync_access_refresh(
             "stage": "notifications_summary",
             "notifications": notifications.notifications,
             "since": notifications.since,
+            "error": notifications_error,
         }),
     )
     .await?;
@@ -1046,6 +1089,7 @@ pub async fn sync_access_refresh(
         social,
         social_error,
         notifications,
+        notifications_error,
     })
 }
 
@@ -2536,11 +2580,100 @@ pub async fn sync_subscriptions(
     )
     .await?;
 
+    if context.is_cancel_requested().await? {
+        context
+            .log(
+                "warning",
+                "scheduler",
+                "run_canceled",
+                "subscription sync canceled before social phase",
+                json!({
+                    "total_users": star_summary.total_users,
+                    "successful_users": star_summary.succeeded_users,
+                    "release_repos": release_summary.total_repos,
+                    "releases_written": releases_written,
+                }),
+            )
+            .await?;
+        return Ok(SyncSubscriptionsResult {
+            skipped: false,
+            skip_reason: None,
+            star: star_summary,
+            release: release_summary,
+            social: SyncSubscriptionSocialSummary::default(),
+            notifications: SyncSubscriptionNotificationsSummary::default(),
+            releases_written,
+            critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+        });
+    }
+
+    let social_summary = run_social_phase(&context, &successful_users).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "social_summary",
+            "total_users": social_summary.total_users,
+            "succeeded_users": social_summary.succeeded_users,
+            "failed_users": social_summary.failed_users,
+            "repo_stars": social_summary.repo_stars,
+            "followers": social_summary.followers,
+            "events": social_summary.events,
+        }),
+    )
+    .await?;
+
+    if context.is_cancel_requested().await? {
+        context
+            .log(
+                "warning",
+                "scheduler",
+                "run_canceled",
+                "subscription sync canceled before notifications phase",
+                json!({
+                    "total_users": social_summary.total_users,
+                    "succeeded_users": social_summary.succeeded_users,
+                    "failed_users": social_summary.failed_users,
+                }),
+            )
+            .await?;
+        return Ok(SyncSubscriptionsResult {
+            skipped: false,
+            skip_reason: None,
+            star: star_summary,
+            release: release_summary,
+            social: social_summary,
+            notifications: SyncSubscriptionNotificationsSummary::default(),
+            releases_written,
+            critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
+        });
+    }
+
+    let notifications_summary = run_notifications_phase(&context, &successful_users).await?;
+    jobs::append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "notifications_summary",
+            "total_users": notifications_summary.total_users,
+            "succeeded_users": notifications_summary.succeeded_users,
+            "failed_users": notifications_summary.failed_users,
+            "notifications": notifications_summary.notifications,
+        }),
+    )
+    .await?;
+
     let result = SyncSubscriptionsResult {
         skipped: false,
         skip_reason: None,
         star: star_summary,
         release: release_summary,
+        social: social_summary,
+        notifications: notifications_summary,
         releases_written,
         critical_events: context.critical_events.load(AtomicOrdering::Relaxed),
     };
@@ -2914,6 +3047,442 @@ async fn run_release_phase(
         },
         waited.releases,
     ))
+}
+
+async fn run_social_phase(
+    context: &SubscriptionRunContext,
+    users: &[StarPhaseSuccess],
+) -> Result<SyncSubscriptionSocialSummary> {
+    let mut join_set = JoinSet::new();
+    let mut summary = SyncSubscriptionSocialSummary {
+        total_users: users.len(),
+        ..SyncSubscriptionSocialSummary::default()
+    };
+
+    context
+        .log(
+            "info",
+            "social",
+            "phase_started",
+            "subscription social sync phase started",
+            json!({
+                "total_users": summary.total_users,
+            }),
+        )
+        .await?;
+
+    for user in users {
+        while join_set.len() >= SUBSCRIPTION_SOCIAL_WORKERS {
+            collect_social_result(join_set.join_next().await, &mut summary)?;
+            if context.is_cancel_requested().await? {
+                context
+                    .log(
+                        "warning",
+                        "social",
+                        "run_canceled",
+                        "subscription sync canceled during social phase",
+                        json!({
+                            "completed_users": summary.succeeded_users + summary.failed_users,
+                            "total_users": summary.total_users,
+                        }),
+                    )
+                    .await?;
+                return Ok(summary);
+            }
+        }
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "social",
+                    "run_canceled",
+                    "subscription sync canceled during social phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok(summary);
+        }
+        let worker_context = context.clone();
+        let user_id = user.user_id.clone();
+        join_set.spawn(async move { sync_social_for_user(worker_context, user_id).await });
+    }
+
+    while !join_set.is_empty() {
+        collect_social_result(join_set.join_next().await, &mut summary)?;
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "social",
+                    "run_canceled",
+                    "subscription sync canceled during social phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok(summary);
+        }
+    }
+
+    context
+        .log(
+            "info",
+            "social",
+            "phase_completed",
+            "subscription social sync phase completed",
+            serde_json::to_value(&summary).unwrap_or_else(|_| json!({"ok": true})),
+        )
+        .await?;
+
+    Ok(summary)
+}
+
+fn collect_social_result(
+    joined: Option<Result<Result<Option<SyncSocialActivityResult>>, tokio::task::JoinError>>,
+    summary: &mut SyncSubscriptionSocialSummary,
+) -> Result<()> {
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+
+    match joined {
+        Ok(Ok(Some(success))) => {
+            summary.succeeded_users += 1;
+            summary.repo_stars += success.repo_stars;
+            summary.followers += success.followers;
+            summary.events += success.events;
+            Ok(())
+        }
+        Ok(Ok(None)) => {
+            summary.failed_users += 1;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(anyhow!("social worker join failed: {err}")),
+    }
+}
+
+async fn sync_social_for_user(
+    context: SubscriptionRunContext,
+    user_id: String,
+) -> Result<Option<SyncSocialActivityResult>> {
+    context
+        .log(
+            "info",
+            "social",
+            "user_started",
+            format!("refreshing social activity for user #{}", user_id),
+            json!({
+                "user_id": user_id.as_str(),
+            }),
+        )
+        .await?;
+
+    if context.is_cancel_requested().await? {
+        context
+            .log(
+                "warning",
+                "social",
+                "user_canceled",
+                format!("social sync canceled for user #{}", user_id),
+                json!({
+                    "user_id": user_id.as_str(),
+                }),
+            )
+            .await?;
+        return Ok(None);
+    }
+
+    let (result, error) = sync_social_activity_best_effort(
+        context.state.as_ref(),
+        user_id.as_str(),
+        "sync.subscriptions",
+    )
+    .await;
+
+    if let Some(error) = error {
+        context
+            .key_event(
+                format!("failed to refresh social activity for user #{}", user_id),
+                SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_sync_failed",
+                    severity: "error",
+                    recoverable: false,
+                    attempt: 1,
+                    user_id: Some(user_id.as_str()),
+                    repo_id: None,
+                    repo_full_name: None,
+                    payload: json!({
+                        "user_id": user_id.as_str(),
+                        "error": error,
+                    }),
+                },
+            )
+            .await?;
+        return Ok(None);
+    }
+
+    for source_error in &result.source_errors {
+        context
+            .key_event(
+                format!("social sync degraded for user #{}", user_id),
+                SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_source_degraded",
+                    severity: "warning",
+                    recoverable: true,
+                    attempt: 1,
+                    user_id: Some(user_id.as_str()),
+                    repo_id: None,
+                    repo_full_name: None,
+                    payload: json!({
+                        "user_id": user_id.as_str(),
+                        "error": source_error,
+                    }),
+                },
+            )
+            .await?;
+    }
+
+    if !result.failed_repos.is_empty() {
+        context
+            .key_event(
+                format!(
+                    "repo stargazer snapshots partially failed for user #{}",
+                    user_id
+                ),
+                SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_repo_stargazers_partial",
+                    severity: "warning",
+                    recoverable: true,
+                    attempt: 1,
+                    user_id: Some(user_id.as_str()),
+                    repo_id: None,
+                    repo_full_name: None,
+                    payload: json!({
+                        "user_id": user_id.as_str(),
+                        "failed_repos": result.failed_repos.clone(),
+                    }),
+                },
+            )
+            .await?;
+    }
+
+    context
+        .log(
+            "info",
+            "social",
+            "user_succeeded",
+            format!("social activity refreshed for user #{}", user_id),
+            json!({
+                "user_id": user_id,
+                "repo_stars": result.repo_stars,
+                "followers": result.followers,
+                "events": result.events,
+            }),
+        )
+        .await?;
+
+    Ok(Some(result))
+}
+
+async fn run_notifications_phase(
+    context: &SubscriptionRunContext,
+    users: &[StarPhaseSuccess],
+) -> Result<SyncSubscriptionNotificationsSummary> {
+    let mut join_set = JoinSet::new();
+    let mut summary = SyncSubscriptionNotificationsSummary {
+        total_users: users.len(),
+        ..SyncSubscriptionNotificationsSummary::default()
+    };
+
+    context
+        .log(
+            "info",
+            "notifications",
+            "phase_started",
+            "subscription notifications sync phase started",
+            json!({
+                "total_users": summary.total_users,
+            }),
+        )
+        .await?;
+
+    for user in users {
+        while join_set.len() >= SUBSCRIPTION_NOTIFICATION_WORKERS {
+            collect_notification_result(join_set.join_next().await, &mut summary)?;
+            if context.is_cancel_requested().await? {
+                context
+                    .log(
+                        "warning",
+                        "notifications",
+                        "run_canceled",
+                        "subscription sync canceled during notifications phase",
+                        json!({
+                            "completed_users": summary.succeeded_users + summary.failed_users,
+                            "total_users": summary.total_users,
+                        }),
+                    )
+                    .await?;
+                return Ok(summary);
+            }
+        }
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "notifications",
+                    "run_canceled",
+                    "subscription sync canceled during notifications phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok(summary);
+        }
+        let worker_context = context.clone();
+        let user_id = user.user_id.clone();
+        join_set.spawn(async move { sync_notifications_for_user(worker_context, user_id).await });
+    }
+
+    while !join_set.is_empty() {
+        collect_notification_result(join_set.join_next().await, &mut summary)?;
+        if context.is_cancel_requested().await? {
+            context
+                .log(
+                    "warning",
+                    "notifications",
+                    "run_canceled",
+                    "subscription sync canceled during notifications phase",
+                    json!({
+                        "completed_users": summary.succeeded_users + summary.failed_users,
+                        "total_users": summary.total_users,
+                    }),
+                )
+                .await?;
+            return Ok(summary);
+        }
+    }
+
+    context
+        .log(
+            "info",
+            "notifications",
+            "phase_completed",
+            "subscription notifications sync phase completed",
+            serde_json::to_value(&summary).unwrap_or_else(|_| json!({"ok": true})),
+        )
+        .await?;
+
+    Ok(summary)
+}
+
+fn collect_notification_result(
+    joined: Option<Result<Result<Option<SyncNotificationsResult>>, tokio::task::JoinError>>,
+    summary: &mut SyncSubscriptionNotificationsSummary,
+) -> Result<()> {
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+
+    match joined {
+        Ok(Ok(Some(success))) => {
+            summary.succeeded_users += 1;
+            summary.notifications += success.notifications;
+            Ok(())
+        }
+        Ok(Ok(None)) => {
+            summary.failed_users += 1;
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err),
+        Err(err) => Err(anyhow!("notifications worker join failed: {err}")),
+    }
+}
+
+async fn sync_notifications_for_user(
+    context: SubscriptionRunContext,
+    user_id: String,
+) -> Result<Option<SyncNotificationsResult>> {
+    context
+        .log(
+            "info",
+            "notifications",
+            "user_started",
+            format!("refreshing inbox notifications for user #{}", user_id),
+            json!({
+                "user_id": user_id.as_str(),
+            }),
+        )
+        .await?;
+
+    if context.is_cancel_requested().await? {
+        context
+            .log(
+                "warning",
+                "notifications",
+                "user_canceled",
+                format!("notifications sync canceled for user #{}", user_id),
+                json!({
+                    "user_id": user_id.as_str(),
+                }),
+            )
+            .await?;
+        return Ok(None);
+    }
+
+    match sync_notifications(context.state.as_ref(), user_id.as_str()).await {
+        Ok(result) => {
+            context
+                .log(
+                    "info",
+                    "notifications",
+                    "user_succeeded",
+                    format!("inbox notifications refreshed for user #{}", user_id),
+                    json!({
+                        "user_id": user_id.as_str(),
+                        "notifications": result.notifications,
+                        "since": result.since.clone(),
+                    }),
+                )
+                .await?;
+            Ok(Some(result))
+        }
+        Err(err) => {
+            context
+                .key_event(
+                    format!(
+                        "failed to refresh inbox notifications for user #{}",
+                        user_id
+                    ),
+                    SubscriptionEventRecord {
+                        stage: "notifications",
+                        event_type: "notifications_sync_failed",
+                        severity: "error",
+                        recoverable: false,
+                        attempt: 1,
+                        user_id: Some(user_id.as_str()),
+                        repo_id: None,
+                        repo_full_name: None,
+                        payload: json!({
+                            "user_id": user_id.as_str(),
+                            "error": err.to_string(),
+                        }),
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn claim_next_repo_release_work_item(
@@ -4580,6 +5149,7 @@ mod tests {
         },
     };
 
+    use serde_json::{Value, json};
     use sqlx::{
         SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -7312,6 +7882,99 @@ mod tests {
         let merged =
             super::merge_smart_preheat_release_ids(&[105, 104, 103], &[104, 103, 102, 101, 100]);
         assert_eq!(merged, vec![105, 104, 103, 102, 101, 100]);
+    }
+
+    #[test]
+    fn skipped_subscription_result_includes_social_and_notifications_defaults() {
+        let result = super::skipped_subscription_result("2026-03-06T14:30", "previous_run_active");
+        assert_eq!(result.get("skipped").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            result
+                .get("social")
+                .and_then(|value| value.get("total_users"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            result
+                .get("notifications")
+                .and_then(|value| value.get("notifications"))
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn sync_access_refresh_result_serializes_optional_notifications_error() {
+        let value = serde_json::to_value(super::SyncAccessRefreshResult {
+            starred: super::SyncStarredResult { repos: 2 },
+            release: super::SharedReleaseDemandResult {
+                repos: 2,
+                releases: 5,
+                ..super::SharedReleaseDemandResult::default()
+            },
+            social: super::SyncSocialActivityResult::default(),
+            social_error: None,
+            notifications: super::SyncNotificationsResult {
+                notifications: 0,
+                since: None,
+            },
+            notifications_error: Some("notifications unavailable".to_owned()),
+        })
+        .expect("serialize access refresh result");
+
+        assert_eq!(
+            value.get("notifications_error"),
+            Some(&json!("notifications unavailable"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_subscriptions_without_eligible_users_emits_social_and_notifications_summaries() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-sync-subscriptions-empty").await;
+
+        let result = super::sync_subscriptions(
+            state.as_ref(),
+            "task-sync-subscriptions-empty",
+            &json!({
+                "trigger": "schedule",
+                "schedule_key": "2026-03-06T14:30",
+            }),
+        )
+        .await
+        .expect("run sync subscriptions");
+
+        assert_eq!(result.star.total_users, 0);
+        assert_eq!(result.social.total_users, 0);
+        assert_eq!(result.notifications.notifications, 0);
+
+        let stages = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT json_extract(payload_json, '$.stage')
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind("task-sync-subscriptions-empty")
+        .fetch_all(&pool)
+        .await
+        .expect("load task progress stages");
+
+        assert_eq!(
+            stages,
+            vec![
+                "collect".to_owned(),
+                "star_summary".to_owned(),
+                "repo_collect".to_owned(),
+                "release_summary".to_owned(),
+                "social_summary".to_owned(),
+                "notifications_summary".to_owned(),
+                "summary".to_owned(),
+            ]
+        );
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {

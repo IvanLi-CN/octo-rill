@@ -403,10 +403,12 @@ function buildTaskDetailPageModel(
 			const skipped = diagnostics?.skipped ?? readBoolean(result, "skipped");
 			const skipReason =
 				diagnostics?.skip_reason ?? readString(result, "skip_reason");
+			const social = readObject(result, "social");
+			const notifications = readObject(result, "notifications");
 			return {
 				pageTitle: "订阅同步详情页",
 				pageSummary:
-					"展示半小时全用户订阅同步的 Star -> Release 两阶段结果、关键事件与日志入口。",
+					"展示半小时全用户订阅同步的 Star、Release、social 与 Inbox 四阶段结果、关键事件与日志入口。",
 				fields: buildFields(
 					field(
 						"触发方式",
@@ -429,6 +431,46 @@ function buildTaskDetailPageModel(
 						diagnostics
 							? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
 							: null,
+					),
+					field(
+						"Social 成功/总计",
+						diagnostics
+							? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
+							: readNumber(social, "succeeded_users") !== null &&
+									readNumber(social, "total_users") !== null
+								? `${readNumber(social, "succeeded_users")}/${readNumber(
+										social,
+										"total_users",
+									)}`
+								: null,
+					),
+					field(
+						"Social 事件写入",
+						diagnostics
+							? `${diagnostics.social.events}`
+							: readNumber(social, "events") !== null
+								? `${readNumber(social, "events")}`
+								: null,
+					),
+					field(
+						"Inbox 成功/总计",
+						diagnostics
+							? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
+							: readNumber(notifications, "succeeded_users") !== null &&
+									readNumber(notifications, "total_users") !== null
+								? `${readNumber(notifications, "succeeded_users")}/${readNumber(
+										notifications,
+										"total_users",
+									)}`
+								: null,
+					),
+					field(
+						"同步通知数",
+						diagnostics
+							? `${diagnostics.notifications.notifications}`
+							: readNumber(notifications, "notifications") !== null
+								? `${readNumber(notifications, "notifications")}`
+								: null,
 					),
 					field(
 						"写入 Release 数",

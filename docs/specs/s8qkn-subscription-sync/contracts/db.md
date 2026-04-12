@@ -139,3 +139,4 @@ Unchanged responsibility:
 
 - append-only key-event audit table for subscription sync runs
 - `release` phase events now describe attachment / shared queue outcomes rather than user fan-out writes
+- `social` / `notifications` phase failures and degradations are also written here so scheduled runs can expose partial-success diagnostics without failing the whole task

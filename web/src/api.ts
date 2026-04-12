@@ -311,6 +311,20 @@ export type AdminSyncSubscriptionsDiagnostics = {
 		failed_repos: number;
 		candidate_failures: number;
 	};
+	social: {
+		total_users: number;
+		succeeded_users: number;
+		failed_users: number;
+		repo_stars: number;
+		followers: number;
+		events: number;
+	};
+	notifications: {
+		total_users: number;
+		succeeded_users: number;
+		failed_users: number;
+		notifications: number;
+	};
 	releases_written: number;
 	critical_events: number;
 	recent_events: Array<{

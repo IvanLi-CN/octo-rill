@@ -45,6 +45,8 @@ Event payload contract:
   - `stage=star_refreshed`
   - `stage=release_attached`
   - `stage=release_summary`
+  - `stage=social_summary`
+  - `stage=notifications_summary`
 - `task.completed`
 
 ## `POST /api/sync/all`
@@ -54,7 +56,8 @@ Behavior:
 - Authenticated user only.
 - `return_mode=task_id|sse` enqueues `sync.access_refresh`.
 - `return_mode=sync` runs `sync.starred + sync.releases` inline.
-- Does not include Inbox synchronization.
+- `sync.access_refresh` covers `Star + Release + social + Inbox`.
+- `return_mode=sync` remains the legacy inline path; owner-facing Dashboard and scheduler flows use task-based sync so progress can be observed.
 
 ## `POST /api/sync/releases`
 
@@ -102,9 +105,25 @@ Result (`job_tasks.result_json`):
     "reused_fresh": 19,
     "queued": 17,
     "failed": 0
-  }
+  },
+  "social": {
+    "repo_stars": 48,
+    "followers": 19,
+    "events": 67
+  },
+  "social_error": null,
+  "notifications": {
+    "notifications": 192,
+    "since": "2026-03-06T14:20:00Z"
+  },
+  "notifications_error": null
 }
 ```
+
+Notes:
+
+- `social_error` and `notifications_error` are optional best-effort error strings.
+- A transient social / Inbox failure does not fail `sync.access_refresh`; the task still completes with the successful Star / Release data it already collected.
 
 ## `sync.subscriptions` task payload / result
 
@@ -135,6 +154,20 @@ Result (`job_tasks.result_json`):
     "failed_repos": 5,
     "candidate_failures": 7
   },
+  "social": {
+    "total_users": 11,
+    "succeeded_users": 9,
+    "failed_users": 2,
+    "repo_stars": 48,
+    "followers": 19,
+    "events": 67
+  },
+  "notifications": {
+    "total_users": 11,
+    "succeeded_users": 10,
+    "failed_users": 1,
+    "notifications": 192
+  },
   "releases_written": 1840,
   "critical_events": 6
 }
@@ -144,6 +177,9 @@ Updated semantics:
 
 - `release` summary now reflects linked shared repo release work items instead of inline repo fetch fan-out.
 - `releases_written` now represents shared release rows observed from the satisfied repo work items.
+- `social` summarizes post-release social activity refresh across all Star-succeeded users.
+- `notifications` summarizes post-release Inbox refresh across all Star-succeeded users.
+- `sync.subscriptions` still completes as a single task even when individual social / Inbox users fail; those failures are surfaced through `sync_subscription_events`, `recent_events`, and partial business outcome diagnostics.
 
 ## `GET /api/admin/jobs/realtime/{task_id}`
 
@@ -151,7 +187,7 @@ Response changes for `task_type=sync.subscriptions` remain under `diagnostics.sy
 
 Notes:
 
-- Existing admin diagnostics stay compatible.
+- Existing admin diagnostics stay compatible while adding `social` and `notifications` sections.
 - `sync.access_refresh` currently reuses generic task detail rendering.
 
 ## `GET /api/admin/jobs/realtime/{task_id}/log`
