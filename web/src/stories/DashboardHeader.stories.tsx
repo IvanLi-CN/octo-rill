@@ -1,6 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
 
+import { AppMetaFooter } from "@/layout/AppMetaFooter";
+import { AppShell } from "@/layout/AppShell";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 
 function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
@@ -148,6 +150,41 @@ export const StateGallery: Story = {
 				story:
 					"把默认、AI 未配置与紧凑宽度三种状态放进同一审阅面，便于确认品牌位独立、右侧账号入口收敛，以及窄宽度下同步/头像的排列。",
 			},
+		},
+	},
+};
+
+export const EvidenceMobileShell: Story = {
+	name: "Evidence / Mobile Shell",
+	render: (args) => (
+		<AppShell
+			header={<DashboardHeader {...args} />}
+			footer={<AppMetaFooter />}
+			mobileChrome
+		>
+			<div className="space-y-3 sm:space-y-4">
+				{Array.from({ length: 6 }, (_, index) => {
+					const blockNumber = index + 1;
+					return (
+						<section
+							key={`mobile-header-proof-${blockNumber}`}
+							className="rounded-3xl border bg-card p-5 shadow-sm"
+						>
+							<h2 className="text-base font-semibold">
+								Mobile header proof #{blockNumber}
+							</h2>
+							<p className="text-muted-foreground mt-2 text-sm">
+								用于窄屏验证页头基准态、compact 态与底部 footer auto-hide。
+							</p>
+						</section>
+					);
+				})}
+			</div>
+		</AppShell>
+	),
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };

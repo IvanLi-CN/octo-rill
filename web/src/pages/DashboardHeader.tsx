@@ -1,9 +1,17 @@
-import { LogOut, RefreshCcw, ShieldCheck, Sparkles } from "lucide-react";
+import {
+	ArrowUpRight,
+	LogOut,
+	RefreshCcw,
+	ShieldCheck,
+	Sparkles,
+} from "lucide-react";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { useAppShellChrome } from "@/layout/AppShell";
+import { cn } from "@/lib/utils";
 
 export type DashboardHeaderProps = {
 	login: string;
@@ -69,16 +77,25 @@ function DashboardUserInfoCard(props: {
 	isAdmin: boolean;
 	aiDisabledHint: boolean;
 	logoutHref: string;
+	showMobileAdminLink: boolean;
 }) {
-	const { login, name, avatarUrl, email, isAdmin, aiDisabledHint, logoutHref } =
-		props;
+	const {
+		login,
+		name,
+		avatarUrl,
+		email,
+		isAdmin,
+		aiDisabledHint,
+		logoutHref,
+		showMobileAdminLink,
+	} = props;
 	const displayName = name?.trim() || login;
 	const secondaryName =
 		name?.trim() && name.trim() !== login ? `@${login}` : null;
 
 	return (
 		<div
-			className="absolute top-full right-0 z-50 mt-2 w-64 rounded-3xl border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur dark:ring-white/10"
+			className="absolute top-full right-0 z-50 mt-2 w-[min(18rem,calc(100vw-2rem))] rounded-[1.6rem] border bg-card/98 p-4 shadow-lg ring-1 ring-black/5 backdrop-blur dark:ring-white/10 sm:w-64"
 			data-dashboard-user-card
 			role="dialog"
 			aria-label="账号信息"
@@ -130,6 +147,17 @@ function DashboardUserInfoCard(props: {
 				</p>
 			) : null}
 
+			{showMobileAdminLink ? (
+				<div className="mt-4 border-t border-border/70 pt-3 sm:hidden">
+					<Button asChild variant="ghost" className="w-full justify-start px-2">
+						<a href="/admin" data-dashboard-mobile-admin-entry="true">
+							<ArrowUpRight className="size-4" />
+							管理员面板
+						</a>
+					</Button>
+				</div>
+			) : null}
+
 			<div className="mt-4 border-t border-border/70 pt-3">
 				<Button asChild variant="ghost" className="w-full justify-start px-2">
 					<a aria-label="退出登录" href={logoutHref}>
@@ -150,9 +178,20 @@ function DashboardUserMenu(props: {
 	isAdmin: boolean;
 	aiDisabledHint: boolean;
 	logoutHref: string;
+	compactHeader: boolean;
+	showMobileAdminLink: boolean;
 }) {
-	const { login, name, avatarUrl, email, isAdmin, aiDisabledHint, logoutHref } =
-		props;
+	const {
+		login,
+		name,
+		avatarUrl,
+		email,
+		isAdmin,
+		aiDisabledHint,
+		logoutHref,
+		compactHeader,
+		showMobileAdminLink,
+	} = props;
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
 	const [hoverOpen, setHoverOpen] = useState(false);
@@ -196,7 +235,10 @@ function DashboardUserMenu(props: {
 		>
 			<button
 				type="button"
-				className="inline-flex size-9 items-center justify-center overflow-hidden rounded-full border border-border/70 bg-card shadow-sm transition hover:border-foreground/20 hover:shadow"
+				className={cn(
+					"inline-flex items-center justify-center overflow-hidden rounded-full border border-border/70 bg-card shadow-sm transition hover:border-foreground/20 hover:shadow",
+					compactHeader ? "size-8" : "size-9",
+				)}
 				aria-label="查看账号信息"
 				aria-controls={cardId}
 				aria-expanded={open}
@@ -230,6 +272,7 @@ function DashboardUserMenu(props: {
 						isAdmin={isAdmin}
 						aiDisabledHint={aiDisabledHint}
 						logoutHref={logoutHref}
+						showMobileAdminLink={showMobileAdminLink}
 					/>
 				</div>
 			) : null}
@@ -249,39 +292,84 @@ export function DashboardHeader({
 	onSyncAll,
 	logoutHref = "/auth/logout",
 }: DashboardHeaderProps) {
+	const { compactHeader, isMobileViewport, mobileChromeEnabled } =
+		useAppShellChrome();
+	const useMobileCompact =
+		mobileChromeEnabled && isMobileViewport && compactHeader;
+	const hideSubtitle = mobileChromeEnabled && isMobileViewport;
+
 	return (
-		<div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+		<div
+			className={cn(
+				"flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between",
+				useMobileCompact && "flex-row items-center justify-between gap-2",
+			)}
+			data-dashboard-header-compact={useMobileCompact ? "true" : "false"}
+		>
 			<div
-				className="flex min-w-0 flex-1 items-start gap-3"
+				className={cn(
+					"flex min-w-0 flex-1 items-start gap-3",
+					useMobileCompact && "items-center gap-2",
+				)}
 				data-dashboard-brand-block
 			>
 				<BrandLogo
 					variant="mark"
 					alt=""
 					className="shrink-0"
-					imgClassName="size-10 sm:size-11 lg:size-12"
+					imgClassName={cn(
+						"size-10 sm:size-11 lg:size-12",
+						hideSubtitle && "size-9 sm:size-11 lg:size-12",
+						useMobileCompact && "size-8 sm:size-10 lg:size-12",
+					)}
 				/>
 
-				<div className="min-w-0 space-y-1">
+				<div
+					className={cn(
+						"min-w-0",
+						useMobileCompact ? "space-y-0" : "space-y-1",
+					)}
+				>
 					<h1
-						className="min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]"
+						className={cn(
+							"min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]",
+							hideSubtitle && "text-[1.9rem] sm:text-[1.75rem]",
+							useMobileCompact && "text-[1.45rem] sm:text-[1.65rem]",
+						)}
 						data-dashboard-brand-heading
 					>
 						OctoRill
 					</h1>
 
-					<p className="text-muted-foreground text-sm font-medium leading-snug">
+<<<<<<< HEAD
+					<p
+						className={cn(
+							"text-muted-foreground text-sm font-medium leading-snug",
+							hideSubtitle && "hidden sm:block",
+							useMobileCompact && "hidden",
+						)}
+						data-dashboard-brand-subtitle
+					>
 						GitHub 动态 · 中文翻译 · 日报与 Inbox
 					</p>
 				</div>
 			</div>
 
 			<div
-				className="flex flex-wrap items-center gap-2 self-start lg:justify-end"
+				className={cn(
+					"flex items-center gap-2 self-start lg:justify-end",
+					hideSubtitle && "w-full justify-between",
+					useMobileCompact && "w-auto justify-end gap-1.5 self-auto",
+				)}
 				data-dashboard-primary-actions
 			>
-				<ThemeToggle />
-				<Button disabled={busy} onClick={onSyncAll}>
+				<ThemeToggle className={cn(useMobileCompact && "p-0.5")} />
+				<Button
+					disabled={busy}
+					onClick={onSyncAll}
+					size={hideSubtitle ? "sm" : "default"}
+					className={cn(hideSubtitle && "h-8 px-3")}
+				>
 					<RefreshCcw
 						className={syncingAll ? "size-4 animate-spin" : "size-4"}
 					/>
@@ -295,6 +383,8 @@ export function DashboardHeader({
 					isAdmin={isAdmin}
 					aiDisabledHint={aiDisabledHint}
 					logoutHref={logoutHref}
+					compactHeader={useMobileCompact}
+					showMobileAdminLink={isAdmin}
 				/>
 			</div>
 		</div>

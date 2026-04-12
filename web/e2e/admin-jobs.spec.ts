@@ -2099,14 +2099,38 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await installAdminJobsMocks(page);
 
 	await page.goto("/admin/jobs");
+	await expect(
+		page.locator("[data-app-meta-footer-hidden='false']"),
+	).toHaveCount(1);
 	await page.getByRole("tab", { name: "翻译调度" }).click({ force: true });
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
 	await expect(
 		page.getByText("release_summary · feed_body · entity 290978079"),
 	).toBeVisible();
+
+	await page.evaluate(() => window.scrollTo(0, 900));
+	await page.waitForTimeout(120);
+	await expect(
+		page.locator("[data-app-meta-footer-hidden='true']"),
+	).toHaveCount(1);
+	await expect(page.locator("[data-admin-header-compact='true']")).toHaveCount(
+		0,
+	);
+
+	await page.evaluate(() => window.scrollTo(0, 360));
+	await page.waitForTimeout(120);
+	await expect(page.locator("[data-admin-header-compact='true']")).toHaveCount(
+		1,
+	);
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByText("W4 · 请求 1 · work items 1")).toBeVisible();
+
+	await page.evaluate(() => window.scrollTo(0, 0));
+	await page.waitForTimeout(120);
+	await expect(
+		page.locator("[data-app-meta-footer-hidden='false']"),
+	).toHaveCount(1);
 });
 
 test.describe("localized admin diagnostics timestamps", () => {

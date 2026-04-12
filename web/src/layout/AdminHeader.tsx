@@ -1,6 +1,7 @@
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { useAppShellChrome } from "@/layout/AppShell";
 import { cn } from "@/lib/utils";
 import { Home, LogOut } from "lucide-react";
 
@@ -25,17 +26,53 @@ const ADMIN_NAV_ITEMS: AdminNavItem[] = [
 ];
 
 export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
+	const { compactHeader, isMobileViewport, mobileChromeEnabled } =
+		useAppShellChrome();
+	const useMobileCompact =
+		mobileChromeEnabled && isMobileViewport && compactHeader;
+
 	return (
-		<div className="flex flex-col gap-2">
-			<div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-				<div className="flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6">
-					<div className="flex flex-wrap items-center gap-2">
-						<h1 className="text-lg font-semibold tracking-tight">管理后台</h1>
-						<BrandLogo variant="wordmark" className="h-5" />
+		<div
+			className={cn("flex flex-col gap-2.5", useMobileCompact && "gap-2")}
+			data-admin-header-compact={useMobileCompact ? "true" : "false"}
+		>
+			<div
+				className={cn(
+					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
+					useMobileCompact && "gap-1.5",
+				)}
+			>
+				<div
+					className={cn(
+						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6",
+						useMobileCompact && "gap-1.5",
+					)}
+				>
+					<div className="flex min-w-0 flex-wrap items-center gap-2">
+						<h1
+							className={cn(
+								"text-lg font-semibold tracking-tight",
+								useMobileCompact && "text-base",
+							)}
+						>
+							管理后台
+						</h1>
+						<BrandLogo
+							variant="wordmark"
+							className={cn("h-5", useMobileCompact && "h-[18px]")}
+						/>
 					</div>
 
-					<nav aria-label="管理员导航">
-						<div className="flex h-8 items-center gap-4 pr-1">
+					<nav
+						aria-label="管理员导航"
+						className="-mx-1 overflow-x-auto px-1 no-scrollbar"
+					>
+						<div
+							className={cn(
+								"flex h-8 min-w-max items-center gap-4 pr-1 whitespace-nowrap",
+								useMobileCompact && "h-7 gap-3",
+							)}
+						>
 							{ADMIN_NAV_ITEMS.map((item) => {
 								const isActive = activeNav === item.key;
 								return (
@@ -45,6 +82,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 										aria-current={isActive ? "page" : undefined}
 										className={cn(
 											"text-muted-foreground relative inline-flex h-8 items-center text-sm transition-colors hover:text-foreground",
+											useMobileCompact && "h-7 text-[13px]",
 											"after:absolute after:right-0 after:bottom-0 after:left-0 after:h-0.5 after:rounded-full after:bg-transparent",
 											isActive
 												? "text-foreground font-medium after:bg-foreground"
@@ -59,17 +97,44 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					</nav>
 				</div>
 
-				<div className="flex items-center gap-2 self-start lg:self-auto">
-					<ThemeToggle />
-					<Button asChild variant="outline" size="sm" className="mr-2 h-8 px-2">
+				<div
+					className={cn(
+						"flex items-center gap-2 self-start lg:self-auto",
+						useMobileCompact && "gap-1.5",
+					)}
+				>
+					<ThemeToggle className={cn(useMobileCompact && "p-0.5")} />
+					<Button
+						asChild
+						variant="outline"
+						size="sm"
+						className={cn("mr-2 h-8 px-2", useMobileCompact && "mr-1 h-7 px-2")}
+					>
 						<a href="/" aria-label="返回前台首页" title="返回前台首页">
 							<Home className="size-4" />
 							<span>返回前台</span>
 						</a>
 					</Button>
-					<div className="flex items-center gap-1">
-						<span className="text-muted-foreground text-sm">{user.login}</span>
-						<Button asChild variant="ghost" size="icon" className="size-8">
+					<div
+						className={cn(
+							"flex items-center gap-1",
+							useMobileCompact && "gap-0.5",
+						)}
+					>
+						<span
+							className={cn(
+								"text-muted-foreground text-sm",
+								useMobileCompact && "text-xs",
+							)}
+						>
+							{user.login}
+						</span>
+						<Button
+							asChild
+							variant="ghost"
+							size="icon"
+							className={cn("size-8", useMobileCompact && "size-7")}
+						>
 							<a href="/auth/logout" aria-label="退出登录" title="退出登录">
 								<LogOut className="size-4" />
 							</a>

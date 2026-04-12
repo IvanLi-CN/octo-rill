@@ -239,7 +239,7 @@ function FeedCardLaneTabs(props: {
 	const { activeLane, isTranslating, isSmartGenerating } = props;
 
 	return (
-		<TabsList className="h-8 shrink-0 gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm">
+		<TabsList className="h-7 shrink-0 gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm sm:h-8">
 			{FEED_LANE_OPTIONS.map((option) => {
 				const Icon = option.icon;
 				const active = option.lane === activeLane;
@@ -520,8 +520,13 @@ function ReleaseFeedCard(props: {
 	const displayTitle = displayTitleForLane(item, activeLane);
 
 	const header = (
-		<CardHeader className={cn("pb-4", isVersionOnly && "pb-5")}>
-			<div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+		<CardHeader
+			className={cn(
+				"px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6",
+				isVersionOnly && "pb-4 sm:pb-5",
+			)}
+		>
+			<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
 				<div className="min-w-0">
 					<div className="flex flex-wrap items-center gap-2">
 						{item.unread ? (
@@ -540,10 +545,10 @@ function ReleaseFeedCard(props: {
 						/>
 					</div>
 
-					<CardTitle className="mt-2.5 text-balance text-lg">
+					<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
 						{displayTitle}
 					</CardTitle>
-					<p className="mt-1 font-mono text-xs text-muted-foreground">
+					<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
 						{formatIsoShortLocal(item.ts)}
 						{subtitle ? ` · ${subtitle}` : ""}
 					</p>
@@ -562,7 +567,7 @@ function ReleaseFeedCard(props: {
 						asChild
 						variant="outline"
 						size="sm"
-						className="shrink-0 font-mono text-xs"
+						className="h-8 shrink-0 px-3 font-mono text-xs"
 					>
 						<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
 							<ArrowUpRight className="size-4" />
@@ -576,7 +581,7 @@ function ReleaseFeedCard(props: {
 
 	const reactionsFooter = reactions ? (
 		<CardFooter
-			className="border-border/70 flex flex-wrap items-center gap-2.5 border-t px-6 py-4"
+			className="border-border/70 flex flex-wrap items-center gap-2 border-t px-4 py-3 sm:gap-3 sm:px-6 sm:py-4"
 			data-reaction-footer="true"
 		>
 			{reactions.status === "ready"
@@ -595,7 +600,7 @@ function ReleaseFeedCard(props: {
 									variant="outline"
 									size="icon"
 									className={cn(
-										"group relative size-9 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm",
+										"group relative size-9 overflow-visible rounded-full border p-0 shadow-xs transition-[border-color,background-color,box-shadow,opacity] duration-200 ease-out hover:shadow-sm sm:size-10",
 										active
 											? "border-primary/45 bg-primary/10 hover:bg-primary/14"
 											: "border-border/70 bg-background hover:border-foreground/15 hover:bg-accent/70",
@@ -670,7 +675,7 @@ function ReleaseFeedCard(props: {
 				>
 					{header}
 
-					<CardContent className="pt-0">
+					<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
 						<TabsContent value="original" className="mt-0">
 							<OriginalLane item={item} />
 						</TabsContent>

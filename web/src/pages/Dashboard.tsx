@@ -45,6 +45,7 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { normalizeReleaseId } from "@/lib/releaseId";
+import { cn } from "@/lib/utils";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -131,6 +132,18 @@ type ReactionTokenCheckResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const DASHBOARD_TAB_OPTIONS: Array<{
+	value: Tab;
+	mobileLabel: string;
+	desktopLabel: string;
+}> = [
+	{ value: "all", mobileLabel: "全部", desktopLabel: "全部" },
+	{ value: "releases", mobileLabel: "发布", desktopLabel: "Releases" },
+	{ value: "stars", mobileLabel: "加星", desktopLabel: "被加星" },
+	{ value: "followers", mobileLabel: "关注", desktopLabel: "被关注" },
+	{ value: "briefs", mobileLabel: "日报", desktopLabel: "日报" },
+	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "Inbox" },
+];
 
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
@@ -205,6 +218,65 @@ function itemFromKey(key: string): Pick<FeedItem, "kind" | "id"> | null {
 	const [kind, id] = key.split(":", 2);
 	if (kind !== "release" || !id) return null;
 	return { kind: "release", id };
+}
+
+function DashboardTabsList(props: { className?: string }) {
+	return (
+		<TabsList
+			className={cn(
+				"h-auto shrink-0 flex-nowrap rounded-lg bg-muted/60 p-1",
+				props.className,
+			)}
+		>
+			{DASHBOARD_TAB_OPTIONS.map((option) => (
+				<TabsTrigger
+					key={option.value}
+					value={option.value}
+					className="font-mono text-xs"
+				>
+					<span className="sm:hidden">{option.mobileLabel}</span>
+					<span className="hidden sm:inline">{option.desktopLabel}</span>
+				</TabsTrigger>
+			))}
+		</TabsList>
+	);
+}
+
+function DashboardMobileRailTabs(props: {
+	tab: Tab;
+	onSelectTab: (tab: Tab) => void;
+}) {
+	const { tab, onSelectTab } = props;
+
+	return (
+		<div
+			role="tablist"
+			aria-label="Dashboard 主导航"
+			className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-border/45 bg-muted/60 p-1 shadow-sm"
+		>
+			{DASHBOARD_TAB_OPTIONS.map((option) => {
+				const active = option.value === tab;
+				return (
+					<button
+						key={option.value}
+						type="button"
+						role="tab"
+						aria-selected={active}
+						data-state={active ? "active" : "inactive"}
+						className={cn(
+							"inline-flex h-7 items-center justify-center rounded-full px-3 font-mono text-xs whitespace-nowrap transition-all",
+							active
+								? "bg-background text-foreground shadow-sm"
+								: "text-foreground/55 hover:text-foreground",
+						)}
+						onClick={() => onSelectTab(option.value)}
+					>
+						{option.mobileLabel}
+					</button>
+				);
+			})}
+		</div>
+	);
 }
 
 function firstPendingReactionContent(
@@ -1214,7 +1286,28 @@ export function Dashboard(props: { me: MeResponse }) {
 				/>
 			}
 			notice={<VersionUpdateNotice />}
+			subheader={
+				<div data-dashboard-mobile-rail="true">
+					<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
+						<div className="flex min-w-max items-center gap-2">
+							<DashboardMobileRailTabs
+								tab={tab}
+								onSelectTab={(nextTab) => onSelectTab(nextTab)}
+							/>
+							{showPageLaneSelector ? (
+								<FeedPageLaneSelector
+									value={effectivePageDefaultLane}
+									onValueChange={onSelectPageDefaultLane}
+									className="shrink-0"
+								/>
+							) : null}
+						</div>
+					</div>
+				</div>
+			}
+			subheaderClassName="sm:hidden"
 			footer={<AppMetaFooter />}
+			mobileChrome
 		>
 			{bootError ? (
 				<p className="text-destructive mb-4 text-sm">{bootError}</p>
@@ -1223,29 +1316,10 @@ export function Dashboard(props: { me: MeResponse }) {
 			<Tabs
 				value={tab}
 				onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
-				className="gap-6"
+				className="gap-4 sm:gap-6"
 			>
-				<div className="flex flex-wrap items-center justify-between gap-2">
-					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-						<TabsTrigger value="all" className="font-mono text-xs">
-							全部
-						</TabsTrigger>
-						<TabsTrigger value="releases" className="font-mono text-xs">
-							Releases
-						</TabsTrigger>
-						<TabsTrigger value="stars" className="font-mono text-xs">
-							被加星
-						</TabsTrigger>
-						<TabsTrigger value="followers" className="font-mono text-xs">
-							被关注
-						</TabsTrigger>
-						<TabsTrigger value="briefs" className="font-mono text-xs">
-							日报
-						</TabsTrigger>
-						<TabsTrigger value="inbox" className="font-mono text-xs">
-							Inbox
-						</TabsTrigger>
-					</TabsList>
+				<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
+					<DashboardTabsList />
 
 					<div
 						className="flex items-center gap-2"
@@ -1255,6 +1329,7 @@ export function Dashboard(props: { me: MeResponse }) {
 							<FeedPageLaneSelector
 								value={effectivePageDefaultLane}
 								onValueChange={onSelectPageDefaultLane}
+								className="hidden sm:inline-flex"
 							/>
 						) : null}
 						{aiDisabledHint ? (
@@ -1280,7 +1355,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					</div>
 				</div>
 
-				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+				<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
 					<section className="min-w-0">
 						<TabsContent value="all" className="mt-0 min-w-0">
 							{renderFeedPanel("all")}
@@ -1313,7 +1388,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						</TabsContent>
 					</section>
 
-					<aside className="space-y-6">
+					<aside className="space-y-4 sm:space-y-6">
 						{tab === "briefs" ? (
 							<BriefListCard
 								briefs={briefs}

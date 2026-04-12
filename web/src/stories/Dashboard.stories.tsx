@@ -32,6 +32,7 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import { cn } from "@/lib/utils";
 import type { RepoVisual } from "@/lib/repoVisual";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
@@ -69,6 +70,18 @@ const STORYBOOK_VERSION_STATE = {
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
+const DASHBOARD_TAB_OPTIONS: Array<{
+	value: Tab;
+	mobileLabel: string;
+	desktopLabel: string;
+}> = [
+	{ value: "all", mobileLabel: "全部", desktopLabel: "全部" },
+	{ value: "releases", mobileLabel: "发布", desktopLabel: "Releases" },
+	{ value: "stars", mobileLabel: "加星", desktopLabel: "被加星" },
+	{ value: "followers", mobileLabel: "关注", desktopLabel: "被关注" },
+	{ value: "briefs", mobileLabel: "日报", desktopLabel: "日报" },
+	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "Inbox" },
+];
 
 function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -116,6 +129,65 @@ function defaultLaneForItem(
 	pageDefaultLane: FeedLane,
 ): FeedLane {
 	return resolvePreferredLaneForItem(item, pageDefaultLane);
+}
+
+function DashboardTabsList(props: { className?: string }) {
+	return (
+		<TabsList
+			className={cn(
+				"h-auto shrink-0 flex-nowrap rounded-lg bg-muted/60 p-1",
+				props.className,
+			)}
+		>
+			{DASHBOARD_TAB_OPTIONS.map((option) => (
+				<TabsTrigger
+					key={option.value}
+					value={option.value}
+					className="font-mono text-xs"
+				>
+					<span className="sm:hidden">{option.mobileLabel}</span>
+					<span className="hidden sm:inline">{option.desktopLabel}</span>
+				</TabsTrigger>
+			))}
+		</TabsList>
+	);
+}
+
+function DashboardMobileRailTabs(props: {
+	tab: Tab;
+	onSelectTab: (tab: Tab) => void;
+}) {
+	const { tab, onSelectTab } = props;
+
+	return (
+		<div
+			role="tablist"
+			aria-label="Dashboard 主导航"
+			className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-border/45 bg-muted/60 p-1 shadow-sm"
+		>
+			{DASHBOARD_TAB_OPTIONS.map((option) => {
+				const active = option.value === tab;
+				return (
+					<button
+						key={option.value}
+						type="button"
+						role="tab"
+						aria-selected={active}
+						data-state={active ? "active" : "inactive"}
+						className={cn(
+							"inline-flex h-7 items-center justify-center rounded-full px-3 font-mono text-xs whitespace-nowrap transition-all",
+							active
+								? "bg-background text-foreground shadow-sm"
+								: "text-foreground/55 hover:text-foreground",
+						)}
+						onClick={() => onSelectTab(option.value)}
+					>
+						{option.mobileLabel}
+					</button>
+				);
+			})}
+		</div>
+	);
 }
 
 function buildFeedItem(
@@ -988,34 +1060,39 @@ function DashboardPreview(props: {
 					/>
 				}
 				notice={<VersionUpdateNotice />}
+				subheader={
+					<div data-dashboard-mobile-rail="true">
+						<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
+							<div className="flex min-w-max items-center gap-2">
+								<DashboardMobileRailTabs
+									tab={tab}
+									onSelectTab={(nextTab) => setTab(nextTab)}
+								/>
+								{tab === "all" || tab === "releases" ? (
+									<FeedPageLaneSelector
+										value={effectivePageDefaultLane}
+										onValueChange={(lane) => {
+											setPageDefaultLane(lane);
+											setSelectedLaneByKey({});
+										}}
+										className="shrink-0"
+									/>
+								) : null}
+							</div>
+						</div>
+					</div>
+				}
+				subheaderClassName="sm:hidden"
 				footer={<AppMetaFooter />}
+				mobileChrome
 			>
 				<Tabs
 					value={tab}
 					onValueChange={(nextTab) => setTab(nextTab as Tab)}
-					className="gap-6"
+					className="gap-4 sm:gap-6"
 				>
-					<div className="flex flex-wrap items-center justify-between gap-2">
-						<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-							<TabsTrigger value="all" className="font-mono text-xs">
-								全部
-							</TabsTrigger>
-							<TabsTrigger value="releases" className="font-mono text-xs">
-								Releases
-							</TabsTrigger>
-							<TabsTrigger value="stars" className="font-mono text-xs">
-								被加星
-							</TabsTrigger>
-							<TabsTrigger value="followers" className="font-mono text-xs">
-								被关注
-							</TabsTrigger>
-							<TabsTrigger value="briefs" className="font-mono text-xs">
-								日报
-							</TabsTrigger>
-							<TabsTrigger value="inbox" className="font-mono text-xs">
-								Inbox
-							</TabsTrigger>
-						</TabsList>
+					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
+						<DashboardTabsList />
 						<div
 							className="flex items-center gap-2"
 							data-dashboard-secondary-controls
@@ -1027,6 +1104,7 @@ function DashboardPreview(props: {
 										setPageDefaultLane(lane);
 										setSelectedLaneByKey({});
 									}}
+									className="hidden sm:inline-flex"
 								/>
 							) : null}
 							<Button
@@ -1048,7 +1126,7 @@ function DashboardPreview(props: {
 						</div>
 					</div>
 
-					<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+					<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
 						<section className="min-w-0">
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
@@ -1081,7 +1159,7 @@ function DashboardPreview(props: {
 							</TabsContent>
 						</section>
 
-						<aside className="space-y-6">
+						<aside className="space-y-4 sm:space-y-6">
 							{tab === "briefs" ? (
 								<BriefListCard
 									briefs={storyBriefs}

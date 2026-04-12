@@ -13,7 +13,7 @@ export function FeedPageLaneSelector(props: {
 	return (
 		<fieldset
 			className={cn(
-				"inline-flex h-8 items-center gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm",
+				"inline-flex h-7 items-center gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm sm:h-8",
 				className,
 			)}
 		>
@@ -31,7 +31,7 @@ export function FeedPageLaneSelector(props: {
 						aria-pressed={active}
 						aria-label={option.label}
 						className={cn(
-							"h-7 rounded-[14px] px-3.5 text-sm font-medium shadow-none transition-all",
+							"h-6 rounded-[14px] px-2.5 text-[13px] font-medium shadow-none transition-all sm:h-7 sm:px-3.5 sm:text-sm",
 							active
 								? "border border-border/80 bg-background text-foreground shadow-[0_1px_2px_rgba(15,23,42,0.12),inset_0_1px_0_rgba(255,255,255,0.7)] hover:bg-background"
 								: "border border-transparent bg-transparent text-foreground/40 hover:text-foreground/75",

@@ -19,8 +19,9 @@ export function AdminPanel(props: {
 			header={<AdminHeader user={me.user} activeNav="users" />}
 			notice={<VersionUpdateNotice />}
 			footer={<AppMetaFooter />}
+			mobileChrome
 		>
-			<div className="space-y-4">
+			<div className="space-y-3 sm:space-y-4">
 				<p className="text-muted-foreground text-sm">
 					这是独立的管理员界面，当前包含用户管理与任务中心两个模块。
 				</p>

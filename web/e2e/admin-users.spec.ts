@@ -55,6 +55,7 @@ async function installBaseMocks(
 		isAdmin: boolean;
 		adminApiForbidden?: boolean;
 		patchMode?: "ok" | "conflict_last_admin";
+		extraUsers?: number;
 	},
 ) {
 	let currentUserIsAdmin = options.isAdmin;
@@ -86,6 +87,21 @@ async function installBaseMocks(
 			updated_at: "2026-02-25T08:00:00Z",
 		},
 	];
+	for (let index = 0; index < (options.extraUsers ?? 0); index += 1) {
+		users.push({
+			id: `extra-user-${index + 1}`,
+			github_user_id: 30 + index,
+			login: `extra-user-${index + 1}`,
+			name: `Extra User ${index + 1}`,
+			avatar_url: null,
+			email: `extra-user-${index + 1}@example.com`,
+			is_admin: false,
+			is_disabled: false,
+			last_active_at: "2026-02-26T06:00:00Z",
+			created_at: "2026-02-25T09:00:00Z",
+			updated_at: "2026-02-25T09:00:00Z",
+		});
+	}
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -354,6 +370,49 @@ test("non-admin user cannot stay on admin route", async ({ page }) => {
 	await expect(page).toHaveURL("/");
 	await expect(page.getByRole("link", { name: "管理员面板" })).toHaveCount(0);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toHaveCount(0);
+});
+
+test.describe("mobile admin shell", () => {
+	test.use({ viewport: { width: 390, height: 844 } });
+
+	test("admin panel shares the compact mobile shell without breaking navigation", async ({
+		page,
+	}) => {
+		await installBaseMocks(page, { isAdmin: true, extraUsers: 10 });
+		await page.goto("/admin");
+
+		await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
+		await expect(
+			page.getByRole("navigation", { name: "管理员导航" }),
+		).toBeVisible();
+		await expect(
+			page.locator("[data-app-meta-footer-hidden='false']"),
+		).toHaveCount(1);
+
+		await page.evaluate(() => window.scrollTo(0, 720));
+		await page.waitForTimeout(120);
+		await expect(
+			page.locator("[data-app-meta-footer-hidden='true']"),
+		).toHaveCount(1);
+		await expect(
+			page.locator("[data-admin-header-compact='true']"),
+		).toHaveCount(0);
+
+		await page.evaluate(() => window.scrollTo(0, 240));
+		await page.waitForTimeout(120);
+		await expect(
+			page.locator("[data-admin-header-compact='true']"),
+		).toHaveCount(1);
+		await expect(
+			page.getByRole("navigation", { name: "管理员导航" }),
+		).toBeVisible();
+
+		await page.evaluate(() => window.scrollTo(0, 0));
+		await page.waitForTimeout(120);
+		await expect(
+			page.locator("[data-app-meta-footer-hidden='false']"),
+		).toHaveCount(1);
+	});
 });
 
 test.describe("daily brief time formatting", () => {
