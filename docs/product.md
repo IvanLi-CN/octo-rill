@@ -1,11 +1,11 @@
 # OctoRill 产品说明
 
-OctoRill 是一个 GitHub 信息聚合与阅读界面：提供一个 **Dashboard 活动流**（类似 GitHub dashboard 的阅读体验），聚合 **Releases**、**谁给我的个人仓库加星**、**谁关注了我** 三类与“我”直接相关的动态，并用 AI 自动翻译 Release 内容为用户语言（当前默认中文）；同时提供 **Release 日报** 与 **Inbox（GitHub Notifications）** 的快捷入口。日报中的 release 主入口先在站内打开详情卡，其余外链统一跳转 GitHub。
+OctoRill 是一个面向个人 GitHub 动态的聚合与阅读界面：提供一个 **Dashboard 活动流**，集中展示 **发布更新（Releases）**、**谁给我的个人仓库加星**、**谁关注了我** 三类与“我”直接相关的动态；同时提供 **发布内容中文翻译与要点整理**、**Release 日报** 与 **Inbox（GitHub Notifications）** 的快捷入口。日报中的 release 主入口会在站内打开详情弹窗，其余外链统一跳转 GitHub。
 
 ## 核心体验
 
-- **信息流（Feed）**：在 `全部` tab 中按时间倒序混排 Releases、仓库被加星、账号被关注三类动态，并支持无限滚动加载更多。
-- **AI 自动翻译**：Release 条目会按当前可见窗口自动请求译文并缓存；AI 未配置或翻译失败时回退显示原文。
+- **信息流（Feed）**：在 `全部` tab 中按时间倒序混排发布更新、仓库被加星、账号被关注三类动态，并支持无限滚动加载更多。
+- **发布阅读模式**：Release 条目支持 `原文 / 翻译 / 智能` 三种阅读模式；发布内容可查看中文译文与要点整理，必要时再切回原文。
 - **Release 日报**：根据固定时间边界生成“昨日更新”日报，按项目分组覆盖完整 release 内容，并输出可点击链接。
 - **Inbox 快捷入口**：把 GitHub Notifications 抄一份到侧栏，提供快速跳转入口。
 - **个人社交动态**：支持查看“谁给我的个人仓库加星”“谁关注了我”，并在卡片中展示对方头像、账号与 GitHub 跳转入口。
@@ -40,7 +40,8 @@ Tab 语义：
 信息流条目包含两种：
 
 1) **Release 条目**
-- 展示：仓库名、发布版本（tag 或 release name）、发布时间、正文内容（按统一字符上限裁切后的 Markdown）、（可选）中文翻译标题与正文译文
+- 展示：仓库名、发布版本（tag 或 release name）、发布时间、正文内容（按统一字符上限裁切后的 Markdown）、（可选）中文翻译标题与正文译文 / 智能要点
+- 阅读模式：页面支持 `原文`、`翻译`、`智能` 三种 lane；默认页级模式为 `智能`，但用户可以切换为原文或翻译
 - 反馈：展示 GitHub 同款反馈表情（👍 😄 ❤️ 🎉 🚀 👀），支持查看计数；站内点按切换需要用户提供 PAT
 - 操作：点击“在 GitHub 打开”跳转到对应 Release 页面（新标签页）
 
@@ -64,9 +65,9 @@ Tab 语义：
 - 链接完整性保障：日报润色后会按 `release` 查询参数做精确 `release_id` 校验，缺失时自动补链（避免 `12/123` 前缀误判）。
 - 用途：让用户快速了解这段时间发生了什么，并能一跳查看完整上下文。
 
-### Release 详情卡（briefs 内联）
+### Release 详情弹窗（从日报或列表进入）
 
-- 入口：日报中的 release 主链接（站内链接）触发打开。
+- 入口：日报中的 release 主链接（站内链接）触发打开；详情以模态弹窗呈现，不再把正文内联插回主列。
 - 内容：
   - 默认显示完整中文翻译（支持切换原文）
   - 保留 Markdown 结构（标题、列表、代码块、表格、链接）
@@ -103,7 +104,7 @@ Tab 语义：
 ## 数据来源与同步
 
 - 登录方式：GitHub OAuth。
-- OAuth 职责：用于登录、读取和同步（Feed / Notifications / Starred / Releases）。
+- OAuth 职责：用于登录、读取和同步（Feed / Notifications / Starred / Releases / Followers / owned repo stargazers）。
 - OAuth scope：采用最小授权策略（不包含用于站内反馈写操作的额外 scope）。
 - Release 反馈写操作：使用用户提供的 GitHub PAT（Personal Access Token），与 OAuth 通道分离。
   - Fine-grained PAT：按 GitHub Reactions 接口可不额外申请 repository permissions，但 token 必须覆盖目标仓库。

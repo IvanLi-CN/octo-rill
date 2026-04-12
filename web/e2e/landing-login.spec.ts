@@ -60,17 +60,19 @@ test("landing page shows concise login copy for unauthenticated users", async ({
 	await expect(loginButton).toHaveAttribute("href", "/auth/github/login");
 	await expect(
 		page.getByRole("heading", {
-			name: "把和你有关的 GitHub 动态放到一个首页里",
+			name: "集中查看与你相关的 GitHub 动态",
 		}),
 	).toBeVisible();
 	await expect(
 		page.getByText(
-			"这里集中看 Releases、被加星、被关注和 Inbox；Release 默认提供中文翻译。",
+			"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。",
 		),
 	).toBeVisible();
-	await expect(page.getByText("Releases 信息流")).toBeVisible();
-	await expect(page.getByText("被加星 / 被关注")).toBeVisible();
-	await expect(page.getByText("日报 + Inbox 入口")).toBeVisible();
+	await expect(page.getByText("发布更新", { exact: true })).toBeVisible();
+	await expect(page.getByText("社交动态", { exact: true })).toBeVisible();
+	await expect(page.getByText("日报通知", { exact: true })).toBeVisible();
+	await expect(page.getByText("查看发布译文与要点")).toBeVisible();
+	await expect(page.getByText("查看获星与关注变化")).toBeVisible();
 	await expect(page.getByText(TECH_HINT_PATTERN)).toHaveCount(0);
 	await expect(page.getByText(LEGACY_COPY_PATTERN)).toHaveCount(0);
 });

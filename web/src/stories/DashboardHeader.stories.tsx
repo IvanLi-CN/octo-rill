@@ -91,7 +91,7 @@ export const Default: Story = {
 			canvas.getByRole("heading", { name: "OctoRill" }),
 		).toBeVisible();
 		await expect(
-			canvas.getByText("GitHub 信息流 · AI 中文翻译 · Inbox 工作台"),
+			canvas.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
 		).toBeVisible();
 		await expect(canvas.getByRole("group", { name: "主题模式" })).toBeVisible();
 		await expect(canvas.queryByText(/Logged in as/)).not.toBeInTheDocument();
@@ -111,7 +111,7 @@ export const Default: Story = {
 		docs: {
 			description: {
 				story:
-					"默认状态：品牌位先展示 OctoRill 与产品定位；右侧只显示同步与头像入口，账号详情与退出登录收进头像浮层。",
+					"默认状态：品牌位先展示 OctoRill 与面向前台用户的核心能力概括；右侧只显示同步与头像入口，账号详情与退出登录收进头像浮层。",
 			},
 		},
 	},
