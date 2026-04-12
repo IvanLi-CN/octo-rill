@@ -1,6 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
+import { Inbox, Package2, Users } from "lucide-react";
 import {
 	Card,
 	CardContent,
@@ -16,117 +17,107 @@ type LandingProps = {
 	bootError?: string | null;
 };
 
+const heroTitle = "集中查看与你相关的 GitHub 动态";
+const heroDescription =
+	"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。";
+const loginCardDescription =
+	"连接后即可同步你的 GitHub 动态，并在站内查看译文、日报与通知。";
+
 const heroHighlights = [
 	{
-		title: "Release Feed",
-		description: "把 starred 仓库的更新整理成更适合连续阅读的信息流。",
+		title: "发布更新",
+		description: "查看发布译文与要点",
+		icon: Package2,
 	},
 	{
-		title: "AI 中文翻译",
-		description: "自动生成中文摘要，先快速理解，再决定是否回到原文。",
+		title: "社交动态",
+		description: "查看获星与关注变化",
+		icon: Users,
 	},
 	{
-		title: "Inbox 工作台",
-		description: "把日报、通知和待处理入口收进同一个首页起点。",
+		title: "日报通知",
+		description: "查看日报与通知入口",
+		icon: Inbox,
 	},
 ] as const;
 
 export function Landing({ bootError }: LandingProps) {
 	return (
 		<AppShell notice={<VersionUpdateNotice />} footer={<AppMetaFooter />}>
-			<div className="mx-auto max-w-6xl py-4 sm:py-8">
-				<div className="mb-4 flex items-center justify-end sm:mb-6">
+			<div className="mx-auto max-w-6xl py-2 sm:py-4">
+				<div className="mb-4 flex items-center justify-between gap-4 sm:mb-6">
+					<BrandLogo variant="wordmark" className="h-8 sm:h-10" />
 					<ThemeToggle />
 				</div>
 
-				<div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-start xl:grid-cols-[minmax(0,1fr)_400px] xl:gap-10">
-					<section className="space-y-6">
-						<div className="rounded-[32px] border border-[#E4DACB] bg-[linear-gradient(135deg,rgba(255,255,255,0.96),rgba(255,248,238,0.96),rgba(246,239,229,0.92))] p-6 shadow-[0_20px_50px_rgba(40,28,12,0.06)] dark:border-[#2d3645] dark:bg-[linear-gradient(135deg,rgba(20,27,37,0.96),rgba(14,20,31,0.98),rgba(9,13,21,0.98))] dark:shadow-[0_24px_60px_rgba(2,6,23,0.45)] sm:p-8">
-							<div className="flex flex-col gap-8">
-								<div className="inline-flex w-fit flex-col gap-3 rounded-[28px] bg-white/92 px-5 py-5 shadow-sm shadow-black/5 ring-1 ring-[#E9DECF] dark:bg-[#131926]/92 dark:ring-[#344055] dark:shadow-[0_12px_35px_rgba(2,6,23,0.35)]">
-									<BrandLogo variant="wordmark" className="h-10 sm:h-11" />
-									<p className="text-muted-foreground text-sm font-medium sm:text-base">
-										GitHub 信息流 · AI 中文翻译 · Inbox 工作台
-									</p>
-								</div>
-
-								<div className="max-w-3xl space-y-4">
-									<div className="inline-flex items-center rounded-full border border-[#E5D9C7] bg-white/70 px-3 py-1 text-sm font-medium text-[#6B5C4A] dark:border-[#334155] dark:bg-[#111827]/70 dark:text-[#dbe7ff]">
-										为 GitHub Release 阅读而生
-									</div>
-									<h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-5xl lg:text-6xl">
-										把 GitHub 的更新变成可读的信息流
+				<div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-center xl:grid-cols-[minmax(0,1fr)_392px] xl:gap-8">
+					<section className="order-2 lg:order-1">
+						<div className="rounded-[32px] border border-border/70 bg-[linear-gradient(180deg,color-mix(in_oklab,var(--color-card)_92%,transparent),color-mix(in_oklab,var(--color-card)_72%,transparent))] p-6 shadow-[0_20px_50px_rgba(15,23,42,0.07)] dark:shadow-[0_28px_60px_rgba(2,6,23,0.42)] sm:p-8 lg:p-10">
+							<div className="max-w-3xl space-y-6">
+								<div className="space-y-4">
+									<h1 className="max-w-3xl text-balance text-4xl font-semibold tracking-tight sm:text-5xl lg:text-6xl">
+										{heroTitle}
 									</h1>
-									<p className="text-muted-foreground max-w-2xl text-pretty text-lg leading-relaxed">
-										Releases 信息流（无限滚动），AI 自动翻译成中文；并提供“昨日
-										Release 日报”和 Inbox 快捷入口。需要操作时，直接跳回
-										GitHub。
+									<p className="text-muted-foreground max-w-2xl text-pretty text-base leading-7 sm:text-lg">
+										{heroDescription}
 									</p>
 								</div>
 
-								<div className="grid gap-3 sm:grid-cols-3">
-									{heroHighlights.map((item) => (
-										<div
-											key={item.title}
-											className="rounded-[24px] border border-[#E8DDCF] bg-white/72 px-4 py-4 shadow-sm shadow-black/5 dark:border-[#344055] dark:bg-[#121926]/78 dark:shadow-[0_12px_32px_rgba(2,6,23,0.35)]"
-										>
-											<p className="text-base font-semibold text-[#3A3329] dark:text-[#f8fafc]">
-												{item.title}
-											</p>
-											<p className="text-muted-foreground mt-2 text-sm leading-relaxed">
-												{item.description}
-											</p>
-										</div>
-									))}
-								</div>
+								<ul className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
+									{heroHighlights.map(
+										({ title, description, icon: Icon }, index) => (
+											<li
+												key={title}
+												className="flex min-h-32 flex-col rounded-2xl border border-border/70 bg-background/72 px-5 py-5 shadow-sm"
+											>
+												<div className="mb-5 flex items-center justify-between gap-3">
+													<span className="text-muted-foreground font-mono text-xs leading-6">
+														0{index + 1}
+													</span>
+													<Icon className="text-muted-foreground size-4" />
+												</div>
+												<div className="space-y-2">
+													<p className="text-lg font-semibold tracking-tight">
+														{title}
+													</p>
+													<p className="text-muted-foreground text-sm leading-6">
+														{description}
+													</p>
+												</div>
+											</li>
+										),
+									)}
+								</ul>
 							</div>
 						</div>
 					</section>
 
-					<aside className="lg:pt-4">
-						<Card className="rounded-[32px] border-[#E4DACB] bg-card/95 shadow-[0_18px_45px_rgba(40,28,12,0.08)] dark:border-[#2d3645] dark:bg-card/96 dark:shadow-[0_24px_55px_rgba(2,6,23,0.42)]">
-							<CardHeader className="gap-4 p-7">
-								<div className="inline-flex w-fit items-center rounded-full bg-[#FFF3E3] px-3 py-1 text-xs font-semibold tracking-[0.18em] text-[#7A6247] uppercase dark:bg-[#1e293b] dark:text-[#f7d9a8]">
-									Start here
-								</div>
+					<aside className="order-1 lg:order-2">
+						<Card
+							className="rounded-[28px] border-border/70 bg-card/96 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:shadow-[0_24px_55px_rgba(2,6,23,0.4)]"
+							data-landing-login-card
+						>
+							<CardHeader className="gap-3 px-5 pt-5 pb-0 sm:px-6 sm:pt-6">
 								<div className="space-y-2">
-									<CardTitle className="text-3xl">登录</CardTitle>
-									<CardDescription className="text-base leading-relaxed">
-										通过 GitHub OAuth 登录后，OctoRill 才能同步你的 starred 与
-										inbox，并把你真正关心的更新带进首页。
+									<CardTitle className="text-2xl sm:text-[2rem]">
+										连接到 GitHub
+									</CardTitle>
+									<CardDescription className="text-sm leading-6 sm:text-base">
+										{loginCardDescription}
 									</CardDescription>
 								</div>
 							</CardHeader>
-							<CardContent className="flex flex-col gap-4 p-7 pt-0">
-								<div className="grid gap-3">
-									<div className="rounded-2xl border border-[#E8DDCF] bg-[#FFF8EE] px-4 py-3 dark:border-[#344055] dark:bg-[#172030]">
-										<p className="text-sm font-semibold text-[#3A3329] dark:text-[#f8fafc]">
-											同步 starred 与 inbox
-										</p>
-										<p className="text-muted-foreground mt-1 text-sm leading-relaxed">
-											自动聚合你已经关注的仓库和通知，不需要重新组织信息源。
-										</p>
-									</div>
-									<div className="rounded-2xl border border-[#D9E7DE] bg-[#F2FBF7] px-4 py-3 dark:border-[#28463d] dark:bg-[#11221f]">
-										<p className="text-sm font-semibold text-[#3A3329] dark:text-[#f8fafc]">
-											仍然回到 GitHub 操作
-										</p>
-										<p className="text-muted-foreground mt-1 text-sm leading-relaxed">
-											阅读、筛选和理解在这里完成；真正的点赞、评论和 Issue
-											仍然回到原生页面。
-										</p>
-									</div>
-								</div>
-
+							<CardContent className="flex flex-col gap-3 px-5 pt-5 pb-5 sm:px-6 sm:pb-6">
 								<Button
 									asChild
-									className="h-14 w-full rounded-2xl text-base font-semibold"
+									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
+									data-landing-login-cta
 								>
-									<a href="/auth/github/login">使用 GitHub 登录</a>
+									<a href="/auth/github/login">连接到 GitHub</a>
 								</Button>
 
 								{bootError ? (
-									<div className="rounded-2xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+									<div className="rounded-2xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm leading-6 text-destructive">
 										{bootError}
 									</div>
 								) : null}
