@@ -262,6 +262,35 @@ function makeMockFeed(): FeedItem[] {
 	];
 }
 
+function makeReactionCompactFeed(): FeedItem[] {
+	return makeMockFeed().map((item, index) =>
+		item.kind === "release" && index === 0
+			? {
+					...item,
+					reactions: {
+						counts: {
+							plus1: 2,
+							laugh: 1,
+							heart: 3,
+							hooray: 1,
+							rocket: 2,
+							eyes: 0,
+						},
+						viewer: {
+							plus1: true,
+							laugh: false,
+							heart: false,
+							hooray: false,
+							rocket: false,
+							eyes: false,
+						},
+						status: "ready",
+					},
+				}
+			: item,
+	);
+}
+
 function buildRepoStarItem(
 	id: string,
 	overrides?: Partial<SocialFeedItem>,
@@ -1580,6 +1609,85 @@ export const PatDialogOpen: Story = {
 			description: {
 				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
 			},
+		},
+	},
+};
+
+export const ReactionCompact: Story = {
+	render: () => (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={makeReactionCompactFeed()}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Release 底部反馈区轻微收紧：按钮收敛到 36px、图标约 18px、badge 同步下调并保持外置，不再像上一版那样过于抢眼。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("button", { name: "赞 2" })).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "关注" })).toBeVisible();
+		const reactionFooter = canvasElement.querySelector<HTMLElement>(
+			'[data-reaction-footer="true"]',
+		);
+		expect(reactionFooter).not.toBeNull();
+		if (!reactionFooter) {
+			throw new Error("Expected reaction footer to exist");
+		}
+
+		const plusOneButton = reactionFooter.querySelector<HTMLButtonElement>(
+			'[data-reaction-trigger="plus1"]',
+		);
+		const plusOneBadge = reactionFooter.querySelector<HTMLElement>(
+			'[data-reaction-count-badge="plus1"]',
+		);
+		const plusOneIcon = reactionFooter.querySelector<HTMLImageElement>(
+			'[data-reaction-icon="plus1"]',
+		);
+		const eyesBadge = reactionFooter.querySelector(
+			'[data-reaction-count-badge="eyes"]',
+		);
+		expect(plusOneButton).not.toBeNull();
+		expect(plusOneBadge).not.toBeNull();
+		expect(plusOneIcon).not.toBeNull();
+		expect(eyesBadge).toBeNull();
+		if (!plusOneButton || !plusOneBadge || !plusOneIcon) {
+			throw new Error("Expected compact reaction button, badge, and icon");
+		}
+
+		const buttonRect = plusOneButton.getBoundingClientRect();
+		const badgeRect = plusOneBadge.getBoundingClientRect();
+		const iconRect = plusOneIcon.getBoundingClientRect();
+		expect(buttonRect.width).toBeGreaterThanOrEqual(35);
+		expect(buttonRect.width).toBeLessThanOrEqual(37);
+		expect(buttonRect.height).toBeGreaterThanOrEqual(35);
+		expect(buttonRect.height).toBeLessThanOrEqual(37);
+		expect(Math.abs(buttonRect.width - buttonRect.height)).toBeLessThanOrEqual(
+			1,
+		);
+		expect(iconRect.width).toBeGreaterThanOrEqual(17);
+		expect(iconRect.width).toBeLessThanOrEqual(19);
+		expect(iconRect.height).toBeGreaterThanOrEqual(17);
+		expect(iconRect.height).toBeLessThanOrEqual(19);
+		expect(badgeRect.height).toBeGreaterThanOrEqual(17);
+		expect(badgeRect.height).toBeLessThanOrEqual(19.5);
+		expect(badgeRect.width).toBeLessThanOrEqual(24);
+		expect(badgeRect.right).toBeGreaterThan(buttonRect.right);
+		expect(badgeRect.top).toBeLessThan(buttonRect.top + 2);
+	},
+};
+
+export const EvidenceReactionCompact: Story = {
+	name: "Evidence / Reaction Compact",
+	render: ReactionCompact.render,
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };
