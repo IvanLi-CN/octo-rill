@@ -70,7 +70,7 @@
 | 67n8t | 全库主键 NanoID 化与公开标识收口 | 已完成 | `67n8t-nanoid-primary-keys/SPEC.md` | 2026-03-08 | PR #29; checks green; review-loop clear; destructive SQLite rebuild |
 | 35r55 | 统一翻译调度器与独立管理界面改造 | 已完成 | `35r55-translation-scheduler/SPEC.md` | 2026-03-27 | PR #38; unified request scheduler + stale runtime recovery completed |
 | gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
-| s8qkn | 全局 Repo Release 复用与访问触发增量同步 | 已完成 | `s8qkn-subscription-sync/SPEC.md` | 2026-03-28 | PR #41; shared repo release cache + access refresh + staged dashboard sync |
+| s8qkn | 全局 Repo Release 复用与访问触发增量同步 | 已完成 | `s8qkn-subscription-sync/SPEC.md` | 2026-04-12 | PR #41; shared repo release cache + access refresh + scheduler social/inbox sync |
 | dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-08 | PR #25; dashboard/browser-timezone timestamp follow-up synced; Playwright merge-gate evidence aligned |
 | x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-03-03 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health |
 | 9vb46 | 管理员任务中心刷新闪烁修复 | 已完成 | `9vb46-admin-jobs-refresh-flicker-fix/SPEC.md` | 2026-03-07 | PR #23、PR #26；已补齐首载后筛选复载不闪烁，且后台刷新期间旧行交互已禁用 |
