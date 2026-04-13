@@ -5250,7 +5250,8 @@ fn feed_item_from_row(
             if let Some(status) = r.detail_trans_status.as_deref()
                 && status != "ready"
             {
-                if matches!(status, "missing" | "error")
+                if !body_truncated
+                    && matches!(status, "missing" | "error")
                     && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
                     && r.trans_status.as_deref() == Some("ready")
                 {
@@ -13107,6 +13108,45 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("旧译文标题"));
         assert_eq!(translated.summary.as_deref(), Some("- 旧译文"));
+    }
+
+    #[test]
+    fn feed_item_from_row_does_not_fall_back_to_legacy_ready_translation_when_truncated_detail_failed()
+     {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.6".to_owned());
+        row.release_body = Some("a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 1));
+        let body = release_feed_body(row.release_body.as_deref()).expect("release body");
+        let source = format!(
+            "v=5
+kind=release
+repo={}
+title={}
+body={}
+",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            body,
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("ready".to_owned());
+        row.trans_title = Some("旧译文标题".to_owned());
+        row.trans_summary = Some("- 旧译文".to_owned());
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("error".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert!(item.body_truncated);
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
     }
 
     #[test]
