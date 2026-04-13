@@ -415,7 +415,7 @@ export type AdminLlmSchedulerStatusResponse = {
 };
 export type AdminLlmRuntimeConfigUpdateRequest = {
 	max_concurrency: number;
-	ai_model_context_limit: number | null;
+	ai_model_context_limit?: number | null;
 };
 export type AdminLlmCallItem = {
 	id: string;

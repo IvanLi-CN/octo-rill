@@ -1040,10 +1040,15 @@ function AdminJobsPreview({
 					max_concurrency?: number;
 					ai_model_context_limit?: number | null;
 				};
-				const aiModelContextLimit =
-					typeof body.ai_model_context_limit === "number"
+				const hasModelContextLimit = Object.hasOwn(
+					body,
+					"ai_model_context_limit",
+				);
+				const aiModelContextLimit = hasModelContextLimit
+					? typeof body.ai_model_context_limit === "number"
 						? Number(body.ai_model_context_limit)
-						: null;
+						: null
+					: llmSchedulerStatus.ai_model_context_limit;
 				llmSchedulerStatus = {
 					...llmSchedulerStatus,
 					max_concurrency: Number(body.max_concurrency ?? 1),

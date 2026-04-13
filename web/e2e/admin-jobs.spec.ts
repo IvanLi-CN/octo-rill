@@ -1210,10 +1210,15 @@ async function installAdminJobsMocks(
 				ai_model_context_limit?: number | null;
 			};
 			const maxConcurrency = Number(body.max_concurrency ?? 1);
-			const aiModelContextLimit =
-				typeof body.ai_model_context_limit === "number"
+			const hasModelContextLimit = Object.hasOwn(
+				body,
+				"ai_model_context_limit",
+			);
+			const aiModelContextLimit = hasModelContextLimit
+				? typeof body.ai_model_context_limit === "number"
 					? Number(body.ai_model_context_limit)
-					: null;
+					: null
+				: llmSchedulerStatus.ai_model_context_limit;
 			llmSchedulerStatus = {
 				...llmSchedulerStatus,
 				max_concurrency: maxConcurrency,

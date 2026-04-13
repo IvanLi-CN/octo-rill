@@ -9,7 +9,7 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -2245,7 +2245,8 @@ pub struct AdminLlmSchedulerStatusResponse {
 #[derive(Debug, Deserialize)]
 pub struct AdminLlmRuntimeConfigUpdateRequest {
     max_concurrency: i64,
-    ai_model_context_limit: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_optional_nullable_i64")]
+    ai_model_context_limit: Option<Option<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2420,11 +2421,14 @@ pub async fn admin_patch_llm_runtime_config(
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
     let ai_model_context_limit = match req.ai_model_context_limit {
-        Some(value) => Some(parse_positive_runtime_limit(
+        Some(Some(value)) => Some(parse_positive_runtime_limit(
             value,
             "ai_model_context_limit",
         )?),
-        None => None,
+        Some(None) => None,
+        None => admin_runtime::load_ai_model_context_limit(&state.pool)
+            .await
+            .map_err(ApiError::internal)?,
     };
     admin_runtime::update_llm_runtime_settings(
         &state.pool,
@@ -2535,6 +2539,15 @@ fn parse_positive_runtime_limit(value: i64, field: &str) -> Result<u32, ApiError
         )));
     }
     Ok(parsed)
+}
+
+fn deserialize_optional_nullable_i64<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i64>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::<i64>::deserialize(deserializer)?))
 }
 
 struct AdminLlmCallListScope<'a> {
@@ -6696,8 +6709,15 @@ fn estimate_release_batch_candidate_tokens(item: &ReleaseBatchCandidate) -> u32 
         .saturating_add(48)
 }
 
-fn release_candidate_can_batch(item: &ReleaseBatchCandidate, chunk_char_budget: usize) -> bool {
+fn release_candidate_can_batch(
+    item: &ReleaseBatchCandidate,
+    chunk_char_budget: usize,
+    batch_input_budget: u32,
+) -> bool {
     split_markdown_chunks(item.body.as_str(), chunk_char_budget).len() <= 1
+        && estimate_release_batch_candidate_tokens(item)
+            .saturating_add(RELEASE_BATCH_OVERHEAD_TOKENS)
+            <= batch_input_budget
 }
 
 async fn translate_pending_release_batch_candidates(
@@ -6709,25 +6729,26 @@ async fn translate_pending_release_batch_candidates(
         return Ok(Vec::new());
     }
 
+    let batch_budget = ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_TOKENS).await;
     let chunk_budget = release_detail_chunk_budget(state).await;
     let mut batchable = Vec::new();
     let mut fallback = HashMap::<i64, ReleaseBatchCandidate>::new();
     for candidate in pending {
-        if release_candidate_can_batch(candidate, chunk_budget.max_chars) {
+        if release_candidate_can_batch(candidate, chunk_budget.max_chars, batch_budget.input_budget)
+        {
             batchable.push(candidate.clone());
         } else {
             fallback.insert(candidate.release_id, candidate.clone());
         }
     }
 
-    let budget_info = ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_TOKENS).await;
     let estimated = batchable
         .iter()
         .map(estimate_release_batch_candidate_tokens)
         .collect::<Vec<_>>();
     let groups = ai::pack_batch_indices(
         &estimated,
-        budget_info.input_budget,
+        batch_budget.input_budget,
         RELEASE_BATCH_OVERHEAD_TOKENS,
     );
     if !batchable.is_empty() {
@@ -6739,9 +6760,9 @@ async fn translate_pending_release_batch_candidates(
             estimated_tokens,
             split_count,
             saved_calls,
-            fallback_source = budget_info.fallback_source,
-            input_budget = budget_info.input_budget,
-            model_input_limit = budget_info.model_input_limit,
+            fallback_source = batch_budget.fallback_source,
+            input_budget = batch_budget.input_budget,
+            model_input_limit = batch_budget.model_input_limit,
             "release detail batch plan"
         );
     }
@@ -9673,23 +9694,24 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 mod tests {
     use super::{
         ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallListScope,
-        AdminLlmCallsQuery, AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery,
-        AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
-        AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow, GitHubCompareCommit,
-        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
+        AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest, AdminRealtimeTaskDetailItem,
+        AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow,
+        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
+        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
-        admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
-        ai_error_is_non_retryable, brief_contains_release_link, build_compare_digest,
-        build_task_diagnostics, ensure_account_enabled, execute_sync_all_sync_with,
-        extract_translation_fields, feed_item_from_row, get_release_detail,
-        github_access_restricted_error, github_graphql_errors_to_api_error,
-        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
-        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
-        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
+        admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
+        brief_contains_release_link, build_compare_digest, build_task_diagnostics,
+        ensure_account_enabled, execute_sync_all_sync_with, extract_translation_fields,
+        feed_item_from_row, get_release_detail, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_feed, list_releases, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -12089,6 +12111,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_patch_llm_runtime_config_preserves_saved_model_limit_when_field_is_omitted() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        let now = "2026-03-28T11:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              ai_model_context_limit,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 4, 65536, 3, 1, ?, ?)
+            "#,
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+        let resp = admin_patch_llm_runtime_config(
+            State(state),
+            session,
+            Json(AdminLlmRuntimeConfigUpdateRequest {
+                max_concurrency: 2,
+                ai_model_context_limit: None,
+            }),
+        )
+        .await
+        .expect("patch runtime settings")
+        .0;
+
+        assert_eq!(resp.max_concurrency, 2);
+        assert_eq!(resp.ai_model_context_limit, Some(65_536));
+        assert_eq!(resp.effective_model_input_limit, 65_536);
+        assert_eq!(resp.effective_model_input_limit_source, "admin_override");
+    }
+
+    #[tokio::test]
     async fn migration_backfills_earliest_user_as_admin() {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
@@ -13839,6 +13910,116 @@ line two",
         .await
         .expect("count release feed cache entries");
         assert_eq!(release_cache_count, 0);
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_skips_batch_calls_that_exceed_batch_budget() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            INSERT INTO admin_runtime_settings (
+              id,
+              llm_max_concurrency,
+              ai_model_context_limit,
+              translation_general_worker_concurrency,
+              translation_dedicated_worker_concurrency,
+              created_at,
+              updated_at
+            )
+            VALUES (1, 1, 2048, 3, 1, '2026-03-28T11:00:00Z', '2026-03-28T11:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert runtime settings");
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?
+            WHERE release_id = ?
+            "#,
+        )
+        .bind("a".repeat(1_200))
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update release body");
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let detail_chunk_calls = Arc::new(AtomicUsize::new(0));
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_detail_chunk_calls = Arc::clone(&detail_chunk_calls);
+        let route_title_calls = Arc::clone(&title_calls);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_detail_chunk_calls = Arc::clone(&route_detail_chunk_calls);
+                let route_title_calls = Arc::clone(&route_title_calls);
+                async move {
+                    let system_prompt = payload["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let user_prompt = payload["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let content = if system_prompt.contains("批量翻译助手")
+                        && user_prompt.contains("release_id:")
+                    {
+                        route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            Json(json!({"error": "batch should not be used"})),
+                        );
+                    } else if system_prompt.contains("只把 GitHub Release 标题翻译成自然中文")
+                    {
+                        route_title_calls.fetch_add(1, Ordering::SeqCst);
+                        "版本 v1.2.3".to_owned()
+                    } else {
+                        route_detail_chunk_calls.fetch_add(1, Ordering::SeqCst);
+                        user_prompt
+                            .split("Release notes chunk (Markdown):\n")
+                            .nth(1)
+                            .and_then(|rest| rest.split("\n\n请把这段 GitHub Release notes").next())
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    let response = serde_json::json!({
+                        "choices": [{"message": {"content": content}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool, base_url);
+
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+                .await
+                .expect("translate release batch");
+
+        let expected_body = "a".repeat(1_200);
+        assert_eq!(translated.items.len(), 1);
+        assert_eq!(translated.items[0].status, "ready");
+        assert_eq!(translated.items[0].title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(
+            translated.items[0].summary.as_deref(),
+            Some(expected_body.as_str())
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert!(detail_chunk_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(title_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
