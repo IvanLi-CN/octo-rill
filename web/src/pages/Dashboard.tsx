@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import {
@@ -45,7 +45,11 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { normalizeReleaseId } from "@/lib/releaseId";
-import { cn } from "@/lib/utils";
+import {
+	DashboardMobileControlBand,
+	type DashboardTab as Tab,
+	DashboardTabsList,
+} from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -54,8 +58,6 @@ import {
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
-
-type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 
 type TaskAcceptedResponse = {
 	mode: "task_id";
@@ -132,19 +134,6 @@ type ReactionTokenCheckResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
-const DASHBOARD_TAB_OPTIONS: Array<{
-	value: Tab;
-	mobileLabel: string;
-	desktopLabel: string;
-}> = [
-	{ value: "all", mobileLabel: "全部", desktopLabel: "全部" },
-	{ value: "releases", mobileLabel: "发布", desktopLabel: "Releases" },
-	{ value: "stars", mobileLabel: "加星", desktopLabel: "被加星" },
-	{ value: "followers", mobileLabel: "关注", desktopLabel: "被关注" },
-	{ value: "briefs", mobileLabel: "日报", desktopLabel: "日报" },
-	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "Inbox" },
-];
-
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -219,66 +208,6 @@ function itemFromKey(key: string): Pick<FeedItem, "kind" | "id"> | null {
 	if (kind !== "release" || !id) return null;
 	return { kind: "release", id };
 }
-
-function DashboardTabsList(props: { className?: string }) {
-	return (
-		<TabsList
-			className={cn(
-				"h-auto shrink-0 flex-nowrap rounded-lg bg-muted/60 p-1",
-				props.className,
-			)}
-		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => (
-				<TabsTrigger
-					key={option.value}
-					value={option.value}
-					className="font-mono text-xs"
-				>
-					<span className="sm:hidden">{option.mobileLabel}</span>
-					<span className="hidden sm:inline">{option.desktopLabel}</span>
-				</TabsTrigger>
-			))}
-		</TabsList>
-	);
-}
-
-function DashboardMobileRailTabs(props: {
-	tab: Tab;
-	onSelectTab: (tab: Tab) => void;
-}) {
-	const { tab, onSelectTab } = props;
-
-	return (
-		<div
-			role="tablist"
-			aria-label="Dashboard 主导航"
-			className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-border/45 bg-muted/60 p-1 shadow-sm"
-		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => {
-				const active = option.value === tab;
-				return (
-					<button
-						key={option.value}
-						type="button"
-						role="tab"
-						aria-selected={active}
-						data-state={active ? "active" : "inactive"}
-						className={cn(
-							"inline-flex h-7 items-center justify-center rounded-full px-3 font-mono text-xs whitespace-nowrap transition-all",
-							active
-								? "bg-background text-foreground shadow-sm"
-								: "text-foreground/55 hover:text-foreground",
-						)}
-						onClick={() => onSelectTab(option.value)}
-					>
-						{option.mobileLabel}
-					</button>
-				);
-			})}
-		</div>
-	);
-}
-
 function firstPendingReactionContent(
 	server: ReleaseReactions,
 	desired: ReleaseReactions,
@@ -1283,29 +1212,19 @@ export function Dashboard(props: { me: MeResponse }) {
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
 					onSyncAll={onSyncAll}
+					mobileControlBand={
+						<DashboardMobileControlBand
+							tab={tab}
+							onSelectTab={(nextTab) => onSelectTab(nextTab)}
+							showPageLaneSelector={showPageLaneSelector}
+							pageLane={effectivePageDefaultLane}
+							onSelectPageLane={onSelectPageDefaultLane}
+							layout="stacked"
+						/>
+					}
 				/>
 			}
 			notice={<VersionUpdateNotice />}
-			subheader={
-				<div data-dashboard-mobile-rail="true">
-					<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
-						<div className="flex min-w-max items-center gap-2">
-							<DashboardMobileRailTabs
-								tab={tab}
-								onSelectTab={(nextTab) => onSelectTab(nextTab)}
-							/>
-							{showPageLaneSelector ? (
-								<FeedPageLaneSelector
-									value={effectivePageDefaultLane}
-									onValueChange={onSelectPageDefaultLane}
-									className="shrink-0"
-								/>
-							) : null}
-						</div>
-					</div>
-				</div>
-			}
-			subheaderClassName="sm:hidden"
 			footer={<AppMetaFooter />}
 			mobileChrome
 		>

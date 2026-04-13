@@ -396,13 +396,13 @@ test.describe("mobile admin shell", () => {
 		).toHaveCount(1);
 		await expect(
 			page.locator("[data-admin-header-compact='true']"),
-		).toHaveCount(0);
+		).toHaveCount(1);
 
 		await page.evaluate(() => window.scrollTo(0, 240));
 		await page.waitForTimeout(120);
 		await expect(
 			page.locator("[data-admin-header-compact='true']"),
-		).toHaveCount(1);
+		).toHaveCount(0);
 		await expect(
 			page.getByRole("navigation", { name: "管理员导航" }),
 		).toBeVisible();

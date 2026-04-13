@@ -33,25 +33,28 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 
 	return (
 		<div
-			className={cn("flex flex-col gap-2.5", useMobileCompact && "gap-2")}
+			className={cn(
+				"flex flex-col gap-2.5 motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+				useMobileCompact && "gap-2",
+			)}
 			data-admin-header-compact={useMobileCompact ? "true" : "false"}
 		>
 			<div
 				className={cn(
-					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
+					"flex flex-col gap-2 motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out lg:flex-row lg:items-center lg:justify-between",
 					useMobileCompact && "gap-1.5",
 				)}
 			>
 				<div
 					className={cn(
-						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6",
+						"flex min-w-0 flex-col gap-2 motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out lg:flex-row lg:items-center lg:gap-6",
 						useMobileCompact && "gap-1.5",
 					)}
 				>
 					<div className="flex min-w-0 flex-wrap items-center gap-2">
 						<h1
 							className={cn(
-								"text-lg font-semibold tracking-tight",
+								"text-lg font-semibold tracking-tight motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
 								useMobileCompact && "text-base",
 							)}
 						>
@@ -59,7 +62,10 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						</h1>
 						<BrandLogo
 							variant="wordmark"
-							className={cn("h-5", useMobileCompact && "h-[18px]")}
+							className={cn(
+								"h-5 motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
+								useMobileCompact && "h-[18px]",
+							)}
 						/>
 					</div>
 
@@ -69,7 +75,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					>
 						<div
 							className={cn(
-								"flex h-8 min-w-max items-center gap-4 pr-1 whitespace-nowrap",
+								"flex h-8 min-w-max items-center gap-4 pr-1 whitespace-nowrap motion-safe:transition-[gap,height] motion-safe:duration-200 motion-safe:ease-out",
 								useMobileCompact && "h-7 gap-3",
 							)}
 						>
@@ -99,16 +105,24 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 
 				<div
 					className={cn(
-						"flex items-center gap-2 self-start lg:self-auto",
+						"flex items-center gap-2 self-start motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out lg:self-auto",
 						useMobileCompact && "gap-1.5",
 					)}
 				>
-					<ThemeToggle className={cn(useMobileCompact && "p-0.5")} />
+					<ThemeToggle
+						className={cn(
+							"motion-safe:transition-[padding,transform] motion-safe:duration-200 motion-safe:ease-out",
+							useMobileCompact && "p-0.5",
+						)}
+					/>
 					<Button
 						asChild
 						variant="outline"
 						size="sm"
-						className={cn("mr-2 h-8 px-2", useMobileCompact && "mr-1 h-7 px-2")}
+						className={cn(
+							"mr-2 h-8 px-2 motion-safe:transition-[height,padding,margin,transform] motion-safe:duration-200 motion-safe:ease-out",
+							useMobileCompact && "mr-1 h-7 px-2",
+						)}
 					>
 						<a href="/" aria-label="返回前台首页" title="返回前台首页">
 							<Home className="size-4" />
@@ -123,7 +137,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					>
 						<span
 							className={cn(
-								"text-muted-foreground text-sm",
+								"text-muted-foreground text-sm motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
 								useMobileCompact && "text-xs",
 							)}
 						>
@@ -133,7 +147,10 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							asChild
 							variant="ghost"
 							size="icon"
-							className={cn("size-8", useMobileCompact && "size-7")}
+							className={cn(
+								"size-8 motion-safe:transition-[width,height,transform] motion-safe:duration-200 motion-safe:ease-out",
+								useMobileCompact && "size-7",
+							)}
 						>
 							<a href="/auth/logout" aria-label="退出登录" title="退出登录">
 								<LogOut className="size-4" />

@@ -2115,13 +2115,13 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 		page.locator("[data-app-meta-footer-hidden='true']"),
 	).toHaveCount(1);
 	await expect(page.locator("[data-admin-header-compact='true']")).toHaveCount(
-		0,
+		1,
 	);
 
 	await page.evaluate(() => window.scrollTo(0, 360));
 	await page.waitForTimeout(120);
 	await expect(page.locator("[data-admin-header-compact='true']")).toHaveCount(
-		1,
+		0,
 	);
 	await page.getByRole("tab", { name: "任务记录" }).click();
 	await expect(page.getByText("W4 · 请求 1 · work items 1")).toBeVisible();

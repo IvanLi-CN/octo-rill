@@ -18,7 +18,7 @@
 ### Goals
 
 - 为 Dashboard / Admin 引入 opt-in 的移动端壳层状态：顶部 compact header、sticky subheader 与滚动时 footer 自动收起。
-- 把 Dashboard 移动端页头收敛成“无副标题的基准版 + 上滚后更薄的 compact 版”。
+- 把 Dashboard 移动端页头收敛成“无副标题的基准版 + 内容上滑后更薄的 compact 版”。
 - 把 Dashboard 移动端顶部控制区重做为单行 sticky rail，并把管理员入口迁移进用户信息浮层。
 - 收紧 Dashboard 小屏内容与卡片内外间距，提升同一视口里的信息密度。
 - 补齐 Storybook / Playwright 移动端覆盖与视觉证据。
@@ -68,7 +68,7 @@
 ### MUST
 
 - Dashboard 移动端基准页头不显示副标题。
-- Dashboard 在小屏滚动向上时切换到 compact header，向下滚动后恢复到基准页头。
+- Dashboard 在小屏内容上滑时切换到 compact header，向下回拉后恢复到基准页头。
 - Dashboard 顶部一级 tabs 在移动端必须保持单行，并在滚动中 sticky 到页头下方。
 - `原文 / 翻译 / 智能` 必须在 `全部 / 发布` 视图中并入同一条移动端 sticky rail，而不是形成第二行。
 - Dashboard 移动端不再在次级控制区显示“管理员面板”按钮；管理员入口改放进用户信息浮层。
@@ -96,9 +96,9 @@
    - 主内容与卡片 padding 按移动端收紧。
 
 2. **Dashboard 移动端滚动**
-   - 用户向下滚动时，footer 收起；sticky rail 贴在当前页头下方。
-   - 用户先向下再向上滚动时，页头切换到 compact 版，为正文腾出更多高度。
-   - 再次向下滚动时，compact 版退出，恢复到整改后的基准页头。
+   - 用户向下滚动浏览内容时，footer 收起；sticky rail 贴在当前页头下方。
+   - 内容继续上滑时，页头切换到 compact 版，为正文腾出更多高度。
+   - 用户向下回拉内容时，compact 版退出，恢复到整改后的基准页头。
 
 3. **管理员入口迁移**
    - 桌面端仍保留 Dashboard 次级控制区里的“管理员面板”入口。
@@ -111,7 +111,7 @@
 ### Edge cases / errors
 
 - 不在顶部时 footer 一律保持隐藏，不因滚动停止自动弹回。
-- Compact header 仅在移动端、且页面已离开顶部并发生向上滚动时生效。
+- Compact header 仅在移动端、且页面已离开顶部并继续向下滚动浏览内容时生效。
 - Dashboard sticky rail 只在移动端启用；桌面端继续使用原有顶部控制区布局。
 - Landing 不启用移动壳层状态，也不继承 footer auto-hide。
 
@@ -140,16 +140,16 @@
   When 用户继续浏览内容
   Then footer 自动收起，sticky rail 仍贴在页头下方，且不遮挡正文。
 
-- Given 移动端 Dashboard 已经先向下滚动
-  When 用户向上回滚内容
-  Then 页头切换到 compact 版；When 再次向下滚动 Then 页头恢复到基准版。
+- Given 移动端 Dashboard 已经离开顶部
+  When 用户继续向下滚动浏览内容
+  Then 页头切换到 compact 版；When 用户向下回拉内容 Then 页头恢复到基准版。
 
 - Given 用户是管理员并处于移动端 Dashboard
   When 打开头像浮层
   Then 可在浮层内看到“管理员面板”入口与“退出登录”动作。
 
 - Given 移动端 Admin Users 或 Admin Jobs 页面
-  When 页面离开顶部再向上滚动
+  When 页面离开顶部后继续向下滚动浏览内容
   Then 共享 footer auto-hide 与 compact header 生效，同时管理员导航仍可见。
 
 ## 实现前置条件（Definition of Ready / Preconditions）

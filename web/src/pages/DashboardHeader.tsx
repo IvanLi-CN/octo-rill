@@ -1,3 +1,4 @@
+import type * as React from "react";
 import {
 	ArrowUpRight,
 	LogOut,
@@ -24,7 +25,16 @@ export type DashboardHeaderProps = {
 	syncingAll?: boolean;
 	onSyncAll?: () => void;
 	logoutHref?: string;
+	mobileControlBand?: React.ReactNode;
 };
+
+function clampUnit(value: number) {
+	return Math.max(0, Math.min(1, value));
+}
+
+function mix(from: number, to: number, progress: number) {
+	return from + (to - from) * clampUnit(progress);
+}
 
 function resolveUserInitials(login: string, name?: string | null) {
 	const source = (name?.trim() || login.trim()).replace(/^@+/, "");
@@ -178,7 +188,7 @@ function DashboardUserMenu(props: {
 	isAdmin: boolean;
 	aiDisabledHint: boolean;
 	logoutHref: string;
-	compactHeader: boolean;
+	headerProgress: number;
 	showMobileAdminLink: boolean;
 }) {
 	const {
@@ -189,7 +199,7 @@ function DashboardUserMenu(props: {
 		isAdmin,
 		aiDisabledHint,
 		logoutHref,
-		compactHeader,
+		headerProgress,
 		showMobileAdminLink,
 	} = props;
 	const cardId = useId();
@@ -228,7 +238,8 @@ function DashboardUserMenu(props: {
 	return (
 		<fieldset
 			ref={wrapperRef}
-			className="relative m-0 min-w-0 border-0 p-0"
+			className="relative inline-flex min-w-0 items-center leading-none"
+			data-dashboard-user-menu
 			aria-label="账号菜单"
 			onMouseEnter={() => setHoverOpen(true)}
 			onMouseLeave={() => setHoverOpen(false)}
@@ -237,8 +248,11 @@ function DashboardUserMenu(props: {
 				type="button"
 				className={cn(
 					"inline-flex items-center justify-center overflow-hidden rounded-full border border-border/70 bg-card shadow-sm transition hover:border-foreground/20 hover:shadow",
-					compactHeader ? "size-8" : "size-9",
 				)}
+				style={{
+					width: `${mix(36, 32, headerProgress)}px`,
+					height: `${mix(36, 32, headerProgress)}px`,
+				}}
 				aria-label="查看账号信息"
 				aria-controls={cardId}
 				aria-expanded={open}
@@ -291,102 +305,258 @@ export function DashboardHeader({
 	syncingAll = false,
 	onSyncAll,
 	logoutHref = "/auth/logout",
+	mobileControlBand = null,
 }: DashboardHeaderProps) {
-	const { compactHeader, isMobileViewport, mobileChromeEnabled } =
-		useAppShellChrome();
+	const {
+		compactHeader,
+		headerInteracting,
+		headerTransitionSuppressed,
+		headerProgress,
+		isMobileViewport,
+		mobileChromeEnabled,
+	} = useAppShellChrome();
 	const useMobileCompact =
 		mobileChromeEnabled && isMobileViewport && compactHeader;
+	const mobileHeaderProgress =
+		mobileChromeEnabled && isMobileViewport
+			? clampUnit(headerProgress)
+			: useMobileCompact
+				? 1
+				: 0;
+	const disableHeaderMotion = headerInteracting || headerTransitionSuppressed;
+	const interactiveMotionClass = disableHeaderMotion
+		? "transition-none"
+		: "motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out";
+	const actionScale = mix(1, 0.9, mobileHeaderProgress);
 	const hideSubtitle = mobileChromeEnabled && isMobileViewport;
+	const useSingleLineHeader = hideSubtitle;
+	const shouldRenderMobileControlBand = Boolean(
+		mobileControlBand && mobileChromeEnabled && isMobileViewport,
+	);
 
 	return (
 		<div
 			className={cn(
-				"flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between",
-				useMobileCompact && "flex-row items-center justify-between gap-2",
+				"flex flex-col gap-3",
+				!disableHeaderMotion &&
+					"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 			)}
+			style={
+				hideSubtitle
+					? {
+							gap: `${mix(12, 8, mobileHeaderProgress)}px`,
+						}
+					: undefined
+			}
 			data-dashboard-header-compact={useMobileCompact ? "true" : "false"}
+			data-dashboard-header-progress={mobileHeaderProgress.toFixed(3)}
+			data-dashboard-header-interacting={headerInteracting ? "true" : "false"}
 		>
 			<div
 				className={cn(
-					"flex min-w-0 flex-1 items-start gap-3",
-					useMobileCompact && "items-center gap-2",
+					"flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between",
+					interactiveMotionClass,
+					useSingleLineHeader && "flex-row items-center justify-between gap-3",
 				)}
-				data-dashboard-brand-block
+				style={
+					useSingleLineHeader
+						? {
+								gap: `${mix(12, 8, mobileHeaderProgress)}px`,
+							}
+						: undefined
+				}
 			>
-				<BrandLogo
-					variant="mark"
-					alt=""
-					className="shrink-0"
-					imgClassName={cn(
-						"size-10 sm:size-11 lg:size-12",
-						hideSubtitle && "size-9 sm:size-11 lg:size-12",
-						useMobileCompact && "size-8 sm:size-10 lg:size-12",
+				<div
+					className={cn(
+						"flex min-w-0 flex-1 items-start gap-3",
+						disableHeaderMotion
+							? "transition-none"
+							: "motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+						useSingleLineHeader && "items-center gap-2.5",
+						hideSubtitle && "items-center",
 					)}
-				/>
+					style={
+						hideSubtitle
+							? {
+									gap: `${mix(10, 8, mobileHeaderProgress)}px`,
+								}
+							: undefined
+					}
+					data-dashboard-brand-block
+				>
+					<div
+						className="shrink-0"
+						style={
+							hideSubtitle
+								? {
+										width: `${mix(34, 32, mobileHeaderProgress)}px`,
+										height: `${mix(34, 32, mobileHeaderProgress)}px`,
+									}
+								: undefined
+						}
+					>
+						<BrandLogo
+							variant="mark"
+							alt=""
+							className="size-full"
+							imgClassName={cn(
+								"size-10 sm:size-11 lg:size-12",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[width,height,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+								hideSubtitle && "size-full",
+							)}
+						/>
+					</div>
+
+					<div
+						className={cn(
+							"min-w-0",
+							!disableHeaderMotion &&
+								"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+							disableHeaderMotion && "transition-none",
+							hideSubtitle && "space-y-0",
+						)}
+					>
+						<h1
+							className={cn(
+								"min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]",
+								disableHeaderMotion
+									? "transition-none"
+									: "motion-safe:transition-[font-size,line-height,letter-spacing,transform] motion-safe:duration-200 motion-safe:ease-out",
+								hideSubtitle && "text-[1.75rem] sm:text-[1.75rem]",
+							)}
+							style={
+								hideSubtitle
+									? {
+											fontSize: `${mix(28, 23.2, mobileHeaderProgress)}px`,
+											lineHeight: mix(0.95, 0.92, mobileHeaderProgress),
+										}
+									: undefined
+							}
+							data-dashboard-brand-heading
+						>
+							OctoRill
+						</h1>
+
+						<p
+							className={cn(
+								"text-muted-foreground text-sm font-medium leading-snug",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[opacity,transform] motion-safe:duration-150 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+								hideSubtitle && "hidden sm:block",
+								useMobileCompact && "hidden",
+							)}
+							data-dashboard-brand-subtitle
+						>
+							GitHub 动态 · 中文翻译 · 日报与 Inbox
+						</p>
+					</div>
+				</div>
 
 				<div
 					className={cn(
-						"min-w-0",
-						useMobileCompact ? "space-y-0" : "space-y-1",
+						"flex items-center gap-2 self-start lg:justify-end",
+						disableHeaderMotion
+							? "transition-none"
+							: "motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+						useSingleLineHeader &&
+							"w-auto shrink-0 justify-end gap-1.5 self-auto",
 					)}
+					style={
+						useSingleLineHeader
+							? {
+									gap: `${mix(6, 4, mobileHeaderProgress)}px`,
+								}
+							: undefined
+					}
+					data-dashboard-primary-actions
 				>
-					<h1
-						className={cn(
-							"min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]",
-							hideSubtitle && "text-[1.9rem] sm:text-[1.75rem]",
-							useMobileCompact && "text-[1.45rem] sm:text-[1.65rem]",
-						)}
-						data-dashboard-brand-heading
+					<div
+						style={
+							hideSubtitle
+								? {
+										transform: `scale(${actionScale})`,
+										transformOrigin: "center",
+									}
+								: undefined
+						}
 					>
-						OctoRill
-					</h1>
-
-<<<<<<< HEAD
-					<p
+						<ThemeToggle
+							compact={useSingleLineHeader}
+							className={cn(
+								!disableHeaderMotion &&
+									"motion-safe:transition-[width,height,padding,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+								useMobileCompact && "size-8",
+							)}
+						/>
+					</div>
+					<Button
+						disabled={busy}
+						onClick={onSyncAll}
+						size={hideSubtitle ? "sm" : "default"}
 						className={cn(
-							"text-muted-foreground text-sm font-medium leading-snug",
-							hideSubtitle && "hidden sm:block",
-							useMobileCompact && "hidden",
+							!disableHeaderMotion &&
+								"motion-safe:transition-[height,padding,border-radius,transform] motion-safe:duration-200 motion-safe:ease-out",
+							disableHeaderMotion && "transition-none",
+							hideSubtitle && "h-9 rounded-full px-3.5 text-sm",
+							useMobileCompact && "h-8 px-3",
 						)}
-						data-dashboard-brand-subtitle
+						style={
+							hideSubtitle
+								? {
+										height: `${mix(36, 32, mobileHeaderProgress)}px`,
+										paddingInline: `${mix(14, 12, mobileHeaderProgress)}px`,
+									}
+								: undefined
+						}
 					>
-						GitHub 动态 · 中文翻译 · 日报与 Inbox
-					</p>
+						<RefreshCcw
+							className={syncingAll ? "size-4 animate-spin" : "size-4"}
+						/>
+						同步
+					</Button>
+					<DashboardUserMenu
+						login={login}
+						name={name}
+						avatarUrl={avatarUrl}
+						email={email}
+						isAdmin={isAdmin}
+						aiDisabledHint={aiDisabledHint}
+						logoutHref={logoutHref}
+						headerProgress={mobileHeaderProgress}
+						showMobileAdminLink={isAdmin}
+					/>
 				</div>
 			</div>
 
-			<div
-				className={cn(
-					"flex items-center gap-2 self-start lg:justify-end",
-					hideSubtitle && "w-full justify-between",
-					useMobileCompact && "w-auto justify-end gap-1.5 self-auto",
-				)}
-				data-dashboard-primary-actions
-			>
-				<ThemeToggle className={cn(useMobileCompact && "p-0.5")} />
-				<Button
-					disabled={busy}
-					onClick={onSyncAll}
-					size={hideSubtitle ? "sm" : "default"}
-					className={cn(hideSubtitle && "h-8 px-3")}
+			{shouldRenderMobileControlBand ? (
+				<div
+					className={cn(
+						"sm:hidden overflow-hidden",
+						!disableHeaderMotion &&
+							"motion-safe:transition-[max-height,opacity,transform,margin] motion-safe:duration-200 motion-safe:ease-out",
+						disableHeaderMotion && "transition-none",
+						useMobileCompact
+							? "pointer-events-none max-h-0 -translate-y-1 opacity-0"
+							: "max-h-32 translate-y-0 opacity-100",
+					)}
+					style={{
+						maxHeight: `${mix(116, 0, mobileHeaderProgress)}px`,
+						opacity: mix(1, 0, mobileHeaderProgress),
+						transform: `translateY(${mix(0, -6, mobileHeaderProgress)}px)`,
+					}}
+					data-dashboard-mobile-top-shell={
+						useMobileCompact ? undefined : "expanded"
+					}
+					data-dashboard-mobile-top-shell-section="workband"
+					aria-hidden={useMobileCompact}
 				>
-					<RefreshCcw
-						className={syncingAll ? "size-4 animate-spin" : "size-4"}
-					/>
-					同步
-				</Button>
-				<DashboardUserMenu
-					login={login}
-					name={name}
-					avatarUrl={avatarUrl}
-					email={email}
-					isAdmin={isAdmin}
-					aiDisabledHint={aiDisabledHint}
-					logoutHref={logoutHref}
-					compactHeader={useMobileCompact}
-					showMobileAdminLink={isAdmin}
-				/>
-			</div>
+					{mobileControlBand}
+				</div>
+			) : null}
 		</div>
 	);
 }

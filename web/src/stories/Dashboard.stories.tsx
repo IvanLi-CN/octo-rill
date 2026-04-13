@@ -14,9 +14,9 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
+import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import {
 	DEFAULT_PAGE_LANE,
 	resolveDisplayLaneForFeed,
@@ -32,8 +32,12 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
-import { cn } from "@/lib/utils";
 import type { RepoVisual } from "@/lib/repoVisual";
+import {
+	DashboardMobileControlBand,
+	type DashboardTab as Tab,
+	DashboardTabsList,
+} from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -44,7 +48,6 @@ import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 import { VersionMonitorStateProvider } from "@/version/versionMonitor";
 
-type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 type FeedMode =
 	| "default"
 	| "visible-window-queued"
@@ -70,18 +73,6 @@ const STORYBOOK_VERSION_STATE = {
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
-const DASHBOARD_TAB_OPTIONS: Array<{
-	value: Tab;
-	mobileLabel: string;
-	desktopLabel: string;
-}> = [
-	{ value: "all", mobileLabel: "全部", desktopLabel: "全部" },
-	{ value: "releases", mobileLabel: "发布", desktopLabel: "Releases" },
-	{ value: "stars", mobileLabel: "加星", desktopLabel: "被加星" },
-	{ value: "followers", mobileLabel: "关注", desktopLabel: "被关注" },
-	{ value: "briefs", mobileLabel: "日报", desktopLabel: "日报" },
-	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "Inbox" },
-];
 
 function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -119,7 +110,6 @@ const repoVisualFixtures: Record<
 	},
 	text: null,
 };
-
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
@@ -129,65 +119,6 @@ function defaultLaneForItem(
 	pageDefaultLane: FeedLane,
 ): FeedLane {
 	return resolvePreferredLaneForItem(item, pageDefaultLane);
-}
-
-function DashboardTabsList(props: { className?: string }) {
-	return (
-		<TabsList
-			className={cn(
-				"h-auto shrink-0 flex-nowrap rounded-lg bg-muted/60 p-1",
-				props.className,
-			)}
-		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => (
-				<TabsTrigger
-					key={option.value}
-					value={option.value}
-					className="font-mono text-xs"
-				>
-					<span className="sm:hidden">{option.mobileLabel}</span>
-					<span className="hidden sm:inline">{option.desktopLabel}</span>
-				</TabsTrigger>
-			))}
-		</TabsList>
-	);
-}
-
-function DashboardMobileRailTabs(props: {
-	tab: Tab;
-	onSelectTab: (tab: Tab) => void;
-}) {
-	const { tab, onSelectTab } = props;
-
-	return (
-		<div
-			role="tablist"
-			aria-label="Dashboard 主导航"
-			className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-border/45 bg-muted/60 p-1 shadow-sm"
-		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => {
-				const active = option.value === tab;
-				return (
-					<button
-						key={option.value}
-						type="button"
-						role="tab"
-						aria-selected={active}
-						data-state={active ? "active" : "inactive"}
-						className={cn(
-							"inline-flex h-7 items-center justify-center rounded-full px-3 font-mono text-xs whitespace-nowrap transition-all",
-							active
-								? "bg-background text-foreground shadow-sm"
-								: "text-foreground/55 hover:text-foreground",
-						)}
-						onClick={() => onSelectTab(option.value)}
-					>
-						{option.mobileLabel}
-					</button>
-				);
-			})}
-		</div>
-	);
 }
 
 function buildFeedItem(
@@ -1057,32 +988,22 @@ function DashboardPreview(props: {
 						syncingAll={syncingAll}
 						onSyncAll={() => {}}
 						logoutHref="#"
+						mobileControlBand={
+							<DashboardMobileControlBand
+								tab={tab}
+								onSelectTab={(nextTab) => setTab(nextTab)}
+								showPageLaneSelector={tab === "all" || tab === "releases"}
+								pageLane={effectivePageDefaultLane}
+								onSelectPageLane={(lane) => {
+									setPageDefaultLane(lane);
+									setSelectedLaneByKey({});
+								}}
+								layout="stacked"
+							/>
+						}
 					/>
 				}
 				notice={<VersionUpdateNotice />}
-				subheader={
-					<div data-dashboard-mobile-rail="true">
-						<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
-							<div className="flex min-w-max items-center gap-2">
-								<DashboardMobileRailTabs
-									tab={tab}
-									onSelectTab={(nextTab) => setTab(nextTab)}
-								/>
-								{tab === "all" || tab === "releases" ? (
-									<FeedPageLaneSelector
-										value={effectivePageDefaultLane}
-										onValueChange={(lane) => {
-											setPageDefaultLane(lane);
-											setSelectedLaneByKey({});
-										}}
-										className="shrink-0"
-									/>
-								) : null}
-							</div>
-						</div>
-					</div>
-				}
-				subheaderClassName="sm:hidden"
 				footer={<AppMetaFooter />}
 				mobileChrome
 			>

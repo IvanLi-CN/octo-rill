@@ -252,27 +252,54 @@ test.describe("mobile dashboard shell", () => {
 		await page.goto("/");
 
 		await expect(page.locator("[data-dashboard-brand-subtitle]")).toBeHidden();
-		await expect(page.locator("[data-dashboard-mobile-rail]")).toBeVisible();
+		const expandedWorkband = page.locator(
+			"[data-dashboard-mobile-top-shell='expanded'][data-dashboard-mobile-top-shell-section='workband']",
+		);
+		await expect(expandedWorkband).toBeVisible();
 		await expect(
-			page.locator("[data-dashboard-mobile-rail]").getByRole("tab", {
-				name: "发布",
-			}),
+			expandedWorkband.getByRole("tab", { name: "发布" }),
 		).toBeVisible();
-		await expect(
-			page.locator("[data-dashboard-mobile-rail]").getByRole("button", {
-				name: "原文",
-			}),
-		).toBeVisible();
+		const laneMenuTrigger = expandedWorkband.locator(
+			"[data-dashboard-mobile-lane-menu-trigger]",
+		);
+		await expect(laneMenuTrigger).toBeVisible();
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
 		await expect(
 			page.locator("[data-dashboard-secondary-controls]").getByRole("link", {
 				name: "管理员面板",
 			}),
 		).toHaveCount(0);
 
-		const mobileRailHeight = await page
-			.locator("[data-dashboard-mobile-rail]")
-			.evaluate((el) => el.getBoundingClientRect().height);
-		expect(mobileRailHeight).toBeLessThan(52);
+		await expect(
+			expandedWorkband.locator(
+				"[data-dashboard-mobile-control-band-row='lane']",
+			),
+		).toHaveCount(0);
+		await laneMenuTrigger.click();
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toBeVisible();
+		await expect(
+			page
+				.locator("[data-dashboard-mobile-lane-menu-popover]")
+				.getByRole("menuitemradio", { name: "原文" }),
+		).toBeVisible();
+		await page
+			.locator("[data-dashboard-mobile-lane-menu-popover]")
+			.getByRole("menuitemradio", { name: "智能" })
+			.click();
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toHaveCount(0);
+		await expandedWorkband.getByRole("tab", { name: "关注" }).click();
+		await expect(laneMenuTrigger).toBeVisible();
+		await expect(laneMenuTrigger).toBeDisabled();
+		await laneMenuTrigger.click({ force: true });
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toHaveCount(0);
+		await expandedWorkband.getByRole("tab", { name: "全部" }).click();
+		await expect(laneMenuTrigger).toBeEnabled();
 
 		await page.evaluate(() => window.scrollTo(0, 700));
 		await page.waitForTimeout(120);
@@ -281,23 +308,25 @@ test.describe("mobile dashboard shell", () => {
 		).toHaveCount(1);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
-		).toHaveCount(0);
+		).toBeVisible();
+		await expect(expandedWorkband).toHaveCount(0);
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
 
 		await page.evaluate(() => window.scrollTo(0, 280));
 		await page.waitForTimeout(120);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
-		).toBeVisible();
-		const railTop = await page
-			.locator("[data-dashboard-mobile-rail]")
-			.evaluate((el) => Math.round(el.getBoundingClientRect().top));
-		expect(railTop).toBeLessThanOrEqual(84);
+		).toHaveCount(0);
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(expandedWorkband).toBeVisible();
 
-		await page.evaluate(() => window.scrollTo(0, 420));
+		await page.evaluate(() => window.scrollTo(0, 760));
 		await page.waitForTimeout(120);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
-		).toHaveCount(0);
+		).toBeVisible();
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(expandedWorkband).toHaveCount(0);
 
 		await page.getByRole("button", { name: "查看账号信息" }).click();
 		await expect(
