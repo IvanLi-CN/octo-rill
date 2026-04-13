@@ -1958,7 +1958,7 @@ async fn ensure_translation_result_for_item(
             if work_item.result_status.is_some()
                 && matches!(work_item.status.as_str(), "completed" | "failed")
             {
-                let result = terminal_result_from_work_row(&work_item, item.producer_ref.clone());
+                let result = terminal_result_from_work_row(&work_item, item);
                 persist_translation_terminal_state(
                     tx,
                     user_id,
@@ -2027,7 +2027,7 @@ async fn ensure_translation_result_for_item(
                 return Ok(result);
             }
 
-            let pending = pending_result_from_work_row(&work_item, item.producer_ref.clone());
+            let pending = pending_result_from_work_row(&work_item, item);
             upsert_translation_demand_state(
                 tx,
                 user_id,
@@ -2212,7 +2212,7 @@ async fn insert_translation_request(
     if existing.result_status.is_some()
         && matches!(existing.status.as_str(), "completed" | "failed")
     {
-        let result = terminal_result_from_work_row(&existing, canonical_item.producer_ref.clone());
+        let result = terminal_result_from_work_row(&existing, &canonical_item);
         let status = request_status_from_result_status(result.status.as_str()).to_owned();
         apply_request_result(
             tx,
@@ -2249,7 +2249,7 @@ async fn insert_translation_request(
     }
 
     let status = request_status_from_work_item_status(existing.status.as_str()).to_owned();
-    let result = pending_result_from_work_row(&existing, canonical_item.producer_ref.clone());
+    let result = pending_result_from_work_row(&existing, &canonical_item);
     attach_request_to_work_item(tx, request_id.as_str(), &existing.id, status.as_str(), now)
         .await?;
     upsert_translation_demand_state(
@@ -2303,7 +2303,7 @@ async fn ensure_translation_result_demand(
     if existing.result_status.is_some()
         && matches!(existing.status.as_str(), "completed" | "failed")
     {
-        let result = terminal_result_from_work_row(&existing, item.producer_ref.clone());
+        let result = terminal_result_from_work_row(&existing, item);
         persist_translation_terminal_state(
             tx,
             user_id,
@@ -2346,7 +2346,7 @@ async fn ensure_translation_result_demand(
     }
 
     let status = request_status_from_work_item_status(existing.status.as_str()).to_owned();
-    let result = pending_result_from_work_row(&existing, item.producer_ref.clone());
+    let result = pending_result_from_work_row(&existing, item);
     attach_request_to_work_item(tx, request_id, &existing.id, status.as_str(), now).await?;
     upsert_translation_demand_state(
         tx,
@@ -3782,7 +3782,7 @@ async fn finalize_batch_success(
 
         let requests = sqlx::query(
             r#"
-            SELECT id, producer_ref, entity_id, kind, variant
+            SELECT id, producer_ref, entity_id, kind, variant, target_slots_json
             FROM translation_requests
             WHERE work_item_id = ?
             "#,
@@ -3796,19 +3796,27 @@ async fn finalize_batch_success(
             let entity_id: String = request.try_get("entity_id")?;
             let kind: String = request.try_get("kind")?;
             let variant: String = request.try_get("variant")?;
-            let request_result = TranslationResultItem {
-                producer_ref,
-                entity_id,
-                kind,
-                variant,
-                status: result.result_status.clone(),
-                title_zh: result.title_zh.clone(),
-                summary_md: result.summary_md.clone(),
-                body_md: result.body_md.clone(),
-                error: result.error.clone(),
-                work_item_id: Some(result.work_item_id.clone()),
-                batch_id: Some(batch.id.clone()),
-            };
+            let target_slots_json: String = request.try_get("target_slots_json")?;
+            let target_slots =
+                serde_json::from_str::<Vec<String>>(target_slots_json.as_str()).unwrap_or_default();
+            let request_result = translation_result_for_request(
+                &TranslationRequestItemInput {
+                    producer_ref,
+                    kind,
+                    variant,
+                    entity_id,
+                    target_lang: batch.target_lang.clone(),
+                    max_wait_ms: 0,
+                    source_blocks: Vec::new(),
+                    target_slots,
+                },
+                result.result_status.clone(),
+                result.title_zh.clone(),
+                result.body_md.as_deref().or(result.summary_md.as_deref()),
+                result.error.clone(),
+                Some(result.work_item_id.clone()),
+                Some(batch.id.clone()),
+            );
             apply_request_result(
                 &mut tx,
                 request_id.as_str(),
@@ -4633,11 +4641,17 @@ fn build_dedupe_key(
     item: &TranslationRequestItemInput,
     source_hash: &str,
 ) -> String {
+    let (kind, variant) =
+        if uses_release_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
+            ("release_detail", "shared")
+        } else {
+            (item.kind.as_str(), item.variant.as_str())
+        };
     format!(
         "{}:{}:{}:{}:{}:{}:{}",
         user_id,
-        item.kind,
-        item.variant,
+        kind,
+        variant,
         item.entity_id,
         item.target_lang,
         TRANSLATION_PROTOCOL_VERSION,
@@ -4904,12 +4918,15 @@ async fn current_server_source_hash_for_item(
         .map(|canonical| build_source_hash(&canonical)))
 }
 
-fn pending_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
+fn pending_result_from_work_row(
+    row: &WorkItemRow,
+    item: &TranslationRequestItemInput,
+) -> TranslationResultItem {
     TranslationResultItem {
-        producer_ref,
-        entity_id: row.entity_id.clone(),
-        kind: row.kind.clone(),
-        variant: row.variant.clone(),
+        producer_ref: item.producer_ref.clone(),
+        entity_id: item.entity_id.clone(),
+        kind: item.kind.clone(),
+        variant: item.variant.clone(),
         status: pending_result_status_from_work_status(Some(row.status.as_str())).to_owned(),
         title_zh: None,
         summary_md: None,
@@ -4920,23 +4937,56 @@ fn pending_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> Tran
     }
 }
 
-fn terminal_result_from_work_row(row: &WorkItemRow, producer_ref: String) -> TranslationResultItem {
-    TranslationResultItem {
-        producer_ref,
-        entity_id: row.entity_id.clone(),
-        kind: row.kind.clone(),
-        variant: row.variant.clone(),
-        status: row
-            .result_status
+fn translation_result_for_request(
+    item: &TranslationRequestItemInput,
+    status: String,
+    title_zh: Option<String>,
+    translated_text: Option<&str>,
+    error: Option<String>,
+    work_item_id: Option<String>,
+    batch_id: Option<String>,
+) -> TranslationResultItem {
+    let mut result = TranslationResultItem {
+        producer_ref: item.producer_ref.clone(),
+        entity_id: item.entity_id.clone(),
+        kind: item.kind.clone(),
+        variant: item.variant.clone(),
+        status,
+        title_zh,
+        summary_md: None,
+        body_md: None,
+        error,
+        work_item_id,
+        batch_id,
+    };
+
+    if let Some(text) = translated_text {
+        if item.target_slots.iter().any(|slot| slot == "summary_md") {
+            result.summary_md = Some(text.to_owned());
+        }
+        if item.target_slots.iter().any(|slot| slot == "body_md") {
+            result.body_md = Some(text.to_owned());
+        }
+    }
+
+    result
+}
+
+fn terminal_result_from_work_row(
+    row: &WorkItemRow,
+    item: &TranslationRequestItemInput,
+) -> TranslationResultItem {
+    translation_result_for_request(
+        item,
+        row.result_status
             .clone()
             .unwrap_or_else(|| "error".to_owned()),
-        title_zh: row.title_zh.clone(),
-        summary_md: row.summary_md.clone(),
-        body_md: row.body_md.clone(),
-        error: row.error_text.clone(),
-        work_item_id: Some(row.id.clone()),
-        batch_id: row.batch_id.clone(),
-    }
+        row.title_zh.clone(),
+        row.body_md.as_deref().or(row.summary_md.as_deref()),
+        row.error_text.clone(),
+        Some(row.id.clone()),
+        row.batch_id.clone(),
+    )
 }
 
 fn parse_ts(raw: &str) -> Result<DateTime<Utc>> {
@@ -6662,6 +6712,79 @@ mod tests {
         .expect("load translation state");
         assert_eq!(state_row.get::<String, _>("entity_type"), "release_detail");
         assert_eq!(state_row.get::<String, _>("source_hash"), expected_hash);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_reuses_release_detail_work_item_across_request_kinds() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let detail_item = seed_canonical_release_item(&pool, "1", 42, 422).await;
+        let feed_item = release_feed_item(
+            "422",
+            "Release 422",
+            Some("- change A\n- change B"),
+            Some("octo/repo"),
+        );
+
+        let queued = create_translation_request(state.as_ref(), "1", "async", &feed_item)
+            .await
+            .expect("queue shared release translation");
+        let work_item_id = queued
+            .result
+            .work_item_id
+            .clone()
+            .expect("queued work item id");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET
+              status = 'completed',
+              result_status = 'ready',
+              title_zh = ?,
+              summary_md = ?,
+              body_md = NULL,
+              finished_at = ?,
+              updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("版本 422")
+        .bind("共享译文")
+        .bind("2026-03-30T00:00:02Z")
+        .bind("2026-03-30T00:00:02Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("complete shared work item");
+
+        let detail_created = create_translation_request(state.as_ref(), "1", "async", &detail_item)
+            .await
+            .expect("reuse shared release translation");
+
+        assert_eq!(detail_created.status, "completed");
+        assert_eq!(
+            detail_created.result.work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+        assert_eq!(detail_created.result.kind, "release_detail");
+        assert_eq!(detail_created.result.variant, "feed_body");
+        assert_eq!(detail_created.result.body_md.as_deref(), Some("共享译文"));
+
+        let work_item_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM translation_work_items
+            WHERE scope_user_id = ? AND entity_id = ?
+            "#,
+        )
+        .bind("1")
+        .bind("422")
+        .fetch_one(&pool)
+        .await
+        .expect("count shared work items");
+        assert_eq!(work_item_count, 1);
     }
 
     #[tokio::test]
