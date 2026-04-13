@@ -70,6 +70,7 @@ export function AppShell({
 	const HEADER_PROGRESS_DISTANCE = 96;
 	const SNAP_TO_COMPACT_THRESHOLD = 0.65;
 	const SNAP_TO_EXPANDED_THRESHOLD = 0.35;
+	const INTERACTION_RELEASE_THRESHOLD = 0.5;
 	const SCROLL_SETTLE_DELAY_MS = 96;
 	const TOUCH_FALLBACK_SETTLE_DELAY_MS = 160;
 	const WHEEL_INTERACTION_WINDOW_MS = 140;
@@ -198,13 +199,24 @@ export function AppShell({
 			activePointerTypeRef.current = null;
 		};
 
-		const settleHeaderState = () => {
+		const settleHeaderState = (mode: "scroll" | "interaction" = "scroll") => {
 			const currentTop = window.scrollY;
+			if (currentTop <= COMPACT_ENTER_MIN_TOP) {
+				applySettledState(false, currentTop);
+				return;
+			}
+
+			if (mode === "interaction") {
+				applySettledState(
+					headerProgressRef.current >= INTERACTION_RELEASE_THRESHOLD,
+					currentTop,
+				);
+				return;
+			}
+
 			const nextCompact =
-				currentTop > COMPACT_ENTER_MIN_TOP &&
 				headerProgressRef.current >= SNAP_TO_COMPACT_THRESHOLD;
 			const nextExpanded =
-				currentTop <= COMPACT_ENTER_MIN_TOP ||
 				headerProgressRef.current <= SNAP_TO_EXPANDED_THRESHOLD;
 
 			if (compactHeaderRef.current) {
@@ -359,25 +371,28 @@ export function AppShell({
 			resetProgressAnchors(window.scrollY);
 		};
 
-		const endTouchInteraction = () => {
+		const endTouchInteraction = (releasedPointerType?: "touch" | "mouse") => {
 			if (!headerInteractingRef.current) {
 				return;
 			}
 
-			const releasedPointerType = activePointerTypeRef.current;
+			const settledPointerType =
+				releasedPointerType ?? activePointerTypeRef.current;
 			clearTouchFallback();
 			setHeaderInteracting(false);
 			headerInteractingRef.current = false;
 			activePointerTypeRef.current = null;
 			activeTouchPointerIdRef.current = null;
 			gestureStartClientYRef.current = 0;
+			settleHeaderState(
+				settledPointerType === "touch" ? "interaction" : "scroll",
+			);
 			discreteLockUntilRef.current =
-				releasedPointerType === "touch"
+				settledPointerType === "touch"
 					? (typeof performance !== "undefined"
 							? performance.now()
 							: Date.now()) + POST_TOUCH_DISCRETE_LOCK_MS
 					: Number.NEGATIVE_INFINITY;
-			settleHeaderState();
 		};
 
 		const handlePointerDown = (event: PointerEvent) => {
@@ -410,7 +425,7 @@ export function AppShell({
 				return;
 			}
 
-			endTouchInteraction();
+			endTouchInteraction(event.pointerType === "mouse" ? "mouse" : "touch");
 		};
 
 		const handlePointerCancel = (event: PointerEvent) => {
@@ -462,7 +477,7 @@ export function AppShell({
 			if (event.touches.length > 0) {
 				return;
 			}
-			endTouchInteraction();
+			endTouchInteraction("touch");
 		};
 
 		const handleTouchMove = (event: TouchEvent) => {
