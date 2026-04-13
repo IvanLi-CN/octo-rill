@@ -2006,6 +2006,8 @@ export const StarsTab: Story = {
 			expect(
 				card.querySelectorAll('a[href^="https://github.com/"]').length,
 			).toBe(2);
+			expect(card.dataset.socialCardTimeVisible).toBe("true");
+			expect(card.querySelector("[data-social-card-timestamp]")).not.toBeNull();
 		}
 		await expect(
 			canvas.queryByText("gaearon", { exact: true }),
@@ -2024,7 +2026,7 @@ export const FollowersTab: Story = {
 		docs: {
 			description: {
 				story:
-					"`被关注` tab 只显示 follower 收到记录，并保留头像 + GitHub CTA 的轻量卡片样式。",
+					"`被关注` tab 只显示 follower 收到记录，并保留头像 + GitHub CTA 的轻量卡片样式；followers 不展示时间文案。",
 			},
 		},
 	},
@@ -2040,6 +2042,8 @@ export const FollowersTab: Story = {
 			expect(
 				card.querySelectorAll('a[href^="https://github.com/"]').length,
 			).toBe(1);
+			expect(card.dataset.socialCardTimeVisible).toBe("false");
+			expect(card.querySelector("[data-social-card-timestamp]")).toBeNull();
 		}
 		await expect(
 			canvas.queryByRole("heading", { name: "v2.63.0 · 版本变化" }),

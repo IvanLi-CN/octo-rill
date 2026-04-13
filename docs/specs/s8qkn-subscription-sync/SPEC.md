@@ -26,6 +26,7 @@
   - 首访或超过 1 小时未访问时自动触发
   - `star_refreshed` 后立即让前端刷新可见缓存
   - Release work 完成后再刷新一次，并在 social / Inbox 阶段结束后收口
+  - 首次成功拿到 social snapshot 时直接写入可见社交事件
   - social / Inbox 失败保持 best-effort，不把整轮访问刷新降级成硬失败
 - `sync.subscriptions` 改成：
   - 刷新用户 Star
@@ -113,6 +114,7 @@
   8. 触发 `task.progress(stage=notifications_summary)`
   9. `task.completed`
 - 访问自动刷新会继续补齐 `social + Inbox`，但 `star_refreshed` 仍然是前端第一次刷新缓存的关键节点。
+- social 阶段拿到首次 follower / repo star snapshot 时，必须直接写入 `social_activity_events`；其中 `repo_star_received` 保留真实 `starred_at`，`follower_received` 仅保留内部检测时间供排序使用。
 - social 或 Inbox 若失败，访问刷新任务仍返回成功，并把对应错误附带到阶段事件 / 结果 JSON 中。
 
 ### 共享 repo release queue
@@ -143,6 +145,7 @@
 - Release 结束后继续按 Star 成功用户 fan-out：
   - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
   - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数
+- social 同步若遇到 owned-repo GraphQL 的视觉字段返回 `null`，必须按兼容值归一化，不得把该用户整个 social 阶段直接降级成 `source_degraded`。
 - social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
 
 ### 读模型与可见性
@@ -188,6 +191,10 @@
 - Given `sync.subscriptions` 被 scheduler 在半小时槽触发
   When 本轮 Star / Release 摘要已经完成
   Then 同一 task 还会继续发出 `social_summary` 与 `notifications_summary`，并在 `result_json` 中包含四段聚合摘要。
+
+- Given 当前用户尚未建立 social baseline
+  When `sync.access_refresh` 或 `sync.subscriptions` 首次成功拿到 followers / repo stargazers snapshot
+  Then 当前 social 记录会立即写入 feed 事件流，而不是只存在 current membership 快照里。
 
 - Given 某个用户的 social 或 Inbox 拉取失败
   When `sync.subscriptions` 结束
