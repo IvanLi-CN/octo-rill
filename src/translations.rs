@@ -4803,7 +4803,7 @@ async fn build_canonical_feed_request_item(
         (item.kind.as_str(), item.variant.as_str()),
         ("release_summary", "feed_card" | "feed_body")
             | ("release_smart", "feed_card")
-            | ("release_detail", "feed_body")
+            | ("release_detail", "feed_body" | "detail_card")
     ) {
         return Ok(None);
     }
@@ -4862,7 +4862,7 @@ async fn build_canonical_feed_request_item(
     };
     let body = if matches!(
         (item.kind.as_str(), item.variant.as_str()),
-        ("release_summary", "feed_body") | ("release_detail", "feed_body")
+        ("release_summary", "feed_body") | ("release_detail", "feed_body" | "detail_card")
     ) {
         row.body
             .as_deref()
@@ -6707,6 +6707,104 @@ mod tests {
         )
         .bind("1")
         .bind("421")
+        .fetch_one(&pool)
+        .await
+        .expect("load translation state");
+        assert_eq!(state_row.get::<String, _>("entity_type"), "release_detail");
+        assert_eq!(state_row.get::<String, _>("source_hash"), expected_hash);
+    }
+
+    #[tokio::test]
+    async fn create_translation_request_canonicalizes_release_detail_card_source() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            423,
+            "openai/codex",
+            "Release v2.0.3",
+            "- current body\n- current tail",
+        )
+        .await;
+
+        let item = release_detail_card_item(
+            "423",
+            "Release v1.9.9",
+            Some("- stale body"),
+            Some("openai/codex\n2026-03-30T00:00:00Z"),
+        );
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create canonical detail request");
+        assert_eq!(created.status, "queued");
+
+        let expected_hash = crate::api::release_detail_source_hash(
+            "openai/codex",
+            "Release v2.0.3",
+            "- current body\n- current tail",
+        );
+
+        let request_row = sqlx::query(
+            r#"
+            SELECT source_hash, source_blocks_json
+            FROM translation_requests
+            WHERE id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request row");
+        assert_eq!(request_row.get::<String, _>("source_hash"), expected_hash);
+        let request_blocks: Vec<TranslationSourceBlock> =
+            serde_json::from_str(request_row.get::<String, _>("source_blocks_json").as_str())
+                .expect("parse request source blocks");
+        assert_eq!(
+            request_blocks
+                .iter()
+                .find(|block| block.slot == "title")
+                .map(|block| block.text.as_str()),
+            Some("Release v2.0.3"),
+        );
+        assert_eq!(
+            request_blocks
+                .iter()
+                .find(|block| block.slot == "body_markdown")
+                .map(|block| block.text.as_str()),
+            Some("- current body\n- current tail"),
+        );
+
+        let work_row = sqlx::query(
+            r#"
+            SELECT kind, variant, source_hash
+            FROM translation_work_items
+            WHERE entity_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("423")
+        .fetch_one(&pool)
+        .await
+        .expect("load work row");
+        assert_eq!(work_row.get::<String, _>("kind"), "release_detail");
+        assert_eq!(work_row.get::<String, _>("variant"), "detail_card");
+        assert_eq!(work_row.get::<String, _>("source_hash"), expected_hash);
+
+        let state_row = sqlx::query(
+            r#"
+            SELECT entity_type, source_hash
+            FROM ai_translations
+            WHERE user_id = ? AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind("423")
         .fetch_one(&pool)
         .await
         .expect("load translation state");
@@ -9170,6 +9268,18 @@ mod tests {
     ) -> TranslationRequestItemInput {
         let mut item = release_feed_item(entity_id, title, body, metadata);
         item.kind = "release_detail".to_owned();
+        item
+    }
+
+    fn release_detail_card_item(
+        entity_id: &str,
+        title: &str,
+        body: Option<&str>,
+        metadata: Option<&str>,
+    ) -> TranslationRequestItemInput {
+        let mut item = release_detail_feed_item(entity_id, title, body, metadata);
+        item.variant = "detail_card".to_owned();
+        item.producer_ref = format!("release_detail:{entity_id}");
         item
     }
 
