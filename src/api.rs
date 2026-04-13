@@ -5033,6 +5033,35 @@ fn translated_ready_item(
     })
 }
 
+fn translated_release_feed_ready_item(
+    raw_title: Option<String>,
+    raw_summary: Option<String>,
+    body: Option<&str>,
+    auto_translate: Option<bool>,
+) -> Option<TranslatedItem> {
+    let (mut title, mut summary) = normalize_translation_fields(raw_title, raw_summary);
+    let mut status = "ready".to_owned();
+    if title.is_none() && summary.is_none() {
+        status = "missing".to_owned();
+    }
+    if status == "ready"
+        && let (Some(src), Some(s)) = (body, summary.as_deref())
+        && !markdown_structure_preserved(src, s)
+    {
+        status = "missing".to_owned();
+        title = None;
+        summary = None;
+    }
+
+    Some(TranslatedItem {
+        lang: "zh-CN".to_owned(),
+        status,
+        title,
+        summary,
+        auto_translate,
+    })
+}
+
 fn translated_missing_item(auto_translate: bool) -> TranslatedItem {
     TranslatedItem {
         lang: "zh-CN".to_owned(),
@@ -5221,7 +5250,19 @@ fn feed_item_from_row(
             if let Some(status) = r.detail_trans_status.as_deref()
                 && status != "ready"
             {
-                translated_terminal_item(status)
+                if matches!(status, "missing" | "error")
+                    && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
+                    && r.trans_status.as_deref() == Some("ready")
+                {
+                    translated_release_feed_ready_item(
+                        r.trans_title.clone(),
+                        r.trans_summary.clone(),
+                        body.as_deref(),
+                        None,
+                    )
+                } else {
+                    translated_terminal_item(status)
+                }
             } else {
                 let (mut title, mut summary) = normalize_translation_fields(
                     r.detail_trans_title.clone(),
@@ -5260,28 +5301,12 @@ fn feed_item_from_row(
                     Some(translated_missing_item(true))
                 }
             } else {
-                let (mut title, mut summary) =
-                    normalize_translation_fields(r.trans_title.clone(), r.trans_summary.clone());
-                let mut status = "ready".to_owned();
-                if title.is_none() && summary.is_none() {
-                    status = "missing".to_owned();
-                }
-                if status == "ready"
-                    && let (Some(src), Some(s)) = (body.as_deref(), summary.as_deref())
-                    && !markdown_structure_preserved(src, s)
-                {
-                    status = "missing".to_owned();
-                    title = None;
-                    summary = None;
-                }
-
-                Some(TranslatedItem {
-                    lang: "zh-CN".to_owned(),
-                    status,
-                    title,
-                    summary,
-                    auto_translate: None,
-                })
+                translated_release_feed_ready_item(
+                    r.trans_title.clone(),
+                    r.trans_summary.clone(),
+                    body.as_deref(),
+                    None,
+                )
             }
         } else if refresh_in_flight {
             translated_ready_item(r.trans_title.clone(), r.trans_summary.clone(), Some(true))
@@ -6768,6 +6793,7 @@ async fn translate_pending_release_batch_candidates(
     }
 
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
+    let mut non_retryable_error_text: Option<String> = None;
     let mut abort_remaining_batches = false;
     for batch_indices in groups {
         if abort_remaining_batches {
@@ -6798,11 +6824,16 @@ async fn translate_pending_release_batch_candidates(
                         };
                         let (title, summary) =
                             normalize_translation_fields(item.title_zh, item.summary_md);
+                        let markdown_ok = candidate.body.trim().is_empty()
+                            || summary.as_deref().is_some_and(|value| {
+                                markdown_structure_preserved(candidate.body.as_str(), value)
+                            });
                         if (title.is_some() || summary.is_some())
                             && release_detail_translation_ready(
                                 Some(candidate.body.as_str()),
                                 summary.as_deref(),
                             )
+                            && markdown_ok
                         {
                             translated.insert(candidate.release_id, (title, summary));
                         }
@@ -6816,6 +6847,7 @@ async fn translate_pending_release_batch_candidates(
             Err(err) => {
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
+                    non_retryable_error_text = Some(err.to_string());
                     tracing::warn!(
                         ?err,
                         "release detail batch translation upstream error is non-retryable; skipping remaining batch calls"
@@ -6861,6 +6893,18 @@ async fn translate_pending_release_batch_candidates(
                 title,
                 summary,
                 error: None,
+            });
+            continue;
+        }
+
+        if let Some(error_text) = non_retryable_error_text.as_ref() {
+            items.push(TranslateBatchItem {
+                id: candidate.release_id.to_string(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some(error_text.clone()),
             });
             continue;
         }
@@ -13035,6 +13079,37 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_falls_back_to_legacy_ready_translation_when_detail_failed() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.5".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let body = release_feed_body(row.release_body.as_deref()).expect("release body");
+        let source = format!(
+            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            body,
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("ready".to_owned());
+        row.trans_title = Some("旧译文标题".to_owned());
+        row.trans_summary = Some("- 旧译文".to_owned());
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("error".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("旧译文标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 旧译文"));
+    }
+
+    #[test]
     fn feed_item_from_row_keeps_ready_translation_visible_while_refresh_pending() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
@@ -13843,6 +13918,93 @@ line two",
     }
 
     #[tokio::test]
+    async fn translate_releases_batch_for_user_falls_back_when_batched_markdown_is_invalid() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?, name = 'Release v1.2.3', tag_name = 'v1.2.3'
+            WHERE release_id = ?
+            "#,
+        )
+        .bind("## Heading\n- item")
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update release body");
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let detail_chunk_calls = Arc::new(AtomicUsize::new(0));
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_detail_chunk_calls = Arc::clone(&detail_chunk_calls);
+        let route_title_calls = Arc::clone(&title_calls);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_detail_chunk_calls = Arc::clone(&route_detail_chunk_calls);
+                let route_title_calls = Arc::clone(&route_title_calls);
+                async move {
+                    let system_prompt = payload["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    let content = if system_prompt.contains("批量翻译助手") {
+                        route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                        serde_json::json!({
+                            "items": [
+                                {
+                                    "release_id": 120,
+                                    "title_zh": "批量标题",
+                                    "summary_md": "Heading item"
+                                }
+                            ]
+                        })
+                        .to_string()
+                    } else if system_prompt.contains("只把 GitHub Release 标题翻译成自然中文")
+                    {
+                        route_title_calls.fetch_add(1, Ordering::SeqCst);
+                        "版本 v1.2.3".to_owned()
+                    } else {
+                        route_detail_chunk_calls.fetch_add(1, Ordering::SeqCst);
+                        "## 标题\n- 条目".to_owned()
+                    };
+                    let response = serde_json::json!({
+                        "choices": [{"message": {"content": content}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool, base_url);
+
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+                .await
+                .expect("translate release batch");
+
+        assert_eq!(translated.items.len(), 1);
+        assert_eq!(translated.items[0].status, "ready");
+        assert_eq!(translated.items[0].title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(
+            translated.items[0].summary.as_deref(),
+            Some("## 标题\n- 条目")
+        );
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert!(detail_chunk_calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(title_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn translate_releases_batch_for_user_reuses_cached_release_detail_for_truncated_release()
     {
         let pool = setup_pool().await;
@@ -14020,6 +14182,74 @@ line two",
         assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
         assert!(detail_chunk_calls.load(Ordering::SeqCst) >= 1);
         assert_eq!(title_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_skips_per_release_retry_after_non_retryable_batch_error()
+     {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?, name = 'Release v1.2.3', tag_name = 'v1.2.3'
+            WHERE release_id = ?
+            "#,
+        )
+        .bind("- item")
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update release body");
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_fallback_calls = Arc::clone(&fallback_calls);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_fallback_calls = Arc::clone(&route_fallback_calls);
+                async move {
+                    let system_prompt = payload["messages"][0]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if system_prompt.contains("批量翻译助手") {
+                        route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            Json(json!({"error": {"message": "bad key"}})),
+                        );
+                    }
+                    route_fallback_calls.fetch_add(1, Ordering::SeqCst);
+                    let response = serde_json::json!({
+                        "choices": [{"message": {"content": "should not be called"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                    });
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(response),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool, base_url);
+
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+                .await
+                .expect("translate release batch");
+
+        assert_eq!(translated.items.len(), 1);
+        assert_eq!(translated.items[0].status, "error");
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
