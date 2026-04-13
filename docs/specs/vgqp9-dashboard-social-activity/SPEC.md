@@ -21,7 +21,8 @@
 - `/api/feed` 支持返回混合活动流，并支持 `types=releases|stars|followers` 过滤。
 - 社交记录在写入时快照 `actor.login`、`actor.avatar_url`、`actor.html_url`，前端直接渲染头像，不额外查询 GitHub 用户资料。
 - 自动 access refresh 与顶部 `同步` / `sync.all` 纳入社交活动同步。
-- 首轮同步只建立 followers / stargazers baseline，不补历史事件。
+- 首次成功获取 social snapshot 时，当前 followers / stargazers 必须直接落入同一条事件流。
+- `repo_star_received` 继续显示 GitHub `starred_at`；`follower_received` 只保留内部排序时间，UI 不显示时间文案。
 - 为 UI 改动补齐 Storybook 场景、视觉证据与回归测试。
 
 ### Non-goals
@@ -30,6 +31,8 @@
 - 不引入 GitHub Events API、Webhook 或其他实时推送机制。
 - 不在 `日报` / `Inbox` tab 内复用社交活动列表。
 - 不给 `Sync starred` 单独增加“被加星 / 被关注”能力。
+- 不追加“空 social tab 再自动触发一次同步”的前端策略。
+- 不做一次性生产回填脚本或手工补写。
 
 ## 范围（Scope）
 
@@ -38,14 +41,18 @@
 - `src/api.rs`
 - `src/sync.rs`
 - `src/jobs.rs`
-- `migrations/0026_dashboard_social_activity.sql`
-- `migrations/0027_social_activity_event_dedupe.sql`
+- `migrations/0027_dashboard_social_activity.sql`
+- `migrations/0028_social_activity_event_dedupe.sql`
+- `migrations/0029_owned_repo_star_baseline_snapshot_state.sql`
+- `migrations/0030_owned_repo_visuals.sql`
+- `migrations/0031_social_activity_event_repo_visuals.sql`
+- `migrations/0032_repo_star_sync_baselines.sql`
 - `web/src/feed/**`
 - `web/src/pages/Dashboard.tsx`
 - `web/src/stories/Dashboard.stories.tsx`
 - `web/e2e/**`
-- `docs/product.md`
-- `docs/specs/README.md`
+- `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
+- `docs/specs/s8qkn-subscription-sync/SPEC.md`
 
 ### Out of scope
 
@@ -60,10 +67,12 @@
 - `全部` tab 必须混排 `release`、`repo_star_received`、`follower_received` 三类记录。
 - `Releases` tab 必须继续只展示 release cards，保留原文 / 翻译 / 智能 lane 与 reactions。
 - `被加星` tab 必须只展示 `repo_star_received` 记录；`被关注` tab 必须只展示 `follower_received` 记录。
-- 社交记录卡片必须展示对方头像、login、发生时间，以及单个 GitHub CTA。
+- 社交记录卡片必须展示对方头像、login 与单个 GitHub CTA。
 - `repo_star_received` 记录必须展示目标仓库名。
+- `repo_star_received` 记录必须展示真实 `starred_at`。
+- `follower_received` 记录不得显示时间文案；内部仍保留检测时间用于排序与去重。
 - actor 头像缺失或加载失败时，必须回退到稳定占位头像，且布局不抖动。
-- 首轮同步时必须只建立 baseline，不生成伪历史 follower/star 事件。
+- 首次成功获取的 follower / repo star snapshot 必须直接写入 `social_activity_events`，而不是只留在 current membership 快照。
 - `sync.access_refresh` 与 `sync.all` 必须在 release 阶段后继续执行社交活动同步。
 - `/api/feed` 必须支持 `types=releases|stars|followers`，并在分页时保持去重和顺序稳定。
 - 历史日组的 brief 逻辑只能概括 release；社交记录不得折叠进 brief 正文。
@@ -84,14 +93,15 @@
 
 - 用户打开 Dashboard 默认进入 `全部` tab 时，主列按统一日边界分组，并在每个日组内按 `ts DESC` 混排三类记录。
 - 用户切到 `被加星` tab 时，只看到“谁给哪个个人仓库加了星”的记录列表；release 与 follower 记录不会出现。
-- 用户切到 `被关注` tab 时，只看到“谁关注了当前登录账号”的记录列表。
+- 用户切到 `被关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
 - 用户点击顶部 `同步` 时，系统继续沿用既有 `starred -> releases -> notifications` 主体验，并在 release 同步完成后补跑社交活动 diff，再刷新页面。
-- access refresh 在服务端发现新 follower 或新 repo stargazer 后，会写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab。
+- access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab。
 
 ### Edge cases / errors
 
-- followers API 没有 `followed_at` 字段时，新增 follower 事件时间固定取本次检测到差异的 `detected_at`。
-- repo stargazers API 返回 `starred_at` 时，只有 baseline 之后的新成员才写事件；baseline 当次即使存在 `starred_at` 也不能补历史。
+- followers API 没有 `followed_at` 字段时，`follower_received` 事件内部使用本次检测到差异的 `detected_at` 排序，但 UI 不显示时间。
+- repo stargazers API 返回 `starred_at` 时，首次与增量 snapshot 都直接写事件，并继续展示真实 `starred_at`。
+- owned-repo GraphQL 若返回 `usesCustomOpenGraphImage = null`，同步必须按 `false` 容忍而不是整轮降级失败。
 - 若社交同步中某个 repo 暂时不可访问，不能影响 release feed 读取；同步失败按既有 task error/reporting 机制上报。
 - 历史日组只含社交记录时，不显示“生成日报”入口。
 
@@ -152,11 +162,11 @@
 
 - Given 某条 `follower_received` 记录
   When 卡片渲染完成
-  Then 必须可见 follower 头像、login、发生时间与 GitHub 个人页 CTA。
+  Then 必须可见 follower 头像、login 与 GitHub 个人页 CTA，且不显示时间文案。
 
 - Given 当前用户第一次完成 followers / stargazers 同步
   When 页面刷新
-  Then 不会立即出现旧 follower / old star 历史记录。
+  Then 首次 social snapshot 中已有的 followers / repo stars 会立即出现在 feed 里。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -180,9 +190,8 @@
 
 ## 文档更新（Docs to Update）
 
-- `docs/product.md`
-- `docs/specs/README.md`
 - `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
+- `docs/specs/s8qkn-subscription-sync/SPEC.md`
 
 ## 计划资产（Plan assets）
 
@@ -215,9 +224,9 @@
 
 ## 方案概述（Approach, high-level）
 
-- 在同步层新增“本人个人仓库 stargazers + 本人 followers”的快照拉取与基线 diff，写入 append-only `social_activity_events`。
+- 在同步层新增“本人个人仓库 stargazers + 本人 followers”的快照拉取与写入，首次与增量 snapshot 都进入 append-only `social_activity_events`。
 - `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`Releases / 被加星 / 被关注` 通过 `types` 请求服务端专属数据集，避免跨 tab 分页串味。
-- 前端保持 release card 行为不变，为社交记录新增轻量只读卡片，并在头像缺失或加载失败时回退到稳定占位头像。
+- 前端保持 release card 行为不变，为社交记录新增轻量只读卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行。
 - 历史日报组继续只概括 release，社交记录在同日组中以原始卡片单独呈现。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
