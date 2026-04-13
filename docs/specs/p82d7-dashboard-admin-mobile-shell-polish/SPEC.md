@@ -188,6 +188,7 @@
   story_id_or_title: `pages-dashboard-header--evidence-mobile-shell`
   state: expanded mobile shell
   evidence_note: 验证 Dashboard 移动端展开态顶部壳层保留品牌操作条与工作台切换带两行布局，右侧阅读模式入口折叠为 icon 按钮且首屏 spacing 已收紧。
+  PR: include
   image:
   ![Dashboard 移动端展开态顶部壳层](./assets/dashboard-mobile-shell-expanded-light.png)
 
@@ -195,6 +196,7 @@
   story_id_or_title: `pages-dashboard-header--evidence-mobile-shell`
   state: compact mobile shell after wheel scroll
   evidence_note: 验证 Dashboard 在滚轮滚动收起后进入薄页头，工作台切换带隐藏、footer 自动收起，页头状态保持离散收口。
+  PR: include
   image:
   ![Dashboard 移动端薄页头与 footer auto-hide](./assets/dashboard-mobile-shell-compact-light.png)
 
@@ -202,6 +204,7 @@
   story_id_or_title: `pages-dashboard-header--evidence-mobile-shell`
   state: account popover with admin entry
   evidence_note: 验证移动端管理员入口已经从分类带迁移到头像浮层，并与退出登录动作共置。
+  PR: include
   image:
   ![Dashboard 头像浮层中的管理员入口](./assets/dashboard-mobile-account-menu-light.png)
 
@@ -209,6 +212,7 @@
   story_id_or_title: `admin-admin-panel--evidence-mobile-shell`
   state: compact mobile admin shell after scroll
   evidence_note: 验证 Admin 页面复用了移动端壳层行为，薄页头、内容密度与 footer auto-hide 的共享语义已经接通。
+  PR: include
   image:
   ![Admin 移动端共享壳层](./assets/admin-mobile-shell-compact-light.png)
 
