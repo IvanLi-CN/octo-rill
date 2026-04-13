@@ -142,6 +142,21 @@ function parsePositiveIntegerInput(value: string) {
 	return parsed;
 }
 
+function formatModelInputLimitSource(source: string | null | undefined) {
+	switch (source) {
+		case "admin_override":
+			return "后台覆盖";
+		case "synced_catalog":
+			return "同步模型目录";
+		case "builtin_catalog":
+			return "内置模型目录";
+		case "unknown_fallback":
+			return "默认兜底";
+		default:
+			return source ?? "-";
+	}
+}
+
 function formatTranslationWorkerBoardDescription(
 	generalWorkerConcurrency: number | null | undefined,
 	dedicatedWorkerConcurrency: number | null | undefined,
@@ -1759,7 +1774,8 @@ function TranslationSchedulerSection(props: {
 							{formatCount(status?.running_batches)}
 						</p>
 						<p className="text-muted-foreground mt-1 text-xs">
-							阈值 {formatCount(status?.batch_token_threshold)} tokens
+							预算 {formatCount(status?.batch_token_threshold)} tokens ·
+							模型输入 {formatCount(status?.effective_model_input_limit)} tokens
 						</p>
 					</div>
 					<div className="bg-card/70 rounded-lg border p-3">
@@ -2614,6 +2630,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const [llmStatusLoading, setLlmStatusLoading] = useState(false);
 	const [llmSettingsDialogOpen, setLlmSettingsDialogOpen] = useState(false);
 	const [llmMaxConcurrencyInput, setLlmMaxConcurrencyInput] = useState("");
+	const [llmModelContextLimitInput, setLlmModelContextLimitInput] =
+		useState("");
 	const [llmSettingsSaveError, setLlmSettingsSaveError] = useState<
 		string | null
 	>(null);
@@ -2978,6 +2996,11 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 	const openLlmSettingsDialog = useCallback(() => {
 		setLlmSettingsSaveError(null);
 		setLlmMaxConcurrencyInput(String(llmStatus?.max_concurrency ?? ""));
+		setLlmModelContextLimitInput(
+			typeof llmStatus?.ai_model_context_limit === "number"
+				? String(llmStatus.ai_model_context_limit)
+				: "",
+		);
 		setLlmSettingsDialogOpen(true);
 	}, [llmStatus]);
 
@@ -2987,12 +3010,24 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			setLlmSettingsSaveError("并发上限必须是大于 0 的整数。");
 			return;
 		}
+		const normalizedModelContextLimit = llmModelContextLimitInput.trim();
+		const aiModelContextLimit =
+			normalizedModelContextLimit.length === 0
+				? null
+				: parsePositiveIntegerInput(normalizedModelContextLimit);
+		if (normalizedModelContextLimit.length > 0 && !aiModelContextLimit) {
+			setLlmSettingsSaveError(
+				"LLM 输入长度上限必须留空，或填写大于 0 的整数。",
+			);
+			return;
+		}
 
 		setLlmSettingsSaving(true);
 		setLlmSettingsSaveError(null);
 		try {
 			const nextStatus = await apiPatchAdminLlmRuntimeConfig({
 				max_concurrency: maxConcurrency,
+				ai_model_context_limit: aiModelContextLimit,
 			});
 			setLlmStatus(nextStatus);
 			setLlmSettingsDialogOpen(false);
@@ -3001,7 +3036,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		} finally {
 			setLlmSettingsSaving(false);
 		}
-	}, [llmMaxConcurrencyInput]);
+	}, [llmMaxConcurrencyInput, llmModelContextLimitInput]);
 
 	const loadLlmCalls = useCallback(
 		async (options?: LoadOptions) => {
@@ -4083,7 +4118,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								type="button"
 								variant="outline"
 								size="icon"
-								aria-label="配置 LLM 并发上限"
+								aria-label="配置 LLM 运行参数"
 								onClick={openLlmSettingsDialog}
 								disabled={!llmStatus || llmSettingsSaving}
 							>
@@ -4106,7 +4141,8 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 									</p>
 									<p className="text-muted-foreground mt-1 text-xs">
 										并发上限 {formatCount(llmStatus?.max_concurrency)} · 可用{" "}
-										{formatCount(llmStatus?.available_slots)}
+										{formatCount(llmStatus?.available_slots)} · 输入{" "}
+										{formatCount(llmStatus?.effective_model_input_limit)} tokens
 									</p>
 								</div>
 							</div>
@@ -4299,10 +4335,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			>
 				<DialogContent className="max-w-md">
 					<DialogHeader>
-						<DialogTitle>配置 LLM 并发上限</DialogTitle>
+						<DialogTitle>配置 LLM 运行参数</DialogTitle>
 						<DialogDescription>
-							保存后立即生效；若新值低于当前 in-flight
-							数量，已有调用会继续执行，新的调用会等待空闲槽位。
+							保存后立即生效；并发上限控制同时 in-flight
+							调用数，输入长度上限为空时会自动跟随当前模型能力，后续翻译分块会据此计算。
 						</DialogDescription>
 					</DialogHeader>
 
@@ -4321,11 +4357,36 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 								}
 							/>
 						</div>
+						<div className="space-y-2">
+							<Label htmlFor="llm-model-context-limit">
+								LLM 输入长度上限（tokens）
+							</Label>
+							<Input
+								id="llm-model-context-limit"
+								type="number"
+								min={1}
+								step={1}
+								inputMode="numeric"
+								placeholder="留空则自动跟随模型能力"
+								value={llmModelContextLimitInput}
+								onChange={(event) =>
+									setLlmModelContextLimitInput(event.target.value)
+								}
+							/>
+							<p className="text-muted-foreground text-xs">
+								留空时按当前模型目录自动推导；当前生效{" "}
+								{formatCount(llmStatus?.effective_model_input_limit)} tokens（
+								{formatModelInputLimitSource(
+									llmStatus?.effective_model_input_limit_source,
+								)}
+								）。
+							</p>
+						</div>
 						{llmSettingsSaveError ? (
 							<p className="text-destructive text-sm">{llmSettingsSaveError}</p>
 						) : (
 							<p className="text-muted-foreground text-xs">
-								当前页面会保留正在执行的调用，不会因为缩容而中断已有任务。
+								当前页面会保留正在执行的调用，不会因为缩容而中断已有任务；只有模型目录不准确时，才需要手动填写输入长度上限。
 							</p>
 						)}
 					</div>

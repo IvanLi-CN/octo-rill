@@ -25,14 +25,14 @@ description: OctoRill 本地开发与部署时最常用的配置项。
 - `AI_BASE_URL`
 - `AI_MODEL`
 - `AI_MAX_CONCURRENCY`
-- `AI_MODEL_CONTEXT_LIMIT`
 - `AI_DAILY_AT_LOCAL`
 
 说明：
 
 - 未配置 AI 相关项时，核心登录与浏览流程仍可运行，但翻译与日报能力不可用或受限。
 - `AI_MAX_CONCURRENCY` 控制单进程内同时在途的上游 LLM 请求数；默认 `1`，可按实例容量逐步调高。
-- 管理员在任务中心保存新的 LLM / translation runtime 配置后，这些值会持久化到数据库，并在后续重启时覆盖首次启动的 env/default 种子。
+- release 翻译的输入预算默认按模型目录自动推导；如需手动覆盖，请在管理员任务中心 `LLM 调度` 页签的“配置 LLM 运行参数”里填写 `LLM 输入长度上限（tokens）`。
+- 管理员在任务中心保存新的 LLM / translation runtime 配置后，这些值会持久化到数据库，并在后续重启时覆盖首次启动的 env/default 或空值种子。
 - 对 OpenAI-compatible 网关，`AI_MODEL` 通常需要匹配 `/v1/models` 返回的模型 ID。
 
 ## 本地数据与兼容性
