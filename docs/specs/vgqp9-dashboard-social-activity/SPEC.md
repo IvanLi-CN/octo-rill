@@ -32,7 +32,7 @@
 - 不在 `日报` / `Inbox` tab 内复用社交活动列表。
 - 不给 `Sync starred` 单独增加“被加星 / 被关注”能力。
 - 不追加“空 social tab 再自动触发一次同步”的前端策略。
-- 不做一次性生产回填脚本或手工补写。
+- 不做一次性生产 SQL 补写；旧账号通过下一次正常 social sync 自动完成可见性迁移。
 
 ## 范围（Scope）
 
@@ -96,12 +96,14 @@
 - 用户切到 `被关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
 - 用户点击顶部 `同步` 时，系统继续沿用既有 `starred -> releases -> notifications` 主体验，并在 release 同步完成后补跑社交活动 diff，再刷新页面。
 - access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab。
+- 若账号在升级前已经持有 `follower_current_members` 或 `repo_star_current_members`，但历史 `social_activity_events` 为空，则下一次正常 social sync 必须自动把当前快照补齐成可见事件。
 
 ### Edge cases / errors
 
 - followers API 没有 `followed_at` 字段时，`follower_received` 事件内部使用本次检测到差异的 `detected_at` 排序，但 UI 不显示时间。
 - repo stargazers API 返回 `starred_at` 时，首次与增量 snapshot 都直接写事件，并继续展示真实 `starred_at`。
 - owned-repo GraphQL 若返回 `usesCustomOpenGraphImage = null`，同步必须按 `false` 容忍而不是整轮降级失败。
+- notifications list / thread 若返回 `unread = null`，同步必须按可容忍空值处理，且 thread repair 不得把已有 unread 状态抹成错误值。
 - 若社交同步中某个 repo 暂时不可访问，不能影响 release feed 读取；同步失败按既有 task error/reporting 机制上报。
 - 历史日组只含社交记录时，不显示“生成日报”入口。
 
@@ -210,6 +212,18 @@
 ### Followers tab
 
 ![Followers tab](assets/dashboard-social-followers-tab.png)
+
+### Legacy recovered / All mixed timeline
+
+![Legacy recovered all mixed timeline](assets/dashboard-social-legacy-recovered-all.png)
+
+### Legacy recovered / Stars tab
+
+![Legacy recovered stars tab](assets/dashboard-social-legacy-recovered-stars.png)
+
+### Legacy recovered / Followers tab
+
+![Legacy recovered followers tab](assets/dashboard-social-legacy-recovered-followers.png)
 
 ### Avatar fallback
 

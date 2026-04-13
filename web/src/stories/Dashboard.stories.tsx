@@ -2056,6 +2056,48 @@ export const FollowersTab: Story = {
 	},
 };
 
+export const LegacyRecoveredAllSocialActivity: Story = {
+	...AllMixedSocialActivity,
+	name: "Evidence / Legacy Recovered All Social Activity",
+	parameters: {
+		...AllMixedSocialActivity.parameters,
+		docs: {
+			description: {
+				story:
+					"旧账号在下一次 social sync 后补齐可见事件时，`全部` tab 仍按统一时间线混排 release、repo stars 与 followers。",
+			},
+		},
+	},
+};
+
+export const LegacyRecoveredStarsTab: Story = {
+	...StarsTab,
+	name: "Evidence / Legacy Recovered Stars Tab",
+	parameters: {
+		...StarsTab.parameters,
+		docs: {
+			description: {
+				story:
+					"旧账号恢复可见性后，`被加星` tab 继续只显示 repo star 记录，并保留真实时间。",
+			},
+		},
+	},
+};
+
+export const LegacyRecoveredFollowersTab: Story = {
+	...FollowersTab,
+	name: "Evidence / Legacy Recovered Followers Tab",
+	parameters: {
+		...FollowersTab.parameters,
+		docs: {
+			description: {
+				story:
+					"旧账号恢复可见性后，`被关注` tab 继续只显示 follower 记录，且不展示时间文案。",
+			},
+		},
+	},
+};
+
 export const SocialAvatarFallback: Story = {
 	render: () => {
 		const items = makeMixedSocialFeed().map((item) =>
