@@ -315,7 +315,7 @@ struct StarredRepositories {
 #[serde(rename_all = "camelCase")]
 struct OwnedRepositories {
     page_info: PageInfo,
-    nodes: Vec<RepoNode>,
+    nodes: Vec<OwnedRepoNode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +330,22 @@ struct PageInfo {
 struct StarredEdge {
     starred_at: String,
     node: RepoNode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OwnedRepoNode {
+    database_id: Option<i64>,
+    name_with_owner: String,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<bool>,
+    owner: RepoOwner,
+}
+
+impl OwnedRepoNode {
+    fn uses_custom_open_graph_image(&self) -> bool {
+        self.uses_custom_open_graph_image.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -416,6 +432,16 @@ struct RepoStarCurrentMemberRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+struct RepoStarCurrentMemberEventRow {
+    actor_github_user_id: i64,
+    actor_login: String,
+    actor_avatar_url: Option<String>,
+    actor_html_url: Option<String>,
+    starred_at: Option<String>,
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct OwnedRepoStarBaselineRow {
     repo_id: i64,
     members_snapshot_initialized: i64,
@@ -424,6 +450,15 @@ struct OwnedRepoStarBaselineRow {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct FollowerCurrentMemberRow {
     actor_github_user_id: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct FollowerCurrentMemberEventRow {
+    actor_github_user_id: i64,
+    actor_login: String,
+    actor_avatar_url: Option<String>,
+    actor_html_url: Option<String>,
+    created_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -455,7 +490,7 @@ struct GitHubReleaseReactions {
 #[derive(Debug, Deserialize)]
 struct GitHubNotification {
     id: String,
-    unread: bool,
+    unread: Option<bool>,
     reason: Option<String>,
     updated_at: Option<String>,
     url: Option<String>,
@@ -1315,6 +1350,9 @@ async fn apply_social_activity_snapshot_partial(
             .await
             .context("upsert follower sync baseline")?;
         }
+
+        events_written +=
+            materialize_follower_current_members_tx(&mut tx, user_id, now.as_str()).await?;
     }
 
     if let Some(owned_repos) = owned_repos {
@@ -1420,7 +1458,6 @@ async fn apply_social_activity_snapshot_partial(
                 || !repo_tracking_initialized
                 || newly_discovered_repo_ids.contains(&repo.repo_id)
                 || repo_waiting_for_first_success;
-
             let current_rows = sqlx::query_as::<_, RepoStarCurrentMemberRow>(
                 r#"
                 SELECT actor_github_user_id
@@ -1486,6 +1523,10 @@ async fn apply_social_activity_snapshot_partial(
                     )
                 })?;
             }
+
+            events_written +=
+                materialize_repo_star_current_members_tx(&mut tx, user_id, repo, now.as_str())
+                    .await?;
 
             upsert_owned_repo_star_baseline_tx(&mut tx, user_id, repo, true, now.as_str())
                 .await
@@ -1729,6 +1770,143 @@ async fn upsert_repo_star_current_member_tx(
     .await
     .context("upsert repo star current member")?;
     Ok(())
+}
+
+async fn materialize_follower_current_members_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    now: &str,
+) -> Result<usize> {
+    let rows = sqlx::query_as::<_, FollowerCurrentMemberEventRow>(
+        r#"
+        SELECT
+          cm.actor_github_user_id,
+          cm.actor_login,
+          cm.actor_avatar_url,
+          cm.actor_html_url,
+          cm.created_at
+        FROM follower_current_members cm
+        LEFT JOIN social_activity_events e
+          ON e.user_id = cm.user_id
+         AND e.kind = 'follower_received'
+         AND e.repo_id IS NULL
+         AND e.actor_github_user_id = cm.actor_github_user_id
+         AND e.occurred_at = COALESCE(cm.created_at, ?)
+        WHERE cm.user_id = ?
+          AND e.id IS NULL
+        ORDER BY cm.actor_github_user_id ASC
+        "#,
+    )
+    .bind(now)
+    .bind(user_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("query follower members for social history materialization")?;
+    let mut inserted = 0usize;
+
+    for row in rows {
+        let actor = GitHubActor {
+            id: row.actor_github_user_id,
+            login: row.actor_login,
+            avatar_url: row.actor_avatar_url,
+            html_url: row.actor_html_url,
+        };
+        let occurred_at = row.created_at.as_deref().unwrap_or(now);
+        if insert_social_activity_event_tx(
+            tx,
+            SocialActivityEventInsert {
+                user_id,
+                kind: "follower_received",
+                repo_id: None,
+                repo_full_name: None,
+                repo_visual: None,
+                actor: &actor,
+                occurred_at,
+                detected_at: now,
+            },
+        )
+        .await?
+        {
+            inserted += 1;
+        }
+    }
+
+    Ok(inserted)
+}
+
+async fn materialize_repo_star_current_members_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    user_id: &str,
+    repo: &OwnedRepoSnapshot,
+    now: &str,
+) -> Result<usize> {
+    let rows = sqlx::query_as::<_, RepoStarCurrentMemberEventRow>(
+        r#"
+        SELECT
+          cm.actor_github_user_id,
+          cm.actor_login,
+          cm.actor_avatar_url,
+          cm.actor_html_url,
+          cm.starred_at,
+          cm.created_at
+        FROM repo_star_current_members cm
+        LEFT JOIN social_activity_events e
+          ON e.user_id = cm.user_id
+         AND e.kind = 'repo_star_received'
+         AND e.repo_id = cm.repo_id
+         AND e.actor_github_user_id = cm.actor_github_user_id
+         AND e.occurred_at = COALESCE(cm.starred_at, cm.created_at, ?)
+        WHERE cm.user_id = ?
+          AND cm.repo_id = ?
+          AND e.id IS NULL
+        ORDER BY cm.actor_github_user_id ASC
+        "#,
+    )
+    .bind(now)
+    .bind(user_id)
+    .bind(repo.repo_id)
+    .fetch_all(&mut **tx)
+    .await
+    .with_context(|| {
+        format!(
+            "query repo star members for social history materialization for {}",
+            repo.full_name
+        )
+    })?;
+    let mut inserted = 0usize;
+
+    for row in rows {
+        let actor = GitHubActor {
+            id: row.actor_github_user_id,
+            login: row.actor_login,
+            avatar_url: row.actor_avatar_url,
+            html_url: row.actor_html_url,
+        };
+        let occurred_at = row
+            .starred_at
+            .as_deref()
+            .or(row.created_at.as_deref())
+            .unwrap_or(now);
+        if insert_social_activity_event_tx(
+            tx,
+            SocialActivityEventInsert {
+                user_id,
+                kind: "repo_star_received",
+                repo_id: Some(repo.repo_id),
+                repo_full_name: Some(repo.full_name.as_str()),
+                repo_visual: Some(repo),
+                actor: &actor,
+                occurred_at,
+                detected_at: now,
+            },
+        )
+        .await?
+        {
+            inserted += 1;
+        }
+    }
+
+    Ok(inserted)
 }
 
 async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<HashSet<i64>> {
@@ -4338,7 +4516,10 @@ async fn fetch_owned_repo_snapshot(
     Ok(repos)
 }
 
-fn owned_repo_snapshot_from_node(node: RepoNode, viewer_login: &str) -> Option<OwnedRepoSnapshot> {
+fn owned_repo_snapshot_from_node(
+    node: OwnedRepoNode,
+    viewer_login: &str,
+) -> Option<OwnedRepoSnapshot> {
     let repo_id = node.database_id?;
     if !node.owner.login.eq_ignore_ascii_case(viewer_login) {
         return None;
@@ -4803,7 +4984,15 @@ async fn upsert_notifications(
             INSERT INTO notifications (
               id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
               updated_at, unread, url, html_url, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )
+            SELECT
+              ?, ?, ?, ?, ?, ?, ?, ?,
+              COALESCE(?, (
+                SELECT unread
+                FROM notifications
+                WHERE user_id = ? AND thread_id = ?
+              ), 0),
+              ?, ?, ?
             ON CONFLICT(user_id, thread_id) DO UPDATE SET
               repo_full_name = excluded.repo_full_name,
               subject_title = excluded.subject_title,
@@ -4823,7 +5012,9 @@ async fn upsert_notifications(
         .bind(notification.subject.subject_type.as_deref())
         .bind(notification.reason.as_deref())
         .bind(notification.updated_at.as_deref())
-        .bind(notification.unread as i64)
+        .bind(notification.unread.map(i64::from))
+        .bind(user_id)
+        .bind(&notification.id)
         .bind(api_url)
         .bind(html_url)
         .bind(now)
@@ -4953,7 +5144,8 @@ where
             .or(updated_at.clone());
         let resolved_unread = thread
             .as_ref()
-            .map(|item| item.unread as i64)
+            .and_then(|item| item.unread)
+            .map(|unread| unread as i64)
             .unwrap_or(unread);
         let resolved_api_url = match (&thread_refresh, thread) {
             (_, Some(item)) => item
@@ -5172,7 +5364,7 @@ mod tests {
         EligibleUserRow, FollowerSnapshot, GitHubActor, GitHubNotification,
         NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
         NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
-        NotificationSubject, OwnedRepoSnapshot, ReleaseDemandRepo, RepoNode, RepoOwner,
+        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, ReleaseDemandRepo, RepoOwner,
         RepoReleaseOrigin, RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess,
         StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
@@ -5209,13 +5401,9 @@ mod tests {
     #[test]
     fn owned_repo_snapshot_from_node_preserves_visuals_for_viewer_owned_repo() {
         let snapshot = owned_repo_snapshot_from_node(
-            RepoNode {
+            OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
-                name: "rocket".to_owned(),
-                description: None,
-                url: "https://github.com/octo/rocket".to_owned(),
-                is_private: false,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
                 ),
@@ -5245,13 +5433,9 @@ mod tests {
     #[test]
     fn owned_repo_snapshot_from_node_defaults_visual_flag_when_graphql_returns_null() {
         let snapshot = owned_repo_snapshot_from_node(
-            RepoNode {
+            OwnedRepoNode {
                 database_id: Some(42),
                 name_with_owner: "octo/rocket".to_owned(),
-                name: "rocket".to_owned(),
-                description: None,
-                url: "https://github.com/octo/rocket".to_owned(),
-                is_private: false,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
                 ),
@@ -5271,13 +5455,9 @@ mod tests {
     #[test]
     fn owned_repo_snapshot_from_node_skips_non_viewer_owned_repo() {
         let snapshot = owned_repo_snapshot_from_node(
-            RepoNode {
+            OwnedRepoNode {
                 database_id: Some(99),
                 name_with_owner: "acme/shared".to_owned(),
-                name: "shared".to_owned(),
-                description: None,
-                url: "https://github.com/acme/shared".to_owned(),
-                is_private: false,
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/99/shared".to_owned(),
                 ),
@@ -5291,6 +5471,145 @@ mod tests {
         );
 
         assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn owned_repo_node_deserializes_minimal_graphql_payload_with_null_visual_flag() {
+        let node: OwnedRepoNode = serde_json::from_value(json!({
+            "databaseId": 42,
+            "nameWithOwner": "octo/rocket",
+            "openGraphImageUrl": "https://repository-images.githubusercontent.com/42/rocket",
+            "usesCustomOpenGraphImage": null,
+            "owner": {
+                "login": "octo",
+                "avatarUrl": "https://avatars.githubusercontent.com/u/42"
+            }
+        }))
+        .expect("deserialize owned repo node");
+
+        assert_eq!(node.database_id, Some(42));
+        assert_eq!(node.name_with_owner, "octo/rocket");
+        assert!(!node.uses_custom_open_graph_image());
+    }
+
+    #[test]
+    fn github_notification_deserializes_nullable_unread() {
+        let notification: GitHubNotification = serde_json::from_value(json!({
+            "id": "123",
+            "unread": null,
+            "reason": "subscribed",
+            "updated_at": "2026-04-13T09:00:00Z",
+            "url": "https://api.github.com/notifications/threads/123",
+            "subject": {
+                "title": "Issue",
+                "type": "Issue",
+                "url": "https://api.github.com/repos/octo/rocket/issues/1"
+            },
+            "repository": {
+                "full_name": "octo/rocket"
+            }
+        }))
+        .expect("deserialize notification with null unread");
+
+        assert_eq!(notification.unread, None);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_defaults_new_null_unread_to_read() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-null-unread-new-row");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T10:00:00Z";
+
+        let mut notification = mock_notification(
+            "thread-new-null-unread",
+            Some("https://api.github.com/repos/octo/rocket/issues/2"),
+            Some("octo/rocket"),
+            Some("Issue"),
+            now,
+        );
+        notification.unread = None;
+
+        super::upsert_notifications(state.as_ref(), user_id.as_str(), &[notification], now)
+            .await
+            .expect("upsert notifications");
+
+        let unread = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-new-null-unread")
+        .fetch_one(&pool)
+        .await
+        .expect("load new notification unread");
+
+        assert_eq!(unread, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_preserves_existing_unread_when_payload_is_null() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("notifications-null-unread-preserve");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T10:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("thread-read")
+        .bind("octo/rocket")
+        .bind("Read thread")
+        .bind("Issue")
+        .bind("subscribed")
+        .bind("2026-04-13T09:00:00Z")
+        .bind(0_i64)
+        .bind("https://api.github.com/notifications/threads/thread-read")
+        .bind("https://github.com/octo/rocket/issues/1")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("seed read notification");
+
+        let mut notification = mock_notification(
+            "thread-read",
+            Some("https://api.github.com/repos/octo/rocket/issues/1"),
+            Some("octo/rocket"),
+            Some("Issue"),
+            now,
+        );
+        notification.unread = None;
+
+        super::upsert_notifications(state.as_ref(), user_id.as_str(), &[notification], now)
+            .await
+            .expect("upsert notifications");
+
+        let unread = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-read")
+        .fetch_one(&pool)
+        .await
+        .expect("load notification unread");
+
+        assert_eq!(unread, 0);
     }
 
     #[test]
@@ -6461,6 +6780,652 @@ mod tests {
         assert_eq!(history_rows[1].1.as_deref(), Some("octo/alpha"));
         assert_eq!(history_rows[1].2, "octocat");
         assert_eq!(history_rows[1].3, "2026-03-06T10:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn social_activity_materializes_legacy_followers_without_existing_history() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-legacy-followers");
+        seed_user(&pool, user_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO follower_sync_baselines (id, user_id, initialized_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("2026-03-06T09:00:00Z")
+        .bind("2026-03-06T09:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert follower baseline");
+        sqlx::query(
+            r#"
+            INSERT INTO follower_current_members (
+              id,
+              user_id,
+              actor_github_user_id,
+              actor_login,
+              actor_avatar_url,
+              actor_html_url,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(201_i64)
+        .bind("monalisa")
+        .bind("https://avatars.example/monalisa.png")
+        .bind("https://github.com/monalisa")
+        .bind("2026-03-06T09:05:00Z")
+        .bind("2026-03-06T09:05:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert follower current member");
+
+        let events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(&[FollowerSnapshot {
+                actor: GitHubActor {
+                    id: 201,
+                    login: "monalisa".to_owned(),
+                    avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                    html_url: Some("https://github.com/monalisa".to_owned()),
+                },
+            }]),
+        )
+        .await
+        .expect("materialize legacy followers");
+        assert_eq!(events, 1);
+
+        let row: (String, String) = sqlx::query_as(
+            r#"
+            SELECT actor_login, occurred_at
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'follower_received'
+            ORDER BY occurred_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load follower history");
+        assert_eq!(row.0, "monalisa");
+        assert_eq!(row.1, "2026-03-06T09:05:00Z");
+
+        let second_events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(&[FollowerSnapshot {
+                actor: GitHubActor {
+                    id: 201,
+                    login: "monalisa".to_owned(),
+                    avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                    html_url: Some("https://github.com/monalisa".to_owned()),
+                },
+            }]),
+        )
+        .await
+        .expect("re-run follower migration");
+        assert_eq!(second_events, 0);
+    }
+
+    #[tokio::test]
+    async fn social_activity_materializes_legacy_repo_stars_without_existing_history() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-legacy-stars");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: Some("https://avatars.example/octo.png".to_owned()),
+            open_graph_image_url: Some(
+                "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
+            ),
+            uses_custom_open_graph_image: true,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_star_sync_baselines (id, user_id, initialized_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("2026-03-06T08:00:00Z")
+        .bind("2026-03-06T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert repo star baseline");
+        sqlx::query(
+            r#"
+            INSERT INTO owned_repo_star_baselines (
+              id,
+              user_id,
+              repo_id,
+              repo_full_name,
+              owner_avatar_url,
+              open_graph_image_url,
+              uses_custom_open_graph_image,
+              members_snapshot_initialized,
+              initialized_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .bind(repo.full_name.as_str())
+        .bind(repo.owner_avatar_url.as_deref())
+        .bind(repo.open_graph_image_url.as_deref())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind("2026-03-06T08:00:00Z")
+        .bind("2026-03-06T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert owned repo baseline");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_star_current_members (
+              id,
+              user_id,
+              repo_id,
+              repo_full_name,
+              actor_github_user_id,
+              actor_login,
+              actor_avatar_url,
+              actor_html_url,
+              starred_at,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .bind(repo.full_name.as_str())
+        .bind(301_i64)
+        .bind("ghost")
+        .bind("https://avatars.example/ghost.png")
+        .bind("https://github.com/ghost")
+        .bind("2026-03-01T12:00:00Z")
+        .bind("2026-03-06T08:05:00Z")
+        .bind("2026-03-06T08:05:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert repo star current member");
+
+        let events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(
+                repo.clone(),
+                vec![RepoStargazerSnapshot {
+                    repo_id: repo.repo_id,
+                    repo_full_name: repo.full_name.clone(),
+                    actor: GitHubActor {
+                        id: 301,
+                        login: "ghost".to_owned(),
+                        avatar_url: Some("https://avatars.example/ghost.png".to_owned()),
+                        html_url: Some("https://github.com/ghost".to_owned()),
+                    },
+                    starred_at: Some("2026-03-01T12:00:00Z".to_owned()),
+                }],
+            )],
+            &[],
+        )
+        .await
+        .expect("materialize legacy repo stars");
+        assert_eq!(events, 1);
+
+        let row: (String, String, Option<String>, i64) = sqlx::query_as(
+            r#"
+            SELECT actor_login, occurred_at, repo_open_graph_image_url, repo_uses_custom_open_graph_image
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'repo_star_received'
+            ORDER BY occurred_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load repo star history");
+        assert_eq!(row.0, "ghost");
+        assert_eq!(row.1, "2026-03-01T12:00:00Z");
+        assert_eq!(
+            row.2.as_deref(),
+            Some("https://repository-images.githubusercontent.com/42/alpha")
+        );
+        assert_eq!(row.3, 1);
+
+        let second_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(
+                repo.clone(),
+                vec![RepoStargazerSnapshot {
+                    repo_id: repo.repo_id,
+                    repo_full_name: repo.full_name.clone(),
+                    actor: GitHubActor {
+                        id: 301,
+                        login: "ghost".to_owned(),
+                        avatar_url: Some("https://avatars.example/ghost.png".to_owned()),
+                        html_url: Some("https://github.com/ghost".to_owned()),
+                    },
+                    starred_at: Some("2026-03-01T12:00:00Z".to_owned()),
+                }],
+            )],
+            &[],
+        )
+        .await
+        .expect("re-run repo star migration");
+        assert_eq!(second_events, 0);
+    }
+
+    #[tokio::test]
+    async fn social_activity_materializes_missing_legacy_followers_when_history_is_partial() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-partial-legacy-followers");
+        seed_user(&pool, user_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO follower_sync_baselines (id, user_id, initialized_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("2026-03-06T09:00:00Z")
+        .bind("2026-03-06T09:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert follower baseline");
+
+        for (actor_id, login, created_at) in [
+            (201_i64, "monalisa", "2026-03-06T09:05:00Z"),
+            (202_i64, "hubot", "2026-03-06T09:06:00Z"),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO follower_current_members (
+                  id,
+                  user_id,
+                  actor_github_user_id,
+                  actor_login,
+                  actor_avatar_url,
+                  actor_html_url,
+                  created_at,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(user_id.as_str())
+            .bind(actor_id)
+            .bind(login)
+            .bind(format!("https://avatars.example/{login}.png"))
+            .bind(format!("https://github.com/{login}"))
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert follower current member");
+        }
+
+        let mut tx = pool.begin().await.expect("begin follower history tx");
+        let inserted = insert_social_activity_event_tx(
+            &mut tx,
+            SocialActivityEventInsert {
+                user_id: user_id.as_str(),
+                kind: "follower_received",
+                repo_id: None,
+                repo_full_name: None,
+                repo_visual: None,
+                actor: &GitHubActor {
+                    id: 201,
+                    login: "monalisa".to_owned(),
+                    avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                    html_url: Some("https://github.com/monalisa".to_owned()),
+                },
+                occurred_at: "2026-03-06T09:05:00Z",
+                detected_at: "2026-03-06T09:05:00Z",
+            },
+        )
+        .await
+        .expect("insert existing follower history");
+        assert!(inserted);
+        tx.commit().await.expect("commit follower history tx");
+
+        let events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(&[
+                FollowerSnapshot {
+                    actor: GitHubActor {
+                        id: 201,
+                        login: "monalisa".to_owned(),
+                        avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                        html_url: Some("https://github.com/monalisa".to_owned()),
+                    },
+                },
+                FollowerSnapshot {
+                    actor: GitHubActor {
+                        id: 202,
+                        login: "hubot".to_owned(),
+                        avatar_url: Some("https://avatars.example/hubot.png".to_owned()),
+                        html_url: Some("https://github.com/hubot".to_owned()),
+                    },
+                },
+            ]),
+        )
+        .await
+        .expect("materialize partial legacy followers");
+        assert_eq!(events, 1);
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT actor_login, occurred_at
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'follower_received'
+            ORDER BY actor_github_user_id ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load follower history rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("monalisa".to_owned(), "2026-03-06T09:05:00Z".to_owned()),
+                ("hubot".to_owned(), "2026-03-06T09:06:00Z".to_owned()),
+            ]
+        );
+
+        let second_events = apply_social_activity_snapshot_partial(
+            state.as_ref(),
+            user_id.as_str(),
+            None,
+            None,
+            Some(&[
+                FollowerSnapshot {
+                    actor: GitHubActor {
+                        id: 201,
+                        login: "monalisa".to_owned(),
+                        avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                        html_url: Some("https://github.com/monalisa".to_owned()),
+                    },
+                },
+                FollowerSnapshot {
+                    actor: GitHubActor {
+                        id: 202,
+                        login: "hubot".to_owned(),
+                        avatar_url: Some("https://avatars.example/hubot.png".to_owned()),
+                        html_url: Some("https://github.com/hubot".to_owned()),
+                    },
+                },
+            ]),
+        )
+        .await
+        .expect("re-run partial follower migration");
+        assert_eq!(second_events, 0);
+    }
+
+    #[tokio::test]
+    async fn social_activity_materializes_missing_legacy_repo_stars_when_history_is_partial() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-partial-legacy-stars");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: Some("https://avatars.example/octo.png".to_owned()),
+            open_graph_image_url: Some(
+                "https://repository-images.githubusercontent.com/42/alpha".to_owned(),
+            ),
+            uses_custom_open_graph_image: true,
+        };
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_star_sync_baselines (id, user_id, initialized_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("2026-03-06T08:00:00Z")
+        .bind("2026-03-06T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert repo star baseline");
+        sqlx::query(
+            r#"
+            INSERT INTO owned_repo_star_baselines (
+              id,
+              user_id,
+              repo_id,
+              repo_full_name,
+              owner_avatar_url,
+              open_graph_image_url,
+              uses_custom_open_graph_image,
+              members_snapshot_initialized,
+              initialized_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .bind(repo.full_name.as_str())
+        .bind(repo.owner_avatar_url.as_deref())
+        .bind(repo.open_graph_image_url.as_deref())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind("2026-03-06T08:00:00Z")
+        .bind("2026-03-06T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert owned repo baseline");
+
+        for (actor_id, login, starred_at, created_at) in [
+            (
+                301_i64,
+                "ghost",
+                "2026-03-01T12:00:00Z",
+                "2026-03-06T08:05:00Z",
+            ),
+            (
+                302_i64,
+                "mona",
+                "2026-03-02T12:00:00Z",
+                "2026-03-06T08:06:00Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO repo_star_current_members (
+                  id,
+                  user_id,
+                  repo_id,
+                  repo_full_name,
+                  actor_github_user_id,
+                  actor_login,
+                  actor_avatar_url,
+                  actor_html_url,
+                  starred_at,
+                  created_at,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(user_id.as_str())
+            .bind(repo.repo_id)
+            .bind(repo.full_name.as_str())
+            .bind(actor_id)
+            .bind(login)
+            .bind(format!("https://avatars.example/{login}.png"))
+            .bind(format!("https://github.com/{login}"))
+            .bind(starred_at)
+            .bind(created_at)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert repo star current member");
+        }
+
+        let mut tx = pool.begin().await.expect("begin repo star history tx");
+        let inserted = insert_social_activity_event_tx(
+            &mut tx,
+            SocialActivityEventInsert {
+                user_id: user_id.as_str(),
+                kind: "repo_star_received",
+                repo_id: Some(repo.repo_id),
+                repo_full_name: Some(repo.full_name.as_str()),
+                repo_visual: Some(&repo),
+                actor: &GitHubActor {
+                    id: 301,
+                    login: "ghost".to_owned(),
+                    avatar_url: Some("https://avatars.example/ghost.png".to_owned()),
+                    html_url: Some("https://github.com/ghost".to_owned()),
+                },
+                occurred_at: "2026-03-01T12:00:00Z",
+                detected_at: "2026-03-06T08:05:00Z",
+            },
+        )
+        .await
+        .expect("insert existing repo star history");
+        assert!(inserted);
+        tx.commit().await.expect("commit repo star history tx");
+
+        let events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(
+                repo.clone(),
+                vec![
+                    RepoStargazerSnapshot {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 301,
+                            login: "ghost".to_owned(),
+                            avatar_url: Some("https://avatars.example/ghost.png".to_owned()),
+                            html_url: Some("https://github.com/ghost".to_owned()),
+                        },
+                        starred_at: Some("2026-03-01T12:00:00Z".to_owned()),
+                    },
+                    RepoStargazerSnapshot {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 302,
+                            login: "mona".to_owned(),
+                            avatar_url: Some("https://avatars.example/mona.png".to_owned()),
+                            html_url: Some("https://github.com/mona".to_owned()),
+                        },
+                        starred_at: Some("2026-03-02T12:00:00Z".to_owned()),
+                    },
+                ],
+            )],
+            &[],
+        )
+        .await
+        .expect("materialize partial legacy repo stars");
+        assert_eq!(events, 1);
+
+        let rows = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT actor_login, occurred_at
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'repo_star_received' AND repo_id = ?
+            ORDER BY actor_github_user_id ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .fetch_all(&pool)
+        .await
+        .expect("load repo star history rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("ghost".to_owned(), "2026-03-01T12:00:00Z".to_owned()),
+                ("mona".to_owned(), "2026-03-02T12:00:00Z".to_owned()),
+            ]
+        );
+
+        let second_events = apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(
+                repo.clone(),
+                vec![
+                    RepoStargazerSnapshot {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 301,
+                            login: "ghost".to_owned(),
+                            avatar_url: Some("https://avatars.example/ghost.png".to_owned()),
+                            html_url: Some("https://github.com/ghost".to_owned()),
+                        },
+                        starred_at: Some("2026-03-01T12:00:00Z".to_owned()),
+                    },
+                    RepoStargazerSnapshot {
+                        repo_id: repo.repo_id,
+                        repo_full_name: repo.full_name.clone(),
+                        actor: GitHubActor {
+                            id: 302,
+                            login: "mona".to_owned(),
+                            avatar_url: Some("https://avatars.example/mona.png".to_owned()),
+                            html_url: Some("https://github.com/mona".to_owned()),
+                        },
+                        starred_at: Some("2026-03-02T12:00:00Z".to_owned()),
+                    },
+                ],
+            )],
+            &[],
+        )
+        .await
+        .expect("re-run partial repo star migration");
+        assert_eq!(second_events, 0);
     }
 
     #[tokio::test]
@@ -8198,7 +9163,7 @@ mod tests {
     ) -> GitHubNotification {
         GitHubNotification {
             id: id.to_owned(),
-            unread: true,
+            unread: Some(true),
             reason: Some("state_change".to_owned()),
             updated_at: Some(updated_at.to_owned()),
             url: Some(format!("https://api.github.com/notifications/threads/{id}")),
