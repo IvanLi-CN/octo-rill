@@ -2032,7 +2032,13 @@ export const FollowersTab: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
-		await expect(canvas.getByText("关注", { exact: true })).toBeVisible();
+		await expect(
+			within(
+				canvasElement.querySelector<HTMLElement>(
+					'[data-social-card-kind="follower_received"]',
+				) ?? canvasElement,
+			).getByText("关注", { exact: true }),
+		).toBeVisible();
 		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
 			'[data-social-card-kind="follower_received"]',
 		);
