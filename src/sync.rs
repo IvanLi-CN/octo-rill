@@ -8067,7 +8067,6 @@ mod tests {
             },
             ai: None,
             ai_max_concurrency: 1,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");

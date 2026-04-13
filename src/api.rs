@@ -2228,6 +2228,9 @@ pub struct AdminLlmCallsResponse {
 pub struct AdminLlmSchedulerStatusResponse {
     scheduler_enabled: bool,
     max_concurrency: i64,
+    ai_model_context_limit: Option<i64>,
+    effective_model_input_limit: i64,
+    effective_model_input_limit_source: String,
     available_slots: i64,
     waiting_calls: i64,
     in_flight_calls: i64,
@@ -2242,6 +2245,7 @@ pub struct AdminLlmSchedulerStatusResponse {
 #[derive(Debug, Deserialize)]
 pub struct AdminLlmRuntimeConfigUpdateRequest {
     max_concurrency: i64,
+    ai_model_context_limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2415,9 +2419,20 @@ pub async fn admin_patch_llm_runtime_config(
 ) -> Result<Json<AdminLlmSchedulerStatusResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let max_concurrency = parse_positive_admin_concurrency(req.max_concurrency, "max_concurrency")?;
-    admin_runtime::update_llm_runtime_settings(&state.pool, max_concurrency)
-        .await
-        .map_err(ApiError::internal)?;
+    let ai_model_context_limit = match req.ai_model_context_limit {
+        Some(value) => Some(parse_positive_runtime_limit(
+            value,
+            "ai_model_context_limit",
+        )?),
+        None => None,
+    };
+    admin_runtime::update_llm_runtime_settings(
+        &state.pool,
+        max_concurrency,
+        ai_model_context_limit,
+    )
+    .await
+    .map_err(ApiError::internal)?;
     admin_runtime::sync_persisted_runtime_settings(state.clone())
         .await
         .map_err(ApiError::internal)?;
@@ -2470,10 +2485,18 @@ async fn load_admin_llm_scheduler_status_response(
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
+    let effective_model_input_limit = ai::resolve_model_input_limit_with_source(state).await;
+    let ai_model_context_limit = admin_runtime::load_ai_model_context_limit(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+        .map(i64::from);
 
     Ok(AdminLlmSchedulerStatusResponse {
         scheduler_enabled: state.config.ai.is_some(),
         max_concurrency: runtime.max_concurrency,
+        ai_model_context_limit,
+        effective_model_input_limit: i64::from(effective_model_input_limit.0),
+        effective_model_input_limit_source: effective_model_input_limit.1.to_owned(),
         available_slots: runtime.available_slots,
         waiting_calls: runtime.waiting_calls,
         in_flight_calls: runtime.in_flight_calls,
@@ -2498,6 +2521,17 @@ fn parse_positive_admin_concurrency(value: i64, field: &str) -> Result<usize, Ap
         return Err(ApiError::bad_request(format!(
             "{field} must be a positive integer <= {}",
             tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_runtime_limit(value: i64, field: &str) -> Result<u32, ApiError> {
+    let parsed = u32::try_from(value)
+        .map_err(|_| ApiError::bad_request(format!("{field} must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be a positive integer"
         )));
     }
     Ok(parsed)
@@ -4064,6 +4098,11 @@ struct FeedRow {
     trans_title: Option<String>,
     trans_summary: Option<String>,
     trans_work_status: Option<String>,
+    detail_trans_source_hash: Option<String>,
+    detail_trans_status: Option<String>,
+    detail_trans_title: Option<String>,
+    detail_trans_summary: Option<String>,
+    detail_trans_work_status: Option<String>,
     smart_source_hash: Option<String>,
     smart_status: Option<String>,
     smart_title: Option<String>,
@@ -4234,7 +4273,7 @@ fn repo_visual_from_parts(
     })
 }
 
-fn release_detail_source_hash(
+pub(crate) fn release_detail_source_hash(
     repo_full_name: &str,
     original_title: &str,
     original_body: &str,
@@ -4612,6 +4651,11 @@ async fn fetch_feed_items(
           t.title AS trans_title,
           t.summary AS trans_summary,
           tw.status AS trans_work_status,
+          dt.source_hash AS detail_trans_source_hash,
+          dt.status AS detail_trans_status,
+          dt.title AS detail_trans_title,
+          dt.summary AS detail_trans_summary,
+          dtw.status AS detail_trans_work_status,
           s.source_hash AS smart_source_hash,
           s.status AS smart_status,
           s.title AS smart_title,
@@ -4623,6 +4667,10 @@ async fn fetch_feed_items(
           ON t.user_id = ? AND t.entity_type = 'release' AND t.entity_id = i.entity_id AND t.lang = 'zh-CN' AND t.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
+        LEFT JOIN ai_translations dt
+          ON dt.user_id = ? AND dt.entity_type = 'release_detail' AND dt.entity_id = i.entity_id AND dt.lang = 'zh-CN' AND dt.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items dtw
+          ON dtw.id = dt.active_work_item_id
         LEFT JOIN ai_translations s
           ON s.user_id = ? AND s.entity_type = 'release_smart' AND s.entity_id = i.entity_id AND s.lang = 'zh-CN' AND s.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items sw
@@ -4646,6 +4694,7 @@ async fn fetch_feed_items(
     let cursor = cursor.cloned();
 
     let qy = sqlx::query_as::<_, FeedRow>(sql)
+        .bind(user_id)
         .bind(user_id)
         .bind(user_id)
         .bind(user_id)
@@ -5134,32 +5183,66 @@ fn feed_item_from_row(
         })
     } else {
         let current_hash = ai::sha256_hex(&source);
+        let detail_current_hash = release_detail_source_hash(
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            r.release_body.as_deref().unwrap_or(""),
+        );
         let refresh_in_flight = r.trans_source_hash.as_deref() != Some(current_hash.as_str())
             && r.trans_status.as_deref() == Some("ready")
             && matches!(
                 r.trans_work_status.as_deref(),
                 Some("queued" | "batched" | "running")
             );
-        if body_truncated {
-            match r.trans_status.as_deref() {
-                Some("disabled" | "error")
-                    if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) =>
+        let detail_refresh_in_flight = r.detail_trans_source_hash.as_deref()
+            != Some(detail_current_hash.as_str())
+            && r.detail_trans_status.as_deref() == Some("ready")
+            && matches!(
+                r.detail_trans_work_status.as_deref(),
+                Some("queued" | "batched" | "running")
+            );
+        if r.detail_trans_source_hash.as_deref() == Some(detail_current_hash.as_str()) {
+            if let Some(status) = r.detail_trans_status.as_deref()
+                && status != "ready"
+            {
+                translated_terminal_item(status)
+            } else {
+                let (mut title, mut summary) = normalize_translation_fields(
+                    r.detail_trans_title.clone(),
+                    r.detail_trans_summary.clone(),
+                );
+                let mut status = "ready".to_owned();
+                if !release_detail_translation_ready(r.release_body.as_deref(), summary.as_deref())
                 {
-                    translated_terminal_item(r.trans_status.as_deref().unwrap_or("error"))
+                    status = "missing".to_owned();
+                    title = None;
+                    summary = None;
                 }
-                _ => Some(TranslatedItem {
+
+                Some(TranslatedItem {
                     lang: "zh-CN".to_owned(),
-                    status: "error".to_owned(),
-                    title: None,
-                    summary: None,
-                    auto_translate: Some(false),
-                }),
+                    status,
+                    title,
+                    summary,
+                    auto_translate: None,
+                })
             }
+        } else if detail_refresh_in_flight {
+            translated_ready_item(
+                r.detail_trans_title.clone(),
+                r.detail_trans_summary.clone(),
+                Some(true),
+            )
+            .or_else(|| Some(translated_missing_item(false)))
         } else if r.trans_source_hash.as_deref() == Some(current_hash.as_str()) {
             if let Some(status) = r.trans_status.as_deref()
                 && status != "ready"
             {
-                translated_terminal_item(status)
+                if status == "disabled" {
+                    translated_terminal_item(status)
+                } else {
+                    Some(translated_missing_item(true))
+                }
             } else {
                 let (mut title, mut summary) =
                     normalize_translation_fields(r.trans_title.clone(), r.trans_summary.clone());
@@ -5872,6 +5955,7 @@ fn parse_json_value_relaxed(raw: &str) -> Option<serde_json::Value> {
         .or_else(|| extract_json_array_span(trimmed).and_then(parse_direct))
 }
 
+#[cfg(test)]
 fn value_as_i64(raw: &serde_json::Value) -> Option<i64> {
     if let Some(v) = raw.as_i64() {
         return Some(v);
@@ -5991,11 +6075,13 @@ fn extract_translation_from_json_blob(raw: &str) -> Option<(Option<String>, Opti
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct BatchReleaseTranslationPayload {
     items: Vec<BatchReleaseTranslationItem>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct BatchReleaseTranslationItem {
     release_id: i64,
@@ -6077,6 +6163,7 @@ fn parse_unique_thread_ids(raw_ids: &[String], max_items: usize) -> Result<Vec<S
     Ok(out)
 }
 
+#[cfg(test)]
 fn parse_batch_release_translation_payload(raw: &str) -> Option<BatchReleaseTranslationPayload> {
     let value = parse_json_value_relaxed(raw)?;
     let items = extract_items_array(&value)?;
@@ -6312,9 +6399,36 @@ fn preserve_chunk_trailing_newline(source_chunk: &str, translated_chunk: String)
     translated_chunk
 }
 
-const RELEASE_DETAIL_CHUNK_MAX_CHARS: usize = 2200;
-const RELEASE_DETAIL_CHUNK_MAX_TOKENS: u32 = 2200;
+const RELEASE_DETAIL_CHUNK_PROMPT_OVERHEAD_TOKENS: u32 = 320;
 
+#[derive(Debug, Clone, Copy)]
+struct ReleaseDetailChunkBudget {
+    max_chars: usize,
+    input_budget: u32,
+    max_output_tokens: u32,
+    model_input_limit: u32,
+    fallback_source: &'static str,
+}
+
+async fn release_detail_chunk_budget(state: &AppState) -> ReleaseDetailChunkBudget {
+    let budget_info = ai::compute_input_budget_with_source(state, 0).await;
+    let io_budget = budget_info
+        .input_budget
+        .saturating_sub(RELEASE_DETAIL_CHUNK_PROMPT_OVERHEAD_TOKENS)
+        .max(2);
+    let input_budget = (io_budget / 2).max(1);
+    let max_output_tokens = io_budget.saturating_sub(input_budget).max(1);
+
+    ReleaseDetailChunkBudget {
+        max_chars: usize::try_from(input_budget.saturating_mul(4)).unwrap_or(usize::MAX),
+        input_budget,
+        max_output_tokens,
+        model_input_limit: budget_info.model_input_limit,
+        fallback_source: budget_info.fallback_source,
+    }
+}
+
+#[cfg(test)]
 fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
     let parsed = parse_translation_json(raw);
     let out_title = parsed
@@ -6341,22 +6455,6 @@ fn extract_translation_fields(raw: &str) -> (Option<String>, Option<String>) {
             }
         });
     (out_title, out_summary)
-}
-
-fn release_translation_prompt(
-    repo: &str,
-    title: &str,
-    body: &str,
-    previous_summary: Option<&str>,
-) -> String {
-    match previous_summary {
-        Some(previous_summary) => format!(
-            "Repo: {repo}\nOriginal title: {title}\n\nRelease notes body:\n{body}\n\n上一次翻译（不合格，Markdown 结构丢失）：\n{previous_summary}\n\n请重新翻译并输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与 body 完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。"
-        ),
-        None => format!(
-            "Repo: {repo}\nOriginal title: {title}\n\nRelease notes body:\n{body}\n\n请把这条 Release 的标题与内容翻译为中文，输出严格 JSON（不要 markdown code block）：\n{{\"title_zh\": \"...\", \"summary_md\": \"...\"}}\n\n硬性要求：\n1) summary_md 的非空行数必须与 body 完全一致；\n2) 每行保持相同 Markdown 前缀（#, -, 1., >）；\n3) 若原文该行包含 ** 或 `，译文该行也必须保留；\n4) 仅翻译文字，不得合并、拆分或删除行；\n5) 不新增信息，不输出 URL。"
-        ),
-    }
 }
 
 struct TranslationUpsert<'a> {
@@ -6456,8 +6554,6 @@ struct ReleaseBatchCandidate {
     entity_id: String,
     full_name: String,
     title: String,
-    body: String,
-    source_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -6466,31 +6562,6 @@ struct ReleaseBatchTerminalState {
     error: Option<String>,
 }
 
-fn build_release_batch_prompt(batch: &[ReleaseBatchCandidate]) -> String {
-    let mut prompt = String::from(
-        "你会收到多条 GitHub Release 正文。请逐条翻译为中文。\n\
-输出严格 JSON（不要 markdown code block）：\n\
-{\"items\":[{\"release_id\":123,\"title_zh\":\"...\",\"summary_md\":\"...\"}]}\n\
-硬性要求：\n\
-1) 每个输入 release_id 必须在输出 items 中出现一次；\n\
-2) 不新增事实，不输出任何 URL；\n\
-3) summary_md 保持 Markdown 结构，不合并/拆分输入内容。\n",
-    );
-
-    for item in batch {
-        prompt.push_str("\n---\n");
-        prompt.push_str(&format!("release_id: {}\n", item.release_id));
-        prompt.push_str(&format!("repo: {}\n", item.full_name));
-        prompt.push_str(&format!("title: {}\n", item.title));
-        prompt.push_str("body:\n");
-        prompt.push_str(&item.body);
-        prompt.push('\n');
-    }
-    prompt
-}
-
-const RELEASE_BATCH_MAX_TOKENS: u32 = 1_400;
-const RELEASE_BATCH_OVERHEAD_TOKENS: u32 = 320;
 const NOTIFICATION_BATCH_MAX_TOKENS: u32 = 1_100;
 const NOTIFICATION_BATCH_OVERHEAD_TOKENS: u32 = 220;
 
@@ -6544,191 +6615,6 @@ fn normalize_translation_fields(
     (title, summary)
 }
 
-async fn translate_release_single_candidate_with_ai(
-    state: &AppState,
-    item: &ReleaseBatchCandidate,
-) -> Option<(Option<String>, Option<String>)> {
-    let prompt = release_translation_prompt(&item.full_name, &item.title, &item.body, None);
-    let raw = ai::chat_completion(
-        state,
-        "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
-        &prompt,
-        900,
-    )
-    .await
-    .ok()?;
-
-    let (mut out_title, mut out_summary) = extract_translation_fields(&raw);
-    if let Some(summary) = out_summary.as_deref()
-        && !markdown_structure_preserved(&item.body, summary)
-    {
-        let retry_prompt =
-            release_translation_prompt(&item.full_name, &item.title, &item.body, Some(summary));
-        if let Ok(retry_raw) = ai::chat_completion(
-            state,
-            "你是一个助理，负责把 GitHub Release 标题与发布说明翻译为中文（严格保留 Markdown 结构与标记，不新增信息）。不要包含任何 URL。",
-            &retry_prompt,
-            900,
-        )
-        .await
-        {
-            let (retry_title, retry_summary) = extract_translation_fields(&retry_raw);
-            if retry_summary
-                .as_deref()
-                .is_some_and(|s| markdown_structure_preserved(&item.body, s))
-            {
-                out_title = retry_title.or(out_title);
-                out_summary = retry_summary;
-            }
-        }
-    }
-
-    if out_title.is_none() && out_summary.is_none() {
-        None
-    } else if !item.body.trim().is_empty() && out_summary.is_none() {
-        // A translated title without body summary regresses UX because the item becomes non-retryable.
-        None
-    } else {
-        Some((out_title, out_summary))
-    }
-}
-
-async fn plan_release_translation_groups(
-    state: &AppState,
-    pending: &[ReleaseBatchCandidate],
-) -> Vec<Vec<usize>> {
-    let budget_info = ai::compute_input_budget_with_source(state, RELEASE_BATCH_MAX_TOKENS).await;
-    let budget = budget_info.input_budget;
-    let estimated = pending
-        .iter()
-        .map(|item| {
-            ai::estimate_text_tokens(&item.title)
-                .saturating_add(ai::estimate_text_tokens(&item.body))
-                .saturating_add(64)
-        })
-        .collect::<Vec<_>>();
-    let groups = ai::pack_batch_indices(&estimated, budget, RELEASE_BATCH_OVERHEAD_TOKENS);
-    let split_count = groups.len().saturating_sub(1);
-    let saved_calls = pending.len().saturating_sub(groups.len());
-    let estimated_tokens = estimated.iter().copied().sum::<u32>();
-    tracing::info!(
-        batch_size = pending.len(),
-        estimated_tokens,
-        split_count,
-        saved_calls,
-        fallback_source = budget_info.fallback_source,
-        input_budget = budget_info.input_budget,
-        model_input_limit = budget_info.model_input_limit,
-        "release translation batch plan"
-    );
-    groups
-}
-
-async fn translate_release_candidate_group_with_ai(
-    state: &AppState,
-    batch: &[ReleaseBatchCandidate],
-) -> (HashMap<i64, (Option<String>, Option<String>)>, bool) {
-    let prompt = build_release_batch_prompt(batch);
-    let raw = ai::chat_completion(
-        state,
-        "你是一个批量翻译助手，负责把 GitHub Release 标题与片段翻译为中文。",
-        &prompt,
-        RELEASE_BATCH_MAX_TOKENS,
-    )
-    .await;
-
-    let mut translated = HashMap::new();
-    let mut abort_remaining_batches = false;
-    match raw {
-        Ok(raw) => {
-            if let Some(payload) = parse_batch_release_translation_payload(&raw) {
-                for item in payload.items {
-                    if let Some(source) = batch
-                        .iter()
-                        .find(|candidate| candidate.release_id == item.release_id)
-                    {
-                        let (title, summary) =
-                            normalize_translation_fields(item.title_zh, item.summary_md);
-                        if !source.body.trim().is_empty() && summary.is_none() {
-                            continue;
-                        }
-                        if summary
-                            .as_deref()
-                            .is_some_and(|s| !markdown_structure_preserved(&source.body, s))
-                        {
-                            continue;
-                        }
-                        if title.is_some() || summary.is_some() {
-                            translated.insert(item.release_id, (title, summary));
-                        }
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "release batch translation response parse failed; fallback to single"
-                );
-            }
-        }
-        Err(err) => {
-            if ai_error_is_non_retryable(&err) {
-                abort_remaining_batches = true;
-                tracing::warn!(
-                    ?err,
-                    "release batch translation upstream error is non-retryable; skipping single fallback"
-                );
-            } else {
-                tracing::warn!(?err, "release batch translation failed; fallback to single");
-            }
-        }
-    }
-
-    if !abort_remaining_batches {
-        for item in batch {
-            if translated.contains_key(&item.release_id) {
-                continue;
-            }
-            if let Some(res) = translate_release_single_candidate_with_ai(state, item).await {
-                translated.insert(item.release_id, res);
-            }
-        }
-    }
-
-    (translated, abort_remaining_batches)
-}
-
-async fn translate_release_candidates_with_ai(
-    state: &AppState,
-    pending: &[ReleaseBatchCandidate],
-) -> HashMap<i64, (Option<String>, Option<String>)> {
-    if pending.is_empty() {
-        return HashMap::new();
-    }
-
-    let groups = plan_release_translation_groups(state, pending).await;
-
-    let mut translated = HashMap::new();
-    let mut abort_remaining_batches = false;
-    for batch_indices in groups {
-        if abort_remaining_batches {
-            break;
-        }
-        let batch = batch_indices
-            .iter()
-            .map(|idx| pending[*idx].clone())
-            .collect::<Vec<_>>();
-        let (batch_translated, abort_after_batch) =
-            translate_release_candidate_group_with_ai(state, &batch).await;
-        for (release_id, values) in batch_translated {
-            translated.insert(release_id, values);
-        }
-        if abort_after_batch {
-            abort_remaining_batches = true;
-        }
-    }
-
-    translated
-}
-
 #[derive(Debug, sqlx::FromRow)]
 struct ReleaseBatchSourceRow {
     release_id: i64,
@@ -6764,6 +6650,7 @@ fn looks_like_json_blob(raw: &str) -> bool {
         || trimmed.contains("\"body_md\"")
 }
 
+#[cfg(test)]
 fn release_cache_entry_reusable(cache: &TranslationCacheRow, body: &str) -> bool {
     if cache.summary.as_deref().is_some_and(looks_like_json_blob) {
         return false;
@@ -6778,8 +6665,7 @@ fn release_cache_entry_reusable(cache: &TranslationCacheRow, body: &str) -> bool
 
 #[derive(Debug)]
 struct PreparedReleaseBatch {
-    candidates: Vec<ReleaseBatchCandidate>,
-    pending: Vec<ReleaseBatchCandidate>,
+    detail_pending_release_ids: Vec<i64>,
     translated: HashMap<i64, (Option<String>, Option<String>)>,
     terminal: HashMap<i64, ReleaseBatchTerminalState>,
     missing: HashSet<i64>,
@@ -6792,8 +6678,7 @@ async fn prepare_release_batch(
 ) -> Result<PreparedReleaseBatch, ApiError> {
     if state.config.ai.is_none() {
         return Ok(PreparedReleaseBatch {
-            candidates: Vec::new(),
-            pending: Vec::new(),
+            detail_pending_release_ids: Vec::new(),
             translated: HashMap::new(),
             terminal: HashMap::new(),
             missing: HashSet::new(),
@@ -6842,36 +6727,16 @@ async fn prepare_release_batch(
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&row.tag_name)
             .to_owned();
-        let over_limit = release_feed_body_is_over_limit(row.body.as_deref());
-        let body = release_feed_body(row.body.as_deref()).unwrap_or_default();
-        let source = format!(
-            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
-            row.full_name, title, body
-        );
         let candidate = ReleaseBatchCandidate {
             release_id: *release_id,
             entity_id: release_id.to_string(),
             full_name: row.full_name.clone(),
             title,
-            body,
-            source_hash: ai::sha256_hex(&source),
         };
-        if over_limit {
-            terminal.insert(
-                *release_id,
-                ReleaseBatchTerminalState {
-                    status: "error".to_owned(),
-                    error: Some(format!(
-                        "release body exceeds {} characters and is not eligible for single-pass translation",
-                        RELEASE_FEED_BODY_MAX_CHARS
-                    )),
-                },
-            );
-        }
         candidates.push(candidate);
     }
 
-    let mut cache_by_entity: HashMap<String, TranslationCacheRow> = HashMap::new();
+    let mut detail_cache_by_entity: HashMap<String, TranslationCacheRow> = HashMap::new();
     if !candidates.is_empty() {
         let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
@@ -6880,7 +6745,7 @@ async fn prepare_release_batch(
             WHERE user_id = "#,
         );
         cache_query.push_bind(user_id);
-        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
+        cache_query.push(" AND entity_type = 'release_detail' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
         {
             let mut separated = cache_query.separated(", ");
             for item in &candidates {
@@ -6895,20 +6760,25 @@ async fn prepare_release_batch(
             .await
             .map_err(ApiError::internal)?;
         for row in cache_rows {
-            cache_by_entity.insert(row.entity_id.clone(), row);
+            detail_cache_by_entity.insert(row.entity_id.clone(), row);
         }
     }
 
-    let mut pending = Vec::new();
+    let mut detail_pending_release_ids = Vec::new();
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
 
     for item in &candidates {
-        if terminal.contains_key(&item.release_id) {
+        let Some(source_row) = source_by_id.get(&item.release_id) else {
+            missing.insert(item.release_id);
             continue;
-        }
-        let cache = cache_by_entity.get(&item.entity_id);
-        if let Some(cache) = cache
-            && cache.source_hash == item.source_hash
+        };
+        let detail_source_hash = release_detail_source_hash(
+            item.full_name.as_str(),
+            item.title.as_str(),
+            source_row.body.as_deref().unwrap_or(""),
+        );
+        if let Some(cache) = detail_cache_by_entity.get(&item.entity_id)
+            && cache.source_hash == detail_source_hash
         {
             if matches!(cache.status.as_str(), "disabled" | "missing" | "error") {
                 terminal.insert(
@@ -6920,31 +6790,18 @@ async fn prepare_release_batch(
                 );
                 continue;
             }
-            if let Some(raw) = cache.summary.as_deref()
-                && looks_like_json_blob(raw)
-                && let Some((t_title, t_summary)) = extract_translation_from_json_blob(raw)
-            {
-                let out_title = t_title.or_else(|| cache.title.clone());
-                let out_summary = t_summary.or_else(|| cache.summary.clone());
-                if out_title.is_some() || out_summary.is_some() {
-                    translated.insert(item.release_id, (out_title, out_summary));
-                    continue;
-                }
-            }
-            if release_cache_entry_reusable(cache, &item.body) {
-                translated.insert(
-                    item.release_id,
-                    (cache.title.clone(), cache.summary.clone()),
-                );
+            let (title, summary) =
+                normalize_translation_fields(cache.title.clone(), cache.summary.clone());
+            if release_detail_translation_ready(source_row.body.as_deref(), summary.as_deref()) {
+                translated.insert(item.release_id, (title, summary));
                 continue;
             }
         }
-        pending.push(item.clone());
+        detail_pending_release_ids.push(item.release_id);
     }
 
     Ok(PreparedReleaseBatch {
-        candidates,
-        pending,
+        detail_pending_release_ids,
         translated,
         terminal,
         missing,
@@ -7048,93 +6905,6 @@ async fn upsert_translation_terminal_status(
     Ok(())
 }
 
-async fn upsert_release_batch_translations(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseBatchCandidate],
-    translated: &HashMap<i64, (Option<String>, Option<String>)>,
-) -> Result<(), ApiError> {
-    for item in candidates {
-        if let Some((title, summary)) = translated.get(&item.release_id) {
-            upsert_translation(
-                state,
-                user_id,
-                requested_at,
-                TranslationUpsert {
-                    entity_type: "release",
-                    entity_id: &item.entity_id,
-                    lang: "zh-CN",
-                    source_hash: &item.source_hash,
-                    title: title.as_deref(),
-                    summary: summary.as_deref(),
-                },
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn upsert_release_batch_terminal_states(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseBatchCandidate],
-    terminal: &HashMap<i64, ReleaseBatchTerminalState>,
-) -> Result<(), ApiError> {
-    for item in candidates {
-        let Some(terminal_state) = terminal.get(&item.release_id) else {
-            continue;
-        };
-        if terminal_state.status != "error" {
-            continue;
-        }
-        upsert_translation_terminal_status(
-            state,
-            user_id,
-            requested_at,
-            TranslationUpsert {
-                entity_type: "release",
-                entity_id: &item.entity_id,
-                lang: "zh-CN",
-                source_hash: &item.source_hash,
-                title: None,
-                summary: None,
-            },
-            terminal_state.status.as_str(),
-            terminal_state.error.as_deref(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn mark_release_batch_translations_requested(
-    state: &AppState,
-    user_id: &str,
-    requested_at: &str,
-    candidates: &[ReleaseBatchCandidate],
-) -> Result<(), ApiError> {
-    for item in candidates {
-        mark_translation_requested(
-            state,
-            user_id,
-            requested_at,
-            TranslationUpsert {
-                entity_type: "release",
-                entity_id: &item.entity_id,
-                lang: "zh-CN",
-                source_hash: &item.source_hash,
-                title: None,
-                summary: None,
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 async fn translate_releases_batch_internal(
     state: &AppState,
     user_id: &str,
@@ -7154,37 +6924,37 @@ async fn translate_releases_batch_internal(
             .collect());
     }
 
-    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut prepared = prepare_release_batch(state, user_id, release_ids).await?;
-    mark_release_batch_translations_requested(
-        state,
-        user_id,
-        requested_at.as_str(),
-        &prepared.pending,
-    )
-    .await?;
-    let translated_pending = translate_release_candidates_with_ai(state, &prepared.pending).await;
-    for (release_id, values) in translated_pending {
-        prepared.translated.insert(release_id, values);
+    if !prepared.detail_pending_release_ids.is_empty() {
+        for item in translate_release_detail_batch_internal(
+            state,
+            user_id,
+            &prepared.detail_pending_release_ids,
+        )
+        .await?
+        {
+            let Ok(release_id) = item.id.parse::<i64>() else {
+                continue;
+            };
+            match item.status.as_str() {
+                "ready" => {
+                    prepared
+                        .translated
+                        .insert(release_id, (item.title, item.summary));
+                }
+                "disabled" | "missing" | "error" => {
+                    prepared.terminal.insert(
+                        release_id,
+                        ReleaseBatchTerminalState {
+                            status: item.status,
+                            error: item.error,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
     }
-
-    upsert_release_batch_translations(
-        state,
-        user_id,
-        requested_at.as_str(),
-        &prepared.candidates,
-        &prepared.translated,
-    )
-    .await?;
-    upsert_release_batch_terminal_states(
-        state,
-        user_id,
-        requested_at.as_str(),
-        &prepared.candidates,
-        &prepared.terminal,
-    )
-    .await?;
-
     Ok(release_ids
         .iter()
         .map(|release_id| {
@@ -8090,7 +7860,6 @@ async fn translate_releases_batch_stream_worker(
     tx: mpsc::Sender<Result<Bytes, Infallible>>,
 ) {
     let heartbeat = jobs::spawn_task_lease_heartbeat(state.clone(), task_id.clone());
-    let requested_at = chrono::Utc::now().to_rfc3339();
     let mut ready_count = 0usize;
     let mut disabled_count = 0usize;
     let mut missing_count = 0usize;
@@ -8179,22 +7948,14 @@ async fn translate_releases_batch_stream_worker(
         }
 
         let mut prepared = prepare_release_batch(state.as_ref(), &user_id, &release_ids).await?;
-        upsert_release_batch_terminal_states(
-            state.as_ref(),
-            &user_id,
-            requested_at.as_str(),
-            &prepared.candidates,
-            &prepared.terminal,
-        )
-        .await?;
-        let pending_ids = prepared
-            .pending
+        let detail_pending_ids = prepared
+            .detail_pending_release_ids
             .iter()
-            .map(|item| item.release_id)
+            .copied()
             .collect::<HashSet<_>>();
 
         for release_id in &release_ids {
-            if pending_ids.contains(release_id) {
+            if detail_pending_ids.contains(release_id) {
                 continue;
             }
             let item = build_release_batch_item(
@@ -8239,16 +8000,14 @@ async fn translate_releases_batch_stream_worker(
             .map_err(ApiError::internal)?;
         }
 
-        if !prepared.pending.is_empty() {
-            // Emit immediate in-progress items so the frontend receives stream bytes early
-            // instead of waiting for the first upstream translation response.
-            for item in &prepared.pending {
+        if !prepared.detail_pending_release_ids.is_empty() {
+            for release_id in &prepared.detail_pending_release_ids {
                 if !send_batch_stream_event(
                     &tx,
                     TranslateBatchStreamEvent {
                         event: "item",
                         item: Some(TranslateBatchItem {
-                            id: item.release_id.to_string(),
+                            id: release_id.to_string(),
                             lang: "zh-CN".to_owned(),
                             status: "processing".to_owned(),
                             title: None,
@@ -8264,85 +8023,65 @@ async fn translate_releases_batch_stream_worker(
                 }
             }
 
-            let groups = plan_release_translation_groups(state.as_ref(), &prepared.pending).await;
-            let mut abort_remaining_batches = false;
-            for batch_indices in groups {
-                let batch = batch_indices
-                    .iter()
-                    .map(|idx| prepared.pending[*idx].clone())
-                    .collect::<Vec<_>>();
-
-                if !abort_remaining_batches {
-                    let (batch_translated, abort_after_batch) =
-                        translate_release_candidate_group_with_ai(state.as_ref(), &batch).await;
-                    if !batch_translated.is_empty() {
-                        upsert_release_batch_translations(
-                            state.as_ref(),
-                            &user_id,
-                            requested_at.as_str(),
-                            &batch,
-                            &batch_translated,
-                        )
-                        .await?;
-                        for (release_id, values) in batch_translated {
-                            prepared.translated.insert(release_id, values);
+            for item in translate_release_detail_batch_internal(
+                state.as_ref(),
+                &user_id,
+                &prepared.detail_pending_release_ids,
+            )
+            .await?
+            {
+                if let Ok(release_id) = item.id.parse::<i64>() {
+                    match item.status.as_str() {
+                        "ready" => {
+                            prepared
+                                .translated
+                                .insert(release_id, (item.title.clone(), item.summary.clone()));
                         }
-                    }
-                    upsert_release_batch_terminal_states(
-                        state.as_ref(),
-                        &user_id,
-                        requested_at.as_str(),
-                        &batch,
-                        &prepared.terminal,
-                    )
-                    .await?;
-                    if abort_after_batch {
-                        abort_remaining_batches = true;
+                        "disabled" | "missing" | "error" => {
+                            prepared.terminal.insert(
+                                release_id,
+                                ReleaseBatchTerminalState {
+                                    status: item.status.clone(),
+                                    error: item.error.clone(),
+                                },
+                            );
+                        }
+                        _ => {}
                     }
                 }
-
-                for item in &batch {
-                    let out = build_release_batch_item(
-                        item.release_id,
-                        &prepared.missing,
-                        &prepared.terminal,
-                        &prepared.translated,
-                    );
-                    if !send_batch_stream_event(
-                        &tx,
-                        TranslateBatchStreamEvent {
-                            event: "item",
-                            item: Some(out.clone()),
-                            error: None,
-                        },
-                    )
-                    .await
-                    {
-                        return Err(ApiError::internal("stream client disconnected"));
-                    }
-
-                    accumulate_batch_item_stats(
-                        &out,
-                        &mut ready_count,
-                        &mut disabled_count,
-                        &mut missing_count,
-                        &mut error_count,
-                    );
-                    jobs::append_task_event(
-                        state.as_ref(),
-                        task_id.as_str(),
-                        "task.progress",
-                        json!({
-                            "task_id": task_id.as_str(),
-                            "stage": "release",
-                            "release_id": out.id,
-                            "item_status": out.status,
-                            "item_error": out.error.clone(),
-                        }),
-                    )
-                    .await
-                    .map_err(ApiError::internal)?;
+                if !send_batch_stream_event(
+                    &tx,
+                    TranslateBatchStreamEvent {
+                        event: "item",
+                        item: Some(item.clone()),
+                        error: None,
+                    },
+                )
+                .await
+                {
+                    return Err(ApiError::internal("stream client disconnected"));
                 }
+                accumulate_batch_item_stats(
+                    &item,
+                    &mut ready_count,
+                    &mut disabled_count,
+                    &mut missing_count,
+                    &mut error_count,
+                );
+                jobs::append_task_event(
+                    state.as_ref(),
+                    task_id.as_str(),
+                    "task.progress",
+                    json!({
+                        "task_id": task_id.as_str(),
+                        "stage": "release",
+                        "release_id": item.id,
+                        "item_status": item.status,
+                        "item_error": item.error.clone(),
+                    }),
+                )
+                .await
+                .map_err(ApiError::internal)?;
             }
         }
 
@@ -8550,6 +8289,7 @@ pub async fn translate_release(
 
 async fn translate_release_detail_chunk(
     state: &AppState,
+    budget: ReleaseDetailChunkBudget,
     repo_full_name: &str,
     original_title: &str,
     chunk: &str,
@@ -8569,7 +8309,7 @@ async fn translate_release_detail_chunk(
         state,
         "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
         &prompt,
-        RELEASE_DETAIL_CHUNK_MAX_TOKENS,
+        budget.max_output_tokens,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -8591,7 +8331,7 @@ async fn translate_release_detail_chunk(
         state,
         "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes 翻译成中文并保持 Markdown 结构。",
         &retry_prompt,
-        RELEASE_DETAIL_CHUNK_MAX_TOKENS,
+        budget.max_output_tokens,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -8634,6 +8374,7 @@ fn build_release_detail_batch_prompt(
 
 async fn translate_release_detail_chunks_batched(
     state: &AppState,
+    budget: ReleaseDetailChunkBudget,
     repo_full_name: &str,
     original_title: &str,
     chunks: &[String],
@@ -8643,14 +8384,12 @@ async fn translate_release_detail_chunks_batched(
     }
 
     const CHUNK_BATCH_OVERHEAD_TOKENS: u32 = 320;
-    let budget_info =
-        ai::compute_input_budget_with_source(state, RELEASE_DETAIL_CHUNK_MAX_TOKENS).await;
-    let budget = budget_info.input_budget;
+    let input_budget = budget.input_budget;
     let estimated = chunks
         .iter()
         .map(|chunk| ai::estimate_text_tokens(chunk).saturating_add(48))
         .collect::<Vec<_>>();
-    let grouped = ai::pack_batch_indices(&estimated, budget, CHUNK_BATCH_OVERHEAD_TOKENS);
+    let grouped = ai::pack_batch_indices(&estimated, input_budget, CHUNK_BATCH_OVERHEAD_TOKENS);
     let split_count = grouped.len().saturating_sub(1);
     let saved_calls = chunks.len().saturating_sub(grouped.len());
     let estimated_tokens = estimated.iter().copied().sum::<u32>();
@@ -8659,9 +8398,10 @@ async fn translate_release_detail_chunks_batched(
         estimated_tokens,
         split_count,
         saved_calls,
-        fallback_source = budget_info.fallback_source,
-        input_budget = budget_info.input_budget,
-        model_input_limit = budget_info.model_input_limit,
+        fallback_source = budget.fallback_source,
+        input_budget = budget.input_budget,
+        model_input_limit = budget.model_input_limit,
+        max_output_tokens = budget.max_output_tokens,
         "release detail chunk batch plan"
     );
 
@@ -8682,7 +8422,7 @@ async fn translate_release_detail_chunks_batched(
             state,
             "你是一个严谨的技术文档翻译助手，负责把 GitHub Release notes chunk 批量翻译成中文并保持 Markdown 结构。",
             &prompt,
-            RELEASE_DETAIL_CHUNK_MAX_TOKENS,
+            budget.max_output_tokens,
         )
         .await;
 
@@ -8732,6 +8472,7 @@ async fn translate_release_detail_chunks_batched(
                 out = Some(
                     translate_release_detail_chunk(
                         state,
+                        budget,
                         repo_full_name,
                         original_title,
                         source,
@@ -8913,9 +8654,19 @@ async fn translate_release_detail_internal(
     let body_markdown = if original_body.trim().is_empty() {
         String::new()
     } else {
-        let chunks = split_markdown_chunks(&original_body, RELEASE_DETAIL_CHUNK_MAX_CHARS);
+        let chunk_budget = release_detail_chunk_budget(state).await;
+        tracing::info!(
+            chunk_char_budget = chunk_budget.max_chars,
+            chunk_input_budget = chunk_budget.input_budget,
+            chunk_output_budget = chunk_budget.max_output_tokens,
+            fallback_source = chunk_budget.fallback_source,
+            model_input_limit = chunk_budget.model_input_limit,
+            "release detail chunk budget resolved"
+        );
+        let chunks = split_markdown_chunks(&original_body, chunk_budget.max_chars);
         let translated_chunks = translate_release_detail_chunks_batched(
             state,
+            chunk_budget,
             &repo_full_name,
             &original_title,
             &chunks,
@@ -9704,8 +9455,8 @@ mod tests {
         AdminSyncSubscriptionEventItem, AdminTaskEventItem, AdminUserPatchRequest,
         AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow, GitHubCompareCommit,
         GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO,
-        TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
+        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_user, admin_users_offset,
@@ -9723,12 +9474,13 @@ mod tests {
         parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
         parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
         parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
-        preserve_chunk_trailing_newline, release_cache_entry_reusable, release_detail_source_hash,
-        release_detail_translation_ready, release_excerpt, release_feed_body,
-        release_reactions_status, require_active_user_id, resolve_release_full_name,
-        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
-        sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_response_from_batch_item, upsert_translation,
+        prepare_release_batch, preserve_chunk_trailing_newline, release_cache_entry_reusable,
+        release_detail_source_hash, release_detail_translation_ready, release_excerpt,
+        release_feed_body, release_reactions_status, require_active_user_id,
+        resolve_release_full_name, should_retry_public_compare_without_auth,
+        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -9797,6 +9549,11 @@ mod tests {
             trans_title: None,
             trans_summary: None,
             trans_work_status: None,
+            detail_trans_source_hash: None,
+            detail_trans_status: None,
+            detail_trans_title: None,
+            detail_trans_summary: None,
+            detail_trans_work_status: None,
             smart_source_hash: None,
             smart_status: None,
             smart_title: None,
@@ -9918,7 +9675,6 @@ mod tests {
             },
             ai: None,
             ai_max_concurrency: 1,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
@@ -9964,7 +9720,6 @@ mod tests {
                 api_key: "test-key".to_owned(),
             }),
             ai_max_concurrency: 1,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
@@ -12053,12 +11808,13 @@ mod tests {
             INSERT INTO admin_runtime_settings (
               id,
               llm_max_concurrency,
+              ai_model_context_limit,
               translation_general_worker_concurrency,
               translation_dedicated_worker_concurrency,
               created_at,
               updated_at
             )
-            VALUES (1, 4, 3, 1, ?, ?)
+            VALUES (1, 4, 65536, 3, 1, ?, ?)
             "#,
         )
         .bind(now)
@@ -12077,6 +11833,9 @@ mod tests {
             .0;
 
         assert_eq!(resp.max_concurrency, 4);
+        assert_eq!(resp.ai_model_context_limit, Some(65_536));
+        assert_eq!(resp.effective_model_input_limit, 65_536);
+        assert_eq!(resp.effective_model_input_limit_source, "admin_override");
         assert_eq!(resp.available_slots, 4);
         assert_eq!(state.llm_scheduler.max_concurrency(), 4);
     }
@@ -12907,7 +12666,7 @@ mod tests {
         let item = feed_item_from_row(row, true, None);
         let translated = item.translated.expect("translated item");
         assert_eq!(translated.status, "missing");
-        assert_eq!(translated.auto_translate, Some(false));
+        assert_eq!(translated.auto_translate, None);
     }
 
     #[test]
@@ -12928,8 +12687,32 @@ mod tests {
 
         let item = feed_item_from_row(row, true, None);
         let translated = item.translated.expect("translated item");
-        assert_eq!(translated.status, "error");
-        assert_eq!(translated.auto_translate, Some(false));
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, None);
+    }
+
+    #[test]
+    fn feed_item_from_row_uses_release_detail_translation_for_truncated_release() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.4".to_owned());
+        row.release_body = Some("a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 1));
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("中文标题".to_owned());
+        row.detail_trans_summary = Some("- 分块译文".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("中文标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 分块译文"));
+        assert_eq!(translated.auto_translate, None);
+        assert!(item.body_truncated);
     }
 
     #[test]
@@ -13586,6 +13369,105 @@ mod tests {
         assert_eq!(translated.status, "ready");
         assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
         assert_eq!(translated.summary.as_deref(), Some("- 条目"));
+    }
+
+    #[tokio::test]
+    async fn prepare_release_batch_routes_release_to_detail_translation_path() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let long_body = "a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 24);
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?
+            WHERE release_id = ?
+            "#,
+        )
+        .bind(long_body.as_str())
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update repo release body");
+        let state = setup_state_with_ai(pool);
+
+        let prepared = prepare_release_batch(state.as_ref(), user_id.as_str(), &[120])
+            .await
+            .expect("prepare release batch");
+
+        assert_eq!(prepared.detail_pending_release_ids, vec![120]);
+        assert!(prepared.terminal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_reuses_cached_release_detail_for_truncated_release()
+    {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let long_body = "a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 24);
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?
+            WHERE release_id = ?
+            "#,
+        )
+        .bind(long_body.as_str())
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update repo release body");
+        let state = setup_state_with_ai(pool.clone());
+        let source_hash =
+            release_detail_source_hash("openai/codex", "Release v1.2.3", long_body.as_str());
+        seed_release_detail_translation(
+            &pool,
+            user_id.as_str(),
+            "120",
+            source_hash.as_str(),
+            Some("版本 v1.2.3"),
+            Some(
+                "- 第一段
+- 第二段",
+            ),
+        )
+        .await;
+
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+                .await
+                .expect("translate cached long release batch");
+
+        assert_eq!(translated.items.len(), 1);
+        let item = &translated.items[0];
+        assert_eq!(item.id, "120");
+        assert_eq!(item.status, "ready");
+        assert_eq!(item.title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(
+            item.summary.as_deref(),
+            Some(
+                "- 第一段
+- 第二段"
+            )
+        );
+
+        let release_cache_count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM ai_translations
+            WHERE user_id = ?
+              AND entity_type = 'release'
+              AND entity_id = '120'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count release feed cache entries");
+        assert_eq!(release_cache_count, 0);
     }
 
     #[tokio::test]

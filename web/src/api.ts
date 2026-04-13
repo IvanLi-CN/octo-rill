@@ -400,6 +400,9 @@ export type AdminScheduledSlotsResponse = {
 export type AdminLlmSchedulerStatusResponse = {
 	scheduler_enabled: boolean;
 	max_concurrency: number;
+	ai_model_context_limit: number | null;
+	effective_model_input_limit: number;
+	effective_model_input_limit_source: string;
 	available_slots: number;
 	waiting_calls: number;
 	in_flight_calls: number;
@@ -412,6 +415,7 @@ export type AdminLlmSchedulerStatusResponse = {
 };
 export type AdminLlmRuntimeConfigUpdateRequest = {
 	max_concurrency: number;
+	ai_model_context_limit: number | null;
 };
 export type AdminLlmCallItem = {
 	id: string;
@@ -678,6 +682,9 @@ export type AdminTranslationStatusResponse = {
 	llm_enabled: boolean;
 	scan_interval_ms: number;
 	batch_token_threshold: number;
+	ai_model_context_limit: number | null;
+	effective_model_input_limit: number;
+	effective_model_input_limit_source: string;
 	general_worker_concurrency: number;
 	dedicated_worker_concurrency: number;
 	worker_concurrency: number;
