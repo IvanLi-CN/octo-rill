@@ -85,10 +85,9 @@ pub async fn load_or_seed_runtime_settings(
         return Ok(snapshot);
     }
 
-    let ai_model_context_limit = load_legacy_ai_model_context_limit_from_env()?;
     let snapshot = AdminRuntimeSettingsSnapshot {
         llm_max_concurrency: config.ai_max_concurrency,
-        ai_model_context_limit,
+        ai_model_context_limit: None,
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
     };
@@ -111,7 +110,7 @@ pub async fn load_or_seed_runtime_settings(
     )
     .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
     .bind(snapshot.ai_model_context_limit.map(i64::from))
-    .bind(snapshot.ai_model_context_limit.map(|_| now.as_str()))
+    .bind(Option::<&str>::None)
     .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
     .bind(now.as_str())
@@ -390,6 +389,31 @@ mod tests {
             .expect("fetch backfilled runtime settings")
             .expect("runtime settings should exist");
         assert_eq!(stored.ai_model_context_limit, Some(65_536));
+
+        clear_legacy_context_limit_env();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn load_or_seed_runtime_settings_keeps_fresh_rows_on_auto_limit_even_with_legacy_env() {
+        let _env_guard = env_lock().lock().expect("lock env");
+        unsafe {
+            std::env::set_var("AI_MODEL_CONTEXT_LIMIT", "65536");
+        }
+
+        let pool = setup_pool().await;
+        let config = test_config(2);
+
+        let snapshot = load_or_seed_runtime_settings(&pool, &config)
+            .await
+            .expect("seed runtime settings without legacy env carryover");
+        assert_eq!(snapshot.ai_model_context_limit, None);
+
+        let stored = fetch_runtime_settings(&pool)
+            .await
+            .expect("fetch seeded runtime settings")
+            .expect("runtime settings should exist");
+        assert_eq!(stored.ai_model_context_limit, None);
 
         clear_legacy_context_limit_env();
     }

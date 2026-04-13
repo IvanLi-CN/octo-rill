@@ -4312,6 +4312,19 @@ pub(crate) fn release_feed_body(body: Option<&str>) -> Option<String> {
     Some(truncate_chars(trimmed, RELEASE_FEED_BODY_MAX_CHARS).into_owned())
 }
 
+pub(crate) fn release_feed_translation_source_hash(
+    repo_full_name: &str,
+    title: &str,
+    body: Option<&str>,
+) -> String {
+    ai::sha256_hex(&format!(
+        "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
+        repo_full_name.trim(),
+        title.trim(),
+        body.unwrap_or("").trim(),
+    ))
+}
+
 pub(crate) fn release_feed_body_is_over_limit(body: Option<&str>) -> bool {
     let Some(body) = body else {
         return false;
@@ -5189,23 +5202,6 @@ fn feed_item_from_row(
         _ => (None, false),
     };
 
-    let source = match r.kind.as_str() {
-        "release" => format!(
-            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
-            r.repo_full_name.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            body.as_deref().unwrap_or(""),
-        ),
-        "notification" => format!(
-            "kind=notification\nrepo={}\ntitle={}\nreason={}\nsubject_type={}\n",
-            r.repo_full_name.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            r.reason.as_deref().unwrap_or(""),
-            r.subject_type.as_deref().unwrap_or(""),
-        ),
-        _ => String::new(),
-    };
-
     let smart_current_hash = match r.kind.as_str() {
         "release" => crate::translations::release_smart_feed_source_hash(
             r.entity_id.as_str(),
@@ -5227,7 +5223,11 @@ fn feed_item_from_row(
             auto_translate: None,
         })
     } else {
-        let current_hash = ai::sha256_hex(&source);
+        let current_hash = release_feed_translation_source_hash(
+            r.repo_full_name.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            body.as_deref(),
+        );
         let detail_current_hash = release_detail_source_hash(
             r.repo_full_name.as_deref().unwrap_or(""),
             r.title.as_deref().unwrap_or(""),
@@ -6594,6 +6594,7 @@ struct ReleaseBatchCandidate {
     title: String,
     body: String,
     source_hash: String,
+    legacy_source_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7034,6 +7035,15 @@ async fn prepare_release_batch(
             .map(|value| value.replace("\r\n", "\n"))
             .map(|value| value.trim().to_owned())
             .unwrap_or_default();
+        let legacy_body = release_feed_body(Some(body.as_str()));
+        let legacy_source_hash =
+            (!release_feed_body_is_over_limit(Some(body.as_str()))).then(|| {
+                release_feed_translation_source_hash(
+                    row.full_name.as_str(),
+                    title.as_str(),
+                    legacy_body.as_deref(),
+                )
+            });
         let candidate = ReleaseBatchCandidate {
             release_id: *release_id,
             entity_id: release_id.to_string(),
@@ -7045,6 +7055,7 @@ async fn prepare_release_batch(
                 title.as_str(),
                 body.as_str(),
             ),
+            legacy_source_hash,
         };
         candidates.push(candidate);
     }
@@ -7077,6 +7088,37 @@ async fn prepare_release_batch(
         }
     }
 
+    let mut legacy_cache_by_entity: HashMap<String, TranslationCacheRow> = HashMap::new();
+    if candidates
+        .iter()
+        .any(|candidate| candidate.legacy_source_hash.is_some())
+    {
+        let mut cache_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            r#"
+            SELECT entity_id, source_hash, status, title, summary, error_text
+            FROM ai_translations
+            WHERE user_id = "#,
+        );
+        cache_query.push_bind(user_id);
+        cache_query.push(" AND entity_type = 'release' AND lang = 'zh-CN' AND status IN ('ready', 'disabled', 'missing', 'error') AND entity_id IN (");
+        {
+            let mut separated = cache_query.separated(", ");
+            for item in &candidates {
+                separated.push_bind(&item.entity_id);
+            }
+        }
+        cache_query.push(")");
+
+        let cache_rows = cache_query
+            .build_query_as::<TranslationCacheRow>()
+            .fetch_all(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+        for row in cache_rows {
+            legacy_cache_by_entity.insert(row.entity_id.clone(), row);
+        }
+    }
+
     let mut detail_pending_candidates = Vec::new();
     let mut translated = HashMap::<i64, (Option<String>, Option<String>)>::new();
 
@@ -7099,6 +7141,32 @@ async fn prepare_release_batch(
             if release_detail_translation_ready(Some(item.body.as_str()), summary.as_deref()) {
                 translated.insert(item.release_id, (title, summary));
                 continue;
+            }
+        }
+        if let Some(legacy_source_hash) = item.legacy_source_hash.as_deref()
+            && let Some(cache) = legacy_cache_by_entity.get(&item.entity_id)
+            && cache.source_hash == legacy_source_hash
+        {
+            if cache.status == "disabled" {
+                terminal.insert(
+                    item.release_id,
+                    ReleaseBatchTerminalState {
+                        status: cache.status.clone(),
+                        error: cache.error_text.clone(),
+                    },
+                );
+                continue;
+            }
+            if cache.status == "ready" {
+                let (title, summary) =
+                    normalize_translation_fields(cache.title.clone(), cache.summary.clone());
+                if summary
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    translated.insert(item.release_id, (title, summary));
+                    continue;
+                }
             }
         }
         detail_pending_candidates.push(item.clone());
@@ -10716,6 +10784,36 @@ mod tests {
         .expect("seed release detail translation");
     }
 
+    async fn seed_release_translation(
+        pool: &SqlitePool,
+        user_id: &str,
+        entity_id: &str,
+        source_hash: &str,
+        title: Option<&str>,
+        summary: Option<&str>,
+    ) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash, status, title, summary, error_text, active_work_item_id, created_at, updated_at
+            )
+            VALUES (?, ?, 'release', ?, 'zh-CN', ?, 'ready', ?, ?, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id)
+        .bind(entity_id)
+        .bind(source_hash)
+        .bind(title)
+        .bind(summary)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed release translation");
+    }
+
     async fn seed_access_refresh_task(
         pool: &SqlitePool,
         task_id: &str,
@@ -14128,6 +14226,72 @@ line two",
         .await
         .expect("count release feed cache entries");
         assert_eq!(release_cache_count, 0);
+    }
+
+    #[tokio::test]
+    async fn translate_releases_batch_for_user_reuses_legacy_release_cache_for_short_release() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+
+        let legacy_body = release_feed_body(Some("- item")).expect("legacy feed body");
+        let legacy_hash = crate::api::release_feed_translation_source_hash(
+            "openai/codex",
+            "Release v1.2.3",
+            Some(&legacy_body),
+        );
+        seed_release_translation(
+            &pool,
+            user_id.as_str(),
+            "120",
+            legacy_hash.as_str(),
+            Some("版本 v1.2.3"),
+            Some("- 已缓存条目"),
+        )
+        .await;
+
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let detail_chunk_calls = Arc::new(AtomicUsize::new(0));
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let route_batch_calls = Arc::clone(&batch_calls);
+        let route_detail_chunk_calls = Arc::clone(&detail_chunk_calls);
+        let route_title_calls = Arc::clone(&title_calls);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |_payload: Json<Value>| {
+                let route_batch_calls = Arc::clone(&route_batch_calls);
+                let route_detail_chunk_calls = Arc::clone(&route_detail_chunk_calls);
+                let route_title_calls = Arc::clone(&route_title_calls);
+                async move {
+                    route_batch_calls.fetch_add(1, Ordering::SeqCst);
+                    route_detail_chunk_calls.fetch_add(1, Ordering::SeqCst);
+                    route_title_calls.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Json(json!({"error": "legacy cache should avoid upstream calls"})),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool, base_url);
+
+        let translated =
+            translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+                .await
+                .expect("reuse legacy short release cache");
+
+        assert_eq!(translated.items.len(), 1);
+        let item = &translated.items[0];
+        assert_eq!(item.id, "120");
+        assert_eq!(item.status, "ready");
+        assert_eq!(item.title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(item.summary.as_deref(), Some("- 已缓存条目"));
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(detail_chunk_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(title_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
