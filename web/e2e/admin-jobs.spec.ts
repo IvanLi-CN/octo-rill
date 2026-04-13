@@ -1714,7 +1714,7 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 				pathname: "/api/admin/jobs/llm/calls",
 				search: "status=failed",
 				times: 1,
-				delayMs: 300,
+				delayMs: 2200,
 			},
 		],
 		emitStreamEvents: false,
@@ -1739,7 +1739,7 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 	).toBeDisabled();
 	await expect(refreshButton).toBeDisabled();
 
-	await page.waitForTimeout(1300);
+	await page.waitForTimeout(2400);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
 	await expect(refreshButton).toBeEnabled();
