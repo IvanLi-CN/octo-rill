@@ -398,6 +398,7 @@ function SocialActivityCard(props: {
 	const { item, currentViewer } = props;
 	const actor = item.actor;
 	const isRepoStar = item.kind === "repo_star_received";
+	const showTimestamp = isRepoStar;
 	const actorHref = actor.html_url ?? `https://github.com/${actor.login}`;
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
@@ -411,10 +412,19 @@ function SocialActivityCard(props: {
 	};
 
 	return (
-		<div className="space-y-0 px-1 py-1" data-social-card-kind={item.kind}>
-			<p className="mb-0.5 font-mono text-xs leading-none text-muted-foreground">
-				{formatIsoShortLocal(item.ts)}
-			</p>
+		<div
+			className="space-y-0 px-1 py-1"
+			data-social-card-kind={item.kind}
+			data-social-card-time-visible={showTimestamp ? "true" : "false"}
+		>
+			{showTimestamp ? (
+				<p
+					className="mb-0.5 font-mono text-xs leading-none text-muted-foreground"
+					data-social-card-timestamp
+				>
+					{formatIsoShortLocal(item.ts)}
+				</p>
+			) : null}
 			<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)] md:items-center">
 				<SocialEntityCard
 					href={actorCardHref}

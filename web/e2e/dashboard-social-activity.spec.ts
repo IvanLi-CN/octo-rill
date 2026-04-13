@@ -156,9 +156,19 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 	).toHaveCount(2);
 	await expect(
 		page.locator(
+			'[data-social-card-kind="repo_star_received"][data-social-card-time-visible="true"] [data-social-card-timestamp]',
+		),
+	).toHaveCount(1);
+	await expect(
+		page.locator(
 			'[data-social-card-kind="follower_received"] a[href^="https://github.com/"]',
 		),
 	).toHaveCount(1);
+	await expect(
+		page.locator(
+			'[data-social-card-kind="follower_received"][data-social-card-time-visible="false"] [data-social-card-timestamp]',
+		),
+	).toHaveCount(0);
 
 	await page.getByRole("tab", { name: "被加星" }).click();
 	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
@@ -170,6 +180,11 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]',
 		),
 	).toHaveCount(2);
+	await expect(
+		page.locator(
+			'[data-social-card-kind="repo_star_received"][data-social-card-time-visible="true"] [data-social-card-timestamp]',
+		),
+	).toHaveCount(1);
 
 	await page.getByRole("tab", { name: "被关注" }).click();
 	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
@@ -184,6 +199,11 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 			'[data-social-card-kind="follower_received"] a[href^="https://github.com/"]',
 		),
 	).toHaveCount(1);
+	await expect(
+		page.locator(
+			'[data-social-card-kind="follower_received"][data-social-card-time-visible="false"] [data-social-card-timestamp]',
+		),
+	).toHaveCount(0);
 });
 
 test("social activity cards fall back to placeholder avatar when image fails", async ({

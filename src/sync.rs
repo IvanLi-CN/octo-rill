@@ -342,8 +342,14 @@ struct RepoNode {
     url: String,
     is_private: bool,
     open_graph_image_url: Option<String>,
-    uses_custom_open_graph_image: bool,
+    uses_custom_open_graph_image: Option<bool>,
     owner: RepoOwner,
+}
+
+impl RepoNode {
+    fn uses_custom_open_graph_image(&self) -> bool {
+        self.uses_custom_open_graph_image.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1255,7 +1261,7 @@ async fn apply_social_activity_snapshot_partial(
             .collect::<HashSet<_>>();
 
         for follower in followers {
-            if follower_baseline_exists && !current_follower_ids.contains(&follower.actor.id) {
+            if !current_follower_ids.contains(&follower.actor.id) {
                 let inserted = insert_social_activity_event_tx(
                     &mut tx,
                     SocialActivityEventInsert {
@@ -1408,8 +1414,12 @@ async fn apply_social_activity_snapshot_partial(
 
         for (repo, members) in repo_members.unwrap_or(&[]) {
             let repo_snapshot_initialized = repo_snapshot_initialized_ids.contains(&repo.repo_id);
+            let repo_waiting_for_first_success =
+                known_repo_ids.contains(&repo.repo_id) && !repo_snapshot_initialized;
             let emit_current_members = repo_snapshot_initialized
-                || (repo_tracking_initialized && newly_discovered_repo_ids.contains(&repo.repo_id));
+                || !repo_tracking_initialized
+                || newly_discovered_repo_ids.contains(&repo.repo_id)
+                || repo_waiting_for_first_success;
 
             let current_rows = sqlx::query_as::<_, RepoStarCurrentMemberRow>(
                 r#"
@@ -4333,13 +4343,14 @@ fn owned_repo_snapshot_from_node(node: RepoNode, viewer_login: &str) -> Option<O
     if !node.owner.login.eq_ignore_ascii_case(viewer_login) {
         return None;
     }
+    let uses_custom_open_graph_image = node.uses_custom_open_graph_image();
 
     Some(OwnedRepoSnapshot {
         repo_id,
         full_name: node.name_with_owner,
         owner_avatar_url: node.owner.avatar_url,
         open_graph_image_url: node.open_graph_image_url,
-        uses_custom_open_graph_image: node.uses_custom_open_graph_image,
+        uses_custom_open_graph_image,
     })
 }
 
@@ -4491,6 +4502,7 @@ async fn fetch_starred_snapshot(
             let Some(repo_id) = edge.node.database_id else {
                 continue;
             };
+            let uses_custom_open_graph_image = edge.node.uses_custom_open_graph_image();
             all.push(StarredRepoSnapshot {
                 repo_id,
                 full_name: edge.node.name_with_owner,
@@ -4502,7 +4514,7 @@ async fn fetch_starred_snapshot(
                 is_private: edge.node.is_private,
                 owner_avatar_url: edge.node.owner.avatar_url,
                 open_graph_image_url: edge.node.open_graph_image_url,
-                uses_custom_open_graph_image: edge.node.uses_custom_open_graph_image,
+                uses_custom_open_graph_image,
             });
         }
         if !page.page_info.has_next_page {
@@ -5207,7 +5219,7 @@ mod tests {
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
                 ),
-                uses_custom_open_graph_image: true,
+                uses_custom_open_graph_image: Some(true),
                 owner: RepoOwner {
                     login: "octo".to_owned(),
                     avatar_url: Some("https://avatars.githubusercontent.com/u/42".to_owned()),
@@ -5231,6 +5243,32 @@ mod tests {
     }
 
     #[test]
+    fn owned_repo_snapshot_from_node_defaults_visual_flag_when_graphql_returns_null() {
+        let snapshot = owned_repo_snapshot_from_node(
+            RepoNode {
+                database_id: Some(42),
+                name_with_owner: "octo/rocket".to_owned(),
+                name: "rocket".to_owned(),
+                description: None,
+                url: "https://github.com/octo/rocket".to_owned(),
+                is_private: false,
+                open_graph_image_url: Some(
+                    "https://repository-images.githubusercontent.com/42/rocket".to_owned(),
+                ),
+                uses_custom_open_graph_image: None,
+                owner: RepoOwner {
+                    login: "octo".to_owned(),
+                    avatar_url: Some("https://avatars.githubusercontent.com/u/42".to_owned()),
+                },
+            },
+            "octo",
+        )
+        .expect("viewer-owned repo snapshot");
+
+        assert!(!snapshot.uses_custom_open_graph_image);
+    }
+
+    #[test]
     fn owned_repo_snapshot_from_node_skips_non_viewer_owned_repo() {
         let snapshot = owned_repo_snapshot_from_node(
             RepoNode {
@@ -5243,7 +5281,7 @@ mod tests {
                 open_graph_image_url: Some(
                     "https://repository-images.githubusercontent.com/99/shared".to_owned(),
                 ),
-                uses_custom_open_graph_image: true,
+                uses_custom_open_graph_image: Some(true),
                 owner: RepoOwner {
                     login: "acme".to_owned(),
                     avatar_url: Some("https://avatars.githubusercontent.com/u/99".to_owned()),
@@ -6344,7 +6382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn social_activity_baseline_does_not_backfill_history() {
+    async fn social_activity_initial_snapshot_writes_visible_events() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-baseline");
@@ -6392,7 +6430,7 @@ mod tests {
         .await
         .expect("apply initial social snapshot");
 
-        assert_eq!(events, 0);
+        assert_eq!(events, 2);
 
         let baseline_count: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*) FROM follower_sync_baselines WHERE user_id = ?"#)
@@ -6402,13 +6440,27 @@ mod tests {
                 .expect("count follower baseline");
         assert_eq!(baseline_count, 1);
 
-        let history_count: i64 =
-            sqlx::query_scalar(r#"SELECT COUNT(*) FROM social_activity_events WHERE user_id = ?"#)
-                .bind(user_id.as_str())
-                .fetch_one(&pool)
-                .await
-                .expect("count social events");
-        assert_eq!(history_count, 0);
+        let history_rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+            r#"
+            SELECT kind, repo_full_name, actor_login, occurred_at
+            FROM social_activity_events
+            WHERE user_id = ?
+            ORDER BY kind ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load social events");
+        assert_eq!(history_rows.len(), 2);
+        assert_eq!(history_rows[0].0, "follower_received");
+        assert_eq!(history_rows[0].1, None);
+        assert_eq!(history_rows[0].2, "monalisa");
+        assert_ne!(history_rows[0].3, "2026-03-06T10:00:00Z");
+        assert_eq!(history_rows[1].0, "repo_star_received");
+        assert_eq!(history_rows[1].1.as_deref(), Some("octo/alpha"));
+        assert_eq!(history_rows[1].2, "octocat");
+        assert_eq!(history_rows[1].3, "2026-03-06T10:00:00Z");
     }
 
     #[tokio::test]
@@ -6545,7 +6597,7 @@ mod tests {
             },
         };
 
-        apply_social_activity_snapshot(
+        let initial_events = apply_social_activity_snapshot(
             state.as_ref(),
             user_id.as_str(),
             std::slice::from_ref(&repo),
@@ -6554,6 +6606,7 @@ mod tests {
         )
         .await
         .expect("seed initial social baseline");
+        assert_eq!(initial_events, 1);
 
         let repo_members = vec![(
             repo.clone(),
@@ -6672,13 +6725,14 @@ mod tests {
             event_kinds,
             vec![
                 "follower_received".to_owned(),
+                "follower_received".to_owned(),
                 "repo_star_received".to_owned()
             ]
         );
     }
 
     #[tokio::test]
-    async fn social_activity_repo_bootstrap_does_not_backfill_after_follower_only_baseline() {
+    async fn social_activity_first_repo_snapshot_after_follower_only_baseline_emits_events() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-repo-bootstrap-after-follower-only");
@@ -6732,15 +6786,31 @@ mod tests {
         )
         .await
         .expect("apply first repo snapshot after follower-only baseline");
-        assert_eq!(events, 0);
+        assert_eq!(events, 1);
 
-        let history_count: i64 =
-            sqlx::query_scalar(r#"SELECT COUNT(*) FROM social_activity_events WHERE user_id = ?"#)
-                .bind(user_id.as_str())
-                .fetch_one(&pool)
-                .await
-                .expect("count social history");
-        assert_eq!(history_count, 0);
+        let history_rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            r#"
+            SELECT kind, repo_full_name, actor_login
+            FROM social_activity_events
+            WHERE user_id = ?
+            ORDER BY kind ASC, actor_login ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load social history");
+        assert_eq!(
+            history_rows,
+            vec![
+                ("follower_received".to_owned(), None, "monalisa".to_owned()),
+                (
+                    "repo_star_received".to_owned(),
+                    Some("octo/alpha".to_owned()),
+                    "octocat".to_owned(),
+                ),
+            ]
+        );
 
         let baseline_state: i64 = sqlx::query_scalar(
             r#"
@@ -6940,7 +7010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn social_activity_failed_repo_bootstrap_seeds_members_without_backfilling_history() {
+    async fn social_activity_failed_repo_bootstrap_emits_events_on_first_successful_recovery() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let user_id = test_user_id("social-failed-repo-bootstrap");
@@ -7013,7 +7083,7 @@ mod tests {
         .await
         .expect("recover skipped repo snapshot");
 
-        assert_eq!(recovery_events, 0);
+        assert_eq!(recovery_events, 1);
 
         let baseline_state: i64 = sqlx::query_scalar(
             r#"
@@ -7041,7 +7111,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count skipped repo history");
-        assert_eq!(history_count, 0);
+        assert_eq!(history_count, 1);
 
         let current_member_count: i64 = sqlx::query_scalar(
             r#"
@@ -7466,7 +7536,21 @@ mod tests {
         )
         .await
         .expect("reacquire churn repo with fresh tracking");
-        assert_eq!(reacquired_events, 1);
+        assert_eq!(reacquired_events, 0);
+
+        let churn_history_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM social_activity_events
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(churn_repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count churn repo history");
+        assert_eq!(churn_history_count, 1);
     }
 
     #[tokio::test]
