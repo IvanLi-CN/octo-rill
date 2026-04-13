@@ -337,7 +337,7 @@ test.describe("mobile dashboard shell", () => {
 		await dispatchTouch("touchMove", 360);
 		await page.waitForTimeout(48);
 		await dispatchTouch("touchEnd");
-		await page.waitForTimeout(220);
+		await page.waitForTimeout(320);
 		await expect(mobileHeader).toHaveAttribute(
 			"data-dashboard-header-interacting",
 			"false",
@@ -362,8 +362,13 @@ test.describe("mobile dashboard shell", () => {
 			"false",
 		);
 
-		await page.evaluate(() => window.scrollTo(0, 700));
-		await page.waitForTimeout(220);
+		await dispatchTouch("touchStart", 520);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 360);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(320);
 		await expect(
 			page.locator("[data-app-meta-footer-hidden='true']"),
 		).toHaveCount(1);
@@ -386,8 +391,13 @@ test.describe("mobile dashboard shell", () => {
 		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
 		await expect(expandedWorkband).toBeVisible();
 
-		await page.evaluate(() => window.scrollTo(0, 760));
-		await page.waitForTimeout(220);
+		await dispatchTouch("touchStart", 520);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 340);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(320);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
 		).toBeVisible();

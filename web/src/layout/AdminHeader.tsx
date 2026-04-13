@@ -37,6 +37,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 	const {
 		compactHeader,
 		headerInteracting,
+		headerTransitionSuppressed,
 		headerProgress,
 		isMobileViewport,
 		mobileChromeEnabled,
@@ -49,12 +50,13 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			: useMobileCompact
 				? 1
 				: 0;
+	const disableHeaderMotion = headerInteracting || headerTransitionSuppressed;
 
 	return (
 		<div
 			className={cn(
 				"flex flex-col gap-2.5",
-				!headerInteracting &&
+				!disableHeaderMotion &&
 					"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 			)}
 			style={
@@ -69,7 +71,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			<div
 				className={cn(
 					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
-					!headerInteracting &&
+					!disableHeaderMotion &&
 						"motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out",
 				)}
 				style={
@@ -83,7 +85,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 				<div
 					className={cn(
 						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6",
-						!headerInteracting &&
+						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 					)}
 					style={
@@ -98,8 +100,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						<h1
 							className={cn(
 								"text-lg font-semibold tracking-tight",
-								!headerInteracting &&
+								!disableHeaderMotion &&
 									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
 							)}
 							style={
 								isMobileViewport
@@ -123,7 +126,10 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							<BrandLogo
 								variant="wordmark"
 								className={cn(
-									"h-5 motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
+									"h-5",
+									!disableHeaderMotion &&
+										"motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
+									disableHeaderMotion && "transition-none",
 									isMobileViewport && "h-full",
 									useMobileCompact && "h-[18px]",
 								)}
@@ -139,8 +145,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						<div
 							className={cn(
 								"flex h-8 min-w-max items-center gap-4 pr-1 whitespace-nowrap",
-								!headerInteracting &&
+								!disableHeaderMotion &&
 									"motion-safe:transition-[gap,height] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
 							)}
 							style={
 								isMobileViewport
@@ -185,8 +192,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 				<div
 					className={cn(
 						"flex items-center gap-2 self-start lg:self-auto",
-						!headerInteracting &&
+						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+						disableHeaderMotion && "transition-none",
 					)}
 					style={
 						isMobileViewport
@@ -208,8 +216,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					>
 						<ThemeToggle
 							className={cn(
-								!headerInteracting &&
+								!disableHeaderMotion &&
 									"motion-safe:transition-[padding,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
 								useMobileCompact && "p-0.5",
 							)}
 						/>
@@ -220,8 +229,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						size="sm"
 						className={cn(
 							"mr-2 h-8 px-2",
-							!headerInteracting &&
+							!disableHeaderMotion &&
 								"motion-safe:transition-[height,padding,margin,transform] motion-safe:duration-200 motion-safe:ease-out",
+							disableHeaderMotion && "transition-none",
 							useMobileCompact && "mr-1 h-7 px-2",
 						)}
 						style={
@@ -253,8 +263,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						<span
 							className={cn(
 								"text-muted-foreground text-sm",
-								!headerInteracting &&
+								!disableHeaderMotion &&
 									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
 							)}
 							style={
 								isMobileViewport
@@ -272,8 +283,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							size="icon"
 							className={cn(
 								"size-8",
-								!headerInteracting &&
+								!disableHeaderMotion &&
 									"motion-safe:transition-[width,height,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
 								useMobileCompact && "size-7",
 							)}
 							style={

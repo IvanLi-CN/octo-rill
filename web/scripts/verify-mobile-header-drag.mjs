@@ -175,16 +175,21 @@ async function verifyWheelHysteresis(page) {
 	await openStory(page);
 
 	await page.mouse.wheel(0, 180);
-	await page.waitForTimeout(40);
-	const earlyCompact = await readHeaderState(page);
+	const compactSamples = [];
+	for (let index = 0; index < 18; index += 1) {
+		await page.waitForTimeout(25);
+		compactSamples.push(await readHeaderState(page));
+	}
+	const settledCompact = compactSamples.at(-1);
+	assert(Boolean(settledCompact), "wheel down should produce samples");
 	assert(
-		earlyCompact.progress === 0 && !earlyCompact.compact,
-		`wheel down should not expose a mid state before hysteresis settles, got ${JSON.stringify(
-			earlyCompact,
+		compactSamples.every(
+			(sample) => sample.progress === 0 || sample.progress === 1,
+		),
+		`wheel down should not jitter through mid states, got ${JSON.stringify(
+			compactSamples,
 		)}`,
 	);
-	await page.waitForTimeout(180);
-	const settledCompact = await readHeaderState(page);
 	assert(
 		settledCompact.compact && !settledCompact.interacting,
 		`wheel down should settle to compact, got ${JSON.stringify(
@@ -193,8 +198,21 @@ async function verifyWheelHysteresis(page) {
 	);
 
 	await page.mouse.wheel(0, -140);
-	await page.waitForTimeout(220);
-	const settledExpanded = await readHeaderState(page);
+	const expandedSamples = [];
+	for (let index = 0; index < 22; index += 1) {
+		await page.waitForTimeout(25);
+		expandedSamples.push(await readHeaderState(page));
+	}
+	const settledExpanded = expandedSamples.at(-1);
+	assert(Boolean(settledExpanded), "wheel up should produce samples");
+	assert(
+		expandedSamples.every(
+			(sample) => sample.progress === 0 || sample.progress === 1,
+		),
+		`wheel up should not jitter through mid states, got ${JSON.stringify(
+			expandedSamples,
+		)}`,
+	);
 	assert(
 		settledExpanded.progress === 0 && !settledExpanded.compact,
 		`wheel up should settle to expanded, got ${JSON.stringify(

@@ -19,6 +19,7 @@ type AppShellChromeState = {
 	compactHeader: boolean;
 	headerProgress: number;
 	headerInteracting: boolean;
+	headerTransitionSuppressed: boolean;
 	footerHidden: boolean;
 	atTop: boolean;
 	headerHeight: number;
@@ -31,6 +32,7 @@ const DEFAULT_CHROME_STATE: AppShellChromeState = {
 	compactHeader: false,
 	headerProgress: 0,
 	headerInteracting: false,
+	headerTransitionSuppressed: false,
 	footerHidden: false,
 	atTop: true,
 	headerHeight: 0,
@@ -71,13 +73,16 @@ export function AppShell({
 	const SNAP_TO_COMPACT_THRESHOLD = 0.65;
 	const SNAP_TO_EXPANDED_THRESHOLD = 0.35;
 	const INTERACTION_RELEASE_THRESHOLD = 0.5;
+	const WHEEL_TOGGLE_DELTA = 36;
 	const SCROLL_SETTLE_DELAY_MS = 96;
 	const TOUCH_FALLBACK_SETTLE_DELAY_MS = 160;
 	const WHEEL_INTERACTION_WINDOW_MS = 140;
+	const POST_WHEEL_DISCRETE_LOCK_MS = 420;
 	const POST_TOUCH_DISCRETE_LOCK_MS = 260;
 	const headerRef = useRef<HTMLElement | null>(null);
 	const frameRef = useRef<number | null>(null);
 	const settleTimeoutRef = useRef<number | null>(null);
+	const deferredScrollTimeoutRef = useRef<number | null>(null);
 	const lastScrollTopRef = useRef(0);
 	const compactHeaderRef = useRef(false);
 	const headerInteractingRef = useRef(false);
@@ -91,7 +96,9 @@ export function AppShell({
 	const gestureStartProgressRef = useRef(0);
 	const gestureStartClientYRef = useRef(0);
 	const touchFallbackTimeoutRef = useRef<number | null>(null);
+	const transitionSuppressionTimeoutRef = useRef<number | null>(null);
 	const lastWheelAtRef = useRef(Number.NEGATIVE_INFINITY);
+	const wheelDeltaAccumulatorRef = useRef(0);
 	const discreteLockUntilRef = useRef(Number.NEGATIVE_INFINITY);
 	const [isMobileViewport, setIsMobileViewport] = useState(false);
 	const [atTop, setAtTop] = useState(true);
@@ -100,6 +107,8 @@ export function AppShell({
 	const [compactHeader, setCompactHeader] = useState(false);
 	const [headerProgress, setHeaderProgress] = useState(0);
 	const [headerInteracting, setHeaderInteracting] = useState(false);
+	const [headerTransitionSuppressed, setHeaderTransitionSuppressed] =
+		useState(false);
 	const [headerHeight, setHeaderHeight] = useState(0);
 
 	useEffect(() => {
@@ -139,6 +148,7 @@ export function AppShell({
 			setCompactHeader(false);
 			setHeaderProgress(0);
 			setHeaderInteracting(false);
+			setHeaderTransitionSuppressed(false);
 			compactHeaderRef.current = false;
 			headerProgressRef.current = 0;
 			headerInteractingRef.current = false;
@@ -149,6 +159,7 @@ export function AppShell({
 			gestureStartProgressRef.current = 0;
 			gestureStartClientYRef.current = 0;
 			lastWheelAtRef.current = Number.NEGATIVE_INFINITY;
+			wheelDeltaAccumulatorRef.current = 0;
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
 			activePointerTypeRef.current = null;
 			activeTouchPointerIdRef.current = null;
@@ -156,9 +167,17 @@ export function AppShell({
 				window.clearTimeout(settleTimeoutRef.current);
 				settleTimeoutRef.current = null;
 			}
+			if (deferredScrollTimeoutRef.current !== null) {
+				window.clearTimeout(deferredScrollTimeoutRef.current);
+				deferredScrollTimeoutRef.current = null;
+			}
 			if (touchFallbackTimeoutRef.current !== null) {
 				window.clearTimeout(touchFallbackTimeoutRef.current);
 				touchFallbackTimeoutRef.current = null;
+			}
+			if (transitionSuppressionTimeoutRef.current !== null) {
+				window.clearTimeout(transitionSuppressionTimeoutRef.current);
+				transitionSuppressionTimeoutRef.current = null;
 			}
 			return;
 		}
@@ -170,6 +189,41 @@ export function AppShell({
 				window.clearTimeout(touchFallbackTimeoutRef.current);
 				touchFallbackTimeoutRef.current = null;
 			}
+		};
+
+		const scheduleDeferredScrollAfterLock = (delayMs: number) => {
+			if (deferredScrollTimeoutRef.current !== null) {
+				window.clearTimeout(deferredScrollTimeoutRef.current);
+			}
+			deferredScrollTimeoutRef.current = window.setTimeout(
+				() => {
+					deferredScrollTimeoutRef.current = null;
+					if (frameRef.current !== null) {
+						return;
+					}
+					frameRef.current = window.requestAnimationFrame(updateScrollState);
+				},
+				Math.max(0, delayMs),
+			);
+		};
+
+		const clearTransitionSuppression = () => {
+			if (transitionSuppressionTimeoutRef.current !== null) {
+				window.clearTimeout(transitionSuppressionTimeoutRef.current);
+				transitionSuppressionTimeoutRef.current = null;
+			}
+			setHeaderTransitionSuppressed(false);
+		};
+
+		const suppressHeaderTransitionsFor = (durationMs: number) => {
+			if (transitionSuppressionTimeoutRef.current !== null) {
+				window.clearTimeout(transitionSuppressionTimeoutRef.current);
+			}
+			setHeaderTransitionSuppressed(true);
+			transitionSuppressionTimeoutRef.current = window.setTimeout(() => {
+				transitionSuppressionTimeoutRef.current = null;
+				setHeaderTransitionSuppressed(false);
+			}, durationMs);
 		};
 
 		const resetProgressAnchors = (currentTop: number) => {
@@ -196,10 +250,13 @@ export function AppShell({
 			gestureStartProgressRef.current = nextCompact ? 1 : 0;
 			gestureStartClientYRef.current = 0;
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			wheelDeltaAccumulatorRef.current = 0;
 			activePointerTypeRef.current = null;
 		};
 
-		const settleHeaderState = (mode: "scroll" | "interaction" = "scroll") => {
+		const settleHeaderState = (
+			mode: "scroll" | "interaction" | "wheel" = "scroll",
+		) => {
 			const currentTop = window.scrollY;
 			if (currentTop <= COMPACT_ENTER_MIN_TOP) {
 				applySettledState(false, currentTop);
@@ -211,6 +268,16 @@ export function AppShell({
 					headerProgressRef.current >= INTERACTION_RELEASE_THRESHOLD,
 					currentTop,
 				);
+				return;
+			}
+
+			if (mode === "wheel") {
+				if (Math.abs(wheelDeltaAccumulatorRef.current) < WHEEL_TOGGLE_DELTA) {
+					applySettledState(compactHeaderRef.current, currentTop);
+					return;
+				}
+
+				applySettledState(wheelDeltaAccumulatorRef.current > 0, currentTop);
 				return;
 			}
 
@@ -254,6 +321,7 @@ export function AppShell({
 		const promoteToTouchInteraction = (clientY?: number) => {
 			const nextClientY = clientY ?? gestureStartClientYRef.current ?? 0;
 			clearTouchFallback();
+			clearTransitionSuppression();
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
 
 			if (!headerInteractingRef.current) {
@@ -298,13 +366,36 @@ export function AppShell({
 				typeof performance !== "undefined" ? performance.now() : Date.now();
 			const wheelDriven =
 				now - lastWheelAtRef.current <= WHEEL_INTERACTION_WINDOW_MS;
+			const wheelSequenceActive =
+				wheelDriven || wheelDeltaAccumulatorRef.current !== 0;
 			setScrollDirection(nextDirection);
 
-			if (now < discreteLockUntilRef.current) {
+			if (now < discreteLockUntilRef.current && !wheelDriven) {
+				scheduleDeferredScrollAfterLock(discreteLockUntilRef.current - now + 4);
 				return;
 			}
 
 			if (headerInteractingRef.current) {
+				return;
+			}
+
+			if (wheelSequenceActive) {
+				if (settleTimeoutRef.current !== null) {
+					window.clearTimeout(settleTimeoutRef.current);
+				}
+				settleTimeoutRef.current = window.setTimeout(() => {
+					settleTimeoutRef.current = null;
+					if (wheelDeltaAccumulatorRef.current === 0) {
+						return;
+					}
+
+					settleHeaderState("wheel");
+					discreteLockUntilRef.current =
+						(typeof performance !== "undefined"
+							? performance.now()
+							: Date.now()) + POST_WHEEL_DISCRETE_LOCK_MS;
+					suppressHeaderTransitionsFor(POST_WHEEL_DISCRETE_LOCK_MS);
+				}, SCROLL_SETTLE_DELAY_MS);
 				return;
 			}
 
@@ -360,7 +451,12 @@ export function AppShell({
 				window.clearTimeout(settleTimeoutRef.current);
 				settleTimeoutRef.current = null;
 			}
+			if (deferredScrollTimeoutRef.current !== null) {
+				window.clearTimeout(deferredScrollTimeoutRef.current);
+				deferredScrollTimeoutRef.current = null;
+			}
 			clearTouchFallback();
+			clearTransitionSuppression();
 			setHeaderInteracting(true);
 			headerInteractingRef.current = true;
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
@@ -507,9 +603,16 @@ export function AppShell({
 			frameRef.current = window.requestAnimationFrame(updateScrollState);
 		};
 
-		const handleWheel = () => {
-			lastWheelAtRef.current =
+		const handleWheel = (event: WheelEvent) => {
+			const now =
 				typeof performance !== "undefined" ? performance.now() : Date.now();
+			if (now - lastWheelAtRef.current > WHEEL_INTERACTION_WINDOW_MS * 2) {
+				wheelDeltaAccumulatorRef.current = 0;
+			}
+			lastWheelAtRef.current = now;
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			setHeaderTransitionSuppressed(true);
+			wheelDeltaAccumulatorRef.current += event.deltaY;
 		};
 
 		window.addEventListener("pointerdown", handlePointerDown, {
@@ -550,6 +653,7 @@ export function AppShell({
 				settleTimeoutRef.current = null;
 			}
 			clearTouchFallback();
+			clearTransitionSuppression();
 		};
 	}, [mobileChrome, isMobileViewport]);
 
@@ -563,6 +667,7 @@ export function AppShell({
 			gestureStartTopRef.current = 0;
 			gestureStartProgressRef.current = 0;
 			lastWheelAtRef.current = Number.NEGATIVE_INFINITY;
+			wheelDeltaAccumulatorRef.current = 0;
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
 			activePointerTypeRef.current = null;
 			activeTouchPointerIdRef.current = null;
@@ -570,6 +675,7 @@ export function AppShell({
 			setCompactHeader(false);
 			setHeaderProgress(0);
 			setHeaderInteracting(false);
+			setHeaderTransitionSuppressed(false);
 			headerInteractingRef.current = false;
 			if (
 				touchFallbackTimeoutRef.current !== null &&
@@ -577,6 +683,20 @@ export function AppShell({
 			) {
 				window.clearTimeout(touchFallbackTimeoutRef.current);
 				touchFallbackTimeoutRef.current = null;
+			}
+			if (
+				transitionSuppressionTimeoutRef.current !== null &&
+				typeof window !== "undefined"
+			) {
+				window.clearTimeout(transitionSuppressionTimeoutRef.current);
+				transitionSuppressionTimeoutRef.current = null;
+			}
+			if (
+				deferredScrollTimeoutRef.current !== null &&
+				typeof window !== "undefined"
+			) {
+				window.clearTimeout(deferredScrollTimeoutRef.current);
+				deferredScrollTimeoutRef.current = null;
 			}
 		}
 	}, [isMobileViewport, mobileChrome]);
@@ -618,6 +738,7 @@ export function AppShell({
 					? Math.max(0, Math.min(1, headerProgress))
 					: 0,
 			headerInteracting,
+			headerTransitionSuppressed,
 			footerHidden,
 			atTop,
 			headerHeight,
@@ -627,6 +748,7 @@ export function AppShell({
 			atTop,
 			footerHidden,
 			headerInteracting,
+			headerTransitionSuppressed,
 			headerHeight,
 			headerProgress,
 			isMobileViewport,
