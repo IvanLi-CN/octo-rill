@@ -29,7 +29,7 @@ pub async fn load_or_seed_runtime_settings(
 
     let snapshot = AdminRuntimeSettingsSnapshot {
         llm_max_concurrency: config.ai_max_concurrency,
-        ai_model_context_limit: None,
+        ai_model_context_limit: legacy_ai_model_context_limit_seed(),
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
     };
@@ -175,6 +175,17 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
     }))
 }
 
+fn legacy_ai_model_context_limit_seed() -> Option<u32> {
+    parse_legacy_ai_model_context_limit_seed(
+        std::env::var("AI_MODEL_CONTEXT_LIMIT").ok().as_deref(),
+    )
+}
+
+fn parse_legacy_ai_model_context_limit_seed(raw: Option<&str>) -> Option<u32> {
+    raw.and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -263,6 +274,21 @@ mod tests {
         );
 
         state.translation_scheduler.abort_all().await;
+    }
+
+    #[test]
+    fn parse_legacy_ai_model_context_limit_seed_accepts_positive_values_only() {
+        assert_eq!(
+            parse_legacy_ai_model_context_limit_seed(Some("32768")),
+            Some(32_768)
+        );
+        assert_eq!(
+            parse_legacy_ai_model_context_limit_seed(Some(" 8192 ")),
+            Some(8_192)
+        );
+        assert_eq!(parse_legacy_ai_model_context_limit_seed(Some("0")), None);
+        assert_eq!(parse_legacy_ai_model_context_limit_seed(Some("abc")), None);
+        assert_eq!(parse_legacy_ai_model_context_limit_seed(None), None);
     }
 
     async fn setup_pool() -> SqlitePool {

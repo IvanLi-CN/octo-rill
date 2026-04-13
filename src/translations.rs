@@ -1963,6 +1963,7 @@ async fn ensure_translation_result_for_item(
                     tx,
                     user_id,
                     item.kind.as_str(),
+                    item.variant.as_str(),
                     item.entity_id.as_str(),
                     item.target_lang.as_str(),
                     source_hash.as_str(),
@@ -2222,6 +2223,7 @@ async fn insert_translation_request(
             tx,
             user_id,
             item.kind.as_str(),
+            item.variant.as_str(),
             item.entity_id.as_str(),
             item.target_lang.as_str(),
             source_hash.as_str(),
@@ -2303,6 +2305,7 @@ async fn ensure_translation_result_demand(
             tx,
             user_id,
             item.kind.as_str(),
+            item.variant.as_str(),
             item.entity_id.as_str(),
             item.target_lang.as_str(),
             source_hash,
@@ -2594,7 +2597,7 @@ async fn load_translation_state_row(
     user_id: &str,
     item: &TranslationRequestItemInput,
 ) -> Result<Option<TranslationStateRow>, ApiError> {
-    let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
+    let Some(entity_type) = map_entity_type(item.kind.as_str(), item.variant.as_str()) else {
         return Ok(None);
     };
     sqlx::query_as::<_, TranslationStateRow>(
@@ -2641,7 +2644,7 @@ async fn upsert_translation_demand_state(
     work_item_id: &str,
     now: &str,
 ) -> Result<(), ApiError> {
-    let Some(entity_type) = map_entity_type(item.kind.as_str()) else {
+    let Some(entity_type) = map_entity_type(item.kind.as_str(), item.variant.as_str()) else {
         return Ok(());
     };
     let existing = load_translation_state_row(tx, user_id, item).await?;
@@ -2761,6 +2764,7 @@ async fn persist_translation_terminal_state(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     kind: &str,
+    variant: &str,
     entity_id: &str,
     target_lang: &str,
     source_hash: &str,
@@ -2771,7 +2775,7 @@ async fn persist_translation_terminal_state(
     work_item_id: &str,
     now: &str,
 ) -> Result<(), ApiError> {
-    let Some(entity_type) = map_entity_type(kind) else {
+    let Some(entity_type) = map_entity_type(kind, variant) else {
         return Ok(());
     };
     let update = sqlx::query(
@@ -3821,6 +3825,7 @@ async fn finalize_batch_success(
                 &mut tx,
                 &work_item.scope_user_id,
                 work_item.kind.as_str(),
+                work_item.variant.as_str(),
                 work_item.entity_id.as_str(),
                 work_item.target_lang.as_str(),
                 work_item.source_hash.as_str(),
@@ -4006,6 +4011,7 @@ async fn fail_batch_with_message(
             tx,
             item.scope_user_id.as_str(),
             item.kind.as_str(),
+            item.variant.as_str(),
             item.entity_id.as_str(),
             item.target_lang.as_str(),
             item.source_hash.as_str(),
@@ -4587,7 +4593,7 @@ fn normalize_request_items(
 }
 
 fn build_source_hash(item: &TranslationRequestItemInput) -> String {
-    if item.kind == "release_detail" {
+    if uses_release_detail_translation_state(item.kind.as_str(), item.variant.as_str()) {
         let repo_full_name = item
             .source_blocks
             .iter()
@@ -4694,11 +4700,17 @@ fn current_model_profile() -> String {
         .unwrap_or_else(|| TRANSLATION_MODEL_PROFILE_DISABLED.to_owned())
 }
 
-fn map_entity_type(kind: &str) -> Option<&'static str> {
+fn uses_release_detail_translation_state(kind: &str, variant: &str) -> bool {
+    kind == "release_detail" || matches!((kind, variant), ("release_summary", "feed_body"))
+}
+
+fn map_entity_type(kind: &str, variant: &str) -> Option<&'static str> {
+    if uses_release_detail_translation_state(kind, variant) {
+        return Some("release_detail");
+    }
     match kind {
         "release_summary" => Some("release"),
         "release_smart" => Some("release_smart"),
-        "release_detail" => Some("release_detail"),
         "notification" => Some("notification"),
         _ => None,
     }
@@ -4864,14 +4876,6 @@ async fn build_canonical_feed_request_item(
     }
 
     Ok(Some(TranslationRequestItemInput {
-        kind: if matches!(
-            (item.kind.as_str(), item.variant.as_str()),
-            ("release_summary", "feed_body")
-        ) {
-            "release_detail".to_owned()
-        } else {
-            item.kind.clone()
-        },
         source_blocks,
         ..item.clone()
     }))
@@ -6330,13 +6334,13 @@ mod tests {
         )
         .await;
 
-        let current_item = release_detail_feed_item(
+        let current_item = release_feed_item(
             "420",
             "Release v2.0.0",
             Some("- current body"),
             Some("openai/codex"),
         );
-        let stale_item = release_detail_feed_item(
+        let stale_item = release_feed_item(
             "420",
             "Release v1.9.0",
             Some("- stale body"),
@@ -6429,7 +6433,7 @@ mod tests {
             Some("- current body"),
             Some("openai/codex"),
         );
-        let stale_item = release_detail_feed_item(
+        let stale_item = release_feed_item(
             "420",
             "Release v1.9.0",
             Some("- stale body"),
@@ -6480,6 +6484,82 @@ mod tests {
                 .expect("count work items");
         assert_eq!(request_count, 0);
         assert_eq!(work_item_count, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_keeps_feed_body_work_items_batchable() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            420,
+            "openai/codex",
+            "Release v2.0.0",
+            "- current body",
+        )
+        .await;
+
+        let stale_item = release_feed_item(
+            "420",
+            "Release v1.9.0",
+            Some("- stale body"),
+            Some("openai/codex"),
+        );
+
+        let resolved =
+            resolve_translation_results_for_user(state.as_ref(), "1", &[stale_item], false)
+                .await
+                .expect("resolve canonical queued result");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, "queued");
+        assert_eq!(resolved[0].kind, "release_summary");
+        assert_eq!(resolved[0].variant, "feed_body");
+
+        let work_row = sqlx::query(
+            r#"
+            SELECT kind, variant, source_hash
+            FROM translation_work_items
+            WHERE entity_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind("420")
+        .fetch_one(&pool)
+        .await
+        .expect("load translation work item");
+        assert_eq!(work_row.get::<String, _>("kind"), "release_summary");
+        assert_eq!(work_row.get::<String, _>("variant"), "feed_body");
+
+        let state_row = sqlx::query(
+            r#"
+            SELECT entity_type, source_hash
+            FROM ai_translations
+            WHERE user_id = ? AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind("420")
+        .fetch_one(&pool)
+        .await
+        .expect("load translation state row");
+        assert_eq!(state_row.get::<String, _>("entity_type"), "release_detail");
+        assert_eq!(
+            state_row.get::<String, _>("source_hash"),
+            crate::api::release_detail_source_hash(
+                "openai/codex",
+                "Release v2.0.0",
+                "- current body",
+            ),
+        );
+        assert_eq!(
+            work_row.get::<String, _>("source_hash"),
+            state_row.get::<String, _>("source_hash"),
+        );
     }
 
     #[tokio::test]
