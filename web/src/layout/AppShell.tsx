@@ -17,6 +17,8 @@ type AppShellChromeState = {
 	mobileChromeEnabled: boolean;
 	isMobileViewport: boolean;
 	compactHeader: boolean;
+	headerProgress: number;
+	headerInteracting: boolean;
 	footerHidden: boolean;
 	atTop: boolean;
 	headerHeight: number;
@@ -27,6 +29,8 @@ const DEFAULT_CHROME_STATE: AppShellChromeState = {
 	mobileChromeEnabled: false,
 	isMobileViewport: false,
 	compactHeader: false,
+	headerProgress: 0,
+	headerInteracting: false,
 	footerHidden: false,
 	atTop: true,
 	headerHeight: 0,
@@ -63,26 +67,38 @@ export function AppShell({
 }: AppShellProps) {
 	const SCROLL_DIRECTION_EPSILON = 2;
 	const COMPACT_ENTER_MIN_TOP = 40;
-	const COMPACT_ENTER_DISTANCE = 16;
-	const COMPACT_EXIT_DISTANCE = 24;
-	const USER_INPUT_DIRECTION_TTL_MS = 220;
-	const PROGRAMMATIC_COMPACT_DISTANCE = 120;
-	const PROGRAMMATIC_EXPAND_DISTANCE = 120;
+	const HEADER_PROGRESS_DISTANCE = 96;
+	const SNAP_TO_COMPACT_THRESHOLD = 0.65;
+	const SNAP_TO_EXPANDED_THRESHOLD = 0.35;
+	const SCROLL_SETTLE_DELAY_MS = 96;
+	const TOUCH_FALLBACK_SETTLE_DELAY_MS = 160;
+	const WHEEL_INTERACTION_WINDOW_MS = 140;
+	const POST_TOUCH_DISCRETE_LOCK_MS = 260;
 	const headerRef = useRef<HTMLElement | null>(null);
 	const frameRef = useRef<number | null>(null);
+	const settleTimeoutRef = useRef<number | null>(null);
 	const lastScrollTopRef = useRef(0);
-	const gestureAnchorTopRef = useRef(0);
-	const gestureDirectionRef = useRef<AppShellScrollDirection>("idle");
 	const compactHeaderRef = useRef(false);
-	const compactPeakTopRef = useRef(0);
-	const inputDirectionRef = useRef<AppShellScrollDirection>("idle");
-	const inputDirectionAtRef = useRef(0);
-	const touchLastYRef = useRef<number | null>(null);
+	const headerInteractingRef = useRef(false);
+	const headerProgressRef = useRef(0);
+	const progressAnchorTopRef = useRef(0);
+	const progressAnchorValueRef = useRef(0);
+	const progressDirectionRef = useRef<AppShellScrollDirection>("idle");
+	const activeTouchPointerIdRef = useRef<number | null>(null);
+	const activePointerTypeRef = useRef<"touch" | "mouse" | null>(null);
+	const gestureStartTopRef = useRef(0);
+	const gestureStartProgressRef = useRef(0);
+	const gestureStartClientYRef = useRef(0);
+	const touchFallbackTimeoutRef = useRef<number | null>(null);
+	const lastWheelAtRef = useRef(Number.NEGATIVE_INFINITY);
+	const discreteLockUntilRef = useRef(Number.NEGATIVE_INFINITY);
 	const [isMobileViewport, setIsMobileViewport] = useState(false);
 	const [atTop, setAtTop] = useState(true);
 	const [scrollDirection, setScrollDirection] =
 		useState<AppShellScrollDirection>("idle");
 	const [compactHeader, setCompactHeader] = useState(false);
+	const [headerProgress, setHeaderProgress] = useState(0);
+	const [headerInteracting, setHeaderInteracting] = useState(false);
 	const [headerHeight, setHeaderHeight] = useState(0);
 
 	useEffect(() => {
@@ -108,24 +124,140 @@ export function AppShell({
 	}, [compactHeader]);
 
 	useEffect(() => {
+		headerProgressRef.current = headerProgress;
+	}, [headerProgress]);
+
+	useEffect(() => {
+		headerInteractingRef.current = headerInteracting;
+	}, [headerInteracting]);
+
+	useEffect(() => {
 		if (!mobileChrome || typeof window === "undefined") {
 			setAtTop(true);
 			setScrollDirection("idle");
 			setCompactHeader(false);
+			setHeaderProgress(0);
+			setHeaderInteracting(false);
 			compactHeaderRef.current = false;
-			gestureAnchorTopRef.current = 0;
-			gestureDirectionRef.current = "idle";
-			compactPeakTopRef.current = 0;
-			inputDirectionRef.current = "idle";
-			inputDirectionAtRef.current = 0;
-			touchLastYRef.current = null;
+			headerProgressRef.current = 0;
+			headerInteractingRef.current = false;
+			progressAnchorTopRef.current = 0;
+			progressAnchorValueRef.current = 0;
+			progressDirectionRef.current = "idle";
+			gestureStartTopRef.current = 0;
+			gestureStartProgressRef.current = 0;
+			gestureStartClientYRef.current = 0;
+			lastWheelAtRef.current = Number.NEGATIVE_INFINITY;
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			activePointerTypeRef.current = null;
+			activeTouchPointerIdRef.current = null;
+			if (settleTimeoutRef.current !== null) {
+				window.clearTimeout(settleTimeoutRef.current);
+				settleTimeoutRef.current = null;
+			}
+			if (touchFallbackTimeoutRef.current !== null) {
+				window.clearTimeout(touchFallbackTimeoutRef.current);
+				touchFallbackTimeoutRef.current = null;
+			}
 			return;
 		}
 
-		const setRecentInputDirection = (direction: AppShellScrollDirection) => {
-			if (direction === "idle") return;
-			inputDirectionRef.current = direction;
-			inputDirectionAtRef.current = window.performance.now();
+		const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
+
+		const clearTouchFallback = () => {
+			if (touchFallbackTimeoutRef.current !== null) {
+				window.clearTimeout(touchFallbackTimeoutRef.current);
+				touchFallbackTimeoutRef.current = null;
+			}
+		};
+
+		const resetProgressAnchors = (currentTop: number) => {
+			progressAnchorTopRef.current = currentTop;
+			progressAnchorValueRef.current = headerProgressRef.current;
+			progressDirectionRef.current = "idle";
+		};
+
+		const applySettledState = (nextCompact: boolean, currentTop: number) => {
+			if (settleTimeoutRef.current !== null) {
+				window.clearTimeout(settleTimeoutRef.current);
+				settleTimeoutRef.current = null;
+			}
+			clearTouchFallback();
+
+			compactHeaderRef.current = nextCompact;
+			headerProgressRef.current = nextCompact ? 1 : 0;
+			setCompactHeader(nextCompact);
+			setHeaderProgress(nextCompact ? 1 : 0);
+			progressAnchorTopRef.current = currentTop;
+			progressAnchorValueRef.current = nextCompact ? 1 : 0;
+			progressDirectionRef.current = "idle";
+			gestureStartTopRef.current = currentTop;
+			gestureStartProgressRef.current = nextCompact ? 1 : 0;
+			gestureStartClientYRef.current = 0;
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			activePointerTypeRef.current = null;
+		};
+
+		const settleHeaderState = () => {
+			const currentTop = window.scrollY;
+			const nextCompact =
+				currentTop > COMPACT_ENTER_MIN_TOP &&
+				headerProgressRef.current >= SNAP_TO_COMPACT_THRESHOLD;
+			const nextExpanded =
+				currentTop <= COMPACT_ENTER_MIN_TOP ||
+				headerProgressRef.current <= SNAP_TO_EXPANDED_THRESHOLD;
+
+			if (compactHeaderRef.current) {
+				applySettledState(!nextExpanded, currentTop);
+				return;
+			}
+
+			applySettledState(nextCompact, currentTop);
+		};
+
+		const scheduleTouchFallbackSettle = () => {
+			clearTouchFallback();
+			touchFallbackTimeoutRef.current = window.setTimeout(() => {
+				touchFallbackTimeoutRef.current = null;
+				if (!headerInteractingRef.current) {
+					return;
+				}
+				setHeaderInteracting(false);
+				headerInteractingRef.current = false;
+				settleHeaderState();
+			}, TOUCH_FALLBACK_SETTLE_DELAY_MS);
+		};
+
+		const updateInteractiveGestureProgress = (clientY: number) => {
+			const nextHeaderProgress = clampUnit(
+				gestureStartProgressRef.current +
+					(gestureStartClientYRef.current - clientY) / HEADER_PROGRESS_DISTANCE,
+			);
+			headerProgressRef.current = nextHeaderProgress;
+			setHeaderProgress(nextHeaderProgress);
+			clearTouchFallback();
+			return nextHeaderProgress;
+		};
+
+		const promoteToTouchInteraction = (clientY?: number) => {
+			const nextClientY = clientY ?? gestureStartClientYRef.current ?? 0;
+			clearTouchFallback();
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+
+			if (!headerInteractingRef.current) {
+				beginTouchInteraction({
+					pointerType: "touch",
+					clientY: nextClientY,
+				});
+				return;
+			}
+
+			activePointerTypeRef.current = "touch";
+			activeTouchPointerIdRef.current = null;
+			gestureStartTopRef.current = window.scrollY;
+			gestureStartProgressRef.current = headerProgressRef.current;
+			gestureStartClientYRef.current = nextClientY;
+			resetProgressAnchors(window.scrollY);
 		};
 
 		const updateScrollState = () => {
@@ -133,24 +265,14 @@ export function AppShell({
 			const currentTop = window.scrollY;
 			const previousTop = lastScrollTopRef.current;
 			const delta = currentTop - previousTop;
-			const now = window.performance.now();
 			lastScrollTopRef.current = currentTop;
 			const nextAtTop = currentTop <= 4;
-			const currentCompactHeader = compactHeaderRef.current;
-			const hasRecentInputDirection = (direction: AppShellScrollDirection) =>
-				inputDirectionRef.current === direction &&
-				now - inputDirectionAtRef.current <= USER_INPUT_DIRECTION_TTL_MS;
 			setAtTop(nextAtTop);
 
-			if (nextAtTop) {
+			if (nextAtTop && !headerInteractingRef.current) {
 				setScrollDirection("idle");
-				setCompactHeader(false);
-				compactHeaderRef.current = false;
-				gestureAnchorTopRef.current = 0;
-				gestureDirectionRef.current = "idle";
-				compactPeakTopRef.current = 0;
-				inputDirectionRef.current = "idle";
-				inputDirectionAtRef.current = 0;
+				applySettledState(false, currentTop);
+				activeTouchPointerIdRef.current = null;
 				return;
 			}
 
@@ -160,103 +282,209 @@ export function AppShell({
 
 			const nextDirection: AppShellScrollDirection =
 				delta > 0 ? "content-up" : "content-down";
+			const now =
+				typeof performance !== "undefined" ? performance.now() : Date.now();
+			const wheelDriven =
+				now - lastWheelAtRef.current <= WHEEL_INTERACTION_WINDOW_MS;
+			setScrollDirection(nextDirection);
 
-			if (gestureDirectionRef.current !== nextDirection) {
-				gestureDirectionRef.current = nextDirection;
-				gestureAnchorTopRef.current = previousTop;
+			if (now < discreteLockUntilRef.current) {
+				return;
+			}
+
+			if (headerInteractingRef.current) {
+				return;
+			}
+
+			const currentProgress = headerProgressRef.current;
+
+			if (progressDirectionRef.current !== nextDirection) {
+				progressDirectionRef.current = nextDirection;
+				progressAnchorTopRef.current = previousTop;
+				progressAnchorValueRef.current = currentProgress;
 			}
 
 			const directionDistance =
 				nextDirection === "content-up"
-					? currentTop - gestureAnchorTopRef.current
-					: gestureAnchorTopRef.current - currentTop;
+					? currentTop - progressAnchorTopRef.current
+					: progressAnchorTopRef.current - currentTop;
+			const nextHeaderProgress =
+				nextDirection === "content-up"
+					? clampUnit(
+							progressAnchorValueRef.current +
+								directionDistance / HEADER_PROGRESS_DISTANCE,
+						)
+					: clampUnit(
+							progressAnchorValueRef.current -
+								directionDistance / HEADER_PROGRESS_DISTANCE,
+						);
 
-			setScrollDirection(nextDirection);
-
-			if (!currentCompactHeader) {
-				if (
-					nextDirection === "content-up" &&
-					currentTop >= COMPACT_ENTER_MIN_TOP &&
-					directionDistance >= COMPACT_ENTER_DISTANCE &&
-					(hasRecentInputDirection("content-up") ||
-						directionDistance >= PROGRAMMATIC_COMPACT_DISTANCE)
-				) {
-					compactHeaderRef.current = true;
-					compactPeakTopRef.current = currentTop;
-					setCompactHeader(true);
-					gestureAnchorTopRef.current = currentTop;
-					gestureDirectionRef.current = nextDirection;
-				}
-				return;
+			headerProgressRef.current = nextHeaderProgress;
+			if (!wheelDriven) {
+				setHeaderProgress(nextHeaderProgress);
 			}
 
-			compactPeakTopRef.current = Math.max(
-				compactPeakTopRef.current,
-				currentTop,
-			);
-
-			if (currentTop <= COMPACT_ENTER_MIN_TOP - 8) {
-				compactHeaderRef.current = false;
-				compactPeakTopRef.current = 0;
-				setCompactHeader(false);
-				gestureAnchorTopRef.current = currentTop;
-				gestureDirectionRef.current = "content-down";
-				return;
+			if (settleTimeoutRef.current !== null) {
+				window.clearTimeout(settleTimeoutRef.current);
 			}
-
-			if (nextDirection === "content-up") {
-				return;
-			}
-
-			if (
-				nextDirection === "content-down" &&
-				compactPeakTopRef.current - currentTop >= COMPACT_EXIT_DISTANCE &&
-				(hasRecentInputDirection("content-down") ||
-					compactPeakTopRef.current - currentTop >=
-						PROGRAMMATIC_EXPAND_DISTANCE)
-			) {
-				compactHeaderRef.current = false;
-				compactPeakTopRef.current = 0;
-				setCompactHeader(false);
-				gestureAnchorTopRef.current = currentTop;
-				gestureDirectionRef.current = nextDirection;
-			}
+			settleTimeoutRef.current = window.setTimeout(() => {
+				settleTimeoutRef.current = null;
+				settleHeaderState();
+			}, SCROLL_SETTLE_DELAY_MS);
 		};
 
 		lastScrollTopRef.current = window.scrollY;
 		updateScrollState();
 
-		const handleWheel = (event: WheelEvent) => {
-			if (Math.abs(event.deltaY) < SCROLL_DIRECTION_EPSILON) {
+		const beginTouchInteraction = (options?: {
+			pointerType?: "touch" | "mouse";
+			clientY?: number;
+		}) => {
+			if (headerInteractingRef.current) {
 				return;
 			}
 
-			setRecentInputDirection(event.deltaY > 0 ? "content-up" : "content-down");
+			if (settleTimeoutRef.current !== null) {
+				window.clearTimeout(settleTimeoutRef.current);
+				settleTimeoutRef.current = null;
+			}
+			clearTouchFallback();
+			setHeaderInteracting(true);
+			headerInteractingRef.current = true;
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			activePointerTypeRef.current = options?.pointerType ?? "touch";
+			gestureStartTopRef.current = window.scrollY;
+			gestureStartProgressRef.current = headerProgressRef.current;
+			gestureStartClientYRef.current = options?.clientY ?? 0;
+			resetProgressAnchors(window.scrollY);
+		};
+
+		const endTouchInteraction = () => {
+			if (!headerInteractingRef.current) {
+				return;
+			}
+
+			const releasedPointerType = activePointerTypeRef.current;
+			clearTouchFallback();
+			setHeaderInteracting(false);
+			headerInteractingRef.current = false;
+			activePointerTypeRef.current = null;
+			activeTouchPointerIdRef.current = null;
+			gestureStartClientYRef.current = 0;
+			discreteLockUntilRef.current =
+				releasedPointerType === "touch"
+					? (typeof performance !== "undefined"
+							? performance.now()
+							: Date.now()) + POST_TOUCH_DISCRETE_LOCK_MS
+					: Number.NEGATIVE_INFINITY;
+			settleHeaderState();
+		};
+
+		const handlePointerDown = (event: PointerEvent) => {
+			const isDirectPointer =
+				event.pointerType === "touch" ||
+				(isMobileViewport &&
+					event.pointerType === "mouse" &&
+					event.isPrimary &&
+					event.button === 0);
+			if (!isDirectPointer) {
+				return;
+			}
+
+			activeTouchPointerIdRef.current = event.pointerId;
+			beginTouchInteraction({
+				pointerType: event.pointerType === "mouse" ? "mouse" : "touch",
+				clientY: event.clientY,
+			});
+		};
+
+		const handlePointerUp = (event: PointerEvent) => {
+			if (activeTouchPointerIdRef.current !== event.pointerId) {
+				return;
+			}
+
+			const isDirectPointer =
+				event.pointerType === "touch" ||
+				(isMobileViewport && event.pointerType === "mouse" && event.isPrimary);
+			if (!isDirectPointer) {
+				return;
+			}
+
+			endTouchInteraction();
+		};
+
+		const handlePointerCancel = (event: PointerEvent) => {
+			if (activeTouchPointerIdRef.current !== event.pointerId) {
+				return;
+			}
+
+			activePointerTypeRef.current = null;
+			activeTouchPointerIdRef.current = null;
+			gestureStartClientYRef.current = 0;
+			scheduleTouchFallbackSettle();
+		};
+
+		const handlePointerMove = (event: PointerEvent) => {
+			if (
+				activeTouchPointerIdRef.current !== event.pointerId ||
+				!headerInteractingRef.current
+			) {
+				return;
+			}
+
+			if (
+				activePointerTypeRef.current !== "mouse" &&
+				activePointerTypeRef.current !== "touch"
+			) {
+				return;
+			}
+
+			updateInteractiveGestureProgress(event.clientY);
+
+			if (activePointerTypeRef.current !== "mouse") {
+				return;
+			}
+
+			const nextScrollTop = Math.max(
+				0,
+				gestureStartTopRef.current +
+					(gestureStartClientYRef.current - event.clientY),
+			);
+			event.preventDefault();
+			window.scrollTo({ top: nextScrollTop, behavior: "auto" });
 		};
 
 		const handleTouchStart = (event: TouchEvent) => {
-			touchLastYRef.current = event.touches[0]?.clientY ?? null;
+			promoteToTouchInteraction(event.touches[0]?.clientY ?? 0);
+		};
+
+		const handleTouchEnd = (event: TouchEvent) => {
+			if (event.touches.length > 0) {
+				return;
+			}
+			endTouchInteraction();
 		};
 
 		const handleTouchMove = (event: TouchEvent) => {
-			const touchY = event.touches[0]?.clientY;
-			const previousTouchY = touchLastYRef.current;
-			touchLastYRef.current = touchY ?? null;
-
-			if (touchY == null || previousTouchY == null) {
+			if (!headerInteractingRef.current) {
 				return;
 			}
 
-			const deltaY = touchY - previousTouchY;
-			if (Math.abs(deltaY) < SCROLL_DIRECTION_EPSILON) {
+			const primaryTouch = event.touches[0];
+			if (!primaryTouch) {
 				return;
 			}
 
-			setRecentInputDirection(deltaY < 0 ? "content-up" : "content-down");
+			if (activePointerTypeRef.current !== "touch") {
+				promoteToTouchInteraction(primaryTouch.clientY);
+			}
+
+			updateInteractiveGestureProgress(primaryTouch.clientY);
 		};
 
-		const clearTouchGesture = () => {
-			touchLastYRef.current = null;
+		const handleTouchCancel = () => {
+			activeTouchPointerIdRef.current = null;
+			scheduleTouchFallbackSettle();
 		};
 
 		const handleScroll = () => {
@@ -264,36 +492,77 @@ export function AppShell({
 			frameRef.current = window.requestAnimationFrame(updateScrollState);
 		};
 
-		window.addEventListener("wheel", handleWheel, { passive: true });
-		window.addEventListener("touchstart", handleTouchStart, { passive: true });
-		window.addEventListener("touchmove", handleTouchMove, { passive: true });
-		window.addEventListener("touchend", clearTouchGesture, { passive: true });
-		window.addEventListener("touchcancel", clearTouchGesture, {
+		const handleWheel = () => {
+			lastWheelAtRef.current =
+				typeof performance !== "undefined" ? performance.now() : Date.now();
+		};
+
+		window.addEventListener("pointerdown", handlePointerDown, {
 			passive: true,
 		});
+		window.addEventListener("pointermove", handlePointerMove, {
+			passive: false,
+		});
+		window.addEventListener("pointerup", handlePointerUp, { passive: true });
+		window.addEventListener("pointercancel", handlePointerCancel, {
+			passive: true,
+		});
+		window.addEventListener("touchstart", handleTouchStart, { passive: true });
+		window.addEventListener("touchmove", handleTouchMove, { passive: true });
+		window.addEventListener("touchend", handleTouchEnd, { passive: true });
+		window.addEventListener("touchcancel", handleTouchCancel, {
+			passive: true,
+		});
+		window.addEventListener("wheel", handleWheel, { passive: true });
 		window.addEventListener("scroll", handleScroll, { passive: true });
 		return () => {
-			window.removeEventListener("wheel", handleWheel);
+			window.removeEventListener("pointerdown", handlePointerDown);
+			window.removeEventListener("pointermove", handlePointerMove);
+			window.removeEventListener("pointerup", handlePointerUp);
+			window.removeEventListener("pointercancel", handlePointerCancel);
 			window.removeEventListener("touchstart", handleTouchStart);
 			window.removeEventListener("touchmove", handleTouchMove);
-			window.removeEventListener("touchend", clearTouchGesture);
-			window.removeEventListener("touchcancel", clearTouchGesture);
+			window.removeEventListener("touchend", handleTouchEnd);
+			window.removeEventListener("touchcancel", handleTouchCancel);
+			window.removeEventListener("wheel", handleWheel);
 			window.removeEventListener("scroll", handleScroll);
 			if (frameRef.current !== null) {
 				window.cancelAnimationFrame(frameRef.current);
 				frameRef.current = null;
 			}
+			if (settleTimeoutRef.current !== null) {
+				window.clearTimeout(settleTimeoutRef.current);
+				settleTimeoutRef.current = null;
+			}
+			clearTouchFallback();
 		};
-	}, [mobileChrome]);
+	}, [mobileChrome, isMobileViewport]);
 
 	useEffect(() => {
 		if (!mobileChrome || !isMobileViewport) {
 			compactHeaderRef.current = false;
-			compactPeakTopRef.current = 0;
-			inputDirectionRef.current = "idle";
-			inputDirectionAtRef.current = 0;
-			touchLastYRef.current = null;
+			headerProgressRef.current = 0;
+			progressAnchorTopRef.current = 0;
+			progressAnchorValueRef.current = 0;
+			progressDirectionRef.current = "idle";
+			gestureStartTopRef.current = 0;
+			gestureStartProgressRef.current = 0;
+			lastWheelAtRef.current = Number.NEGATIVE_INFINITY;
+			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
+			activePointerTypeRef.current = null;
+			activeTouchPointerIdRef.current = null;
+			gestureStartClientYRef.current = 0;
 			setCompactHeader(false);
+			setHeaderProgress(0);
+			setHeaderInteracting(false);
+			headerInteractingRef.current = false;
+			if (
+				touchFallbackTimeoutRef.current !== null &&
+				typeof window !== "undefined"
+			) {
+				window.clearTimeout(touchFallbackTimeoutRef.current);
+				touchFallbackTimeoutRef.current = null;
+			}
 		}
 	}, [isMobileViewport, mobileChrome]);
 
@@ -329,6 +598,11 @@ export function AppShell({
 			mobileChromeEnabled: mobileChrome,
 			isMobileViewport,
 			compactHeader: mobileCompactHeader,
+			headerProgress:
+				mobileChrome && isMobileViewport && !atTop
+					? Math.max(0, Math.min(1, headerProgress))
+					: 0,
+			headerInteracting,
 			footerHidden,
 			atTop,
 			headerHeight,
@@ -337,7 +611,9 @@ export function AppShell({
 		[
 			atTop,
 			footerHidden,
+			headerInteracting,
 			headerHeight,
+			headerProgress,
 			isMobileViewport,
 			mobileCompactHeader,
 			mobileChrome,
@@ -351,6 +627,8 @@ export function AppShell({
 				className="min-h-screen"
 				data-app-shell-mobile-chrome={mobileChrome ? "true" : "false"}
 				data-app-shell-header-compact={mobileCompactHeader ? "true" : "false"}
+				data-app-shell-header-progress={chromeState.headerProgress.toFixed(3)}
+				data-app-shell-header-interacting={headerInteracting ? "true" : "false"}
 				data-app-shell-footer-hidden={footerHidden ? "true" : "false"}
 				style={
 					{

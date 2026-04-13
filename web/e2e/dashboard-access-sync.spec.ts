@@ -259,6 +259,7 @@ test.describe("mobile dashboard shell", () => {
 		await expect(
 			expandedWorkband.getByRole("tab", { name: "发布" }),
 		).toBeVisible();
+		const mobileHeader = page.locator("[data-dashboard-header-progress]");
 		const laneMenuTrigger = expandedWorkband.locator(
 			"[data-dashboard-mobile-lane-menu-trigger]",
 		);
@@ -301,8 +302,68 @@ test.describe("mobile dashboard shell", () => {
 		await expandedWorkband.getByRole("tab", { name: "全部" }).click();
 		await expect(laneMenuTrigger).toBeEnabled();
 
+		const client = await page.context().newCDPSession(page);
+		const dispatchTouch = async (
+			type: "touchStart" | "touchMove" | "touchEnd",
+			y?: number,
+		) => {
+			await client.send("Input.dispatchTouchEvent", {
+				type,
+				touchPoints:
+					type === "touchEnd"
+						? []
+						: [{ x: 200, y: y ?? 0, radiusX: 5, radiusY: 5, force: 1, id: 1 }],
+			});
+		};
+
+		await dispatchTouch("touchStart", 500);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-interacting",
+			"true",
+		);
+		const intermediateProgress = await mobileHeader.evaluate((element) =>
+			Number.parseFloat(
+				element.getAttribute("data-dashboard-header-progress") ?? "0",
+			),
+		);
+		expect(intermediateProgress).toBeGreaterThan(0.25);
+		expect(intermediateProgress).toBeLessThan(0.9);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+		await dispatchTouch("touchMove", 360);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(220);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-interacting",
+			"false",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-progress",
+			"1.000",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"true",
+		);
+
+		await page.mouse.wheel(0, -120);
+		await page.waitForTimeout(180);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-progress",
+			"0.000",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+
 		await page.evaluate(() => window.scrollTo(0, 700));
-		await page.waitForTimeout(120);
+		await page.waitForTimeout(220);
 		await expect(
 			page.locator("[data-app-meta-footer-hidden='true']"),
 		).toHaveCount(1);
@@ -312,8 +373,13 @@ test.describe("mobile dashboard shell", () => {
 		await expect(expandedWorkband).toHaveCount(0);
 		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
 
-		await page.evaluate(() => window.scrollTo(0, 280));
-		await page.waitForTimeout(120);
+		await dispatchTouch("touchStart", 360);
+		await dispatchTouch("touchMove", 404);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 452);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(240);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
 		).toHaveCount(0);
@@ -321,7 +387,7 @@ test.describe("mobile dashboard shell", () => {
 		await expect(expandedWorkband).toBeVisible();
 
 		await page.evaluate(() => window.scrollTo(0, 760));
-		await page.waitForTimeout(120);
+		await page.waitForTimeout(220);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
 		).toBeVisible();
