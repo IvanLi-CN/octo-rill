@@ -6899,6 +6899,22 @@ async fn translate_pending_release_batch_candidates(
         }
 
         if let Some(error_text) = non_retryable_error_text.as_ref() {
+            upsert_translation_terminal_status(
+                state,
+                user_id,
+                requested_at.as_str(),
+                TranslationUpsert {
+                    entity_type: "release_detail",
+                    entity_id: &candidate.entity_id,
+                    lang: "zh-CN",
+                    source_hash: &candidate.source_hash,
+                    title: None,
+                    summary: None,
+                },
+                "error",
+                Some(error_text.as_str()),
+            )
+            .await?;
             items.push(TranslateBatchItem {
                 id: candidate.release_id.to_string(),
                 lang: "zh-CN".to_owned(),
@@ -14025,7 +14041,7 @@ line two",
             }),
         ))
         .await;
-        let state = setup_state_with_ai_base_url(pool, base_url);
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
 
         let translated =
             translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
@@ -14204,7 +14220,7 @@ line two",
             }),
         ))
         .await;
-        let state = setup_state_with_ai_base_url(pool, base_url);
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
 
         let translated =
             translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
@@ -14279,17 +14295,45 @@ line two",
             }),
         ))
         .await;
-        let state = setup_state_with_ai_base_url(pool, base_url);
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
 
         let translated =
             translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
                 .await
                 .expect("translate release batch");
+        let replay = translate_releases_batch_for_user(state.as_ref(), user_id.as_str(), &[120])
+            .await
+            .expect("translate cached release batch failure");
 
         assert_eq!(translated.items.len(), 1);
         assert_eq!(translated.items[0].status, "error");
+        assert_eq!(replay.items.len(), 1);
+        assert_eq!(replay.items[0].status, "error");
         assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, error_text
+            FROM ai_translations
+            WHERE user_id = ?
+              AND entity_type = 'release_detail'
+              AND entity_id = ?
+              AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("120")
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted terminal detail translation");
+        assert_eq!(row.get::<String, _>("status"), "error");
+        assert!(
+            row.get::<Option<String>, _>("error_text")
+                .as_deref()
+                .is_some_and(|value| value.contains("401") || value.contains("bad key"))
+        );
     }
 
     #[tokio::test]
