@@ -48,7 +48,7 @@ type FeedMode =
 	| "default"
 	| "visible-window-queued"
 	| "visible-window-settling"
-	| "body-limit-error"
+	| "long-body-translation"
 	| "sync-preheated"
 	| "smart-ready-body"
 	| "smart-ready-diff"
@@ -418,22 +418,25 @@ function makeVisibleWindowFeed(
 	return items;
 }
 
-function makeBodyLimitErrorFeed(): FeedItem[] {
+function makeLongBodyTranslationFeed(): FeedItem[] {
 	return [
 		buildFeedItem("30001", {
-			title: "v3.0.0",
+			title: "v3.0.0（长正文）",
 			body: [
-				"- Introduces the new deployment lane",
-				"- Ships a very long migration checklist",
-				"- Operators should read the full release on GitHub",
+				"- 长正文会在列表里保留截断原文，避免卡片失控膨胀",
+				"- 切到翻译标签后会走 release_detail 分块翻译链路",
+				"- sync 后的后台预热也会复用同一套长正文缓存结果",
 			].join("\n"),
 			body_truncated: true,
 			translated: {
 				lang: "zh-CN",
-				status: "error",
-				title: null,
-				summary: null,
-				auto_translate: false,
+				status: "ready",
+				title: "v3.0.0（长正文）",
+				summary: [
+					"- 长正文会走完整 release 详情翻译链路，不再直接拒绝",
+					"- 列表卡片继续展示截断原文，翻译标签展示完整分块译文",
+					"- 后台预热与手动触发共用同一份长正文缓存",
+				].join("\n"),
 			},
 		}),
 	];
@@ -796,8 +799,8 @@ function DashboardPreview(props: {
 				? feedItems
 				: feedMode === "default"
 					? makeMockFeed()
-					: feedMode === "body-limit-error"
-						? makeBodyLimitErrorFeed()
+					: feedMode === "long-body-translation"
+						? makeLongBodyTranslationFeed()
 						: feedMode === "sync-preheated"
 							? makeSyncPreheatedFeed()
 							: feedMode === "smart-ready-body"
@@ -815,7 +818,7 @@ function DashboardPreview(props: {
 	const translationInFlightKeys =
 		emptyState !== "content" ||
 		feedMode === "default" ||
-		feedMode === "body-limit-error" ||
+		feedMode === "long-body-translation" ||
 		feedMode === "sync-preheated" ||
 		feedMode === "smart-ready-body" ||
 		feedMode === "smart-ready-diff" ||
@@ -1706,27 +1709,29 @@ export const AccessSyncEmptyState: Story = {
 	},
 };
 
-export const BodyLimitError: Story = {
+export const LongBodyTranslation: Story = {
 	args: {
 		initialTab: "releases",
-		feedMode: "body-limit-error",
+		feedMode: "long-body-translation",
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"超长 Release 正文在列表中只展示受限正文，并明确提示该卡片不会自动翻译。",
+					"超长 Release 正文在列表中仍然展示截断原文，但翻译标签会直接展示分块翻译结果。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByRole("heading", { name: "v3.0.0" })).toBeVisible();
-		await canvas.getByRole("tab", { name: "翻译" }).click();
-		await expect(canvas.getByText(/正文过长，无法直接翻译/)).toBeVisible();
 		await expect(
-			canvas.getByText(/建议直接打开 GitHub 阅读完整内容/),
+			canvas.getByRole("heading", { name: "v3.0.0（长正文）" }),
 		).toBeVisible();
+		await canvas.getByRole("tab", { name: "翻译" }).click();
+		await expect(
+			canvas.getByText(/长正文会走完整 release 详情翻译链路/),
+		).toBeVisible();
+		await expect(canvas.queryByText(/正文过长，无法直接翻译/)).toBeNull();
 	},
 };
 

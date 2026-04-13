@@ -14,6 +14,7 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdminRuntimeSettingsSnapshot {
     pub llm_max_concurrency: usize,
+    pub ai_model_context_limit: Option<u32>,
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
 }
@@ -28,6 +29,7 @@ pub async fn load_or_seed_runtime_settings(
 
     let snapshot = AdminRuntimeSettingsSnapshot {
         llm_max_concurrency: config.ai_max_concurrency,
+        ai_model_context_limit: None,
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
     };
@@ -37,16 +39,18 @@ pub async fn load_or_seed_runtime_settings(
         INSERT INTO admin_runtime_settings (
           id,
           llm_max_concurrency,
+          ai_model_context_limit,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           created_at,
           updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         "#,
     )
     .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
+    .bind(snapshot.ai_model_context_limit.map(i64::from))
     .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
     .bind(now.as_str())
@@ -61,16 +65,18 @@ pub async fn load_or_seed_runtime_settings(
 pub async fn update_llm_runtime_settings(
     pool: &SqlitePool,
     llm_max_concurrency: usize,
+    ai_model_context_limit: Option<u32>,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         UPDATE admin_runtime_settings
-        SET llm_max_concurrency = ?, updated_at = ?
+        SET llm_max_concurrency = ?, ai_model_context_limit = ?, updated_at = ?
         WHERE id = 1
         "#,
     )
     .bind(i64::try_from(llm_max_concurrency).unwrap_or(i64::MAX))
+    .bind(ai_model_context_limit.map(i64::from))
     .bind(now.as_str())
     .execute(pool)
     .await?;
@@ -105,6 +111,12 @@ pub async fn update_translation_runtime_settings(
     })
 }
 
+pub async fn load_ai_model_context_limit(pool: &SqlitePool) -> Result<Option<u32>> {
+    Ok(fetch_runtime_settings(pool)
+        .await?
+        .and_then(|snapshot| snapshot.ai_model_context_limit))
+}
+
 pub async fn sync_persisted_runtime_settings(
     state: std::sync::Arc<AppState>,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
@@ -136,6 +148,7 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
         r#"
         SELECT
           llm_max_concurrency,
+          ai_model_context_limit,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency
         FROM admin_runtime_settings
@@ -147,6 +160,10 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
     .await?;
     Ok(row.map(|row| AdminRuntimeSettingsSnapshot {
         llm_max_concurrency: usize::try_from(row.get::<i64, _>("llm_max_concurrency")).unwrap_or(1),
+        ai_model_context_limit: row
+            .get::<Option<i64>, _>("ai_model_context_limit")
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
         translation_general_worker_concurrency: usize::try_from(
             row.get::<i64, _>("translation_general_worker_concurrency"),
         )
@@ -199,6 +216,7 @@ mod tests {
         assert_eq!(left, stored);
         assert_eq!(right, stored);
         assert_eq!(stored.llm_max_concurrency, 7);
+        assert_eq!(stored.ai_model_context_limit, None);
         assert_eq!(
             stored.translation_general_worker_concurrency,
             DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
@@ -218,7 +236,7 @@ mod tests {
             .expect("seed runtime settings");
         let state = setup_state(pool.clone(), config.clone());
 
-        update_llm_runtime_settings(&pool, 4)
+        update_llm_runtime_settings(&pool, 4, Some(32_768))
             .await
             .expect("update llm settings");
         update_translation_runtime_settings(&pool, 5, 2)
@@ -230,6 +248,11 @@ mod tests {
             .expect("sync persisted runtime settings");
 
         assert_eq!(state.llm_scheduler.max_concurrency(), 4);
+        let stored = fetch_runtime_settings(&pool)
+            .await
+            .expect("fetch synced runtime settings")
+            .expect("runtime settings should exist");
+        assert_eq!(stored.ai_model_context_limit, Some(32_768));
         assert_eq!(
             state.translation_scheduler.desired_config().await,
             TranslationRuntimeConfig::new(5, 2),
@@ -300,7 +323,6 @@ mod tests {
             },
             ai: None,
             ai_max_concurrency,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
         }
     }
