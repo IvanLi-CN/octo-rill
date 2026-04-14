@@ -30,7 +30,7 @@ const FEED_DAY_ACTION_SLOT_CLASS =
 const FEED_DAY_ACTION_BUTTON_CLASS =
 	"h-auto min-h-0 w-full justify-end gap-1 rounded-none px-0 py-0 font-mono text-[15px] font-normal leading-none tracking-wide text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100";
 const FEED_BRIEF_PANEL_CLASS =
-	"bg-card/58 overflow-hidden rounded-[24px] shadow-sm ring-1 ring-inset ring-border/60";
+	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
 
 function formatGroupCountLabel(releaseCount: number, activityCount: number) {
 	if (releaseCount > 0 && activityCount > 0) {
@@ -74,7 +74,7 @@ function FeedDayHeader(props: {
 	return (
 		<div
 			className={cn(
-				"flex min-h-8 flex-wrap items-center gap-3 sm:min-h-8",
+				"flex min-h-8 flex-wrap items-center gap-2.5 sm:min-h-8 sm:gap-3",
 				className,
 			)}
 		>
@@ -138,7 +138,7 @@ function FeedBriefBody(props: {
 	const { brief, onOpenRelease } = props;
 
 	return (
-		<div className="px-5 pb-4 pt-4 sm:px-6 sm:pb-5">
+		<div className="px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
 			{brief ? (
 				<Markdown
 					content={brief.content_markdown}
@@ -168,7 +168,7 @@ function HistoricalBriefPanel(props: {
 	const { brief, onOpenReleaseFromBrief } = props;
 	return (
 		<div className={FEED_BRIEF_PANEL_CLASS}>
-			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-5 py-[10px] text-foreground/82 sm:px-6">
+			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
 				<Newspaper className="size-4" />
 				<span className="font-mono text-[13px] tracking-wide">日报摘要</span>
 			</div>
@@ -204,7 +204,7 @@ function FeedHistoricalDayGroup(props: {
 
 	if (!showBriefPanel) {
 		return (
-			<div className="space-y-4">
+			<div className="space-y-3 sm:space-y-4">
 				<FeedDayDivider
 					date={date}
 					releaseCount={releaseCount}
@@ -232,7 +232,7 @@ function FeedHistoricalDayGroup(props: {
 			: items.filter((item) => isSocialFeedItem(item));
 
 	return (
-		<div className="space-y-4">
+		<div className="space-y-3 sm:space-y-4">
 			<div className="px-1">
 				<FeedDayHeader
 					date={date}
@@ -387,11 +387,11 @@ export function FeedGroupedList(
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
 
 	return (
-		<div className="space-y-4">
+		<div className="space-y-3 sm:space-y-4">
 			{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
 			{loadingInitial && items.length === 0 ? (
-				<div className="space-y-4">
+				<div className="space-y-3 sm:space-y-4">
 					{skeletons.map((i) => (
 						<div
 							key={i}
@@ -501,7 +501,7 @@ export function FeedGroupedList(
 				return (
 					<section
 						key={group.id}
-						className="space-y-4"
+						className="space-y-3 sm:space-y-4"
 						data-feed-group-id={group.id}
 						data-feed-brief-date={group.briefDate}
 						data-feed-group-type={

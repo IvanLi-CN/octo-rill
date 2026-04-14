@@ -42,3 +42,30 @@ export const Default: Story = {
 		await expect(systemButton).toHaveAttribute("aria-pressed", "true");
 	},
 };
+
+export const Compact: Story = {
+	args: {
+		compact: true,
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const button = canvas.getByRole("button", {
+			name: /主题模式：浅色/,
+		});
+
+		await expect(button).toHaveAttribute("data-theme-toggle-compact", "true");
+		await userEvent.click(button);
+		await expect(button).toHaveAttribute(
+			"aria-label",
+			expect.stringContaining("深色"),
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"紧凑模式供移动端页头使用，折叠成单按钮循环切换 `浅色 / 深色 / 跟随系统`，避免主题控件独占一整行。",
+			},
+		},
+	},
+};

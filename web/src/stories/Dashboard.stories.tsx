@@ -14,9 +14,9 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
+import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import {
 	DEFAULT_PAGE_LANE,
 	resolveDisplayLaneForFeed,
@@ -33,6 +33,11 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import type { RepoVisual } from "@/lib/repoVisual";
+import {
+	DashboardMobileControlBand,
+	type DashboardTab as Tab,
+	DashboardTabsList,
+} from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -43,7 +48,6 @@ import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 import { VersionMonitorStateProvider } from "@/version/versionMonitor";
 
-type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 type FeedMode =
 	| "default"
 	| "visible-window-queued"
@@ -106,7 +110,6 @@ const repoVisualFixtures: Record<
 	},
 	text: null,
 };
-
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
@@ -988,37 +991,32 @@ function DashboardPreview(props: {
 						syncingAll={syncingAll}
 						onSyncAll={() => {}}
 						logoutHref="#"
+						mobileControlBand={
+							<DashboardMobileControlBand
+								tab={tab}
+								onSelectTab={(nextTab) => setTab(nextTab)}
+								showPageLaneSelector={tab === "all" || tab === "releases"}
+								pageLane={effectivePageDefaultLane}
+								onSelectPageLane={(lane) => {
+									setPageDefaultLane(lane);
+									setSelectedLaneByKey({});
+								}}
+								layout="stacked"
+							/>
+						}
 					/>
 				}
 				notice={<VersionUpdateNotice />}
 				footer={<AppMetaFooter />}
+				mobileChrome
 			>
 				<Tabs
 					value={tab}
 					onValueChange={(nextTab) => setTab(nextTab as Tab)}
-					className="gap-6"
+					className="gap-4 sm:gap-6"
 				>
-					<div className="flex flex-wrap items-center justify-between gap-2">
-						<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-							<TabsTrigger value="all" className="font-mono text-xs">
-								全部
-							</TabsTrigger>
-							<TabsTrigger value="releases" className="font-mono text-xs">
-								Releases
-							</TabsTrigger>
-							<TabsTrigger value="stars" className="font-mono text-xs">
-								被加星
-							</TabsTrigger>
-							<TabsTrigger value="followers" className="font-mono text-xs">
-								被关注
-							</TabsTrigger>
-							<TabsTrigger value="briefs" className="font-mono text-xs">
-								日报
-							</TabsTrigger>
-							<TabsTrigger value="inbox" className="font-mono text-xs">
-								Inbox
-							</TabsTrigger>
-						</TabsList>
+					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
+						<DashboardTabsList />
 						<div
 							className="flex items-center gap-2"
 							data-dashboard-secondary-controls
@@ -1030,6 +1028,7 @@ function DashboardPreview(props: {
 										setPageDefaultLane(lane);
 										setSelectedLaneByKey({});
 									}}
+									className="hidden sm:inline-flex"
 								/>
 							) : null}
 							<Button
@@ -1051,7 +1050,7 @@ function DashboardPreview(props: {
 						</div>
 					</div>
 
-					<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+					<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
 						<section className="min-w-0">
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
@@ -1084,7 +1083,7 @@ function DashboardPreview(props: {
 							</TabsContent>
 						</section>
 
-						<aside className="space-y-6">
+						<aside className="space-y-4 sm:space-y-6">
 							{tab === "briefs" ? (
 								<BriefListCard
 									briefs={storyBriefs}
@@ -2038,7 +2037,13 @@ export const FollowersTab: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
-		await expect(canvas.getByText("关注", { exact: true })).toBeVisible();
+		await expect(
+			within(
+				canvasElement.querySelector<HTMLElement>(
+					'[data-social-card-kind="follower_received"]',
+				) ?? canvasElement,
+			).getByText("关注", { exact: true }),
+		).toBeVisible();
 		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
 			'[data-social-card-kind="follower_received"]',
 		);

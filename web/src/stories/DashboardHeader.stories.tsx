@@ -1,6 +1,16 @@
+import type * as React from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { useState } from "react";
 import { expect, userEvent, within } from "storybook/test";
 
+import { DEFAULT_PAGE_LANE } from "@/feed/laneOptions";
+import type { FeedLane } from "@/feed/types";
+import { AppMetaFooter } from "@/layout/AppMetaFooter";
+import { AppShell } from "@/layout/AppShell";
+import {
+	DashboardMobileControlBand,
+	type DashboardTab,
+} from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 
 function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
@@ -48,6 +58,87 @@ function DashboardHeaderGallery() {
 				/>
 			</section>
 		</div>
+	);
+}
+
+function DashboardHeaderMobileShellPreview(
+	args: React.ComponentProps<typeof DashboardHeader>,
+) {
+	const [tab, setTab] = useState<DashboardTab>("all");
+	const [lane, setLane] = useState<FeedLane>(DEFAULT_PAGE_LANE);
+	const showPageLaneSelector = tab === "all" || tab === "releases";
+	const previewItems = Array.from({ length: 14 }, (_, index) => ({
+		id: index + 1,
+		title:
+			index % 3 === 0
+				? "发布摘要与反应区"
+				: index % 3 === 1
+					? "收件箱工作卡片"
+					: "日报摘要卡片",
+		lines: [
+			"用于验证移动端顶部壳层在长滚动列表中的高度切换与吸顶稳定性。",
+			"滚动离开顶部后页脚自动收起，回到顶部前保持隐藏，避免挤占可视区。",
+			"内容继续上滑时应切到薄页头；向下回拉时恢复展开态顶部壳层。",
+		],
+	}));
+
+	return (
+		<AppShell
+			header={
+				<DashboardHeader
+					{...args}
+					mobileControlBand={
+						<DashboardMobileControlBand
+							tab={tab}
+							onSelectTab={setTab}
+							showPageLaneSelector={showPageLaneSelector}
+							pageLane={lane}
+							onSelectPageLane={setLane}
+							layout="stacked"
+						/>
+					}
+				/>
+			}
+			footer={<AppMetaFooter />}
+			mobileChrome
+		>
+			<div className="space-y-3 sm:space-y-4">
+				{previewItems.map((item) => {
+					return (
+						<section
+							key={`mobile-header-proof-${item.id}`}
+							className="rounded-3xl border bg-card p-5 shadow-sm sm:p-6"
+						>
+							<p className="text-muted-foreground text-xs font-mono">
+								2026-04-12 · Proof {item.id}
+							</p>
+							<h2 className="mt-2 text-lg font-semibold">
+								{item.title} #{item.id}
+							</h2>
+							<ul className="text-muted-foreground mt-3 space-y-2 text-sm leading-6">
+								{item.lines.map((line) => (
+									<li key={`${item.id}-${line}`} className="flex gap-2">
+										<span aria-hidden="true">•</span>
+										<span>{line}</span>
+									</li>
+								))}
+							</ul>
+							<div className="mt-4 flex min-h-16 flex-wrap gap-2 border-t border-border/50 pt-4">
+								<span className="rounded-full border border-border/50 px-3 py-1 text-xs">
+									展开态顶部壳层
+								</span>
+								<span className="rounded-full border border-border/50 px-3 py-1 text-xs">
+									薄页头
+								</span>
+								<span className="rounded-full border border-border/50 px-3 py-1 text-xs">
+									footer auto-hide
+								</span>
+							</div>
+						</section>
+					);
+				})}
+			</div>
+		</AppShell>
 	);
 }
 
@@ -148,6 +239,16 @@ export const StateGallery: Story = {
 				story:
 					"把默认、AI 未配置与紧凑宽度三种状态放进同一审阅面，便于确认品牌位独立、右侧账号入口收敛，以及窄宽度下同步/头像的排列。",
 			},
+		},
+	},
+};
+
+export const EvidenceMobileShell: Story = {
+	name: "Evidence / Mobile Shell",
+	render: (args) => <DashboardHeaderMobileShellPreview {...args} />,
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };

@@ -23,8 +23,46 @@ function resolveThemeOption(themePreference: ThemePreference): ThemeOption {
 	);
 }
 
-export function ThemeToggle({ className }: { className?: string }) {
+function getNextThemePreference(
+	themePreference: ThemePreference,
+): ThemePreference {
+	const currentIndex = THEME_OPTIONS.findIndex(
+		(option) => option.value === themePreference,
+	);
+	const nextIndex =
+		currentIndex < 0 ? 0 : (currentIndex + 1) % THEME_OPTIONS.length;
+	return THEME_OPTIONS[nextIndex]?.value ?? "system";
+}
+
+export function ThemeToggle(props: { className?: string; compact?: boolean }) {
+	const { className, compact = false } = props;
 	const { themePreference, setThemePreference } = useTheme();
+	const activeOption = resolveThemeOption(themePreference);
+
+	if (compact) {
+		const ActiveIcon = activeOption.icon;
+		const nextPreference = getNextThemePreference(themePreference);
+		const nextOption = resolveThemeOption(nextPreference);
+
+		return (
+			<button
+				type="button"
+				className={cn(
+					"inline-flex size-9 items-center justify-center rounded-full border border-border/70 bg-background/85 text-foreground shadow-sm backdrop-blur transition-colors motion-safe:transition-[width,height,padding,transform,background-color,border-color] motion-safe:duration-200 motion-safe:ease-out hover:bg-accent/70 focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] focus-visible:outline-1 focus-visible:outline-ring supports-[backdrop-filter]:bg-background/75",
+					className,
+				)}
+				data-theme-toggle
+				data-theme-preference={themePreference}
+				data-theme-toggle-compact="true"
+				aria-label={`主题模式：${activeOption.label}（点击切换到${nextOption.label}）`}
+				title={`当前：${activeOption.label} · 点击切换到${nextOption.label}`}
+				onClick={() => setThemePreference(nextPreference)}
+			>
+				<ActiveIcon className="size-4" />
+				<span className="sr-only">{`当前主题模式：${activeOption.label}`}</span>
+			</button>
+		);
+	}
 
 	return (
 		<fieldset
@@ -38,8 +76,7 @@ export function ThemeToggle({ className }: { className?: string }) {
 			<legend className="sr-only">主题模式</legend>
 			{THEME_OPTIONS.map((option) => {
 				const OptionIcon = option.icon;
-				const isActive =
-					resolveThemeOption(themePreference).value === option.value;
+				const isActive = activeOption.value === option.value;
 
 				return (
 					<button

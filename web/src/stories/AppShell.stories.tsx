@@ -16,6 +16,7 @@ type ShellScenario = "steady" | "update" | "unknown";
 type AppShellPreviewProps = {
 	scenario: ShellScenario;
 	onRefresh: () => void;
+	mobileChrome?: boolean;
 };
 
 function makeVersionState(
@@ -47,7 +48,11 @@ function makeVersionState(
 	}
 }
 
-function AppShellPreview({ scenario, onRefresh }: AppShellPreviewProps) {
+function AppShellPreview({
+	scenario,
+	onRefresh,
+	mobileChrome = false,
+}: AppShellPreviewProps) {
 	return (
 		<VersionMonitorStateProvider value={makeVersionState(scenario, onRefresh)}>
 			<AppShell
@@ -65,7 +70,33 @@ function AppShellPreview({ scenario, onRefresh }: AppShellPreviewProps) {
 					</div>
 				}
 				notice={<VersionUpdateNotice />}
+				subheader={
+					mobileChrome ? (
+						<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
+							<div className="flex min-w-max items-center gap-2">
+								<Button
+									size="sm"
+									variant="outline"
+									className="font-mono text-xs"
+								>
+									全部
+								</Button>
+								<Button size="sm" variant="ghost" className="font-mono text-xs">
+									发布
+								</Button>
+								<Button size="sm" variant="ghost" className="font-mono text-xs">
+									关注
+								</Button>
+								<Button size="sm" variant="ghost" className="font-mono text-xs">
+									收件箱
+								</Button>
+							</div>
+						</div>
+					) : null
+				}
+				subheaderClassName={mobileChrome ? "sm:hidden" : undefined}
 				footer={<AppMetaFooter />}
+				mobileChrome={mobileChrome}
 			>
 				<div className="space-y-4">
 					<section className="rounded-2xl border bg-card p-6 shadow-sm">
@@ -88,6 +119,27 @@ function AppShellPreview({ scenario, onRefresh }: AppShellPreviewProps) {
 							</p>
 						</div>
 					</section>
+					{mobileChrome ? (
+						<section className="grid gap-3">
+							{Array.from({ length: 8 }, (_, index) => {
+								const blockNumber = index + 1;
+								return (
+									<div
+										key={`mobile-shell-block-${blockNumber}`}
+										className="rounded-2xl border bg-card p-5 shadow-sm"
+									>
+										<p className="text-sm font-medium">
+											Mobile shell block #{blockNumber}
+										</p>
+										<p className="text-muted-foreground mt-2 text-sm">
+											用于在移动端视口下验证 sticky subheader、compact header 与
+											footer auto-hide。
+										</p>
+									</div>
+								);
+							})}
+						</section>
+					) : null}
 				</div>
 			</AppShell>
 		</VersionMonitorStateProvider>
@@ -110,6 +162,7 @@ const meta = {
 	args: {
 		scenario: "steady",
 		onRefresh: fn(),
+		mobileChrome: false,
 	},
 	argTypes: {
 		scenario: {
@@ -118,6 +171,9 @@ const meta = {
 		},
 		onRefresh: {
 			control: false,
+		},
+		mobileChrome: {
+			control: "boolean",
 		},
 	},
 } satisfies Meta<typeof AppShellPreview>;
@@ -184,5 +240,30 @@ export const EvidenceUpdateNotice: Story = {
 		docs: {
 			disable: true,
 		},
+	},
+};
+
+export const MobileChrome: Story = {
+	args: {
+		scenario: "steady",
+		mobileChrome: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端壳层预览：启用 compact header / sticky rail / footer auto-hide 的共享壳层能力，供浏览器窄屏审阅。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvasElement.querySelector("[data-app-shell-mobile-chrome='true']"),
+		).not.toBeNull();
+		await expect(
+			canvasElement.querySelector("[data-app-meta-footer-hidden='false']"),
+		).not.toBeNull();
+		await expect(canvas.getByText("Mobile shell block #1")).toBeVisible();
 	},
 };
