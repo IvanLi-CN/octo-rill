@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{
-    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
+    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc,
     offset::LocalResult,
 };
 use rand::RngExt;
@@ -3734,7 +3734,7 @@ pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<Str
 
 fn parse_legacy_brief_window_timestamp(
     raw: &str,
-    effective_time_zone: &str,
+    effective_time_zone: &LegacyTimeZoneSeed,
 ) -> Option<DateTime<FixedOffset>> {
     let trimmed = raw.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
@@ -3742,15 +3742,172 @@ fn parse_legacy_brief_window_timestamp(
     }
     for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, format) {
-            return briefs::resolve_daily_brief_local_datetime(effective_time_zone, naive).ok();
+            return effective_time_zone.resolve_local_datetime(naive);
         }
     }
     None
 }
 
+#[derive(Debug, Clone)]
+enum LegacyTimeZoneSeed {
+    Iana(String),
+    FixedOffset(FixedOffset),
+}
+
+impl LegacyTimeZoneSeed {
+    fn display_label(&self) -> String {
+        match self {
+            Self::Iana(value) => value.clone(),
+            Self::FixedOffset(offset) => format_fixed_offset_label(*offset),
+        }
+    }
+
+    fn resolve_local_datetime(&self, naive: NaiveDateTime) -> Option<DateTime<FixedOffset>> {
+        match self {
+            Self::Iana(value) => briefs::resolve_daily_brief_local_datetime(value, naive).ok(),
+            Self::FixedOffset(offset) => match offset.from_local_datetime(&naive) {
+                LocalResult::Single(dt) => Some(dt),
+                LocalResult::Ambiguous(first, _) => Some(first),
+                LocalResult::None => None,
+            },
+        }
+    }
+
+    fn convert_utc_to_local(&self, utc: DateTime<Utc>) -> Option<DateTime<FixedOffset>> {
+        match self {
+            Self::Iana(value) => briefs::convert_daily_brief_utc_to_local(value, utc).ok(),
+            Self::FixedOffset(offset) => Some(utc.with_timezone(offset)),
+        }
+    }
+}
+
+fn format_fixed_offset_label(offset: FixedOffset) -> String {
+    let total_minutes = offset.local_minus_utc() / 60;
+    let sign = if total_minutes >= 0 { '+' } else { '-' };
+    let abs_minutes = total_minutes.abs();
+    let hours = abs_minutes / 60;
+    let minutes = abs_minutes % 60;
+    format!("UTC{sign}{hours:02}:{minutes:02}")
+}
+
+fn derive_legacy_fixed_offset_seed(
+    legacy_boundary_local_time: NaiveTime,
+    legacy_daily_brief_utc_time: &str,
+) -> Option<FixedOffset> {
+    let legacy_utc_time =
+        NaiveTime::parse_from_str(legacy_daily_brief_utc_time.trim(), "%H:%M").ok()?;
+    let local_minutes =
+        i32::try_from(legacy_boundary_local_time.num_seconds_from_midnight() / 60).ok()?;
+    let utc_minutes = i32::try_from(legacy_utc_time.num_seconds_from_midnight() / 60).ok()?;
+    let mut offset_minutes = local_minutes - utc_minutes;
+    while offset_minutes <= -12 * 60 {
+        offset_minutes += 24 * 60;
+    }
+    while offset_minutes > 14 * 60 {
+        offset_minutes -= 24 * 60;
+    }
+    FixedOffset::east_opt(offset_minutes * 60)
+}
+
+fn extract_legacy_brief_window_naive_timestamps(line: &str) -> Vec<NaiveDateTime> {
+    fn next_char_at(text: &str, index: usize) -> Option<char> {
+        text.get(index..)?.chars().next()
+    }
+
+    fn advance_while<F>(text: &str, mut index: usize, predicate: F) -> usize
+    where
+        F: Fn(char) -> bool,
+    {
+        while let Some(ch) = next_char_at(text, index) {
+            if !predicate(ch) {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        index
+    }
+
+    let mut timestamps = Vec::new();
+    let mut index = 0usize;
+    while let Some(ch) = next_char_at(line, index) {
+        let Some(date_candidate) = line
+            .as_bytes()
+            .get(index..index + 10)
+            .and_then(|value| std::str::from_utf8(value).ok())
+        else {
+            index += ch.len_utf8();
+            continue;
+        };
+        if NaiveDate::parse_from_str(date_candidate, "%Y-%m-%d").is_err() {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let Some(separator) = next_char_at(line, index + 10) else {
+            index += ch.len_utf8();
+            continue;
+        };
+        if separator != 'T' && !separator.is_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let mut cursor = index + 10;
+        if separator.is_whitespace() {
+            while let Some(space) = next_char_at(line, cursor) {
+                if !space.is_whitespace() {
+                    break;
+                }
+                cursor += space.len_utf8();
+            }
+        } else {
+            cursor += separator.len_utf8();
+        }
+        let time_start = cursor;
+        let end = advance_while(line, cursor, |value| value.is_ascii_digit() || value == ':');
+        if !matches!(end.saturating_sub(time_start), 5 | 8) {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let candidate = line[index..end].trim();
+        for format in [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+        ] {
+            if let Ok(parsed) = NaiveDateTime::parse_from_str(candidate, format) {
+                timestamps.push(parsed);
+                index = end;
+                break;
+            }
+        }
+        if timestamps.last().is_some() {
+            continue;
+        }
+
+        index += ch.len_utf8();
+    }
+
+    timestamps
+}
+
+fn derive_legacy_markdown_time_zone_seed(
+    content_markdown: &str,
+    legacy_daily_brief_utc_time: &str,
+) -> Option<LegacyTimeZoneSeed> {
+    let (_, end_local) = content_markdown.lines().find_map(|line| {
+        let timestamps = extract_legacy_brief_window_naive_timestamps(line);
+        (timestamps.len() >= 2).then(|| (timestamps[0], timestamps[1]))
+    })?;
+    let offset = derive_legacy_fixed_offset_seed(end_local.time(), legacy_daily_brief_utc_time)?;
+    Some(LegacyTimeZoneSeed::FixedOffset(offset))
+}
+
 fn extract_legacy_brief_window_timestamps(
     line: &str,
-    effective_time_zone: &str,
+    effective_time_zone: &LegacyTimeZoneSeed,
 ) -> Vec<DateTime<FixedOffset>> {
     fn next_char_at(text: &str, index: usize) -> Option<char> {
         text.get(index..)?.chars().next()
@@ -3829,7 +3986,7 @@ fn extract_legacy_brief_window_timestamps(
 
 fn parse_legacy_brief_window_from_markdown(
     content_markdown: &str,
-    effective_time_zone: &str,
+    effective_time_zone: &LegacyTimeZoneSeed,
 ) -> Option<UserDailyWindow> {
     let (start_local, end_local) = content_markdown.lines().find_map(|line| {
         let timestamps = extract_legacy_brief_window_timestamps(line, effective_time_zone);
@@ -3844,7 +4001,7 @@ fn parse_legacy_brief_window_from_markdown(
         end_local,
         start_utc: start_local.with_timezone(&Utc),
         end_utc: end_local.with_timezone(&Utc),
-        effective_time_zone: effective_time_zone.to_owned(),
+        effective_time_zone: effective_time_zone.display_label(),
         effective_local_boundary: briefs::format_daily_brief_local_time(end_local.time()),
     })
 }
@@ -3852,7 +4009,7 @@ fn parse_legacy_brief_window_from_markdown(
 fn parse_legacy_brief_window_from_stored_utc(
     window_start_utc: Option<&str>,
     window_end_utc: Option<&str>,
-    effective_time_zone: &str,
+    effective_time_zone: &LegacyTimeZoneSeed,
 ) -> Option<UserDailyWindow> {
     let start_utc = window_start_utc
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
@@ -3860,9 +4017,8 @@ fn parse_legacy_brief_window_from_stored_utc(
     let end_utc = window_end_utc
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
         .with_timezone(&Utc);
-    let start_local =
-        briefs::convert_daily_brief_utc_to_local(effective_time_zone, start_utc).ok()?;
-    let end_local = briefs::convert_daily_brief_utc_to_local(effective_time_zone, end_utc).ok()?;
+    let start_local = effective_time_zone.convert_utc_to_local(start_utc)?;
+    let end_local = effective_time_zone.convert_utc_to_local(end_utc)?;
     let key_date = end_local.date_naive();
 
     Some(UserDailyWindow {
@@ -3872,7 +4028,7 @@ fn parse_legacy_brief_window_from_stored_utc(
         end_local,
         start_utc,
         end_utc,
-        effective_time_zone: effective_time_zone.to_owned(),
+        effective_time_zone: effective_time_zone.display_label(),
         effective_local_boundary: briefs::format_daily_brief_local_time(end_local.time()),
     })
 }
@@ -3889,8 +4045,6 @@ pub async fn recompute_legacy_brief_snapshot(
         window_start_utc: Option<String>,
         window_end_utc: Option<String>,
         effective_time_zone: Option<String>,
-        user_daily_brief_local_time: Option<String>,
-        user_daily_brief_time_zone: Option<String>,
         user_daily_brief_utc_time: String,
         content_markdown: String,
     }
@@ -3898,6 +4052,9 @@ pub async fn recompute_legacy_brief_snapshot(
     #[derive(Debug, sqlx::FromRow)]
     struct ExistingBriefRow {
         id: String,
+        generation_source: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
     }
 
     let legacy = sqlx::query_as::<_, LegacyBriefRow>(
@@ -3909,8 +4066,6 @@ pub async fn recompute_legacy_brief_snapshot(
           briefs.window_start_utc,
           briefs.window_end_utc,
           briefs.effective_time_zone,
-          users.daily_brief_local_time AS user_daily_brief_local_time,
-          users.daily_brief_time_zone AS user_daily_brief_time_zone,
           users.daily_brief_utc_time AS user_daily_brief_utc_time,
           briefs.content_markdown
         FROM briefs
@@ -3930,26 +4085,37 @@ pub async fn recompute_legacy_brief_snapshot(
 
     let key_date = NaiveDate::parse_from_str(&legacy.date, "%Y-%m-%d")
         .with_context(|| format!("invalid legacy brief date: {}", legacy.date))?;
-    let user_preferences = briefs::derive_daily_brief_preferences_with_defaults(
-        briefs::default_daily_brief_local_time(&state.config),
-        briefs::default_daily_brief_time_zone(&state.config),
-        legacy.user_daily_brief_local_time.as_deref(),
-        legacy.user_daily_brief_time_zone.as_deref(),
-        Some(legacy.user_daily_brief_utc_time.as_str()),
-        chrono::Utc::now(),
-    );
-    let time_zone_seed = legacy
+    let effective_time_zone_seed = legacy
         .effective_time_zone
         .as_deref()
         .and_then(briefs::canonical_supported_time_zone)
-        .unwrap_or(user_preferences.time_zone);
+        .map(LegacyTimeZoneSeed::Iana);
+    let markdown_time_zone_seed = effective_time_zone_seed
+        .clone()
+        .or_else(|| {
+            derive_legacy_markdown_time_zone_seed(
+                &legacy.content_markdown,
+                legacy.user_daily_brief_utc_time.as_str(),
+            )
+        })
+        .unwrap_or_else(|| {
+            LegacyTimeZoneSeed::Iana(
+                briefs::default_daily_brief_time_zone(&state.config).to_owned(),
+            )
+        });
+    let stored_window_time_zone_seed = effective_time_zone_seed
+        .clone()
+        .unwrap_or_else(|| LegacyTimeZoneSeed::Iana("UTC".to_owned()));
     let window = parse_legacy_brief_window_from_stored_utc(
         legacy.window_start_utc.as_deref(),
         legacy.window_end_utc.as_deref(),
-        &time_zone_seed,
+        &stored_window_time_zone_seed,
     )
     .or_else(|| {
-        parse_legacy_brief_window_from_markdown(&legacy.content_markdown, &time_zone_seed)
+        parse_legacy_brief_window_from_markdown(
+            &legacy.content_markdown,
+            &markdown_time_zone_seed,
+        )
     })
     .with_context(|| {
         format!(
@@ -3968,7 +4134,11 @@ pub async fn recompute_legacy_brief_snapshot(
         .context("failed to begin legacy brief tx")?;
     let existing = sqlx::query_as::<_, ExistingBriefRow>(
         r#"
-        SELECT id
+        SELECT
+          id,
+          generation_source,
+          effective_time_zone,
+          effective_local_boundary
         FROM briefs
         WHERE user_id = ?
           AND window_start_utc = ?
@@ -3986,6 +4156,43 @@ pub async fn recompute_legacy_brief_snapshot(
     .context("failed to lookup duplicate brief snapshot")?;
 
     if let Some(existing) = existing {
+        let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
+            && existing.effective_time_zone.is_some()
+            && existing.effective_local_boundary.is_some();
+        if !is_normalized_snapshot {
+            let legacy_release_ids = extract_internal_release_id_sequence(&legacy.content_markdown);
+            let historical_releases =
+                load_release_digests_by_ids(&mut *tx, &legacy_release_ids).await?;
+            let content_markdown = legacy.content_markdown.clone();
+            sqlx::query(
+                r#"
+                UPDATE briefs
+                SET date = ?,
+                    window_start_utc = ?,
+                    window_end_utc = ?,
+                    effective_time_zone = ?,
+                    effective_local_boundary = ?,
+                    generation_source = 'history_recompute',
+                    content_markdown = ?,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(&window.display_date)
+            .bind(&window_start)
+            .bind(&window_end)
+            .bind(&window.effective_time_zone)
+            .bind(&window.effective_local_boundary)
+            .bind(&content_markdown)
+            .bind(&now)
+            .bind(&existing.id)
+            .execute(&mut *tx)
+            .await
+            .context("failed to merge legacy brief snapshot into existing collision")?;
+
+            replace_brief_memberships(&mut tx, &existing.id, &historical_releases, &now).await?;
+        }
+
         sqlx::query(
             r#"
             DELETE FROM briefs
@@ -3995,10 +4202,10 @@ pub async fn recompute_legacy_brief_snapshot(
         .bind(&legacy.id)
         .execute(&mut *tx)
         .await
-        .context("failed to delete legacy brief placeholder")?;
+        .context("failed to delete colliding legacy brief placeholder")?;
         tx.commit()
             .await
-            .context("failed to commit legacy brief dedupe")?;
+            .context("failed to commit legacy brief collision cleanup")?;
         return load_stored_brief_snapshot(state, &existing.id).await;
     }
 
@@ -4057,7 +4264,7 @@ pub async fn legacy_brief_count(state: &AppState) -> Result<i64> {
         r#"
         SELECT COUNT(*)
         FROM briefs
-        WHERE generation_source = 'legacy'
+        WHERE generation_source IN ('legacy', 'history_recompute_failed')
         "#,
     )
     .fetch_one(&state.pool)
@@ -4892,8 +5099,11 @@ mod tests {
             "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n"
         );
 
-        let window = parse_legacy_brief_window_from_markdown(markdown, "Asia/Shanghai")
-            .expect("parse legacy brief window");
+        let window = parse_legacy_brief_window_from_markdown(
+            markdown,
+            &LegacyTimeZoneSeed::Iana("Asia/Shanghai".to_owned()),
+        )
+        .expect("parse legacy brief window");
 
         assert_eq!(window.display_date, "2026-03-07");
         assert_eq!(window.effective_local_boundary, "08:00");
@@ -4908,8 +5118,11 @@ mod tests {
             "- 本次摘要覆盖区间从 2026-03-06 08:00:00 到 2026-03-07 08:00:00。\n",
         );
 
-        let window = parse_legacy_brief_window_from_markdown(markdown, "Asia/Shanghai")
-            .expect("parse rephrased legacy brief window");
+        let window = parse_legacy_brief_window_from_markdown(
+            markdown,
+            &LegacyTimeZoneSeed::Iana("Asia/Shanghai".to_owned()),
+        )
+        .expect("parse rephrased legacy brief window");
 
         assert_eq!(window.display_date, "2026-03-07");
         assert_eq!(window.effective_local_boundary, "08:00");
@@ -5905,7 +6118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recompute_legacy_brief_snapshot_keeps_existing_duplicate_snapshot_immutable() {
+    async fn recompute_legacy_brief_snapshot_preserves_existing_snapshot_on_window_collision() {
         let state = setup_llm_state().await;
         let now = "2026-03-07T09:00:00Z";
 
@@ -5956,6 +6169,31 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("insert duplicate repo release");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-duplicate-existing-only")
+        .bind(1_i64)
+        .bind(404_i64)
+        .bind("node-duplicate-existing-only")
+        .bind("v2.0.1")
+        .bind("v2.0.1")
+        .bind("")
+        .bind("https://example.invalid/releases/404")
+        .bind("2026-03-06T13:00:00Z")
+        .bind("2026-03-06T13:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing-only repo release");
 
         sqlx::query(
             r#"
@@ -5999,11 +6237,32 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("insert existing snapshot membership");
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-history-existing")
+        .bind(404_i64)
+        .bind("2026-03-06T13:00:00Z")
+        .bind(1_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing-only snapshot membership");
 
         let legacy_markdown = concat!(
             "## 概览\n\n",
-            "- 本次摘要覆盖区间从 2026-03-06 08:00:00 到 2026-03-07 08:00:00。\n",
-            "- 更新项目：0 个\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n",
+            "- 更新项目：1 个\n",
+            "- Release：1 条（预发布 0 条）\n\n",
+            "## 项目更新\n\n",
+            "### acme/legacy\n\n",
+            "- [v2.0.0](/?tab=briefs&release=403) · 2026-03-06T12:00:00Z · [GitHub Release](https://example.invalid/releases/403)\n",
+            "  - 这条历史内容必须覆盖碰撞出来的手动快照\n",
         );
         sqlx::query(
             r#"
@@ -6037,7 +6296,37 @@ mod tests {
 
         assert_eq!(stored.id, "brief-history-existing");
         assert_eq!(stored.content_markdown, "existing snapshot");
-        assert_eq!(stored.release_ids, vec![403]);
+        assert_eq!(stored.release_ids, vec![403, 404]);
+
+        let merged = sqlx::query_as::<_, (String, String, String, String)>(
+            r#"
+            SELECT generation_source, content_markdown, effective_time_zone, effective_local_boundary
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-history-existing")
+        .fetch_one(&state.pool)
+        .await
+        .expect("load merged snapshot");
+        assert_eq!(merged.0, "scheduled");
+        assert_eq!(merged.1, "existing snapshot");
+        assert_eq!(merged.2, "Asia/Shanghai");
+        assert_eq!(merged.3, "08:00");
+
+        let memberships = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT release_id
+            FROM brief_release_memberships
+            WHERE brief_id = ?
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .bind("brief-history-existing")
+        .fetch_all(&state.pool)
+        .await
+        .expect("load merged memberships");
+        assert_eq!(memberships, vec![403, 404]);
 
         let remaining = sqlx::query_scalar::<_, i64>(
             r#"
@@ -6070,7 +6359,7 @@ mod tests {
         .bind("user-legacy-default-zone")
         .bind(2003_i64)
         .bind("legacy-default-zone")
-        .bind("13:00")
+        .bind("")
         .bind(now)
         .bind(now)
         .execute(&state.pool)
@@ -6123,7 +6412,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recompute_legacy_brief_snapshot_uses_owner_time_zone_when_effective_zone_missing() {
+    async fn recompute_legacy_brief_snapshot_uses_legacy_utc_schedule_seed_before_current_user_zone()
+     {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-utc-seed")
+        .bind(2011_i64)
+        .bind("legacy-utc-seed")
+        .bind("13:00")
+        .bind("America/Los_Angeles")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy utc-seed user");
+
+        let legacy_markdown = concat!(
+            "## 概览\n\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n",
+            "- 更新项目：0 个\n",
+            "- Release：0 条（预发布 0 条）\n\n",
+            "## 项目更新\n\n",
+            "- 本时间窗口内没有新的 Release。\n",
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-utc-seed")
+        .bind("user-legacy-utc-seed")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind(legacy_markdown)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy utc-seed brief");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-utc-seed")
+            .await
+            .expect("recompute legacy brief");
+
+        assert_eq!(stored.effective_time_zone, "UTC-05:00");
+        assert_eq!(stored.effective_local_boundary, "08:00");
+        assert_eq!(stored.window_start, "2026-03-06T13:00:00+00:00");
+        assert_eq!(stored.window_end, "2026-03-07T13:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_preserves_utc_seed_when_effective_zone_missing() {
         let state = setup_llm_state().await;
         let now = "2026-03-07T09:00:00Z";
 
@@ -6178,9 +6539,9 @@ mod tests {
             .await
             .expect("recompute owner-zone legacy brief");
 
-        assert_eq!(stored.date, "2026-03-06");
-        assert_eq!(stored.effective_time_zone, "America/Los_Angeles");
-        assert_eq!(stored.effective_local_boundary, "23:00");
+        assert_eq!(stored.date, "2026-03-07");
+        assert_eq!(stored.effective_time_zone, "UTC");
+        assert_eq!(stored.effective_local_boundary, "07:00");
         assert_eq!(stored.window_start, "2026-03-06T07:00:00+00:00");
         assert_eq!(stored.window_end, "2026-03-07T07:00:00+00:00");
     }

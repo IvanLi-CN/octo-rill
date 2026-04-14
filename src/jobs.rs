@@ -4,6 +4,7 @@ use std::{
     future::Future,
     path::PathBuf,
     pin::Pin,
+    str::FromStr,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -15,7 +16,8 @@ use axum::response::{
     sse::{Event, KeepAlive, Sse},
 };
 use chrono::{DateTime, NaiveDate, Timelike, Utc};
-use serde::Serialize;
+use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
@@ -79,6 +81,36 @@ struct SlotRow {
 #[derive(Debug, sqlx::FromRow)]
 struct DispatchStateRow {
     last_dispatch_key: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct DailySlotUserRow {
+    id: String,
+    daily_brief_local_time: Option<String>,
+    daily_brief_time_zone: Option<String>,
+    daily_brief_utc_time: String,
+    last_active_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DailySlotUserSnapshot {
+    user_id: String,
+    last_active_at: Option<String>,
+    key_date: String,
+    local_boundary: String,
+    #[serde(default)]
+    effective_local_boundary: Option<String>,
+    time_zone: String,
+    window_start_utc: String,
+    window_end_utc: String,
+}
+
+#[derive(Debug)]
+struct DueDailySlotUser {
+    user_id: String,
+    last_active_at: Option<String>,
+    preferences: briefs::DailyBriefPreferences,
+    window: briefs::DailyWindow,
 }
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
@@ -199,6 +231,8 @@ pub async fn enqueue_hour_slot_if_due(
         return Ok(None);
     }
 
+    let due_users = collect_due_daily_slot_user_snapshots(state, now, &hour_key).await?;
+
     let task = enqueue_task(
         state,
         NewTask {
@@ -206,6 +240,7 @@ pub async fn enqueue_hour_slot_if_due(
             payload: json!({
                 "hour_utc": hour_utc,
                 "hour_key": hour_key,
+                "users": due_users,
             }),
             source: "scheduler".to_owned(),
             requested_by: None,
@@ -1696,22 +1731,6 @@ async fn execute_daily_slot_task(
     task_id: &str,
     payload: &Value,
 ) -> Result<Value> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct UserSlotRow {
-        id: String,
-        daily_brief_local_time: Option<String>,
-        daily_brief_time_zone: Option<String>,
-        daily_brief_utc_time: String,
-        last_active_at: Option<String>,
-    }
-
-    #[derive(Debug)]
-    struct DueUser {
-        row: UserSlotRow,
-        preferences: briefs::DailyBriefPreferences,
-        window: briefs::DailyWindow,
-    }
-
     let hour_utc = payload_i64(payload, "hour_utc")?;
     let task_created_at = sqlx::query_scalar::<_, Option<String>>(
         r#"
@@ -1729,47 +1748,9 @@ async fn execute_daily_slot_task(
     let slot_reference_utc =
         payload_slot_reference_utc(payload, task_created_at.as_deref(), now_utc);
     let target_hour_key = slot_reference_utc.format("%Y-%m-%dT%H").to_string();
-
-    let users = sqlx::query_as::<_, UserSlotRow>(
-        r#"
-        SELECT
-          id,
-          daily_brief_local_time,
-          daily_brief_time_zone,
-          daily_brief_utc_time,
-          last_active_at
-        FROM users
-        WHERE is_disabled = 0
-        ORDER BY
-          CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
-          last_active_at DESC,
-          id ASC
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query users for daily slot")?;
-
-    let mut due_users = Vec::new();
-    for row in users {
-        let preferences = briefs::derive_daily_brief_preferences(
-            &state.config,
-            row.daily_brief_local_time.as_deref(),
-            row.daily_brief_time_zone.as_deref(),
-            Some(row.daily_brief_utc_time.as_str()),
-            slot_reference_utc,
-        );
-        let window = briefs::compute_current_daily_window(&preferences, slot_reference_utc)
-            .with_context(|| format!("failed to compute current window for user {}", row.id))?;
-        if window.end_utc.format("%Y-%m-%dT%H").to_string() != target_hour_key {
-            continue;
-        }
-        due_users.push(DueUser {
-            row,
-            preferences,
-            window,
-        });
-    }
+    let due_users =
+        load_due_daily_slot_users(state, payload, slot_reference_utc, target_hour_key.as_str())
+            .await?;
 
     append_task_event(
         state,
@@ -1807,10 +1788,10 @@ async fn execute_daily_slot_task(
                 "stage": "generate",
                 "index": index + 1,
                 "total": due_users.len(),
-                "user_id": user.row.id,
-                "last_active_at": user.row.last_active_at,
+                "user_id": user.user_id,
+                "last_active_at": user.last_active_at,
                 "key_date": user.window.key_date,
-                "local_boundary": briefs::format_daily_brief_local_time(user.preferences.local_time),
+                "local_boundary": user.window.effective_local_boundary,
                 "time_zone": user.preferences.time_zone,
                 "window_start_utc": user.window.start_utc.to_rfc3339(),
                 "window_end_utc": user.window.end_utc.to_rfc3339(),
@@ -1820,7 +1801,7 @@ async fn execute_daily_slot_task(
 
         match ai::generate_daily_brief_snapshot_for_window(
             state,
-            user.row.id.as_str(),
+            user.user_id.as_str(),
             &user.window,
             "scheduled",
         )
@@ -1835,7 +1816,7 @@ async fn execute_daily_slot_task(
                     json!({
                         "task_id": task_id,
                         "stage": "user_succeeded",
-                        "user_id": user.row.id,
+                        "user_id": user.user_id,
                         "key_date": user.window.key_date,
                         "brief_id": snapshot.id,
                         "content_length": snapshot.content_markdown.chars().count(),
@@ -1857,9 +1838,9 @@ async fn execute_daily_slot_task(
                     json!({
                         "task_id": task_id,
                         "stage": "user_failed",
-                        "user_id": user.row.id,
+                        "user_id": user.user_id,
                         "key_date": user.window.key_date,
-                        "local_boundary": briefs::format_daily_brief_local_time(user.preferences.local_time),
+                        "local_boundary": user.window.effective_local_boundary,
                         "time_zone": user.preferences.time_zone,
                         "error": err.to_string(),
                     }),
@@ -1907,6 +1888,165 @@ async fn execute_daily_slot_task(
         "succeeded": succeeded,
         "failed": failed,
     }))
+}
+
+async fn collect_due_daily_slot_user_snapshots(
+    state: &AppState,
+    slot_reference_utc: DateTime<Utc>,
+    target_hour_key: &str,
+) -> Result<Vec<DailySlotUserSnapshot>> {
+    let users = sqlx::query_as::<_, DailySlotUserRow>(
+        r#"
+        SELECT
+          id,
+          daily_brief_local_time,
+          daily_brief_time_zone,
+          daily_brief_utc_time,
+          last_active_at
+        FROM users
+        WHERE is_disabled = 0
+        ORDER BY
+          CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
+          last_active_at DESC,
+          id ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query users for daily slot")?;
+
+    let mut due_users = Vec::new();
+    for row in users {
+        let preferences = briefs::derive_daily_brief_preferences(
+            &state.config,
+            row.daily_brief_local_time.as_deref(),
+            row.daily_brief_time_zone.as_deref(),
+            Some(row.daily_brief_utc_time.as_str()),
+            slot_reference_utc,
+        );
+        let window = briefs::compute_current_daily_window(&preferences, slot_reference_utc)
+            .with_context(|| format!("failed to compute current window for user {}", row.id))?;
+        if window.end_utc.format("%Y-%m-%dT%H").to_string() != target_hour_key {
+            continue;
+        }
+        due_users.push(DailySlotUserSnapshot {
+            user_id: row.id,
+            last_active_at: row.last_active_at,
+            key_date: window.key_date.to_string(),
+            local_boundary: briefs::format_daily_brief_local_time(preferences.local_time),
+            effective_local_boundary: Some(window.effective_local_boundary.clone()),
+            time_zone: preferences.time_zone,
+            window_start_utc: window.start_utc.to_rfc3339(),
+            window_end_utc: window.end_utc.to_rfc3339(),
+        });
+    }
+
+    Ok(due_users)
+}
+
+async fn load_due_daily_slot_users(
+    state: &AppState,
+    payload: &Value,
+    slot_reference_utc: DateTime<Utc>,
+    target_hour_key: &str,
+) -> Result<Vec<DueDailySlotUser>> {
+    if let Some(snapshots) = payload_daily_slot_user_snapshots(payload)? {
+        return snapshots
+            .into_iter()
+            .map(due_daily_slot_user_from_snapshot)
+            .collect();
+    }
+
+    collect_due_daily_slot_user_snapshots(state, slot_reference_utc, target_hour_key)
+        .await?
+        .into_iter()
+        .map(due_daily_slot_user_from_snapshot)
+        .collect()
+}
+
+fn payload_daily_slot_user_snapshots(
+    payload: &Value,
+) -> Result<Option<Vec<DailySlotUserSnapshot>>> {
+    let Some(users) = payload.get("users") else {
+        return Ok(None);
+    };
+    serde_json::from_value::<Vec<DailySlotUserSnapshot>>(users.clone())
+        .map(Some)
+        .context("payload field users must be daily slot snapshot array")
+}
+
+fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<DueDailySlotUser> {
+    let key_date =
+        NaiveDate::parse_from_str(snapshot.key_date.as_str(), "%Y-%m-%d").with_context(|| {
+            format!(
+                "invalid daily slot snapshot key_date for user {}",
+                snapshot.user_id
+            )
+        })?;
+    let local_time = briefs::parse_daily_brief_local_time(snapshot.local_boundary.as_str())
+        .with_context(|| {
+            format!(
+                "invalid daily slot snapshot local_boundary for user {}",
+                snapshot.user_id
+            )
+        })?;
+    let effective_local_boundary = snapshot
+        .effective_local_boundary
+        .unwrap_or_else(|| snapshot.local_boundary.clone());
+    briefs::parse_daily_brief_local_time(effective_local_boundary.as_str()).with_context(|| {
+        format!(
+            "invalid daily slot snapshot effective_local_boundary for user {}",
+            snapshot.user_id
+        )
+    })?;
+    let time_zone =
+        briefs::parse_daily_brief_time_zone(snapshot.time_zone.as_str()).with_context(|| {
+            format!(
+                "invalid daily slot snapshot time_zone for user {}",
+                snapshot.user_id
+            )
+        })?;
+    let tz = Tz::from_str(time_zone.as_str()).with_context(|| {
+        format!(
+            "invalid daily slot snapshot time_zone for user {}",
+            snapshot.user_id
+        )
+    })?;
+    let start_utc = DateTime::parse_from_rfc3339(snapshot.window_start_utc.as_str())
+        .with_context(|| {
+            format!(
+                "invalid daily slot snapshot window_start_utc for user {}",
+                snapshot.user_id
+            )
+        })?
+        .with_timezone(&Utc);
+    let end_utc = DateTime::parse_from_rfc3339(snapshot.window_end_utc.as_str())
+        .with_context(|| {
+            format!(
+                "invalid daily slot snapshot window_end_utc for user {}",
+                snapshot.user_id
+            )
+        })?
+        .with_timezone(&Utc);
+
+    Ok(DueDailySlotUser {
+        user_id: snapshot.user_id,
+        last_active_at: snapshot.last_active_at,
+        preferences: briefs::DailyBriefPreferences {
+            local_time,
+            time_zone: time_zone.clone(),
+        },
+        window: briefs::DailyWindow {
+            key_date,
+            display_date: key_date.to_string(),
+            start_local: start_utc.with_timezone(&tz).fixed_offset(),
+            end_local: end_utc.with_timezone(&tz).fixed_offset(),
+            start_utc,
+            end_utc,
+            effective_time_zone: time_zone,
+            effective_local_boundary,
+        },
+    })
 }
 
 async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -> Result<Value> {
@@ -1959,7 +2099,7 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
         r#"
         SELECT id, user_id, date
         FROM briefs
-        WHERE generation_source = 'legacy'
+        WHERE generation_source IN ('legacy', 'history_recompute_failed')
         ORDER BY date DESC, created_at DESC, id DESC
         "#,
     )
@@ -2396,13 +2536,14 @@ mod tests {
         TASK_BRIEF_HISTORY_RECOMPUTE, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
         TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
         claim_next_queued_task, current_subscription_schedule_key,
-        enqueue_brief_history_recompute_if_needed, execute_brief_history_recompute_task,
-        execute_sync_all_task_with, is_scheduled_task_type, load_translation_stream_cursor,
+        enqueue_brief_history_recompute_if_needed, enqueue_hour_slot_if_due,
+        execute_brief_history_recompute_task, execute_daily_slot_task, execute_sync_all_task_with,
+        is_scheduled_task_type, load_due_daily_slot_users, load_translation_stream_cursor,
         load_translation_stream_rows, next_llm_scheduler_stream_event, payload_slot_hour_key,
         payload_slot_reference_utc, recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::{
         Row, SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -2523,6 +2664,228 @@ mod tests {
                 .single()
                 .expect("valid datetime")
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_hour_slot_if_due_snapshots_due_users_into_payload() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            UPDATE daily_brief_hour_slots
+            SET enabled = 1, last_dispatch_at = NULL, updated_at = ?
+            WHERE hour_utc = 0
+            "#,
+        )
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("enable midnight slot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time,
+              last_active_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("slot-user")
+        .bind(1001_i64)
+        .bind("slot-user")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind("00:00")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert slot user");
+
+        let task_id = enqueue_hour_slot_if_due(
+            state.as_ref(),
+            Utc.with_ymd_and_hms(2026, 4, 13, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+        )
+        .await
+        .expect("enqueue slot task")
+        .expect("task id");
+
+        let payload = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT payload_json
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load slot task payload");
+        let payload: Value = serde_json::from_str(&payload).expect("parse payload");
+        let users = payload["users"].as_array().expect("users array");
+        assert_eq!(users.len(), 1);
+        assert_eq!(payload["hour_key"], json!("2026-04-13T00"));
+        assert_eq!(users[0]["user_id"], json!("slot-user"));
+        assert_eq!(users[0]["key_date"], json!("2026-04-13"));
+        assert_eq!(users[0]["local_boundary"], json!("08:00"));
+        assert_eq!(users[0]["effective_local_boundary"], json!("08:00"));
+        assert_eq!(users[0]["time_zone"], json!("Asia/Shanghai"));
+        assert_eq!(
+            users[0]["window_start_utc"],
+            json!("2026-04-12T00:00:00+00:00")
+        );
+        assert_eq!(
+            users[0]["window_end_utc"],
+            json!("2026-04-13T00:00:00+00:00")
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_hour_slot_if_due_snapshots_resolved_dst_gap_boundary() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-08T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            UPDATE daily_brief_hour_slots
+            SET enabled = 1,
+                last_dispatch_at = NULL,
+                updated_at = ?
+            WHERE hour_utc = ?
+            "#,
+        )
+        .bind(now)
+        .bind(7_i64)
+        .execute(&pool)
+        .await
+        .expect("reset dst slot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time,
+              last_active_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("slot-user-dst-gap")
+        .bind(1003_i64)
+        .bind("slot-user-dst-gap")
+        .bind("02:00")
+        .bind("America/New_York")
+        .bind("07:00")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert dst-gap user");
+
+        let task_id = enqueue_hour_slot_if_due(
+            state.as_ref(),
+            Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0)
+                .single()
+                .expect("valid datetime"),
+        )
+        .await
+        .expect("enqueue dst-gap slot task")
+        .expect("task id");
+
+        let payload = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT payload_json
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load dst-gap slot task payload");
+        let payload: Value = serde_json::from_str(&payload).expect("parse payload");
+        let users = payload["users"].as_array().expect("users array");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0]["local_boundary"], json!("02:00"));
+        assert_eq!(users[0]["effective_local_boundary"], json!("03:00"));
+
+        let due_users = load_due_daily_slot_users(
+            state.as_ref(),
+            &payload,
+            Utc.with_ymd_and_hms(2026, 3, 8, 7, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            "2026-03-08T07",
+        )
+        .await
+        .expect("load due users from payload");
+        assert_eq!(due_users.len(), 1);
+        assert_eq!(due_users[0].preferences.local_time.to_string(), "02:00:00");
+        assert_eq!(due_users[0].window.effective_local_boundary, "03:00");
+    }
+
+    #[tokio::test]
+    async fn execute_daily_slot_task_prefers_payload_snapshots_over_live_user_settings() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time,
+              last_active_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("slot-user-live")
+        .bind(1002_i64)
+        .bind("slot-user-live")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind("00:00")
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert live due user");
+
+        seed_task(
+            &pool,
+            "task-daily-slot-payload-snapshots",
+            TASK_BRIEF_DAILY_SLOT,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let result = execute_daily_slot_task(
+            state.as_ref(),
+            "task-daily-slot-payload-snapshots",
+            &json!({
+                "hour_utc": 0,
+                "hour_key": "2026-04-13T00",
+                "users": [],
+            }),
+        )
+        .await
+        .expect("execute daily slot task");
+
+        assert_eq!(result["total"], json!(0));
+        assert_eq!(result["succeeded"], json!(0));
+        assert_eq!(result["failed"], json!(0));
     }
 
     #[test]
@@ -3413,11 +3776,27 @@ mod tests {
         .expect("load failed brief generation source");
         assert_eq!(generation_source, "history_recompute_failed");
 
+        sqlx::query(
+            r#"
+            UPDATE job_tasks
+            SET status = ?, finished_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(STATUS_FAILED)
+        .bind(now)
+        .bind(now)
+        .bind(&task_id)
+        .execute(&pool)
+        .await
+        .expect("mark original recompute task finished");
+
         let next_task_id = enqueue_brief_history_recompute_if_needed(state.as_ref())
             .await
-            .expect("skip bootstrap once failed rows are marked");
+            .expect("requeue bootstrap after failed rows are marked");
 
-        assert_eq!(next_task_id, None);
+        assert!(next_task_id.is_some());
+        assert_ne!(next_task_id.as_deref(), Some(task_id.as_str()));
 
         let queued = sqlx::query_scalar::<_, i64>(
             r#"
@@ -3431,6 +3810,6 @@ mod tests {
         .await
         .expect("count history recompute tasks");
 
-        assert_eq!(queued, 1);
+        assert_eq!(queued, 2);
     }
 }

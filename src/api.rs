@@ -103,6 +103,10 @@ fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
         .any(|candidate| candidate == release_id)
 }
 
+fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
+    matches!(generation_source, "legacy" | "history_recompute_failed")
+}
+
 async fn user_has_brief_access_to_release(
     state: &AppState,
     user_id: &str,
@@ -133,7 +137,7 @@ async fn user_has_brief_access_to_release(
         SELECT content_markdown
         FROM briefs
         WHERE user_id = ?
-          AND generation_source = 'legacy'
+          AND generation_source IN ('legacy', 'history_recompute_failed')
           AND content_markdown LIKE ?
         "#,
     )
@@ -3250,7 +3254,7 @@ pub async fn list_starred(
         LIMIT 2000
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -3285,7 +3289,7 @@ pub async fn list_releases(
         LIMIT 200
         "#,
     )
-    .bind(user_id)
+     .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -3563,32 +3567,28 @@ pub async fn list_briefs(
         FROM briefs
         WHERE user_id = ?
         ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
-        LIMIT 30
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
     let mut release_ids_by_brief = HashMap::<String, Vec<String>>::new();
     if !rows.is_empty() {
-        let brief_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "SELECT brief_id, release_id FROM brief_release_memberships WHERE brief_id IN (",
-        );
-        {
-            let mut separated = query.separated(", ");
-            for brief_id in &brief_ids {
-                separated.push_bind(brief_id);
-            }
-        }
-        query.push(") ORDER BY brief_id ASC, ordinal ASC");
-        let membership_rows = query
-            .build_query_as::<BriefMembershipRow>()
-            .fetch_all(&state.pool)
-            .await
-            .map_err(ApiError::internal)?;
+        let membership_rows = sqlx::query_as::<_, BriefMembershipRow>(
+            r#"
+            SELECT m.brief_id, m.release_id
+            FROM brief_release_memberships m
+            JOIN briefs b ON b.id = m.brief_id
+            WHERE b.user_id = ?
+            ORDER BY m.brief_id ASC, m.ordinal ASC
+            "#,
+        )
+        .bind(&user_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
         for row in membership_rows {
             release_ids_by_brief
                 .entry(row.brief_id)
@@ -3601,7 +3601,7 @@ pub async fn list_briefs(
         .into_iter()
         .map(|r| {
             let release_ids = release_ids_by_brief.remove(&r.id).unwrap_or_else(|| {
-                if r.generation_source == "legacy" {
+                if brief_uses_markdown_release_fallback(&r.generation_source) {
                     extract_brief_release_ids(&r.content_markdown)
                         .into_iter()
                         .map(|value| value.to_string())
