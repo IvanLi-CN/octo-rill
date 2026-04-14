@@ -341,7 +341,7 @@ const translationRequestSeed = {
 	requested_by: CURRENT_USER_ID,
 	scope_user_id: CURRENT_USER_ID,
 	producer_ref: "feed.auto_translate:release:290978079",
-	kind: "release_summary",
+	kind: "release_detail",
 	variant: "feed_body",
 	entity_id: "290978079",
 	batch_id: "batch-translation-story",
@@ -354,7 +354,7 @@ const translationRequestSeed = {
 const translationRequestItemSeed = {
 	producer_ref: "feed.auto_translate:release:290978079",
 	entity_id: "290978079",
-	kind: "release_summary",
+	kind: "release_detail",
 	variant: "feed_body",
 	status: "ready",
 	title_zh: "发布说明 290978079",
@@ -731,6 +731,9 @@ function AdminJobsPreview({
 		let llmSchedulerStatus = {
 			scheduler_enabled: true,
 			max_concurrency: 2,
+			ai_model_context_limit: null as number | null,
+			effective_model_input_limit: 32768,
+			effective_model_input_limit_source: "builtin_catalog",
 			waiting_calls: 1,
 			in_flight_calls: 1,
 			available_slots: 1,
@@ -829,6 +832,11 @@ function AdminJobsPreview({
 				llm_enabled: true,
 				scan_interval_ms: 250,
 				batch_token_threshold: 1800,
+				ai_model_context_limit: llmSchedulerStatus.ai_model_context_limit,
+				effective_model_input_limit:
+					llmSchedulerStatus.effective_model_input_limit,
+				effective_model_input_limit_source:
+					llmSchedulerStatus.effective_model_input_limit_source,
 				general_worker_concurrency:
 					translationWorkerConfig.general_worker_concurrency,
 				dedicated_worker_concurrency:
@@ -1028,10 +1036,26 @@ function AdminJobsPreview({
 				url.pathname === "/api/admin/jobs/llm/runtime-config" &&
 				req.method === "PATCH"
 			) {
-				const body = (await req.json()) as { max_concurrency?: number };
+				const body = (await req.json()) as {
+					max_concurrency?: number;
+					ai_model_context_limit?: number | null;
+				};
+				const hasModelContextLimit = Object.hasOwn(
+					body,
+					"ai_model_context_limit",
+				);
+				const aiModelContextLimit = hasModelContextLimit
+					? typeof body.ai_model_context_limit === "number"
+						? Number(body.ai_model_context_limit)
+						: null
+					: llmSchedulerStatus.ai_model_context_limit;
 				llmSchedulerStatus = {
 					...llmSchedulerStatus,
 					max_concurrency: Number(body.max_concurrency ?? 1),
+					ai_model_context_limit: aiModelContextLimit,
+					effective_model_input_limit: aiModelContextLimit ?? 32768,
+					effective_model_input_limit_source:
+						aiModelContextLimit === null ? "builtin_catalog" : "admin_override",
 					available_slots: Math.max(
 						0,
 						Number(body.max_concurrency ?? 1) -
@@ -1480,12 +1504,41 @@ export const LlmSettingsDialog: Story = {
 	play: async ({ canvasElement }) => {
 		const body = within(canvasElement.ownerDocument.body);
 		await userEvent.click(
-			body.getByRole("button", { name: "配置 LLM 并发上限" }),
+			body.getByRole("button", { name: "配置 LLM 运行参数" }),
 		);
 		await expect(
-			body.getByRole("heading", { name: "配置 LLM 并发上限" }),
+			body.getByRole("heading", { name: "配置 LLM 运行参数" }),
 		).toBeVisible();
 		await expect(body.getByLabelText("最大并发数")).toHaveValue(2);
+		await expect(body.getByLabelText("LLM 输入长度上限（tokens）")).toHaveValue(
+			"",
+		);
+	},
+};
+
+export const LlmSettingsSaved: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/llm" />,
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			body.getByRole("button", { name: "配置 LLM 运行参数" }),
+		);
+		const concurrencyInput = body.getByLabelText(
+			"最大并发数",
+		) as HTMLInputElement;
+		const modelInput = body.getByLabelText(
+			"LLM 输入长度上限（tokens）",
+		) as HTMLInputElement;
+		await userEvent.clear(concurrencyInput);
+		await userEvent.type(concurrencyInput, "5");
+		await userEvent.type(modelInput, "65536");
+		await userEvent.click(body.getByRole("button", { name: "保存设置" }));
+		await expect(
+			body.queryByRole("heading", { name: "配置 LLM 运行参数" }),
+		).not.toBeInTheDocument();
+		await expect(
+			body.getByText("并发上限 5 · 可用 4 · 输入 65,536 tokens"),
+		).toBeVisible();
 	},
 };
 

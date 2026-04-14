@@ -172,15 +172,6 @@ function TranslatedLane(props: {
 		);
 	}
 
-	if (item.body_truncated) {
-		return (
-			<EmptyPanel
-				title="正文过长，无法直接翻译"
-				description="列表卡片只保留截断正文；这类超长 release 建议直接打开 GitHub 阅读完整内容。"
-			/>
-		);
-	}
-
 	if (item.translated?.status === "error") {
 		return (
 			<EmptyPanel

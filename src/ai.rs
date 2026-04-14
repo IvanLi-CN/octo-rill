@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{config::AiConfig, local_id, runtime, state::AppState};
+use crate::{admin_runtime, config::AiConfig, local_id, runtime, state::AppState};
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -23,7 +23,7 @@ const MODEL_LIMIT_SAFETY_RATIO: f64 = 0.05;
 const MODEL_LIMIT_SOURCE_OPENROUTER: &str = "https://openrouter.ai/api/v1/models";
 const MODEL_LIMIT_SOURCE_LITELLM: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
-const MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE: &str = "env_override";
+const MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE: &str = "admin_override";
 const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
@@ -492,8 +492,8 @@ fn lookup_model_limit_in_map(map: &HashMap<String, u32>, model: &str) -> Option<
 }
 
 pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'static str) {
-    if let Some(limit) = state.config.ai_model_context_limit {
-        return (limit.max(1), MODEL_LIMIT_RESOLUTION_ENV_OVERRIDE);
+    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
+        return (limit.max(1), MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE);
     }
 
     let model = state
@@ -3341,7 +3341,6 @@ mod tests {
                 api_key: "test-api-key".to_owned(),
             }),
             ai_max_concurrency: 1,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");

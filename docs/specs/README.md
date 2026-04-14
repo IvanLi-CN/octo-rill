@@ -77,15 +77,15 @@
 | vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-03-08 | task drawer route outlet + in-drawer LLM detail navigation; recent-events browser-timezone sync + merge-gate evidence aligned |
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
-| g4456 | LLM 批处理效率改造 | 已完成 | `g4456-llm-batch-efficiency/SPEC.md` | 2026-03-30 | local implementation completed; release feed visible-window resolve flow, backend dedupe, and Playwright coverage aligned |
-| 3k9fd | Release Feed 正文卡片与同步后后台翻译 | 已完成 | `3k9fd-release-feed-body-translation/SPEC.md` | 2026-04-03 | PR #44; body-based release feed cards + sync-triggered background translation |
+| g4456 | LLM 批处理效率改造 | 已完成 | `g4456-llm-batch-efficiency/SPEC.md` | 2026-03-30 | local implementation completed; batching/dedupe contract landed; runtime input-limit source superseded by #y2yf8 |
+| 3k9fd | Release Feed 正文卡片与同步后后台翻译 | 重新设计（#y2yf8） | `3k9fd-release-feed-body-translation/SPEC.md` | 2026-04-13 | historical body-limit contract superseded by #y2yf8 LLM-input-budget chunk translation |
 | gd6zm | 管理员任务中心（二期）+ 用户管理字段补齐 | 已完成 | `gd6zm-admin-job-center-phase2/SPEC.md` | 2026-03-27 | PR #28, PR #38; admin jobs runtime recovery + stale running cleanup aligned |
 | n6zd8 | 管理员面板一期（首登管理员 + 用户管理） | 已完成 | `n6zd8-admin-panel-user-management/SPEC.md` | 2026-02-25 | local implementation completed |
 | regzy | OctoRill 文档站点与 Storybook 文档快车道实施 | 已完成 | `regzy-octo-rill-docs-site/SPEC.md` | 2026-03-09 | PR #31; docs-site + pages workflow + storybook docs; checks green; review-loop clear |
 | erscd | 管理员任务中心：LLM 调度观测与调用排障 | 已完成 | `erscd-admin-llm-scheduler-observability/SPEC.md` | 2026-02-27 | local implementation completed |
 | 96dp9 | Dashboard 同步入口收敛与顺序固定 | 已完成 | `96dp9-dashboard-sync-unification/SPEC.md` | 2026-03-27 | PR #39; single sync entry shipped with one retained visual evidence asset |
 | g8p8z | 管理员任务中心 Tab 路由化 | 已完成 | `g8p8z-admin-jobs-tab-routing/SPEC.md` | 2026-03-27 | local implementation completed; pathname-driven primary tabs + translation `view` deep links + task drawer `from` restore |
-| epn56 | 管理员任务中心运行时 worker 数量设置 | 已完成 | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-03-28 | PR #42; checks green; review-loop clear; runtime config dialogs + persisted hot updates |
+| epn56 | 管理员任务中心运行时 worker 数量设置 | 重新设计（#y2yf8） | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-04-13 | historical worker-only contract superseded by #y2yf8 translation runtime settings |
 | r8m4k | Dashboard 日报阅读流与详情弹窗修正 | 已完成 | `r8m4k-dashboard-brief-detail-auto-height/SPEC.md` | 2026-04-03 | PR #45; brief card grows with content and release detail now opens in a modal dialog |
 | qvewp | Release 成功后回写 PR 版本评论 | 已完成 | `qvewp-release-pr-version-comment/SPEC.md` | 2026-04-04 | PR #46, PR #47; release run #43 comments PRs and rerun updates in place |
 | xaycu | Dashboard 按日报边界分组与历史日报折叠 | 已完成 | `xaycu-dashboard-day-grouping/SPEC.md` | 2026-04-04 | local implementation completed; PR pending |
@@ -99,5 +99,6 @@
 | u6b32 | Web 暗色模式接通 | 已完成 | `u6b32-web-dark-mode/SPEC.md` | 2026-04-11 | PR #63; header-based theme toggle, Storybook evidence, and review-loop clear |
 | at76w | 修复 Release 自动发版断链并补齐漏发版本 | 待实现 | `at76w-release-reliability-backfill/SPEC.md` | 2026-04-11 | release trigger cut over to push@main + backfill queue planned |
 | 2nsc2 | Landing 登录页重做：降噪文案、重构布局、修复移动端 CTA | 已完成 | `2nsc2-landing-login-refresh/SPEC.md` | 2026-04-12 | PR #72; fast-track / storybook canvas evidence / mobile CTA above the fold |
+| y2yf8 | Release 翻译输入预算与运行时设置收口 | 已完成 | `y2yf8-release-translation-input-budget-runtime/SPEC.md` | 2026-04-13 | local implementation completed; runtime `ai_model_context_limit`; release_detail chunk translation unified; visual evidence landed |
 | jfkcf | Release reaction 反馈图标轻量收敛 | 已完成 | `jfkcf-release-reaction-compact-size/SPEC.md` | 2026-04-12 | local implementation completed; compact reaction trigger + Storybook canvas evidence |
 | p82d7 | Dashboard / Admin 移动端壳层与顶栏收敛优化 | 部分完成（4/4） | `p82d7-dashboard-admin-mobile-shell-polish/SPEC.md` | 2026-04-14 | PR #77; visual evidence refreshed and mobile shell gesture polish landed |

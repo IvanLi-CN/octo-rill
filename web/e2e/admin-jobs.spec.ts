@@ -205,6 +205,9 @@ async function installAdminJobsMocks(
 	let llmSchedulerStatus = {
 		scheduler_enabled: true,
 		max_concurrency: 2,
+		ai_model_context_limit: null as number | null,
+		effective_model_input_limit: 32768,
+		effective_model_input_limit_source: "builtin_catalog",
 		available_slots: 1,
 		waiting_calls: 1,
 		in_flight_calls: 1,
@@ -228,7 +231,7 @@ async function installAdminJobsMocks(
 		requested_by: CURRENT_USER_ID,
 		scope_user_id: CURRENT_USER_ID,
 		producer_ref: "feed.auto_translate:release:290978079",
-		kind: "release_summary",
+		kind: "release_detail",
 		variant: "feed_body",
 		entity_id: "290978079",
 		batch_id: "batch-translation-1",
@@ -380,12 +383,12 @@ async function installAdminJobsMocks(
 	const completedTranslationRequestItem = {
 		producer_ref: "feed.auto_translate:release:290978079",
 		entity_id: "290978079",
-		kind: "release_summary",
+		kind: "release_detail",
 		variant: "feed_body",
 		status: "ready",
 		title_zh: "发布说明 290978079",
-		summary_md: "- 修复了调度窗口\n- 保持单请求语义",
-		body_md: null,
+		summary_md: null,
+		body_md: "- 修复了调度窗口\n- 保持单请求语义",
 		error: null,
 		work_item_id: "work-translation-1",
 		batch_id: "batch-translation-1",
@@ -449,6 +452,11 @@ async function installAdminJobsMocks(
 				llm_enabled: true,
 				scan_interval_ms: 250,
 				batch_token_threshold: 1800,
+				ai_model_context_limit: llmSchedulerStatus.ai_model_context_limit,
+				effective_model_input_limit:
+					llmSchedulerStatus.effective_model_input_limit,
+				effective_model_input_limit_source:
+					llmSchedulerStatus.effective_model_input_limit_source,
 				general_worker_concurrency:
 					translationRuntimeOverride.general_worker_concurrency,
 				dedicated_worker_concurrency:
@@ -482,6 +490,11 @@ async function installAdminJobsMocks(
 				llm_enabled: true,
 				scan_interval_ms: 250,
 				batch_token_threshold: 1800,
+				ai_model_context_limit: llmSchedulerStatus.ai_model_context_limit,
+				effective_model_input_limit:
+					llmSchedulerStatus.effective_model_input_limit,
+				effective_model_input_limit_source:
+					llmSchedulerStatus.effective_model_input_limit_source,
 				general_worker_concurrency: 3,
 				dedicated_worker_concurrency: 1,
 				worker_concurrency: 4,
@@ -507,6 +520,11 @@ async function installAdminJobsMocks(
 			llm_enabled: true,
 			scan_interval_ms: 250,
 			batch_token_threshold: 1800,
+			ai_model_context_limit: llmSchedulerStatus.ai_model_context_limit,
+			effective_model_input_limit:
+				llmSchedulerStatus.effective_model_input_limit,
+			effective_model_input_limit_source:
+				llmSchedulerStatus.effective_model_input_limit_source,
 			general_worker_concurrency: 3,
 			dedicated_worker_concurrency: 1,
 			worker_concurrency: 4,
@@ -1187,11 +1205,27 @@ async function installAdminJobsMocks(
 			req.method() === "PATCH" &&
 			pathname === "/api/admin/jobs/llm/runtime-config"
 		) {
-			const body = (req.postDataJSON() ?? {}) as { max_concurrency?: number };
+			const body = (req.postDataJSON() ?? {}) as {
+				max_concurrency?: number;
+				ai_model_context_limit?: number | null;
+			};
 			const maxConcurrency = Number(body.max_concurrency ?? 1);
+			const hasModelContextLimit = Object.hasOwn(
+				body,
+				"ai_model_context_limit",
+			);
+			const aiModelContextLimit = hasModelContextLimit
+				? typeof body.ai_model_context_limit === "number"
+					? Number(body.ai_model_context_limit)
+					: null
+				: llmSchedulerStatus.ai_model_context_limit;
 			llmSchedulerStatus = {
 				...llmSchedulerStatus,
 				max_concurrency: maxConcurrency,
+				ai_model_context_limit: aiModelContextLimit,
+				effective_model_input_limit: aiModelContextLimit ?? 32768,
+				effective_model_input_limit_source:
+					aiModelContextLimit === null ? "builtin_catalog" : "admin_override",
 				available_slots: Math.max(
 					0,
 					maxConcurrency - llmSchedulerStatus.in_flight_calls,
@@ -1578,7 +1612,7 @@ test("admin can manage jobs center", async ({ page }) => {
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
 	await llmCallCardAgain.getByRole("button", { name: "详情" }).click();
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
-	await expect(llmSheet).toHaveCount(0);
+	await expect(llmSheet).not.toBeVisible();
 });
 
 test("admin jobs tabs are URL-driven and support deep links plus history", async ({
@@ -1685,7 +1719,7 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 				pathname: "/api/admin/jobs/llm/calls",
 				search: "status=failed",
 				times: 1,
-				delayMs: 300,
+				delayMs: 2200,
 			},
 		],
 		emitStreamEvents: false,
@@ -1710,7 +1744,7 @@ test("admin keeps newest llm filter results after overlapping refreshes", async 
 	).toBeDisabled();
 	await expect(refreshButton).toBeDisabled();
 
-	await page.waitForTimeout(1300);
+	await page.waitForTimeout(2400);
 	await expect(page.getByText("job.api.translate_release")).toBeVisible();
 	await expect(page.getByText("api.translate_releases_batch")).toHaveCount(0);
 	await expect(refreshButton).toBeEnabled();
@@ -1918,7 +1952,7 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	).toBeVisible();
 	const requestDialog = page.getByLabel("翻译请求详情");
 	await expect(
-		requestDialog.getByText("release_summary · feed_body", { exact: true }),
+		requestDialog.getByText("release_detail · feed_body", { exact: true }),
 	).toBeVisible();
 	await expect(
 		requestDialog.getByText(
@@ -1938,25 +1972,30 @@ test("admin can inspect translation scheduler", async ({ page }) => {
 	await expect(llmDialog.getByText("llm-translation-1")).toBeVisible();
 });
 
-test("admin can update llm runtime concurrency from settings dialog", async ({
+test("admin can update llm runtime settings from settings dialog", async ({
 	page,
 }) => {
 	await installAdminJobsMocks(page);
 	await page.goto("/admin/jobs");
 	await page.getByRole("tab", { name: "LLM调度" }).click();
 
-	await page.getByRole("button", { name: "配置 LLM 并发上限" }).click();
-	const dialog = page.getByRole("dialog", { name: "配置 LLM 并发上限" });
+	await page.getByRole("button", { name: "配置 LLM 运行参数" }).click();
+	const dialog = page.getByRole("dialog", { name: "配置 LLM 运行参数" });
 	await expect(dialog).toBeVisible();
-	const input = dialog.getByLabel("最大并发数");
-	await expect(input).toHaveValue("2");
-	await input.fill("0");
+	const concurrencyInput = dialog.getByLabel("最大并发数");
+	const modelInput = dialog.getByLabel("LLM 输入长度上限（tokens）");
+	await expect(concurrencyInput).toHaveValue("2");
+	await expect(modelInput).toHaveValue("");
+	await concurrencyInput.fill("0");
 	await dialog.getByRole("button", { name: "保存设置" }).click();
 	await expect(dialog.getByText("并发上限必须是大于 0 的整数。")).toBeVisible();
-	await input.fill("5");
+	await concurrencyInput.fill("5");
+	await modelInput.fill("65536");
 	await dialog.getByRole("button", { name: "保存设置" }).click();
 	await expect(dialog).toHaveCount(0);
-	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
+	await expect(
+		page.getByText("并发上限 5 · 可用 4 · 输入 65,536 tokens"),
+	).toBeVisible();
 });
 
 test("admin refreshes llm scheduler via shared sse stream", async ({
@@ -1976,7 +2015,9 @@ test("admin refreshes llm scheduler via shared sse stream", async ({
 
 	await page.goto("/admin/jobs");
 	await page.getByRole("tab", { name: "LLM调度" }).click();
-	await expect(page.getByText("并发上限 5 · 可用 4")).toBeVisible();
+	await expect(
+		page.getByText("并发上限 5 · 可用 4 · 输入 32,768 tokens"),
+	).toBeVisible();
 });
 
 test("admin can update translation worker counts from settings dialog", async ({
@@ -2106,7 +2147,7 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await expect(page.getByText("工作者板")).toBeVisible();
 	await expect(page.getByText("W4 · 用户专用")).toBeVisible();
 	await expect(
-		page.getByText("release_summary · feed_body · entity 290978079"),
+		page.getByText("release_detail · feed_body · entity 290978079"),
 	).toBeVisible();
 
 	await page.evaluate(() => window.scrollTo(0, 900));
