@@ -6,8 +6,13 @@ import {
 	ApiError,
 	apiGet,
 	apiGetAdminUserProfile,
+	apiPatchAdminUserProfile,
 	apiPatchJson,
 } from "@/api";
+import {
+	DailyBriefProfileForm,
+	readHourAlignedBrowserTimeZone,
+} from "@/briefs/DailyBriefProfileForm";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -116,31 +121,6 @@ function formatLocalHm(value: string | null | undefined) {
 	return HM_FORMATTER.format(parsed);
 }
 
-function formatUtcClockToLocalHm(utcClock: string | null | undefined) {
-	if (!utcClock) return "-";
-	const [hourRaw, minuteRaw] = utcClock.split(":");
-	const hour = Number(hourRaw);
-	const minute = Number(minuteRaw ?? "0");
-	if (
-		!Number.isInteger(hour) ||
-		!Number.isInteger(minute) ||
-		hour < 0 ||
-		hour > 23 ||
-		minute < 0 ||
-		minute > 59
-	)
-		return "-";
-
-	// Anchor the UTC clock to the browser's current local date so DST-sensitive
-	// time zones display the current offset instead of the 1970 epoch offset.
-	const now = new Date();
-	const parsed = new Date(
-		Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), hour, minute, 0),
-	);
-	if (Number.isNaN(parsed.getTime())) return "-";
-	return HM_FORMATTER.format(parsed);
-}
-
 function toAdminUserErrorMessage(err: unknown) {
 	if (err instanceof ApiError) {
 		switch (err.code) {
@@ -202,6 +182,11 @@ export function UserManagement({
 	const [profileLoading, setProfileLoading] = useState(false);
 	const [profileError, setProfileError] = useState<string | null>(null);
 	const [profile, setProfile] = useState<AdminUserProfileResponse | null>(null);
+	const [profileSaving, setProfileSaving] = useState(false);
+	const [profileDraft, setProfileDraft] = useState({
+		daily_brief_local_time: "08:00",
+		daily_brief_time_zone: readHourAlignedBrowserTimeZone() ?? "Asia/Shanghai",
+	});
 
 	const storyProfileInitializedRef = useRef(false);
 	const storyConfirmInitializedRef = useRef(false);
@@ -316,18 +301,44 @@ export function UserManagement({
 		try {
 			const detail = await apiGetAdminUserProfile(user.id);
 			setProfile(detail);
+			setProfileDraft({
+				daily_brief_local_time: detail.daily_brief_local_time,
+				daily_brief_time_zone: detail.daily_brief_time_zone,
+			});
 		} catch (err) {
 			setProfileError(toAdminUserErrorMessage(err));
 		} finally {
 			setProfileLoading(false);
 		}
 	}, []);
+	const onSaveProfile = useCallback(async () => {
+		if (!profileUser) return;
+		setProfileSaving(true);
+		setProfileError(null);
+		try {
+			const detail = await apiPatchAdminUserProfile(
+				profileUser.id,
+				profileDraft,
+			);
+			setProfile(detail);
+			setProfileDraft({
+				daily_brief_local_time: detail.daily_brief_local_time,
+				daily_brief_time_zone: detail.daily_brief_time_zone,
+			});
+			await loadUsers({ clearError: false });
+		} catch (err) {
+			setProfileError(toAdminUserErrorMessage(err));
+		} finally {
+			setProfileSaving(false);
+		}
+	}, [loadUsers, profileDraft, profileUser]);
 
 	const onCloseProfile = useCallback(() => {
 		setProfileUser(null);
 		setProfile(null);
 		setProfileError(null);
 		setProfileLoading(false);
+		setProfileSaving(false);
 	}, []);
 
 	useEffect(() => {
@@ -576,17 +587,6 @@ export function UserManagement({
 								</p>
 							</div>
 							<div className="rounded-lg border p-3">
-								<p className="text-muted-foreground text-xs">
-									日报时间（浏览器当前时区）
-								</p>
-								<p className="mt-1 font-medium">
-									{formatUtcClockToLocalHm(profile?.daily_brief_utc_time)}
-								</p>
-								<p className="text-muted-foreground mt-1 text-xs">
-									UTC 原值：{profile?.daily_brief_utc_time ?? "-"}
-								</p>
-							</div>
-							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">账号状态</p>
 								<p className="mt-1 font-medium">
 									{profileUser?.is_disabled ? "已禁用" : "已启用"} ·{" "}
@@ -595,14 +595,45 @@ export function UserManagement({
 							</div>
 						</div>
 
+						<DailyBriefProfileForm
+							localTime={profileDraft.daily_brief_local_time}
+							timeZone={profileDraft.daily_brief_time_zone}
+							disabled={profileLoading || profileSaving}
+							error={profileError}
+							helperText="修改的是这个用户未来的日报边界；历史日报快照不会被覆写。管理员替别人修改时，必须显式写入目标用户时区。"
+							onLocalTimeChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_local_time: value,
+								}))
+							}
+							onTimeZoneChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: value,
+								}))
+							}
+							onUseBrowserTimeZone={(timeZone) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: timeZone,
+								}))
+							}
+						/>
+
 						{profileLoading ? (
 							<p className="text-muted-foreground text-sm">详情加载中...</p>
 						) : null}
-						{profileError ? (
-							<p className="text-destructive text-sm">{profileError}</p>
-						) : null}
 
-						<div className="flex justify-end">
+						<div className="flex justify-end gap-2">
+							<Button
+								onClick={() => void onSaveProfile()}
+								disabled={
+									profileLoading || profileSaving || !profileUser || !profile
+								}
+							>
+								{profileSaving ? "保存中..." : "保存"}
+							</Button>
 							<Button variant="outline" onClick={onCloseProfile}>
 								关闭
 							</Button>

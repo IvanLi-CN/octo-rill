@@ -476,6 +476,7 @@ mod tests {
             ai: None,
             ai_max_concurrency,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         }
     }
 }

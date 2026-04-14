@@ -14,12 +14,12 @@ use axum::response::{
     IntoResponse, Response,
     sse::{Event, KeepAlive, Sse},
 };
-use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ai, api, local_id, runtime, state::AppState, sync, translations};
+use crate::{ai, api, briefs, local_id, runtime, state::AppState, sync, translations};
 
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
@@ -35,6 +35,7 @@ pub const TASK_SYNC_ACCESS_REFRESH: &str = "sync.access_refresh";
 pub const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
+pub const TASK_BRIEF_HISTORY_RECOMPUTE: &str = "brief.history_recompute";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
@@ -168,6 +169,7 @@ pub async fn enqueue_hour_slot_if_due(
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
     let hour_utc = i64::from(now.hour());
+    let hour_key = now.format("%Y-%m-%dT%H").to_string();
     let slot = sqlx::query_as::<_, SlotRow>(
         r#"
         SELECT enabled, last_dispatch_at
@@ -189,7 +191,6 @@ pub async fn enqueue_hour_slot_if_due(
         return Ok(None);
     }
 
-    let hour_key = now.format("%Y-%m-%dT%H").to_string();
     let already_dispatched = slot
         .last_dispatch_at
         .as_deref()
@@ -202,7 +203,10 @@ pub async fn enqueue_hour_slot_if_due(
         state,
         NewTask {
             task_type: TASK_BRIEF_DAILY_SLOT.to_owned(),
-            payload: json!({ "hour_utc": hour_utc }),
+            payload: json!({
+                "hour_utc": hour_utc,
+                "hour_key": hour_key,
+            }),
             source: "scheduler".to_owned(),
             requested_by: None,
             parent_task_id: None,
@@ -276,6 +280,30 @@ pub async fn enqueue_subscription_run_if_due(
     };
 
     upsert_dispatch_state(state, &schedule_key, &task.task_id).await?;
+    Ok(Some(task.task_id))
+}
+
+pub async fn enqueue_brief_history_recompute_if_needed(state: &AppState) -> Result<Option<String>> {
+    if ai::legacy_brief_count(state).await? == 0 {
+        return Ok(None);
+    }
+
+    if let Some(existing) = find_inflight_task_by_type(state, TASK_BRIEF_HISTORY_RECOMPUTE).await? {
+        return Ok(Some(existing.task_id));
+    }
+
+    let task = enqueue_task(
+        state,
+        NewTask {
+            task_type: TASK_BRIEF_HISTORY_RECOMPUTE.to_owned(),
+            payload: json!({}),
+            source: "migration.bootstrap".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+    )
+    .await?;
+
     Ok(Some(task.task_id))
 }
 
@@ -569,6 +597,41 @@ pub async fn find_inflight_task_for_requester(
     .fetch_optional(&state.pool)
     .await
     .context("failed to find inflight task for requester")?;
+
+    Ok(row.map(|row| EnqueuedTask {
+        task_id: row.id,
+        task_type: row.task_type,
+        status: row.status,
+    }))
+}
+
+pub async fn find_inflight_task_by_type(
+    state: &AppState,
+    task_type: &str,
+) -> Result<Option<EnqueuedTask>> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct InflightTaskRow {
+        id: String,
+        task_type: String,
+        status: String,
+    }
+
+    let row = sqlx::query_as::<_, InflightTaskRow>(
+        r#"
+        SELECT id, task_type, status
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status IN (?, ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_type)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to find inflight task by type")?;
 
     Ok(row.map(|row| EnqueuedTask {
         task_id: row.id,
@@ -1493,14 +1556,25 @@ async fn execute_task(
         TASK_BRIEF_GENERATE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let key_date = payload_date(payload, "key_date")?;
-            let content = if let Some(key_date) = key_date {
-                ai::generate_daily_brief_for_key_date(state, user_id.as_str(), key_date).await?
+            let snapshot = if let Some(key_date) = key_date {
+                ai::generate_daily_brief_snapshot_for_key_date(state, user_id.as_str(), key_date)
+                    .await?
             } else {
-                ai::generate_daily_brief(state, user_id.as_str()).await?
+                ai::generate_daily_brief_snapshot_for_current(state, user_id.as_str()).await?
             };
-            Ok(json!({"content_length": content.chars().count()}))
+            Ok(json!({
+                "brief_id": snapshot.id,
+                "content_length": snapshot.content_markdown.chars().count(),
+                "date": snapshot.date,
+                "window_start_utc": snapshot.window_start,
+                "window_end_utc": snapshot.window_end,
+                "effective_time_zone": snapshot.effective_time_zone,
+                "effective_local_boundary": snapshot.effective_local_boundary,
+                "release_count": snapshot.release_ids.len(),
+            }))
         }
         TASK_BRIEF_DAILY_SLOT => execute_daily_slot_task(state, task_id, payload).await,
+        TASK_BRIEF_HISTORY_RECOMPUTE => execute_brief_history_recompute_task(state, task_id).await,
         TASK_TRANSLATE_RELEASE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
@@ -1625,28 +1699,77 @@ async fn execute_daily_slot_task(
     #[derive(Debug, sqlx::FromRow)]
     struct UserSlotRow {
         id: String,
+        daily_brief_local_time: Option<String>,
+        daily_brief_time_zone: Option<String>,
         daily_brief_utc_time: String,
         last_active_at: Option<String>,
     }
 
+    #[derive(Debug)]
+    struct DueUser {
+        row: UserSlotRow,
+        preferences: briefs::DailyBriefPreferences,
+        window: briefs::DailyWindow,
+    }
+
     let hour_utc = payload_i64(payload, "hour_utc")?;
+    let task_created_at = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT created_at
+        FROM job_tasks
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to load daily slot task metadata")?;
+    let now_utc = Utc::now();
+    let slot_reference_utc =
+        payload_slot_reference_utc(payload, task_created_at.as_deref(), now_utc);
+    let target_hour_key = slot_reference_utc.format("%Y-%m-%dT%H").to_string();
 
     let users = sqlx::query_as::<_, UserSlotRow>(
         r#"
-        SELECT id, daily_brief_utc_time, last_active_at
+        SELECT
+          id,
+          daily_brief_local_time,
+          daily_brief_time_zone,
+          daily_brief_utc_time,
+          last_active_at
         FROM users
         WHERE is_disabled = 0
-          AND CAST(substr(daily_brief_utc_time, 1, 2) AS INTEGER) = ?
         ORDER BY
           CASE WHEN last_active_at IS NULL THEN 1 ELSE 0 END ASC,
           last_active_at DESC,
           id ASC
         "#,
     )
-    .bind(hour_utc)
     .fetch_all(&state.pool)
     .await
     .context("failed to query users for daily slot")?;
+
+    let mut due_users = Vec::new();
+    for row in users {
+        let preferences = briefs::derive_daily_brief_preferences(
+            &state.config,
+            row.daily_brief_local_time.as_deref(),
+            row.daily_brief_time_zone.as_deref(),
+            Some(row.daily_brief_utc_time.as_str()),
+            slot_reference_utc,
+        );
+        let window = briefs::compute_current_daily_window(&preferences, slot_reference_utc)
+            .with_context(|| format!("failed to compute current window for user {}", row.id))?;
+        if window.end_utc.format("%Y-%m-%dT%H").to_string() != target_hour_key {
+            continue;
+        }
+        due_users.push(DueUser {
+            row,
+            preferences,
+            window,
+        });
+    }
 
     append_task_event(
         state,
@@ -1656,7 +1779,8 @@ async fn execute_daily_slot_task(
             "task_id": task_id,
             "stage": "collect",
             "hour_utc": hour_utc,
-            "total_users": users.len(),
+            "hour_key": target_hour_key,
+            "total_users": due_users.len(),
         }),
     )
     .await?;
@@ -1665,7 +1789,7 @@ async fn execute_daily_slot_task(
     let mut failed = 0usize;
     let mut canceled = false;
 
-    for (index, user) in users.iter().enumerate() {
+    for (index, user) in due_users.iter().enumerate() {
         if is_task_cancel_requested(state, task_id)
             .await
             .unwrap_or(false)
@@ -1673,13 +1797,6 @@ async fn execute_daily_slot_task(
             canceled = true;
             break;
         }
-
-        let at =
-            NaiveTime::parse_from_str(&user.daily_brief_utc_time, "%H:%M").unwrap_or_else(|_| {
-                NaiveTime::from_hms_opt(hour_utc as u32, 0, 0)
-                    .unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).expect("00:00 valid"))
-            });
-        let key_date = key_date_for_boundary(Utc::now(), at);
 
         append_task_event(
             state,
@@ -1689,17 +1806,27 @@ async fn execute_daily_slot_task(
                 "task_id": task_id,
                 "stage": "generate",
                 "index": index + 1,
-                "total": users.len(),
-                "user_id": user.id,
-                "last_active_at": user.last_active_at,
-                "key_date": key_date,
+                "total": due_users.len(),
+                "user_id": user.row.id,
+                "last_active_at": user.row.last_active_at,
+                "key_date": user.window.key_date,
+                "local_boundary": briefs::format_daily_brief_local_time(user.preferences.local_time),
+                "time_zone": user.preferences.time_zone,
+                "window_start_utc": user.window.start_utc.to_rfc3339(),
+                "window_end_utc": user.window.end_utc.to_rfc3339(),
             }),
         )
         .await?;
 
-        match ai::generate_daily_brief_for_key_date_at(state, user.id.as_str(), key_date, at).await
+        match ai::generate_daily_brief_snapshot_for_window(
+            state,
+            user.row.id.as_str(),
+            &user.window,
+            "scheduled",
+        )
+        .await
         {
-            Ok(content) => {
+            Ok(snapshot) => {
                 succeeded += 1;
                 append_task_event(
                     state,
@@ -1708,9 +1835,15 @@ async fn execute_daily_slot_task(
                     json!({
                         "task_id": task_id,
                         "stage": "user_succeeded",
-                        "user_id": user.id,
-                        "key_date": key_date,
-                        "content_length": content.chars().count(),
+                        "user_id": user.row.id,
+                        "key_date": user.window.key_date,
+                        "brief_id": snapshot.id,
+                        "content_length": snapshot.content_markdown.chars().count(),
+                        "local_boundary": snapshot.effective_local_boundary,
+                        "time_zone": snapshot.effective_time_zone,
+                        "window_start_utc": snapshot.window_start,
+                        "window_end_utc": snapshot.window_end,
+                        "release_count": snapshot.release_ids.len(),
                     }),
                 )
                 .await?;
@@ -1724,7 +1857,10 @@ async fn execute_daily_slot_task(
                     json!({
                         "task_id": task_id,
                         "stage": "user_failed",
-                        "user_id": user.id,
+                        "user_id": user.row.id,
+                        "key_date": user.window.key_date,
+                        "local_boundary": briefs::format_daily_brief_local_time(user.preferences.local_time),
+                        "time_zone": user.preferences.time_zone,
                         "error": err.to_string(),
                     }),
                 )
@@ -1740,7 +1876,7 @@ async fn execute_daily_slot_task(
         json!({
             "task_id": task_id,
             "stage": "summary",
-            "total": users.len(),
+            "total": due_users.len(),
             "succeeded": succeeded,
             "failed": failed,
             "canceled": canceled,
@@ -1751,7 +1887,7 @@ async fn execute_daily_slot_task(
     if canceled {
         return Ok(json!({
             "hour_utc": hour_utc,
-            "total": users.len(),
+            "total": due_users.len(),
             "succeeded": succeeded,
             "failed": failed,
             "canceled": true,
@@ -1761,25 +1897,210 @@ async fn execute_daily_slot_task(
     if failed > 0 && succeeded == 0 {
         return Err(anyhow!(
             "daily slot {hour_utc:02} failed for all users (failed={failed}, total={})",
-            users.len()
+            due_users.len()
         ));
     }
 
     Ok(json!({
         "hour_utc": hour_utc,
-        "total": users.len(),
+        "total": due_users.len(),
         "succeeded": succeeded,
         "failed": failed,
     }))
 }
 
-fn key_date_for_boundary(now: DateTime<Utc>, at: NaiveTime) -> chrono::NaiveDate {
-    let today = now.date_naive();
-    if now.time() >= at {
-        today
-    } else {
-        today - chrono::Duration::days(1)
+async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -> Result<Value> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct LegacyBriefRow {
+        id: String,
+        user_id: String,
+        date: String,
     }
+
+    let total = ai::legacy_brief_count(state).await?;
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "collect",
+            "total_briefs": total,
+        }),
+    )
+    .await?;
+
+    if total == 0 {
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "summary",
+                "total": 0,
+                "processed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "canceled": false,
+            }),
+        )
+        .await?;
+        return Ok(json!({
+            "total": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "canceled": false,
+        }));
+    }
+
+    let rows = sqlx::query_as::<_, LegacyBriefRow>(
+        r#"
+        SELECT id, user_id, date
+        FROM briefs
+        WHERE generation_source = 'legacy'
+        ORDER BY date DESC, created_at DESC, id DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query legacy briefs for recompute")?;
+
+    let mut processed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut canceled = false;
+
+    for row in rows {
+        if is_task_cancel_requested(state, task_id)
+            .await
+            .unwrap_or(false)
+        {
+            canceled = true;
+            break;
+        }
+
+        processed += 1;
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "recompute",
+                "index": processed,
+                "total": total,
+                "brief_id": row.id,
+                "user_id": row.user_id,
+                "date": row.date,
+            }),
+        )
+        .await?;
+
+        match ai::recompute_legacy_brief_snapshot(state, row.id.as_str()).await {
+            Ok(snapshot) => {
+                succeeded += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "brief_succeeded",
+                        "index": processed,
+                        "total": total,
+                        "brief_id": snapshot.id,
+                        "date": snapshot.date,
+                        "window_start_utc": snapshot.window_start,
+                        "window_end_utc": snapshot.window_end,
+                        "time_zone": snapshot.effective_time_zone,
+                        "local_boundary": snapshot.effective_local_boundary,
+                        "release_count": snapshot.release_ids.len(),
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                let failed_at = Utc::now().to_rfc3339();
+                sqlx::query(
+                    r#"
+                    UPDATE briefs
+                    SET generation_source = 'history_recompute_failed',
+                        updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(failed_at.as_str())
+                .bind(&row.id)
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to mark legacy brief {} as history_recompute_failed",
+                        row.id
+                    )
+                })?;
+                failed += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "brief_failed",
+                        "index": processed,
+                        "total": total,
+                        "brief_id": row.id,
+                        "user_id": row.user_id,
+                        "date": row.date,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await?;
+            }
+        }
+    }
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "summary",
+            "total": total,
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "canceled": canceled,
+        }),
+    )
+    .await?;
+
+    if canceled {
+        return Ok(json!({
+            "total": total,
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "canceled": true,
+        }));
+    }
+
+    if failed > 0 && succeeded == 0 {
+        return Err(anyhow!(
+            "brief history recompute failed for all legacy briefs (failed={failed}, total={total})"
+        ));
+    }
+
+    Ok(json!({
+        "total": total,
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "canceled": false,
+    }))
 }
 
 async fn finalize_task(
@@ -1965,6 +2286,54 @@ fn payload_i64(payload: &Value, key: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("payload missing integer field: {key}"))
 }
 
+fn payload_slot_hour_key(
+    payload: &Value,
+    task_created_at: Option<&str>,
+    now_utc: DateTime<Utc>,
+) -> String {
+    if let Some(hour_key) = payload
+        .get("hour_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+    {
+        return hour_key;
+    }
+
+    let legacy_hour = payload
+        .get("hour_utc")
+        .and_then(Value::as_i64)
+        .filter(|value| (0..=23).contains(value));
+    let legacy_created_at = task_created_at
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    if let (Some(hour_utc), Some(created_at)) = (legacy_hour, legacy_created_at) {
+        return format!("{}T{:02}", created_at.format("%Y-%m-%d"), hour_utc);
+    }
+
+    now_utc.format("%Y-%m-%dT%H").to_string()
+}
+
+fn payload_slot_reference_utc(
+    payload: &Value,
+    task_created_at: Option<&str>,
+    now_utc: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let hour_key = payload_slot_hour_key(payload, task_created_at, now_utc);
+    let rfc3339_hour = format!("{hour_key}:00:00Z");
+    DateTime::parse_from_rfc3339(&rfc3339_hour)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|| {
+            now_utc
+                .with_minute(0)
+                .and_then(|value| value.with_second(0))
+                .and_then(|value| value.with_nanosecond(0))
+                .unwrap_or(now_utc)
+        })
+}
+
 fn payload_local_id(payload: &Value, key: &str) -> Result<String> {
     let value = payload
         .get(key)
@@ -2024,11 +2393,13 @@ mod tests {
 
     use super::{
         STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
-        current_subscription_schedule_key, execute_sync_all_task_with, is_scheduled_task_type,
-        load_translation_stream_cursor, load_translation_stream_rows,
-        next_llm_scheduler_stream_event, recover_runtime_state, recover_runtime_state_on_startup,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
+        TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
+        claim_next_queued_task, current_subscription_schedule_key,
+        enqueue_brief_history_recompute_if_needed, execute_brief_history_recompute_task,
+        execute_sync_all_task_with, is_scheduled_task_type, load_translation_stream_cursor,
+        load_translation_stream_rows, next_llm_scheduler_stream_event, payload_slot_hour_key,
+        payload_slot_reference_utc, recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -2039,7 +2410,7 @@ mod tests {
     use url::Url;
 
     use crate::{
-        config::{AppConfig, GitHubOAuthConfig},
+        config::{AiConfig, AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         state::{AppState, build_oauth_client},
         sync,
@@ -2063,6 +2434,94 @@ mod tests {
         assert_eq!(
             current_subscription_schedule_key(on_the_half_hour),
             "2026-03-06T14:30"
+        );
+    }
+
+    #[test]
+    fn payload_slot_hour_key_prefers_enqueued_hour_key() {
+        let fallback_now = Utc
+            .with_ymd_and_hms(2026, 4, 13, 10, 45, 0)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            payload_slot_hour_key(
+                &json!({
+                    "hour_utc": 9,
+                    "hour_key": "2026-04-13T09",
+                }),
+                None,
+                fallback_now,
+            ),
+            "2026-04-13T09"
+        );
+        assert_eq!(
+            payload_slot_hour_key(&json!({ "hour_utc": 10 }), None, fallback_now),
+            "2026-04-13T10"
+        );
+    }
+
+    #[test]
+    fn payload_slot_hour_key_reconstructs_legacy_slot_from_task_created_at() {
+        let fallback_now = Utc
+            .with_ymd_and_hms(2026, 4, 13, 10, 45, 0)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            payload_slot_hour_key(
+                &json!({ "hour_utc": 9 }),
+                Some("2026-04-12T09:00:03Z"),
+                fallback_now,
+            ),
+            "2026-04-12T09"
+        );
+    }
+
+    #[test]
+    fn payload_slot_reference_utc_uses_enqueued_hour_key() {
+        let fallback_now = Utc
+            .with_ymd_and_hms(2026, 4, 13, 10, 45, 27)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            payload_slot_reference_utc(
+                &json!({
+                    "hour_utc": 9,
+                    "hour_key": "2026-04-12T09",
+                }),
+                None,
+                fallback_now,
+            ),
+            Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0)
+                .single()
+                .expect("valid datetime")
+        );
+        assert_eq!(
+            payload_slot_reference_utc(&json!({ "hour_utc": 10 }), None, fallback_now),
+            Utc.with_ymd_and_hms(2026, 4, 13, 10, 0, 0)
+                .single()
+                .expect("valid datetime")
+        );
+    }
+
+    #[test]
+    fn payload_slot_reference_utc_uses_task_created_at_for_legacy_payload() {
+        let fallback_now = Utc
+            .with_ymd_and_hms(2026, 4, 13, 10, 45, 27)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            payload_slot_reference_utc(
+                &json!({ "hour_utc": 9 }),
+                Some("2026-04-12T09:00:03Z"),
+                fallback_now,
+            ),
+            Utc.with_ymd_and_hms(2026, 4, 12, 9, 0, 0)
+                .single()
+                .expect("valid datetime")
         );
     }
 
@@ -2582,6 +3041,7 @@ mod tests {
             ai: None,
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
@@ -2726,5 +3186,251 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed task");
+    }
+
+    #[tokio::test]
+    async fn enqueue_brief_history_recompute_preserves_legacy_snapshot_seed() {
+        let pool = setup_pool().await;
+        let mut state = setup_state(pool.clone());
+        Arc::get_mut(&mut state)
+            .expect("unique app state")
+            .config
+            .ai = Some(AiConfig {
+            base_url: Url::parse("https://example.invalid/").expect("ai base url"),
+            model: "test-model".to_owned(),
+            api_key: "test-key".to_owned(),
+        });
+        let now = "2026-03-07T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-seed")
+        .bind(1001_i64)
+        .bind("legacy-seed")
+        .bind("13:00")
+        .bind("America/New_York")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-seed")
+        .bind("user-legacy-seed")
+        .bind("2026-03-07")
+        .bind("2026-03-06T13:00:00Z")
+        .bind("2026-03-07T13:00:00Z")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind("legacy body")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy brief");
+
+        let task_id = enqueue_brief_history_recompute_if_needed(state.as_ref())
+            .await
+            .expect("enqueue history recompute")
+            .expect("task id");
+
+        assert!(!task_id.is_empty());
+
+        let normalized =
+            sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, Option<String>)>(
+                r#"
+                SELECT window_start_utc, window_end_utc, effective_time_zone, effective_local_boundary
+                FROM briefs
+                WHERE id = ?
+                "#,
+            )
+            .bind("brief-legacy-seed")
+            .fetch_one(&pool)
+            .await
+            .expect("load legacy brief");
+
+        assert_eq!(normalized.0.as_deref(), Some("2026-03-06T13:00:00Z"));
+        assert_eq!(normalized.1.as_deref(), Some("2026-03-07T13:00:00Z"));
+        assert_eq!(normalized.2, None);
+        assert_eq!(normalized.3, None);
+    }
+
+    #[tokio::test]
+    async fn enqueue_brief_history_recompute_runs_even_when_ai_is_disabled() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-no-ai")
+        .bind(1002_i64)
+        .bind("legacy-no-ai")
+        .bind("08:00")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-no-ai")
+        .bind("user-legacy-no-ai")
+        .bind("2026-03-07")
+        .bind("legacy")
+        .bind("legacy body")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy brief");
+
+        let task_id = enqueue_brief_history_recompute_if_needed(state.as_ref())
+            .await
+            .expect("enqueue history recompute without ai");
+
+        assert!(task_id.is_some());
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE task_type = ?
+            "#,
+        )
+        .bind(TASK_BRIEF_HISTORY_RECOMPUTE)
+        .fetch_one(&pool)
+        .await
+        .expect("count history recompute tasks");
+
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_brief_history_recompute_marks_failed_rows_out_of_legacy_bootstrap() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-failed-bootstrap")
+        .bind(1003_i64)
+        .bind("legacy-failed-bootstrap")
+        .bind("08:00")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-failed-bootstrap")
+        .bind("user-legacy-failed-bootstrap")
+        .bind("2026-03-07")
+        .bind("legacy")
+        .bind("legacy body")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert legacy brief");
+
+        let task_id = enqueue_brief_history_recompute_if_needed(state.as_ref())
+            .await
+            .expect("enqueue history recompute")
+            .expect("task id");
+
+        let err = execute_brief_history_recompute_task(state.as_ref(), &task_id)
+            .await
+            .expect_err("irrecoverable legacy brief should fail recompute");
+        assert!(
+            err.to_string()
+                .contains("brief history recompute failed for all legacy briefs"),
+            "{err:#}"
+        );
+
+        let generation_source = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT generation_source
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-legacy-failed-bootstrap")
+        .fetch_one(&pool)
+        .await
+        .expect("load failed brief generation source");
+        assert_eq!(generation_source, "history_recompute_failed");
+
+        let next_task_id = enqueue_brief_history_recompute_if_needed(state.as_ref())
+            .await
+            .expect("skip bootstrap once failed rows are marked");
+
+        assert_eq!(next_task_id, None);
+
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE task_type = ?
+            "#,
+        )
+        .bind(TASK_BRIEF_HISTORY_RECOMPUTE)
+        .fetch_one(&pool)
+        .await
+        .expect("count history recompute tasks");
+
+        assert_eq!(queued, 1);
     }
 }

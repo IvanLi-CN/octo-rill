@@ -327,6 +327,20 @@ function buildTaskDetailPageModel(
 			const contentLength =
 				diagnostics?.content_length ?? readNumber(result, "content_length");
 			const keyDate = diagnostics?.key_date ?? readString(payload, "key_date");
+			const briefId = diagnostics?.brief_id ?? readString(result, "brief_id");
+			const date = diagnostics?.date ?? readString(result, "date");
+			const windowStart =
+				diagnostics?.window_start_utc ?? readString(result, "window_start_utc");
+			const windowEnd =
+				diagnostics?.window_end_utc ?? readString(result, "window_end_utc");
+			const effectiveTimeZone =
+				diagnostics?.effective_time_zone ??
+				readString(result, "effective_time_zone");
+			const effectiveLocalBoundary =
+				diagnostics?.effective_local_boundary ??
+				readString(result, "effective_local_boundary");
+			const releaseCount =
+				diagnostics?.release_count ?? readNumber(result, "release_count");
 			const targetUser =
 				diagnostics?.target_user_id !== null &&
 				diagnostics?.target_user_id !== undefined
@@ -336,9 +350,21 @@ function buildTaskDetailPageModel(
 						: null;
 			return {
 				pageTitle: "日报生成详情页",
-				pageSummary: "展示单用户日报生成任务的输入用户与输出长度。",
+				pageSummary: "展示单用户日报快照的窗口、时区与关联 Release 数量。",
 				fields: buildFields(
 					field("目标用户", targetUser),
+					field("Brief ID", briefId),
+					field("display_date", date),
+					field(
+						"窗口",
+						windowStart && windowEnd ? `${windowStart} → ${windowEnd}` : null,
+					),
+					field("本地边界", effectiveLocalBoundary),
+					field("时区", effectiveTimeZone),
+					field(
+						"关联 Release",
+						releaseCount !== null ? `${releaseCount}` : null,
+					),
 					field(
 						"生成字符数",
 						contentLength !== null ? `${contentLength} chars` : null,
@@ -362,7 +388,7 @@ function buildTaskDetailPageModel(
 			return {
 				pageTitle: "日报定时槽详情页",
 				pageSummary:
-					"展示日报定时任务在指定 UTC 小时槽的串行执行进度与成功/失败统计。",
+					"展示日报定时任务在指定 UTC 小时槽的串行执行进度，以及每个用户的本地边界/时区/窗口。",
 				fields: buildFields(
 					field(
 						"UTC 小时槽",
@@ -395,6 +421,22 @@ function buildTaskDetailPageModel(
 						"是否取消",
 						canceled === true ? "是" : canceled === false ? "否" : null,
 					),
+				),
+			};
+		}
+		case "brief.history_recompute": {
+			const diagnostics = detail.diagnostics?.brief_history_recompute ?? null;
+			return {
+				pageTitle: "日报历史重算详情页",
+				pageSummary:
+					"展示已有 brief 历史重算任务的进度、成功/失败数量与当前处理对象。",
+				fields: buildFields(
+					field("总数", diagnostics ? `${diagnostics.total}` : null),
+					field("已处理", diagnostics ? `${diagnostics.processed}` : null),
+					field("成功", diagnostics ? `${diagnostics.succeeded}` : null),
+					field("失败", diagnostics ? `${diagnostics.failed}` : null),
+					field("当前 Brief", diagnostics?.current_brief_id),
+					field("最后错误", diagnostics?.last_error),
 				),
 			};
 		}
@@ -808,6 +850,17 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 										key_date: {item.key_date}
 									</p>
 								) : null}
+								{item.local_boundary || item.time_zone ? (
+									<p className="text-muted-foreground mt-1 text-xs">
+										本地边界：{item.local_boundary ?? "-"} · 时区：
+										{item.time_zone ?? "-"}
+									</p>
+								) : null}
+								{item.window_start_utc && item.window_end_utc ? (
+									<p className="text-muted-foreground mt-1 text-xs">
+										窗口：{item.window_start_utc} → {item.window_end_utc}
+									</p>
+								) : null}
 								{item.error ? (
 									<p className="mt-1 text-sm font-medium text-red-700 dark:text-red-300">
 										错误原因：{item.error}
@@ -819,6 +872,29 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 							</div>
 						))}
 					</div>
+				</div>
+			) : null}
+			{diagnostics?.brief_history_recompute ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">历史重算摘要</p>
+					<p className="mt-1 text-sm font-semibold">
+						已处理 {diagnostics.brief_history_recompute.processed}/
+						{diagnostics.brief_history_recompute.total}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						成功 {diagnostics.brief_history_recompute.succeeded} · 失败{" "}
+						{diagnostics.brief_history_recompute.failed}
+					</p>
+					{diagnostics.brief_history_recompute.current_brief_id ? (
+						<p className="text-muted-foreground mt-2 text-xs">
+							当前 Brief：{diagnostics.brief_history_recompute.current_brief_id}
+						</p>
+					) : null}
+					{diagnostics.brief_history_recompute.last_error ? (
+						<p className="mt-2 text-sm font-medium text-red-700 dark:text-red-300">
+							最后错误：{diagnostics.brief_history_recompute.last_error}
+						</p>
+					) : null}
 				</div>
 			) : null}
 			{syncDiagnostics ? (

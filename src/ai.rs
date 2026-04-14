@@ -5,14 +5,23 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, offset::LocalResult};
+use chrono::{
+    DateTime, FixedOffset, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc,
+    offset::LocalResult,
+};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{admin_runtime, config::AiConfig, local_id, runtime, state::AppState};
+use crate::{
+    admin_runtime,
+    briefs::{self, DailyWindow as UserDailyWindow},
+    config::AiConfig,
+    local_id, runtime,
+    state::AppState,
+};
 
 const MODEL_LIMIT_UNKNOWN_FALLBACK: u32 = 32_768;
 const MODEL_LIMIT_SYNC_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -696,6 +705,24 @@ struct RepoRendered {
     releases: Vec<ReleaseRendered>,
 }
 
+#[derive(Debug)]
+struct BuiltBriefContent {
+    content_markdown: String,
+    releases: Vec<ReleaseDigest>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredBrief {
+    pub id: String,
+    pub date: String,
+    pub window_start: String,
+    pub window_end: String,
+    pub effective_time_zone: String,
+    pub effective_local_boundary: String,
+    pub content_markdown: String,
+    pub release_ids: Vec<i64>,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatCompletionsRequest<'a> {
     model: &'a str,
@@ -1063,6 +1090,7 @@ pub fn sha256_hex(input: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn compute_daily_window_naive(
     now_local: NaiveDateTime,
     at: NaiveTime,
@@ -1077,6 +1105,7 @@ fn compute_daily_window_naive(
     (start, end, end.date())
 }
 
+#[allow(dead_code)]
 fn local_from_naive(naive: NaiveDateTime) -> chrono::DateTime<Local> {
     match Local.from_local_datetime(&naive) {
         LocalResult::Single(dt) => dt,
@@ -1091,6 +1120,7 @@ fn local_from_naive(naive: NaiveDateTime) -> chrono::DateTime<Local> {
     }
 }
 
+#[allow(dead_code)]
 pub struct DailyWindow {
     pub key_date: NaiveDate,
     pub start_local: chrono::DateTime<Local>,
@@ -1099,6 +1129,7 @@ pub struct DailyWindow {
     pub end_utc: chrono::DateTime<chrono::Utc>,
 }
 
+#[allow(dead_code)]
 pub fn compute_window_for_key_date(
     key_date: NaiveDate,
     at: NaiveTime,
@@ -1108,6 +1139,7 @@ pub fn compute_window_for_key_date(
     (local_from_naive(start_naive), local_from_naive(end_naive))
 }
 
+#[allow(dead_code)]
 fn daily_window_for_key_date(key_date: NaiveDate, at: NaiveTime) -> DailyWindow {
     let (start_local, end_local) = compute_window_for_key_date(key_date, at);
     DailyWindow {
@@ -1119,6 +1151,7 @@ fn daily_window_for_key_date(key_date: NaiveDate, at: NaiveTime) -> DailyWindow 
     }
 }
 
+#[allow(dead_code)]
 pub fn compute_daily_window(at: Option<NaiveTime>, now: chrono::DateTime<Local>) -> DailyWindow {
     let now_naive = now.naive_local();
     let at = at.or_else(|| NaiveTime::from_hms_opt(8, 0, 0));
@@ -2960,7 +2993,7 @@ fn build_repo_rendered(
     }
 }
 
-fn build_brief_markdown(window: &DailyWindow, repos: &[RepoRendered]) -> String {
+fn build_brief_markdown(window: &UserDailyWindow, repos: &[RepoRendered]) -> String {
     let total_releases = repos.iter().map(|r| r.releases.len()).sum::<usize>();
     let prerelease_count = repos
         .iter()
@@ -3064,8 +3097,9 @@ fn parse_internal_release_id(target: &str) -> Option<i64> {
     raw_release.parse::<i64>().ok()
 }
 
-fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
-    let mut ids = HashSet::new();
+fn extract_internal_release_id_sequence(markdown: &str) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
     let mut i = 0usize;
 
     while i < markdown.len() {
@@ -3078,8 +3112,10 @@ fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
             let url_start = i + text_end_rel + 2;
             let url_end = url_start + url_end_rel;
             let target = &markdown[url_start..url_end];
-            if let Some(release_id) = parse_internal_release_id(target) {
-                ids.insert(release_id);
+            if let Some(release_id) = parse_internal_release_id(target)
+                && seen.insert(release_id)
+            {
+                ids.push(release_id);
             }
             i = url_end + 1;
             continue;
@@ -3091,6 +3127,80 @@ fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
     }
 
     ids
+}
+
+fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
+    let mut ids = HashSet::new();
+    for release_id in extract_internal_release_id_sequence(markdown) {
+        ids.insert(release_id);
+    }
+    ids
+}
+
+async fn load_release_digests_by_ids<'e, E>(
+    executor: E,
+    release_ids: &[i64],
+) -> Result<Vec<ReleaseDigest>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if release_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; release_ids.len()].join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+          release_id,
+          repo_id,
+          tag_name,
+          name,
+          body,
+          html_url,
+          COALESCE(published_at, created_at, updated_at) AS published_at,
+          is_prerelease
+        FROM repo_releases
+        WHERE release_id IN ({placeholders})
+        "#
+    );
+
+    let mut query = sqlx::query_as::<_, ReleaseRow>(&sql);
+    for release_id in release_ids {
+        query = query.bind(*release_id);
+    }
+
+    let by_id = to_release_digest(
+        query
+            .fetch_all(executor)
+            .await
+            .context("failed to load historical release digests")?,
+    )
+    .into_iter()
+    .map(|release| (release.release_id, release))
+    .collect::<HashMap<_, _>>();
+
+    let mut releases = Vec::with_capacity(release_ids.len());
+    let mut missing = Vec::new();
+    for release_id in release_ids {
+        if let Some(release) = by_id.get(release_id) {
+            releases.push(release.clone());
+        } else {
+            missing.push(*release_id);
+        }
+    }
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "historical brief references release ids missing from repo_releases: {}",
+            missing
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    Ok(releases)
 }
 
 fn contains_all_release_links(markdown: &str, release_ids: &[i64]) -> bool {
@@ -3158,9 +3268,9 @@ async fn polish_brief_markdown(
 
 async fn build_brief_content(
     state: &AppState,
-    window: &DailyWindow,
+    window: &UserDailyWindow,
     user_id: &str,
-) -> Result<String> {
+) -> Result<BuiltBriefContent> {
     let start_utc = window.start_utc.to_rfc3339();
     let end_utc = window.end_utc.to_rfc3339();
 
@@ -3215,74 +3325,744 @@ async fn build_brief_content(
     let deterministic = sanitize_markdown_links(&build_brief_markdown(window, &repos));
 
     if state.config.ai.is_none() || releases.is_empty() {
-        return Ok(reconcile_brief_release_links(&deterministic, &releases));
+        return Ok(BuiltBriefContent {
+            content_markdown: reconcile_brief_release_links(&deterministic, &releases),
+            releases,
+        });
     }
 
     let release_ids = releases.iter().map(|r| r.release_id).collect::<Vec<_>>();
     if let Some(polished) = polish_brief_markdown(state, &deterministic, &release_ids).await {
-        return Ok(reconcile_brief_release_links(&polished, &releases));
+        return Ok(BuiltBriefContent {
+            content_markdown: reconcile_brief_release_links(&polished, &releases),
+            releases,
+        });
     }
 
-    Ok(reconcile_brief_release_links(&deterministic, &releases))
+    Ok(BuiltBriefContent {
+        content_markdown: reconcile_brief_release_links(&deterministic, &releases),
+        releases,
+    })
 }
 
+#[allow(dead_code)]
 fn resolve_daily_boundary(at: Option<NaiveTime>) -> NaiveTime {
     at.or_else(|| NaiveTime::from_hms_opt(8, 0, 0))
         .expect("08:00 is valid")
 }
 
+async fn replace_brief_memberships(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    brief_id: &str,
+    releases: &[ReleaseDigest],
+    created_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM brief_release_memberships
+        WHERE brief_id = ?
+        "#,
+    )
+    .bind(brief_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to clear brief memberships")?;
+
+    for (ordinal, release) in releases.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(brief_id)
+        .bind(release.release_id)
+        .bind(&release.published_at)
+        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
+        .bind(created_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to insert brief membership")?;
+    }
+
+    Ok(())
+}
+
+async fn load_stored_brief_snapshot(state: &AppState, brief_id: &str) -> Result<StoredBrief> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct StoredBriefRow {
+        id: String,
+        date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+        content_markdown: String,
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct StoredBriefMembershipRow {
+        release_id: i64,
+    }
+
+    let row = sqlx::query_as::<_, StoredBriefRow>(
+        r#"
+        SELECT
+          id,
+          date,
+          window_start_utc,
+          window_end_utc,
+          effective_time_zone,
+          effective_local_boundary,
+          content_markdown
+        FROM briefs
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(brief_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to load stored brief snapshot")?;
+
+    let release_ids = sqlx::query_as::<_, StoredBriefMembershipRow>(
+        r#"
+        SELECT release_id
+        FROM brief_release_memberships
+        WHERE brief_id = ?
+        ORDER BY ordinal ASC
+        "#,
+    )
+    .bind(brief_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load stored brief memberships")?
+    .into_iter()
+    .map(|row| row.release_id)
+    .collect::<Vec<_>>();
+
+    Ok(StoredBrief {
+        id: row.id,
+        date: row.date,
+        window_start: row
+            .window_start_utc
+            .context("stored brief snapshot missing window_start_utc")?,
+        window_end: row
+            .window_end_utc
+            .context("stored brief snapshot missing window_end_utc")?,
+        effective_time_zone: row
+            .effective_time_zone
+            .context("stored brief snapshot missing effective_time_zone")?,
+        effective_local_boundary: row
+            .effective_local_boundary
+            .context("stored brief snapshot missing effective_local_boundary")?,
+        content_markdown: row.content_markdown,
+        release_ids,
+    })
+}
+
+async fn find_normalized_brief_snapshot_id_by_window(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Sqlite>,
+    user_id: &str,
+    window_start_utc: &str,
+    window_end_utc: &str,
+) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM briefs
+        WHERE user_id = ?
+          AND window_start_utc = ?
+          AND window_end_utc = ?
+          AND generation_source != 'legacy'
+          AND effective_time_zone IS NOT NULL
+          AND effective_local_boundary IS NOT NULL
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(window_start_utc)
+    .bind(window_end_utc)
+    .fetch_optional(executor)
+    .await
+    .context("failed to lookup existing brief snapshot")
+}
+
+async fn upsert_daily_brief_snapshot(
+    state: &AppState,
+    user_id: &str,
+    window: &UserDailyWindow,
+    built: &BuiltBriefContent,
+    generation_source: &str,
+) -> Result<StoredBrief> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct UpsertedBriefRow {
+        id: String,
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ExistingBriefRow {
+        id: String,
+        generation_source: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let window_start = window.start_utc.to_rfc3339();
+    let window_end = window.end_utc.to_rfc3339();
+    let date = window.display_date.clone();
+    if let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
+        &state.pool,
+        user_id,
+        &window_start,
+        &window_end,
+    )
+    .await?
+    {
+        return load_stored_brief_snapshot(state, &existing_id).await;
+    }
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("failed to begin brief tx")?;
+    let inserted = sqlx::query_as::<_, UpsertedBriefRow>(
+        r#"
+        INSERT INTO briefs (
+          id,
+          user_id,
+          date,
+          window_start_utc,
+          window_end_utc,
+          effective_time_zone,
+          effective_local_boundary,
+          generation_source,
+          content_markdown,
+          created_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, window_start_utc, window_end_utc)
+        WHERE window_start_utc IS NOT NULL AND window_end_utc IS NOT NULL
+        DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user_id)
+    .bind(&date)
+    .bind(&window_start)
+    .bind(&window_end)
+    .bind(&window.effective_time_zone)
+    .bind(&window.effective_local_boundary)
+    .bind(generation_source)
+    .bind(&built.content_markdown)
+    .bind(&now)
+    .bind(&now)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to upsert brief snapshot")?
+    .map(|row| row.id);
+
+    let Some(brief_id) = inserted else {
+        let existing = sqlx::query_as::<_, ExistingBriefRow>(
+            r#"
+            SELECT
+              id,
+              generation_source,
+              effective_time_zone,
+              effective_local_boundary
+            FROM briefs
+            WHERE user_id = ?
+              AND window_start_utc = ?
+              AND window_end_utc = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(&window_start)
+        .bind(&window_end)
+        .fetch_one(&mut *tx)
+        .await
+        .context("failed to reload existing brief snapshot after conflict")?;
+        let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
+            && existing.effective_time_zone.is_some()
+            && existing.effective_local_boundary.is_some();
+        if is_normalized_snapshot {
+            tx.commit()
+                .await
+                .context("failed to finalize no-op brief snapshot upsert")?;
+            return load_stored_brief_snapshot(state, &existing.id).await;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE briefs
+            SET date = ?,
+                window_start_utc = ?,
+                window_end_utc = ?,
+                effective_time_zone = ?,
+                effective_local_boundary = ?,
+                generation_source = ?,
+                content_markdown = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&date)
+        .bind(&window_start)
+        .bind(&window_end)
+        .bind(&window.effective_time_zone)
+        .bind(&window.effective_local_boundary)
+        .bind(generation_source)
+        .bind(&built.content_markdown)
+        .bind(&now)
+        .bind(&existing.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to normalize conflicting legacy brief snapshot")?;
+
+        replace_brief_memberships(&mut tx, &existing.id, &built.releases, &now).await?;
+        tx.commit()
+            .await
+            .context("failed to commit normalized brief snapshot")?;
+        return Ok(StoredBrief {
+            id: existing.id,
+            date,
+            window_start,
+            window_end,
+            effective_time_zone: window.effective_time_zone.clone(),
+            effective_local_boundary: window.effective_local_boundary.clone(),
+            content_markdown: built.content_markdown.clone(),
+            release_ids: built
+                .releases
+                .iter()
+                .map(|release| release.release_id)
+                .collect(),
+        });
+    };
+
+    replace_brief_memberships(&mut tx, &brief_id, &built.releases, &now).await?;
+    tx.commit()
+        .await
+        .context("failed to commit brief snapshot")?;
+
+    Ok(StoredBrief {
+        id: brief_id,
+        date,
+        window_start,
+        window_end,
+        effective_time_zone: window.effective_time_zone.clone(),
+        effective_local_boundary: window.effective_local_boundary.clone(),
+        content_markdown: built.content_markdown.clone(),
+        release_ids: built
+            .releases
+            .iter()
+            .map(|release| release.release_id)
+            .collect(),
+    })
+}
+
+pub(crate) async fn generate_daily_brief_snapshot_for_window(
+    state: &AppState,
+    user_id: &str,
+    window: &UserDailyWindow,
+    generation_source: &str,
+) -> Result<StoredBrief> {
+    let window_start = window.start_utc.to_rfc3339();
+    let window_end = window.end_utc.to_rfc3339();
+    if let Some(existing_id) = find_normalized_brief_snapshot_id_by_window(
+        &state.pool,
+        user_id,
+        &window_start,
+        &window_end,
+    )
+    .await?
+    {
+        return load_stored_brief_snapshot(state, &existing_id).await;
+    }
+    if state.config.ai.is_none() {
+        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
+    }
+
+    let built = build_brief_content(state, window, user_id).await?;
+    upsert_daily_brief_snapshot(state, user_id, window, &built, generation_source).await
+}
+
+pub async fn generate_daily_brief_snapshot_for_key_date(
+    state: &AppState,
+    user_id: &str,
+    key_date: NaiveDate,
+) -> Result<StoredBrief> {
+    let preferences = briefs::load_daily_brief_preferences(state, user_id).await?;
+    let window = briefs::compute_daily_window_for_key_date(&preferences, key_date)?;
+    generate_daily_brief_snapshot_for_window(state, user_id, &window, "manual").await
+}
+
+#[allow(dead_code)]
 pub async fn generate_daily_brief_for_key_date(
     state: &AppState,
     user_id: &str,
     key_date: NaiveDate,
 ) -> Result<String> {
-    let at = resolve_daily_boundary(state.config.ai_daily_at_local);
-    generate_daily_brief_for_key_date_at(state, user_id, key_date, at).await
+    Ok(
+        generate_daily_brief_snapshot_for_key_date(state, user_id, key_date)
+            .await?
+            .content_markdown,
+    )
 }
 
-pub async fn generate_daily_brief_for_key_date_at(
+pub async fn generate_daily_brief_snapshot_for_current(
     state: &AppState,
     user_id: &str,
-    key_date: NaiveDate,
-    at: NaiveTime,
-) -> Result<String> {
-    if state.config.ai.is_none() {
-        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
-    }
-
-    let window = daily_window_for_key_date(key_date, at);
-    let content = build_brief_content(state, &window, user_id).await?;
-
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO briefs (id, user_id, date, content_markdown, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, date) DO UPDATE SET
-          content_markdown = excluded.content_markdown,
-          created_at = excluded.created_at
-        "#,
-    )
-    .bind(local_id::generate_local_id())
-    .bind(user_id)
-    .bind(key_date.to_string())
-    .bind(&content)
-    .bind(&now)
-    .execute(&state.pool)
-    .await
-    .context("failed to store brief")?;
-
-    Ok(content)
+) -> Result<StoredBrief> {
+    let preferences = briefs::load_daily_brief_preferences(state, user_id).await?;
+    let window = briefs::compute_current_daily_window(&preferences, chrono::Utc::now())?;
+    generate_daily_brief_snapshot_for_window(state, user_id, &window, "scheduled").await
 }
 
+#[allow(dead_code)]
 pub async fn generate_daily_brief(state: &AppState, user_id: &str) -> Result<String> {
-    if state.config.ai.is_none() {
-        return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
+    Ok(generate_daily_brief_snapshot_for_current(state, user_id)
+        .await?
+        .content_markdown)
+}
+
+fn parse_legacy_brief_window_timestamp(
+    raw: &str,
+    effective_time_zone: &str,
+) -> Option<DateTime<FixedOffset>> {
+    let trimmed = raw.trim();
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(parsed);
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, format) {
+            return briefs::resolve_daily_brief_local_datetime(effective_time_zone, naive).ok();
+        }
+    }
+    None
+}
+
+fn extract_legacy_brief_window_timestamps(
+    line: &str,
+    effective_time_zone: &str,
+) -> Vec<DateTime<FixedOffset>> {
+    fn next_char_at(text: &str, index: usize) -> Option<char> {
+        text.get(index..)?.chars().next()
     }
 
-    let now_local = chrono::Local::now();
-    let window = compute_daily_window(state.config.ai_daily_at_local, now_local);
-    generate_daily_brief_for_key_date(state, user_id, window.key_date).await
+    fn advance_while<F>(text: &str, mut index: usize, predicate: F) -> usize
+    where
+        F: Fn(char) -> bool,
+    {
+        while let Some(ch) = next_char_at(text, index) {
+            if !predicate(ch) {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        index
+    }
+
+    let mut timestamps = Vec::new();
+    let mut index = 0usize;
+    while let Some(ch) = next_char_at(line, index) {
+        let Some(date_candidate) = line
+            .as_bytes()
+            .get(index..index + 10)
+            .and_then(|value| std::str::from_utf8(value).ok())
+        else {
+            index += ch.len_utf8();
+            continue;
+        };
+        if NaiveDate::parse_from_str(date_candidate, "%Y-%m-%d").is_err() {
+            index += ch.len_utf8();
+            continue;
+        }
+
+        let candidate_end = match next_char_at(line, index + 10) {
+            Some('T') => {
+                let end = advance_while(line, index + 11, |value| {
+                    value.is_ascii_digit() || matches!(value, ':' | '+' | '-' | '.' | 'Z')
+                });
+                (end > index + 11).then_some(end)
+            }
+            Some(value) if value.is_whitespace() => {
+                let mut cursor = index + 10;
+                while let Some(space) = next_char_at(line, cursor) {
+                    if !space.is_whitespace() {
+                        break;
+                    }
+                    cursor += space.len_utf8();
+                }
+                let time_start = cursor;
+                let end =
+                    advance_while(line, cursor, |value| value.is_ascii_digit() || value == ':');
+                matches!(end.saturating_sub(time_start), 5 | 8).then_some(end)
+            }
+            _ => None,
+        };
+
+        if let Some(end) = candidate_end {
+            let candidate = line[index..end].trim_matches(|value: char| {
+                value.is_whitespace() || matches!(value, ',' | '，' | '.' | '。' | ')' | '）')
+            });
+            if let Some(parsed) =
+                parse_legacy_brief_window_timestamp(candidate, effective_time_zone)
+            {
+                timestamps.push(parsed);
+                index = end;
+                continue;
+            }
+        }
+
+        index += ch.len_utf8();
+    }
+
+    timestamps
+}
+
+fn parse_legacy_brief_window_from_markdown(
+    content_markdown: &str,
+    effective_time_zone: &str,
+) -> Option<UserDailyWindow> {
+    let (start_local, end_local) = content_markdown.lines().find_map(|line| {
+        let timestamps = extract_legacy_brief_window_timestamps(line, effective_time_zone);
+        (timestamps.len() >= 2).then(|| (timestamps[0], timestamps[1]))
+    })?;
+    let key_date = end_local.date_naive();
+
+    Some(UserDailyWindow {
+        key_date,
+        display_date: key_date.to_string(),
+        start_local,
+        end_local,
+        start_utc: start_local.with_timezone(&Utc),
+        end_utc: end_local.with_timezone(&Utc),
+        effective_time_zone: effective_time_zone.to_owned(),
+        effective_local_boundary: briefs::format_daily_brief_local_time(end_local.time()),
+    })
+}
+
+fn parse_legacy_brief_window_from_stored_utc(
+    window_start_utc: Option<&str>,
+    window_end_utc: Option<&str>,
+    effective_time_zone: &str,
+) -> Option<UserDailyWindow> {
+    let start_utc = window_start_utc
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+        .with_timezone(&Utc);
+    let end_utc = window_end_utc
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+        .with_timezone(&Utc);
+    let start_local =
+        briefs::convert_daily_brief_utc_to_local(effective_time_zone, start_utc).ok()?;
+    let end_local = briefs::convert_daily_brief_utc_to_local(effective_time_zone, end_utc).ok()?;
+    let key_date = end_local.date_naive();
+
+    Some(UserDailyWindow {
+        key_date,
+        display_date: key_date.to_string(),
+        start_local,
+        end_local,
+        start_utc,
+        end_utc,
+        effective_time_zone: effective_time_zone.to_owned(),
+        effective_local_boundary: briefs::format_daily_brief_local_time(end_local.time()),
+    })
+}
+
+pub async fn recompute_legacy_brief_snapshot(
+    state: &AppState,
+    brief_id: &str,
+) -> Result<StoredBrief> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct LegacyBriefRow {
+        id: String,
+        user_id: String,
+        date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        user_daily_brief_local_time: Option<String>,
+        user_daily_brief_time_zone: Option<String>,
+        user_daily_brief_utc_time: String,
+        content_markdown: String,
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct ExistingBriefRow {
+        id: String,
+    }
+
+    let legacy = sqlx::query_as::<_, LegacyBriefRow>(
+        r#"
+        SELECT
+          briefs.id,
+          briefs.user_id,
+          briefs.date,
+          briefs.window_start_utc,
+          briefs.window_end_utc,
+          briefs.effective_time_zone,
+          users.daily_brief_local_time AS user_daily_brief_local_time,
+          users.daily_brief_time_zone AS user_daily_brief_time_zone,
+          users.daily_brief_utc_time AS user_daily_brief_utc_time,
+          briefs.content_markdown
+        FROM briefs
+        JOIN users ON users.id = briefs.user_id
+        WHERE briefs.id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(brief_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to load legacy brief")?;
+
+    let Some(legacy) = legacy else {
+        anyhow::bail!("legacy brief not found: {brief_id}");
+    };
+
+    let key_date = NaiveDate::parse_from_str(&legacy.date, "%Y-%m-%d")
+        .with_context(|| format!("invalid legacy brief date: {}", legacy.date))?;
+    let user_preferences = briefs::derive_daily_brief_preferences_with_defaults(
+        briefs::default_daily_brief_local_time(&state.config),
+        briefs::default_daily_brief_time_zone(&state.config),
+        legacy.user_daily_brief_local_time.as_deref(),
+        legacy.user_daily_brief_time_zone.as_deref(),
+        Some(legacy.user_daily_brief_utc_time.as_str()),
+        chrono::Utc::now(),
+    );
+    let time_zone_seed = legacy
+        .effective_time_zone
+        .as_deref()
+        .and_then(briefs::canonical_supported_time_zone)
+        .unwrap_or(user_preferences.time_zone);
+    let window = parse_legacy_brief_window_from_stored_utc(
+        legacy.window_start_utc.as_deref(),
+        legacy.window_end_utc.as_deref(),
+        &time_zone_seed,
+    )
+    .or_else(|| {
+        parse_legacy_brief_window_from_markdown(&legacy.content_markdown, &time_zone_seed)
+    })
+    .with_context(|| {
+        format!(
+            "legacy brief {brief_id} is missing a stored UTC window or parseable markdown range; refusing lossy reconstruction for {}",
+            key_date
+        )
+    })?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let window_start = window.start_utc.to_rfc3339();
+    let window_end = window.end_utc.to_rfc3339();
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("failed to begin legacy brief tx")?;
+    let existing = sqlx::query_as::<_, ExistingBriefRow>(
+        r#"
+        SELECT id
+        FROM briefs
+        WHERE user_id = ?
+          AND window_start_utc = ?
+          AND window_end_utc = ?
+          AND id != ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&legacy.user_id)
+    .bind(&window_start)
+    .bind(&window_end)
+    .bind(&legacy.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to lookup duplicate brief snapshot")?;
+
+    if let Some(existing) = existing {
+        sqlx::query(
+            r#"
+            DELETE FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind(&legacy.id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete legacy brief placeholder")?;
+        tx.commit()
+            .await
+            .context("failed to commit legacy brief dedupe")?;
+        return load_stored_brief_snapshot(state, &existing.id).await;
+    }
+
+    let legacy_release_ids = extract_internal_release_id_sequence(&legacy.content_markdown);
+    let historical_releases = load_release_digests_by_ids(&mut *tx, &legacy_release_ids).await?;
+    let content_markdown = legacy.content_markdown.clone();
+
+    sqlx::query(
+        r#"
+        UPDATE briefs
+        SET date = ?,
+            window_start_utc = ?,
+            window_end_utc = ?,
+            effective_time_zone = ?,
+            effective_local_boundary = ?,
+            generation_source = 'history_recompute',
+            content_markdown = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&window.display_date)
+    .bind(&window_start)
+    .bind(&window_end)
+    .bind(&window.effective_time_zone)
+    .bind(&window.effective_local_boundary)
+    .bind(&content_markdown)
+    .bind(&now)
+    .bind(&legacy.id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to update legacy brief snapshot")?;
+
+    replace_brief_memberships(&mut tx, &legacy.id, &historical_releases, &now).await?;
+    tx.commit()
+        .await
+        .context("failed to commit legacy brief recompute")?;
+
+    Ok(StoredBrief {
+        id: legacy.id,
+        date: window.display_date,
+        window_start,
+        window_end,
+        effective_time_zone: window.effective_time_zone,
+        effective_local_boundary: window.effective_local_boundary,
+        content_markdown,
+        release_ids: historical_releases
+            .iter()
+            .map(|release| release.release_id)
+            .collect(),
+    })
+}
+
+pub async fn legacy_brief_count(state: &AppState) -> Result<i64> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM briefs
+        WHERE generation_source = 'legacy'
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to count legacy briefs")
 }
 
 #[cfg(test)]
@@ -3342,6 +4122,7 @@ mod tests {
             }),
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
@@ -4105,6 +4886,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_legacy_brief_window_from_markdown_resolves_naive_local_timestamps() {
+        let markdown = concat!(
+            "## 概览\n\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n"
+        );
+
+        let window = parse_legacy_brief_window_from_markdown(markdown, "Asia/Shanghai")
+            .expect("parse legacy brief window");
+
+        assert_eq!(window.display_date, "2026-03-07");
+        assert_eq!(window.effective_local_boundary, "08:00");
+        assert_eq!(window.start_utc.to_rfc3339(), "2026-03-06T00:00:00+00:00");
+        assert_eq!(window.end_utc.to_rfc3339(), "2026-03-07T00:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_legacy_brief_window_from_markdown_accepts_rephrased_window_lines() {
+        let markdown = concat!(
+            "## 概览\n\n",
+            "- 本次摘要覆盖区间从 2026-03-06 08:00:00 到 2026-03-07 08:00:00。\n",
+        );
+
+        let window = parse_legacy_brief_window_from_markdown(markdown, "Asia/Shanghai")
+            .expect("parse rephrased legacy brief window");
+
+        assert_eq!(window.display_date, "2026-03-07");
+        assert_eq!(window.effective_local_boundary, "08:00");
+        assert_eq!(window.start_utc.to_rfc3339(), "2026-03-06T00:00:00+00:00");
+        assert_eq!(window.end_utc.to_rfc3339(), "2026-03-07T00:00:00+00:00");
+    }
+
+    #[test]
     fn recent_key_dates_returns_descending_days() {
         let at = NaiveTime::from_hms_opt(8, 0, 0).unwrap();
         let now = local_from_naive(
@@ -4249,25 +5062,15 @@ mod tests {
 
     #[test]
     fn build_brief_markdown_escapes_release_title_link_text() {
-        let start_local = local_from_naive(
-            NaiveDate::from_ymd_opt(2026, 2, 20)
-                .unwrap()
-                .and_hms_opt(8, 0, 0)
-                .unwrap(),
-        );
-        let end_local = local_from_naive(
-            NaiveDate::from_ymd_opt(2026, 2, 21)
-                .unwrap()
-                .and_hms_opt(8, 0, 0)
-                .unwrap(),
-        );
-        let window = DailyWindow {
-            key_date: NaiveDate::from_ymd_opt(2026, 2, 21).unwrap(),
-            start_utc: start_local.with_timezone(&chrono::Utc),
-            end_utc: end_local.with_timezone(&chrono::Utc),
-            start_local,
-            end_local,
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+            time_zone: "Asia/Shanghai".to_owned(),
         };
+        let window = briefs::compute_daily_window_for_key_date(
+            &preferences,
+            NaiveDate::from_ymd_opt(2026, 2, 21).unwrap(),
+        )
+        .unwrap();
         let repo = RepoRendered {
             full_name: "acme/rocket".to_owned(),
             releases: vec![ReleaseRendered {
@@ -4283,5 +5086,1102 @@ mod tests {
 
         let markdown = build_brief_markdown(&window, &[repo]);
         assert!(markdown.contains("- [v1.0 \\[beta\\]\\(rc\\)](/?tab=briefs&release=42)"));
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_uses_brief_window_not_current_user_schedule() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-brief")
+        .bind(2001_i64)
+        .bind("legacy-brief")
+        .bind("10:00")
+        .bind("18:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy user");
+
+        let legacy_markdown = concat!(
+            "## 概览\n\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n",
+            "- 更新项目：0 个\n",
+            "- Release：0 条（预发布 0 条）\n\n",
+            "## 项目更新\n\n",
+            "- 本时间窗口内没有新的 Release。\n",
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-window")
+        .bind("user-legacy-brief")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("Asia/Shanghai")
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind(legacy_markdown)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy brief");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-window")
+            .await
+            .expect("recompute legacy brief");
+
+        assert_eq!(stored.date, "2026-03-07");
+        assert_eq!(stored.effective_local_boundary, "08:00");
+        assert_eq!(stored.window_start, "2026-03-06T00:00:00+00:00");
+        assert_eq!(stored.window_end, "2026-03-07T00:00:00+00:00");
+        assert_eq!(stored.content_markdown, legacy_markdown);
+        assert_eq!(stored.release_ids, Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_rejects_lossy_window_fallback() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-lossy")
+        .bind(2004_i64)
+        .bind("legacy-lossy")
+        .bind("10:00")
+        .bind("18:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-lossy")
+        .bind("user-legacy-lossy")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("Asia/Shanghai")
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind("## 概览\n\n- 只有总结，没有时间窗口。\n")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert unresolved legacy brief");
+
+        let err = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-lossy")
+            .await
+            .expect_err("reject lossy reconstruction");
+        assert!(
+            err.to_string().contains("refusing lossy reconstruction"),
+            "{err:#}"
+        );
+
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT generation_source, content_markdown
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-legacy-lossy")
+        .fetch_one(&state.pool)
+        .await
+        .expect("load unresolved legacy brief");
+        assert_eq!(row.0, "legacy");
+        assert_eq!(row.1, "## 概览\n\n- 只有总结，没有时间窗口。\n");
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_preserves_legacy_contents_and_release_links() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-content")
+        .bind(2007_i64)
+        .bind("legacy-content")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy content user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-history")
+        .bind(5_i64)
+        .bind(404_i64)
+        .bind("node-history")
+        .bind("v3.0.0")
+        .bind("v3.0.0")
+        .bind("legacy release body")
+        .bind("https://example.invalid/releases/404")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert repo release");
+
+        let legacy_markdown = concat!(
+            "## 概览\n\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n",
+            "- 更新项目：1 个\n",
+            "- Release：1 条（预发布 0 条）\n\n",
+            "## 项目更新\n\n",
+            "### acme/rocket\n\n",
+            "- [v3.0.0](/?tab=briefs&release=404) · 2026-03-06T12:00:00Z · [GitHub Release](https://example.invalid/releases/404)\n",
+            "  - 历史条目应该保持原样\n",
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-content")
+        .bind("user-legacy-content")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("Asia/Shanghai")
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind(legacy_markdown)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy brief");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-content")
+            .await
+            .expect("recompute legacy brief");
+
+        assert_eq!(stored.content_markdown, legacy_markdown);
+        assert_eq!(stored.release_ids, vec![404]);
+
+        let memberships = sqlx::query_as::<_, (i64, String)>(
+            r#"
+            SELECT release_id, release_ts_utc
+            FROM brief_release_memberships
+            WHERE brief_id = ?
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .bind("brief-legacy-content")
+        .fetch_all(&state.pool)
+        .await
+        .expect("load stored memberships");
+        assert_eq!(memberships, vec![(404, "2026-03-06T12:00:00Z".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn generate_daily_brief_snapshot_preserves_existing_snapshot_identity_on_utc_collision() {
+        let state = setup_llm_state_with_ai(Some(
+            Url::parse("https://example.invalid/").expect("parse ai url"),
+        ))
+        .await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-brief-collision")
+        .bind(2002_i64)
+        .bind("brief-collision")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-collision")
+        .bind("user-brief-collision")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("original snapshot")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing snapshot");
+
+        let colliding_preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(9, 0, 0).expect("09:00"),
+            time_zone: "Asia/Tokyo".to_owned(),
+        };
+        let colliding_window = briefs::compute_daily_window_for_key_date(
+            &colliding_preferences,
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("date"),
+        )
+        .expect("compute colliding window");
+
+        let stored = generate_daily_brief_snapshot_for_window(
+            state.as_ref(),
+            "user-brief-collision",
+            &colliding_window,
+            "manual",
+        )
+        .await
+        .expect("preserve existing snapshot");
+
+        assert_eq!(stored.id, "brief-existing-collision");
+        assert_eq!(stored.effective_time_zone, "Asia/Shanghai");
+        assert_eq!(stored.effective_local_boundary, "08:00");
+        assert_eq!(stored.content_markdown, "original snapshot");
+        assert_eq!(stored.window_start, "2026-03-06T00:00:00+00:00");
+        assert_eq!(stored.window_end, "2026-03-07T00:00:00+00:00");
+
+        let row = sqlx::query_as::<_, (String, String, String, String)>(
+            r#"
+            SELECT effective_time_zone, effective_local_boundary, generation_source, content_markdown
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-existing-collision")
+        .fetch_one(&state.pool)
+        .await
+        .expect("load preserved snapshot");
+
+        assert_eq!(row.0, "Asia/Shanghai");
+        assert_eq!(row.1, "08:00");
+        assert_eq!(row.2, "scheduled");
+        assert_eq!(row.3, "original snapshot");
+    }
+
+    #[tokio::test]
+    async fn generate_daily_brief_snapshot_reuses_existing_snapshot_before_ai_guard() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-brief-existing-no-ai")
+        .bind(2009_i64)
+        .bind("brief-existing-no-ai")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-no-ai")
+        .bind("user-brief-existing-no-ai")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("existing snapshot")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert stored snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-existing-no-ai")
+        .bind(1_i64)
+        .bind(406_i64)
+        .bind("node-existing-no-ai")
+        .bind("v2.0.0")
+        .bind("v2.0.0")
+        .bind("")
+        .bind("https://example.invalid/releases/406")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-no-ai")
+        .bind(406_i64)
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert stored membership");
+
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let window = briefs::compute_daily_window_for_key_date(
+            &preferences,
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("date"),
+        )
+        .expect("window");
+
+        let stored = generate_daily_brief_snapshot_for_window(
+            state.as_ref(),
+            "user-brief-existing-no-ai",
+            &window,
+            "manual",
+        )
+        .await
+        .expect("reuse stored snapshot before ai guard");
+
+        assert_eq!(stored.id, "brief-existing-no-ai");
+        assert_eq!(stored.content_markdown, "existing snapshot");
+        assert_eq!(stored.release_ids, vec![406]);
+    }
+
+    #[tokio::test]
+    async fn upsert_daily_brief_snapshot_keeps_existing_snapshot_immutable() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-upsert-immutable")
+        .bind(2005_i64)
+        .bind("upsert-immutable")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-existing")
+        .bind(1_i64)
+        .bind(401_i64)
+        .bind("node-existing")
+        .bind("v1.0.0")
+        .bind("v1.0.0")
+        .bind("")
+        .bind("https://example.invalid/releases/401")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-new")
+        .bind(1_i64)
+        .bind(402_i64)
+        .bind("node-new")
+        .bind("v1.0.1")
+        .bind("v1.0.1")
+        .bind("")
+        .bind("https://example.invalid/releases/402")
+        .bind("2026-03-06T18:00:00Z")
+        .bind("2026-03-06T18:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert new repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-window")
+        .bind("user-upsert-immutable")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("original snapshot")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert stored snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-window")
+        .bind(401_i64)
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert stored membership");
+
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let window = briefs::compute_daily_window_for_key_date(
+            &preferences,
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("date"),
+        )
+        .expect("window");
+        let built = BuiltBriefContent {
+            content_markdown: "new snapshot".to_owned(),
+            releases: vec![ReleaseDigest {
+                release_id: 402,
+                full_name: "acme/rocket".to_owned(),
+                title: "v1.0.1".to_owned(),
+                body: String::new(),
+                html_url: "https://example.invalid/releases/402".to_owned(),
+                published_at: "2026-03-06T18:00:00Z".to_owned(),
+                is_prerelease: false,
+            }],
+        };
+
+        let stored = upsert_daily_brief_snapshot(
+            state.as_ref(),
+            "user-upsert-immutable",
+            &window,
+            &built,
+            "manual",
+        )
+        .await
+        .expect("preserve existing snapshot");
+
+        assert_eq!(stored.id, "brief-existing-window");
+        assert_eq!(stored.content_markdown, "original snapshot");
+        assert_eq!(stored.release_ids, vec![401]);
+
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT generation_source, content_markdown
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-existing-window")
+        .fetch_one(&state.pool)
+        .await
+        .expect("reload stored snapshot");
+        assert_eq!(row.0, "scheduled");
+        assert_eq!(row.1, "original snapshot");
+
+        let memberships = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT release_id
+            FROM brief_release_memberships
+            WHERE brief_id = ?
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .bind("brief-existing-window")
+        .fetch_all(&state.pool)
+        .await
+        .expect("reload stored memberships");
+        assert_eq!(memberships, vec![401]);
+    }
+
+    #[tokio::test]
+    async fn upsert_daily_brief_snapshot_normalizes_legacy_placeholder_with_same_window() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-upsert-legacy-placeholder")
+        .bind(2008_i64)
+        .bind("upsert-legacy-placeholder")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-legacy-placeholder")
+        .bind(1_i64)
+        .bind(405_i64)
+        .bind("node-legacy-placeholder")
+        .bind("v1.2.3")
+        .bind("v1.2.3")
+        .bind("")
+        .bind("https://example.invalid/releases/405")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-placeholder")
+        .bind("user-upsert-legacy-placeholder")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind("legacy placeholder")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy placeholder");
+
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let window = briefs::compute_daily_window_for_key_date(
+            &preferences,
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("date"),
+        )
+        .expect("window");
+        let built = BuiltBriefContent {
+            content_markdown: "normalized snapshot".to_owned(),
+            releases: vec![ReleaseDigest {
+                release_id: 405,
+                full_name: "acme/rocket".to_owned(),
+                title: "v1.2.3".to_owned(),
+                body: String::new(),
+                html_url: "https://example.invalid/releases/405".to_owned(),
+                published_at: "2026-03-06T12:00:00Z".to_owned(),
+                is_prerelease: false,
+            }],
+        };
+
+        let stored = upsert_daily_brief_snapshot(
+            state.as_ref(),
+            "user-upsert-legacy-placeholder",
+            &window,
+            &built,
+            "manual",
+        )
+        .await
+        .expect("normalize legacy placeholder");
+
+        assert_eq!(stored.id, "brief-legacy-placeholder");
+        assert_eq!(stored.content_markdown, "normalized snapshot");
+        assert_eq!(stored.effective_time_zone, "Asia/Shanghai");
+        assert_eq!(stored.effective_local_boundary, "08:00");
+        assert_eq!(stored.release_ids, vec![405]);
+
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            SELECT generation_source, effective_time_zone, effective_local_boundary
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-legacy-placeholder")
+        .fetch_one(&state.pool)
+        .await
+        .expect("reload normalized placeholder");
+        assert_eq!(row.0, "manual");
+        assert_eq!(row.1, "Asia/Shanghai");
+        assert_eq!(row.2, "08:00");
+
+        let memberships = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT release_id
+            FROM brief_release_memberships
+            WHERE brief_id = ?
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .bind("brief-legacy-placeholder")
+        .fetch_all(&state.pool)
+        .await
+        .expect("reload normalized memberships");
+        assert_eq!(memberships, vec![405]);
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_keeps_existing_duplicate_snapshot_immutable() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-duplicate")
+        .bind(2006_i64)
+        .bind("legacy-duplicate")
+        .bind("10:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy duplicate user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-duplicate")
+        .bind(1_i64)
+        .bind(403_i64)
+        .bind("node-duplicate")
+        .bind("v2.0.0")
+        .bind("v2.0.0")
+        .bind("")
+        .bind("https://example.invalid/releases/403")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert duplicate repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-history-existing")
+        .bind("user-legacy-duplicate")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("existing snapshot")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-history-existing")
+        .bind(403_i64)
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert existing snapshot membership");
+
+        let legacy_markdown = concat!(
+            "## 概览\n\n",
+            "- 本次摘要覆盖区间从 2026-03-06 08:00:00 到 2026-03-07 08:00:00。\n",
+            "- 更新项目：0 个\n",
+        );
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-history-legacy")
+        .bind("user-legacy-duplicate")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("Asia/Shanghai")
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind(legacy_markdown)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy duplicate placeholder");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-history-legacy")
+            .await
+            .expect("dedupe into existing snapshot");
+
+        assert_eq!(stored.id, "brief-history-existing");
+        assert_eq!(stored.content_markdown, "existing snapshot");
+        assert_eq!(stored.release_ids, vec![403]);
+
+        let remaining = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-history-legacy")
+        .fetch_one(&state.pool)
+        .await
+        .expect("check legacy placeholder deletion");
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_uses_app_default_time_zone_when_seed_missing() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-default-zone")
+        .bind(2003_i64)
+        .bind("legacy-default-zone")
+        .bind("13:00")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy user");
+
+        let legacy_markdown = concat!(
+            "## 概览\n\n",
+            "- 时间窗口（本地）：2026-03-06 08:00:00 → 2026-03-07 08:00:00\n",
+            "- 更新项目：0 个\n",
+            "- Release：0 条（预发布 0 条）\n\n",
+            "## 项目更新\n\n",
+            "- 本时间窗口内没有新的 Release。\n",
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-default-zone")
+        .bind("user-legacy-default-zone")
+        .bind("2026-03-07")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind(legacy_markdown)
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy brief");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-default-zone")
+            .await
+            .expect("recompute legacy brief");
+
+        assert_eq!(stored.effective_time_zone, "Asia/Shanghai");
+        assert_eq!(stored.effective_local_boundary, "08:00");
+        assert_eq!(stored.window_start, "2026-03-06T00:00:00+00:00");
+        assert_eq!(stored.window_end, "2026-03-07T00:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn recompute_legacy_brief_snapshot_uses_owner_time_zone_when_effective_zone_missing() {
+        let state = setup_llm_state().await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-legacy-owner-zone")
+        .bind(2010_i64)
+        .bind("legacy-owner-zone")
+        .bind("07:00")
+        .bind("America/Los_Angeles")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy owner-zone user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-legacy-owner-zone")
+        .bind("user-legacy-owner-zone")
+        .bind("2026-03-06")
+        .bind("2026-03-06T07:00:00Z")
+        .bind("2026-03-07T07:00:00Z")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("legacy")
+        .bind("legacy owner-zone body")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert legacy owner-zone brief");
+
+        let stored = recompute_legacy_brief_snapshot(state.as_ref(), "brief-legacy-owner-zone")
+            .await
+            .expect("recompute owner-zone legacy brief");
+
+        assert_eq!(stored.date, "2026-03-06");
+        assert_eq!(stored.effective_time_zone, "America/Los_Angeles");
+        assert_eq!(stored.effective_local_boundary, "23:00");
+        assert_eq!(stored.window_start, "2026-03-06T07:00:00+00:00");
+        assert_eq!(stored.window_end, "2026-03-07T07:00:00+00:00");
     }
 }
