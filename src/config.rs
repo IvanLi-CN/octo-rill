@@ -2,6 +2,7 @@ use std::{
     env, fmt,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
+    str::FromStr,
 };
 
 use anyhow::{Context, Result};
@@ -56,6 +57,37 @@ fn parse_bounded_positive_usize_env(
     Ok(parsed)
 }
 
+fn validate_app_default_time_zone(raw: &str) -> Result<String> {
+    let canonical = raw.trim().to_owned();
+    chrono_tz::Tz::from_str(&canonical)
+        .context("invalid APP_DEFAULT_TIME_ZONE (expected IANA time zone)")?;
+    crate::briefs::validate_hour_aligned_time_zone(&canonical, chrono::Utc::now())
+        .context("invalid APP_DEFAULT_TIME_ZONE (expected whole-hour IANA time zone year-round)")?;
+    Ok(canonical)
+}
+
+fn resolve_app_default_time_zone(
+    env_value: Option<String>,
+    legacy_runtime_time_zone: Option<&str>,
+) -> Result<String> {
+    if let Some(value) = env_value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return validate_app_default_time_zone(&value);
+    }
+
+    if let Some(legacy_runtime_time_zone) = legacy_runtime_time_zone
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && let Ok(validated) = validate_app_default_time_zone(legacy_runtime_time_zone)
+    {
+        return Ok(validated);
+    }
+
+    Ok(crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned())
+}
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
@@ -69,6 +101,7 @@ pub struct AppConfig {
     pub ai: Option<AiConfig>,
     pub ai_max_concurrency: usize,
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
+    pub app_default_time_zone: String,
 }
 
 #[derive(Clone)]
@@ -118,6 +151,7 @@ impl fmt::Debug for AppConfig {
             .field("ai", &self.ai)
             .field("ai_max_concurrency", &self.ai_max_concurrency)
             .field("ai_daily_at_local", &self.ai_daily_at_local)
+            .field("app_default_time_zone", &self.app_default_time_zone)
             .field("encryption_key", &"<redacted>")
             .finish()
     }
@@ -204,6 +238,12 @@ impl AppConfig {
             .transpose()?
             .or_else(|| chrono::NaiveTime::from_hms_opt(8, 0, 0));
 
+        let legacy_runtime_time_zone = iana_time_zone::get_timezone().ok();
+        let app_default_time_zone = resolve_app_default_time_zone(
+            env::var("APP_DEFAULT_TIME_ZONE").ok(),
+            legacy_runtime_time_zone.as_deref(),
+        )?;
+
         let static_dir = {
             let candidate = PathBuf::from("web/dist");
             if candidate.exists() {
@@ -229,6 +269,7 @@ impl AppConfig {
             ai,
             ai_max_concurrency,
             ai_daily_at_local,
+            app_default_time_zone,
         })
     }
 }
@@ -257,6 +298,7 @@ mod tests {
             );
             env::remove_var("AI_API_KEY");
             env::remove_var("AI_MAX_CONCURRENCY");
+            env::remove_var("APP_DEFAULT_TIME_ZONE");
             env::remove_var("OCTORILL_TASK_WORKERS");
         }
     }
@@ -353,5 +395,39 @@ mod tests {
                 .contains("invalid OCTORILL_TASK_WORKERS (expected positive integer)"),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn from_env_rejects_non_hour_aligned_default_time_zone() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("APP_DEFAULT_TIME_ZONE", "Asia/Kolkata");
+        }
+
+        let err = AppConfig::from_env().expect_err("non-hour-aligned default timezone should fail");
+
+        assert!(
+            err.to_string().contains(
+                "invalid APP_DEFAULT_TIME_ZONE (expected whole-hour IANA time zone year-round)"
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_app_default_time_zone_prefers_legacy_runtime_when_env_unset() {
+        let resolved = resolve_app_default_time_zone(None, Some("America/New_York"))
+            .expect("resolve legacy runtime time zone");
+
+        assert_eq!(resolved, "America/New_York");
+    }
+
+    #[test]
+    fn resolve_app_default_time_zone_falls_back_when_legacy_runtime_is_unsupported() {
+        let resolved = resolve_app_default_time_zone(None, Some("Asia/Kolkata"))
+            .expect("fallback for unsupported runtime time zone");
+
+        assert_eq!(resolved, crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE);
     }
 }

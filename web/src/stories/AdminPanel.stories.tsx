@@ -61,6 +61,17 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 	useEffect(() => {
 		const originalFetch = window.fetch.bind(window);
 		let users = mockAdminUsers.map((item) => ({ ...item }));
+		const profiles = new Map(
+			users.map((user) => [
+				user.id,
+				{
+					user_id: user.id,
+					daily_brief_local_time: "08:00",
+					daily_brief_time_zone: "Asia/Shanghai",
+					last_active_at: user.last_active_at,
+				},
+			]),
+		);
 
 		window.fetch = async (input, init) => {
 			const req =
@@ -126,15 +137,55 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 				}
 				return new Response(
 					JSON.stringify({
-						user_id: target.id,
-						daily_brief_utc_time: "08:00",
-						last_active_at: target.last_active_at,
+						...(profiles.get(target.id) ?? {
+							user_id: target.id,
+							daily_brief_local_time: "08:00",
+							daily_brief_time_zone: "Asia/Shanghai",
+							last_active_at: target.last_active_at,
+						}),
 					}),
 					{
 						status: 200,
 						headers: { "content-type": "application/json" },
 					},
 				);
+			}
+
+			if (
+				url.pathname.startsWith("/api/admin/users/") &&
+				url.pathname.endsWith("/profile") &&
+				req.method === "PATCH"
+			) {
+				const id = decodeURIComponent(url.pathname.split("/").at(-2) ?? "");
+				const target = users.find((user) => user.id === id);
+				if (!target) {
+					return new Response(
+						JSON.stringify({
+							ok: false,
+							error: { code: "not_found", message: "user not found" },
+						}),
+						{
+							status: 404,
+							headers: { "content-type": "application/json" },
+						},
+					);
+				}
+				const payload = (await req.json()) as {
+					daily_brief_local_time?: string;
+					daily_brief_time_zone?: string;
+				};
+				const nextProfile = {
+					user_id: target.id,
+					daily_brief_local_time: payload.daily_brief_local_time ?? "08:00",
+					daily_brief_time_zone:
+						payload.daily_brief_time_zone ?? "Asia/Shanghai",
+					last_active_at: target.last_active_at,
+				};
+				profiles.set(target.id, nextProfile);
+				return new Response(JSON.stringify(nextProfile), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 
 			if (

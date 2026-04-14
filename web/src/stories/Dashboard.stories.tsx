@@ -74,6 +74,36 @@ const STORYBOOK_VERSION_STATE = {
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 
+function makeBrief(
+	brief: Omit<
+		BriefItem,
+		| "id"
+		| "effective_time_zone"
+		| "effective_local_boundary"
+		| "release_count"
+		| "release_ids"
+	> &
+		Partial<
+			Pick<
+				BriefItem,
+				| "id"
+				| "effective_time_zone"
+				| "effective_local_boundary"
+				| "release_count"
+				| "release_ids"
+			>
+		>,
+): BriefItem {
+	return {
+		id: brief.id ?? `brief-${brief.date}`,
+		effective_time_zone: brief.effective_time_zone ?? "Asia/Shanghai",
+		effective_local_boundary: brief.effective_local_boundary ?? "08:00",
+		release_count: brief.release_count ?? brief.release_ids?.length ?? 0,
+		release_ids: brief.release_ids ?? [],
+		...brief,
+	};
+}
+
 function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
 		`<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640"><defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="1"><stop offset="0%" stop-color="${accent}"/><stop offset="100%" stop-color="#0f172a"/></linearGradient></defs><rect width="1280" height="640" rx="48" fill="url(#g)"/><rect x="72" y="72" width="1136" height="496" rx="36" fill="rgba(15,23,42,0.18)" stroke="rgba(255,255,255,0.18)" stroke-width="4"/><text x="120" y="228" font-family="Inter,Arial,sans-serif" font-size="84" font-weight="800" fill="#ffffff">${title}</text><text x="120" y="334" font-family="Inter,Arial,sans-serif" font-size="40" font-weight="600" fill="rgba(255,255,255,0.84)">${body}</text></svg>`,
@@ -590,14 +620,17 @@ function makeSmartInFlightKeys(mode: FeedMode) {
 }
 
 const mockBriefs: BriefItem[] = [
-	{
+	makeBrief({
+		id: "brief-2026-04-04",
 		date: "2026-04-04",
 		window_start: "2026-04-03T08:00:00+08:00",
 		window_end: "2026-04-04T08:00:00+08:00",
+		release_count: 2,
+		release_ids: ["10003", "10004"],
 		content_markdown:
 			"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：2 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)、[acme/satellite](https://github.com/acme/satellite)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n",
 		created_at: "2026-04-04T08:00:03+08:00",
-	},
+	}),
 ];
 
 const longBriefMarkdown = [
@@ -635,25 +668,40 @@ const longBriefMarkdown = [
 ].join("\n");
 
 const longBriefs: BriefItem[] = [
-	{
+	makeBrief({
+		id: "brief-long-2026-04-04",
 		date: "2026-04-04",
 		window_start: "2026-04-03T08:00:00+08:00",
 		window_end: "2026-04-04T08:00:00+08:00",
+		release_count: 8,
+		release_ids: [
+			LONG_BRIEF_RELEASE_ID,
+			"777003",
+			"777004",
+			"777005",
+			"777006",
+			"777007",
+			"777008",
+			"777009",
+		],
 		content_markdown: longBriefMarkdown,
 		created_at: "2026-04-04T08:00:35+08:00",
-	},
+	}),
 	mockBriefs[0],
 ];
 
 const generatedBriefTemplates: Record<string, BriefItem> = {
-	"2026-04-03": {
+	"2026-04-03": makeBrief({
+		id: "brief-2026-04-03",
 		date: "2026-04-03",
 		window_start: "2026-04-02T08:00:00+08:00",
 		window_end: "2026-04-03T08:00:00+08:00",
+		release_count: 1,
+		release_ids: ["10005"],
 		content_markdown:
 			"## 概览\n\n- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/fleet](https://github.com/acme/fleet)\n\n## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n",
 		created_at: "2026-04-03T08:00:03+08:00",
-	},
+	}),
 };
 
 const longReleaseDetail: ReleaseDetailResponse = {
@@ -849,8 +897,8 @@ function DashboardPreview(props: {
 		items,
 		pageDefaultLane,
 	);
-	const [selectedDate, setSelectedDate] = useState<string | null>(
-		briefs[0]?.date ?? null,
+	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
+		briefs[0]?.id ?? null,
 	);
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
@@ -873,6 +921,15 @@ function DashboardPreview(props: {
 		setSmartInFlightKeys(makeSmartInFlightKeys(feedMode));
 	}, [feedMode]);
 
+	useEffect(() => {
+		setSelectedBriefId((current) => {
+			if (current && storyBriefs.some((brief) => brief.id === current)) {
+				return current;
+			}
+			return storyBriefs[0]?.id ?? null;
+		});
+	}, [storyBriefs]);
+
 	const openReleaseDetail = (releaseId: string) => {
 		setTab("briefs");
 		setActiveReleaseId(releaseId);
@@ -882,19 +939,24 @@ function DashboardPreview(props: {
 		await new Promise((resolve) => window.setTimeout(resolve, 900));
 		const nextBrief =
 			generatedBriefTemplates[date] ??
-			({
+			makeBrief({
+				id: `brief-generated-${date}`,
 				date,
 				window_start: null,
 				window_end: null,
 				content_markdown:
 					"## 概览\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。",
 				created_at: `${date}T08:00:03+08:00`,
-			} satisfies BriefItem);
+			});
 		setStoryBriefs((current) =>
-			[nextBrief, ...current.filter((brief) => brief.date !== date)].sort(
-				(a, b) => b.date.localeCompare(a.date),
+			[nextBrief, ...current.filter((brief) => brief.id !== nextBrief.id)].sort(
+				(a, b) =>
+					(b.window_end ?? b.created_at).localeCompare(
+						a.window_end ?? a.created_at,
+					),
 			),
 		);
+		setSelectedBriefId(nextBrief.id);
 	};
 
 	const triggerSmartNow = (item: FeedItem) => {
@@ -1067,7 +1129,7 @@ function DashboardPreview(props: {
 							<TabsContent value="briefs" className="mt-0 min-w-0">
 								<ReleaseDailyCard
 									briefs={storyBriefs}
-									selectedDate={selectedDate}
+									selectedId={selectedBriefId}
 									busy={false}
 									onGenerate={() => {}}
 									onOpenRelease={setActiveReleaseId}
@@ -1087,8 +1149,8 @@ function DashboardPreview(props: {
 							{tab === "briefs" ? (
 								<BriefListCard
 									briefs={storyBriefs}
-									selectedDate={selectedDate}
-									onSelectDate={(d) => setSelectedDate(d)}
+									selectedId={selectedBriefId}
+									onSelectId={(id) => setSelectedBriefId(id)}
 								/>
 							) : null}
 							<InboxQuickList notifications={notifications} />

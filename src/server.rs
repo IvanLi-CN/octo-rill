@@ -121,6 +121,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api_version).layer(middleware::from_fn(version_no_store_cache)),
         )
         .route("/me", get(api::me))
+        .route(
+            "/me/profile",
+            get(api::me_get_profile).patch(api::me_patch_profile),
+        )
         .route("/tasks/{task_id}/events", get(api::task_events_sse))
         .route("/starred", get(api::list_starred))
         .route("/releases", get(api::list_releases))
@@ -134,7 +138,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .route("/admin/users/{user_id}", patch(api::admin_patch_user))
         .route(
             "/admin/users/{user_id}/profile",
-            get(api::admin_get_user_profile),
+            get(api::admin_get_user_profile).patch(api::admin_patch_user_profile),
         )
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
         .route("/admin/jobs/events", get(api::admin_jobs_events_sse))
@@ -292,6 +296,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         sync::recover_repo_release_runtime_state_on_startup(app_state.as_ref()).await?;
         translations::recover_runtime_state_on_startup(app_state.as_ref()).await?;
         ai::recover_runtime_state_on_startup(app_state.as_ref()).await?;
+        let backfilled_daily_brief_preferences =
+            crate::briefs::backfill_legacy_daily_brief_preferences(app_state.as_ref()).await?;
+        if backfilled_daily_brief_preferences > 0 {
+            info!(
+                backfilled_daily_brief_preferences,
+                "backfilled legacy daily brief preferences on startup"
+            );
+        }
 
         jobs::spawn_task_workers(app_state.clone(), config.job_worker_concurrency);
         let task_recovery_abort_handle = jobs::spawn_task_recovery_worker(app_state.clone());
@@ -300,6 +312,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             sync::spawn_repo_release_recovery_worker(app_state.clone());
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
+        if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
+        {
+            tracing::warn!(?err, "failed to enqueue brief history recompute bootstrap");
+        }
         let model_catalog_abort_handle = config
             .ai
             .as_ref()

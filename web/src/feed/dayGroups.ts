@@ -10,14 +10,24 @@ export type DailyBoundaryLocal = {
 };
 
 export type FeedDayGroup = {
+	kind: "raw" | "brief";
 	id: string;
 	displayDate: string;
 	briefDate: string;
+	briefId: string | null;
 	items: FeedItem[];
 	itemCount: number;
 	releaseCount: number;
 	activityCount: number;
 	isCurrent: boolean;
+};
+
+export type BriefSnapshotCandidate = {
+	id: string;
+	date: string;
+	window_start?: string | null;
+	window_end?: string | null;
+	release_ids?: string[];
 };
 
 function pad2(value: number) {
@@ -167,6 +177,7 @@ export function groupFeedItemsByDay(
 	dailyBoundaryLocal: string | null | undefined,
 	dailyBoundaryTimeZone: string | null | undefined,
 	dailyBoundaryUtcOffsetMinutes: number | null | undefined,
+	briefs: BriefSnapshotCandidate[] = [],
 	now = new Date(),
 ) {
 	const boundary = parseDailyBoundaryLocal(dailyBoundaryLocal);
@@ -177,10 +188,108 @@ export function groupFeedItemsByDay(
 		dailyBoundaryUtcOffsetMinutes,
 	);
 	const currentGroupId = `${currentWindowStartKey}@${boundary.label}`;
+	const historicalBriefOrder = new Map<string, number>();
+	const historicalBriefById = new Map<string, BriefSnapshotCandidate>();
+	const releaseToHistoricalBriefIds = new Map<string, string[]>();
+	const historicalBriefWindows: Array<{
+		brief: BriefSnapshotCandidate;
+		windowStartMs: number;
+		windowEndMs: number;
+	}> = [];
 
+	for (const [index, brief] of briefs.entries()) {
+		if (!brief.window_start || !brief.window_end) continue;
+		const windowStart = new Date(brief.window_start);
+		const windowEnd = new Date(brief.window_end);
+		if (
+			Number.isNaN(windowStart.getTime()) ||
+			Number.isNaN(windowEnd.getTime()) ||
+			windowEnd >= now
+		) {
+			continue;
+		}
+		historicalBriefOrder.set(brief.id, index);
+		historicalBriefById.set(brief.id, brief);
+		for (const releaseId of brief.release_ids ?? []) {
+			const existing = releaseToHistoricalBriefIds.get(releaseId);
+			if (existing) {
+				if (!existing.includes(brief.id)) {
+					existing.push(brief.id);
+				}
+			} else {
+				releaseToHistoricalBriefIds.set(releaseId, [brief.id]);
+			}
+		}
+		historicalBriefWindows.push({
+			brief,
+			windowStartMs: windowStart.getTime(),
+			windowEndMs: windowEnd.getTime(),
+		});
+	}
+	historicalBriefWindows.sort(
+		(left, right) =>
+			right.windowEndMs - left.windowEndMs ||
+			right.windowStartMs - left.windowStartMs ||
+			right.brief.id.localeCompare(left.brief.id),
+	);
+	const pickCanonicalHistoricalBrief = (briefIds: string[]) => {
+		let bestBrief: BriefSnapshotCandidate | null = null;
+		let bestRank = Number.POSITIVE_INFINITY;
+		for (const briefId of briefIds) {
+			const brief = historicalBriefById.get(briefId);
+			if (!brief) continue;
+			const rank =
+				historicalBriefOrder.get(briefId) ?? Number.POSITIVE_INFINITY;
+			if (rank < bestRank) {
+				bestBrief = brief;
+				bestRank = rank;
+			}
+		}
+		return bestBrief;
+	};
 	const groups = new Map<string, FeedDayGroup>();
+	const appendHistoricalBriefItem = (
+		brief: BriefSnapshotCandidate,
+		item: FeedItem,
+		countType: "release" | "activity",
+	) => {
+		const groupId = `brief:${brief.id}`;
+		const existing = groups.get(groupId);
+		if (existing) {
+			existing.items.push(item);
+			existing.itemCount += 1;
+			if (countType === "release") {
+				existing.releaseCount += 1;
+			} else {
+				existing.activityCount += 1;
+			}
+			return;
+		}
+		groups.set(groupId, {
+			kind: "brief",
+			id: groupId,
+			displayDate: brief.date,
+			briefDate: brief.date,
+			briefId: brief.id,
+			items: [item],
+			itemCount: 1,
+			releaseCount: countType === "release" ? 1 : 0,
+			activityCount: countType === "activity" ? 1 : 0,
+			isCurrent: false,
+		});
+	};
 
 	for (const item of items) {
+		if (isReleaseFeedItem(item)) {
+			const canonicalBrief = pickCanonicalHistoricalBrief(
+				releaseToHistoricalBriefIds.get(item.id) ?? [],
+			);
+			if (canonicalBrief) {
+				appendHistoricalBriefItem(canonicalBrief, item, "release");
+				continue;
+			}
+		}
+
 		const publishedAt = new Date(item.ts);
 		if (Number.isNaN(publishedAt.getTime())) {
 			const unknownKey = "unknown";
@@ -196,9 +305,11 @@ export function groupFeedItemsByDay(
 				continue;
 			}
 			groups.set(unknownKey, {
+				kind: "raw",
 				id: unknownKey,
 				displayDate: "未知日期",
 				briefDate: "",
+				briefId: null,
 				items: [item],
 				itemCount: 1,
 				releaseCount: isReleaseFeedItem(item) ? 1 : 0,
@@ -214,6 +325,19 @@ export function groupFeedItemsByDay(
 			dailyBoundaryTimeZone,
 			dailyBoundaryUtcOffsetMinutes,
 		);
+		const briefDate = shiftDateKey(windowStartKey, 1);
+		if (!isReleaseFeedItem(item)) {
+			const itemTime = publishedAt.getTime();
+			const canonicalBrief = historicalBriefWindows.find(
+				(candidate) =>
+					itemTime >= candidate.windowStartMs &&
+					itemTime < candidate.windowEndMs,
+			)?.brief;
+			if (canonicalBrief) {
+				appendHistoricalBriefItem(canonicalBrief, item, "activity");
+				continue;
+			}
+		}
 		const groupId = `${windowStartKey}@${boundary.label}`;
 		const existing = groups.get(groupId);
 		if (existing) {
@@ -228,9 +352,11 @@ export function groupFeedItemsByDay(
 		}
 
 		groups.set(groupId, {
+			kind: "raw",
 			id: groupId,
 			displayDate: windowStartKey,
-			briefDate: shiftDateKey(windowStartKey, 1),
+			briefDate,
+			briefId: null,
 			items: [item],
 			itemCount: 1,
 			releaseCount: isReleaseFeedItem(item) ? 1 : 0,

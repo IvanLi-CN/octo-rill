@@ -402,8 +402,39 @@ export const BriefGenerate: Story = {
 	args: {
 		detail: buildDetail(
 			"brief.generate",
-			{ user_id: TARGET_USER_ID },
-			{ content_length: 3840 },
+			{ user_id: TARGET_USER_ID, key_date: "2026-02-26" },
+			{
+				content_length: 3840,
+				brief_id: "brief_20260226",
+				date: "2026-02-26",
+				window_start_utc: "2026-02-25T00:00:00Z",
+				window_end_utc: "2026-02-26T00:00:00Z",
+				effective_time_zone: "Asia/Shanghai",
+				effective_local_boundary: "08:00",
+				release_count: 5,
+			},
+			[],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "ok",
+						label: "生成成功",
+						message: "日报快照已写入数据库并补齐 release memberships。",
+					},
+					brief_generate: {
+						target_user_id: TARGET_USER_ID,
+						content_length: 3840,
+						key_date: "2026-02-26",
+						brief_id: "brief_20260226",
+						date: "2026-02-26",
+						window_start_utc: "2026-02-25T00:00:00Z",
+						window_end_utc: "2026-02-26T00:00:00Z",
+						effective_time_zone: "Asia/Shanghai",
+						effective_local_boundary: "08:00",
+						release_count: 5,
+					},
+				},
+			},
 		),
 	},
 };
@@ -490,6 +521,10 @@ export const BriefDailySlot: Story = {
 								key_date: "2026-02-26",
 								state: "succeeded",
 								error: null,
+								local_boundary: "08:00",
+								time_zone: "Asia/Shanghai",
+								window_start_utc: "2026-02-25T00:00:00Z",
+								window_end_utc: "2026-02-26T00:00:00Z",
 								last_event_at: "2026-02-26T12:00:25Z",
 							},
 							{
@@ -497,9 +532,50 @@ export const BriefDailySlot: Story = {
 								key_date: "2026-02-26",
 								state: "failed",
 								error: "ai timeout",
+								local_boundary: "09:00",
+								time_zone: "America/New_York",
+								window_start_utc: "2026-02-25T14:00:00Z",
+								window_end_utc: "2026-02-26T14:00:00Z",
 								last_event_at: "2026-02-26T12:00:28Z",
 							},
 						],
+					},
+				},
+			},
+		),
+	},
+};
+
+export const BriefHistoryRecompute: Story = {
+	args: {
+		detail: buildDetail(
+			"brief.history_recompute",
+			{},
+			{},
+			[
+				{
+					stage: "progress",
+					total: 12,
+					processed: 7,
+					succeeded: 6,
+					failed: 1,
+					brief_id: "brief_legacy_07",
+				},
+			],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "partial",
+						label: "部分成功",
+						message: "历史重算已推进过半，仍有少量 legacy brief 需要重试。",
+					},
+					brief_history_recompute: {
+						total: 12,
+						processed: 7,
+						succeeded: 6,
+						failed: 1,
+						current_brief_id: "brief_legacy_07",
+						last_error: "invalid legacy brief date: 2026-02-30",
 					},
 				},
 			},

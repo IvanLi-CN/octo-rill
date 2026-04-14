@@ -9117,6 +9117,7 @@ mod tests {
             ai: None,
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {

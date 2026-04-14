@@ -14,10 +14,10 @@ import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 
 export function BriefListCard(props: {
 	briefs: BriefItem[];
-	selectedDate: string | null;
-	onSelectDate: (date: string) => void;
+	selectedId: string | null;
+	onSelectId: (id: string) => void;
 }) {
-	const { briefs, selectedDate, onSelectDate } = props;
+	const { briefs, selectedId, onSelectId } = props;
 
 	const list = briefs.slice(0, 12);
 
@@ -41,14 +41,14 @@ export function BriefListCard(props: {
 				) : (
 					<div className="space-y-1">
 						{list.map((b) => {
-							const active = selectedDate === b.date;
+							const active = selectedId === b.id;
 							return (
 								<Button
-									key={b.date}
+									key={b.id}
 									type="button"
 									variant={active ? "outline" : "ghost"}
 									size="sm"
-									onClick={() => onSelectDate(b.date)}
+									onClick={() => onSelectId(b.id)}
 									className={cn(
 										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none",
 										active
@@ -56,8 +56,13 @@ export function BriefListCard(props: {
 											: "border-transparent bg-background/40 hover:bg-background",
 									)}
 								>
-									<span className={active ? "text-foreground" : ""}>
-										#{b.date}
+									<span
+										className={cn("min-w-0", active ? "text-foreground" : "")}
+									>
+										<span>#{b.date}</span>
+										<span className="text-muted-foreground ml-2 text-[11px]">
+											{b.release_count} 条
+										</span>
 									</span>
 									<span className="text-muted-foreground truncate text-[11px]">
 										{formatIsoShortLocal(b.created_at)}
