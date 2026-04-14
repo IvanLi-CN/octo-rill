@@ -23,7 +23,7 @@ export function BriefListCard(props: {
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
-			<CardHeader>
+			<CardHeader className="px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6">
 				<CardTitle className="inline-flex items-center gap-2">
 					<CalendarDays className="size-4" />
 					日报列表
@@ -33,7 +33,7 @@ export function BriefListCard(props: {
 				</CardDescription>
 			</CardHeader>
 
-			<CardContent className="pt-0">
+			<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
 				{list.length === 0 ? (
 					<p className="text-muted-foreground text-sm">
 						暂无日报（右侧卡片可手动生成）

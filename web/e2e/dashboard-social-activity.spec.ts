@@ -148,7 +148,11 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		page.getByText("owner/repo", { exact: true }).nth(1),
 	).toBeVisible();
 	await expect(page.getByText("标星", { exact: true })).toBeVisible();
-	await expect(page.getByText("关注", { exact: true })).toBeVisible();
+	await expect(
+		page
+			.locator('[data-social-card-kind="follower_received"]')
+			.getByText("关注", { exact: true }),
+	).toBeVisible();
 	await expect(
 		page.locator(
 			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]',
@@ -189,7 +193,11 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 	await page.getByRole("tab", { name: "被关注" }).click();
 	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
 	await expect(page.getByText("octo", { exact: true })).toBeVisible();
-	await expect(page.getByText("关注", { exact: true })).toBeVisible();
+	await expect(
+		page
+			.locator('[data-social-card-kind="follower_received"]')
+			.getByText("关注", { exact: true }),
+	).toBeVisible();
 	await expect(
 		page.getByRole("heading", { name: "Release 20001" }),
 	).toHaveCount(0);

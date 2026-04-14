@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
 import {
@@ -45,6 +45,11 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { normalizeReleaseId } from "@/lib/releaseId";
+import {
+	DashboardMobileControlBand,
+	type DashboardTab as Tab,
+	DashboardTabsList,
+} from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -53,8 +58,6 @@ import {
 } from "@/sidebar/InboxQuickList";
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
-
-type Tab = "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
 
 type TaskAcceptedResponse = {
 	mode: "task_id";
@@ -131,7 +134,6 @@ type ReactionTokenCheckResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
-
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -206,7 +208,6 @@ function itemFromKey(key: string): Pick<FeedItem, "kind" | "id"> | null {
 	if (kind !== "release" || !id) return null;
 	return { kind: "release", id };
 }
-
 function firstPendingReactionContent(
 	server: ReleaseReactions,
 	desired: ReleaseReactions,
@@ -1211,10 +1212,21 @@ export function Dashboard(props: { me: MeResponse }) {
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
 					onSyncAll={onSyncAll}
+					mobileControlBand={
+						<DashboardMobileControlBand
+							tab={tab}
+							onSelectTab={(nextTab) => onSelectTab(nextTab)}
+							showPageLaneSelector={showPageLaneSelector}
+							pageLane={effectivePageDefaultLane}
+							onSelectPageLane={onSelectPageDefaultLane}
+							layout="stacked"
+						/>
+					}
 				/>
 			}
 			notice={<VersionUpdateNotice />}
 			footer={<AppMetaFooter />}
+			mobileChrome
 		>
 			{bootError ? (
 				<p className="text-destructive mb-4 text-sm">{bootError}</p>
@@ -1223,29 +1235,10 @@ export function Dashboard(props: { me: MeResponse }) {
 			<Tabs
 				value={tab}
 				onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
-				className="gap-6"
+				className="gap-4 sm:gap-6"
 			>
-				<div className="flex flex-wrap items-center justify-between gap-2">
-					<TabsList className="h-auto flex-wrap rounded-lg bg-muted/60 p-1">
-						<TabsTrigger value="all" className="font-mono text-xs">
-							全部
-						</TabsTrigger>
-						<TabsTrigger value="releases" className="font-mono text-xs">
-							Releases
-						</TabsTrigger>
-						<TabsTrigger value="stars" className="font-mono text-xs">
-							被加星
-						</TabsTrigger>
-						<TabsTrigger value="followers" className="font-mono text-xs">
-							被关注
-						</TabsTrigger>
-						<TabsTrigger value="briefs" className="font-mono text-xs">
-							日报
-						</TabsTrigger>
-						<TabsTrigger value="inbox" className="font-mono text-xs">
-							Inbox
-						</TabsTrigger>
-					</TabsList>
+				<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
+					<DashboardTabsList />
 
 					<div
 						className="flex items-center gap-2"
@@ -1255,6 +1248,7 @@ export function Dashboard(props: { me: MeResponse }) {
 							<FeedPageLaneSelector
 								value={effectivePageDefaultLane}
 								onValueChange={onSelectPageDefaultLane}
+								className="hidden sm:inline-flex"
 							/>
 						) : null}
 						{aiDisabledHint ? (
@@ -1280,7 +1274,7 @@ export function Dashboard(props: { me: MeResponse }) {
 					</div>
 				</div>
 
-				<div className="grid gap-6 md:grid-cols-[minmax(0,1fr)_360px]">
+				<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
 					<section className="min-w-0">
 						<TabsContent value="all" className="mt-0 min-w-0">
 							{renderFeedPanel("all")}
@@ -1313,7 +1307,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						</TabsContent>
 					</section>
 
-					<aside className="space-y-6">
+					<aside className="space-y-4 sm:space-y-6">
 						{tab === "briefs" ? (
 							<BriefListCard
 								briefs={briefs}

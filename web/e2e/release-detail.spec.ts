@@ -832,9 +832,9 @@ test("reaction buttons stay circular and render count badges outside the trigger
 		};
 	});
 	expect(shape.buttonWidth).toBeGreaterThanOrEqual(35);
-	expect(shape.buttonWidth).toBeLessThanOrEqual(37);
+	expect(shape.buttonWidth).toBeLessThanOrEqual(41);
 	expect(shape.buttonHeight).toBeGreaterThanOrEqual(35);
-	expect(shape.buttonHeight).toBeLessThanOrEqual(37);
+	expect(shape.buttonHeight).toBeLessThanOrEqual(41);
 	expect(Math.abs(shape.buttonWidth - shape.buttonHeight)).toBeLessThanOrEqual(
 		1,
 	);

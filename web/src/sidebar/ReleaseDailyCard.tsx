@@ -44,7 +44,7 @@ export function ReleaseDailyCard(props: {
 
 	return (
 		<Card className="bg-card/80 shadow-sm">
-			<CardHeader>
+			<CardHeader className="px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6">
 				<div className="flex items-start justify-between gap-3">
 					<div>
 						<CardTitle>Release 日报</CardTitle>
@@ -72,14 +72,14 @@ export function ReleaseDailyCard(props: {
 				</div>
 			</CardHeader>
 
-			<CardContent className="pt-0">
+			<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
 				{briefs.length === 0 ? (
 					<p className="text-muted-foreground text-sm">
 						提示：日报基于 <code>AI_DAILY_AT_LOCAL</code>{" "}
 						的时间边界统计“昨日更新”。
 					</p>
 				) : selected ? (
-					<div className="bg-muted/10 rounded-lg border p-4">
+					<div className="bg-muted/10 rounded-lg border p-3.5 sm:p-4">
 						<Markdown
 							content={selected.content_markdown}
 							onInternalReleaseClick={onOpenRelease}

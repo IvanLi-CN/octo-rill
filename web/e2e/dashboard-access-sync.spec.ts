@@ -20,6 +20,26 @@ function svgAvatarDataUrl(
 	)}`;
 }
 
+function buildReleaseFeedItem(id: string) {
+	return {
+		kind: "release",
+		ts: "2026-04-09T08:00:00Z",
+		id,
+		repo_full_name: "owner/repo",
+		title: `Release ${id}`,
+		body: "- mobile shell proof\n- tighten spacing\n- keep sticky rail visible",
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: `https://github.com/owner/repo/releases/tag/v${id}`,
+		unread: null,
+		translated: null,
+		smart: null,
+		reactions: null,
+	};
+}
+
 test("dashboard keeps sync as a single header action for admins", async ({
 	page,
 }) => {
@@ -156,6 +176,247 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	await expect(
 		secondaryControls.getByRole("link", { name: "管理员面板" }),
 	).toBeVisible();
+});
+
+test.describe("mobile dashboard shell", () => {
+	test.use({ viewport: { width: 390, height: 844 } });
+
+	test("dashboard switches to compact mobile chrome and moves admin entry into the user menu", async ({
+		page,
+	}) => {
+		await page.route("**/api/**", async (route) => {
+			const req = route.request();
+			const url = new URL(req.url());
+			const { pathname } = url;
+
+			if (req.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-admin",
+						name: "Octo Admin",
+						avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+						email: "admin@example.com",
+						is_admin: true,
+					}),
+				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/feed") {
+				return json(route, {
+					items: Array.from({ length: 10 }, (_, index) =>
+						buildReleaseFeedItem(String(20001 + index)),
+					),
+					next_cursor: null,
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/notifications") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/briefs") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+				return json(route, {
+					configured: false,
+					masked_token: null,
+					check: {
+						state: "idle",
+						message: null,
+						checked_at: null,
+					},
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/health") {
+				return json(route, { ok: true, version: "1.2.3" });
+			}
+
+			return json(
+				route,
+				{
+					error: {
+						code: "not_found",
+						message: `unhandled ${req.method()} ${pathname}`,
+					},
+				},
+				404,
+			);
+		});
+
+		await page.goto("/");
+
+		await expect(page.locator("[data-dashboard-brand-subtitle]")).toBeHidden();
+		const expandedWorkband = page.locator(
+			"[data-dashboard-mobile-top-shell='expanded'][data-dashboard-mobile-top-shell-section='workband']",
+		);
+		await expect(expandedWorkband).toBeVisible();
+		await expect(
+			expandedWorkband.getByRole("tab", { name: "发布" }),
+		).toBeVisible();
+		const mobileHeader = page.locator("[data-dashboard-header-progress]");
+		const laneMenuTrigger = expandedWorkband.locator(
+			"[data-dashboard-mobile-lane-menu-trigger]",
+		);
+		await expect(laneMenuTrigger).toBeVisible();
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(
+			page.locator("[data-dashboard-secondary-controls]").getByRole("link", {
+				name: "管理员面板",
+			}),
+		).toHaveCount(0);
+
+		await expect(
+			expandedWorkband.locator(
+				"[data-dashboard-mobile-control-band-row='lane']",
+			),
+		).toHaveCount(0);
+		await laneMenuTrigger.click();
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toBeVisible();
+		await expect(
+			page
+				.locator("[data-dashboard-mobile-lane-menu-popover]")
+				.getByRole("menuitemradio", { name: "原文" }),
+		).toBeVisible();
+		await page
+			.locator("[data-dashboard-mobile-lane-menu-popover]")
+			.getByRole("menuitemradio", { name: "智能" })
+			.click();
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toHaveCount(0);
+		await expandedWorkband.getByRole("tab", { name: "关注" }).click();
+		await expect(laneMenuTrigger).toBeVisible();
+		await expect(laneMenuTrigger).toBeDisabled();
+		await laneMenuTrigger.click({ force: true });
+		await expect(
+			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
+		).toHaveCount(0);
+		await expandedWorkband.getByRole("tab", { name: "全部" }).click();
+		await expect(laneMenuTrigger).toBeEnabled();
+
+		const client = await page.context().newCDPSession(page);
+		const dispatchTouch = async (
+			type: "touchStart" | "touchMove" | "touchEnd",
+			y?: number,
+		) => {
+			await client.send("Input.dispatchTouchEvent", {
+				type,
+				touchPoints:
+					type === "touchEnd"
+						? []
+						: [{ x: 200, y: y ?? 0, radiusX: 5, radiusY: 5, force: 1, id: 1 }],
+			});
+		};
+
+		await dispatchTouch("touchStart", 500);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-interacting",
+			"true",
+		);
+		const intermediateProgress = await mobileHeader.evaluate((element) =>
+			Number.parseFloat(
+				element.getAttribute("data-dashboard-header-progress") ?? "0",
+			),
+		);
+		expect(intermediateProgress).toBeGreaterThan(0.25);
+		expect(intermediateProgress).toBeLessThan(0.9);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+		await dispatchTouch("touchMove", 360);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(320);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-interacting",
+			"false",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-progress",
+			"1.000",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"true",
+		);
+
+		await page.mouse.wheel(0, -120);
+		await page.waitForTimeout(180);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-progress",
+			"0.000",
+		);
+		await expect(mobileHeader).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+
+		await dispatchTouch("touchStart", 520);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 360);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(320);
+		await expect(
+			page.locator("[data-app-meta-footer-hidden='true']"),
+		).toHaveCount(1);
+		await expect(
+			page.locator("[data-dashboard-header-compact='true']"),
+		).toBeVisible();
+		await expect(expandedWorkband).toHaveCount(0);
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+
+		await dispatchTouch("touchStart", 360);
+		await dispatchTouch("touchMove", 404);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 452);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(240);
+		await expect(
+			page.locator("[data-dashboard-header-compact='true']"),
+		).toHaveCount(0);
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(expandedWorkband).toBeVisible();
+
+		await dispatchTouch("touchStart", 520);
+		await dispatchTouch("touchMove", 430);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchMove", 340);
+		await page.waitForTimeout(48);
+		await dispatchTouch("touchEnd");
+		await page.waitForTimeout(320);
+		await expect(
+			page.locator("[data-dashboard-header-compact='true']"),
+		).toBeVisible();
+		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(expandedWorkband).toHaveCount(0);
+
+		await page.getByRole("button", { name: "查看账号信息" }).click();
+		await expect(
+			page.locator("[data-dashboard-user-card]").getByRole("link", {
+				name: "管理员面板",
+			}),
+		).toBeVisible();
+
+		await page.evaluate(() => window.scrollTo(0, 0));
+		await page.waitForTimeout(120);
+		await expect(
+			page.locator("[data-app-meta-footer-hidden='false']"),
+		).toHaveCount(1);
+	});
 });
 
 test("dashboard refreshes cached and fresh feed data across access sync stages", async ({

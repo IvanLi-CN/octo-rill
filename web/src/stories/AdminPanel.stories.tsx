@@ -264,6 +264,15 @@ export const Filtered: Story = {
 	},
 };
 
+export const EvidenceMobileShell: Story = {
+	name: "Evidence / Mobile Shell",
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
 export const ProfileSheetOpen: Story = {
 	args: {
 		storyState: {

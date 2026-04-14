@@ -13,6 +13,7 @@ export function AdminJobs(props: { me: MeResponse }) {
 			header={<AdminHeader user={me.user} activeNav="jobs" />}
 			notice={<VersionUpdateNotice />}
 			footer={<AppMetaFooter />}
+			mobileChrome
 		>
 			<JobManagement currentUserId={me.user.id} />
 		</AppShell>

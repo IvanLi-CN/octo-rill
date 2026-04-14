@@ -114,15 +114,15 @@ export function FeedList(
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
 
 	return (
-		<div className="space-y-4">
+		<div className="space-y-3 sm:space-y-4">
 			{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
 			{loadingInitial && items.length === 0 ? (
-				<div className="space-y-4">
+				<div className="space-y-3 sm:space-y-4">
 					{skeletons.map((i) => (
 						<div
 							key={i}
-							className="bg-card/70 animate-pulse rounded-xl border p-6 shadow-sm"
+							className="bg-card/70 animate-pulse rounded-xl border p-4 shadow-sm sm:p-6"
 						>
 							<div className="h-3 w-48 rounded bg-muted" />
 							<div className="mt-4 h-5 w-3/4 rounded bg-muted" />

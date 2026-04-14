@@ -1,8 +1,17 @@
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { useAppShellChrome } from "@/layout/AppShell";
 import { cn } from "@/lib/utils";
 import { Home, LogOut } from "lucide-react";
+
+function clampUnit(value: number) {
+	return Math.max(0, Math.min(1, value));
+}
+
+function mix(from: number, to: number, progress: number) {
+	return from + (to - from) * clampUnit(progress);
+}
 
 type AdminHeaderUser = {
 	login: string;
@@ -25,17 +34,130 @@ const ADMIN_NAV_ITEMS: AdminNavItem[] = [
 ];
 
 export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
+	const {
+		compactHeader,
+		headerInteracting,
+		headerTransitionSuppressed,
+		headerProgress,
+		isMobileViewport,
+		mobileChromeEnabled,
+	} = useAppShellChrome();
+	const useMobileCompact =
+		mobileChromeEnabled && isMobileViewport && compactHeader;
+	const mobileHeaderProgress =
+		mobileChromeEnabled && isMobileViewport
+			? clampUnit(headerProgress)
+			: useMobileCompact
+				? 1
+				: 0;
+	const disableHeaderMotion = headerInteracting || headerTransitionSuppressed;
+
 	return (
-		<div className="flex flex-col gap-2">
-			<div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-				<div className="flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6">
-					<div className="flex flex-wrap items-center gap-2">
-						<h1 className="text-lg font-semibold tracking-tight">管理后台</h1>
-						<BrandLogo variant="wordmark" className="h-5" />
+		<div
+			className={cn(
+				"flex flex-col gap-2.5",
+				!disableHeaderMotion &&
+					"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+			)}
+			style={
+				isMobileViewport
+					? {
+							gap: `${mix(10, 8, mobileHeaderProgress)}px`,
+						}
+					: undefined
+			}
+			data-admin-header-compact={useMobileCompact ? "true" : "false"}
+		>
+			<div
+				className={cn(
+					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
+					!disableHeaderMotion &&
+						"motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out",
+				)}
+				style={
+					isMobileViewport
+						? {
+								gap: `${mix(8, 6, mobileHeaderProgress)}px`,
+							}
+						: undefined
+				}
+			>
+				<div
+					className={cn(
+						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6",
+						!disableHeaderMotion &&
+							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+					)}
+					style={
+						isMobileViewport
+							? {
+									gap: `${mix(8, 6, mobileHeaderProgress)}px`,
+								}
+							: undefined
+					}
+				>
+					<div className="flex min-w-0 flex-wrap items-center gap-2">
+						<h1
+							className={cn(
+								"text-lg font-semibold tracking-tight",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+							)}
+							style={
+								isMobileViewport
+									? {
+											fontSize: `${mix(18, 16, mobileHeaderProgress)}px`,
+										}
+									: undefined
+							}
+						>
+							管理后台
+						</h1>
+						<div
+							style={
+								isMobileViewport
+									? {
+											height: `${mix(20, 18, mobileHeaderProgress)}px`,
+										}
+									: undefined
+							}
+						>
+							<BrandLogo
+								variant="wordmark"
+								className={cn(
+									"h-5",
+									!disableHeaderMotion &&
+										"motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
+									disableHeaderMotion && "transition-none",
+									isMobileViewport && "h-full",
+									useMobileCompact && "h-[18px]",
+								)}
+								alt="OctoRill"
+							/>
+						</div>
 					</div>
 
-					<nav aria-label="管理员导航">
-						<div className="flex h-8 items-center gap-4 pr-1">
+					<nav
+						aria-label="管理员导航"
+						className="-mx-1 overflow-x-auto px-1 no-scrollbar"
+					>
+						<div
+							className={cn(
+								"flex h-8 min-w-max items-center gap-4 pr-1 whitespace-nowrap",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[gap,height] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+							)}
+							style={
+								isMobileViewport
+									? {
+											height: `${mix(32, 28, mobileHeaderProgress)}px`,
+											gap: `${mix(16, 12, mobileHeaderProgress)}px`,
+										}
+									: undefined
+							}
+						>
 							{ADMIN_NAV_ITEMS.map((item) => {
 								const isActive = activeNav === item.key;
 								return (
@@ -50,6 +172,14 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 												? "text-foreground font-medium after:bg-foreground"
 												: null,
 										)}
+										style={
+											isMobileViewport
+												? {
+														height: `${mix(32, 28, mobileHeaderProgress)}px`,
+														fontSize: `${mix(14, 13, mobileHeaderProgress)}px`,
+													}
+												: undefined
+										}
 									>
 										{item.label}
 									</a>
@@ -59,17 +189,114 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					</nav>
 				</div>
 
-				<div className="flex items-center gap-2 self-start lg:self-auto">
-					<ThemeToggle />
-					<Button asChild variant="outline" size="sm" className="mr-2 h-8 px-2">
+				<div
+					className={cn(
+						"flex items-center gap-2 self-start lg:self-auto",
+						!disableHeaderMotion &&
+							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+						disableHeaderMotion && "transition-none",
+					)}
+					style={
+						isMobileViewport
+							? {
+									gap: `${mix(8, 6, mobileHeaderProgress)}px`,
+								}
+							: undefined
+					}
+				>
+					<div
+						style={
+							isMobileViewport
+								? {
+										transform: `scale(${mix(1, 0.92, mobileHeaderProgress)})`,
+										transformOrigin: "center",
+									}
+								: undefined
+						}
+					>
+						<ThemeToggle
+							className={cn(
+								!disableHeaderMotion &&
+									"motion-safe:transition-[padding,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+								useMobileCompact && "p-0.5",
+							)}
+						/>
+					</div>
+					<Button
+						asChild
+						variant="outline"
+						size="sm"
+						className={cn(
+							"mr-2 h-8 px-2",
+							!disableHeaderMotion &&
+								"motion-safe:transition-[height,padding,margin,transform] motion-safe:duration-200 motion-safe:ease-out",
+							disableHeaderMotion && "transition-none",
+							useMobileCompact && "mr-1 h-7 px-2",
+						)}
+						style={
+							isMobileViewport
+								? {
+										height: `${mix(32, 28, mobileHeaderProgress)}px`,
+									}
+								: undefined
+						}
+					>
 						<a href="/" aria-label="返回前台首页" title="返回前台首页">
 							<Home className="size-4" />
 							<span>返回前台</span>
 						</a>
 					</Button>
-					<div className="flex items-center gap-1">
-						<span className="text-muted-foreground text-sm">{user.login}</span>
-						<Button asChild variant="ghost" size="icon" className="size-8">
+					<div
+						className={cn(
+							"flex items-center gap-1",
+							useMobileCompact && "gap-0.5",
+						)}
+						style={
+							isMobileViewport
+								? {
+										gap: `${mix(4, 2, mobileHeaderProgress)}px`,
+									}
+								: undefined
+						}
+					>
+						<span
+							className={cn(
+								"text-muted-foreground text-sm",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+							)}
+							style={
+								isMobileViewport
+									? {
+											fontSize: `${mix(14, 12, mobileHeaderProgress)}px`,
+										}
+									: undefined
+							}
+						>
+							{user.login}
+						</span>
+						<Button
+							asChild
+							variant="ghost"
+							size="icon"
+							className={cn(
+								"size-8",
+								!disableHeaderMotion &&
+									"motion-safe:transition-[width,height,transform] motion-safe:duration-200 motion-safe:ease-out",
+								disableHeaderMotion && "transition-none",
+								useMobileCompact && "size-7",
+							)}
+							style={
+								isMobileViewport
+									? {
+											width: `${mix(32, 28, mobileHeaderProgress)}px`,
+											height: `${mix(32, 28, mobileHeaderProgress)}px`,
+										}
+									: undefined
+							}
+						>
 							<a href="/auth/logout" aria-label="退出登录" title="退出登录">
 								<LogOut className="size-4" />
 							</a>
