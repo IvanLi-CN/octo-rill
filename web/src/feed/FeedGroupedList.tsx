@@ -15,11 +15,7 @@ import {
 	type BriefSnapshotCandidate,
 	groupFeedItemsByDay,
 } from "@/feed/dayGroups";
-import {
-	isReleaseFeedItem,
-	isSocialFeedItem,
-	type FeedItem,
-} from "@/feed/types";
+import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 
 type BriefLike = BriefSnapshotCandidate & {
@@ -224,19 +220,28 @@ function FeedHistoricalDayGroup(props: {
 		);
 	}
 
-	const firstReleaseIndex = items.findIndex((item) => isReleaseFeedItem(item));
+	const hiddenReleaseIds = new Set(brief?.release_ids ?? []);
+	const firstHiddenReleaseIndex = items.findIndex(
+		(item) => isReleaseFeedItem(item) && hiddenReleaseIds.has(item.id),
+	);
 	const leadingItems =
-		firstReleaseIndex > 0
+		firstHiddenReleaseIndex > 0
 			? items
-					.slice(0, firstReleaseIndex)
-					.filter((item) => isSocialFeedItem(item))
+					.slice(0, firstHiddenReleaseIndex)
+					.filter(
+						(item) =>
+							!isReleaseFeedItem(item) || !hiddenReleaseIds.has(item.id),
+					)
 			: [];
 	const trailingItems =
-		firstReleaseIndex >= 0
+		firstHiddenReleaseIndex >= 0
 			? items
-					.slice(firstReleaseIndex + 1)
-					.filter((item) => isSocialFeedItem(item))
-			: items.filter((item) => isSocialFeedItem(item));
+					.slice(firstHiddenReleaseIndex + 1)
+					.filter(
+						(item) =>
+							!isReleaseFeedItem(item) || !hiddenReleaseIds.has(item.id),
+					)
+			: items;
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
@@ -342,7 +347,7 @@ export function FeedGroupedList(
 				dailyBoundaryLocal,
 				dailyBoundaryTimeZone,
 				dailyBoundaryUtcOffsetMinutes,
-				briefs,
+				mode === "all" ? briefs : [],
 				now,
 			),
 		[
@@ -352,6 +357,7 @@ export function FeedGroupedList(
 			dailyBoundaryUtcOffsetMinutes,
 			briefs,
 			now,
+			mode,
 		],
 	);
 	const briefById = useMemo(
@@ -422,7 +428,9 @@ export function FeedGroupedList(
 			{groups.map((group, index) => {
 				const brief =
 					(group.briefId ? briefById.get(group.briefId) : null) ??
-					(group.kind === "brief" ? briefByDate.get(group.briefDate) : null) ??
+					(group.kind === "historical"
+						? briefByDate.get(group.briefDate)
+						: null) ??
 					null;
 				const hasReleases = group.releaseCount > 0;
 				const isHistoricalRawGroup =
@@ -433,13 +441,13 @@ export function FeedGroupedList(
 				const pendingBrief = pendingGroupIds.has(group.id);
 				const showBriefPanel =
 					mode === "all" &&
-					group.kind === "brief" &&
+					group.kind === "historical" &&
 					(Boolean(brief) || pendingBrief) &&
 					!rawListGroupIds.has(group.id);
 				const showDivider = index > 0;
 				let groupAction: ReactNode = null;
 
-				if (mode === "all" && group.kind === "brief") {
+				if (mode === "all" && group.kind === "historical") {
 					if (brief && !rawListGroupIds.has(group.id)) {
 						groupAction = (
 							<Button
@@ -528,16 +536,18 @@ export function FeedGroupedList(
 						className="space-y-3 sm:space-y-4"
 						data-feed-group-id={group.id}
 						data-feed-brief-date={group.briefDate}
-						data-feed-group-type={group.kind === "brief" ? "brief" : "default"}
+						data-feed-group-type={
+							group.kind === "historical" ? "historical" : "default"
+						}
 						data-feed-group-view={
-							group.kind === "brief"
+							group.kind === "historical"
 								? showBriefPanel
 									? "brief"
 									: "raw"
 								: "default"
 						}
 					>
-						{mode === "all" && group.kind === "brief" ? (
+						{mode === "all" && group.kind === "historical" ? (
 							<FeedHistoricalDayGroup
 								date={group.displayDate}
 								releaseCount={group.releaseCount}
