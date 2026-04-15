@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import shutil
 import subprocess
 from collections import deque
@@ -19,6 +20,7 @@ WEB_BRAND = WEB_PUBLIC / "brand"
 DOCS_PUBLIC = REPO / "docs-site" / "docs" / "public"
 DOCS_BRAND = DOCS_PUBLIC / "brand"
 REFERENCE = BRAND_SOURCE / "reference" / "generated-brand-refresh-reference.png"
+WORDMARK_LETTERING = BRAND_SOURCE / "wordmark-lettering.svg"
 
 WORDMARK_NAVY = "#495675"
 WORDMARK_CREAM = "#FFF8EE"
@@ -33,6 +35,30 @@ if not REFERENCE.exists():
     raise FileNotFoundError(
         f"Missing brand reference PNG: {REFERENCE}. Download or place the approved source image first."
     )
+
+if not WORDMARK_LETTERING.exists():
+    raise FileNotFoundError(
+        f"Missing wordmark lettering SVG: {WORDMARK_LETTERING}."
+    )
+
+
+def _load_wordmark_lettering() -> tuple[float, float, str]:
+    raw = WORDMARK_LETTERING.read_text(encoding="utf-8")
+    view_box_match = re.search(r'viewBox="0 0 ([0-9.]+) ([0-9.]+)"', raw)
+    if view_box_match is None:
+        raise RuntimeError(
+            f"Could not parse lettering viewBox from {WORDMARK_LETTERING}."
+        )
+    inner = re.sub(r"^.*?<svg[^>]*>", "", raw, count=1, flags=re.S)
+    inner = re.sub(r"</svg>\s*$", "", inner, count=1, flags=re.S).strip()
+    if not inner:
+        raise RuntimeError(
+            f"Lettering SVG {WORDMARK_LETTERING} did not contain inner markup."
+        )
+    return float(view_box_match.group(1)), float(view_box_match.group(2)), inner
+
+
+LETTERING_WIDTH, LETTERING_HEIGHT, LETTERING_MARKUP = _load_wordmark_lettering()
 
 
 def _largest_alpha_component(image: Image.Image, threshold: int = 20) -> tuple[tuple[int, int, int, int], list[tuple[int, int]]]:
@@ -170,12 +196,18 @@ def mark_svg(mascot_uri: str) -> str:
 
 
 def wordmark_svg(mascot_uri: str, text_fill: str) -> str:
-    font_stack = "'Avenir Next Rounded', 'SF Pro Rounded', 'Nunito Sans', 'Trebuchet MS', 'Segoe UI', sans-serif"
+    lettering_target_height = 136
+    lettering_scale = lettering_target_height / LETTERING_HEIGHT
+    lettering_x = 236
+    lettering_y = 60
+    lettering_markup = LETTERING_MARKUP.replace("currentColor", text_fill)
     return dedent(
         f'''\
         <svg width="100%" height="100%" viewBox="0 0 860 256" fill="none" xmlns="http://www.w3.org/2000/svg">
-          {_image_tag(mascot_uri, x=0, y=8, width=232, height=232)}
-          <text x="246" y="152" fill="{text_fill}" font-family="{font_stack}" font-size="106" font-weight="800" letter-spacing="-2">OctoRill</text>
+          {_image_tag(mascot_uri, x=0, y=12, width=220, height=220)}
+          <g transform="translate({lettering_x} {lettering_y}) scale({lettering_scale:.6f})">
+            {lettering_markup}
+          </g>
         </svg>
         '''
     ).strip() + "\n"

@@ -103,3 +103,4 @@
 | jfkcf | Release reaction 反馈图标轻量收敛 | 已完成 | `jfkcf-release-reaction-compact-size/SPEC.md` | 2026-04-12 | local implementation completed; compact reaction trigger + Storybook canvas evidence |
 | p82d7 | Dashboard / Admin 移动端壳层与顶栏收敛优化 | 部分完成（4/4） | `p82d7-dashboard-admin-mobile-shell-polish/SPEC.md` | 2026-04-14 | PR #77; visual evidence refreshed and mobile shell gesture polish landed |
 | y9qpf | TanStack Router 接管前端路由并消除登录页闪现 | 已完成 | `y9qpf-tanstack-router-auth-boot-no-login-flicker/SPEC.md` | 2026-04-15 | PR #80; fast-track; TanStack Router SPA routing + three-layer startup model + build-time version monitor landed |
+| gzyja | 全局字标路径化与几何对齐修复 | 部分完成（2/3） | `gzyja-wordmark-path-geometry-fix/SPEC.md` | 2026-04-15 | fast-track follow-up to #tvujt; local implementation + visual evidence landed; PR pending screenshot push approval |

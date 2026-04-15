@@ -5,6 +5,87 @@ import { DashboardHeader } from "@/pages/DashboardHeader";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 
 const FAVICON_SRC = withBaseAssetPath("brand/favicon.svg");
+const HEADER_SCALE_PRESETS = [
+	{
+		label: "Admin header",
+		note: "h-5 · 对应后台紧凑品牌位",
+		className: "h-5",
+	},
+	{
+		label: "Shell / section",
+		note: "h-8 · 对应启动骨架与常规页头",
+		className: "h-8",
+	},
+	{
+		label: "Landing / hero",
+		note: "h-10 · 对应大尺寸品牌露出",
+		className: "h-10",
+	},
+] as const;
+
+function HeaderScaleGallery() {
+	return (
+		<div className="grid gap-4 xl:grid-cols-2">
+			{[
+				{
+					label: "Light surfaces",
+					theme: "light" as const,
+					surfaceClassName: "bg-[#FFF8EE]",
+					rowClassName: "bg-white/72",
+					labelClassName: "text-muted-foreground",
+					titleClassName: "text-foreground",
+					noteClassName: "text-muted-foreground",
+				},
+				{
+					label: "Dark surfaces",
+					theme: "dark" as const,
+					surfaceClassName: "bg-[#252A30]",
+					rowClassName: "bg-white/6",
+					labelClassName: "text-white/65",
+					titleClassName: "text-white/92",
+					noteClassName: "text-white/68",
+				},
+			].map((surface) => (
+				<div
+					key={surface.label}
+					className={`rounded-2xl border p-4 ${surface.surfaceClassName}`}
+				>
+					<p
+						className={`mb-3 text-[11px] font-medium uppercase tracking-[0.2em] ${surface.labelClassName}`}
+					>
+						{surface.label}
+					</p>
+					<div className="grid gap-3">
+						{HEADER_SCALE_PRESETS.map((preset) => (
+							<div
+								key={`${surface.label}-${preset.label}`}
+								className={`flex items-center justify-between gap-4 rounded-2xl border border-black/5 px-4 py-4 dark:border-white/10 ${surface.rowClassName}`}
+							>
+								<div className="min-w-0">
+									<p
+										className={`text-sm font-semibold tracking-tight ${surface.titleClassName}`}
+									>
+										{preset.label}
+									</p>
+									<p className={`text-xs leading-5 ${surface.noteClassName}`}>
+										{preset.note}
+									</p>
+								</div>
+								<div className="shrink-0">
+									<BrandLogo
+										theme={surface.theme}
+										variant="wordmark"
+										className={preset.className}
+									/>
+								</div>
+							</div>
+						))}
+					</div>
+				</div>
+			))}
+		</div>
+	);
+}
 
 function SurfaceGallery() {
 	return (
@@ -54,6 +135,13 @@ function SurfaceGallery() {
 						</div>
 					</div>
 				</div>
+			</section>
+
+			<section className="rounded-2xl border bg-card p-4 shadow-sm">
+				<p className="text-muted-foreground mb-4 text-xs font-medium uppercase tracking-[0.2em]">
+					Header scale review
+				</p>
+				<HeaderScaleGallery />
 			</section>
 
 			<section className="rounded-2xl border bg-card p-4 shadow-sm">
@@ -168,6 +256,22 @@ export const MarkOnly: Story = {
 	},
 };
 
+export const HeaderScale: Story = {
+	render: () => (
+		<div className="bg-background p-6">
+			<HeaderScaleGallery />
+		</div>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"把后台紧凑品牌位、常规页头与大尺寸品牌露出放到同一张表面里，专门检查小尺寸字标是否仍然清晰、对齐且有足够权重。",
+			},
+		},
+	},
+};
+
 export const SurfaceGalleryStory: Story = {
 	name: "Surface gallery",
 	render: () => <SurfaceGallery />,
@@ -175,7 +279,7 @@ export const SurfaceGalleryStory: Story = {
 		docs: {
 			description: {
 				story:
-					"把独立资产、Landing hero 品牌簇、Dashboard header 与 Admin header 摆到同一个稳定 review 面里，用于本地视觉验收与后续截图复用。",
+					"把独立资产、header-scale 对照、Landing hero 品牌簇、Dashboard header 与 Admin header 摆到同一个稳定 review 面里，用于本地视觉验收与后续截图复用。",
 			},
 		},
 	},
