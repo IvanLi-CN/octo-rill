@@ -783,7 +783,11 @@ export type AdminTranslationRequestsResponse = {
 };
 export type AdminTranslationRequestDetailResponse = {
 	request: AdminTranslationRequestListItem;
-	result: TranslationResultItem;
+	result: TranslationResultItem & {
+		error_code: string | null;
+		error_summary: string | null;
+		error_detail: string | null;
+	};
 };
 export type AdminTranslationBatchListItem = {
 	id: string;

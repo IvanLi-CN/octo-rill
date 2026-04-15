@@ -142,6 +142,22 @@ pub fn translation_error_summary(error_text: Option<&str>) -> Option<String> {
     classify_translation_error(error_text).map(|classified| classified.summary.to_owned())
 }
 
+fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslationRequestResultItem {
+    let classified = (item.status == "error")
+        .then(|| classify_translation_error(item.error.as_deref()))
+        .flatten();
+    let mut item = item;
+    if let Some(classified) = classified.as_ref() {
+        item.error = Some(classified.summary.to_owned());
+    }
+    AdminTranslationRequestResultItem {
+        item,
+        error_code: classified.as_ref().map(|value| value.code.to_owned()),
+        error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
+        error_detail: classified.map(|value| value.detail),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TranslationRequestResponse {
     pub request_id: String,
@@ -253,7 +269,7 @@ pub struct AdminTranslationRequestsResponse {
 #[derive(Debug, Serialize)]
 pub struct AdminTranslationRequestDetailResponse {
     pub request: AdminTranslationRequestListItem,
-    pub result: TranslationResultItem,
+    pub result: AdminTranslationRequestResultItem,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -299,6 +315,15 @@ pub struct AdminTranslationBatchDetailResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminTranslationBatchResultItem {
+    #[serde(flatten)]
+    pub item: TranslationResultItem,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub error_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminTranslationRequestResultItem {
     #[serde(flatten)]
     pub item: TranslationResultItem,
     pub error_code: Option<String>,
@@ -1782,7 +1807,7 @@ pub async fn admin_get_translation_request_detail(
         })?;
     Ok(Json(AdminTranslationRequestDetailResponse {
         request: request.to_admin_request_list_item(),
-        result: request.to_result(),
+        result: admin_translation_result_item(request.to_result()),
     }))
 }
 
@@ -5197,6 +5222,32 @@ mod tests {
         let result = row.to_result();
         assert_eq!(result.status, "error");
         assert_eq!(result.error.as_deref(), Some("body exceeds 3000 chars"));
+    }
+
+    #[test]
+    fn admin_translation_result_item_exposes_classified_error_fields() {
+        let item = TranslationResultItem {
+            producer_ref: "release_detail:120".to_owned(),
+            entity_id: "120".to_owned(),
+            kind: "release_detail".to_owned(),
+            variant: "detail_card".to_owned(),
+            status: "error".to_owned(),
+            title_zh: None,
+            summary_md: None,
+            body_md: None,
+            error: Some("body exceeds 3000 chars".to_owned()),
+            work_item_id: Some("work-1".to_owned()),
+            batch_id: Some("batch-1".to_owned()),
+        };
+
+        let result = admin_translation_result_item(item);
+        assert_eq!(result.item.error.as_deref(), Some("正文超过 3000 字符"));
+        assert_eq!(result.error_code.as_deref(), Some("body_too_long"));
+        assert_eq!(result.error_summary.as_deref(), Some("正文超过 3000 字符"));
+        assert_eq!(
+            result.error_detail.as_deref(),
+            Some("body exceeds 3000 chars")
+        );
     }
 
     #[test]
