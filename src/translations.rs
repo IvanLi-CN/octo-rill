@@ -86,6 +86,62 @@ pub struct TranslationResultItem {
     pub batch_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClassifiedTranslationError {
+    pub code: &'static str,
+    pub summary: &'static str,
+    pub detail: String,
+}
+
+pub fn classify_translation_error(error_text: Option<&str>) -> Option<ClassifiedTranslationError> {
+    let detail = error_text
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_owned();
+    let normalized = detail.to_ascii_lowercase();
+
+    let (code, summary) = if normalized.contains("runtime_lease_expired") {
+        ("runtime_lease_expired", "运行时租约失效")
+    } else if normalized.contains("preserve markdown structure")
+        || normalized.contains("markdown structure")
+    {
+        ("markdown_structure_mismatch", "Markdown 结构校验失败")
+    } else if normalized.contains("body exceeds 3000 chars")
+        || (normalized.contains("3000")
+            && normalized.contains("body")
+            && normalized.contains("exceed"))
+        || (normalized.contains("3000")
+            && normalized.contains("body")
+            && normalized.contains("too long"))
+    {
+        ("body_too_long", "正文超过 3000 字符")
+    } else if normalized.contains("empty summary") || normalized.contains("empty translation") {
+        ("empty_translation", "模型输出为空")
+    } else if normalized.contains("upstream model/channel rejected request")
+        || normalized.contains("invalid_model_error")
+        || normalized.contains("model not found")
+        || normalized.contains("insufficient_quota")
+        || normalized.contains("bad key")
+        || normalized.contains("ai returned 401")
+        || normalized.contains("ai returned 403")
+        || normalized.contains("ai returned 429")
+    {
+        ("upstream_rejected", "上游模型拒绝请求")
+    } else {
+        ("unknown_internal_error", "翻译失败")
+    };
+
+    Some(ClassifiedTranslationError {
+        code,
+        summary,
+        detail,
+    })
+}
+
+pub fn translation_error_summary(error_text: Option<&str>) -> Option<String> {
+    classify_translation_error(error_text).map(|classified| classified.summary.to_owned())
+}
+
 #[derive(Debug, Serialize)]
 pub struct TranslationRequestResponse {
     pub request_id: String,
@@ -237,8 +293,17 @@ pub struct AdminTranslationLinkedLlmCall {
 #[derive(Debug, Serialize)]
 pub struct AdminTranslationBatchDetailResponse {
     pub batch: AdminTranslationBatchListItem,
-    pub items: Vec<TranslationResultItem>,
+    pub items: Vec<AdminTranslationBatchResultItem>,
     pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminTranslationBatchResultItem {
+    #[serde(flatten)]
+    pub item: TranslationResultItem,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -253,6 +318,9 @@ pub struct AdminTranslationWorkerStatus {
     pub trigger_reason: Option<String>,
     pub updated_at: String,
     pub error_text: Option<String>,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -734,6 +802,7 @@ impl TranslationWorkerRuntimeState {
     }
 
     fn to_admin_status(&self) -> AdminTranslationWorkerStatus {
+        let classified = classify_translation_error(self.error_text.as_deref());
         AdminTranslationWorkerStatus {
             worker_id: self.worker_id.clone(),
             worker_slot: self.worker_slot,
@@ -745,6 +814,9 @@ impl TranslationWorkerRuntimeState {
             trigger_reason: self.trigger_reason.clone(),
             updated_at: self.updated_at.clone(),
             error_text: self.error_text.clone(),
+            error_code: classified.as_ref().map(|value| value.code.to_owned()),
+            error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
+            error_detail: classified.map(|value| value.detail),
         }
     }
 }
@@ -4432,7 +4504,7 @@ async fn load_translation_request_detail(
 async fn load_translation_result_items_by_batch(
     state: &AppState,
     batch_id: &str,
-) -> Result<Vec<TranslationResultItem>, ApiError> {
+) -> Result<Vec<AdminTranslationBatchResultItem>, ApiError> {
     let rows = sqlx::query(
         r#"
         SELECT w.id AS work_item_id, b.entity_id, b.kind, b.variant,
@@ -4455,20 +4527,35 @@ async fn load_translation_result_items_by_batch(
 
     Ok(rows
         .into_iter()
-        .map(|row| TranslationResultItem {
-            producer_ref: row
-                .get::<Option<String>, _>("producer_ref")
-                .unwrap_or_else(|| "(shared)".to_owned()),
-            entity_id: row.get("entity_id"),
-            kind: row.get("kind"),
-            variant: row.get("variant"),
-            status: row.get("result_status"),
-            title_zh: row.get("title_zh"),
-            summary_md: row.get("summary_md"),
-            body_md: row.get("body_md"),
-            error: row.get("error_text"),
-            work_item_id: row.get("work_item_id"),
-            batch_id: Some(batch_id.to_owned()),
+        .map(|row| {
+            let result_status = row.get::<String, _>("result_status");
+            let raw_error_text = row.get::<Option<String>, _>("error_text");
+            let classified = (result_status == "error")
+                .then(|| classify_translation_error(raw_error_text.as_deref()))
+                .flatten();
+            AdminTranslationBatchResultItem {
+                item: TranslationResultItem {
+                    producer_ref: row
+                        .get::<Option<String>, _>("producer_ref")
+                        .unwrap_or_else(|| "(shared)".to_owned()),
+                    entity_id: row.get("entity_id"),
+                    kind: row.get("kind"),
+                    variant: row.get("variant"),
+                    status: result_status,
+                    title_zh: row.get("title_zh"),
+                    summary_md: row.get("summary_md"),
+                    body_md: row.get("body_md"),
+                    error: classified
+                        .as_ref()
+                        .map(|value| value.summary.to_owned())
+                        .or(raw_error_text.clone()),
+                    work_item_id: row.get("work_item_id"),
+                    batch_id: Some(batch_id.to_owned()),
+                },
+                error_code: classified.as_ref().map(|value| value.code.to_owned()),
+                error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
+                error_detail: classified.map(|value| value.detail),
+            }
         })
         .collect())
 }
@@ -5053,6 +5140,160 @@ mod tests {
     }
 
     #[test]
+    fn classify_translation_error_maps_markdown_mismatch() {
+        let classified = classify_translation_error(Some(
+            "release detail translation failed to preserve markdown structure",
+        ))
+        .expect("classified markdown mismatch");
+
+        assert_eq!(classified.code, "markdown_structure_mismatch");
+        assert_eq!(classified.summary, "Markdown 结构校验失败");
+        assert_eq!(
+            classified.detail,
+            "release detail translation failed to preserve markdown structure"
+        );
+    }
+
+    #[test]
+    fn classify_translation_error_maps_body_too_long() {
+        let classified = classify_translation_error(Some("body exceeds 3000 chars"))
+            .expect("classified overlength body");
+
+        assert_eq!(classified.code, "body_too_long");
+        assert_eq!(classified.summary, "正文超过 3000 字符");
+        assert_eq!(classified.detail, "body exceeds 3000 chars");
+    }
+
+    #[test]
+    fn request_row_to_result_preserves_original_error_text() {
+        let row = RequestRow {
+            id: "req-1".to_owned(),
+            mode: "wait".to_owned(),
+            source: "api.translate_release_detail".to_owned(),
+            request_origin: "api".to_owned(),
+            requested_by: Some("user-1".to_owned()),
+            scope_user_id: "user-1".to_owned(),
+            producer_ref: "release_detail:120".to_owned(),
+            kind: "release_detail".to_owned(),
+            variant: "detail_card".to_owned(),
+            entity_id: "120".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 5_000,
+            work_item_id: Some("work-1".to_owned()),
+            status: "failed".to_owned(),
+            result_status: Some("error".to_owned()),
+            title_zh: None,
+            summary_md: None,
+            body_md: None,
+            error_text: Some("body exceeds 3000 chars".to_owned()),
+            created_at: "2026-04-15T00:00:00Z".to_owned(),
+            started_at: Some("2026-04-15T00:00:01Z".to_owned()),
+            finished_at: Some("2026-04-15T00:00:02Z".to_owned()),
+            updated_at: "2026-04-15T00:00:02Z".to_owned(),
+            work_item_status: Some("failed".to_owned()),
+            batch_id: None,
+        };
+
+        let result = row.to_result();
+        assert_eq!(result.status, "error");
+        assert_eq!(result.error.as_deref(), Some("body exceeds 3000 chars"));
+    }
+
+    #[test]
+    fn translation_state_row_to_result_preserves_original_error_text() {
+        let item = TranslationRequestItemInput {
+            producer_ref: "release_detail:120".to_owned(),
+            kind: "release_detail".to_owned(),
+            variant: "detail_card".to_owned(),
+            entity_id: "120".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 5_000,
+            source_blocks: Vec::new(),
+            target_slots: vec!["title_zh".to_owned(), "body_md".to_owned()],
+        };
+        let row = TranslationStateRow {
+            id: "state-1".to_owned(),
+            user_id: "user-1".to_owned(),
+            entity_type: "release_detail".to_owned(),
+            entity_id: "120".to_owned(),
+            lang: "zh-CN".to_owned(),
+            source_hash: "hash-1".to_owned(),
+            status: "error".to_owned(),
+            title: None,
+            summary: None,
+            error_text: Some("body exceeds 3000 chars".to_owned()),
+            active_work_item_id: Some("work-1".to_owned()),
+            created_at: "2026-04-15T00:00:00Z".to_owned(),
+            updated_at: "2026-04-15T00:00:02Z".to_owned(),
+        };
+
+        let result = row.to_result(&item);
+        assert_eq!(result.status, "error");
+        assert_eq!(result.error.as_deref(), Some("body exceeds 3000 chars"));
+    }
+
+    #[test]
+    fn worker_runtime_status_exposes_error_summary_and_detail() {
+        let worker = TranslationWorkerRuntimeState {
+            worker_id: "translation-worker-3".to_owned(),
+            worker_slot: 3,
+            worker_kind: "general".to_owned(),
+            status: "error".to_owned(),
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            updated_at: "2026-04-15T03:24:11Z".to_owned(),
+            error_text: Some(
+                "release detail translation failed to preserve markdown structure".to_owned(),
+            ),
+        };
+
+        let status = worker.to_admin_status();
+        assert_eq!(
+            status.error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            status.error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            status.error_detail.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
+        assert_eq!(
+            status.error_text.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
+    }
+
+    #[test]
+    fn worker_runtime_status_serializes_null_error_fields() {
+        let worker = TranslationWorkerRuntimeState {
+            worker_id: "translation-worker-1".to_owned(),
+            worker_slot: 1,
+            worker_kind: "general".to_owned(),
+            status: "idle".to_owned(),
+            current_batch_id: None,
+            request_count: 0,
+            work_item_count: 0,
+            trigger_reason: None,
+            updated_at: "2026-04-15T03:24:11Z".to_owned(),
+            error_text: None,
+        };
+
+        let payload =
+            serde_json::to_value(worker.to_admin_status()).expect("serialize worker admin status");
+        assert!(payload.get("error_code").is_some());
+        assert!(payload["error_code"].is_null());
+        assert!(payload.get("error_summary").is_some());
+        assert!(payload["error_summary"].is_null());
+        assert!(payload.get("error_detail").is_some());
+        assert!(payload["error_detail"].is_null());
+    }
+
+    #[test]
     fn parse_positive_worker_concurrency_rejects_values_above_max() {
         let overflow =
             i64::try_from(MAX_TRANSLATION_WORKER_CONCURRENCY).expect("max fits in i64") + 1;
@@ -5500,6 +5741,266 @@ mod tests {
                 .get::<Option<String>, _>("finished_at")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn load_translation_batch_detail_items_include_classified_error_fields() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("batch-detail-error");
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create translation request");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("created request should have work item id");
+        let now = "2026-04-15T03:24:11Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+            "#,
+        )
+        .bind("batch-detail-error")
+        .bind("general:release_detail:feed_body:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, result_status, error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-detail-error")
+        .bind("batch-detail-error")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind("error")
+        .bind("release detail translation failed to preserve markdown structure")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert batch item");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET batch_id = ?, status = 'failed', result_status = 'error',
+                error_text = ?, finished_at = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("batch-detail-error")
+        .bind("release detail translation failed to preserve markdown structure")
+        .bind(now)
+        .bind(now)
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item failed");
+
+        let items = load_translation_result_items_by_batch(state.as_ref(), "batch-detail-error")
+            .await
+            .expect("load batch detail items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].item.error.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            items[0].error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            items[0].error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            items[0].error_detail.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
+
+        let payload = serde_json::to_value(AdminTranslationBatchDetailResponse {
+            batch: AdminTranslationBatchListItem {
+                id: "batch-detail-error".to_owned(),
+                status: "completed".to_owned(),
+                trigger_reason: "deadline".to_owned(),
+                worker_slot: 1,
+                request_count: 1,
+                item_count: 1,
+                estimated_input_tokens: 128,
+                created_at: now.to_owned(),
+                started_at: Some(now.to_owned()),
+                finished_at: Some(now.to_owned()),
+                updated_at: now.to_owned(),
+            },
+            items,
+            llm_calls: Vec::new(),
+        })
+        .expect("serialize admin translation batch detail");
+        assert_eq!(
+            payload["items"][0]["error_code"].as_str(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            payload["items"][0]["error_summary"].as_str(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            payload["items"][0]["error_detail"].as_str(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_translation_batch_detail_items_preserve_missing_errors_without_classification() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = sample_release_item("404");
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create translation request");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("created request should have work item id");
+
+        let now = "2026-04-15T03:24:11Z";
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
+            "#,
+        )
+        .bind("batch-detail-missing")
+        .bind("general:release_detail:feed_body:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(64_i64)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, result_status, error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-item-detail-missing")
+        .bind("batch-detail-missing")
+        .bind(work_item_id.as_str())
+        .bind(0_i64)
+        .bind(item.kind.as_str())
+        .bind(item.variant.as_str())
+        .bind(item.entity_id.as_str())
+        .bind(1_i64)
+        .bind(64_i64)
+        .bind("missing")
+        .bind("release not found")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert missing batch item");
+
+        let items = load_translation_result_items_by_batch(state.as_ref(), "batch-detail-missing")
+            .await
+            .expect("load batch detail items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item.status, "missing");
+        assert_eq!(items[0].item.error.as_deref(), Some("release not found"));
+        assert_eq!(items[0].error_code, None);
+        assert_eq!(items[0].error_summary, None);
+        assert_eq!(items[0].error_detail, None);
+    }
+
+    #[test]
+    fn admin_translation_batch_detail_serializes_null_error_fields() {
+        let payload = serde_json::to_value(AdminTranslationBatchDetailResponse {
+            batch: AdminTranslationBatchListItem {
+                id: "batch-ready".to_owned(),
+                status: "completed".to_owned(),
+                trigger_reason: "deadline".to_owned(),
+                worker_slot: 1,
+                request_count: 1,
+                item_count: 1,
+                estimated_input_tokens: 64,
+                created_at: "2026-04-15T03:24:11Z".to_owned(),
+                started_at: Some("2026-04-15T03:24:12Z".to_owned()),
+                finished_at: Some("2026-04-15T03:24:13Z".to_owned()),
+                updated_at: "2026-04-15T03:24:13Z".to_owned(),
+            },
+            items: vec![AdminTranslationBatchResultItem {
+                item: TranslationResultItem {
+                    producer_ref: "general:release_detail:feed_body:zh-CN".to_owned(),
+                    entity_id: "308844700".to_owned(),
+                    kind: "release_summary".to_owned(),
+                    variant: "feed_body".to_owned(),
+                    status: "ready".to_owned(),
+                    title_zh: Some("标题".to_owned()),
+                    summary_md: Some("摘要".to_owned()),
+                    body_md: Some("正文".to_owned()),
+                    error: None,
+                    work_item_id: Some("work-item-ready".to_owned()),
+                    batch_id: Some("batch-ready".to_owned()),
+                },
+                error_code: None,
+                error_summary: None,
+                error_detail: None,
+            }],
+            llm_calls: Vec::new(),
+        })
+        .expect("serialize admin translation batch detail");
+
+        assert!(payload["items"][0].get("error_code").is_some());
+        assert!(payload["items"][0]["error_code"].is_null());
+        assert!(payload["items"][0].get("error_summary").is_some());
+        assert!(payload["items"][0]["error_summary"].is_null());
+        assert!(payload["items"][0].get("error_detail").is_some());
+        assert!(payload["items"][0]["error_detail"].is_null());
     }
 
     #[tokio::test]

@@ -724,6 +724,9 @@ export type AdminTranslationWorkerStatus = {
 	trigger_reason: string | null;
 	updated_at: string;
 	error_text: string | null;
+	error_code: string | null;
+	error_summary: string | null;
+	error_detail: string | null;
 };
 export type AdminTranslationStatusResponse = {
 	scheduler_enabled: boolean;
@@ -810,9 +813,14 @@ export type AdminTranslationLinkedLlmCall = {
 	duration_ms: number | null;
 	created_at: string;
 };
+export type AdminTranslationBatchResultItem = TranslationResultItem & {
+	error_code: string | null;
+	error_summary: string | null;
+	error_detail: string | null;
+};
 export type AdminTranslationBatchDetailResponse = {
 	batch: AdminTranslationBatchListItem;
-	items: TranslationResultItem[];
+	items: AdminTranslationBatchResultItem[];
 	llm_calls: AdminTranslationLinkedLlmCall[];
 };
 export async function apiSubmitTranslationRequest(

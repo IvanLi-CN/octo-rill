@@ -41,6 +41,7 @@
 - `translate.release.batch` 事件新增 `item_error` 字段。
 - `brief.daily_slot` 事件新增 `stage=user_succeeded` 与 `stage=summary`。
 - 前端任务详情面板改造：结构化业务结果、分项明细、截断提示、业务结果警示。
+- 翻译 worker / batch 详情对齐分类后的 `error_code`、`error_summary`、`error_detail` 展示，避免管理员只看到裸 `translation failed`。
 - 任务详情抽屉支持路由态：`/admin/jobs/tasks/:taskId` 与 `/admin/jobs/tasks/:taskId/llm/:callId`。
 - Storybook 与自动化测试补齐。
 
@@ -97,6 +98,51 @@
 - Given 任务类型为 `sync.*`
   When 管理员查看任务详情
   Then 不展示“查看 LLM 详情”入口，避免产生无关联的排障链路。
+
+- Given 翻译 worker 或 batch item 带原始 `error_text`
+  When 管理员打开对应详情抽屉
+  Then 页面优先显示分类后的短提示，并同时展示错误码与原始错误原因。
+
+## Visual Evidence
+
+### 翻译批次详情（围栏修复后成功）
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `admin-admin-jobs--translation-batch-detail-recovered`
+- state: `batch-detail-recovered`
+- evidence_note: 验证 `release_summary.feed_body` 在围栏 Markdown 被规范化后，批次详情保持完成态且不再显示错误提示。
+
+![翻译批次详情（围栏修复后成功）](./assets/translation-batch-detail-recovered.png)
+
+### 翻译批次详情（结构仍失败）
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `admin-admin-jobs--translation-batch-detail-failed`
+- state: `batch-detail-failed`
+- evidence_note: 验证批次条目会同时展示错误短提示、错误码与原始错误原因，不再只剩 `translation failed`。
+
+![翻译批次详情（结构仍失败）](./assets/translation-batch-detail-failed.png)
+
+### 翻译工作者错误抽屉
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- sensitive_exclusion: `N/A`
+- submission_gate: `pending-owner-approval`
+- story_id_or_title: `admin-admin-jobs--translation-worker-error-drawer`
+- state: `worker-error-drawer`
+- evidence_note: 验证工作者详情抽屉可直接显示分类后的错误摘要、错误码与原始错误原因。
+
+![翻译工作者错误抽屉](./assets/translation-worker-error-drawer.png)
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
