@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 use url::Url;
 
-use crate::{admin_runtime, ai, jobs, local_id, sync};
+use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
@@ -65,7 +65,9 @@ fn parse_internal_brief_release_id(target: &str) -> Option<i64> {
     raw_release.parse::<i64>().ok()
 }
 
-fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
+fn extract_brief_release_ids(markdown: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
     let mut i = 0usize;
 
     while i < markdown.len() {
@@ -78,8 +80,10 @@ fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
             let url_start = i + text_end_rel + 2;
             let url_end = url_start + url_end_rel;
             let target = &markdown[url_start..url_end];
-            if parse_internal_brief_release_id(target) == Some(release_id) {
-                return true;
+            if let Some(release_id) = parse_internal_brief_release_id(target)
+                && seen.insert(release_id)
+            {
+                ids.push(release_id);
             }
             i = url_end + 1;
             continue;
@@ -90,7 +94,17 @@ fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
         i += ch.len_utf8();
     }
 
-    false
+    ids
+}
+
+fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
+    extract_brief_release_ids(markdown)
+        .into_iter()
+        .any(|candidate| candidate == release_id)
+}
+
+fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
+    matches!(generation_source, "legacy" | "history_recompute_failed")
 }
 
 async fn user_has_brief_access_to_release(
@@ -98,12 +112,32 @@ async fn user_has_brief_access_to_release(
     user_id: &str,
     release_id: i64,
 ) -> Result<bool, ApiError> {
+    let membership_exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM brief_release_memberships m
+        JOIN briefs b ON b.id = m.brief_id
+        WHERE b.user_id = ?
+          AND m.release_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .bind(release_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if membership_exists > 0 {
+        return Ok(true);
+    }
+
     let hint = format!("%release={release_id}%");
     let briefs = sqlx::query_scalar::<_, String>(
         r#"
         SELECT content_markdown
         FROM briefs
         WHERE user_id = ?
+          AND generation_source IN ('legacy', 'history_recompute_failed')
           AND content_markdown LIKE ?
         "#,
     )
@@ -223,15 +257,14 @@ pub async fn me(
 
     let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
     touch_user_last_active_at(state.as_ref(), &row.id).await?;
-    let daily_boundary_local = state
-        .config
-        .ai_daily_at_local
-        .unwrap_or_else(|| chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid daily boundary"))
-        .format("%H:%M")
-        .to_string();
-    let now_local = chrono::Local::now();
-    let daily_boundary_time_zone = iana_time_zone::get_timezone().ok();
-    let daily_boundary_utc_offset_minutes = now_local.offset().local_minus_utc() / 60;
+    let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &row.id)
+        .await
+        .map_err(ApiError::internal)?;
+    let daily_boundary_local = briefs::format_daily_brief_local_time(preferences.local_time);
+    let daily_boundary_time_zone = Some(preferences.time_zone.clone());
+    let daily_boundary_utc_offset_minutes =
+        briefs::current_utc_offset_minutes(&preferences, chrono::Utc::now())
+            .map_err(ApiError::internal)?;
 
     Ok(Json(MeResponse {
         user: UserSummary {
@@ -681,10 +714,141 @@ pub async fn admin_patch_user(
 }
 
 #[derive(Debug, Serialize)]
-pub struct AdminUserProfileResponse {
+pub struct DailyBriefProfileResponse {
     user_id: String,
+    daily_brief_local_time: String,
+    daily_brief_time_zone: String,
+    last_active_at: Option<String>,
+}
+
+pub type AdminUserProfileResponse = DailyBriefProfileResponse;
+pub type MeProfileResponse = DailyBriefProfileResponse;
+
+#[derive(Debug, Deserialize)]
+pub struct DailyBriefProfilePatchRequest {
+    daily_brief_local_time: String,
+    daily_brief_time_zone: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DailyBriefProfileRow {
+    daily_brief_local_time: Option<String>,
+    daily_brief_time_zone: Option<String>,
     daily_brief_utc_time: String,
     last_active_at: Option<String>,
+}
+
+async fn load_daily_brief_profile(
+    state: &AppState,
+    user_id: &str,
+) -> Result<DailyBriefProfileResponse, ApiError> {
+    let row = sqlx::query_as::<_, DailyBriefProfileRow>(
+        r#"
+        SELECT
+          daily_brief_local_time,
+          daily_brief_time_zone,
+          daily_brief_utc_time,
+          last_active_at
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some(row) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "user not found",
+        ));
+    };
+
+    let preferences = briefs::derive_daily_brief_preferences(
+        &state.config,
+        row.daily_brief_local_time.as_deref(),
+        row.daily_brief_time_zone.as_deref(),
+        Some(row.daily_brief_utc_time.as_str()),
+        chrono::Utc::now(),
+    );
+
+    Ok(DailyBriefProfileResponse {
+        user_id: user_id.to_owned(),
+        daily_brief_local_time: briefs::format_daily_brief_local_time(preferences.local_time),
+        daily_brief_time_zone: preferences.time_zone,
+        last_active_at: row.last_active_at,
+    })
+}
+
+async fn persist_daily_brief_profile(
+    state: &AppState,
+    user_id: &str,
+    req: DailyBriefProfilePatchRequest,
+) -> Result<DailyBriefProfileResponse, ApiError> {
+    let local_time = briefs::parse_daily_brief_local_time(&req.daily_brief_local_time)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let time_zone = briefs::parse_daily_brief_time_zone(&req.daily_brief_time_zone)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    briefs::validate_hour_aligned_time_zone(&time_zone, chrono::Utc::now())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let enabled_hours = briefs::load_enabled_daily_brief_scheduler_hours(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let missing_hours =
+        briefs::missing_daily_brief_scheduler_hours(local_time, &time_zone, &enabled_hours)
+            .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !missing_hours.is_empty() {
+        let missing_hours = missing_hours
+            .into_iter()
+            .map(|hour| format!("{hour:02}:00Z"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ApiError::bad_request(format!(
+            "invalid daily brief schedule for current scheduler configuration (missing enabled UTC slots: {missing_hours})"
+        )));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET daily_brief_local_time = ?, daily_brief_time_zone = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(briefs::format_daily_brief_local_time(local_time))
+    .bind(time_zone)
+    .bind(now.as_str())
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    load_daily_brief_profile(state, user_id).await
+}
+
+pub async fn me_get_profile(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeProfileResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    Ok(Json(
+        load_daily_brief_profile(state.as_ref(), &user_id).await?,
+    ))
+}
+
+pub async fn me_patch_profile(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<DailyBriefProfilePatchRequest>,
+) -> Result<Json<MeProfileResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    Ok(Json(
+        persist_daily_brief_profile(state.as_ref(), &user_id, req).await?,
+    ))
 }
 
 pub async fn admin_get_user_profile(
@@ -694,33 +858,22 @@ pub async fn admin_get_user_profile(
 ) -> Result<Json<AdminUserProfileResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let user_id = parse_local_id_param(user_id, "user_id")?;
+    Ok(Json(
+        load_daily_brief_profile(state.as_ref(), &user_id).await?,
+    ))
+}
 
-    let row = sqlx::query_as::<_, (String, Option<String>)>(
-        r#"
-        SELECT daily_brief_utc_time, last_active_at
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(&user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-
-    let Some((daily_brief_utc_time, last_active_at)) = row else {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "user not found",
-        ));
-    };
-
-    Ok(Json(AdminUserProfileResponse {
-        user_id,
-        daily_brief_utc_time,
-        last_active_at,
-    }))
+pub async fn admin_patch_user_profile(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(user_id): Path<String>,
+    Json(req): Json<DailyBriefProfilePatchRequest>,
+) -> Result<Json<AdminUserProfileResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let user_id = parse_local_id_param(user_id, "user_id")?;
+    Ok(Json(
+        persist_daily_brief_profile(state.as_ref(), &user_id, req).await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -1007,6 +1160,8 @@ pub struct AdminTaskDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     brief_generate: Option<AdminBriefGenerateDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    brief_history_recompute: Option<AdminBriefHistoryRecomputeDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sync_subscriptions: Option<AdminSyncSubscriptionsDiagnostics>,
 }
 
@@ -1062,6 +1217,10 @@ pub struct AdminBriefDailySlotSummary {
 pub struct AdminBriefDailySlotUserDiagnostic {
     user_id: String,
     key_date: Option<String>,
+    local_boundary: Option<String>,
+    time_zone: Option<String>,
+    window_start_utc: Option<String>,
+    window_end_utc: Option<String>,
     state: String, // succeeded | failed | running
     error: Option<String>,
     last_event_at: String,
@@ -1070,8 +1229,26 @@ pub struct AdminBriefDailySlotUserDiagnostic {
 #[derive(Debug, Serialize)]
 pub struct AdminBriefGenerateDiagnostics {
     target_user_id: Option<String>,
+    brief_id: Option<String>,
     content_length: Option<i64>,
     key_date: Option<String>,
+    date: Option<String>,
+    window_start_utc: Option<String>,
+    window_end_utc: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    release_count: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefHistoryRecomputeDiagnostics {
+    total: i64,
+    processed: i64,
+    succeeded: i64,
+    failed: i64,
+    current_brief_id: Option<String>,
+    last_error: Option<String>,
+    canceled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1434,6 +1611,10 @@ fn upsert_daily_slot_user_diag(
     users.push(AdminBriefDailySlotUserDiagnostic {
         user_id: user_id.clone(),
         key_date: None,
+        local_boundary: None,
+        time_zone: None,
+        window_start_utc: None,
+        window_end_utc: None,
         state: "running".to_owned(),
         error: None,
         last_event_at: event_created_at.to_owned(),
@@ -1497,6 +1678,13 @@ fn build_brief_daily_slot_diagnostics(
                     if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
                         users[pos].key_date = Some(key_date);
                     }
+                    users[pos].local_boundary =
+                        json_object_get_string(payload_object, "local_boundary");
+                    users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
+                    users[pos].window_start_utc =
+                        json_object_get_string(payload_object, "window_start_utc");
+                    users[pos].window_end_utc =
+                        json_object_get_string(payload_object, "window_end_utc");
                 }
             }
             "user_failed" => {
@@ -1513,6 +1701,9 @@ fn build_brief_daily_slot_diagnostics(
                     if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
                         users[pos].key_date = Some(key_date);
                     }
+                    users[pos].local_boundary =
+                        json_object_get_string(payload_object, "local_boundary");
+                    users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
                 }
             }
             "user_succeeded" => {
@@ -1529,6 +1720,13 @@ fn build_brief_daily_slot_diagnostics(
                     if let Some(key_date) = json_object_get_string(payload_object, "key_date") {
                         users[pos].key_date = Some(key_date);
                     }
+                    users[pos].local_boundary =
+                        json_object_get_string(payload_object, "local_boundary");
+                    users[pos].time_zone = json_object_get_string(payload_object, "time_zone");
+                    users[pos].window_start_utc =
+                        json_object_get_string(payload_object, "window_start_utc");
+                    users[pos].window_end_utc =
+                        json_object_get_string(payload_object, "window_end_utc");
                 }
             }
             "summary" => {
@@ -1629,8 +1827,15 @@ fn build_brief_generate_diagnostics(
     let content_length = json_object_get_i64(result_object, "content_length");
     let diagnostics = AdminBriefGenerateDiagnostics {
         target_user_id: json_object_get_local_id(payload_object, "user_id"),
+        brief_id: json_object_get_local_id(result_object, "brief_id"),
         content_length,
         key_date: json_object_get_string(payload_object, "key_date"),
+        date: json_object_get_string(result_object, "date"),
+        window_start_utc: json_object_get_string(result_object, "window_start_utc"),
+        window_end_utc: json_object_get_string(result_object, "window_end_utc"),
+        effective_time_zone: json_object_get_string(result_object, "effective_time_zone"),
+        effective_local_boundary: json_object_get_string(result_object, "effective_local_boundary"),
+        release_count: json_object_get_i64(result_object, "release_count"),
     };
 
     let outcome = if task.status == jobs::STATUS_FAILED {
@@ -1655,6 +1860,104 @@ fn build_brief_generate_diagnostics(
         }
     } else {
         business_outcome("unknown", "处理中", "任务尚未完成。")
+    };
+
+    (outcome, diagnostics)
+}
+
+fn build_brief_history_recompute_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminBriefHistoryRecomputeDiagnostics) {
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let mut total_from_event: Option<i64> = None;
+    let mut processed_from_event: Option<i64> = None;
+    let mut succeeded_from_event: Option<i64> = None;
+    let mut failed_from_event: Option<i64> = None;
+    let mut canceled_from_event: Option<bool> = None;
+    let ordered_events = task_events_for_diagnostics(events);
+    let mut current_brief_id: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    for event in ordered_events {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+        match stage.as_str() {
+            "recompute" | "brief_succeeded" => {
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+            }
+            "brief_failed" => {
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+                last_error = json_object_get_string(payload_object, "error");
+            }
+            "summary" => {
+                total_from_event = json_object_get_i64(payload_object, "total");
+                processed_from_event = json_object_get_i64(payload_object, "processed");
+                succeeded_from_event = json_object_get_i64(payload_object, "succeeded");
+                failed_from_event = json_object_get_i64(payload_object, "failed");
+                canceled_from_event = json_object_get_bool(payload_object, "canceled");
+                current_brief_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    let total = total_from_event
+        .or_else(|| json_object_get_i64(result_object, "total"))
+        .unwrap_or(0);
+    let processed = processed_from_event
+        .or_else(|| json_object_get_i64(result_object, "processed"))
+        .unwrap_or(0);
+    let succeeded = succeeded_from_event
+        .or_else(|| json_object_get_i64(result_object, "succeeded"))
+        .unwrap_or(0);
+    let failed = failed_from_event
+        .or_else(|| json_object_get_i64(result_object, "failed"))
+        .unwrap_or(0);
+    let canceled = canceled_from_event
+        .or_else(|| json_object_get_bool(result_object, "canceled"))
+        .unwrap_or(false);
+
+    let diagnostics = AdminBriefHistoryRecomputeDiagnostics {
+        total,
+        processed,
+        succeeded,
+        failed,
+        current_brief_id,
+        last_error,
+        canceled,
+    };
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "历史日报重算失败。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_CANCELED || canceled {
+        business_outcome("partial", "已取消", "历史日报重算在执行中被取消。")
+    } else if total == 0 {
+        business_outcome("ok", "无需执行", "没有遗留旧日报需要重算。")
+    } else if failed > 0 && succeeded == 0 {
+        business_outcome("failed", "业务失败", "历史日报重算未成功处理任何遗留日报。")
+    } else if failed > 0 {
+        business_outcome("partial", "部分成功", "历史日报已部分重算，仍有失败项。")
+    } else if succeeded > 0 {
+        business_outcome("ok", "业务成功", "历史日报重算已完成。")
+    } else {
+        business_outcome("unknown", "处理中", "历史日报重算尚未完成。")
     };
 
     (outcome, diagnostics)
@@ -1831,6 +2134,7 @@ fn build_task_diagnostics(
                 translate_release_batch: Some(diagnostics),
                 brief_daily_slot: None,
                 brief_generate: None,
+                brief_history_recompute: None,
                 sync_subscriptions: None,
             })
         }
@@ -1841,6 +2145,7 @@ fn build_task_diagnostics(
                 translate_release_batch: None,
                 brief_daily_slot: Some(diagnostics),
                 brief_generate: None,
+                brief_history_recompute: None,
                 sync_subscriptions: None,
             })
         }
@@ -1851,6 +2156,19 @@ fn build_task_diagnostics(
                 translate_release_batch: None,
                 brief_daily_slot: None,
                 brief_generate: Some(diagnostics),
+                brief_history_recompute: None,
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_BRIEF_HISTORY_RECOMPUTE => {
+            let (business_outcome, diagnostics) =
+                build_brief_history_recompute_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                brief_history_recompute: Some(diagnostics),
                 sync_subscriptions: None,
             })
         }
@@ -1862,6 +2180,7 @@ fn build_task_diagnostics(
                 translate_release_batch: None,
                 brief_daily_slot: None,
                 brief_generate: None,
+                brief_history_recompute: None,
                 sync_subscriptions: Some(diagnostics),
             })
         }
@@ -2935,7 +3254,7 @@ pub async fn list_starred(
         LIMIT 2000
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -2970,7 +3289,7 @@ pub async fn list_releases(
         LIMIT 200
         "#,
     )
-    .bind(user_id)
+     .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -3196,9 +3515,14 @@ pub async fn list_notifications(
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct BriefItem {
+    id: String,
     date: String,
     window_start: Option<String>,
     window_end: Option<String>,
+    effective_time_zone: Option<String>,
+    effective_local_boundary: Option<String>,
+    release_count: usize,
+    release_ids: Vec<String>,
     content_markdown: String,
     created_at: String,
 }
@@ -3211,45 +3535,90 @@ pub async fn list_briefs(
 
     #[derive(Debug, sqlx::FromRow)]
     struct BriefRow {
+        id: String,
         date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+        generation_source: String,
         content_markdown: String,
         created_at: String,
     }
 
+    #[derive(Debug, sqlx::FromRow)]
+    struct BriefMembershipRow {
+        brief_id: String,
+        release_id: i64,
+    }
+
     let rows = sqlx::query_as::<_, BriefRow>(
         r#"
-        SELECT date, content_markdown, created_at
+        SELECT
+          id,
+          date,
+          window_start_utc,
+          window_end_utc,
+          effective_time_zone,
+          effective_local_boundary,
+          generation_source,
+          content_markdown,
+          created_at
         FROM briefs
         WHERE user_id = ?
-        ORDER BY date DESC
-        LIMIT 30
+        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
         "#,
     )
-    .bind(user_id)
+    .bind(&user_id)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
-    let at = state.config.ai_daily_at_local;
+    let mut release_ids_by_brief = HashMap::<String, Vec<String>>::new();
+    if !rows.is_empty() {
+        let membership_rows = sqlx::query_as::<_, BriefMembershipRow>(
+            r#"
+            SELECT m.brief_id, m.release_id
+            FROM brief_release_memberships m
+            JOIN briefs b ON b.id = m.brief_id
+            WHERE b.user_id = ?
+            ORDER BY m.brief_id ASC, m.ordinal ASC
+            "#,
+        )
+        .bind(&user_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        for row in membership_rows {
+            release_ids_by_brief
+                .entry(row.brief_id)
+                .or_default()
+                .push(row.release_id.to_string());
+        }
+    }
+
     let items = rows
         .into_iter()
         .map(|r| {
-            let (window_start, window_end) = at
-                .and_then(|at| {
-                    chrono::NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
-                        .ok()
-                        .map(|d| (d, at))
-                })
-                .map(|(d, at)| {
-                    let (start, end) = ai::compute_window_for_key_date(d, at);
-                    (Some(start.to_rfc3339()), Some(end.to_rfc3339()))
-                })
-                .unwrap_or((None, None));
-
+            let release_ids = release_ids_by_brief.remove(&r.id).unwrap_or_else(|| {
+                if brief_uses_markdown_release_fallback(&r.generation_source) {
+                    extract_brief_release_ids(&r.content_markdown)
+                        .into_iter()
+                        .map(|value| value.to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            });
             BriefItem {
+                id: r.id,
                 date: r.date,
-                window_start,
-                window_end,
+                window_start: r.window_start_utc,
+                window_end: r.window_end_utc,
+                effective_time_zone: r.effective_time_zone,
+                effective_local_boundary: r.effective_local_boundary,
+                release_count: release_ids.len(),
+                release_ids,
                 content_markdown: r.content_markdown,
                 created_at: r.created_at,
             }
@@ -3559,9 +3928,14 @@ pub async fn sync_notifications(
 
 #[derive(Debug, Serialize)]
 pub struct BriefGenerateResponse {
+    id: String,
     date: String,
-    window_start: Option<String>,
-    window_end: Option<String>,
+    window_start: String,
+    window_end: String,
+    effective_time_zone: String,
+    effective_local_boundary: String,
+    release_count: usize,
+    release_ids: Vec<String>,
     content_markdown: String,
 }
 
@@ -3605,11 +3979,15 @@ pub async fn generate_brief(
         .await;
     }
 
-    let content = if let Some(key_date) = key_date {
+    let snapshot = if let Some(key_date) = key_date {
         run_with_api_llm_context(
             "api.generate_brief.sync",
             Some(user_id.clone()),
-            ai::generate_daily_brief_for_key_date(state.as_ref(), user_id.as_str(), key_date),
+            ai::generate_daily_brief_snapshot_for_key_date(
+                state.as_ref(),
+                user_id.as_str(),
+                key_date,
+            ),
         )
         .await
         .map_err(ApiError::internal)?
@@ -3617,50 +3995,26 @@ pub async fn generate_brief(
         run_with_api_llm_context(
             "api.generate_brief.sync",
             Some(user_id.clone()),
-            ai::generate_daily_brief(state.as_ref(), user_id.as_str()),
+            ai::generate_daily_brief_snapshot_for_current(state.as_ref(), user_id.as_str()),
         )
         .await
         .map_err(ApiError::internal)?
     };
 
-    // The brief row is keyed by date. Read the most recent one to include window hints.
-    let row = sqlx::query_as::<_, (String,)>(
-        r#"
-        SELECT date
-        FROM briefs
-        WHERE user_id = ?
-        ORDER BY date DESC
-        LIMIT 1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-
-    let at = state.config.ai_daily_at_local;
-    let date = row.map(|r| r.0).unwrap_or_else(|| {
-        key_date
-            .unwrap_or_else(|| chrono::Local::now().date_naive())
-            .to_string()
-    });
-    let (window_start, window_end) = at
-        .and_then(|at| {
-            chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
-                .ok()
-                .map(|d| (d, at))
-        })
-        .map(|(d, at)| {
-            let (start, end) = ai::compute_window_for_key_date(d, at);
-            (Some(start.to_rfc3339()), Some(end.to_rfc3339()))
-        })
-        .unwrap_or((None, None));
-
     Ok(Json(BriefGenerateResponse {
-        date,
-        window_start,
-        window_end,
-        content_markdown: content,
+        id: snapshot.id,
+        date: snapshot.date,
+        window_start: snapshot.window_start,
+        window_end: snapshot.window_end,
+        effective_time_zone: snapshot.effective_time_zone,
+        effective_local_boundary: snapshot.effective_local_boundary,
+        release_count: snapshot.release_ids.len(),
+        release_ids: snapshot
+            .release_ids
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect(),
+        content_markdown: snapshot.content_markdown,
     })
     .into_response())
 }
@@ -9834,13 +10188,13 @@ mod tests {
         admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
         admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
         brief_contains_release_link, build_compare_digest, build_task_diagnostics,
-        ensure_account_enabled, execute_sync_all_sync_with, extract_translation_fields,
-        feed_item_from_row, get_release_detail, github_access_restricted_error,
-        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
-        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_feed, list_releases, llm_call_order_by_clause,
-        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
-        map_public_compare_fallback_error, mark_translation_requested,
+        ensure_account_enabled, execute_sync_all_sync_with, extract_brief_release_ids,
+        extract_translation_fields, feed_item_from_row, get_release_detail,
+        github_access_restricted_error, github_graphql_errors_to_api_error,
+        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
+        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
+        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
+        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -10057,6 +10411,7 @@ mod tests {
             ai: None,
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
@@ -10102,6 +10457,7 @@ mod tests {
             }),
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
@@ -10740,15 +11096,16 @@ mod tests {
         let created_at = format!("{date}T08:00:00Z");
         sqlx::query(
             r#"
-            INSERT INTO briefs (id, user_id, date, content_markdown, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO briefs (id, user_id, date, content_markdown, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(format!("brief-{date}"))
         .bind(user_id)
         .bind(date)
         .bind(content_markdown)
-        .bind(created_at)
+        .bind(&created_at)
+        .bind(created_at.clone())
         .execute(pool)
         .await
         .expect("seed brief");
@@ -12880,6 +13237,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_get_realtime_task_detail_maps_brief_history_recompute_progress() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-brief-history");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_BRIEF_HISTORY_RECOMPUTE)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(r#"{"total":3,"processed":2,"succeeded":1,"failed":1,"canceled":false}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for (event_id, payload_json, created_at) in [
+            (
+                "1111111111111111",
+                r#"{"stage":"recompute","brief_id":"brief_old"}"#,
+                "2026-03-06T14:30:01Z",
+            ),
+            (
+                "2222222222222222",
+                r#"{"stage":"brief_failed","brief_id":"brief_latest","error":"boom"}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let brief_history = diagnostics
+            .brief_history_recompute
+            .expect("brief history diagnostics");
+        assert_eq!(brief_history.total, 3);
+        assert_eq!(brief_history.processed, 2);
+        assert_eq!(brief_history.succeeded, 1);
+        assert_eq!(brief_history.failed, 1);
+        assert_eq!(
+            brief_history.current_brief_id.as_deref(),
+            Some("brief_latest")
+        );
+        assert_eq!(brief_history.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_uses_summary_event_for_failed_brief_history_recompute()
+    {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-brief-history-failed");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_BRIEF_HISTORY_RECOMPUTE)
+        .bind(jobs::STATUS_FAILED)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(Some("all failed"))
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Some("2026-03-06T14:31:00Z"))
+        .bind("2026-03-06T14:31:00Z")
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert failed task row");
+
+        for (event_id, payload_json, created_at) in [
+            (
+                "3333333333333333",
+                r#"{"stage":"brief_failed","brief_id":"brief_legacy_01","error":"boom"}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+            (
+                "4444444444444444",
+                r#"{"stage":"summary","total":4,"processed":4,"succeeded":0,"failed":4,"canceled":false}"#,
+                "2026-03-06T14:31:00Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let brief_history = diagnostics
+            .brief_history_recompute
+            .expect("brief history diagnostics");
+        assert_eq!(brief_history.total, 4);
+        assert_eq!(brief_history.processed, 4);
+        assert_eq!(brief_history.succeeded, 0);
+        assert_eq!(brief_history.failed, 4);
+        assert_eq!(brief_history.current_brief_id, None);
+        assert_eq!(brief_history.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
     async fn admin_get_realtime_task_detail_uses_latest_subscription_events_window() {
         let pool = setup_pool().await;
         seed_user(&pool, 2, "admin", 1, 0).await;
@@ -13654,6 +14199,15 @@ line two",
     fn brief_contains_release_link_accepts_query_order_variant() {
         let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
         assert!(brief_contains_release_link(markdown, 123));
+    }
+
+    #[test]
+    fn extract_brief_release_ids_preserves_order_without_duplicates() {
+        let markdown = "\
+- [a](/?tab=briefs&release=123)\n\
+- [b](/?release=456&tab=briefs)\n\
+- [dup](/?tab=briefs&release=123)\n";
+        assert_eq!(extract_brief_release_ids(markdown), vec![123, 456]);
     }
 
     #[tokio::test]
@@ -14925,5 +15479,70 @@ echo should_not_be_in_excerpt
             preserve_chunk_trailing_newline("line\n", "译文\n".to_owned()),
             "译文\n"
         );
+    }
+
+    #[tokio::test]
+    async fn persist_daily_brief_profile_rejects_missing_scheduler_slots() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            UPDATE daily_brief_hour_slots
+            SET enabled = 0, updated_at = '2026-04-14T00:00:00Z'
+            WHERE hour_utc = 12
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("disable scheduler slot");
+        let state = setup_state(pool);
+
+        let err = super::persist_daily_brief_profile(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            super::DailyBriefProfilePatchRequest {
+                daily_brief_local_time: "08:00".to_owned(),
+                daily_brief_time_zone: "America/New_York".to_owned(),
+            },
+        )
+        .await
+        .expect_err("profile update should fail when required slot is disabled");
+
+        assert_eq!(err.code(), "bad_request");
+        assert!(err.to_string().contains("12:00Z"));
+    }
+
+    #[tokio::test]
+    async fn persist_daily_brief_profile_accepts_supported_scheduler_slots() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let profile = super::persist_daily_brief_profile(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            super::DailyBriefProfilePatchRequest {
+                daily_brief_local_time: "08:00".to_owned(),
+                daily_brief_time_zone: "America/New_York".to_owned(),
+            },
+        )
+        .await
+        .expect("profile update should succeed");
+
+        assert_eq!(profile.daily_brief_local_time, "08:00");
+        assert_eq!(profile.daily_brief_time_zone, "America/New_York");
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT daily_brief_local_time, daily_brief_time_zone
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted profile");
+
+        assert_eq!(row.0.as_deref(), Some("08:00"));
+        assert_eq!(row.1.as_deref(), Some("America/New_York"));
     }
 }

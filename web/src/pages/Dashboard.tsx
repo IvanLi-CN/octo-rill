@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+	type DailyBriefProfilePatchRequest,
 	type MeResponse,
+	type MeProfileResponse,
 	ApiError,
 	apiGet,
+	apiGetMeProfile,
+	apiPatchMeProfile,
 	apiPost,
 	apiPostJson,
 	apiPutJson,
 } from "@/api";
+import {
+	DailyBriefProfileForm,
+	readHourAlignedBrowserTimeZone,
+} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -111,9 +119,14 @@ type TaskEventPayload = {
 	error?: string;
 };
 type BriefGenerateResponse = {
+	id: string;
 	date: string;
 	window_start: string | null;
 	window_end: string | null;
+	effective_time_zone: string | null;
+	effective_local_boundary: string | null;
+	release_count: number;
+	release_ids: string[];
 	content_markdown: string;
 };
 
@@ -222,10 +235,14 @@ function firstPendingReactionContent(
 export function Dashboard(props: { me: MeResponse }) {
 	const { me } = props;
 	const isAdmin = me.user.is_admin;
-	const dailyBoundaryLocal = me.dashboard.daily_boundary_local;
-	const dailyBoundaryTimeZone = me.dashboard.daily_boundary_time_zone;
-	const dailyBoundaryUtcOffsetMinutes =
-		me.dashboard.daily_boundary_utc_offset_minutes;
+	const [dailyBoundaryLocal, setDailyBoundaryLocal] = useState(
+		me.dashboard.daily_boundary_local,
+	);
+	const [dailyBoundaryTimeZone, setDailyBoundaryTimeZone] = useState(
+		me.dashboard.daily_boundary_time_zone,
+	);
+	const [dailyBoundaryUtcOffsetMinutes, setDailyBoundaryUtcOffsetMinutes] =
+		useState(me.dashboard.daily_boundary_utc_offset_minutes);
 	const accessSync = me.access_sync ?? {
 		task_id: null,
 		task_type: null,
@@ -290,9 +307,7 @@ export function Dashboard(props: { me: MeResponse }) {
 		() => resolveDisplayLaneForFeed(feed.items, pageDefaultLane),
 		[feed.items, pageDefaultLane],
 	);
-	const [selectedBriefDate, setSelectedBriefDate] = useState<string | null>(
-		null,
-	);
+	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(null);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
@@ -329,6 +344,23 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
 	const [briefs, setBriefs] = useState<BriefItem[]>([]);
+	const [profileDialogOpen, setProfileDialogOpen] = useState(false);
+	const [briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
+		null,
+	);
+	const [briefProfileDraft, setBriefProfileDraft] =
+		useState<DailyBriefProfilePatchRequest>({
+			daily_brief_local_time: dailyBoundaryLocal,
+			daily_brief_time_zone:
+				dailyBoundaryTimeZone ??
+				readHourAlignedBrowserTimeZone() ??
+				"Asia/Shanghai",
+		});
+	const [briefProfileLoading, setBriefProfileLoading] = useState(false);
+	const [briefProfileSaving, setBriefProfileSaving] = useState(false);
+	const [briefProfileError, setBriefProfileError] = useState<string | null>(
+		null,
+	);
 
 	const loadReactionTokenStatus = useCallback(async () => {
 		const res = await apiGet<ReactionTokenStatusResponse>(
@@ -349,10 +381,34 @@ export function Dashboard(props: { me: MeResponse }) {
 		]);
 		setNotifications(sortNotifications(n));
 		setBriefs(b);
-		setSelectedBriefDate((prev) => {
-			if (prev && b.some((x) => x.date === prev)) return prev;
-			return b[0]?.date ?? null;
+		setSelectedBriefId((prev) => {
+			if (prev && b.some((x) => x.id === prev)) return prev;
+			return b[0]?.id ?? null;
 		});
+	}, []);
+	const refreshDashboardBoundary = useCallback(async () => {
+		const latestMe = await apiGet<MeResponse>("/api/me");
+		setDailyBoundaryLocal(latestMe.dashboard.daily_boundary_local);
+		setDailyBoundaryTimeZone(latestMe.dashboard.daily_boundary_time_zone);
+		setDailyBoundaryUtcOffsetMinutes(
+			latestMe.dashboard.daily_boundary_utc_offset_minutes,
+		);
+	}, []);
+	const loadBriefProfile = useCallback(async () => {
+		setBriefProfileLoading(true);
+		setBriefProfileError(null);
+		try {
+			const profile = await apiGetMeProfile();
+			setBriefProfile(profile);
+			setBriefProfileDraft({
+				daily_brief_local_time: profile.daily_brief_local_time,
+				daily_brief_time_zone: profile.daily_brief_time_zone,
+			});
+		} catch (err) {
+			setBriefProfileError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setBriefProfileLoading(false);
+		}
 	}, []);
 
 	const refreshAll = useCallback(async () => {
@@ -1012,6 +1068,31 @@ export function Dashboard(props: { me: MeResponse }) {
 		},
 		[refreshSidebar],
 	);
+	const onOpenProfileDialog = useCallback(() => {
+		setProfileDialogOpen(true);
+		void loadBriefProfile();
+	}, [loadBriefProfile]);
+	const onSaveBriefProfile = useCallback(() => {
+		if (!briefProfile) return;
+		setBriefProfileSaving(true);
+		setBriefProfileError(null);
+		void apiPatchMeProfile(briefProfileDraft)
+			.then(async (profile) => {
+				setBriefProfile(profile);
+				setBriefProfileDraft({
+					daily_brief_local_time: profile.daily_brief_local_time,
+					daily_brief_time_zone: profile.daily_brief_time_zone,
+				});
+				await refreshDashboardBoundary();
+				setProfileDialogOpen(false);
+			})
+			.catch((err) => {
+				setBriefProfileError(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => {
+				setBriefProfileSaving(false);
+			});
+	}, [briefProfile, briefProfileDraft, refreshDashboardBoundary]);
 	const onSyncInbox = useCallback(() => {
 		void run("Sync inbox", async () => {
 			const task = await apiPost<TaskAcceptedResponse>(
@@ -1261,6 +1342,14 @@ export function Dashboard(props: { me: MeResponse }) {
 								{busy}…
 							</span>
 						) : null}
+						<Button
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
+							onClick={onOpenProfileDialog}
+						>
+							日报设置
+						</Button>
 						{isAdmin ? (
 							<Button
 								asChild
@@ -1291,7 +1380,7 @@ export function Dashboard(props: { me: MeResponse }) {
 						<TabsContent value="briefs" className="mt-0 min-w-0">
 							<ReleaseDailyCard
 								briefs={briefs}
-								selectedDate={selectedBriefDate}
+								selectedId={selectedBriefId}
 								busy={busy === "Generate brief"}
 								onGenerate={onGenerateBrief}
 								onOpenRelease={onOpenReleaseDetail}
@@ -1311,14 +1400,80 @@ export function Dashboard(props: { me: MeResponse }) {
 						{tab === "briefs" ? (
 							<BriefListCard
 								briefs={briefs}
-								selectedDate={selectedBriefDate}
-								onSelectDate={(d) => setSelectedBriefDate(d)}
+								selectedId={selectedBriefId}
+								onSelectId={(id) => setSelectedBriefId(id)}
 							/>
 						) : null}
 						<InboxQuickList notifications={notifications} />
 					</aside>
 				</div>
 			</Tabs>
+
+			<Dialog
+				open={profileDialogOpen}
+				onOpenChange={(open) => {
+					setProfileDialogOpen(open);
+					if (!open) {
+						setBriefProfileError(null);
+					}
+				}}
+			>
+				<DialogContent className="max-w-lg">
+					<DialogHeader>
+						<DialogTitle>日报设置</DialogTitle>
+						<DialogDescription>
+							之后新生成的日报会按这里的“本地整点 + IANA
+							时区”切窗口；历史快照不会被回写。
+						</DialogDescription>
+					</DialogHeader>
+					<DailyBriefProfileForm
+						localTime={briefProfileDraft.daily_brief_local_time}
+						timeZone={briefProfileDraft.daily_brief_time_zone}
+						disabled={briefProfileLoading || briefProfileSaving}
+						error={briefProfileError}
+						helperText={
+							briefProfile?.last_active_at
+								? `最近活动：${new Date(briefProfile.last_active_at).toLocaleString()}`
+								: "保存时会严格校验 IANA 时区；非法值不会降级成 offset。"
+						}
+						onLocalTimeChange={(value) =>
+							setBriefProfileDraft((current) => ({
+								...current,
+								daily_brief_local_time: value,
+							}))
+						}
+						onTimeZoneChange={(value) =>
+							setBriefProfileDraft((current) => ({
+								...current,
+								daily_brief_time_zone: value,
+							}))
+						}
+						onUseBrowserTimeZone={(timeZone) =>
+							setBriefProfileDraft((current) => ({
+								...current,
+								daily_brief_time_zone: timeZone,
+							}))
+						}
+					/>
+					<DialogFooter>
+						<Button
+							variant="outline"
+							onClick={() => setProfileDialogOpen(false)}
+							disabled={briefProfileSaving}
+						>
+							取消
+						</Button>
+						<Button
+							onClick={onSaveBriefProfile}
+							disabled={
+								briefProfileLoading || briefProfileSaving || !briefProfile
+							}
+						>
+							{briefProfileSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 
 			<ReleaseDetailCard
 				releaseId={activeReleaseId}

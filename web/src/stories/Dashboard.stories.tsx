@@ -3,6 +3,10 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
+import {
+	DailyBriefProfileForm,
+	readHourAlignedBrowserTimeZone,
+} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -73,6 +77,36 @@ const STORYBOOK_VERSION_STATE = {
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
+
+function makeBrief(
+	brief: Omit<
+		BriefItem,
+		| "id"
+		| "effective_time_zone"
+		| "effective_local_boundary"
+		| "release_count"
+		| "release_ids"
+	> &
+		Partial<
+			Pick<
+				BriefItem,
+				| "id"
+				| "effective_time_zone"
+				| "effective_local_boundary"
+				| "release_count"
+				| "release_ids"
+			>
+		>,
+): BriefItem {
+	return {
+		id: brief.id ?? `brief-${brief.date}`,
+		effective_time_zone: brief.effective_time_zone ?? "Asia/Shanghai",
+		effective_local_boundary: brief.effective_local_boundary ?? "08:00",
+		release_count: brief.release_count ?? brief.release_ids?.length ?? 0,
+		release_ids: brief.release_ids ?? [],
+		...brief,
+	};
+}
 
 function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(
@@ -590,14 +624,17 @@ function makeSmartInFlightKeys(mode: FeedMode) {
 }
 
 const mockBriefs: BriefItem[] = [
-	{
+	makeBrief({
+		id: "brief-2026-04-04",
 		date: "2026-04-04",
 		window_start: "2026-04-03T08:00:00+08:00",
 		window_end: "2026-04-04T08:00:00+08:00",
+		release_count: 2,
+		release_ids: ["10003", "10004"],
 		content_markdown:
 			"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：2 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)、[acme/satellite](https://github.com/acme/satellite)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n",
 		created_at: "2026-04-04T08:00:03+08:00",
-	},
+	}),
 ];
 
 const longBriefMarkdown = [
@@ -635,25 +672,40 @@ const longBriefMarkdown = [
 ].join("\n");
 
 const longBriefs: BriefItem[] = [
-	{
+	makeBrief({
+		id: "brief-long-2026-04-04",
 		date: "2026-04-04",
 		window_start: "2026-04-03T08:00:00+08:00",
 		window_end: "2026-04-04T08:00:00+08:00",
+		release_count: 8,
+		release_ids: [
+			LONG_BRIEF_RELEASE_ID,
+			"777003",
+			"777004",
+			"777005",
+			"777006",
+			"777007",
+			"777008",
+			"777009",
+		],
 		content_markdown: longBriefMarkdown,
 		created_at: "2026-04-04T08:00:35+08:00",
-	},
+	}),
 	mockBriefs[0],
 ];
 
 const generatedBriefTemplates: Record<string, BriefItem> = {
-	"2026-04-03": {
+	"2026-04-03": makeBrief({
+		id: "brief-2026-04-03",
 		date: "2026-04-03",
 		window_start: "2026-04-02T08:00:00+08:00",
 		window_end: "2026-04-03T08:00:00+08:00",
+		release_count: 1,
+		release_ids: ["10005"],
 		content_markdown:
 			"## 概览\n\n- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/fleet](https://github.com/acme/fleet)\n\n## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n",
 		created_at: "2026-04-03T08:00:03+08:00",
-	},
+	}),
 };
 
 const longReleaseDetail: ReleaseDetailResponse = {
@@ -759,6 +811,7 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
+	initialProfileDialogOpen?: boolean;
 	syncingAll?: boolean;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
@@ -771,10 +824,12 @@ function DashboardPreview(props: {
 	now?: Date;
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
+	showFooter?: boolean;
 }) {
 	const {
 		initialTab = "all",
 		initialPatDialogOpen = false,
+		initialProfileDialogOpen = false,
 		syncingAll = false,
 		showEmptyInbox = false,
 		emptyState = "content",
@@ -787,6 +842,7 @@ function DashboardPreview(props: {
 		now = STORYBOOK_NOW,
 		initialReleaseId = null,
 		releaseDetail = null,
+		showFooter = true,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
@@ -840,6 +896,16 @@ function DashboardPreview(props: {
 	);
 	const [tab, setTab] = useState<Tab>(initialTab);
 	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
+	const [profileDialogOpen, setProfileDialogOpen] = useState(
+		initialProfileDialogOpen,
+	);
+	const [profileDraft, setProfileDraft] = useState({
+		daily_brief_local_time: dailyBoundaryLocal,
+		daily_brief_time_zone:
+			dailyBoundaryTimeZone ??
+			readHourAlignedBrowserTimeZone() ??
+			"Asia/Shanghai",
+	});
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
@@ -849,8 +915,8 @@ function DashboardPreview(props: {
 		items,
 		pageDefaultLane,
 	);
-	const [selectedDate, setSelectedDate] = useState<string | null>(
-		briefs[0]?.date ?? null,
+	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
+		briefs[0]?.id ?? null,
 	);
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
@@ -873,6 +939,25 @@ function DashboardPreview(props: {
 		setSmartInFlightKeys(makeSmartInFlightKeys(feedMode));
 	}, [feedMode]);
 
+	useEffect(() => {
+		setSelectedBriefId((current) => {
+			if (current && storyBriefs.some((brief) => brief.id === current)) {
+				return current;
+			}
+			return storyBriefs[0]?.id ?? null;
+		});
+	}, [storyBriefs]);
+
+	useEffect(() => {
+		setProfileDraft({
+			daily_brief_local_time: dailyBoundaryLocal,
+			daily_brief_time_zone:
+				dailyBoundaryTimeZone ??
+				readHourAlignedBrowserTimeZone() ??
+				"Asia/Shanghai",
+		});
+	}, [dailyBoundaryLocal, dailyBoundaryTimeZone]);
+
 	const openReleaseDetail = (releaseId: string) => {
 		setTab("briefs");
 		setActiveReleaseId(releaseId);
@@ -882,19 +967,24 @@ function DashboardPreview(props: {
 		await new Promise((resolve) => window.setTimeout(resolve, 900));
 		const nextBrief =
 			generatedBriefTemplates[date] ??
-			({
+			makeBrief({
+				id: `brief-generated-${date}`,
 				date,
 				window_start: null,
 				window_end: null,
 				content_markdown:
 					"## 概览\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。",
 				created_at: `${date}T08:00:03+08:00`,
-			} satisfies BriefItem);
+			});
 		setStoryBriefs((current) =>
-			[nextBrief, ...current.filter((brief) => brief.date !== date)].sort(
-				(a, b) => b.date.localeCompare(a.date),
+			[nextBrief, ...current.filter((brief) => brief.id !== nextBrief.id)].sort(
+				(a, b) =>
+					(b.window_end ?? b.created_at).localeCompare(
+						a.window_end ?? a.created_at,
+					),
 			),
 		);
+		setSelectedBriefId(nextBrief.id);
 	};
 
 	const triggerSmartNow = (item: FeedItem) => {
@@ -1007,7 +1097,7 @@ function DashboardPreview(props: {
 					/>
 				}
 				notice={<VersionUpdateNotice />}
-				footer={<AppMetaFooter />}
+				footer={showFooter ? <AppMetaFooter /> : undefined}
 				mobileChrome
 			>
 				<Tabs
@@ -1035,9 +1125,9 @@ function DashboardPreview(props: {
 								variant="outline"
 								size="sm"
 								className="font-mono text-xs"
-								onClick={() => setPatDialogOpen(true)}
+								onClick={() => setProfileDialogOpen(true)}
 							>
-								打开 PAT 配置
+								日报设置
 							</Button>
 							<Button
 								asChild
@@ -1067,7 +1157,7 @@ function DashboardPreview(props: {
 							<TabsContent value="briefs" className="mt-0 min-w-0">
 								<ReleaseDailyCard
 									briefs={storyBriefs}
-									selectedDate={selectedDate}
+									selectedId={selectedBriefId}
 									busy={false}
 									onGenerate={() => {}}
 									onOpenRelease={setActiveReleaseId}
@@ -1087,8 +1177,8 @@ function DashboardPreview(props: {
 							{tab === "briefs" ? (
 								<BriefListCard
 									briefs={storyBriefs}
-									selectedDate={selectedDate}
-									onSelectDate={(d) => setSelectedDate(d)}
+									selectedId={selectedBriefId}
+									onSelectId={(id) => setSelectedBriefId(id)}
 								/>
 							) : null}
 							<InboxQuickList notifications={notifications} />
@@ -1100,6 +1190,50 @@ function DashboardPreview(props: {
 					releaseId={activeReleaseId}
 					onClose={() => setActiveReleaseId(null)}
 				/>
+
+				<Dialog open={profileDialogOpen} onOpenChange={setProfileDialogOpen}>
+					<DialogContent className="max-w-lg">
+						<DialogHeader>
+							<DialogTitle>日报设置</DialogTitle>
+							<DialogDescription>
+								之后新生成的日报会按这里的“本地整点 + IANA 时区”切窗口；
+								历史快照不会被回写。
+							</DialogDescription>
+						</DialogHeader>
+						<DailyBriefProfileForm
+							localTime={profileDraft.daily_brief_local_time}
+							timeZone={profileDraft.daily_brief_time_zone}
+							helperText="Storybook 里只演示入口与表单布局；真实页面会走 /api/me/profile。"
+							onLocalTimeChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_local_time: value,
+								}))
+							}
+							onTimeZoneChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: value,
+								}))
+							}
+							onUseBrowserTimeZone={(timeZone) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: timeZone,
+								}))
+							}
+						/>
+						<DialogFooter>
+							<Button
+								variant="outline"
+								onClick={() => setProfileDialogOpen(false)}
+							>
+								取消
+							</Button>
+							<Button>保存设置</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
 
 				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
 					<DialogContent
@@ -1162,6 +1296,7 @@ const meta = {
 	args: {
 		initialTab: "all",
 		initialPatDialogOpen: false,
+		initialProfileDialogOpen: false,
 		syncingAll: false,
 		showEmptyInbox: false,
 		emptyState: "content",
@@ -1169,6 +1304,7 @@ const meta = {
 		briefs: undefined,
 		initialReleaseId: null,
 		releaseDetail: null,
+		showFooter: true,
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -1214,6 +1350,9 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
+		await expect(
+			canvas.getByRole("button", { name: "日报设置" }),
+		).toBeVisible();
 	},
 };
 
@@ -1248,6 +1387,7 @@ export const EvidenceReleasesGroupedByDay: Story = {
 	name: "Evidence / Releases Grouped By Day",
 	args: {
 		initialTab: "releases",
+		showFooter: false,
 	},
 	parameters: {
 		docs: {
@@ -1349,6 +1489,7 @@ export const EvidenceAllHistoryCollapsedToBriefs: Story = {
 	name: "Evidence / All History Collapsed To Briefs",
 	args: {
 		initialTab: "all",
+		showFooter: false,
 	},
 	parameters: {
 		docs: {
@@ -1395,6 +1536,21 @@ export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
 	args: {
 		initialTab: "all",
 		briefs: [],
+		showFooter: false,
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const EvidenceDailyBriefProfileOpen: Story = {
+	name: "Evidence / Daily Brief Profile Open",
+	args: {
+		initialTab: "all",
+		initialProfileDialogOpen: true,
+		showFooter: false,
 	},
 	parameters: {
 		docs: {
