@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-03-03
-- Last: 2026-03-03
+- Last: 2026-04-15
 
 ## 背景 / 问题陈述
 
@@ -19,6 +19,8 @@
 - 保持 `GET /api/health` 响应兼容，沿用相同有效版本来源。
 - 前端 footer 优先读取 `/api/version`，失败回退 `/api/health`。
 - 打通 Docker 构建注入闭环并增加 release 保护校验。
+- 前端构建阶段嵌入版本优先消费 `APP_EFFECTIVE_VERSION`，仅在 env 缺失时回退仓库根 `Cargo.toml`，且缺失时不得崩溃。
+- 普通 CI 增加 Docker smoke，提前覆盖 release `web-builder` 构建路径。
 
 ### Non-goals
 
@@ -33,9 +35,11 @@
 - `src/version.rs`：统一版本来源解析。
 - `src/server.rs`：新增 `/api/version`，更新 `/api/health` 版本来源。
 - `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑。
-- `Dockerfile`：Rust 构建阶段消费 `APP_EFFECTIVE_VERSION`。
+- `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
+- `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`。
+- `.github/workflows/ci.yml`：新增 Docker smoke 覆盖 release `web-builder` 路径。
 - `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护。
-- 后端/前端测试覆盖新增行为。
+- 后端/前端测试覆盖新增行为与前端构建期 fallback 契约。
 
 ### Out of scope
 
@@ -73,6 +77,22 @@
   When 访问 `/api/version`
   Then 返回 `version=CARGO_PKG_VERSION` 且 `source=CARGO_PKG_VERSION`。
 
+- Given 前端构建时注入 `APP_EFFECTIVE_VERSION=9.9.9`
+  When `vite.config.ts` 解析嵌入版本
+  Then 稳定使用 `APP_EFFECTIVE_VERSION`，不会为了读取 fallback 而强依赖仓库根 `Cargo.toml`。
+
+- Given 前端构建时未注入 `APP_EFFECTIVE_VERSION` 且仓库根 `Cargo.toml` 存在
+  When `vite.config.ts` 解析嵌入版本
+  Then 使用 `Cargo.toml` 中的 package version 作为兜底。
+
+- Given 前端构建时既未注入 `APP_EFFECTIVE_VERSION`，仓库根 `Cargo.toml` 也缺失或不可读
+  When `vite.config.ts` 解析嵌入版本
+  Then 回退 `"unknown"` 且构建成功，不得抛出 `ENOENT`。
+
+- Given CI 运行在 pull request / merge_group / main push
+  When 执行 `CI Pipeline`
+  Then `Docker Smoke` 必须对真实 `Dockerfile` 完成 `linux/amd64` 构建冒烟，并传入合成 `APP_EFFECTIVE_VERSION`。
+
 - Given `/api/version` 不可用
   When 前端 footer 拉取版本
   Then 自动回退 `/api/health` 并正确显示版本。
@@ -86,9 +106,11 @@
 - [x] M1: 后端版本解析模块与 `/api/version` 完成。
 - [x] M2: 前端 footer 双端点回退逻辑完成。
 - [x] M3: Docker/release 注入链路校验与自动化测试完成。
+- [x] M4: 前端 `vite.config.ts` fallback 容错与 CI Docker smoke 完成。
 
 ## 变更记录（Change log）
 
 - 2026-03-03: 建立规格并冻结修复范围与接口决策。
 - 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
 - 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
+- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，并新增 `Docker Smoke` CI 门禁。

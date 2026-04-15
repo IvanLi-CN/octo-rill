@@ -25,7 +25,8 @@
           "Worktree Bootstrap Smoke (ubuntu-latest)": 15368,
           "Worktree Bootstrap Smoke (macos-latest)": 15368,
           "Build (Release)": 15368,
-          "Review Policy Gate": 15368
+          "Review Policy Gate": 15368,
+          "Docker Smoke": 15368
         }
       }
     },
@@ -56,6 +57,7 @@
     "Worktree Bootstrap Smoke (ubuntu-latest)",
     "Worktree Bootstrap Smoke (macos-latest)",
     "Build (Release)",
+    "Docker Smoke",
     "Review Policy Gate"
   ],
   "informational_checks": [],
@@ -75,7 +77,8 @@
         "Frontend E2E",
         "Worktree Bootstrap Smoke (ubuntu-latest)",
         "Worktree Bootstrap Smoke (macos-latest)",
-        "Build (Release)"
+        "Build (Release)",
+        "Docker Smoke"
       ]
     },
     {

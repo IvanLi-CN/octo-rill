@@ -78,6 +78,10 @@
               "integration_id": 15368
             },
             {
+              "context": "Docker Smoke",
+              "integration_id": 15368
+            },
+            {
               "context": "Review Policy Gate",
               "integration_id": 15368
             }

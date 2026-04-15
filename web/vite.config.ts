@@ -1,20 +1,18 @@
-import fs from "node:fs";
 import path from "node:path";
 import { tanstackRouter } from "@tanstack/router-plugin/vite";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react-swc";
 import { defineConfig } from "vite";
+import {
+	readCargoPackageVersion,
+	resolveEmbeddedAppVersion,
+} from "./config/embeddedVersion";
 
 const repoRoot = path.resolve(__dirname, "..");
-const cargoTomlPath = path.resolve(repoRoot, "Cargo.toml");
-const cargoToml = fs.readFileSync(cargoTomlPath, "utf8");
-const cargoVersionMatch = cargoToml.match(
-	/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m,
+const embeddedAppVersion = resolveEmbeddedAppVersion(
+	process.env.APP_EFFECTIVE_VERSION,
+	readCargoPackageVersion(repoRoot),
 );
-const embeddedAppVersion =
-	process.env.APP_EFFECTIVE_VERSION?.trim() ||
-	cargoVersionMatch?.[1] ||
-	"unknown";
 
 // https://vite.dev/config/
 export default defineConfig({
