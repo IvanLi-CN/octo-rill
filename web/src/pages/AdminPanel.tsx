@@ -2,6 +2,7 @@ import {
 	UserManagement,
 	type UserManagementStoryState,
 } from "@/admin/UserManagement";
+import type { AdminUsersWarmSnapshot } from "@/auth/startupCache";
 import type { MeResponse } from "@/api";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -11,8 +12,13 @@ import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 export function AdminPanel(props: {
 	me: MeResponse;
 	userManagementStoryState?: UserManagementStoryState;
+	userManagementWarmStart?: AdminUsersWarmSnapshot | null;
 }) {
-	const { me, userManagementStoryState } = props;
+	const {
+		me,
+		userManagementStoryState,
+		userManagementWarmStart = null,
+	} = props;
 
 	return (
 		<AppShell
@@ -28,6 +34,7 @@ export function AdminPanel(props: {
 				<UserManagement
 					currentUserId={me.user.id}
 					storyState={userManagementStoryState}
+					warmStart={userManagementWarmStart}
 				/>
 			</div>
 		</AppShell>

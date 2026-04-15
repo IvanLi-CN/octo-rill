@@ -13,6 +13,10 @@ import {
 	apiPutJson,
 } from "@/api";
 import {
+	persistDashboardWarmSnapshot,
+	type DashboardWarmSnapshot,
+} from "@/auth/startupCache";
+import {
 	DailyBriefProfileForm,
 	readHourAlignedBrowserTimeZone,
 } from "@/briefs/DailyBriefProfileForm";
@@ -52,12 +56,14 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import { InternalLink } from "@/lib/internalNavigation";
 import { normalizeReleaseId } from "@/lib/releaseId";
 import {
 	DashboardMobileControlBand,
 	type DashboardTab as Tab,
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
+import { DashboardStartupSkeleton } from "@/pages/AppBoot";
 import { DashboardHeader } from "@/pages/DashboardHeader";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -165,14 +171,21 @@ function sortNotifications(items: NotificationItem[]) {
 	});
 }
 
-function parseDashboardQuery() {
-	const params = new URLSearchParams(window.location.search);
-	const releaseId = normalizeReleaseId(params.get("release"));
+export type DashboardRouteState = {
+	tab: Tab;
+	activeReleaseId: string | null;
+};
+
+export function parseDashboardRouteState(search: {
+	tab?: string | null;
+	release?: string | null;
+}): DashboardRouteState {
+	const releaseId = normalizeReleaseId(search.release);
 	if (releaseId) {
-		return { tab: "briefs" as Tab, releaseId };
+		return { tab: "briefs", activeReleaseId: releaseId };
 	}
 
-	const rawTab = params.get("tab");
+	const rawTab = search.tab;
 	const tab: Tab =
 		rawTab === "releases" ||
 		rawTab === "stars" ||
@@ -181,7 +194,29 @@ function parseDashboardQuery() {
 		rawTab === "inbox"
 			? rawTab
 			: "all";
-	return { tab, releaseId };
+	return { tab, activeReleaseId: null };
+}
+
+export function buildDashboardSearch(routeState: DashboardRouteState) {
+	if (routeState.activeReleaseId) {
+		return {
+			tab: "briefs" as const,
+			release: routeState.activeReleaseId,
+		};
+	}
+
+	return {
+		tab: routeState.tab === "all" ? undefined : routeState.tab,
+		release: undefined,
+	};
+}
+
+function parseDashboardQuery() {
+	const params = new URLSearchParams(window.location.search);
+	return parseDashboardRouteState({
+		tab: params.get("tab"),
+		release: params.get("release"),
+	});
 }
 
 function readStoredPageDefaultLane() {
@@ -232,8 +267,24 @@ function firstPendingReactionContent(
 	);
 }
 
-export function Dashboard(props: { me: MeResponse }) {
-	const { me } = props;
+export function Dashboard(props: {
+	me: MeResponse;
+	routeState?: DashboardRouteState;
+	onRouteStateChange?: (
+		nextRouteState: DashboardRouteState,
+		options?: {
+			replace?: boolean;
+		},
+	) => void;
+	warmStart?: DashboardWarmSnapshot | null;
+}) {
+	const {
+		me,
+		routeState: controlledRouteState,
+		onRouteStateChange,
+		warmStart = null,
+	} = props;
+	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, setDailyBoundaryLocal] = useState(
 		me.dashboard.daily_boundary_local,
@@ -260,6 +311,9 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
+	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
+		warmStart ? "warm-cache" : "network",
+	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
@@ -279,9 +333,25 @@ export function Dashboard(props: { me: MeResponse }) {
 		>
 	>(new Map());
 
-	const [tab, setTab] = useState<Tab>(() => parseDashboardQuery().tab);
-	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
-		() => parseDashboardQuery().releaseId,
+	const [uncontrolledRouteState, setUncontrolledRouteState] =
+		useState<DashboardRouteState>(() => parseDashboardQuery());
+	const routeState = controlledRouteState ?? uncontrolledRouteState;
+	const tab = routeState.tab;
+	const activeReleaseId = routeState.activeReleaseId;
+	const setRouteState = useCallback(
+		(
+			nextRouteState: DashboardRouteState,
+			options?: {
+				replace?: boolean;
+			},
+		) => {
+			if (onRouteStateChange) {
+				onRouteStateChange(nextRouteState, options);
+				return;
+			}
+			setUncontrolledRouteState(nextRouteState);
+		},
+		[onRouteStateChange],
 	);
 
 	const feedRequestType: FeedRequestType =
@@ -293,7 +363,17 @@ export function Dashboard(props: { me: MeResponse }) {
 					? "followers"
 					: "all";
 
-	const feed = useFeed(feedRequestType);
+	const warmFeedData =
+		warmStart && warmStart.feedRequestType === feedRequestType
+			? {
+					type: warmStart.feedRequestType,
+					items: warmStart.feedItems,
+					nextCursor: warmStart.nextCursor,
+				}
+			: null;
+	const feed = useFeed(feedRequestType, {
+		initialData: warmFeedData,
+	});
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
 
@@ -307,7 +387,9 @@ export function Dashboard(props: { me: MeResponse }) {
 		() => resolveDisplayLaneForFeed(feed.items, pageDefaultLane),
 		[feed.items, pageDefaultLane],
 	);
-	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(null);
+	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
+		() => warmStart?.selectedBriefId ?? null,
+	);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
@@ -342,8 +424,15 @@ export function Dashboard(props: { me: MeResponse }) {
 	} | null>(null);
 	const patCheckSeqRef = useRef(0);
 
-	const [notifications, setNotifications] = useState<NotificationItem[]>([]);
-	const [briefs, setBriefs] = useState<BriefItem[]>([]);
+	const [notifications, setNotifications] = useState<NotificationItem[]>(
+		() => warmStart?.notifications ?? [],
+	);
+	const [briefs, setBriefs] = useState<BriefItem[]>(
+		() => warmStart?.briefs ?? [],
+	);
+	const [sidebarLoading, setSidebarLoading] = useState(
+		() => warmStart === null,
+	);
 	const [profileDialogOpen, setProfileDialogOpen] = useState(false);
 	const [briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
 		null,
@@ -374,18 +463,28 @@ export function Dashboard(props: { me: MeResponse }) {
 		}
 	}, []);
 
-	const refreshSidebar = useCallback(async () => {
-		const [n, b] = await Promise.all([
-			apiGet<NotificationItem[]>("/api/notifications"),
-			apiGet<BriefItem[]>("/api/briefs"),
-		]);
-		setNotifications(sortNotifications(n));
-		setBriefs(b);
-		setSelectedBriefId((prev) => {
-			if (prev && b.some((x) => x.id === prev)) return prev;
-			return b[0]?.id ?? null;
-		});
-	}, []);
+	const refreshSidebar = useCallback(
+		async (options?: { background?: boolean }) => {
+			if (!options?.background) {
+				setSidebarLoading(true);
+			}
+			try {
+				const [n, b] = await Promise.all([
+					apiGet<NotificationItem[]>("/api/notifications"),
+					apiGet<BriefItem[]>("/api/briefs"),
+				]);
+				setNotifications(sortNotifications(n));
+				setBriefs(b);
+				setSelectedBriefId((prev) => {
+					if (prev && b.some((x) => x.id === prev)) return prev;
+					return b[0]?.id ?? null;
+				});
+			} finally {
+				setSidebarLoading(false);
+			}
+		},
+		[],
+	);
 	const refreshDashboardBoundary = useCallback(async () => {
 		const latestMe = await apiGet<MeResponse>("/api/me");
 		setDailyBoundaryLocal(latestMe.dashboard.daily_boundary_local);
@@ -502,13 +601,13 @@ export function Dashboard(props: { me: MeResponse }) {
 
 	useEffect(() => {
 		void loadInitialFeed();
-		void refreshSidebar().catch((err) => {
+		void refreshSidebar({ background: warmStart !== null }).catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 		void loadReactionTokenStatus().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar]);
+	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar, warmStart]);
 
 	useEffect(() => {
 		window.localStorage.setItem(PAGE_DEFAULT_LANE_STORAGE_KEY, pageDefaultLane);
@@ -1139,21 +1238,35 @@ export function Dashboard(props: { me: MeResponse }) {
 		[resetPatDialogState],
 	);
 
-	const onSelectTab = useCallback((nextTab: Tab) => {
-		setTab(nextTab);
-		if (nextTab !== "briefs") {
-			setActiveReleaseId(null);
-		}
-	}, []);
+	const onSelectTab = useCallback(
+		(nextTab: Tab) => {
+			setRouteState({
+				tab: nextTab,
+				activeReleaseId: nextTab === "briefs" ? activeReleaseId : null,
+			});
+		},
+		[activeReleaseId, setRouteState],
+	);
 
-	const onOpenReleaseDetail = useCallback((releaseId: string) => {
-		setTab("briefs");
-		setActiveReleaseId(releaseId);
-	}, []);
+	const onOpenReleaseDetail = useCallback(
+		(releaseId: string) => {
+			setRouteState({
+				tab: "briefs",
+				activeReleaseId: releaseId,
+			});
+		},
+		[setRouteState],
+	);
 
 	const onCloseReleaseDetail = useCallback(() => {
-		setActiveReleaseId(null);
-	}, []);
+		setRouteState(
+			{
+				tab,
+				activeReleaseId: null,
+			},
+			{ replace: true },
+		);
+	}, [setRouteState, tab]);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
 
 	const renderFeedPanel = (
@@ -1237,6 +1350,7 @@ export function Dashboard(props: { me: MeResponse }) {
 	};
 
 	useEffect(() => {
+		if (isRouteControlled) return;
 		const params = new URLSearchParams(window.location.search);
 		if (tab === "all") {
 			params.delete("tab");
@@ -1253,7 +1367,7 @@ export function Dashboard(props: { me: MeResponse }) {
 		if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
 			window.history.replaceState({}, "", nextUrl);
 		}
-	}, [tab, activeReleaseId]);
+	}, [isRouteControlled, tab, activeReleaseId]);
 
 	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
@@ -1279,6 +1393,44 @@ export function Dashboard(props: { me: MeResponse }) {
 		selectedLaneByKey,
 		tab,
 	]);
+
+	useEffect(() => {
+		if (feed.loadingInitial || sidebarLoading) {
+			return;
+		}
+		persistDashboardWarmSnapshot({
+			userId: me.user.id,
+			routeState: {
+				tab,
+				activeReleaseId,
+			},
+			feedRequestType,
+			feedItems: feed.items,
+			nextCursor: feed.nextCursor,
+			notifications,
+			briefs,
+			selectedBriefId,
+		});
+	}, [
+		activeReleaseId,
+		briefs,
+		feed.items,
+		feed.loadingInitial,
+		feed.nextCursor,
+		feedRequestType,
+		me.user.id,
+		notifications,
+		selectedBriefId,
+		sidebarLoading,
+		tab,
+	]);
+
+	const showStartupSkeleton =
+		warmStart === null && (feed.loadingInitial || sidebarLoading);
+
+	if (showStartupSkeleton) {
+		return <DashboardStartupSkeleton me={me} />;
+	}
 
 	return (
 		<AppShell
@@ -1309,247 +1461,251 @@ export function Dashboard(props: { me: MeResponse }) {
 			footer={<AppMetaFooter />}
 			mobileChrome
 		>
-			{bootError ? (
-				<p className="text-destructive mb-4 text-sm">{bootError}</p>
-			) : null}
+			<div data-dashboard-hydration-source={hydrationSource}>
+				{bootError ? (
+					<p className="text-destructive mb-4 text-sm">{bootError}</p>
+				) : null}
 
-			<Tabs
-				value={tab}
-				onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
-				className="gap-4 sm:gap-6"
-			>
-				<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
-					<DashboardTabsList />
+				<Tabs
+					value={tab}
+					onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
+					className="gap-4 sm:gap-6"
+				>
+					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
+						<DashboardTabsList />
 
-					<div
-						className="flex items-center gap-2"
-						data-dashboard-secondary-controls
-					>
-						{showPageLaneSelector ? (
-							<FeedPageLaneSelector
-								value={effectivePageDefaultLane}
-								onValueChange={onSelectPageDefaultLane}
-								className="hidden sm:inline-flex"
-							/>
-						) : null}
-						{aiDisabledHint ? (
-							<span className="text-muted-foreground font-mono text-xs">
-								AI 未配置，将只显示原文
-							</span>
-						) : null}
-						{busy ? (
-							<span className="text-muted-foreground font-mono text-xs">
-								{busy}…
-							</span>
-						) : null}
-						<Button
-							variant="outline"
-							size="sm"
-							className="font-mono text-xs"
-							onClick={onOpenProfileDialog}
+						<div
+							className="flex items-center gap-2"
+							data-dashboard-secondary-controls
 						>
-							日报设置
-						</Button>
-						{isAdmin ? (
+							{showPageLaneSelector ? (
+								<FeedPageLaneSelector
+									value={effectivePageDefaultLane}
+									onValueChange={onSelectPageDefaultLane}
+									className="hidden sm:inline-flex"
+								/>
+							) : null}
+							{aiDisabledHint ? (
+								<span className="text-muted-foreground font-mono text-xs">
+									AI 未配置，将只显示原文
+								</span>
+							) : null}
+							{busy ? (
+								<span className="text-muted-foreground font-mono text-xs">
+									{busy}…
+								</span>
+							) : null}
 							<Button
-								asChild
 								variant="outline"
 								size="sm"
 								className="font-mono text-xs"
+								onClick={onOpenProfileDialog}
 							>
-								<a href="/admin">管理员面板</a>
+								日报设置
 							</Button>
-						) : null}
+							{isAdmin ? (
+								<Button
+									asChild
+									variant="outline"
+									size="sm"
+									className="font-mono text-xs"
+								>
+									<InternalLink href="/admin" to="/admin">
+										管理员面板
+									</InternalLink>
+								</Button>
+							) : null}
+						</div>
 					</div>
-				</div>
 
-				<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
-					<section className="min-w-0">
-						<TabsContent value="all" className="mt-0 min-w-0">
-							{renderFeedPanel("all")}
-						</TabsContent>
-						<TabsContent value="releases" className="mt-0 min-w-0">
-							{renderFeedPanel("releases")}
-						</TabsContent>
-						<TabsContent value="stars" className="mt-0 min-w-0">
-							{renderFeedPanel("stars")}
-						</TabsContent>
-						<TabsContent value="followers" className="mt-0 min-w-0">
-							{renderFeedPanel("followers")}
-						</TabsContent>
-						<TabsContent value="briefs" className="mt-0 min-w-0">
-							<ReleaseDailyCard
-								briefs={briefs}
-								selectedId={selectedBriefId}
-								busy={busy === "Generate brief"}
-								onGenerate={onGenerateBrief}
-								onOpenRelease={onOpenReleaseDetail}
-							/>
-						</TabsContent>
-						<TabsContent value="inbox" className="mt-0 min-w-0">
-							<InboxList
-								notifications={notifications}
-								busy={Boolean(busy)}
-								syncing={syncingInbox}
-								onSync={tab === "inbox" ? onSyncInbox : undefined}
-							/>
-						</TabsContent>
-					</section>
+					<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
+						<section className="min-w-0">
+							<TabsContent value="all" className="mt-0 min-w-0">
+								{renderFeedPanel("all")}
+							</TabsContent>
+							<TabsContent value="releases" className="mt-0 min-w-0">
+								{renderFeedPanel("releases")}
+							</TabsContent>
+							<TabsContent value="stars" className="mt-0 min-w-0">
+								{renderFeedPanel("stars")}
+							</TabsContent>
+							<TabsContent value="followers" className="mt-0 min-w-0">
+								{renderFeedPanel("followers")}
+							</TabsContent>
+							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<ReleaseDailyCard
+									briefs={briefs}
+									selectedId={selectedBriefId}
+									busy={busy === "Generate brief"}
+									onGenerate={onGenerateBrief}
+									onOpenRelease={onOpenReleaseDetail}
+								/>
+							</TabsContent>
+							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<InboxList
+									notifications={notifications}
+									busy={Boolean(busy)}
+									syncing={syncingInbox}
+									onSync={tab === "inbox" ? onSyncInbox : undefined}
+								/>
+							</TabsContent>
+						</section>
 
-					<aside className="space-y-4 sm:space-y-6">
-						{tab === "briefs" ? (
-							<BriefListCard
-								briefs={briefs}
-								selectedId={selectedBriefId}
-								onSelectId={(id) => setSelectedBriefId(id)}
-							/>
-						) : null}
-						<InboxQuickList notifications={notifications} />
-					</aside>
-				</div>
-			</Tabs>
+						<aside className="space-y-4 sm:space-y-6">
+							{tab === "briefs" ? (
+								<BriefListCard
+									briefs={briefs}
+									selectedId={selectedBriefId}
+									onSelectId={(id) => setSelectedBriefId(id)}
+								/>
+							) : null}
+							<InboxQuickList notifications={notifications} />
+						</aside>
+					</div>
+				</Tabs>
 
-			<Dialog
-				open={profileDialogOpen}
-				onOpenChange={(open) => {
-					setProfileDialogOpen(open);
-					if (!open) {
-						setBriefProfileError(null);
-					}
-				}}
-			>
-				<DialogContent className="max-w-lg">
-					<DialogHeader>
-						<DialogTitle>日报设置</DialogTitle>
-						<DialogDescription>
-							之后新生成的日报会按这里的“本地整点 + IANA
-							时区”切窗口；历史快照不会被回写。
-						</DialogDescription>
-					</DialogHeader>
-					<DailyBriefProfileForm
-						localTime={briefProfileDraft.daily_brief_local_time}
-						timeZone={briefProfileDraft.daily_brief_time_zone}
-						disabled={briefProfileLoading || briefProfileSaving}
-						error={briefProfileError}
-						helperText={
-							briefProfile?.last_active_at
-								? `最近活动：${new Date(briefProfile.last_active_at).toLocaleString()}`
-								: "保存时会严格校验 IANA 时区；非法值不会降级成 offset。"
+				<Dialog
+					open={profileDialogOpen}
+					onOpenChange={(open) => {
+						setProfileDialogOpen(open);
+						if (!open) {
+							setBriefProfileError(null);
 						}
-						onLocalTimeChange={(value) =>
-							setBriefProfileDraft((current) => ({
-								...current,
-								daily_brief_local_time: value,
-							}))
-						}
-						onTimeZoneChange={(value) =>
-							setBriefProfileDraft((current) => ({
-								...current,
-								daily_brief_time_zone: value,
-							}))
-						}
-						onUseBrowserTimeZone={(timeZone) =>
-							setBriefProfileDraft((current) => ({
-								...current,
-								daily_brief_time_zone: timeZone,
-							}))
-						}
-					/>
-					<DialogFooter>
-						<Button
-							variant="outline"
-							onClick={() => setProfileDialogOpen(false)}
-							disabled={briefProfileSaving}
-						>
-							取消
-						</Button>
-						<Button
-							onClick={onSaveBriefProfile}
-							disabled={
-								briefProfileLoading || briefProfileSaving || !briefProfile
+					}}
+				>
+					<DialogContent className="max-w-lg">
+						<DialogHeader>
+							<DialogTitle>日报设置</DialogTitle>
+							<DialogDescription>
+								之后新生成的日报会按这里的“本地整点 + IANA
+								时区”切窗口；历史快照不会被回写。
+							</DialogDescription>
+						</DialogHeader>
+						<DailyBriefProfileForm
+							localTime={briefProfileDraft.daily_brief_local_time}
+							timeZone={briefProfileDraft.daily_brief_time_zone}
+							disabled={briefProfileLoading || briefProfileSaving}
+							error={briefProfileError}
+							helperText={
+								briefProfile?.last_active_at
+									? `最近活动：${new Date(briefProfile.last_active_at).toLocaleString()}`
+									: "保存时会严格校验 IANA 时区；非法值不会降级成 offset。"
+							}
+							onLocalTimeChange={(value) =>
+								setBriefProfileDraft((current) => ({
+									...current,
+									daily_brief_local_time: value,
+								}))
+							}
+							onTimeZoneChange={(value) =>
+								setBriefProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: value,
+								}))
+							}
+							onUseBrowserTimeZone={(timeZone) =>
+								setBriefProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: timeZone,
+								}))
+							}
+						/>
+						<DialogFooter>
+							<Button
+								variant="outline"
+								onClick={() => setProfileDialogOpen(false)}
+								disabled={briefProfileSaving}
+							>
+								取消
+							</Button>
+							<Button
+								onClick={onSaveBriefProfile}
+								disabled={
+									briefProfileLoading || briefProfileSaving || !briefProfile
+								}
+							>
+								{briefProfileSaving ? "保存中…" : "保存设置"}
+							</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+
+				<ReleaseDetailCard
+					releaseId={activeReleaseId}
+					onClose={onCloseReleaseDetail}
+				/>
+
+				<Dialog open={patDialogOpen} onOpenChange={onPatDialogOpenChange}>
+					<DialogContent
+						showCloseButton={false}
+						className="max-w-2xl"
+						onInteractOutside={(event) => event.preventDefault()}
+					>
+						<DialogHeader>
+							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogDescription>
+								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+							</DialogDescription>
+						</DialogHeader>
+
+						<div className="bg-muted/40 rounded-lg border p-3">
+							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
+							<p className="text-muted-foreground mt-1 font-mono text-xs">
+								Settings → Developer settings → Personal access tokens → Tokens
+								(classic)
+							</p>
+							<p className="text-muted-foreground mt-2 text-xs">
+								最小权限：公共仓库用{" "}
+								<span className="font-mono">public_repo</span>； 私有仓库用{" "}
+								<span className="font-mono">repo</span>。
+							</p>
+							{reactionTokenMasked ? (
+								<p className="text-muted-foreground mt-2 text-xs">
+									当前已保存：
+									<span className="font-mono">{reactionTokenMasked}</span>
+								</p>
+							) : null}
+						</div>
+
+						<div className="space-y-2">
+							<Label htmlFor="reaction-pat">GitHub PAT</Label>
+							<Input
+								id="reaction-pat"
+								type="password"
+								value={patInput}
+								onChange={(event) => setPatInput(event.target.value)}
+								placeholder="粘贴 PAT 后将自动校验（800ms 防抖）"
+								className="font-mono text-sm"
+							/>
+						</div>
+
+						<p
+							className={
+								patCheckState === "valid"
+									? "text-xs text-emerald-600"
+									: patCheckState === "invalid"
+										? "text-xs text-red-600"
+										: "text-muted-foreground text-xs"
 							}
 						>
-							{briefProfileSaving ? "保存中…" : "保存设置"}
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
-
-			<ReleaseDetailCard
-				releaseId={activeReleaseId}
-				onClose={onCloseReleaseDetail}
-			/>
-
-			<Dialog open={patDialogOpen} onOpenChange={onPatDialogOpenChange}>
-				<DialogContent
-					showCloseButton={false}
-					className="max-w-2xl"
-					onInteractOutside={(event) => event.preventDefault()}
-				>
-					<DialogHeader>
-						<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
-						<DialogDescription>
-							当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
-						</DialogDescription>
-					</DialogHeader>
-
-					<div className="bg-muted/40 rounded-lg border p-3">
-						<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-						<p className="text-muted-foreground mt-1 font-mono text-xs">
-							Settings → Developer settings → Personal access tokens → Tokens
-							(classic)
+							{patCheckMessage ??
+								"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
 						</p>
-						<p className="text-muted-foreground mt-2 text-xs">
-							最小权限：公共仓库用{" "}
-							<span className="font-mono">public_repo</span>； 私有仓库用{" "}
-							<span className="font-mono">repo</span>。
-						</p>
-						{reactionTokenMasked ? (
-							<p className="text-muted-foreground mt-2 text-xs">
-								当前已保存：
-								<span className="font-mono">{reactionTokenMasked}</span>
-							</p>
-						) : null}
-					</div>
 
-					<div className="space-y-2">
-						<Label htmlFor="reaction-pat">GitHub PAT</Label>
-						<Input
-							id="reaction-pat"
-							type="password"
-							value={patInput}
-							onChange={(event) => setPatInput(event.target.value)}
-							placeholder="粘贴 PAT 后将自动校验（800ms 防抖）"
-							className="font-mono text-sm"
-						/>
-					</div>
-
-					<p
-						className={
-							patCheckState === "valid"
-								? "text-xs text-emerald-600"
-								: patCheckState === "invalid"
-									? "text-xs text-red-600"
-									: "text-muted-foreground text-xs"
-						}
-					>
-						{patCheckMessage ??
-							"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
-					</p>
-
-					<DialogFooter>
-						<Button variant="outline" onClick={resetPatDialogState}>
-							稍后再说
-						</Button>
-						<Button
-							onClick={onSavePat}
-							disabled={patSaving || patCheckState !== "valid"}
-						>
-							{patSaving ? "保存中…" : "保存并继续"}
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
+						<DialogFooter>
+							<Button variant="outline" onClick={resetPatDialogState}>
+								稍后再说
+							</Button>
+							<Button
+								onClick={onSavePat}
+								disabled={patSaving || patCheckState !== "valid"}
+							>
+								{patSaving ? "保存中…" : "保存并继续"}
+							</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+			</div>
 		</AppShell>
 	);
 }
