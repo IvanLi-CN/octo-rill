@@ -3,6 +3,10 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
+import {
+	DailyBriefProfileForm,
+	readHourAlignedBrowserTimeZone,
+} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -807,6 +811,7 @@ const mockNotifs: NotificationItem[] = [
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
+	initialProfileDialogOpen?: boolean;
 	syncingAll?: boolean;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
@@ -819,10 +824,12 @@ function DashboardPreview(props: {
 	now?: Date;
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
+	showFooter?: boolean;
 }) {
 	const {
 		initialTab = "all",
 		initialPatDialogOpen = false,
+		initialProfileDialogOpen = false,
 		syncingAll = false,
 		showEmptyInbox = false,
 		emptyState = "content",
@@ -835,6 +842,7 @@ function DashboardPreview(props: {
 		now = STORYBOOK_NOW,
 		initialReleaseId = null,
 		releaseDetail = null,
+		showFooter = true,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
@@ -888,6 +896,16 @@ function DashboardPreview(props: {
 	);
 	const [tab, setTab] = useState<Tab>(initialTab);
 	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
+	const [profileDialogOpen, setProfileDialogOpen] = useState(
+		initialProfileDialogOpen,
+	);
+	const [profileDraft, setProfileDraft] = useState({
+		daily_brief_local_time: dailyBoundaryLocal,
+		daily_brief_time_zone:
+			dailyBoundaryTimeZone ??
+			readHourAlignedBrowserTimeZone() ??
+			"Asia/Shanghai",
+	});
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
@@ -929,6 +947,16 @@ function DashboardPreview(props: {
 			return storyBriefs[0]?.id ?? null;
 		});
 	}, [storyBriefs]);
+
+	useEffect(() => {
+		setProfileDraft({
+			daily_brief_local_time: dailyBoundaryLocal,
+			daily_brief_time_zone:
+				dailyBoundaryTimeZone ??
+				readHourAlignedBrowserTimeZone() ??
+				"Asia/Shanghai",
+		});
+	}, [dailyBoundaryLocal, dailyBoundaryTimeZone]);
 
 	const openReleaseDetail = (releaseId: string) => {
 		setTab("briefs");
@@ -1069,7 +1097,7 @@ function DashboardPreview(props: {
 					/>
 				}
 				notice={<VersionUpdateNotice />}
-				footer={<AppMetaFooter />}
+				footer={showFooter ? <AppMetaFooter /> : undefined}
 				mobileChrome
 			>
 				<Tabs
@@ -1097,9 +1125,9 @@ function DashboardPreview(props: {
 								variant="outline"
 								size="sm"
 								className="font-mono text-xs"
-								onClick={() => setPatDialogOpen(true)}
+								onClick={() => setProfileDialogOpen(true)}
 							>
-								打开 PAT 配置
+								日报设置
 							</Button>
 							<Button
 								asChild
@@ -1163,6 +1191,50 @@ function DashboardPreview(props: {
 					onClose={() => setActiveReleaseId(null)}
 				/>
 
+				<Dialog open={profileDialogOpen} onOpenChange={setProfileDialogOpen}>
+					<DialogContent className="max-w-lg">
+						<DialogHeader>
+							<DialogTitle>日报设置</DialogTitle>
+							<DialogDescription>
+								之后新生成的日报会按这里的“本地整点 + IANA 时区”切窗口；
+								历史快照不会被回写。
+							</DialogDescription>
+						</DialogHeader>
+						<DailyBriefProfileForm
+							localTime={profileDraft.daily_brief_local_time}
+							timeZone={profileDraft.daily_brief_time_zone}
+							helperText="Storybook 里只演示入口与表单布局；真实页面会走 /api/me/profile。"
+							onLocalTimeChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_local_time: value,
+								}))
+							}
+							onTimeZoneChange={(value) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: value,
+								}))
+							}
+							onUseBrowserTimeZone={(timeZone) =>
+								setProfileDraft((current) => ({
+									...current,
+									daily_brief_time_zone: timeZone,
+								}))
+							}
+						/>
+						<DialogFooter>
+							<Button
+								variant="outline"
+								onClick={() => setProfileDialogOpen(false)}
+							>
+								取消
+							</Button>
+							<Button>保存设置</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+
 				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
 					<DialogContent
 						showCloseButton={false}
@@ -1224,6 +1296,7 @@ const meta = {
 	args: {
 		initialTab: "all",
 		initialPatDialogOpen: false,
+		initialProfileDialogOpen: false,
 		syncingAll: false,
 		showEmptyInbox: false,
 		emptyState: "content",
@@ -1231,6 +1304,7 @@ const meta = {
 		briefs: undefined,
 		initialReleaseId: null,
 		releaseDetail: null,
+		showFooter: true,
 	},
 } satisfies Meta<typeof DashboardPreview>;
 
@@ -1276,6 +1350,9 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
+		await expect(
+			canvas.getByRole("button", { name: "日报设置" }),
+		).toBeVisible();
 	},
 };
 
@@ -1310,6 +1387,7 @@ export const EvidenceReleasesGroupedByDay: Story = {
 	name: "Evidence / Releases Grouped By Day",
 	args: {
 		initialTab: "releases",
+		showFooter: false,
 	},
 	parameters: {
 		docs: {
@@ -1411,6 +1489,7 @@ export const EvidenceAllHistoryCollapsedToBriefs: Story = {
 	name: "Evidence / All History Collapsed To Briefs",
 	args: {
 		initialTab: "all",
+		showFooter: false,
 	},
 	parameters: {
 		docs: {
@@ -1457,6 +1536,21 @@ export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
 	args: {
 		initialTab: "all",
 		briefs: [],
+		showFooter: false,
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const EvidenceDailyBriefProfileOpen: Story = {
+	name: "Evidence / Daily Brief Profile Open",
+	args: {
+		initialTab: "all",
+		initialProfileDialogOpen: true,
+		showFooter: false,
 	},
 	parameters: {
 		docs: {

@@ -97,8 +97,8 @@
 
 ## Visual Evidence
 
-- 普通用户日报设置（默认态）
-![普通用户日报设置（默认态）](./assets/daily-brief-profile-default.png)
+- 普通用户 Dashboard 顶部“日报设置”入口与日报设置（默认态）
+![普通用户 Dashboard 顶部“日报设置”入口与日报设置（默认态）](./assets/daily-brief-profile-default.png)
 
 - 普通用户日报设置（非法时区会被拒绝，不退化成 offset-only）
 ![普通用户日报设置（非法时区）](./assets/daily-brief-profile-invalid-time-zone.png)
