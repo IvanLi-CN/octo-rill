@@ -72,7 +72,7 @@
 | gvxnw | 仓库级 Worktree Bootstrap | 已完成 | `gvxnw-worktree-bootstrap/SPEC.md` | 2026-03-06 | local implementation completed; repo-local hook installer + worktree smoke CI |
 | s8qkn | 全局 Repo Release 复用与访问触发增量同步 | 已完成 | `s8qkn-subscription-sync/SPEC.md` | 2026-04-12 | PR #41; shared repo release cache + access refresh + scheduler social/inbox sync |
 | dynup | shadcn/ui 全量整改与组件收敛 | 已完成 | `dynup-shadcn-ui-full-remediation/SPEC.md` | 2026-03-08 | PR #25; dashboard/browser-timezone timestamp follow-up synced; Playwright merge-gate evidence aligned |
-| x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-04-15 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health；release web-builder fallback + docker smoke |
+| x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-04-15 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health；release web-builder fallback + build gate docker smoke |
 | 9vb46 | 管理员任务中心刷新闪烁修复 | 已完成 | `9vb46-admin-jobs-refresh-flicker-fix/SPEC.md` | 2026-03-07 | PR #23、PR #26；已补齐首载后筛选复载不闪烁，且后台刷新期间旧行交互已禁用 |
 | vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-03-08 | task drawer route outlet + in-drawer LLM detail navigation; recent-events browser-timezone sync + merge-gate evidence aligned |
 | ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |

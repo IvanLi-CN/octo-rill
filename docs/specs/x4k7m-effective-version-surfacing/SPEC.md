@@ -20,7 +20,7 @@
 - 前端 footer 优先读取 `/api/version`，失败回退 `/api/health`。
 - 打通 Docker 构建注入闭环并增加 release 保护校验。
 - 前端构建阶段嵌入版本优先消费 `APP_EFFECTIVE_VERSION`，仅在 env 缺失时回退仓库根 `Cargo.toml`，且缺失时不得崩溃。
-- 普通 CI 增加 Docker smoke，提前覆盖 release `web-builder` 构建路径。
+- 普通 CI 在既有 `Build (Release)` gate 内增加 Docker smoke，提前覆盖 release `web-builder` 构建路径。
 
 ### Non-goals
 
@@ -37,7 +37,7 @@
 - `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑。
 - `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
 - `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`。
-- `.github/workflows/ci.yml`：新增 Docker smoke 覆盖 release `web-builder` 路径。
+- `.github/workflows/ci.yml`：在既有 `Build (Release)` gate 内加入 Docker smoke 覆盖 release `web-builder` 路径。
 - `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护。
 - 后端/前端测试覆盖新增行为与前端构建期 fallback 契约。
 
@@ -90,8 +90,8 @@
   Then 回退 `"unknown"` 且构建成功，不得抛出 `ENOENT`。
 
 - Given CI 运行在 pull request / merge_group / main push
-  When 执行 `CI Pipeline`
-  Then `Docker Smoke` 必须对真实 `Dockerfile` 完成 `linux/amd64` 构建冒烟，并传入合成 `APP_EFFECTIVE_VERSION`。
+  When 执行 `CI Pipeline` 的 `Build (Release)` gate
+  Then 该 gate 必须额外对真实 `Dockerfile` 完成 `linux/amd64` Docker smoke，并传入合成 `APP_EFFECTIVE_VERSION`。
 
 - Given `/api/version` 不可用
   When 前端 footer 拉取版本
@@ -113,4 +113,4 @@
 - 2026-03-03: 建立规格并冻结修复范围与接口决策。
 - 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
 - 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
-- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，并新增 `Docker Smoke` CI 门禁。
+- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
