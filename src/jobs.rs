@@ -38,6 +38,7 @@ pub const TASK_SYNC_SUBSCRIPTIONS: &str = "sync.subscriptions";
 pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_BRIEF_HISTORY_RECOMPUTE: &str = "brief.history_recompute";
+pub const TASK_BRIEF_REFRESH_CONTENT: &str = "brief.refresh_content";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
@@ -331,6 +332,30 @@ pub async fn enqueue_brief_history_recompute_if_needed(state: &AppState) -> Resu
         state,
         NewTask {
             task_type: TASK_BRIEF_HISTORY_RECOMPUTE.to_owned(),
+            payload: json!({}),
+            source: "migration.bootstrap".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+    )
+    .await?;
+
+    Ok(Some(task.task_id))
+}
+
+pub async fn enqueue_brief_refresh_content_if_needed(state: &AppState) -> Result<Option<String>> {
+    if ai::brief_content_refresh_candidate_count(state).await? == 0 {
+        return Ok(None);
+    }
+
+    if let Some(existing) = find_inflight_task_by_type(state, TASK_BRIEF_REFRESH_CONTENT).await? {
+        return Ok(Some(existing.task_id));
+    }
+
+    let task = enqueue_task(
+        state,
+        NewTask {
+            task_type: TASK_BRIEF_REFRESH_CONTENT.to_owned(),
             payload: json!({}),
             source: "migration.bootstrap".to_owned(),
             requested_by: None,
@@ -1610,6 +1635,7 @@ async fn execute_task(
         }
         TASK_BRIEF_DAILY_SLOT => execute_daily_slot_task(state, task_id, payload).await,
         TASK_BRIEF_HISTORY_RECOMPUTE => execute_brief_history_recompute_task(state, task_id).await,
+        TASK_BRIEF_REFRESH_CONTENT => execute_brief_refresh_content_task(state, task_id).await,
         TASK_TRANSLATE_RELEASE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
@@ -2039,7 +2065,6 @@ fn due_daily_slot_user_from_snapshot(snapshot: DailySlotUserSnapshot) -> Result<
         window: briefs::DailyWindow {
             key_date,
             display_date: key_date.to_string(),
-            start_local: start_utc.with_timezone(&tz).fixed_offset(),
             end_local: end_utc.with_timezone(&tz).fixed_offset(),
             start_utc,
             end_utc,
@@ -2231,6 +2256,200 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
     if failed > 0 && succeeded == 0 {
         return Err(anyhow!(
             "brief history recompute failed for all legacy briefs (failed={failed}, total={total})"
+        ));
+    }
+
+    if let Err(err) = enqueue_brief_refresh_content_if_needed(state).await {
+        tracing::warn!(
+            ?err,
+            "failed to enqueue brief content refresh after history recompute"
+        );
+    }
+
+    Ok(json!({
+        "total": total,
+        "processed": processed,
+        "succeeded": succeeded,
+        "failed": failed,
+        "canceled": false,
+    }))
+}
+
+async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> Result<Value> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct RefreshableBriefRow {
+        id: String,
+        user_id: String,
+        date: String,
+    }
+
+    let total = ai::brief_content_refresh_candidate_count(state).await?;
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "collect",
+            "total_briefs": total,
+        }),
+    )
+    .await?;
+
+    if total == 0 {
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "summary",
+                "total": 0,
+                "processed": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "canceled": false,
+            }),
+        )
+        .await?;
+        return Ok(json!({
+            "total": 0,
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "canceled": false,
+        }));
+    }
+
+    let rows = sqlx::query_as::<_, RefreshableBriefRow>(
+        r#"
+        SELECT id, user_id, date
+        FROM briefs
+        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
+          AND window_start_utc IS NOT NULL
+          AND window_end_utc IS NOT NULL
+          AND effective_time_zone IS NOT NULL
+          AND effective_local_boundary IS NOT NULL
+          AND (
+            TRIM(content_markdown) LIKE '```%'
+            OR content_markdown LIKE '%## 概览%'
+            OR content_markdown NOT LIKE '%## 项目更新%'
+            OR content_markdown NOT LIKE '%## 获星与关注%'
+          )
+        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query briefs for content refresh")?;
+
+    let mut processed = 0usize;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut canceled = false;
+
+    for row in rows {
+        if is_task_cancel_requested(state, task_id)
+            .await
+            .unwrap_or(false)
+        {
+            canceled = true;
+            break;
+        }
+
+        processed += 1;
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "refresh",
+                "index": processed,
+                "total": total,
+                "brief_id": row.id,
+                "user_id": row.user_id,
+                "date": row.date,
+            }),
+        )
+        .await?;
+
+        match ai::refresh_existing_brief_snapshot_content(state, row.id.as_str(), "content_refresh")
+            .await
+        {
+            Ok(snapshot) => {
+                succeeded += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "brief_succeeded",
+                        "index": processed,
+                        "total": total,
+                        "brief_id": snapshot.id,
+                        "date": snapshot.date,
+                        "window_start_utc": snapshot.window_start,
+                        "window_end_utc": snapshot.window_end,
+                        "time_zone": snapshot.effective_time_zone,
+                        "local_boundary": snapshot.effective_local_boundary,
+                        "release_count": snapshot.release_ids.len(),
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                failed += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "brief_failed",
+                        "index": processed,
+                        "total": total,
+                        "brief_id": row.id,
+                        "user_id": row.user_id,
+                        "date": row.date,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await?;
+            }
+        }
+    }
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "summary",
+            "total": total,
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "canceled": canceled,
+        }),
+    )
+    .await?;
+
+    if canceled {
+        return Ok(json!({
+            "total": total,
+            "processed": processed,
+            "succeeded": succeeded,
+            "failed": failed,
+            "canceled": true,
+        }));
+    }
+
+    if failed > 0 && succeeded == 0 {
+        return Err(anyhow!(
+            "brief content refresh failed for all candidate briefs (failed={failed}, total={total})"
         ));
     }
 
@@ -2533,14 +2752,16 @@ mod tests {
 
     use super::{
         STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
-        TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
-        claim_next_queued_task, current_subscription_schedule_key,
-        enqueue_brief_history_recompute_if_needed, enqueue_hour_slot_if_due,
-        execute_brief_history_recompute_task, execute_daily_slot_task, execute_sync_all_task_with,
-        is_scheduled_task_type, load_due_daily_slot_users, load_translation_stream_cursor,
-        load_translation_stream_rows, next_llm_scheduler_stream_event, payload_slot_hour_key,
-        payload_slot_reference_utc, recover_runtime_state, recover_runtime_state_on_startup,
+        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
+        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
+        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
+        current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
+        enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
+        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
+        execute_daily_slot_task, execute_sync_all_task_with, is_scheduled_task_type,
+        load_due_daily_slot_users, load_translation_stream_cursor, load_translation_stream_rows,
+        next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
+        recover_runtime_state, recover_runtime_state_on_startup,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::{Value, json};
@@ -3811,5 +4032,272 @@ mod tests {
         .expect("count history recompute tasks");
 
         assert_eq!(queued, 2);
+    }
+
+    #[tokio::test]
+    async fn enqueue_brief_refresh_content_if_needed_detects_outdated_normalized_briefs() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1004, "brief-refresh").await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-candidate")
+        .bind("1004")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("## 概览\n\n- 旧格式\n")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert refresh candidate");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue brief refresh")
+            .expect("task id");
+
+        assert!(!task_id.is_empty());
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE task_type = ?
+            "#,
+        )
+        .bind(TASK_BRIEF_REFRESH_CONTENT)
+        .fetch_one(&pool)
+        .await
+        .expect("count refresh tasks");
+        assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_brief_refresh_content_task_updates_existing_snapshot_in_place() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1005, "brief-refresh-run").await;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET daily_brief_utc_time = ?, daily_brief_local_time = ?, daily_brief_time_zone = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind("1005")
+        .execute(&pool)
+        .await
+        .expect("update brief refresh user prefs");
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-refresh-run")
+        .bind("1005")
+        .bind(1_i64)
+        .bind("acme/rocket")
+        .bind("acme")
+        .bind("rocket")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/acme/rocket")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .expect("insert starred repo");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-refresh-run")
+        .bind(1_i64)
+        .bind(501_i64)
+        .bind("node-refresh-run")
+        .bind("v1.0.0")
+        .bind("v1.0.0")
+        .bind("fix: tighten release brief formatting")
+        .bind("https://github.com/acme/rocket/releases/tag/v1.0.0")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-refresh-stale")
+        .bind(1_i64)
+        .bind(999_i64)
+        .bind("node-refresh-stale")
+        .bind("v0.9.0")
+        .bind("v0.9.0")
+        .bind("old release")
+        .bind("https://github.com/acme/rocket/releases/tag/v0.9.0")
+        .bind("2026-03-05T12:00:00Z")
+        .bind("2026-03-05T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert stale repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO social_activity_events (
+              id, user_id, kind, repo_id, repo_full_name, actor_github_user_id,
+              actor_login, actor_avatar_url, actor_html_url, occurred_at, detected_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("social-refresh-run")
+        .bind("1005")
+        .bind("follower_received")
+        .bind(Option::<i64>::None)
+        .bind(Option::<String>::None)
+        .bind(7001_i64)
+        .bind("alice")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/alice")
+        .bind("2026-03-06T18:00:00Z")
+        .bind("2026-03-06T18:00:00Z")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert social event");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-existing")
+        .bind("1005")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("```markdown\n## 概览\n\n- 旧日报\n```")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert existing brief");
+
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-existing")
+        .bind(999_i64)
+        .bind("2026-03-06T08:00:00Z")
+        .bind(0_i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert stale membership");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue refresh")
+            .expect("task id");
+
+        let result = execute_brief_refresh_content_task(state.as_ref(), &task_id)
+            .await
+            .expect("execute refresh task");
+        assert_eq!(result["succeeded"].as_u64(), Some(1));
+        assert_eq!(result["failed"].as_u64(), Some(0));
+
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            SELECT id, generation_source, content_markdown
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-refresh-existing")
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed brief");
+        assert_eq!(row.0, "brief-refresh-existing");
+        assert_eq!(row.1, "content_refresh");
+        assert!(row.2.contains("## 项目更新"));
+        assert!(row.2.contains("## 获星与关注"));
+        assert!(!row.2.contains("## 概览"));
+        assert!(!row.2.trim_start().starts_with("```"));
+
+        let memberships = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT release_id
+            FROM brief_release_memberships
+            WHERE brief_id = ?
+            ORDER BY ordinal ASC
+            "#,
+        )
+        .bind("brief-refresh-existing")
+        .fetch_all(&pool)
+        .await
+        .expect("load refreshed memberships");
+        assert_eq!(memberships, vec![501]);
     }
 }

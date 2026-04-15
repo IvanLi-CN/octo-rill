@@ -322,6 +322,14 @@ export type AdminBriefHistoryRecomputeDiagnostics = {
 	current_brief_id: string | null;
 	last_error: string | null;
 };
+export type AdminBriefRefreshContentDiagnostics = {
+	total: number;
+	processed: number;
+	succeeded: number;
+	failed: number;
+	current_brief_id: string | null;
+	last_error: string | null;
+};
 export type AdminSyncSubscriptionsDiagnostics = {
 	trigger: string | null;
 	schedule_key: string | null;
@@ -377,6 +385,7 @@ export type AdminTaskDiagnostics = {
 	brief_daily_slot?: AdminBriefDailySlotDiagnostics | null;
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
 	brief_history_recompute?: AdminBriefHistoryRecomputeDiagnostics | null;
+	brief_refresh_content?: AdminBriefRefreshContentDiagnostics | null;
 	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {

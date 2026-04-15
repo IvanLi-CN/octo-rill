@@ -688,6 +688,26 @@ struct ReleaseDigest {
     is_prerelease: bool,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SocialActivityRow {
+    kind: String,
+    repo_full_name: Option<String>,
+    actor_github_user_id: i64,
+    actor_login: String,
+    actor_html_url: Option<String>,
+    occurred_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct SocialActivityDigest {
+    kind: String,
+    repo_full_name: Option<String>,
+    actor_github_user_id: i64,
+    actor_login: String,
+    actor_html_url: Option<String>,
+    occurred_at: String,
+}
+
 #[derive(Debug, Clone)]
 struct ReleaseRendered {
     release_id: i64,
@@ -703,6 +723,27 @@ struct ReleaseRendered {
 struct RepoRendered {
     full_name: String,
     releases: Vec<ReleaseRendered>,
+}
+
+#[derive(Debug, Clone)]
+struct SocialActorRendered {
+    actor_github_user_id: i64,
+    login: String,
+    html_url: Option<String>,
+    latest_occurred_at: String,
+}
+
+#[derive(Debug)]
+struct RepoStarRendered {
+    full_name: String,
+    actors: Vec<SocialActorRendered>,
+    latest_occurred_at: String,
+}
+
+#[derive(Debug, Default)]
+struct SocialSummaryRendered {
+    repo_stars: Vec<RepoStarRendered>,
+    followers: Vec<SocialActorRendered>,
 }
 
 #[derive(Debug)]
@@ -2370,7 +2411,37 @@ fn parse_project_summary_payload(raw: &str) -> Option<ProjectSummaryPayload> {
 
 fn compact_link_label(raw: &str) -> String {
     if let Ok(parsed) = Url::parse(raw) {
-        let host = parsed.host_str().unwrap_or("github.com");
+        let host = parsed.host_str().unwrap_or_default();
+        if host == "github.com" || host == "www.github.com" {
+            let segments = parsed
+                .path_segments()
+                .map(|parts| parts.collect::<Vec<_>>())
+                .unwrap_or_default();
+            if segments.len() >= 4 {
+                match segments[2] {
+                    "pull" | "issues" if segments[3].chars().all(|ch| ch.is_ascii_digit()) => {
+                        return format!("#{}", segments[3]);
+                    }
+                    "commit" => {
+                        return segments[3].chars().take(7).collect();
+                    }
+                    "releases" if segments.get(3) == Some(&"tag") && segments.len() >= 5 => {
+                        return truncate_chars(segments[4], 32);
+                    }
+                    _ => {}
+                }
+            }
+            if segments.len() >= 3 && segments[2] == "releases" {
+                return "releases".to_owned();
+            }
+
+            let fallback = parsed.path().trim_matches('/');
+            if !fallback.is_empty() {
+                return truncate_chars(fallback, 40);
+            }
+            return "github.com".to_owned();
+        }
+
         let mut out = format!("{}{}", host, parsed.path());
         if let Some(q) = parsed.query() {
             out.push('?');
@@ -2527,6 +2598,38 @@ fn sanitize_markdown_links(markdown: &str) -> String {
     }
 
     sanitize_url_literals(&out)
+}
+
+fn strip_outer_markdown_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((_, body_with_closing)) = rest.split_once('\n') else {
+        return trimmed;
+    };
+    let Some(closing_start) = body_with_closing.rfind("\n```") else {
+        return trimmed;
+    };
+    let closing = &body_with_closing[closing_start + 1..];
+    if closing.trim() != "```" {
+        return trimmed;
+    }
+    &body_with_closing[..closing_start]
+}
+
+fn brief_content_matches_v2_signature(markdown: &str) -> bool {
+    let stripped = strip_outer_markdown_fence(markdown);
+    stripped.contains("## 项目更新")
+        && stripped.contains("## 获星与关注")
+        && !stripped.contains("## 概览")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn brief_content_needs_refresh(markdown: &str) -> bool {
+    let trimmed = markdown.trim();
+    let stripped = strip_outer_markdown_fence(markdown);
+    stripped != trimmed || !brief_content_matches_v2_signature(stripped)
 }
 
 fn strip_markdown_links_to_text(input: &str) -> String {
@@ -2741,6 +2844,19 @@ fn to_release_digest(rows: Vec<ReleaseRow>) -> Vec<ReleaseDigest> {
         .collect()
 }
 
+fn to_social_activity_digests(rows: Vec<SocialActivityRow>) -> Vec<SocialActivityDigest> {
+    rows.into_iter()
+        .map(|row| SocialActivityDigest {
+            kind: row.kind,
+            repo_full_name: row.repo_full_name,
+            actor_github_user_id: row.actor_github_user_id,
+            actor_login: row.actor_login,
+            actor_html_url: row.actor_html_url,
+            occurred_at: row.occurred_at,
+        })
+        .collect()
+}
+
 fn group_by_repo(releases: &[ReleaseDigest]) -> BTreeMap<String, Vec<ReleaseDigest>> {
     let mut grouped: BTreeMap<String, Vec<ReleaseDigest>> = BTreeMap::new();
     for r in releases {
@@ -2750,6 +2866,165 @@ fn group_by_repo(releases: &[ReleaseDigest]) -> BTreeMap<String, Vec<ReleaseDige
             .push(r.clone());
     }
     grouped
+}
+
+fn social_actor_markdown(actor: &SocialActorRendered) -> String {
+    let label = format!("@{}", actor.login);
+    match actor.html_url.as_deref() {
+        Some(url) if is_allowed_github_url(url) => format!("[{label}]({url})"),
+        _ => label,
+    }
+}
+
+fn render_social_actor_list(actors: &[SocialActorRendered], max_visible: usize) -> String {
+    let visible = actors
+        .iter()
+        .take(max_visible)
+        .map(social_actor_markdown)
+        .collect::<Vec<_>>();
+    let visible_text = visible.join("、");
+    if actors.len() > max_visible {
+        format!("{visible_text} 等 {} 人", actors.len())
+    } else {
+        visible_text
+    }
+}
+
+fn compare_desc_with_tiebreak(
+    primary_left: &str,
+    primary_right: &str,
+    left_tie: &str,
+    right_tie: &str,
+) -> std::cmp::Ordering {
+    primary_right
+        .cmp(primary_left)
+        .then_with(|| left_tie.cmp(right_tie))
+}
+
+fn build_social_summary(events: &[SocialActivityDigest]) -> SocialSummaryRendered {
+    let mut repo_star_groups =
+        HashMap::<String, (String, HashMap<i64, SocialActorRendered>)>::new();
+    let mut followers = HashMap::<i64, SocialActorRendered>::new();
+
+    for event in events {
+        let actor = SocialActorRendered {
+            actor_github_user_id: event.actor_github_user_id,
+            login: event.actor_login.clone(),
+            html_url: event.actor_html_url.clone(),
+            latest_occurred_at: event.occurred_at.clone(),
+        };
+
+        match event.kind.as_str() {
+            "repo_star_received" => {
+                let repo_name = event
+                    .repo_full_name
+                    .clone()
+                    .unwrap_or_else(|| "unknown/repo".to_owned());
+                let (latest_occurred_at, actors) = repo_star_groups
+                    .entry(repo_name.clone())
+                    .or_insert_with(|| (String::new(), HashMap::new()));
+                if event.occurred_at > *latest_occurred_at {
+                    *latest_occurred_at = event.occurred_at.clone();
+                }
+                actors
+                    .entry(actor.actor_github_user_id)
+                    .and_modify(|existing| {
+                        if actor.latest_occurred_at > existing.latest_occurred_at {
+                            *existing = actor.clone();
+                        }
+                    })
+                    .or_insert(actor);
+            }
+            "follower_received" => {
+                followers
+                    .entry(actor.actor_github_user_id)
+                    .and_modify(|existing| {
+                        if actor.latest_occurred_at > existing.latest_occurred_at {
+                            *existing = actor.clone();
+                        }
+                    })
+                    .or_insert(actor);
+            }
+            _ => {}
+        }
+    }
+
+    let mut repo_stars = repo_star_groups
+        .into_iter()
+        .map(|(full_name, (latest_occurred_at, actors))| {
+            let mut actors = actors.into_values().collect::<Vec<_>>();
+            actors.sort_by(|left, right| {
+                compare_desc_with_tiebreak(
+                    &left.latest_occurred_at,
+                    &right.latest_occurred_at,
+                    &left.login,
+                    &right.login,
+                )
+            });
+            RepoStarRendered {
+                full_name,
+                actors,
+                latest_occurred_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    repo_stars.sort_by(|left, right| {
+        compare_desc_with_tiebreak(
+            &left.latest_occurred_at,
+            &right.latest_occurred_at,
+            &left.full_name,
+            &right.full_name,
+        )
+    });
+
+    let mut followers = followers.into_values().collect::<Vec<_>>();
+    followers.sort_by(|left, right| {
+        compare_desc_with_tiebreak(
+            &left.latest_occurred_at,
+            &right.latest_occurred_at,
+            &left.login,
+            &right.login,
+        )
+    });
+
+    SocialSummaryRendered {
+        repo_stars,
+        followers,
+    }
+}
+
+async fn load_social_activity_digests_for_window(
+    state: &AppState,
+    user_id: &str,
+    start_utc: &str,
+    end_utc: &str,
+) -> Result<Vec<SocialActivityDigest>> {
+    let rows = sqlx::query_as::<_, SocialActivityRow>(
+        r#"
+        SELECT
+          kind,
+          repo_full_name,
+          actor_github_user_id,
+          actor_login,
+          actor_html_url,
+          occurred_at
+        FROM social_activity_events
+        WHERE user_id = ?
+          AND occurred_at >= ?
+          AND occurred_at < ?
+          AND kind IN ('repo_star_received', 'follower_received')
+        ORDER BY occurred_at DESC, created_at DESC, id DESC
+        LIMIT 300
+        "#,
+    )
+    .bind(user_id)
+    .bind(start_utc)
+    .bind(end_utc)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query social activity for brief")?;
+
+    Ok(to_social_activity_digests(rows))
 }
 
 fn build_project_prompt(full_name: &str, releases: &[ReleaseDigest]) -> String {
@@ -2993,81 +3268,71 @@ fn build_repo_rendered(
     }
 }
 
-fn build_brief_markdown(window: &UserDailyWindow, repos: &[RepoRendered]) -> String {
-    let total_releases = repos.iter().map(|r| r.releases.len()).sum::<usize>();
-    let prerelease_count = repos
-        .iter()
-        .flat_map(|r| r.releases.iter())
-        .filter(|r| r.is_prerelease)
-        .count();
-
+fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) -> String {
     let mut out = String::new();
-    out.push_str("## 概览\n\n");
-    out.push_str(&format!(
-        "- 时间窗口（本地）：{} → {}\n",
-        window.start_local.to_rfc3339(),
-        window.end_local.to_rfc3339()
-    ));
-    out.push_str(&format!("- 更新项目：{} 个\n", repos.len()));
-    out.push_str(&format!(
-        "- Release：{} 条（预发布 {} 条）\n",
-        total_releases, prerelease_count
-    ));
-
+    out.push_str("## 项目更新\n\n");
     if repos.is_empty() {
-        out.push_str("\n## 项目更新\n\n- 本时间窗口内没有新的 Release。\n");
-        return out;
-    }
-
-    let repo_links = repos
-        .iter()
-        .map(|repo| {
-            format!(
-                "[{}](https://github.com/{})",
-                repo.full_name, repo.full_name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("、");
-    out.push_str(&format!("- 涉及项目：{}\n", repo_links));
-
-    out.push_str("\n## 项目更新\n\n");
-    for repo in repos {
-        out.push_str(&format!(
-            "### [{}](https://github.com/{})\n\n",
-            repo.full_name, repo.full_name
-        ));
-
-        for release in &repo.releases {
-            let internal_link = format!("/?tab=briefs&release={}", release.release_id);
-            let prerelease_mark = if release.is_prerelease {
-                " · 预发布"
-            } else {
-                ""
-            };
-            let title = escape_markdown_link_text(&release.title);
-
+        out.push_str("- 本时间窗口内没有新的 Release。\n");
+    } else {
+        for repo in repos {
             out.push_str(&format!(
-                "- [{}]({}) · {}{} · [GitHub Release]({})\n",
-                title, internal_link, release.published_at, prerelease_mark, release.html_url
+                "### [{}](https://github.com/{})\n\n",
+                repo.full_name, repo.full_name
             ));
 
-            for bullet in &release.bullets {
-                out.push_str(&format!("  - {}\n", bullet));
-            }
+            for release in &repo.releases {
+                let internal_link = format!("/?tab=briefs&release={}", release.release_id);
+                let prerelease_mark = if release.is_prerelease {
+                    " · 预发布"
+                } else {
+                    ""
+                };
+                let title = escape_markdown_link_text(&release.title);
 
-            if !release.related_links.is_empty() {
-                let links = release
-                    .related_links
-                    .iter()
-                    .map(|url| format!("[{}]({})", compact_link_label(url), url))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                out.push_str(&format!("  - 相关链接：{}\n", links));
-            }
+                out.push_str(&format!(
+                    "- [{}]({}) · {}{} · [GitHub Release]({})\n",
+                    title, internal_link, release.published_at, prerelease_mark, release.html_url
+                ));
 
-            out.push('\n');
+                for bullet in &release.bullets {
+                    out.push_str(&format!("  - {}\n", bullet));
+                }
+
+                if !release.related_links.is_empty() {
+                    let links = release
+                        .related_links
+                        .iter()
+                        .map(|url| format!("[{}]({})", compact_link_label(url), url))
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    out.push_str(&format!("  - 相关链接：{}\n", links));
+                }
+
+                out.push('\n');
+            }
         }
+    }
+
+    out.push_str("\n## 获星与关注\n\n");
+    out.push_str("### 获星\n\n");
+    if social.repo_stars.is_empty() {
+        out.push_str("- 本时间窗口内没有新的获星动态。\n");
+    } else {
+        for repo in &social.repo_stars {
+            let actors = render_social_actor_list(&repo.actors, 4);
+            out.push_str(&format!(
+                "- [{}](https://github.com/{})：{}\n",
+                repo.full_name, repo.full_name, actors
+            ));
+        }
+    }
+
+    out.push_str("\n### 关注\n\n");
+    if social.followers.is_empty() {
+        out.push_str("- 本时间窗口内没有新的关注动态。\n");
+    } else {
+        let actors = render_social_actor_list(&social.followers, 6);
+        out.push_str(&format!("- {}\n", actors));
     }
 
     out
@@ -3242,7 +3507,7 @@ async fn polish_brief_markdown(
     release_ids: &[i64],
 ) -> Option<String> {
     let prompt = format!(
-        "请在不删减任何 release 条目的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n2) 保留“## 概览”和“## 项目更新”两个章节；\n3) 不新增编造事实；\n4) 可以调整语句与去重。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n2) 保留“## 项目更新”和“## 获星与关注”两个章节；\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) 可以调整语句、去重和压缩重复表达。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -3254,9 +3519,10 @@ async fn polish_brief_markdown(
     .await
     .ok()?;
 
-    let sanitized = sanitize_markdown_links(&polished);
+    let stripped = strip_outer_markdown_fence(&polished);
+    let sanitized = sanitize_markdown_links(stripped);
 
-    if !sanitized.contains("## 概览") || !sanitized.contains("## 项目更新") {
+    if !brief_content_matches_v2_signature(&sanitized) {
         return None;
     }
     if !contains_all_release_links(&sanitized, release_ids) {
@@ -3306,6 +3572,8 @@ async fn build_brief_content(
     .await
     .context("failed to query releases for brief")?;
 
+    let social =
+        load_social_activity_digests_for_window(state, user_id, &start_utc, &end_utc).await?;
     let releases = to_release_digest(rows);
     let grouped = group_by_repo(&releases)
         .into_iter()
@@ -3321,8 +3589,22 @@ async fn build_brief_content(
             Some(&ai_bullets),
         ));
     }
+    repos.sort_by(|left, right| {
+        let left_latest = left
+            .releases
+            .first()
+            .map(|release| release.published_at.as_str())
+            .unwrap_or("");
+        let right_latest = right
+            .releases
+            .first()
+            .map(|release| release.published_at.as_str())
+            .unwrap_or("");
+        compare_desc_with_tiebreak(left_latest, right_latest, &left.full_name, &right.full_name)
+    });
+    let social_summary = build_social_summary(&social);
 
-    let deterministic = sanitize_markdown_links(&build_brief_markdown(window, &repos));
+    let deterministic = sanitize_markdown_links(&build_brief_markdown(&repos, &social_summary));
 
     if state.config.ai.is_none() || releases.is_empty() {
         return Ok(BuiltBriefContent {
@@ -3474,8 +3756,8 @@ async fn find_normalized_brief_snapshot_id_by_window(
         SELECT id
         FROM briefs
         WHERE user_id = ?
-          AND window_start_utc = ?
-          AND window_end_utc = ?
+          AND datetime(window_start_utc) = datetime(?)
+          AND datetime(window_end_utc) = datetime(?)
           AND generation_source != 'legacy'
           AND effective_time_zone IS NOT NULL
           AND effective_local_boundary IS NOT NULL
@@ -3522,7 +3804,38 @@ async fn upsert_daily_brief_snapshot(
     )
     .await?
     {
-        return load_stored_brief_snapshot(state, &existing_id).await;
+        let mut tx = state
+            .pool
+            .begin()
+            .await
+            .context("failed to begin refresh brief tx")?;
+        overwrite_brief_snapshot(
+            &mut tx,
+            &existing_id,
+            window,
+            built,
+            generation_source,
+            &now,
+        )
+        .await
+        .with_context(|| format!("failed to refresh brief snapshot {existing_id}"))?;
+        tx.commit()
+            .await
+            .context("failed to commit refreshed brief snapshot")?;
+        return Ok(StoredBrief {
+            id: existing_id,
+            date,
+            window_start,
+            window_end,
+            effective_time_zone: window.effective_time_zone.clone(),
+            effective_local_boundary: window.effective_local_boundary.clone(),
+            content_markdown: built.content_markdown.clone(),
+            release_ids: built
+                .releases
+                .iter()
+                .map(|release| release.release_id)
+                .collect(),
+        });
     }
 
     let mut tx = state
@@ -3592,44 +3905,28 @@ async fn upsert_daily_brief_snapshot(
         let is_normalized_snapshot = existing.generation_source.as_deref() != Some("legacy")
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
-        if is_normalized_snapshot {
-            tx.commit()
-                .await
-                .context("failed to finalize no-op brief snapshot upsert")?;
-            return load_stored_brief_snapshot(state, &existing.id).await;
-        }
-
-        sqlx::query(
-            r#"
-            UPDATE briefs
-            SET date = ?,
-                window_start_utc = ?,
-                window_end_utc = ?,
-                effective_time_zone = ?,
-                effective_local_boundary = ?,
-                generation_source = ?,
-                content_markdown = ?,
-                updated_at = ?
-            WHERE id = ?
-            "#,
+        overwrite_brief_snapshot(
+            &mut tx,
+            &existing.id,
+            window,
+            built,
+            generation_source,
+            &now,
         )
-        .bind(&date)
-        .bind(&window_start)
-        .bind(&window_end)
-        .bind(&window.effective_time_zone)
-        .bind(&window.effective_local_boundary)
-        .bind(generation_source)
-        .bind(&built.content_markdown)
-        .bind(&now)
-        .bind(&existing.id)
-        .execute(&mut *tx)
         .await
-        .context("failed to normalize conflicting legacy brief snapshot")?;
-
-        replace_brief_memberships(&mut tx, &existing.id, &built.releases, &now).await?;
+        .with_context(|| {
+            if is_normalized_snapshot {
+                format!("failed to refresh existing brief snapshot {}", existing.id)
+            } else {
+                format!(
+                    "failed to normalize conflicting legacy brief snapshot {}",
+                    existing.id
+                )
+            }
+        })?;
         tx.commit()
             .await
-            .context("failed to commit normalized brief snapshot")?;
+            .context("failed to commit brief snapshot overwrite")?;
         return Ok(StoredBrief {
             id: existing.id,
             date,
@@ -3667,6 +3964,210 @@ async fn upsert_daily_brief_snapshot(
     })
 }
 
+fn parse_fixed_offset_label(label: &str) -> Option<FixedOffset> {
+    let raw = label.trim();
+    let rest = raw.strip_prefix("UTC")?;
+    let sign = if let Some(value) = rest.strip_prefix('+') {
+        (1, value)
+    } else if let Some(value) = rest.strip_prefix('-') {
+        (-1, value)
+    } else {
+        return None;
+    };
+    let (hours, minutes) = sign.1.split_once(':')?;
+    let hours = hours.parse::<i32>().ok()?;
+    let minutes = minutes.parse::<i32>().ok()?;
+    let total_seconds = sign.0 * (hours * 60 + minutes) * 60;
+    FixedOffset::east_opt(total_seconds)
+}
+
+fn convert_brief_utc_to_effective_local(
+    effective_time_zone: &str,
+    utc: DateTime<Utc>,
+) -> Result<DateTime<FixedOffset>> {
+    if let Some(time_zone) = briefs::canonical_supported_time_zone(effective_time_zone) {
+        return briefs::convert_daily_brief_utc_to_local(&time_zone, utc)
+            .map_err(|err| anyhow!(err.to_string()));
+    }
+    if let Some(offset) = parse_fixed_offset_label(effective_time_zone) {
+        return Ok(utc.with_timezone(&offset));
+    }
+    Err(anyhow!(
+        "unsupported brief effective_time_zone: {effective_time_zone}"
+    ))
+}
+
+fn build_window_from_stored_brief(
+    date: &str,
+    window_start_utc: &str,
+    window_end_utc: &str,
+    effective_time_zone: &str,
+    effective_local_boundary: &str,
+) -> Result<UserDailyWindow> {
+    let key_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("invalid stored brief date: {date}"))?;
+    let start_utc = DateTime::parse_from_rfc3339(window_start_utc)
+        .with_context(|| format!("invalid stored brief window_start_utc: {window_start_utc}"))?
+        .with_timezone(&Utc);
+    let end_utc = DateTime::parse_from_rfc3339(window_end_utc)
+        .with_context(|| format!("invalid stored brief window_end_utc: {window_end_utc}"))?
+        .with_timezone(&Utc);
+    let end_local = convert_brief_utc_to_effective_local(effective_time_zone, end_utc)?;
+
+    Ok(UserDailyWindow {
+        key_date,
+        display_date: key_date.to_string(),
+        end_local,
+        start_utc,
+        end_utc,
+        effective_time_zone: effective_time_zone.to_owned(),
+        effective_local_boundary: effective_local_boundary.to_owned(),
+    })
+}
+
+async fn overwrite_brief_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    brief_id: &str,
+    window: &UserDailyWindow,
+    built: &BuiltBriefContent,
+    generation_source: &str,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE briefs
+        SET date = ?,
+            window_start_utc = ?,
+            window_end_utc = ?,
+            effective_time_zone = ?,
+            effective_local_boundary = ?,
+            generation_source = ?,
+            content_markdown = ?,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&window.display_date)
+    .bind(window.start_utc.to_rfc3339())
+    .bind(window.end_utc.to_rfc3339())
+    .bind(&window.effective_time_zone)
+    .bind(&window.effective_local_boundary)
+    .bind(generation_source)
+    .bind(&built.content_markdown)
+    .bind(now)
+    .bind(brief_id)
+    .execute(&mut **tx)
+    .await
+    .context("failed to overwrite brief snapshot")?;
+
+    replace_brief_memberships(tx, brief_id, &built.releases, now).await
+}
+
+pub async fn brief_content_refresh_candidate_count(state: &AppState) -> Result<i64> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM briefs
+        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
+          AND window_start_utc IS NOT NULL
+          AND window_end_utc IS NOT NULL
+          AND effective_time_zone IS NOT NULL
+          AND effective_local_boundary IS NOT NULL
+          AND (
+            TRIM(content_markdown) LIKE '```%'
+            OR content_markdown LIKE '%## 概览%'
+            OR content_markdown NOT LIKE '%## 项目更新%'
+            OR content_markdown NOT LIKE '%## 获星与关注%'
+          )
+        "#,
+    )
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to count brief content refresh candidates")
+}
+
+pub async fn refresh_existing_brief_snapshot_content(
+    state: &AppState,
+    brief_id: &str,
+    generation_source: &str,
+) -> Result<StoredBrief> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct RefreshableBriefRow {
+        user_id: String,
+        date: String,
+        window_start_utc: Option<String>,
+        window_end_utc: Option<String>,
+        effective_time_zone: Option<String>,
+        effective_local_boundary: Option<String>,
+    }
+
+    let row = sqlx::query_as::<_, RefreshableBriefRow>(
+        r#"
+        SELECT
+          user_id,
+          date,
+          window_start_utc,
+          window_end_utc,
+          effective_time_zone,
+          effective_local_boundary
+        FROM briefs
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(brief_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to load refreshable brief snapshot")?;
+
+    let Some(row) = row else {
+        anyhow::bail!("brief snapshot not found: {brief_id}");
+    };
+    let window = build_window_from_stored_brief(
+        &row.date,
+        row.window_start_utc
+            .as_deref()
+            .context("stored brief snapshot missing window_start_utc")?,
+        row.window_end_utc
+            .as_deref()
+            .context("stored brief snapshot missing window_end_utc")?,
+        row.effective_time_zone
+            .as_deref()
+            .context("stored brief snapshot missing effective_time_zone")?,
+        row.effective_local_boundary
+            .as_deref()
+            .context("stored brief snapshot missing effective_local_boundary")?,
+    )?;
+    let built = build_brief_content(state, &window, &row.user_id).await?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("failed to begin targeted brief refresh tx")?;
+    overwrite_brief_snapshot(&mut tx, brief_id, &window, &built, generation_source, &now)
+        .await
+        .with_context(|| format!("failed to refresh targeted brief snapshot {brief_id}"))?;
+    tx.commit()
+        .await
+        .context("failed to commit targeted brief refresh")?;
+
+    Ok(StoredBrief {
+        id: brief_id.to_owned(),
+        date: window.display_date,
+        window_start: window.start_utc.to_rfc3339(),
+        window_end: window.end_utc.to_rfc3339(),
+        effective_time_zone: window.effective_time_zone,
+        effective_local_boundary: window.effective_local_boundary,
+        content_markdown: built.content_markdown,
+        release_ids: built
+            .releases
+            .into_iter()
+            .map(|release| release.release_id)
+            .collect(),
+    })
+}
+
 pub(crate) async fn generate_daily_brief_snapshot_for_window(
     state: &AppState,
     user_id: &str,
@@ -3683,7 +4184,8 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
     )
     .await?
     {
-        return load_stored_brief_snapshot(state, &existing_id).await;
+        return refresh_existing_brief_snapshot_content(state, &existing_id, generation_source)
+            .await;
     }
     if state.config.ai.is_none() {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
@@ -3997,7 +4499,6 @@ fn parse_legacy_brief_window_from_markdown(
     Some(UserDailyWindow {
         key_date,
         display_date: key_date.to_string(),
-        start_local,
         end_local,
         start_utc: start_local.with_timezone(&Utc),
         end_utc: end_local.with_timezone(&Utc),
@@ -4017,14 +4518,12 @@ fn parse_legacy_brief_window_from_stored_utc(
     let end_utc = window_end_utc
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
         .with_timezone(&Utc);
-    let start_local = effective_time_zone.convert_utc_to_local(start_utc)?;
     let end_local = effective_time_zone.convert_utc_to_local(end_utc)?;
     let key_date = end_local.date_naive();
 
     Some(UserDailyWindow {
         key_date,
         display_date: key_date.to_string(),
-        start_local,
         end_local,
         start_utc,
         end_utc,
@@ -5190,6 +5689,35 @@ mod tests {
     }
 
     #[test]
+    fn compact_link_label_shortens_github_prs_and_commits() {
+        assert_eq!(
+            compact_link_label("https://github.com/acme/app/pull/13840"),
+            "#13840"
+        );
+        assert_eq!(
+            compact_link_label("https://github.com/acme/app/issues/42"),
+            "#42"
+        );
+        assert_eq!(
+            compact_link_label("https://github.com/acme/app/commit/4d8f459e7869d3e0"),
+            "4d8f459"
+        );
+    }
+
+    #[test]
+    fn brief_content_needs_refresh_detects_overview_and_outer_fence() {
+        assert!(brief_content_needs_refresh(
+            "## 概览\n\n## 项目更新\n\n- foo\n"
+        ));
+        assert!(brief_content_needs_refresh(
+            "```markdown\n## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n```"
+        ));
+        assert!(!brief_content_needs_refresh(
+            "## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n"
+        ));
+    }
+
+    #[test]
     fn fallback_bullets_never_empty() {
         let bullets = extract_fallback_bullets("", 3);
         assert_eq!(bullets.len(), 1);
@@ -5275,15 +5803,6 @@ mod tests {
 
     #[test]
     fn build_brief_markdown_escapes_release_title_link_text() {
-        let preferences = briefs::DailyBriefPreferences {
-            local_time: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
-            time_zone: "Asia/Shanghai".to_owned(),
-        };
-        let window = briefs::compute_daily_window_for_key_date(
-            &preferences,
-            NaiveDate::from_ymd_opt(2026, 2, 21).unwrap(),
-        )
-        .unwrap();
         let repo = RepoRendered {
             full_name: "acme/rocket".to_owned(),
             releases: vec![ReleaseRendered {
@@ -5297,8 +5816,46 @@ mod tests {
             }],
         };
 
-        let markdown = build_brief_markdown(&window, &[repo]);
+        let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
         assert!(markdown.contains("- [v1.0 \\[beta\\]\\(rc\\)](/?tab=briefs&release=42)"));
+        assert!(markdown.contains("## 获星与关注"));
+    }
+
+    #[test]
+    fn build_brief_markdown_renders_social_summary_and_empty_states() {
+        let social = SocialSummaryRendered {
+            repo_stars: vec![RepoStarRendered {
+                full_name: "acme/rocket".to_owned(),
+                actors: vec![
+                    SocialActorRendered {
+                        actor_github_user_id: 1,
+                        login: "alice".to_owned(),
+                        html_url: Some("https://github.com/alice".to_owned()),
+                        latest_occurred_at: "2026-02-20T10:00:00Z".to_owned(),
+                    },
+                    SocialActorRendered {
+                        actor_github_user_id: 2,
+                        login: "bob".to_owned(),
+                        html_url: Some("https://github.com/bob".to_owned()),
+                        latest_occurred_at: "2026-02-20T09:00:00Z".to_owned(),
+                    },
+                ],
+                latest_occurred_at: "2026-02-20T10:00:00Z".to_owned(),
+            }],
+            followers: vec![SocialActorRendered {
+                actor_github_user_id: 3,
+                login: "carol".to_owned(),
+                html_url: Some("https://github.com/carol".to_owned()),
+                latest_occurred_at: "2026-02-20T08:00:00Z".to_owned(),
+            }],
+        };
+
+        let markdown = build_brief_markdown(&[], &social);
+        assert!(markdown.contains("- 本时间窗口内没有新的 Release。"));
+        assert!(markdown.contains("### 获星"));
+        assert!(markdown.contains("[acme/rocket](https://github.com/acme/rocket)：[@alice]"));
+        assert!(markdown.contains("### 关注"));
+        assert!(markdown.contains("[@carol](https://github.com/carol)"));
     }
 
     #[tokio::test]
@@ -5641,9 +6198,11 @@ mod tests {
         assert_eq!(stored.id, "brief-existing-collision");
         assert_eq!(stored.effective_time_zone, "Asia/Shanghai");
         assert_eq!(stored.effective_local_boundary, "08:00");
-        assert_eq!(stored.content_markdown, "original snapshot");
         assert_eq!(stored.window_start, "2026-03-06T00:00:00+00:00");
         assert_eq!(stored.window_end, "2026-03-07T00:00:00+00:00");
+        assert!(stored.content_markdown.contains("## 项目更新"));
+        assert!(stored.content_markdown.contains("## 获星与关注"));
+        assert!(!stored.content_markdown.contains("## 概览"));
 
         let row = sqlx::query_as::<_, (String, String, String, String)>(
             r#"
@@ -5659,8 +6218,8 @@ mod tests {
 
         assert_eq!(row.0, "Asia/Shanghai");
         assert_eq!(row.1, "08:00");
-        assert_eq!(row.2, "scheduled");
-        assert_eq!(row.3, "original snapshot");
+        assert_eq!(row.2, "manual");
+        assert_eq!(row.3, stored.content_markdown);
     }
 
     #[tokio::test]
@@ -5715,6 +6274,33 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("insert stored snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-existing-no-ai")
+        .bind("user-brief-existing-no-ai")
+        .bind(1_i64)
+        .bind("acme/rocket")
+        .bind("acme")
+        .bind("rocket")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/acme/rocket")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&state.pool)
+        .await
+        .expect("insert starred repo");
 
         sqlx::query(
             r#"
@@ -5776,15 +6362,16 @@ mod tests {
             "manual",
         )
         .await
-        .expect("reuse stored snapshot before ai guard");
+        .expect("refresh stored snapshot before ai guard");
 
         assert_eq!(stored.id, "brief-existing-no-ai");
-        assert_eq!(stored.content_markdown, "existing snapshot");
+        assert!(stored.content_markdown.contains("## 项目更新"));
+        assert!(stored.content_markdown.contains("## 获星与关注"));
         assert_eq!(stored.release_ids, vec![406]);
     }
 
     #[tokio::test]
-    async fn upsert_daily_brief_snapshot_keeps_existing_snapshot_immutable() {
+    async fn upsert_daily_brief_snapshot_refreshes_existing_snapshot_in_place() {
         let state = setup_llm_state().await;
         let now = "2026-03-07T09:00:00Z";
 
@@ -5864,6 +6451,33 @@ mod tests {
 
         sqlx::query(
             r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-upsert-immutable")
+        .bind("user-upsert-immutable")
+        .bind(1_i64)
+        .bind("acme/rocket")
+        .bind("acme")
+        .bind("rocket")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/acme/rocket")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&state.pool)
+        .await
+        .expect("insert starred repo");
+
+        sqlx::query(
+            r#"
             INSERT INTO briefs (
               id, user_id, date,
               window_start_utc, window_end_utc,
@@ -5935,11 +6549,11 @@ mod tests {
             "manual",
         )
         .await
-        .expect("preserve existing snapshot");
+        .expect("refresh existing snapshot");
 
         assert_eq!(stored.id, "brief-existing-window");
-        assert_eq!(stored.content_markdown, "original snapshot");
-        assert_eq!(stored.release_ids, vec![401]);
+        assert_eq!(stored.content_markdown, "new snapshot");
+        assert_eq!(stored.release_ids, vec![402]);
 
         let row = sqlx::query_as::<_, (String, String)>(
             r#"
@@ -5952,8 +6566,8 @@ mod tests {
         .fetch_one(&state.pool)
         .await
         .expect("reload stored snapshot");
-        assert_eq!(row.0, "scheduled");
-        assert_eq!(row.1, "original snapshot");
+        assert_eq!(row.0, "manual");
+        assert_eq!(row.1, "new snapshot");
 
         let memberships = sqlx::query_scalar::<_, i64>(
             r#"
@@ -5967,7 +6581,7 @@ mod tests {
         .fetch_all(&state.pool)
         .await
         .expect("reload stored memberships");
-        assert_eq!(memberships, vec![401]);
+        assert_eq!(memberships, vec![402]);
     }
 
     #[tokio::test]
