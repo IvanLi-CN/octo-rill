@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-15
 - Last: 2026-04-15
 
@@ -126,7 +126,7 @@
 - [x] M1: 接入 TanStack Router file-based 基建，并由根路由统一承接 auth bootstrap。
 - [x] M2: `/`、`/admin`、`/admin/jobs` 与相关 URL 状态迁入 Router，站内导航改为 SPA。
 - [x] M3: 补齐 Storybook、Playwright 与可视化验证证据。
-- [ ] M4: 完成 spec 同步、review-loop 与 merge-ready PR 收口。
+- [x] M4: 完成 spec 同步、review-loop 与 merge-ready PR 收口。
 
 ## Visual Evidence
 

@@ -102,4 +102,4 @@
 | y2yf8 | Release 翻译输入预算与运行时设置收口 | 已完成 | `y2yf8-release-translation-input-budget-runtime/SPEC.md` | 2026-04-13 | local implementation completed; runtime `ai_model_context_limit`; release_detail chunk translation unified; visual evidence landed |
 | jfkcf | Release reaction 反馈图标轻量收敛 | 已完成 | `jfkcf-release-reaction-compact-size/SPEC.md` | 2026-04-12 | local implementation completed; compact reaction trigger + Storybook canvas evidence |
 | p82d7 | Dashboard / Admin 移动端壳层与顶栏收敛优化 | 部分完成（4/4） | `p82d7-dashboard-admin-mobile-shell-polish/SPEC.md` | 2026-04-14 | PR #77; visual evidence refreshed and mobile shell gesture polish landed |
-| y9qpf | TanStack Router 接管前端路由并消除登录页闪现 | 部分完成（3/4） | `y9qpf-tanstack-router-auth-boot-no-login-flicker/SPEC.md` | 2026-04-15 | fast-track; three-layer startup model landed in progress; Storybook + e2e evidence refreshed; awaiting PR convergence |
+| y9qpf | TanStack Router 接管前端路由并消除登录页闪现 | 已完成 | `y9qpf-tanstack-router-auth-boot-no-login-flicker/SPEC.md` | 2026-04-15 | PR #80; fast-track; TanStack Router SPA routing + three-layer startup model + build-time version monitor landed |
