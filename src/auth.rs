@@ -12,7 +12,7 @@ use sqlx::{Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
 
-use crate::{crypto::EncryptedSecret, error::ApiError, github, local_id, state::AppState};
+use crate::{briefs, crypto::EncryptedSecret, error::ApiError, github, local_id, state::AppState};
 
 const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
 const SESSION_KEY_USER_ID: &str = "user_id";
@@ -37,6 +37,152 @@ async fn promote_first_admin(
     .map_err(ApiError::internal)?;
 
     Ok(updated.rows_affected() > 0)
+}
+
+async fn upsert_github_user(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    now: &str,
+    default_daily_brief_local_time: chrono::NaiveTime,
+    default_daily_brief_time_zone: &str,
+) -> Result<(), ApiError> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct ExistingBriefPreferenceRow {
+        daily_brief_local_time: Option<String>,
+        daily_brief_time_zone: Option<String>,
+        daily_brief_utc_time: String,
+    }
+
+    let existing = sqlx::query_as::<_, ExistingBriefPreferenceRow>(
+        r#"
+        SELECT daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time
+        FROM users
+        WHERE github_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user.id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let existing_local_time = existing
+        .as_ref()
+        .and_then(|row| row.daily_brief_local_time.as_deref())
+        .and_then(|value| briefs::parse_daily_brief_local_time(value).ok())
+        .map(briefs::format_daily_brief_local_time);
+    let existing_time_zone = existing
+        .as_ref()
+        .and_then(|row| row.daily_brief_time_zone.as_deref())
+        .and_then(briefs::canonical_supported_time_zone);
+    let (
+        excluded_daily_brief_utc_time,
+        excluded_daily_brief_local_time,
+        excluded_daily_brief_time_zone,
+    ) = if let (Some(local_time), Some(time_zone)) = (existing_local_time, existing_time_zone) {
+        (
+            existing
+                .as_ref()
+                .map(|row| row.daily_brief_utc_time.clone())
+                .unwrap_or_else(|| "00:00".to_owned()),
+            Some(local_time),
+            Some(time_zone),
+        )
+    } else {
+        let derived_preferences = existing.as_ref().map_or(
+            briefs::DailyBriefPreferences {
+                local_time: default_daily_brief_local_time,
+                time_zone: default_daily_brief_time_zone.to_owned(),
+            },
+            |row| {
+                briefs::derive_daily_brief_preferences_with_defaults(
+                    default_daily_brief_local_time,
+                    default_daily_brief_time_zone,
+                    row.daily_brief_local_time.as_deref(),
+                    row.daily_brief_time_zone.as_deref(),
+                    Some(row.daily_brief_utc_time.as_str()),
+                    chrono::Utc::now(),
+                )
+            },
+        );
+        let derived_local_time =
+            briefs::format_daily_brief_local_time(derived_preferences.local_time);
+        let derived_legacy_utc_time = briefs::format_legacy_daily_brief_utc_time(
+            derived_preferences.local_time,
+            &derived_preferences.time_zone,
+        )
+        .map_err(ApiError::internal)?;
+        let enabled_hours = briefs::load_enabled_daily_brief_scheduler_hours(&mut **tx)
+            .await
+            .map_err(ApiError::internal)?;
+        let missing_hours = briefs::missing_daily_brief_scheduler_hours(
+            derived_preferences.local_time,
+            &derived_preferences.time_zone,
+            &enabled_hours,
+        )
+        .map_err(ApiError::internal)?;
+        if !missing_hours.is_empty() {
+            let missing_hours = missing_hours
+                .into_iter()
+                .map(|hour| format!("{hour:02}:00Z"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::warn!(
+                github_user_id = user.id,
+                login = %user.login,
+                local_time = %derived_local_time,
+                time_zone = %derived_preferences.time_zone,
+                missing_enabled_utc_slots = %missing_hours,
+                "skipping daily brief profile backfill during OAuth login because required scheduler slots are disabled"
+            );
+            (derived_legacy_utc_time, None, None)
+        } else {
+            (
+                derived_legacy_utc_time,
+                Some(derived_local_time),
+                Some(derived_preferences.time_zone),
+            )
+        }
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO users (
+          id, github_user_id, login, name, avatar_url, email,
+          created_at, updated_at, last_active_at,
+          daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(github_user_id) DO UPDATE SET
+          login = excluded.login,
+          name = excluded.name,
+          avatar_url = excluded.avatar_url,
+          email = excluded.email,
+          updated_at = excluded.updated_at,
+          last_active_at = excluded.last_active_at,
+          daily_brief_utc_time = excluded.daily_brief_utc_time,
+          daily_brief_local_time = excluded.daily_brief_local_time,
+          daily_brief_time_zone = excluded.daily_brief_time_zone
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(now)
+    .bind(now)
+    .bind(now)
+    .bind(excluded_daily_brief_utc_time)
+    .bind(excluded_daily_brief_local_time)
+    .bind(excluded_daily_brief_time_zone)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(())
 }
 
 pub async fn github_login(
@@ -119,36 +265,21 @@ pub async fn github_callback(
     };
 
     let now = chrono::Utc::now().to_rfc3339();
+    let default_daily_brief_local_time =
+        crate::briefs::default_daily_brief_local_time(&state.config);
+    let default_daily_brief_time_zone =
+        crate::briefs::default_daily_brief_time_zone(&state.config).to_owned();
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO users (
-          id, github_user_id, login, name, avatar_url, email,
-          created_at, updated_at, last_active_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(github_user_id) DO UPDATE SET
-          login = excluded.login,
-          name = excluded.name,
-          avatar_url = excluded.avatar_url,
-          email = excluded.email,
-          updated_at = excluded.updated_at,
-          last_active_at = excluded.last_active_at
-        "#,
+    upsert_github_user(
+        &mut tx,
+        &user,
+        email.as_deref(),
+        now.as_str(),
+        default_daily_brief_local_time,
+        default_daily_brief_time_zone.as_str(),
     )
-    .bind(local_id::generate_local_id())
-    .bind(user.id)
-    .bind(&user.login)
-    .bind(user.name.as_deref())
-    .bind(user.avatar_url.as_deref())
-    .bind(email.as_deref())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
+    .await?;
 
     #[derive(Debug, sqlx::FromRow)]
     struct AuthUserRow {
@@ -234,7 +365,7 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::promote_first_admin;
+    use super::{promote_first_admin, upsert_github_user};
     use sqlx::{
         SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -303,5 +434,176 @@ mod tests {
                 .await
                 .expect("query first user admin status");
         assert_eq!(first_is_admin, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_github_user_backfills_missing_brief_preferences_for_existing_accounts() {
+        let pool = setup_pool().await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login, daily_brief_utc_time, created_at, updated_at
+            )
+            VALUES (
+              'user-existing-id', 101, 'existing', '13:00',
+              '2026-02-25T10:00:00Z', '2026-02-25T10:00:00Z'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy user");
+
+        let github_user = crate::github::GitHubUser {
+            id: 101,
+            login: "existing".to_owned(),
+            name: Some("Existing User".to_owned()),
+            avatar_url: Some("https://avatars.example/existing.png".to_owned()),
+            email: None,
+        };
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_github_user(
+            &mut tx,
+            &github_user,
+            Some("existing@example.com"),
+            "2026-07-25T12:00:00Z",
+            chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid default time"),
+            "America/New_York",
+        )
+        .await
+        .expect("upsert github user");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT daily_brief_local_time, daily_brief_time_zone
+            FROM users
+            WHERE github_user_id = 101
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted preferences");
+
+        assert_eq!(row.0.as_deref(), Some("08:00"));
+        assert_eq!(row.1.as_deref(), Some("America/New_York"));
+    }
+
+    #[tokio::test]
+    async fn upsert_github_user_skips_unschedulable_brief_preference_backfill() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            UPDATE daily_brief_hour_slots
+            SET enabled = CASE WHEN hour_utc = 13 THEN 0 ELSE enabled END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("disable required slot");
+
+        let github_user = crate::github::GitHubUser {
+            id: 102,
+            login: "new-user".to_owned(),
+            name: Some("New User".to_owned()),
+            avatar_url: Some("https://avatars.example/new-user.png".to_owned()),
+            email: None,
+        };
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_github_user(
+            &mut tx,
+            &github_user,
+            Some("new-user@example.com"),
+            "2026-07-25T12:00:00Z",
+            chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid default time"),
+            "America/New_York",
+        )
+        .await
+        .expect("allow login when derived brief preferences are unschedulable");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            r#"
+            SELECT daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone
+            FROM users
+            WHERE github_user_id = 102
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load new user profile");
+
+        assert_eq!(row.0, "13:00");
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, None);
+    }
+
+    #[tokio::test]
+    async fn upsert_github_user_preserves_existing_unschedulable_brief_preferences() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (
+              'user-existing-unschedulable', 103, 'existing-unschedulable',
+              '13:00', '08:00', 'America/New_York',
+              '2026-02-25T10:00:00Z', '2026-02-25T10:00:00Z'
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed existing user");
+        sqlx::query(
+            r#"
+            UPDATE daily_brief_hour_slots
+            SET enabled = CASE WHEN hour_utc = 13 THEN 0 ELSE enabled END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("disable required slot");
+
+        let github_user = crate::github::GitHubUser {
+            id: 103,
+            login: "existing-unschedulable".to_owned(),
+            name: Some("Existing Unschedulable".to_owned()),
+            avatar_url: Some("https://avatars.example/existing-unschedulable.png".to_owned()),
+            email: None,
+        };
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        upsert_github_user(
+            &mut tx,
+            &github_user,
+            Some("existing-unschedulable@example.com"),
+            "2026-07-25T12:00:00Z",
+            chrono::NaiveTime::from_hms_opt(8, 0, 0).expect("valid default time"),
+            "America/New_York",
+        )
+        .await
+        .expect("preserve existing unschedulable profile");
+        tx.commit().await.expect("commit tx");
+
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT daily_brief_local_time, daily_brief_time_zone
+            FROM users
+            WHERE github_user_id = 103
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted preferences");
+
+        assert_eq!(row.0.as_deref(), Some("08:00"));
+        assert_eq!(row.1.as_deref(), Some("America/New_York"));
     }
 }

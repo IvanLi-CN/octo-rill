@@ -19,6 +19,8 @@ type MockUser = {
 const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
 const STANDARD_USER_ID = "3g5n8q2r4y7d9w3b";
 
+test.describe.configure({ mode: "serial" });
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -205,7 +207,34 @@ async function installBaseMocks(
 			}
 			return json(route, {
 				user_id: target.id,
-				daily_brief_utc_time: "08:00",
+				daily_brief_local_time: "08:00",
+				daily_brief_time_zone: "Asia/Shanghai",
+				last_active_at: target.last_active_at,
+			});
+		}
+
+		if (
+			req.method() === "PATCH" &&
+			pathname.startsWith("/api/admin/users/") &&
+			pathname.endsWith("/profile")
+		) {
+			const id = decodeURIComponent(pathname.split("/").at(-2) ?? "");
+			const target = users.find((u) => u.id === id);
+			if (!target) {
+				return json(
+					route,
+					{ ok: false, error: { code: "not_found", message: "not found" } },
+					404,
+				);
+			}
+			const body = req.postDataJSON() as {
+				daily_brief_local_time?: string;
+				daily_brief_time_zone?: string;
+			};
+			return json(route, {
+				user_id: target.id,
+				daily_brief_local_time: body.daily_brief_local_time ?? "08:00",
+				daily_brief_time_zone: body.daily_brief_time_zone ?? "Asia/Shanghai",
 				last_active_at: target.last_active_at,
 			});
 		}
@@ -268,8 +297,17 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
 	await expect(page).toHaveURL(/\/admin$/);
-	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
-	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+	await expect(
+		page.getByRole("navigation", { name: "管理员导航" }),
+	).toBeVisible();
+	await expect(
+		page.getByText(
+			"这是独立的管理员界面，当前包含用户管理与任务中心两个模块。",
+		),
+	).toBeVisible();
+	await expect(
+		page.getByText("管理账号角色与状态：支持筛选、升降管理员、启用/禁用。"),
+	).toBeVisible();
 	await expect(
 		page.getByRole("textbox", { name: "搜索 login、name 或 email" }),
 	).toBeVisible();
@@ -294,9 +332,10 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await userRow.getByRole("button", { name: "详情" }).click();
 	const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 	await expect(profileSheet).toBeVisible();
-	await expect(
-		profileSheet.getByText("日报时间（浏览器当前时区）"),
-	).toBeVisible();
+	await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
+	await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
+		"Asia/Shanghai",
+	);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(profileSheet).toHaveCount(0);
 	await userRow.getByRole("button", { name: "设为管理员" }).click();
@@ -342,7 +381,9 @@ test("self-demoted admin is redirected out of admin panel", async ({
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
 	await expect(page).toHaveURL(/\/admin$/);
-	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
+	await expect(
+		page.getByText("管理账号角色与状态：支持筛选、升降管理员、启用/禁用。"),
+	).toBeVisible();
 
 	const userRow = page
 		.getByText("octo-user", { exact: false })
@@ -434,13 +475,10 @@ test.describe("daily brief time formatting", () => {
 			await userRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
-			await expect(
-				profileSheet.getByText("日报时间（浏览器当前时区）"),
-			).toBeVisible();
-			await expect(
-				profileSheet.getByText("04:00", { exact: true }),
-			).toBeVisible();
-			await expect(profileSheet.getByText("UTC 原值：08:00")).toBeVisible();
+			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
+			await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
+				"Asia/Shanghai",
+			);
 		});
 	});
 
@@ -462,13 +500,10 @@ test.describe("daily brief time formatting", () => {
 			await userRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
-			await expect(
-				profileSheet.getByText("日报时间（浏览器当前时区）"),
-			).toBeVisible();
-			await expect(
-				profileSheet.getByText("16:00", { exact: true }),
-			).toBeVisible();
-			await expect(profileSheet.getByText("UTC 原值：08:00")).toBeVisible();
+			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
+			await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
+				"Asia/Shanghai",
+			);
 		});
 	});
 });

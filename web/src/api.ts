@@ -201,8 +201,19 @@ export type MeResponse = {
 };
 export type AdminUserProfileResponse = {
 	user_id: LocalUserId;
-	daily_brief_utc_time: string;
+	daily_brief_local_time: string;
+	daily_brief_time_zone: string;
 	last_active_at: string | null;
+};
+export type MeProfileResponse = {
+	user_id: LocalUserId;
+	daily_brief_local_time: string;
+	daily_brief_time_zone: string;
+	last_active_at: string | null;
+};
+export type DailyBriefProfilePatchRequest = {
+	daily_brief_local_time: string;
+	daily_brief_time_zone: string;
 };
 export type AdminJobsOverviewResponse = {
 	queued: number;
@@ -284,6 +295,10 @@ export type AdminBriefDailySlotDiagnostics = {
 		key_date: string | null;
 		state: "succeeded" | "failed" | "running";
 		error: string | null;
+		local_boundary: string | null;
+		time_zone: string | null;
+		window_start_utc: string | null;
+		window_end_utc: string | null;
 		last_event_at: string;
 	}>;
 };
@@ -291,6 +306,21 @@ export type AdminBriefGenerateDiagnostics = {
 	target_user_id: LocalUserId | null;
 	content_length: number | null;
 	key_date: string | null;
+	brief_id: string | null;
+	date: string | null;
+	window_start_utc: string | null;
+	window_end_utc: string | null;
+	effective_time_zone: string | null;
+	effective_local_boundary: string | null;
+	release_count: number | null;
+};
+export type AdminBriefHistoryRecomputeDiagnostics = {
+	total: number;
+	processed: number;
+	succeeded: number;
+	failed: number;
+	current_brief_id: string | null;
+	last_error: string | null;
 };
 export type AdminSyncSubscriptionsDiagnostics = {
 	trigger: string | null;
@@ -346,6 +376,7 @@ export type AdminTaskDiagnostics = {
 	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
 	brief_daily_slot?: AdminBriefDailySlotDiagnostics | null;
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
+	brief_history_recompute?: AdminBriefHistoryRecomputeDiagnostics | null;
 	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {
@@ -458,6 +489,23 @@ export async function apiGetAdminUserProfile(
 	return apiGet<AdminUserProfileResponse>(
 		`/api/admin/users/${encodeURIComponent(userId)}/profile`,
 	);
+}
+export async function apiPatchAdminUserProfile(
+	userId: LocalUserId,
+	body: DailyBriefProfilePatchRequest,
+): Promise<AdminUserProfileResponse> {
+	return apiPatchJson<AdminUserProfileResponse>(
+		`/api/admin/users/${encodeURIComponent(userId)}/profile`,
+		body,
+	);
+}
+export async function apiGetMeProfile(): Promise<MeProfileResponse> {
+	return apiGet<MeProfileResponse>("/api/me/profile");
+}
+export async function apiPatchMeProfile(
+	body: DailyBriefProfilePatchRequest,
+): Promise<MeProfileResponse> {
+	return apiPatchJson<MeProfileResponse>("/api/me/profile", body);
 }
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
