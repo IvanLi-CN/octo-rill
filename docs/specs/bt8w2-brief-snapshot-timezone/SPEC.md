@@ -32,7 +32,7 @@
 
 ### In scope
 
-- `migrations/0033_daily_brief_snapshots.sql`
+- `migrations/0035_daily_brief_snapshots.sql`
 - `src/briefs.rs`
 - `src/ai.rs`
 - `src/api.rs`

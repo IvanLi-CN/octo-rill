@@ -571,7 +571,6 @@ mod tests {
             },
             ai: None,
             ai_max_concurrency: 1,
-            ai_model_context_limit: None,
             ai_daily_at_local: None,
             app_default_time_zone: DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
