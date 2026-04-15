@@ -9,6 +9,11 @@ import {
 	apiPatchAdminUserProfile,
 	apiPatchJson,
 } from "@/api";
+import { useAuthBootstrap } from "@/auth/AuthBootstrap";
+import {
+	persistAdminUsersWarmSnapshot,
+	type AdminUsersWarmSnapshot,
+} from "@/auth/startupCache";
 import {
 	DailyBriefProfileForm,
 	readHourAlignedBrowserTimeZone,
@@ -40,6 +45,7 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import { useInternalNavigate } from "@/lib/internalNavigation";
 import {
 	Sheet,
 	SheetContent,
@@ -88,6 +94,7 @@ export type UserManagementStoryState = {
 type UserManagementProps = {
 	currentUserId: LocalUserId;
 	storyState?: UserManagementStoryState;
+	warmStart?: AdminUsersWarmSnapshot | null;
 };
 
 type PendingAdminConfirm = {
@@ -141,6 +148,14 @@ function toAdminUserErrorMessage(err: unknown) {
 	return err instanceof Error ? err.message : String(err);
 }
 
+const USER_CARD_SKELETON_KEYS = [
+	"user-skeleton-1",
+	"user-skeleton-2",
+	"user-skeleton-3",
+	"user-skeleton-4",
+	"user-skeleton-5",
+] as const;
+
 function userRoleBadgeClass(isAdmin: boolean) {
 	return isAdmin
 		? "border-emerald-300 bg-emerald-100 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
@@ -156,23 +171,34 @@ function userStatusBadgeClass(isDisabled: boolean) {
 export function UserManagement({
 	currentUserId,
 	storyState,
+	warmStart = null,
 }: UserManagementProps) {
-	const [queryInput, setQueryInput] = useState(storyState?.queryInput ?? "");
-	const [query, setQuery] = useState(storyState?.query ?? "");
-	const [role, setRole] = useState<AdminRole>(storyState?.role ?? "all");
-	const [status, setStatus] = useState<AdminStatus>(
-		storyState?.status ?? "all",
+	const { refreshAuth } = useAuthBootstrap();
+	const navigateInternal = useInternalNavigate();
+	const [queryInput, setQueryInput] = useState(
+		storyState?.queryInput ?? warmStart?.queryInput ?? "",
 	);
-	const [page, setPage] = useState(1);
+	const [query, setQuery] = useState(
+		storyState?.query ?? warmStart?.query ?? "",
+	);
+	const [role, setRole] = useState<AdminRole>(
+		storyState?.role ?? warmStart?.role ?? "all",
+	);
+	const [status, setStatus] = useState<AdminStatus>(
+		storyState?.status ?? warmStart?.status ?? "all",
+	);
+	const [page, setPage] = useState(warmStart?.page ?? 1);
 
-	const [loading, setLoading] = useState(false);
+	const [loading, setLoading] = useState(warmStart === null);
 	const [error, setError] = useState<string | null>(null);
-	const [items, setItems] = useState<AdminUserItem[]>([]);
-	const [total, setTotal] = useState(0);
+	const [items, setItems] = useState<AdminUserItem[]>(
+		() => warmStart?.items ?? [],
+	);
+	const [total, setTotal] = useState(warmStart?.total ?? 0);
 	const [guardSummary, setGuardSummary] = useState<{
 		admin_total: number;
 		active_admin_total: number;
-	}>(DEFAULT_GUARD);
+	}>(warmStart?.guardSummary ?? DEFAULT_GUARD);
 	const [actionBusyUserId, setActionBusyUserId] = useState<LocalUserId | null>(
 		null,
 	);
@@ -227,8 +253,13 @@ export function UserManagement({
 			} catch (err) {
 				if (err instanceof ApiError && err.code === "forbidden_admin_only") {
 					// Permission can change within the same session (e.g. self demotion),
-					// so force a full reload to refresh /api/me and exit admin view.
-					window.location.replace("/");
+					// so refresh auth state and exit admin view without a full reload.
+					await refreshAuth();
+					await navigateInternal({
+						href: "/",
+						to: "/",
+						replace: true,
+					});
 					return;
 				}
 				setError(toAdminUserErrorMessage(err));
@@ -236,7 +267,7 @@ export function UserManagement({
 				setLoading(false);
 			}
 		},
-		[page, query, role, status],
+		[navigateInternal, page, query, refreshAuth, role, status],
 	);
 
 	useEffect(() => {
@@ -364,6 +395,36 @@ export function UserManagement({
 		});
 	}, [items, storyState?.pendingAdminConfirmUserId]);
 
+	useEffect(() => {
+		if (loading || items.length === 0) {
+			return;
+		}
+		persistAdminUsersWarmSnapshot({
+			userId: currentUserId,
+			queryInput,
+			query,
+			role,
+			status,
+			page,
+			items,
+			total,
+			guardSummary,
+		});
+	}, [
+		currentUserId,
+		guardSummary,
+		items,
+		loading,
+		page,
+		query,
+		queryInput,
+		role,
+		status,
+		total,
+	]);
+
+	const showStartupSkeleton = loading && items.length === 0 && error === null;
+
 	return (
 		<Card>
 			<CardHeader>
@@ -428,8 +489,26 @@ export function UserManagement({
 				{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
 				<div className="space-y-2">
-					{loading ? (
-						<p className="text-muted-foreground text-sm">正在加载用户列表...</p>
+					{showStartupSkeleton ? (
+						USER_CARD_SKELETON_KEYS.map((key) => (
+							<div
+								key={key}
+								className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 md:flex-row md:items-center md:justify-between"
+							>
+								<div className="min-w-0 space-y-2">
+									<div className="bg-muted h-4 w-24 animate-pulse rounded-full" />
+									<div className="bg-muted h-3 w-40 animate-pulse rounded-full" />
+									<div className="bg-muted h-3 w-20 animate-pulse rounded-full" />
+								</div>
+								<div className="flex flex-wrap gap-2">
+									<div className="bg-muted h-9 w-14 animate-pulse rounded-xl" />
+									<div className="bg-muted h-9 w-20 animate-pulse rounded-xl" />
+									<div className="bg-muted h-9 w-16 animate-pulse rounded-xl" />
+								</div>
+							</div>
+						))
+					) : loading ? (
+						<p className="text-muted-foreground text-sm">正在刷新用户列表...</p>
 					) : items.length === 0 ? (
 						<p className="text-muted-foreground text-sm">没有匹配的用户。</p>
 					) : (

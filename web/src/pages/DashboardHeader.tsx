@@ -12,6 +12,7 @@ import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { useAppShellChrome } from "@/layout/AppShell";
+import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
 
 export type DashboardHeaderProps = {
@@ -160,10 +161,14 @@ function DashboardUserInfoCard(props: {
 			{showMobileAdminLink ? (
 				<div className="mt-4 border-t border-border/70 pt-3 sm:hidden">
 					<Button asChild variant="ghost" className="w-full justify-start px-2">
-						<a href="/admin" data-dashboard-mobile-admin-entry="true">
+						<InternalLink
+							href="/admin"
+							to="/admin"
+							data-dashboard-mobile-admin-entry="true"
+						>
 							<ArrowUpRight className="size-4" />
 							管理员面板
-						</a>
+						</InternalLink>
 					</Button>
 				</div>
 			) : null}

@@ -1,80 +1,26 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useState } from "react";
 import { expect, within } from "storybook/test";
 
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
-import { VersionMonitorProvider } from "@/version/versionMonitor";
+import {
+	type VersionMonitorValue,
+	VERSION_UNKNOWN,
+	VersionMonitorStateProvider,
+} from "@/version/versionMonitor";
 
 type FooterPreviewProps = {
-	delayMs: number;
-	mockMode: "success" | "fallback" | "failure";
-	mockVersion: string;
+	loadedVersion: string;
+	availableVersion: string | null;
+	hasUpdate: boolean;
 };
 
-function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
-	const [mockReady, setMockReady] = useState(false);
-
-	useEffect(() => {
-		const originalFetch = globalThis.fetch.bind(globalThis);
-		setMockReady(false);
-
-		globalThis.fetch = async (input, init) => {
-			const url =
-				typeof input === "string"
-					? input
-					: input instanceof URL
-						? input.toString()
-						: input.url;
-
-			if (url.endsWith("/api/version")) {
-				if (mockMode === "failure" || mockMode === "fallback") {
-					return new Response(null, { status: 503, statusText: "Unavailable" });
-				}
-
-				if (delayMs > 0) {
-					await new Promise((resolve) => setTimeout(resolve, delayMs));
-				}
-
-				return new Response(
-					JSON.stringify({
-						ok: true,
-						version: mockVersion,
-						source: "APP_EFFECTIVE_VERSION",
-					}),
-					{
-						headers: { "Content-Type": "application/json" },
-						status: 200,
-					},
-				);
-			}
-
-			if (url.endsWith("/api/health")) {
-				if (mockMode === "failure") {
-					return new Response(null, { status: 503, statusText: "Unavailable" });
-				}
-
-				if (delayMs > 0) {
-					await new Promise((resolve) => setTimeout(resolve, delayMs));
-				}
-
-				return new Response(
-					JSON.stringify({ ok: true, version: mockVersion }),
-					{
-						headers: { "Content-Type": "application/json" },
-						status: 200,
-					},
-				);
-			}
-
-			return originalFetch(input, init);
-		};
-		setMockReady(true);
-
-		return () => {
-			setMockReady(false);
-			globalThis.fetch = originalFetch;
-		};
-	}, [delayMs, mockMode, mockVersion]);
+function FooterPreview(props: FooterPreviewProps) {
+	const value: VersionMonitorValue = {
+		loadedVersion: props.loadedVersion,
+		availableVersion: props.availableVersion,
+		hasUpdate: props.hasUpdate,
+		refreshPage: () => undefined,
+	};
 
 	return (
 		<div className="bg-background min-h-screen">
@@ -83,11 +29,9 @@ function FooterPreview({ delayMs, mockMode, mockVersion }: FooterPreviewProps) {
 					AppMetaFooter component preview
 				</p>
 			</div>
-			{mockReady ? (
-				<VersionMonitorProvider>
-					<AppMetaFooter />
-				</VersionMonitorProvider>
-			) : null}
+			<VersionMonitorStateProvider value={value}>
+				<AppMetaFooter />
+			</VersionMonitorStateProvider>
 		</div>
 	);
 }
@@ -101,25 +45,24 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Footer 负责展示当前页实际加载版本，并保留 GitHub 仓库入口；当 `/api/version` 不可用时，会回退到 `/api/health`。适合在这里确认版本文案、外链与降级状态。\n\n相关公开文档：[配置参考](../config.html) · [快速开始](../quick-start.html)",
+					"Footer 负责展示当前前端构建已经加载到浏览器里的版本号，而不是等待接口后才知道自身版本。`/api/version` 与 `/api/health` 只用于比较后端当前版本，并决定是否提示发现更新。",
 			},
 		},
 	},
 	args: {
-		delayMs: 0,
-		mockMode: "success",
-		mockVersion: "0.1.0",
+		loadedVersion: "v0.1.0",
+		availableVersion: null,
+		hasUpdate: false,
 	},
 	argTypes: {
-		mockMode: {
-			control: "inline-radio",
-			options: ["success", "fallback", "failure"],
-		},
-		mockVersion: {
+		loadedVersion: {
 			control: "text",
 		},
-		delayMs: {
-			control: "number",
+		availableVersion: {
+			control: "text",
+		},
+		hasUpdate: {
+			control: "boolean",
 		},
 	},
 } satisfies Meta<typeof FooterPreview>;
@@ -130,13 +73,13 @@ type Story = StoryObj<typeof meta>;
 export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const storyRoot = within(canvasElement.ownerDocument.body);
-		await expect(storyRoot.getByText("Version 0.1.0")).toBeVisible();
+		await expect(storyRoot.getByText("Version v0.1.0")).toBeVisible();
 		await expect(storyRoot.getByRole("link", { name: "GitHub" })).toBeVisible();
 	},
 	parameters: {
 		docs: {
 			description: {
-				story: "正常从版本接口拿到当前页实际加载版本时的默认展示。",
+				story: "正常稳态：footer 直接显示当前已加载前端构建版本。",
 			},
 		},
 	},
@@ -144,31 +87,19 @@ export const Default: Story = {
 
 export const BuildMetadataVersion: Story = {
 	args: {
-		mockVersion: "0.2.0-beta.1+git.abc123",
+		loadedVersion: "v0.2.0-beta.1+git.abc123",
 	},
 };
 
-export const VersionEndpointFallback: Story = {
+export const UnknownFallback: Story = {
 	args: {
-		mockMode: "fallback",
+		loadedVersion: VERSION_UNKNOWN,
 	},
 	parameters: {
 		docs: {
 			description: {
-				story: "模拟 `/api/version` 不可用时，Footer 回退到健康检查元信息。",
-			},
-		},
-	},
-};
-
-export const RequestFailed: Story = {
-	args: {
-		mockMode: "failure",
-	},
-	parameters: {
-		docs: {
-			description: {
-				story: "模拟所有版本请求都失败时的降级文案与错误状态。",
+				story:
+					"极端降级态：只有在构建版本本身不可解析时，footer 才退回 unknown。正常轮询失败不会再显示 loading。",
 			},
 		},
 	},

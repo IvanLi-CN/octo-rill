@@ -37,20 +37,20 @@ type VersionMonitorStateProviderProps = {
 	value: VersionMonitorValue;
 };
 
-export const VERSION_LOADING = "loading...";
 export const VERSION_UNKNOWN = "unknown";
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
 const VERSION_REQUEST_HEADERS = {
 	"cache-control": "no-cache",
 	pragma: "no-cache",
 };
+const EMBEDDED_APP_VERSION = normalizeVersion(__APP_LOADED_VERSION__);
 
 const defaultRefreshPage = () => {
 	window.location.reload();
 };
 
 const defaultValue: VersionMonitorValue = {
-	loadedVersion: VERSION_LOADING,
+	loadedVersion: EMBEDDED_APP_VERSION,
 	availableVersion: null,
 	hasUpdate: false,
 	refreshPage: defaultRefreshPage,
@@ -103,10 +103,10 @@ export async function fetchLatestVersion(signal: AbortSignal): Promise<string> {
 function useVersionMonitorController(
 	pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 ): VersionMonitorValue {
-	const [loadedVersion, setLoadedVersion] = useState(VERSION_LOADING);
+	const [loadedVersion] = useState(EMBEDDED_APP_VERSION);
 	const [availableVersion, setAvailableVersion] = useState<string | null>(null);
 	const [hasUpdate, setHasUpdate] = useState(false);
-	const baselineVersionRef = useRef<string | null>(null);
+	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
 
 	useEffect(() => {
@@ -114,30 +114,14 @@ function useVersionMonitorController(
 	}, [hasUpdate]);
 
 	const applyObservedVersion = useCallback((nextVersion: string) => {
-		const baselineVersion = baselineVersionRef.current;
-		if (!baselineVersion) {
-			baselineVersionRef.current = nextVersion;
-			setLoadedVersion(nextVersion);
-			setAvailableVersion(null);
-			setHasUpdate(false);
-			return;
-		}
-
-		if (nextVersion !== baselineVersion) {
+		if (nextVersion !== baselineVersionRef.current) {
 			setAvailableVersion(nextVersion);
 			setHasUpdate(true);
 			return;
 		}
 
-		setLoadedVersion(baselineVersion);
 		setAvailableVersion(null);
 		setHasUpdate(false);
-	}, []);
-
-	const handleVersionCheckFailure = useCallback(() => {
-		if (baselineVersionRef.current === null) {
-			setLoadedVersion(VERSION_UNKNOWN);
-		}
 	}, []);
 
 	useEffect(() => {
@@ -165,9 +149,8 @@ function useVersionMonitorController(
 				}
 				applyObservedVersion(nextVersion);
 			} catch {
-				if (active && !abortController.signal.aborted) {
-					handleVersionCheckFailure();
-				}
+				// Frontend loadedVersion is embedded at build time, so request failure
+				// should not degrade footer text back to a loading/unknown placeholder.
 			} finally {
 				inFlight = false;
 				if (currentAbortController === abortController) {
@@ -193,12 +176,7 @@ function useVersionMonitorController(
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
 			currentAbortController?.abort();
 		};
-	}, [
-		applyObservedVersion,
-		handleVersionCheckFailure,
-		hasUpdate,
-		pollIntervalMs,
-	]);
+	}, [applyObservedVersion, hasUpdate, pollIntervalMs]);
 
 	return useMemo(
 		() => ({
