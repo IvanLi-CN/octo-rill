@@ -38,7 +38,7 @@
 - `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
 - `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`，且 web-builder 在完整仓库上下文里保留 `Cargo.toml` 兜底来源。
 - `.github/workflows/ci.yml`：在既有 `Build (Release)` gate 内加入 Docker smoke 覆盖 release `web-builder` 路径。
-- `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护。
+- `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护，并在历史 backfill 时叠加当前 workflow revision 的 Docker/web 构建基础设施修复。
 - 后端/前端测试覆盖新增行为与前端构建期 fallback 契约。
 
 ### Out of scope
@@ -93,6 +93,10 @@
   When 执行 `CI Pipeline` 的 `Build (Release)` gate
   Then 该 gate 必须额外对真实 `Dockerfile` 完成 `linux/amd64` Docker smoke，并传入合成 `APP_EFFECTIVE_VERSION`。
 
+- Given Release workflow 在补跑历史 `release_head_sha`，且当前 workflow revision 包含构建链路修复
+  When `docker-release` job checkout 历史目标源码
+  Then 必须在构建前叠加当前 workflow revision 的 `Dockerfile`、`web/vite.config.ts` 与 `web/config/embeddedVersion.ts`，避免历史 backfill 复现已修复的构建断链。
+
 - Given `/api/version` 不可用
   When 前端 footer 拉取版本
   Then 自动回退 `/api/health` 并正确显示版本。
@@ -114,3 +118,4 @@
 - 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
 - 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
 - 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，Docker 全仓库构建仍保留 Cargo fallback，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
+- 2026-04-15: 补齐历史 release backfill：当补跑旧 `release_head_sha` 时，`docker-release` 叠加当前 workflow revision 的 Docker/web 构建基础设施修复，避免旧源码再次触发已修复的 `Cargo.toml` 构建断链。

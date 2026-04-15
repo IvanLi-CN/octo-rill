@@ -299,6 +299,27 @@ jobs:
         with:
           ref: ${{ env.RELEASE_HEAD_SHA }}
 
+      - name: Overlay workflow build infrastructure for historical backfills
+        if: ${{ env.RELEASE_HEAD_SHA != github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_sha="${{ github.workflow_sha }}"
+          git fetch --no-tags --depth=1 origin "${workflow_sha}"
+
+          overlay_paths=(
+            "Dockerfile"
+            "web/vite.config.ts"
+            "web/config/embeddedVersion.ts"
+          )
+
+          for path in "${overlay_paths[@]}"; do
+            if git cat-file -e "FETCH_HEAD:${path}" 2>/dev/null; then
+              mkdir -p "$(dirname "${path}")"
+              git checkout FETCH_HEAD -- "${path}"
+            fi
+          done
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 

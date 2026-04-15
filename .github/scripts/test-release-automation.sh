@@ -311,6 +311,33 @@ assert "bash ./.github/scripts/release-intent.sh" in contract.step_run(
     intent_step,
     "release.yml.jobs.prepare.steps['Determine release intent']",
 )
+docker_release_job = contract.job_config(release_workflow, "docker-release", "release.yml")
+docker_release_checkout = contract.step_config(
+    docker_release_job,
+    "Checkout release revision",
+    "release.yml.jobs.docker-release",
+)
+docker_release_checkout_with = contract.require_mapping(
+    docker_release_checkout.get("with"),
+    "release.yml.jobs.docker-release.steps['Checkout release revision'].with",
+)
+assert docker_release_checkout.get("uses") == "actions/checkout@v4"
+assert docker_release_checkout_with.get("ref") == "${{ env.RELEASE_HEAD_SHA }}"
+docker_overlay_step = contract.step_config(
+    docker_release_job,
+    "Overlay workflow build infrastructure for historical backfills",
+    "release.yml.jobs.docker-release",
+)
+assert docker_overlay_step.get("if") == "${{ env.RELEASE_HEAD_SHA != github.workflow_sha }}"
+docker_overlay_run = contract.step_run(
+    docker_overlay_step,
+    "release.yml.jobs.docker-release.steps['Overlay workflow build infrastructure for historical backfills']",
+)
+assert 'git fetch --no-tags --depth=1 origin "${workflow_sha}"' in docker_overlay_run
+assert '"Dockerfile"' in docker_overlay_run
+assert '"web/vite.config.ts"' in docker_overlay_run
+assert '"web/config/embeddedVersion.ts"' in docker_overlay_run
+
 release_existing_step = contract.step_config(
     prepare_job,
     "Create GitHub Release for existing tag",
