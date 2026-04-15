@@ -19,7 +19,8 @@
 			"!**/dist-ssr",
 			"!**/storybook-static",
 			"!**/test-results",
-			"!**/playwright-report"
+			"!**/playwright-report",
+			"!**/src/routeTree.gen.ts"
 		]
 	},
 	"linter": {

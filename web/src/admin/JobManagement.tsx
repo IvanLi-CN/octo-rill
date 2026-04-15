@@ -1138,8 +1138,12 @@ type RealtimeStatusFilter =
 	| "canceled";
 
 type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
-type AdminJobsPrimaryTab = "realtime" | "scheduled" | "llm" | "translations";
-type TranslationViewTab = "queue" | "history";
+export type AdminJobsPrimaryTab =
+	| "realtime"
+	| "scheduled"
+	| "llm"
+	| "translations";
+export type TranslationViewTab = "queue" | "history";
 
 const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPES = new Set([
@@ -1148,20 +1152,20 @@ const SCHEDULED_TASK_TYPES = new Set([
 ]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
-const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
-const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
-const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
-const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
+export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
+export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
+export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
+export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
 const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 
 type StreamStatus = "connecting" | "connected" | "reconnecting";
-type TaskDrawerRoute = {
+export type TaskDrawerRoute = {
 	taskId: string;
 	llmCallId: string | null;
 };
-type AdminJobsRouteState = {
+export type AdminJobsRouteState = {
 	primaryTab: AdminJobsPrimaryTab;
 	translationView: TranslationViewTab;
 	taskDrawerRoute: TaskDrawerRoute | null;
@@ -1181,13 +1185,13 @@ function isPrimaryTab(value: string | null): value is AdminJobsPrimaryTab {
 	);
 }
 
-function parseTranslationView(
+export function parseTranslationView(
 	searchParams: URLSearchParams,
 ): TranslationViewTab {
 	return searchParams.get("view") === "history" ? "history" : "queue";
 }
 
-function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
+export function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
 	switch (primaryTab) {
 		case "scheduled":
 			return ADMIN_JOBS_SCHEDULED_PATH;
@@ -1200,13 +1204,13 @@ function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
 	}
 }
 
-function buildTaskDrawerPath(taskId: string, llmCallId?: string | null) {
+export function buildTaskDrawerPath(taskId: string, llmCallId?: string | null) {
 	const base = `${ADMIN_JOBS_BASE_PATH}/tasks/${encodeURIComponent(taskId)}`;
 	if (!llmCallId) return base;
 	return `${base}/llm/${encodeURIComponent(llmCallId)}`;
 }
 
-function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
+export function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
 	const normalized = normalizePathname(pathname);
 	const matched = normalized.match(TASK_DRAWER_ROUTE_PATTERN);
 	if (!matched) return null;
@@ -1220,7 +1224,7 @@ function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
 	}
 }
 
-function parseAdminJobsRoute(
+export function parseAdminJobsRoute(
 	pathname: string,
 	search: string,
 ): AdminJobsRouteState {
@@ -1259,7 +1263,7 @@ function parseAdminJobsRoute(
 	};
 }
 
-function buildAdminJobsRouteUrl(
+export function buildAdminJobsRouteUrl(
 	route: AdminJobsRouteState,
 	currentSearch = "",
 ) {
@@ -1292,6 +1296,13 @@ function buildAdminJobsRouteUrl(
 
 type JobManagementProps = {
 	currentUserId: LocalUserId;
+	routeState?: AdminJobsRouteState;
+	onNavigateRoute?: (
+		nextRoute: AdminJobsRouteState,
+		options?: {
+			replace?: boolean;
+		},
+	) => void;
 };
 
 type LoadOptions = {
@@ -2599,10 +2610,17 @@ function TranslationSchedulerSection(props: {
 	);
 }
 
-export function JobManagement({ currentUserId }: JobManagementProps) {
-	const [routeState, setRouteState] = useState<AdminJobsRouteState>(() =>
-		parseAdminJobsRoute(window.location.pathname, window.location.search),
-	);
+export function JobManagement({
+	currentUserId,
+	routeState: controlledRouteState,
+	onNavigateRoute,
+}: JobManagementProps) {
+	const isRouteControlled = controlledRouteState !== undefined;
+	const [uncontrolledRouteState, setUncontrolledRouteState] =
+		useState<AdminJobsRouteState>(() =>
+			parseAdminJobsRoute(window.location.pathname, window.location.search),
+		);
+	const routeState = controlledRouteState ?? uncontrolledRouteState;
 	const [overview, setOverview] = useState<AdminJobsOverviewResponse | null>(
 		null,
 	);
@@ -2775,6 +2793,10 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 				replace?: boolean;
 			},
 		) => {
+			if (onNavigateRoute) {
+				onNavigateRoute(nextRoute, options);
+				return;
+			}
 			const currentSearch = window.location.search;
 			const nextUrl = buildAdminJobsRouteUrl(nextRoute, currentSearch);
 			const currentUrl = `${normalizePathname(window.location.pathname)}${currentSearch}`;
@@ -2790,12 +2812,13 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 					window.history.pushState({}, "", nextUrl);
 				}
 			}
-			setRouteState(nextRoute);
+			setUncontrolledRouteState(nextRoute);
 		},
-		[],
+		[onNavigateRoute],
 	);
 
 	useEffect(() => {
+		if (isRouteControlled) return;
 		const syncRouteFromWindow = (replace = false) => {
 			const nextRoute = parseAdminJobsRoute(
 				window.location.pathname,
@@ -2807,7 +2830,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 			if (replace && canonicalUrl !== currentUrl) {
 				window.history.replaceState({}, "", canonicalUrl);
 			}
-			setRouteState(nextRoute);
+			setUncontrolledRouteState(nextRoute);
 		};
 
 		syncRouteFromWindow(true);
@@ -2819,7 +2842,7 @@ export function JobManagement({ currentUserId }: JobManagementProps) {
 		return () => {
 			window.removeEventListener("popstate", onPopState);
 		};
-	}, []);
+	}, [isRouteControlled]);
 
 	const loadOverview = useCallback(async (options?: LoadOptions) => {
 		if (

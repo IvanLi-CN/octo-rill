@@ -34,6 +34,7 @@ import type {
 } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
+import { InternalLink } from "@/lib/internalNavigation";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import type { RepoVisual } from "@/lib/repoVisual";
@@ -1135,7 +1136,9 @@ function DashboardPreview(props: {
 								size="sm"
 								className="font-mono text-xs"
 							>
-								<a href="/admin">管理员面板</a>
+								<InternalLink href="/admin" to="/admin">
+									管理员面板
+								</InternalLink>
 							</Button>
 						</div>
 					</div>
