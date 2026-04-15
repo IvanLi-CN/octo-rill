@@ -243,6 +243,9 @@ const translationCompletedWorkersSeed = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 	{
 		worker_id: "translation-worker-2",
@@ -255,6 +258,9 @@ const translationCompletedWorkersSeed = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 	{
 		worker_id: "translation-worker-3",
@@ -267,6 +273,9 @@ const translationCompletedWorkersSeed = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 	{
 		worker_id: "translation-worker-4",
@@ -279,6 +288,9 @@ const translationCompletedWorkersSeed = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 ];
 
@@ -294,6 +306,9 @@ const translationBusyWorkersSeed = [
 		trigger_reason: "token_threshold",
 		updated_at: RUNNING_WORKER_UPDATED_AT,
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 	{
 		worker_id: "translation-worker-2",
@@ -306,6 +321,9 @@ const translationBusyWorkersSeed = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:02Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 	{
 		worker_id: "translation-worker-3",
@@ -317,7 +335,12 @@ const translationBusyWorkersSeed = [
 		work_item_count: 0,
 		trigger_reason: null,
 		updated_at: ERROR_WORKER_UPDATED_AT,
-		error_text: "claim retry",
+		error_text:
+			"release detail translation failed to preserve markdown structure",
+		error_code: "markdown_structure_mismatch",
+		error_summary: "Markdown 结构校验失败",
+		error_detail:
+			"release detail translation failed to preserve markdown structure",
 	},
 	{
 		worker_id: "translation-worker-4",
@@ -330,6 +353,9 @@ const translationBusyWorkersSeed = [
 		trigger_reason: "deadline",
 		updated_at: RUNNING_WORKER_UPDATED_AT,
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	},
 ];
 
@@ -391,6 +417,93 @@ const translationBatchDetailSeed = {
 			scheduler_wait_ms: 240,
 			duration_ms: 820,
 			created_at: "2026-02-26T04:00:01Z",
+		},
+	],
+};
+
+const translationBatchDetailRecoveredSeed = {
+	batch: {
+		...translationBatchSeed,
+		updated_at: "2026-04-15T03:16:08Z",
+		finished_at: "2026-04-15T03:16:08Z",
+	},
+	items: [
+		{
+			...translationRequestItemSeed,
+			entity_id: "308844700",
+			title_zh: "AionUi v1.9.15",
+			summary_md:
+				"- 修复翻译链路对围栏 Markdown 的兼容\n- 保留原始列表结构与段落换行",
+			batch_id: "batch-translation-story",
+			error: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
+		},
+	],
+	llm_calls: [
+		{
+			id: "llm-translation-recovered-1",
+			status: "succeeded",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			scheduler_wait_ms: 0,
+			duration_ms: 1180,
+			created_at: "2026-04-15T03:16:00Z",
+		},
+		{
+			id: "llm-translation-recovered-2",
+			status: "succeeded",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			scheduler_wait_ms: 0,
+			duration_ms: 920,
+			created_at: "2026-04-15T03:16:05Z",
+		},
+	],
+};
+
+const translationBatchDetailFailedSeed = {
+	batch: {
+		...translationBatchSeed,
+		status: "completed",
+		updated_at: "2026-04-15T03:24:11Z",
+		finished_at: "2026-04-15T03:24:11Z",
+	},
+	items: [
+		{
+			...translationRequestItemSeed,
+			entity_id: "307818508",
+			status: "error",
+			title_zh: null,
+			summary_md: null,
+			body_md: null,
+			error: "Markdown 结构校验失败",
+			batch_id: "batch-translation-story",
+			error_code: "markdown_structure_mismatch",
+			error_summary: "Markdown 结构校验失败",
+			error_detail:
+				"release detail translation failed to preserve markdown structure",
+		},
+	],
+	llm_calls: [
+		{
+			id: "llm-translation-failed-1",
+			status: "succeeded",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			scheduler_wait_ms: 0,
+			duration_ms: 8230,
+			created_at: "2026-04-15T03:23:52Z",
+		},
+		{
+			id: "llm-translation-failed-2",
+			status: "succeeded",
+			source: "translation.scheduler.deadline",
+			model: "gpt-4o-mini",
+			scheduler_wait_ms: 0,
+			duration_ms: 8560,
+			created_at: "2026-04-15T03:24:01Z",
 		},
 	],
 };
@@ -681,7 +794,7 @@ type AdminJobsPreviewProps = {
 	routeUrl?: string;
 	autoOpenConversation?: boolean;
 	llmSourceFilter?: string;
-	translationState?: "default" | "busy";
+	translationState?: "default" | "busy" | "recovered" | "failed";
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -804,6 +917,9 @@ function AdminJobsPreview({
 					trigger_reason: null,
 					updated_at: "2026-02-26T04:00:03Z",
 					error_text: null,
+					error_code: null,
+					error_summary: null,
+					error_detail: null,
 				})),
 				...Array.from({ length: dedicatedWorkerConcurrency }, (_, index) => ({
 					worker_id: `translation-worker-user-dedicated-${index + 1}`,
@@ -816,6 +932,9 @@ function AdminJobsPreview({
 					trigger_reason: null,
 					updated_at: "2026-02-26T04:00:03Z",
 					error_text: null,
+					error_code: null,
+					error_summary: null,
+					error_detail: null,
 				})),
 			];
 		}
@@ -1233,7 +1352,13 @@ function AdminJobsPreview({
 				url.pathname.startsWith("/api/admin/jobs/translations/batches/") &&
 				req.method === "GET"
 			) {
-				return new Response(JSON.stringify(translationBatchDetailSeed), {
+				const detailSeed =
+					translationState === "failed"
+						? translationBatchDetailFailedSeed
+						: translationState === "recovered"
+							? translationBatchDetailRecoveredSeed
+							: translationBatchDetailSeed;
+				return new Response(JSON.stringify(detailSeed), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
@@ -1422,6 +1547,7 @@ function AdminJobsPreview({
 const meta = {
 	title: "Admin/Admin Jobs",
 	component: AdminJobsPreview,
+	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
 		docs: {
@@ -1669,6 +1795,122 @@ export const TranslationHistoryRoute: Story = {
 				canvasElement.ownerDocument.defaultView?.location.search,
 			).toContain("view=history"),
 		);
+	},
+};
+
+export const TranslationBatchDetailRecovered: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/translations?view=history"
+			translationState="recovered"
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"展示围栏 Markdown 被规范化后成功完成的批次详情状态，确认详情抽屉仍保持成功链路。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const batchCells = await body.findAllByText("batch-translation-story");
+		const batchRow = batchCells
+			.map((cell) => cell.closest("tr"))
+			.find(
+				(row): row is HTMLTableRowElement => row instanceof HTMLTableRowElement,
+			);
+		const openButton = batchRow
+			? within(batchRow).getByRole("button", { name: "详情" })
+			: body.getAllByRole("button", { name: "详情" }).at(-1);
+		if (!openButton) {
+			throw new Error("未找到批次详情按钮");
+		}
+		await userEvent.click(openButton);
+		await expect(
+			await body.findByRole("heading", { name: "翻译批次详情" }),
+		).toBeVisible();
+		await expect(
+			body.getByText("translation.scheduler.deadline", { exact: false }),
+		).toBeVisible();
+		await expect(
+			body.queryByText("Markdown 结构校验失败"),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const TranslationBatchDetailFailed: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/translations?view=history"
+			translationState="failed"
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"展示 Markdown 结构仍不一致时的批次详情，验证短提示、错误码与原始原因同时可见。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const batchCells = await body.findAllByText("batch-translation-story");
+		const batchRow = batchCells
+			.map((cell) => cell.closest("tr"))
+			.find(
+				(row): row is HTMLTableRowElement => row instanceof HTMLTableRowElement,
+			);
+		const openButton = batchRow
+			? within(batchRow).getByRole("button", { name: "详情" })
+			: body.getAllByRole("button", { name: "详情" }).at(-1);
+		if (!openButton) {
+			throw new Error("未找到批次详情按钮");
+		}
+		await userEvent.click(openButton);
+		await expect(
+			await body.findByRole("heading", { name: "翻译批次详情" }),
+		).toBeVisible();
+		await expect(body.getByText("Markdown 结构校验失败")).toBeVisible();
+		await expect(body.getByText("markdown_structure_mismatch")).toBeVisible();
+		await expect(
+			body.getByText(
+				"release detail translation failed to preserve markdown structure",
+			),
+		).toBeVisible();
+	},
+};
+
+export const TranslationWorkerErrorDrawer: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/translations?view=queue"
+			translationState="busy"
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"打开 worker 错误抽屉，确认错误摘要、分类码与原始原因对管理员可见。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await userEvent.click(
+			await body.findByRole("button", { name: "打开 W3 · 通用 详情" }),
+		);
+		await expect(await body.findByText("错误与跳转")).toBeVisible();
+		await expect(body.getByText("Markdown 结构校验失败")).toBeVisible();
+		await expect(body.getByText("markdown_structure_mismatch")).toBeVisible();
+		await expect(
+			body.getByText(
+				"release detail translation failed to preserve markdown structure",
+			),
+		).toBeVisible();
 	},
 };
 

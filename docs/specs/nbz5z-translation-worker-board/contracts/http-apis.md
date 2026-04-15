@@ -21,6 +21,9 @@ Response adds worker runtime fields:
 - `trigger_reason: string | null`
 - `updated_at: string`
 - `error_text: string | null`
+- `error_code: string | null`
+- `error_summary: string | null`
+- `error_detail: string | null`
 
 ## Modified: `GET /api/admin/jobs/translations/requests`
 
@@ -40,6 +43,12 @@ Each batch item adds:
 
 - `worker_slot: number`
 - `request_count: number`
+
+Each `items[]` entry continues to flatten the existing translation result fields and now also adds:
+
+- `error_code: string | null`
+- `error_summary: string | null`
+- `error_detail: string | null`
 
 ## Modified: `GET /api/admin/jobs/events` SSE
 

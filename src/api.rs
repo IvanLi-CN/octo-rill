@@ -6230,8 +6230,11 @@ struct TranslateBatchStreamEvent {
 #[allow(dead_code)]
 async fn send_batch_stream_event(
     tx: &mpsc::Sender<Result<Bytes, Infallible>>,
-    event: TranslateBatchStreamEvent,
+    mut event: TranslateBatchStreamEvent,
 ) -> bool {
+    if let Some(item) = event.item.take() {
+        event.item = Some(translate_batch_item_for_public(item));
+    }
     let payload = match serde_json::to_string(&event) {
         Ok(mut line) => {
             line.push('\n');
@@ -6243,6 +6246,21 @@ async fn send_batch_stream_event(
         }
     };
     tx.send(Ok(Bytes::from(payload))).await.is_ok()
+}
+
+fn translate_batch_item_for_public(mut item: TranslateBatchItem) -> TranslateBatchItem {
+    if item.status == "error" {
+        item.error =
+            crate::translations::translation_error_summary(item.error.as_deref()).or(item.error);
+    }
+    item
+}
+
+fn translate_batch_items_for_public(items: Vec<TranslateBatchItem>) -> Vec<TranslateBatchItem> {
+    items
+        .into_iter()
+        .map(translate_batch_item_for_public)
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -6278,7 +6296,8 @@ fn translate_response_from_batch_item(
         }
         "error" => {
             return Err(ApiError::internal(
-                item.error
+                crate::translations::translation_error_summary(item.error.as_deref())
+                    .or(item.error)
                     .unwrap_or_else(|| "translation failed".to_owned()),
             ));
         }
@@ -6309,11 +6328,59 @@ fn strip_markdown_code_fence(raw: &str) -> &str {
     let Some(rest) = trimmed.strip_prefix("```") else {
         return trimmed;
     };
-    let Some((_, rest)) = rest.split_once('\n') else {
+    let Some((_, body_with_closing)) = rest.split_once('\n') else {
         return trimmed;
     };
-    let rest = rest.trim();
-    rest.strip_suffix("```").map(str::trim).unwrap_or(trimmed)
+    let Some(closing_start) = body_with_closing.rfind("\n```") else {
+        return trimmed;
+    };
+    let closing = &body_with_closing[closing_start + 1..];
+    if closing.trim() != "```" {
+        return trimmed;
+    }
+    &body_with_closing[..closing_start]
+}
+
+fn count_leading_newlines(value: &str) -> usize {
+    value.chars().take_while(|ch| *ch == '\n').count()
+}
+
+fn count_trailing_newlines(value: &str) -> usize {
+    value.chars().rev().take_while(|ch| *ch == '\n').count()
+}
+
+fn preserve_chunk_edge_newlines(source_chunk: &str, translated_chunk: String) -> String {
+    let source_leading = count_leading_newlines(source_chunk);
+    let source_trailing = count_trailing_newlines(source_chunk);
+    let translated_leading = count_leading_newlines(&translated_chunk);
+    let translated_trailing = count_trailing_newlines(&translated_chunk);
+    let core_start = translated_leading.min(translated_chunk.len());
+    let core_end = translated_chunk
+        .len()
+        .saturating_sub(translated_trailing)
+        .max(core_start);
+    let core = &translated_chunk[core_start..core_end];
+
+    format!(
+        "{}{}{}",
+        "\n".repeat(source_leading),
+        core,
+        "\n".repeat(source_trailing)
+    )
+}
+
+fn normalize_markdown_translation_output(source: &str, raw: String) -> String {
+    let normalized = if markdown_structure_preserved(source, raw.as_str()) {
+        raw
+    } else {
+        let stripped = strip_markdown_code_fence(raw.as_str());
+        if stripped != raw.as_str() && markdown_structure_preserved(source, stripped) {
+            stripped.to_owned()
+        } else {
+            raw
+        }
+    };
+    preserve_chunk_edge_newlines(source, normalized)
 }
 
 fn extract_json_object_span(raw: &str) -> Option<&str> {
@@ -6784,13 +6851,6 @@ fn split_markdown_chunks(input: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-fn preserve_chunk_trailing_newline(source_chunk: &str, translated_chunk: String) -> String {
-    if source_chunk.ends_with('\n') && !translated_chunk.ends_with('\n') {
-        return format!("{translated_chunk}\n");
-    }
-    translated_chunk
-}
-
 const RELEASE_DETAIL_CHUNK_PROMPT_OVERHEAD_TOKENS: u32 = 320;
 
 #[derive(Debug, Clone, Copy)]
@@ -7180,6 +7240,9 @@ async fn translate_pending_release_batch_candidates(
                         };
                         let (title, summary) =
                             normalize_translation_fields(item.title_zh, item.summary_md);
+                        let summary = summary.map(|value| {
+                            normalize_markdown_translation_output(candidate.body.as_str(), value)
+                        });
                         let markdown_ok = candidate.body.trim().is_empty()
                             || summary.as_deref().is_some_and(|value| {
                                 markdown_structure_preserved(candidate.body.as_str(), value)
@@ -7299,6 +7362,7 @@ async fn translate_pending_release_batch_candidates(
                 error: Some("release not found".to_owned()),
             }),
             Err(err) => {
+                let error_text = err.to_string();
                 tracing::warn!(
                     release_id = candidate.release_id,
                     error_code = err.code(),
@@ -7310,7 +7374,7 @@ async fn translate_pending_release_batch_candidates(
                     status: "error".to_owned(),
                     title: None,
                     summary: None,
-                    error: Some("translation failed".to_owned()),
+                    error: Some(error_text),
                 });
             }
         }
@@ -8906,7 +8970,9 @@ pub async fn translate_releases_batch(
         translate_releases_batch_internal(state.as_ref(), user_id.as_str(), &release_ids),
     )
     .await?;
-    Ok(Json(TranslateBatchResponse { items }))
+    Ok(Json(TranslateBatchResponse {
+        items: translate_batch_items_for_public(items),
+    }))
 }
 
 #[allow(dead_code)]
@@ -9039,7 +9105,7 @@ async fn translate_release_detail_chunk(
     )
     .await
     .map_err(ApiError::internal)?;
-    let translated = preserve_chunk_trailing_newline(chunk, translated);
+    let translated = normalize_markdown_translation_output(chunk, translated);
     if markdown_structure_preserved(chunk, &translated) {
         return Ok(translated);
     }
@@ -9061,7 +9127,7 @@ async fn translate_release_detail_chunk(
     )
     .await
     .map_err(ApiError::internal)?;
-    let retry = preserve_chunk_trailing_newline(chunk, retry);
+    let retry = normalize_markdown_translation_output(chunk, retry);
     if !markdown_structure_preserved(chunk, &retry) {
         return Err(ApiError::internal(
             "release detail translation failed to preserve markdown structure",
@@ -9160,7 +9226,11 @@ async fn translate_release_detail_chunks_batched(
                         if item.chunk_index == 0 || item.chunk_index > chunks.len() {
                             continue;
                         }
-                        parsed.insert(item.chunk_index - 1, item.summary_md);
+                        let source = &chunks[item.chunk_index - 1];
+                        parsed.insert(
+                            item.chunk_index - 1,
+                            normalize_markdown_translation_output(source, item.summary_md),
+                        );
                     }
                 } else {
                     tracing::warn!(
@@ -9187,9 +9257,7 @@ async fn translate_release_detail_chunks_batched(
 
         for idx in batch_indices {
             let source = &chunks[idx];
-            let mut out = parsed
-                .remove(&idx)
-                .map(|translated_chunk| preserve_chunk_trailing_newline(source, translated_chunk));
+            let mut out = parsed.remove(&idx);
 
             if out
                 .as_deref()
@@ -9294,10 +9362,11 @@ async fn translate_release_detail_internal(
         status: String,
         title: Option<String>,
         summary: Option<String>,
+        error_text: Option<String>,
     }
     let cached = sqlx::query_as::<_, TranslationRow>(
         r#"
-        SELECT source_hash, status, title, summary
+        SELECT source_hash, status, title, summary, error_text
         FROM ai_translations
         WHERE user_id = ?
           AND entity_type = 'release_detail'
@@ -9330,13 +9399,29 @@ async fn translate_release_detail_internal(
                     summary: cached.summary,
                 });
             }
-            "disabled" | "missing" | "error" => {
+            "disabled" => {
                 return Ok(TranslateResponse {
                     lang: "zh-CN".to_owned(),
                     status: cached.status,
                     title: None,
                     summary: None,
                 });
+            }
+            "missing" => {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    cached
+                        .error_text
+                        .unwrap_or_else(|| "release not found".to_owned()),
+                ));
+            }
+            "error" => {
+                return Err(ApiError::internal(
+                    cached
+                        .error_text
+                        .unwrap_or_else(|| "release detail translation failed".to_owned()),
+                ));
             }
             _ => {}
         }
@@ -9512,6 +9597,7 @@ async fn translate_release_detail_batch_internal(
                 error: Some("release not found".to_owned()),
             }),
             Err(err) => {
+                let error_text = err.to_string();
                 tracing::warn!(
                     release_id,
                     error_code = err.code(),
@@ -9523,7 +9609,7 @@ async fn translate_release_detail_batch_internal(
                     status: "error".to_owned(),
                     title: None,
                     summary: None,
-                    error: Some("translation failed".to_owned()),
+                    error: Some(error_text),
                 });
             }
         }
@@ -9545,7 +9631,9 @@ pub async fn translate_release_detail_batch(
         translate_release_detail_batch_internal(state.as_ref(), user_id.as_str(), &release_ids),
     )
     .await?;
-    Ok(Json(TranslateBatchResponse { items }))
+    Ok(Json(TranslateBatchResponse {
+        items: translate_batch_items_for_public(items),
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -9992,7 +10080,9 @@ pub async fn translate_notifications_batch(
         translate_notifications_batch_internal(state.as_ref(), user_id.as_str(), &thread_ids),
     )
     .await?;
-    Ok(Json(TranslateBatchResponse { items }))
+    Ok(Json(TranslateBatchResponse {
+        items: translate_batch_items_for_public(items),
+    }))
 }
 
 #[allow(dead_code)]
@@ -10195,13 +10285,13 @@ mod tests {
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
         llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
         map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, normalize_translation_fields,
-        parse_batch_notification_translation_payload,
+        markdown_structure_preserved, me, normalize_markdown_translation_output,
+        normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
         parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
         parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
-        prepare_release_batch, preserve_chunk_trailing_newline, release_cache_entry_reusable,
+        prepare_release_batch, preserve_chunk_edge_newlines, release_cache_entry_reusable,
         release_detail_source_hash, release_detail_translation_ready, release_excerpt,
         release_feed_body, release_reactions_status, require_active_user_id,
         resolve_release_full_name, should_retry_public_compare_without_auth,
@@ -12809,10 +12899,28 @@ mod tests {
             status: "error".to_owned(),
             title: None,
             summary: None,
-            error: Some("translation failed".to_owned()),
+            error: Some(
+                "release detail translation failed to preserve markdown structure".to_owned(),
+            ),
         };
         let err = translate_response_from_batch_item(item).expect_err("error item should fail");
         assert_eq!(err.code(), "internal_error");
+        assert_eq!(err.to_string(), "Markdown 结构校验失败");
+    }
+
+    #[test]
+    fn translate_response_from_batch_item_maps_upstream_rejection_to_summary() {
+        let item = TranslateBatchItem {
+            id: "1".to_owned(),
+            lang: "zh-CN".to_owned(),
+            status: "error".to_owned(),
+            title: None,
+            summary: None,
+            error: Some("ai returned 401: bad key".to_owned()),
+        };
+        let err = translate_response_from_batch_item(item).expect_err("error item should fail");
+        assert_eq!(err.code(), "internal_error");
+        assert_eq!(err.to_string(), "上游模型拒绝请求");
     }
 
     #[test]
@@ -14492,6 +14600,60 @@ line two",
     }
 
     #[tokio::test]
+    async fn translate_release_detail_accepts_fenced_markdown_chunk_output() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET body = ?, name = 'Release v1.2.3', tag_name = 'v1.2.3'
+            WHERE release_id = ?
+            "#,
+        )
+        .bind("- keep `code`\n")
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update release detail body");
+
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| async move {
+                let system_prompt = payload["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let content = if system_prompt.contains("只把 GitHub Release 标题翻译成自然中文")
+                {
+                    "版本 v1.2.3".to_owned()
+                } else {
+                    "```markdown\n- 保留 `code`\n```".to_owned()
+                };
+                let response = serde_json::json!({
+                    "choices": [{"message": {"content": content}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+                });
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    Json(response),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_state_with_ai_base_url(pool.clone(), base_url);
+
+        let translated = translate_release_detail_for_user(state.as_ref(), user_id.as_str(), "120")
+            .await
+            .expect("translate release detail");
+
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("版本 v1.2.3"));
+        assert_eq!(translated.summary.as_deref(), Some("- 保留 `code`\n"));
+    }
+
+    #[tokio::test]
     async fn prepare_release_batch_routes_release_to_detail_translation_path() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
@@ -15466,19 +15628,104 @@ echo should_not_be_in_excerpt
     }
 
     #[test]
-    fn preserve_chunk_trailing_newline_keeps_chunk_boundaries() {
+    fn preserve_chunk_edge_newlines_keeps_chunk_boundaries() {
         assert_eq!(
-            preserve_chunk_trailing_newline("line\n", "译文".to_owned()),
+            preserve_chunk_edge_newlines("line\n", "译文".to_owned()),
             "译文\n"
         );
         assert_eq!(
-            preserve_chunk_trailing_newline("line", "译文".to_owned()),
+            preserve_chunk_edge_newlines("line", "译文".to_owned()),
             "译文"
         );
         assert_eq!(
-            preserve_chunk_trailing_newline("line\n", "译文\n".to_owned()),
+            preserve_chunk_edge_newlines("line\n", "译文\n".to_owned()),
             "译文\n"
         );
+        assert_eq!(
+            preserve_chunk_edge_newlines("\nline\n\n", "line\n".to_owned()),
+            "\nline\n\n"
+        );
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_strips_outer_fence_only() {
+        let normalized = normalize_markdown_translation_output(
+            "- item\n",
+            "```markdown\n- 条目\n```\n\n".to_owned(),
+        );
+        assert_eq!(normalized, "- 条目\n");
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_keeps_fenced_code_only_chunks() {
+        let normalized = normalize_markdown_translation_output(
+            "```rust\nfn main() {}\n```\n",
+            "```rust\nfn main() {}\n```\n\n".to_owned(),
+        );
+        assert_eq!(normalized, "```rust\nfn main() {}\n```\n");
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_strips_outer_fence_for_multi_block_chunks() {
+        let source = "```rust\nfn main() {}\n```\n\n说明文字\n\n```json\n{}\n```\n";
+        let normalized = normalize_markdown_translation_output(
+            source,
+            "```markdown\n```rust\nfn main() {}\n```\n\n说明文字\n\n```json\n{}\n```\n```\n"
+                .to_owned(),
+        );
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_strips_outer_wrapper_for_code_only_chunks() {
+        let source = "```rust\nfn main() {}\n```\n";
+        let normalized = normalize_markdown_translation_output(
+            source,
+            "```markdown\n```rust\nfn main() {}\n```\n```\n".to_owned(),
+        );
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_keeps_valid_multi_block_fences() {
+        let source = "```rust\nfn main() {}\n```\n\n说明文字\n\n```json\n{}\n```\n";
+        let normalized = normalize_markdown_translation_output(source, source.to_owned());
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_preserves_leading_indentation() {
+        let source = "    缩进代码块\n";
+        let normalized = normalize_markdown_translation_output(source, source.to_owned());
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_preserves_indentation_when_unwrapping_outer_fence() {
+        let source = "    缩进代码块  \n";
+        let normalized = normalize_markdown_translation_output(
+            source,
+            "```markdown\n    缩进代码块  \n```\n".to_owned(),
+        );
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_preserves_blank_line_padding() {
+        let source = "\n说明文字\n\n";
+        let normalized = normalize_markdown_translation_output(
+            source,
+            "```markdown\n\n说明文字\n\n```\n".to_owned(),
+        );
+        assert_eq!(normalized, source);
+    }
+
+    #[test]
+    fn normalize_markdown_translation_output_strips_wrapped_fence_with_surrounding_spaces() {
+        let source = "- 条目\n";
+        let normalized =
+            normalize_markdown_translation_output(source, " ```markdown\n- 条目\n``` ".to_owned());
+        assert_eq!(normalized, source);
     }
 
     #[tokio::test]

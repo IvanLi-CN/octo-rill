@@ -39,6 +39,7 @@
   - 当自动翻译终态为不可自动重试时，不再提供“翻译”按钮重试入口。
 - 翻译:
   - `release_summary` / feed 变体切到正文输入（`body_markdown`）。
+  - `release_summary.feed_body -> release_detail` fallback 在进入 Markdown 结构校验前，先规范化外层 fenced Markdown、包装空白与尾部换行；规范化后仍不保结构才记为失败。
   - 超长正文直接写入 `error` 终态，并带明确错误文案。
 - 同步:
   - 手动同步与订阅同步完成后，基于同步前后 release id 差集收集新增 release。
@@ -50,3 +51,4 @@
 - Dashboard release 卡片默认展示正文；中/原文切换作用于同一张卡片正文区域。
 - sync 后新增 release 会自动触发后台翻译任务；再次打开列表时优先命中已预热译文。
 - 正文超过 3000 字符的 release 不进入分块翻译；后台记录明确 `error` 终态。
+- `release_summary.feed_body` 因 Markdown 结构不一致失败时，后台保留分类后的短提示与原始错误原因，不再只显示 `translation failed`。

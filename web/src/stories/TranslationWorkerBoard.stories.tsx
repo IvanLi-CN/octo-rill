@@ -20,6 +20,9 @@ const idleWorkers: AdminTranslationWorkerStatus[] = [1, 2, 3, 4].map(
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	}),
 );
 
@@ -38,6 +41,9 @@ const busyWorkers: AdminTranslationWorkerStatus[] = [
 		...idleWorkers[2],
 		status: "error",
 		error_text: "worker heartbeat timeout",
+		error_code: "unknown_internal_error",
+		error_summary: "翻译失败",
+		error_detail: "worker heartbeat timeout",
 	},
 	{
 		...idleWorkers[3],
@@ -65,6 +71,9 @@ const resizedWorkers: AdminTranslationWorkerStatus[] = [
 				? new Date(Date.now() - 42_000).toISOString()
 				: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	})),
 	...Array.from({ length: 2 }, (_, index) => ({
 		worker_id: `translation-worker-user-dedicated-${index + 1}`,
@@ -77,6 +86,9 @@ const resizedWorkers: AdminTranslationWorkerStatus[] = [
 		trigger_reason: null,
 		updated_at: "2026-02-26T04:00:03Z",
 		error_text: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 	})),
 ];
 
