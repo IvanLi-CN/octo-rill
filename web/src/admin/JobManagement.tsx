@@ -1466,6 +1466,25 @@ function translationWorkerSlotLabel(workerSlot: number | null | undefined) {
 	return `W${workerSlot}`;
 }
 
+function translationErrorSummaryText(error: {
+	error_summary?: string | null;
+	error?: string | null;
+	error_text?: string | null;
+}) {
+	return error.error_summary ?? error.error ?? error.error_text ?? null;
+}
+
+function translationErrorDetailText(error: {
+	error_detail?: string | null;
+	error_text?: string | null;
+	error?: string | null;
+}) {
+	const detail = error.error_detail ?? error.error_text ?? null;
+	const summary = translationErrorSummaryText(error);
+	if (!detail || detail === summary) return null;
+	return detail;
+}
+
 function TranslationSchedulerSection(props: {
 	viewTab: TranslationViewTab;
 	onViewTabChange: (nextValue: TranslationViewTab) => void;
@@ -2335,10 +2354,22 @@ function TranslationSchedulerSection(props: {
 												查看批次
 											</Button>
 										) : null}
-										{requestDetail.result.error ? (
-											<span className="text-destructive text-xs">
-												{requestDetail.result.error}
-											</span>
+										{translationErrorSummaryText(requestDetail.result) ? (
+											<div className="space-y-1 text-xs">
+												<span className="text-destructive block">
+													{translationErrorSummaryText(requestDetail.result)}
+												</span>
+												{requestDetail.result.error_code ? (
+													<span className="text-muted-foreground font-mono block text-[11px]">
+														{requestDetail.result.error_code}
+													</span>
+												) : null}
+												{translationErrorDetailText(requestDetail.result) ? (
+													<span className="text-muted-foreground block">
+														{translationErrorDetailText(requestDetail.result)}
+													</span>
+												) : null}
+											</div>
 										) : null}
 									</div>
 								</div>
@@ -2397,8 +2428,19 @@ function TranslationSchedulerSection(props: {
 												错误与跳转
 											</p>
 											<p className="mt-1 text-sm">
-												{selectedWorker.error_text ?? "当前没有错误信息。"}
+												{translationErrorSummaryText(selectedWorker) ??
+													"当前没有错误信息。"}
 											</p>
+											{selectedWorker.error_code ? (
+												<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+													{selectedWorker.error_code}
+												</p>
+											) : null}
+											{translationErrorDetailText(selectedWorker) ? (
+												<p className="text-muted-foreground mt-1 text-xs">
+													{translationErrorDetailText(selectedWorker)}
+												</p>
+											) : null}
 										</div>
 										{selectedWorker.current_batch_id ? (
 											<Button
@@ -2473,9 +2515,19 @@ function TranslationSchedulerSection(props: {
 												entity {item.entity_id} · fan-out batch{" "}
 												{item.batch_id ?? "-"}
 											</p>
-											{item.error ? (
+											{translationErrorSummaryText(item) ? (
 												<p className="text-destructive mt-1 text-xs">
-													{item.error}
+													{translationErrorSummaryText(item)}
+												</p>
+											) : null}
+											{item.error_code ? (
+												<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+													{item.error_code}
+												</p>
+											) : null}
+											{translationErrorDetailText(item) ? (
+												<p className="text-muted-foreground mt-1 text-xs">
+													{translationErrorDetailText(item)}
 												</p>
 											) : null}
 										</div>
