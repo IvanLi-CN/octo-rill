@@ -36,7 +36,7 @@
 - `src/server.rs`：新增 `/api/version`，更新 `/api/health` 版本来源。
 - `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑。
 - `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
-- `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`。
+- `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`，且 web-builder 在完整仓库上下文里保留 `Cargo.toml` 兜底来源。
 - `.github/workflows/ci.yml`：在既有 `Build (Release)` gate 内加入 Docker smoke 覆盖 release `web-builder` 路径。
 - `.github/workflows/release.yml`：增加 `APP_EFFECTIVE_VERSION` 非空保护。
 - 后端/前端测试覆盖新增行为与前端构建期 fallback 契约。
@@ -113,4 +113,4 @@
 - 2026-03-03: 建立规格并冻结修复范围与接口决策。
 - 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
 - 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
-- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
+- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，Docker 全仓库构建仍保留 Cargo fallback，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
