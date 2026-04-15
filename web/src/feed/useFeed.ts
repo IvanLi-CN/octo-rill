@@ -77,11 +77,28 @@ function buildFeedUrl(
 	return `/api/feed?${params.toString()}`;
 }
 
-export function useFeed(type: FeedRequestType = "all") {
-	const [dataType, setDataType] = useState<FeedRequestType>(type);
-	const [items, setItems] = useState<FeedItem[]>([]);
-	const [nextCursor, setNextCursor] = useState<string | null>(null);
-	const [loadingInitial, setLoadingInitial] = useState(false);
+export function useFeed(
+	type: FeedRequestType = "all",
+	options?: {
+		initialData?: {
+			type: FeedRequestType;
+			items: FeedItem[];
+			nextCursor: string | null;
+		} | null;
+	},
+) {
+	const initialData = options?.initialData;
+	const initialStateMatches = initialData?.type === type;
+	const [dataType, setDataType] = useState<FeedRequestType>(
+		initialStateMatches ? initialData.type : type,
+	);
+	const [items, setItems] = useState<FeedItem[]>(
+		initialStateMatches ? initialData.items : [],
+	);
+	const [nextCursor, setNextCursor] = useState<string | null>(
+		initialStateMatches ? initialData.nextCursor : null,
+	);
+	const [loadingInitial, setLoadingInitial] = useState(!initialStateMatches);
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 

@@ -2,6 +2,7 @@ import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
 import { useAppShellChrome } from "@/layout/AppShell";
+import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
 import { Home, LogOut } from "lucide-react";
 
@@ -161,9 +162,10 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							{ADMIN_NAV_ITEMS.map((item) => {
 								const isActive = activeNav === item.key;
 								return (
-									<a
+									<InternalLink
 										key={item.key}
 										href={item.href}
+										to={item.href}
 										aria-current={isActive ? "page" : undefined}
 										className={cn(
 											"text-muted-foreground relative inline-flex h-8 items-center text-sm transition-colors hover:text-foreground",
@@ -182,7 +184,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 										}
 									>
 										{item.label}
-									</a>
+									</InternalLink>
 								);
 							})}
 						</div>
@@ -242,10 +244,15 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 								: undefined
 						}
 					>
-						<a href="/" aria-label="返回前台首页" title="返回前台首页">
+						<InternalLink
+							href="/"
+							to="/"
+							aria-label="返回前台首页"
+							title="返回前台首页"
+						>
 							<Home className="size-4" />
 							<span>返回前台</span>
-						</a>
+						</InternalLink>
 					</Button>
 					<div
 						className={cn(
