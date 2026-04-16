@@ -80,25 +80,25 @@ const DASHBOARD_BOOT_TAB_PILLS = [
 function DashboardBootHeader(_props: { me: MeResponse }) {
 	return (
 		<div className="flex flex-col gap-4 sm:gap-5" data-dashboard-boot-header>
-			<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+			<div className="flex flex-row items-center justify-between gap-3 sm:flex-col sm:items-start sm:gap-3 lg:flex-row lg:items-start lg:justify-between">
 				<div
-					className="flex min-w-0 flex-1 items-start gap-3.5 sm:gap-4"
+					className="flex min-w-0 flex-1 items-center gap-2.5 sm:items-start sm:gap-3.5 lg:gap-4"
 					data-dashboard-boot-brand-block
 				>
 					<BrandLogo
 						variant="mark"
 						alt=""
-						className="size-10 shrink-0 sm:size-11 lg:size-12"
+						className="size-8 shrink-0 sm:size-10 lg:size-12"
 					/>
-					<div className="min-w-0 space-y-1.5 pt-0.5">
+					<div className="min-w-0 space-y-0 pt-0.5 sm:space-y-1.5">
 						<h1
-							className="min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]"
+							className="min-w-0 text-[1.75rem] leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]"
 							data-dashboard-boot-brand-heading
 						>
 							OctoRill
 						</h1>
 						<p
-							className="text-muted-foreground text-sm font-medium leading-snug"
+							className="text-muted-foreground hidden text-sm font-medium leading-snug sm:block"
 							data-dashboard-boot-brand-subtitle
 						>
 							GitHub 动态 · 中文翻译 · 日报与 Inbox
@@ -106,12 +106,22 @@ function DashboardBootHeader(_props: { me: MeResponse }) {
 					</div>
 				</div>
 				<div
-					className="flex items-center gap-2 self-start"
+					className="flex shrink-0 items-center gap-1.5 self-auto sm:hidden"
+					data-dashboard-boot-primary-actions-mobile
+				>
+					<PulseBlock className="size-8 rounded-full bg-card/85 border border-border/60" />
+					<PulseBlock className="h-8 w-16 rounded-full bg-card/85 border border-border/60" />
+					<PulseBlock className="size-8 rounded-full bg-card/85 border border-border/60" />
+				</div>
+				<div
+					className="hidden self-start rounded-[1.35rem] border border-border/70 bg-card/82 p-1.5 shadow-sm sm:block"
 					data-dashboard-boot-primary-actions
 				>
-					<PulseBlock className="h-10 w-28 rounded-full border border-border/60 bg-card/85" />
-					<PulseBlock className="h-10 w-[4.5rem] rounded-full border border-border/60 bg-card/85" />
-					<PulseBlock className="size-10 rounded-full border border-border/60 bg-card/85" />
+					<div className="flex items-center gap-2">
+						<PulseBlock className="size-10 rounded-full bg-muted/85" />
+						<PulseBlock className="h-10 w-28 rounded-full bg-muted/85" />
+						<PulseBlock className="size-10 rounded-full bg-muted/85" />
+					</div>
 				</div>
 			</div>
 

@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { MeResponse } from "@/api";
@@ -32,12 +33,27 @@ const mockMe: MeResponse = {
 	},
 };
 
+const APP_BOOT_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	appBootMobileFold: {
+		name: "App boot mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+} as const;
+
 const meta = {
 	title: "Pages/App Boot",
 	component: AppBoot,
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: APP_BOOT_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -99,4 +115,40 @@ export const AdminUsersWarmSkeleton: Story = {
 
 export const AdminJobsWarmSkeleton: Story = {
 	render: () => <AdminJobsStartupSkeleton me={mockMe} />,
+};
+
+export const DashboardWarmSkeletonMobile: Story = {
+	name: "Dashboard Warm Skeleton / Mobile shell",
+	render: () => <DashboardStartupSkeleton me={mockMe} />,
+	globals: {
+		viewport: {
+			value: "appBootMobileFold",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端审阅入口：warm skeleton 的页头要对齐真实 Dashboard mobile shell——副标题隐藏、品牌与右侧 actions 同行，第二行才是 control band。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const subtitle = canvasElement.querySelector(
+			"[data-dashboard-boot-brand-subtitle]",
+		) as HTMLElement | null;
+		const mobileActions = canvasElement.querySelector(
+			"[data-dashboard-boot-primary-actions-mobile]",
+		) as HTMLElement | null;
+		const desktopActions = canvasElement.querySelector(
+			"[data-dashboard-boot-primary-actions]",
+		) as HTMLElement | null;
+		expect(subtitle).not.toBeVisible();
+		expect(mobileActions).toBeVisible();
+		expect(desktopActions).not.toBeVisible();
+		expect(
+			canvasElement.querySelector("[data-dashboard-boot-tab-strip]"),
+		).not.toBeNull();
+	},
 };
