@@ -4249,6 +4249,26 @@ pub async fn refresh_existing_brief_snapshot_content(
     brief_id: &str,
     generation_source: &str,
 ) -> Result<StoredBrief> {
+    refresh_existing_brief_snapshot_with_mode(
+        state,
+        brief_id,
+        generation_source,
+        ExistingBriefRefreshMode::PreserveStoredMemberships,
+    )
+    .await
+}
+
+enum ExistingBriefRefreshMode {
+    PreserveStoredMemberships,
+    RebuildWindow,
+}
+
+async fn refresh_existing_brief_snapshot_with_mode(
+    state: &AppState,
+    brief_id: &str,
+    generation_source: &str,
+    mode: ExistingBriefRefreshMode,
+) -> Result<StoredBrief> {
     #[derive(Debug, sqlx::FromRow)]
     struct RefreshableBriefRow {
         user_id: String,
@@ -4305,9 +4325,17 @@ pub async fn refresh_existing_brief_snapshot_content(
         &window.end_utc.to_rfc3339(),
     )
     .await?;
-    let release_ids = load_stored_brief_release_ids(state, brief_id, &row.content_markdown).await?;
-    let releases = load_release_digests_by_ids(&state.pool, &release_ids).await?;
-    let built = build_brief_content_from_digests(state, releases, social).await?;
+    let built = match mode {
+        ExistingBriefRefreshMode::PreserveStoredMemberships => {
+            let release_ids =
+                load_stored_brief_release_ids(state, brief_id, &row.content_markdown).await?;
+            let releases = load_release_digests_by_ids(&state.pool, &release_ids).await?;
+            build_brief_content_from_digests(state, releases, social).await?
+        }
+        ExistingBriefRefreshMode::RebuildWindow => {
+            build_brief_content(state, &window, &row.user_id).await?
+        }
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state
         .pool
@@ -4356,10 +4384,18 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
         && window.end_utc.with_timezone(&chrono::Utc) <= chrono::Utc::now()
     {
         if state.config.ai.is_none() {
-            return load_stored_brief_snapshot(state, existing_id).await;
+            let stored = load_stored_brief_snapshot(state, existing_id).await?;
+            if !brief_content_needs_refresh(&stored.content_markdown) {
+                return Ok(stored);
+            }
         }
-        return refresh_existing_brief_snapshot_content(state, existing_id, generation_source)
-            .await;
+        return refresh_existing_brief_snapshot_with_mode(
+            state,
+            existing_id,
+            generation_source,
+            ExistingBriefRefreshMode::RebuildWindow,
+        )
+        .await;
     }
     if state.config.ai.is_none() && existing_id.is_none() {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
@@ -6511,7 +6547,9 @@ mod tests {
         .bind("Asia/Shanghai")
         .bind("08:00")
         .bind("scheduled")
-        .bind("existing snapshot")
+        .bind(
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v2.0.0](/?tab=briefs&release=406) · 2026-03-06T12:00:00Z · [GitHub Release](https://example.invalid/releases/406)\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n",
+        )
         .bind(now)
         .bind(now)
         .execute(&state.pool)
@@ -6578,11 +6616,153 @@ mod tests {
             "manual",
         )
         .await
-        .expect("preserve stored snapshot when ai is unavailable");
+        .expect("preserve already normalized snapshot when ai is unavailable");
 
         assert_eq!(stored.id, "brief-existing-no-ai");
-        assert_eq!(stored.content_markdown, "existing snapshot");
+        assert!(
+            stored
+                .content_markdown
+                .contains("[v2.0.0](/?tab=briefs&release=406)")
+        );
+        assert!(!stored.content_markdown.contains("## 概览"));
         assert_eq!(stored.release_ids, vec![406]);
+    }
+
+    #[tokio::test]
+    async fn generate_daily_brief_snapshot_refreshes_stale_historical_snapshot_without_ai() {
+        let state = setup_llm_state_with_ai(None).await;
+        let now = "2026-03-07T09:00:00Z";
+
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone,
+              created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("user-brief-existing-stale-no-ai")
+        .bind(2010_i64)
+        .bind("brief-existing-stale-no-ai")
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert user");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-existing-stale-no-ai")
+        .bind("user-brief-existing-stale-no-ai")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00+00:00")
+        .bind("2026-03-07T00:00:00+00:00")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("## 概览\n\n- 旧格式\n")
+        .bind(now)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert stale stored snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-existing-stale-no-ai")
+        .bind(1_i64)
+        .bind(407_i64)
+        .bind("node-existing-stale-no-ai")
+        .bind("v2.1.0")
+        .bind("v2.1.0")
+        .bind("fix: deterministic refresh")
+        .bind("https://github.com/acme/rocket/releases/tag/v2.1.0")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&state.pool)
+        .await
+        .expect("insert release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-existing-stale-no-ai")
+        .bind("user-brief-existing-stale-no-ai")
+        .bind(1_i64)
+        .bind("acme/rocket")
+        .bind("acme")
+        .bind("rocket")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/acme/rocket")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&state.pool)
+        .await
+        .expect("insert starred repo");
+
+        let preferences = briefs::DailyBriefPreferences {
+            local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),
+            time_zone: "Asia/Shanghai".to_owned(),
+        };
+        let window = briefs::compute_daily_window_for_key_date(
+            &preferences,
+            NaiveDate::from_ymd_opt(2026, 3, 7).expect("date"),
+        )
+        .expect("window");
+
+        let stored = generate_daily_brief_snapshot_for_window(
+            state.as_ref(),
+            "user-brief-existing-stale-no-ai",
+            &window,
+            "manual",
+        )
+        .await
+        .expect("refresh stale stored snapshot when ai is unavailable");
+
+        assert_eq!(stored.id, "brief-existing-stale-no-ai");
+        assert!(stored.content_markdown.contains("## 项目更新"));
+        assert!(stored.content_markdown.contains("## 获星与关注"));
+        assert!(!stored.content_markdown.contains("## 概览"));
+        assert!(
+            stored
+                .content_markdown
+                .contains("[v2.1.0](/?tab=briefs&release=407)")
+        );
+        assert_eq!(stored.release_ids, vec![407]);
     }
 
     #[tokio::test]
