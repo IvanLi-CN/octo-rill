@@ -24,7 +24,7 @@ pub struct DailyBriefPreferences {
 pub struct DailyWindow {
     pub key_date: NaiveDate,
     pub display_date: String,
-    pub start_local: DateTime<FixedOffset>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub end_local: DateTime<FixedOffset>,
     pub start_utc: DateTime<Utc>,
     pub end_utc: DateTime<Utc>,
@@ -306,7 +306,6 @@ pub fn compute_daily_window_for_key_date(
         display_date: key_date.to_string(),
         start_utc: start_local.with_timezone(&Utc),
         end_utc: end_local.with_timezone(&Utc),
-        start_local: start_local.fixed_offset(),
         end_local: end_local.fixed_offset(),
         effective_time_zone: preferences.time_zone.clone(),
         effective_local_boundary: format_daily_brief_local_time(end_local.time()),

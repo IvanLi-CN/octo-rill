@@ -775,19 +775,12 @@ const mockBriefs: BriefItem[] = [
 		release_count: 2,
 		release_ids: ["10003", "10004"],
 		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：2 个\n- Release：2 条（预发布 0 条）\n- 涉及项目：[acme/rocket](https://github.com/acme/rocket)、[acme/satellite](https://github.com/acme/satellite)\n\n## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n",
+			"## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999)\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n  - 相关链接：[#13840](https://github.com/acme/satellite/pull/13840)\n\n## 获星与关注\n\n### 获星\n\n- [acme/rocket](https://github.com/acme/rocket)：[@yyx990803](https://github.com/yyx990803)、[@gaearon](https://github.com/gaearon)\n\n### 关注\n\n- [@antfu](https://github.com/antfu)、[@sindresorhus](https://github.com/sindresorhus)\n",
 		created_at: "2026-04-04T08:00:03+08:00",
 	}),
 ];
 
 const longBriefMarkdown = [
-	"## 概览",
-	"",
-	"- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00",
-	"- 更新项目：8 个",
-	"- Release：14 条（预发布 3 条）",
-	"- 涉及项目：`acme/rocket`、`acme/satellite`、`acme/hangar`、`acme/telemetry`、`acme/spark`、`acme/atlas`、`acme/relay`、`acme/fleet`",
-	"",
 	"## 项目更新",
 	"",
 	...Array.from({ length: 8 }, (_, index) => {
@@ -812,6 +805,17 @@ const longBriefMarkdown = [
 			"",
 		].join("\n");
 	}),
+	"",
+	"## 获星与关注",
+	"",
+	"### 获星",
+	"",
+	"- [acme/rocket](https://github.com/acme/rocket)：[@alice](https://github.com/alice)、[@bob](https://github.com/bob)、[@carol](https://github.com/carol) 等 7 人",
+	"- [acme/atlas](https://github.com/acme/atlas)：[@dave](https://github.com/dave)、[@erin](https://github.com/erin)",
+	"",
+	"### 关注",
+	"",
+	"- [@yyx990803](https://github.com/yyx990803)、[@gaearon](https://github.com/gaearon)、[@antfu](https://github.com/antfu) 等 8 人",
 ].join("\n");
 
 const longBriefs: BriefItem[] = [
@@ -846,7 +850,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 		release_count: 1,
 		release_ids: ["10005"],
 		content_markdown:
-			"## 概览\n\n- 时间窗口（本地）：2026-04-02T08:00:00+08:00 → 2026-04-03T08:00:00+08:00\n- 更新项目：1 个\n- Release：1 条（预发布 0 条）\n- 涉及项目：[acme/fleet](https://github.com/acme/fleet)\n\n## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n",
+			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
 		created_at: "2026-04-03T08:00:03+08:00",
 	}),
 };
@@ -1116,7 +1120,7 @@ function DashboardPreview(props: {
 				window_start: null,
 				window_end: null,
 				content_markdown:
-					"## 概览\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。",
+					"## 项目更新\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。",
 				created_at: `${date}T08:00:03+08:00`,
 			});
 		setStoryBriefs((current) =>
@@ -1561,9 +1565,8 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		await expect(
 			canvas.getByText(/^2026-04-03\s+·\s+2 条 Release$/),
 		).toBeVisible();
-		await expect(
-			canvas.getByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
-		).toBeVisible();
+		await expect(canvas.getByText("## 获星与关注")).toBeVisible();
+		await expect(canvas.getByRole("link", { name: "#13840" })).toBeVisible();
 		await expect(
 			canvas.queryByText(HISTORY_RAW_MARKER),
 		).not.toBeInTheDocument();
@@ -1590,9 +1593,7 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			const beforeButtonRect = expandButton.getBoundingClientRect();
 			await expandButton.click();
 			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
-			await expect(
-				canvas.queryByText(/时间窗口（本地）：2026-04-03T08:00:00\+08:00/),
-			).not.toBeInTheDocument();
+			await expect(canvas.queryByText("## 获星与关注")).not.toBeInTheDocument();
 			const afterSlot = historicalGroup.querySelector<HTMLElement>(
 				"[data-feed-day-action-slot]",
 			);

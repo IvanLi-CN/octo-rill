@@ -104,7 +104,10 @@ fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
 }
 
 fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
-    matches!(generation_source, "legacy" | "history_recompute_failed")
+    matches!(
+        generation_source,
+        "legacy" | "history_recompute_failed" | "content_refresh_failed"
+    )
 }
 
 async fn user_has_brief_access_to_release(
@@ -137,7 +140,7 @@ async fn user_has_brief_access_to_release(
         SELECT content_markdown
         FROM briefs
         WHERE user_id = ?
-          AND generation_source IN ('legacy', 'history_recompute_failed')
+          AND generation_source IN ('legacy', 'history_recompute_failed', 'content_refresh_failed')
           AND content_markdown LIKE ?
         "#,
     )
@@ -1162,6 +1165,8 @@ pub struct AdminTaskDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     brief_history_recompute: Option<AdminBriefHistoryRecomputeDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    brief_refresh_content: Option<AdminBriefRefreshContentDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sync_subscriptions: Option<AdminSyncSubscriptionsDiagnostics>,
 }
 
@@ -1242,6 +1247,17 @@ pub struct AdminBriefGenerateDiagnostics {
 
 #[derive(Debug, Serialize)]
 pub struct AdminBriefHistoryRecomputeDiagnostics {
+    total: i64,
+    processed: i64,
+    succeeded: i64,
+    failed: i64,
+    current_brief_id: Option<String>,
+    last_error: Option<String>,
+    canceled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminBriefRefreshContentDiagnostics {
     total: i64,
     processed: i64,
     succeeded: i64,
@@ -1963,6 +1979,130 @@ fn build_brief_history_recompute_diagnostics(
     (outcome, diagnostics)
 }
 
+fn build_brief_refresh_content_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminBriefRefreshContentDiagnostics) {
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+
+    let mut total_from_event: Option<i64> = None;
+    let mut processed_from_event: Option<i64> = None;
+    let mut succeeded_from_event: Option<i64> = None;
+    let mut failed_from_event: Option<i64> = None;
+    let mut canceled_from_event: Option<bool> = None;
+    let ordered_events = task_events_for_diagnostics(events);
+    let mut current_brief_id: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    for event in ordered_events {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+        match stage.as_str() {
+            "collect" => {
+                total_from_event = json_object_get_i64(payload_object, "total_briefs");
+            }
+            "refresh" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+            }
+            "brief_succeeded" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                succeeded_from_event = Some(succeeded_from_event.unwrap_or(0) + 1);
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+            }
+            "brief_failed" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                failed_from_event = Some(failed_from_event.unwrap_or(0) + 1);
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+                last_error = json_object_get_string(payload_object, "error");
+            }
+            "summary" => {
+                total_from_event = json_object_get_i64(payload_object, "total");
+                processed_from_event = json_object_get_i64(payload_object, "processed");
+                succeeded_from_event = json_object_get_i64(payload_object, "succeeded");
+                failed_from_event = json_object_get_i64(payload_object, "failed");
+                canceled_from_event = json_object_get_bool(payload_object, "canceled");
+                current_brief_id = None;
+            }
+            _ => {}
+        }
+    }
+
+    let total = total_from_event
+        .or_else(|| json_object_get_i64(result_object, "total"))
+        .unwrap_or(0);
+    let processed = processed_from_event
+        .or_else(|| json_object_get_i64(result_object, "processed"))
+        .unwrap_or(0);
+    let succeeded = succeeded_from_event
+        .or_else(|| json_object_get_i64(result_object, "succeeded"))
+        .unwrap_or(0);
+    let failed = failed_from_event
+        .or_else(|| json_object_get_i64(result_object, "failed"))
+        .unwrap_or(0);
+    let canceled = canceled_from_event
+        .or_else(|| json_object_get_bool(result_object, "canceled"))
+        .unwrap_or(false);
+
+    let diagnostics = AdminBriefRefreshContentDiagnostics {
+        total,
+        processed,
+        succeeded,
+        failed,
+        current_brief_id,
+        last_error,
+        canceled,
+    };
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "日报内容修复失败。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_CANCELED || canceled {
+        business_outcome("partial", "已取消", "日报内容修复在执行中被取消。")
+    } else if total == 0 {
+        business_outcome("ok", "无需执行", "没有命中过时格式的日报需要修复。")
+    } else if failed > 0 && succeeded == 0 {
+        business_outcome("failed", "业务失败", "日报内容修复未成功处理任何候选日报。")
+    } else if failed > 0 {
+        business_outcome("partial", "部分成功", "日报内容已部分修复，仍有失败项。")
+    } else if succeeded > 0 {
+        business_outcome("ok", "业务成功", "日报内容修复已完成。")
+    } else {
+        business_outcome("unknown", "处理中", "日报内容修复尚未完成。")
+    };
+
+    (outcome, diagnostics)
+}
+
 fn map_sync_subscription_event(
     row: AdminSyncSubscriptionEventRow,
 ) -> AdminSyncSubscriptionEventItem {
@@ -2135,6 +2275,7 @@ fn build_task_diagnostics(
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
+                brief_refresh_content: None,
                 sync_subscriptions: None,
             })
         }
@@ -2146,6 +2287,7 @@ fn build_task_diagnostics(
                 brief_daily_slot: Some(diagnostics),
                 brief_generate: None,
                 brief_history_recompute: None,
+                brief_refresh_content: None,
                 sync_subscriptions: None,
             })
         }
@@ -2157,6 +2299,7 @@ fn build_task_diagnostics(
                 brief_daily_slot: None,
                 brief_generate: Some(diagnostics),
                 brief_history_recompute: None,
+                brief_refresh_content: None,
                 sync_subscriptions: None,
             })
         }
@@ -2169,6 +2312,20 @@ fn build_task_diagnostics(
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: Some(diagnostics),
+                brief_refresh_content: None,
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_BRIEF_REFRESH_CONTENT => {
+            let (business_outcome, diagnostics) =
+                build_brief_refresh_content_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                brief_history_recompute: None,
+                brief_refresh_content: Some(diagnostics),
                 sync_subscriptions: None,
             })
         }
@@ -2181,6 +2338,7 @@ fn build_task_diagnostics(
                 brief_daily_slot: None,
                 brief_generate: None,
                 brief_history_recompute: None,
+                brief_refresh_content: None,
                 sync_subscriptions: Some(diagnostics),
             })
         }
@@ -13533,6 +13691,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_get_realtime_task_detail_maps_brief_refresh_content_progress() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-brief-refresh");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_BRIEF_REFRESH_CONTENT)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(r#"{"total":5,"processed":3,"succeeded":2,"failed":1,"canceled":false}"#)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for (event_id, payload_json, created_at) in [
+            (
+                "5555555555555555",
+                r#"{"stage":"refresh","brief_id":"brief_old"}"#,
+                "2026-03-06T14:30:01Z",
+            ),
+            (
+                "6666666666666666",
+                r#"{"stage":"brief_failed","brief_id":"brief_latest","error":"boom"}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let brief_refresh = diagnostics
+            .brief_refresh_content
+            .expect("brief refresh diagnostics");
+        assert_eq!(brief_refresh.total, 5);
+        assert_eq!(brief_refresh.processed, 3);
+        assert_eq!(brief_refresh.succeeded, 2);
+        assert_eq!(brief_refresh.failed, 1);
+        assert_eq!(
+            brief_refresh.current_brief_id.as_deref(),
+            Some("brief_latest")
+        );
+        assert_eq!(brief_refresh.last_error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_reads_brief_refresh_collect_total_while_running() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-brief-refresh-collect");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_BRIEF_REFRESH_CONTENT)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for (event_id, payload_json, created_at) in [
+            (
+                "7777777777777777",
+                r#"{"stage":"collect","total_briefs":5}"#,
+                "2026-03-06T14:30:01Z",
+            ),
+            (
+                "8888888888888888",
+                r#"{"stage":"refresh","brief_id":"brief_running","index":2,"total":5}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+            (
+                "9999999999999999",
+                r#"{"stage":"brief_succeeded","brief_id":"brief_done","index":1,"total":5}"#,
+                "2026-03-06T14:30:03Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let brief_refresh = diagnostics
+            .brief_refresh_content
+            .expect("brief refresh diagnostics");
+        assert_eq!(brief_refresh.total, 5);
+        assert_eq!(brief_refresh.processed, 2);
+        assert_eq!(brief_refresh.succeeded, 1);
+        assert_eq!(brief_refresh.failed, 0);
+        assert_eq!(
+            brief_refresh.current_brief_id.as_deref(),
+            Some("brief_done")
+        );
+        assert_eq!(brief_refresh.last_error, None);
+    }
+
+    #[tokio::test]
     async fn admin_get_realtime_task_detail_uses_latest_subscription_events_window() {
         let pool = setup_pool().await;
         seed_user(&pool, 2, "admin", 1, 0).await;
@@ -14560,6 +14913,41 @@ line two",
             get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
                 .await
                 .expect("get release detail from brief link");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        assert!(detail.repo_visual.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_allows_content_refresh_failed_brief_link_without_membership() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-content-refresh-failed")
+        .bind(user_id.as_str())
+        .bind("2026-02-23")
+        .bind("content_refresh_failed")
+        .bind("- [v1.2.3](/?tab=briefs&release=120)")
+        .bind("2026-02-23T08:00:00Z")
+        .bind("2026-02-23T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert failed refresh brief");
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail from failed refresh brief link");
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
