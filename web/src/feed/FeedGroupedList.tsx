@@ -37,7 +37,7 @@ const FEED_BRIEF_PANEL_CLASS =
 
 function formatGroupCountLabel(releaseCount: number, activityCount: number) {
 	if (releaseCount > 0 && activityCount > 0) {
-		return `${releaseCount} 条 Release · ${activityCount} 条动态`;
+		return `${releaseCount + activityCount} 条动态`;
 	}
 	if (releaseCount > 0) {
 		return `${releaseCount} 条 Release`;
