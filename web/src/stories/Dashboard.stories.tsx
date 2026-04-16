@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useLayoutEffect, useState } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
@@ -75,6 +76,17 @@ const STORYBOOK_VERSION_STATE = {
 	availableVersion: null,
 	hasUpdate: false,
 	refreshPage: () => {},
+} as const;
+const DASHBOARD_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	dashboardMobileDivider375: {
+		name: "Dashboard mobile 375x667",
+		styles: {
+			height: "667px",
+			width: "375px",
+		},
+		type: "mobile",
+	},
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
@@ -327,6 +339,48 @@ function makeReactionCompactFeed(): FeedItem[] {
 				}
 			: item,
 	);
+}
+
+function makeMobileDayDividerProofFeed(): FeedItem[] {
+	return [
+		buildFeedItem("mobile-divider-current", {
+			ts: "2026-04-04T16:42:00+08:00",
+			repo_full_name: "acme/rocket-mobile",
+			repo_visual: repoVisualFixtures.social,
+			title: "mobile divider current day",
+			body: "- keep reaction footer visible\n- preserve grouped-feed divider readability\n- leave space before the next day header",
+			html_url:
+				"https://github.com/acme/rocket-mobile/releases/tag/mobile-divider-current",
+			reactions: {
+				counts: {
+					plus1: 4,
+					laugh: 1,
+					heart: 2,
+					hooray: 1,
+					rocket: 1,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: true,
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: false,
+					eyes: false,
+				},
+				status: "ready",
+			},
+		}),
+		buildFeedItem("mobile-divider-history", {
+			ts: "2026-04-03T19:18:00+08:00",
+			repo_full_name: "acme/rocket-mobile",
+			repo_visual: repoVisualFixtures.avatar,
+			title: "mobile divider previous day",
+			body: "- historical release without brief\n- render generate button beside the day header on narrow screens",
+			html_url:
+				"https://github.com/acme/rocket-mobile/releases/tag/mobile-divider-history",
+		}),
+	];
 }
 
 function buildRepoStarItem(
@@ -1289,6 +1343,9 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: DASHBOARD_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -1541,6 +1598,90 @@ export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
 		briefs: [],
 		showFooter: false,
 	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const MobileDayDividerNoOverlap: Story = {
+	render: () => (
+		<DashboardPreview
+			initialTab="all"
+			briefs={[]}
+			feedItems={makeMobileDayDividerProofFeed()}
+			showFooter={false}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobileDivider375",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端窄宽度下，当前日 release 卡片的 reaction footer 下方仍要给下一天 divider 留出安全间距；若历史组存在 action，则 action 与 label 要么同排分离、要么稳定换行，不得互相覆盖。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("button", { name: "生成日报" }),
+		).toBeVisible();
+		const reactionFooter = canvasElement.querySelector<HTMLElement>(
+			'[data-reaction-footer="true"]',
+		);
+		const dayLabel = Array.from(
+			canvasElement.querySelectorAll<HTMLElement>(
+				'[data-feed-day-label="true"]',
+			),
+		).find(
+			(element) => element.textContent?.trim() === "2026-04-03 · 1 条 Release",
+		);
+		expect(reactionFooter).not.toBeNull();
+		expect(dayLabel).not.toBeUndefined();
+		if (!reactionFooter || !dayLabel) {
+			throw new Error("Expected reaction footer and day label");
+		}
+		const dayHeader = dayLabel.closest<HTMLElement>(
+			'[data-feed-day-header="true"]',
+		);
+		const actionSlot = dayHeader?.querySelector<HTMLElement>(
+			'[data-feed-day-action-slot="true"]',
+		);
+		expect(dayHeader).not.toBeNull();
+		expect(actionSlot).not.toBeNull();
+		if (!dayHeader || !actionSlot) {
+			throw new Error("Expected header, label, and action slot");
+		}
+
+		const footerRect = reactionFooter.getBoundingClientRect();
+		const headerRect = dayHeader.getBoundingClientRect();
+		const labelRect = dayLabel.getBoundingClientRect();
+		const actionRect = actionSlot.getBoundingClientRect();
+		const intersects =
+			labelRect.left < actionRect.right &&
+			actionRect.left < labelRect.right &&
+			labelRect.top < actionRect.bottom &&
+			actionRect.top < labelRect.bottom;
+
+		expect(headerRect.top - footerRect.bottom).toBeGreaterThanOrEqual(8);
+		expect(
+			Math.min(labelRect.top, actionRect.top) - footerRect.bottom,
+		).toBeGreaterThanOrEqual(8);
+		expect(intersects).toBe(false);
+	},
+};
+
+export const EvidenceMobileDayDividerNoOverlap: Story = {
+	name: "Evidence / Mobile Day Divider No Overlap",
+	render: MobileDayDividerNoOverlap.render,
+	globals: MobileDayDividerNoOverlap.globals,
 	parameters: {
 		docs: {
 			disable: true,

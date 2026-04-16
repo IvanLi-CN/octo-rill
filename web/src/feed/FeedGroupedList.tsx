@@ -29,9 +29,9 @@ type BriefLike = BriefSnapshotCandidate & {
 };
 
 const FEED_DAY_ACTION_SLOT_CLASS =
-	"flex h-8 w-[152px] shrink-0 items-center justify-end";
+	"flex w-full items-start justify-start pt-1 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
 const FEED_DAY_ACTION_BUTTON_CLASS =
-	"h-auto min-h-0 w-full justify-end gap-1 rounded-none px-0 py-0 font-mono text-[15px] font-normal leading-none tracking-wide text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100";
+	"h-auto min-h-0 w-auto justify-start gap-1 rounded-none px-0 py-0 font-mono text-[14px] font-normal leading-[1.35] tracking-[0.02em] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100 sm:w-full sm:justify-end sm:text-[15px] sm:leading-none sm:tracking-wide";
 const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
 
@@ -67,7 +67,10 @@ function FeedDayHeader(props: {
 	} = props;
 
 	const label = (
-		<p className="text-foreground/68 shrink-0 font-mono text-[15px] leading-none tracking-wide">
+		<p
+			className="min-w-0 max-w-full text-center font-mono text-[14px] leading-[1.35] tracking-[0.02em] text-foreground/68 whitespace-normal sm:text-[15px] sm:leading-none sm:tracking-wide"
+			data-feed-day-label="true"
+		>
 			<span className="text-foreground/82">{date}</span>
 			{" · "}
 			{formatGroupCountLabel(releaseCount, activityCount)}
@@ -77,21 +80,31 @@ function FeedDayHeader(props: {
 	return (
 		<div
 			className={cn(
-				"flex min-h-8 flex-wrap items-center gap-2.5 sm:min-h-8 sm:gap-3",
+				"flex flex-col gap-2 py-0.5 sm:min-h-8 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3 sm:py-0",
 				className,
 			)}
+			data-feed-day-header="true"
 		>
 			{withDividerLines ? (
-				<div className="flex min-w-0 flex-1 items-center gap-4">
-					<div className="bg-border/60 h-px flex-1" />
+				<div className="flex min-w-0 w-full flex-1 items-center gap-2 sm:w-auto sm:gap-4">
+					<div
+						className="bg-border/60 h-px min-w-4 flex-1 sm:min-w-8"
+						data-feed-day-divider-before="true"
+					/>
 					{label}
-					<div className="bg-border/60 h-px min-w-8 flex-1" />
+					<div
+						className="bg-border/60 h-px min-w-4 flex-1 sm:min-w-8"
+						data-feed-day-divider-after="true"
+					/>
 				</div>
 			) : (
-				<div className="flex min-w-0 flex-1 items-center">{label}</div>
+				<div className="flex min-w-0 w-full flex-1 items-center sm:w-auto">
+					{label}
+				</div>
 			)}
 			{action ? (
 				<div
+					data-feed-day-action-slot="true"
 					{...actionSlotProps}
 					className={cn(FEED_DAY_ACTION_SLOT_CLASS, actionSlotProps?.className)}
 				>
