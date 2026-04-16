@@ -140,8 +140,8 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 
 	await page.goto("/");
 
-	await expect(page.getByRole("tab", { name: "被加星" })).toBeVisible();
-	await expect(page.getByRole("tab", { name: "被关注" })).toBeVisible();
+	await expect(page.getByRole("tab", { name: "加星" })).toBeVisible();
+	await expect(page.getByRole("tab", { name: "关注" })).toBeVisible();
 	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
 	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
 	await expect(
@@ -174,7 +174,7 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		),
 	).toHaveCount(0);
 
-	await page.getByRole("tab", { name: "被加星" }).click();
+	await page.getByRole("tab", { name: "加星" }).click();
 	await expect(page.getByText("octocat", { exact: true })).toBeVisible();
 	await expect(page.getByText("monalisa", { exact: true })).toHaveCount(0);
 	await expect(page.getByText("owner/repo", { exact: true })).toBeVisible();
@@ -190,7 +190,7 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		),
 	).toHaveCount(1);
 
-	await page.getByRole("tab", { name: "被关注" }).click();
+	await page.getByRole("tab", { name: "关注" }).click();
 	await expect(page.getByText("monalisa", { exact: true })).toBeVisible();
 	await expect(page.getByText("octo", { exact: true })).toBeVisible();
 	await expect(
@@ -449,7 +449,7 @@ test("switching social tabs clears stale feed items before the next dataset reso
 
 	await expect(page.getByText("octocat-old", { exact: true })).toBeVisible();
 
-	await page.getByRole("tab", { name: "被加星" }).click();
+	await page.getByRole("tab", { name: "加星" }).click();
 	await expect(page.getByText("octocat-old", { exact: true })).toHaveCount(0);
 
 	releaseStarsResponse();
