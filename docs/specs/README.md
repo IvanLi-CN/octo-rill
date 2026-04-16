@@ -88,11 +88,12 @@
 | epn56 | 管理员任务中心运行时 worker 数量设置 | 重新设计（#y2yf8） | `epn56-admin-jobs-runtime-worker-settings/SPEC.md` | 2026-04-13 | historical worker-only contract superseded by #y2yf8 translation runtime settings |
 | r8m4k | Dashboard 日报阅读流与详情弹窗修正 | 已完成 | `r8m4k-dashboard-brief-detail-auto-height/SPEC.md` | 2026-04-03 | PR #45; brief card grows with content and release detail now opens in a modal dialog |
 | qvewp | Release 成功后回写 PR 版本评论 | 已完成 | `qvewp-release-pr-version-comment/SPEC.md` | 2026-04-04 | PR #46, PR #47; release run #43 comments PRs and rerun updates in place |
-| xaycu | Dashboard 按日报边界分组与历史日报折叠 | 已完成 | `xaycu-dashboard-day-grouping/SPEC.md` | 2026-04-04 | local implementation completed; PR pending |
+| xaycu | Dashboard 按日报边界分组与历史日报折叠 | 已完成 | `xaycu-dashboard-day-grouping/SPEC.md` | 2026-04-16 | top-level tab copy aligned to `发布`; spec wording refreshed for current dashboard labels |
 | tvujt | 品牌刷新：生成图接管 favicon / Web / Docs | 已完成 | `tvujt-brand-generated-icon-refresh/SPEC.md` | 2026-04-06 | local implementation completed; PR pending screenshot push approval |
 | 7f2b9 | Release Feed 三 Tabs 与智能版本变化卡片 | 已完成 | `7f2b9-release-feed-smart-tabs/SPEC.md` | 2026-04-08 | PR #53; page-level lane selector, segmented selector polish, and visual evidence refreshed |
 | h4yvc | 服务端版本更新轮询轻提示 | 已完成 | `h4yvc-version-update-polling-notice/SPEC.md` | 2026-04-10 | PR #57; version polling notice + visual evidence + regression coverage |
 | crzva | Release 视图仓库图标补齐 | 已完成 | `crzva-release-repo-visuals/SPEC.md` | 2026-04-10 | local implementation completed; review-loop clear; release repo visuals shipped with aligned repo identity polish |
+| vgqp9 | Dashboard 社交活动记录扩展（含头像） | 已完成 | `vgqp9-dashboard-social-activity/SPEC.md` | 2026-04-16 | dashboard social activity labels aligned to `发布 / 加星 / 关注 / 收件箱`; spec wording refreshed for current top-level tabs |
 | 76bxs | Dashboard 页头品牌优先重设计 | 已完成 | `76bxs-dashboard-header-brand-layout/SPEC.md` | 2026-04-10 | PR #61; brand-first header, avatar popover, and refreshed visual evidence assets |
 | g63t8 | Release 视图固定 owner/org avatar | 已完成 | `g63t8-release-avatar-only-visuals/SPEC.md` | 2026-04-10 | local implementation completed; avatar-only repo identity follow-up for PR #58 behavior |
 | zcp33 | Release reaction 扁平化重绘与圆形按钮收敛 | 已完成 | `zcp33-release-reaction-bubble-polish/SPEC.md` | 2026-04-10 | PR #59; Fluent Flat SVG assets + circular reaction trigger + external badge + Storybook evidence landed |

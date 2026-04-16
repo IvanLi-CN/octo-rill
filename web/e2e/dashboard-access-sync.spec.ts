@@ -880,7 +880,7 @@ test("dashboard keeps inbox sync busy through transient task stream errors", asy
 
 		const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
 		await expect(syncInboxButton).toBeVisible();
-		await page.getByRole("tab", { name: "Inbox" }).click();
+		await page.getByRole("tab", { name: "收件箱" }).click();
 		await expect(page.getByText("Cached inbox thread").first()).toBeVisible();
 
 		await syncInboxButton.click();
