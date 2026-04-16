@@ -951,6 +951,17 @@ const mockNotifs: NotificationItem[] = [
 	},
 ];
 
+function isFeedBackedTab(
+	value: Tab,
+): value is Extract<Tab, "all" | "releases" | "stars" | "followers"> {
+	return (
+		value === "all" ||
+		value === "releases" ||
+		value === "stars" ||
+		value === "followers"
+	);
+}
+
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
@@ -968,6 +979,9 @@ function DashboardPreview(props: {
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
 	showFooter?: boolean;
+	deferredFeedTabs?: Tab[];
+	initialFeedTabLoading?: Tab | null;
+	deferredFeedLoadDelayMs?: number;
 }) {
 	const {
 		initialTab = "all",
@@ -986,6 +1000,9 @@ function DashboardPreview(props: {
 		initialReleaseId = null,
 		releaseDetail = null,
 		showFooter = true,
+		deferredFeedTabs = [],
+		initialFeedTabLoading = null,
+		deferredFeedLoadDelayMs = 1400,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
@@ -1064,6 +1081,12 @@ function DashboardPreview(props: {
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
 	);
+	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
+		initialFeedTabLoading,
+	);
+	const [resolvedDeferredFeedTabs, setResolvedDeferredFeedTabs] = useState<
+		Set<Tab>
+	>(() => new Set<Tab>());
 
 	const visibleItems = (mode: "all" | "releases" | "stars" | "followers") => {
 		switch (mode) {
@@ -1100,6 +1123,36 @@ function DashboardPreview(props: {
 				"Asia/Shanghai",
 		});
 	}, [dailyBoundaryLocal, dailyBoundaryTimeZone]);
+
+	useEffect(() => {
+		if (!pendingFeedTab || !isFeedBackedTab(pendingFeedTab)) {
+			return;
+		}
+		const timer = window.setTimeout(() => {
+			setResolvedDeferredFeedTabs((current) => {
+				const next = new Set(current);
+				next.add(pendingFeedTab);
+				return next;
+			});
+			setPendingFeedTab((current) =>
+				current === pendingFeedTab ? null : current,
+			);
+		}, deferredFeedLoadDelayMs);
+		return () => window.clearTimeout(timer);
+	}, [deferredFeedLoadDelayMs, pendingFeedTab]);
+
+	useEffect(() => {
+		if (!isFeedBackedTab(tab)) {
+			return;
+		}
+		if (!deferredFeedTabs.includes(tab)) {
+			return;
+		}
+		if (resolvedDeferredFeedTabs.has(tab) || pendingFeedTab === tab) {
+			return;
+		}
+		setPendingFeedTab(tab);
+	}, [deferredFeedTabs, pendingFeedTab, resolvedDeferredFeedTabs, tab]);
 
 	const openReleaseDetail = (releaseId: string) => {
 		setTab("briefs");
@@ -1141,8 +1194,14 @@ function DashboardPreview(props: {
 		});
 	};
 
-	const renderFeedPanel = (mode: "all" | "releases" | "stars" | "followers") =>
-		visibleItems(mode).length === 0 ? (
+	const renderFeedPanel = (
+		mode: "all" | "releases" | "stars" | "followers",
+	) => {
+		const isActiveMode = tab === mode;
+		const loadingInitial = isActiveMode && pendingFeedTab === mode;
+		const filteredItems = loadingInitial ? [] : visibleItems(mode);
+
+		return filteredItems.length === 0 && !loadingInitial ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 				{emptyState === "auto-sync" ? (
 					<>
@@ -1171,7 +1230,7 @@ function DashboardPreview(props: {
 		) : (
 			<FeedGroupedList
 				mode={mode}
-				items={visibleItems(mode)}
+				items={filteredItems}
 				currentViewer={STORYBOOK_VIEWER}
 				briefs={storyBriefs}
 				dailyBoundaryLocal={dailyBoundaryLocal}
@@ -1179,7 +1238,7 @@ function DashboardPreview(props: {
 				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
 				now={now}
 				error={null}
-				loadingInitial={false}
+				loadingInitial={loadingInitial}
 				loadingMore={false}
 				hasMore={false}
 				translationInFlightKeys={translationInFlightKeys}
@@ -1187,7 +1246,7 @@ function DashboardPreview(props: {
 				registerItemRef={() => () => {}}
 				onLoadMore={() => {}}
 				selectedLaneByKey={Object.fromEntries(
-					visibleItems(mode).map((item) => [
+					filteredItems.map((item) => [
 						feedItemKey(item),
 						selectedLaneByKey[feedItemKey(item)] ??
 							defaultLaneForItem(item, pageDefaultLane),
@@ -1210,6 +1269,7 @@ function DashboardPreview(props: {
 				}
 			/>
 		);
+	};
 
 	return (
 		<VersionMonitorStateProvider value={STORYBOOK_VERSION_STATE}>
@@ -2483,6 +2543,74 @@ export const StarsTab: Story = {
 		await expect(
 			canvas.queryByText("gaearon", { exact: true }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const PostBootStarsTabSwitchKeepsShell: Story = {
+	render: () => (
+		<DashboardPreview
+			feedItems={makeMixedSocialFeed()}
+			deferredFeedTabs={["stars"]}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"模拟页面已完成首次 hydration 后，用户从 `全部` 切到 `加星`，主壳层保持不卸载，仅主列切到局部 loading 骨架，待数据返回后再展示星标记录。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		expect(secondaryControls).not.toBeNull();
+		await expect(
+			canvas.getByRole("button", { name: "日报设置" }),
+		).toBeVisible();
+		await step("switch to stars without dropping the app shell", async () => {
+			await canvas.getByRole("tab", { name: "加星" }).click();
+			expect(
+				canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+			).not.toBeNull();
+			await expect(
+				canvas.getByRole("button", { name: "日报设置" }),
+			).toBeVisible();
+			expect(
+				canvasElement.querySelector("[data-dashboard-boot-header]"),
+			).toBeNull();
+		});
+		await step(
+			"resolve the local skeleton into the new tab dataset",
+			async () => {
+				await expect(
+					canvas.getByText("torvalds", { exact: true }),
+				).toBeVisible();
+				expect(
+					canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+				).toBeNull();
+			},
+		);
+	},
+};
+
+export const EvidencePostBootStarsTabLoading: Story = {
+	name: "Evidence / Post-Boot Stars Tab Loading",
+	render: () => (
+		<DashboardPreview
+			initialTab="stars"
+			feedItems={makeMixedSocialFeed()}
+			initialFeedTabLoading="stars"
+			deferredFeedLoadDelayMs={60_000}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 

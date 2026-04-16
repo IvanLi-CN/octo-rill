@@ -314,6 +314,8 @@ export function Dashboard(props: {
 	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
 		warmStart ? "warm-cache" : "network",
 	);
+	const [bootedFromWarmStart] = useState(() => warmStart !== null);
+	const [shellHydrated, setShellHydrated] = useState(() => warmStart !== null);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
@@ -431,7 +433,7 @@ export function Dashboard(props: {
 		() => warmStart?.briefs ?? [],
 	);
 	const [sidebarLoading, setSidebarLoading] = useState(
-		() => warmStart === null,
+		() => !bootedFromWarmStart,
 	);
 	const [profileDialogOpen, setProfileDialogOpen] = useState(false);
 	const [briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
@@ -601,13 +603,16 @@ export function Dashboard(props: {
 
 	useEffect(() => {
 		void loadInitialFeed();
-		void refreshSidebar({ background: warmStart !== null }).catch((err) => {
+	}, [loadInitialFeed]);
+
+	useEffect(() => {
+		void refreshSidebar({ background: bootedFromWarmStart }).catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 		void loadReactionTokenStatus().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-	}, [loadInitialFeed, loadReactionTokenStatus, refreshSidebar, warmStart]);
+	}, [bootedFromWarmStart, loadReactionTokenStatus, refreshSidebar]);
 
 	useEffect(() => {
 		window.localStorage.setItem(PAGE_DEFAULT_LANE_STORAGE_KEY, pageDefaultLane);
@@ -1398,6 +1403,15 @@ export function Dashboard(props: {
 		if (feed.loadingInitial || sidebarLoading) {
 			return;
 		}
+		if (!shellHydrated) {
+			setShellHydrated(true);
+		}
+	}, [feed.loadingInitial, shellHydrated, sidebarLoading]);
+
+	useEffect(() => {
+		if (feed.loadingInitial || sidebarLoading) {
+			return;
+		}
 		persistDashboardWarmSnapshot({
 			userId: me.user.id,
 			routeState: {
@@ -1426,7 +1440,7 @@ export function Dashboard(props: {
 	]);
 
 	const showStartupSkeleton =
-		warmStart === null && (feed.loadingInitial || sidebarLoading);
+		!shellHydrated && (feed.loadingInitial || sidebarLoading);
 
 	if (showStartupSkeleton) {
 		return <DashboardStartupSkeleton me={me} />;
