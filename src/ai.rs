@@ -4243,10 +4243,32 @@ async fn overwrite_brief_snapshot(
     replace_brief_memberships(tx, brief_id, &built.releases, now).await
 }
 
-pub async fn brief_content_refresh_candidate_count(state: &AppState) -> Result<i64> {
-    sqlx::query_scalar::<_, i64>(
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BriefContentRefreshCandidate {
+    pub id: String,
+    pub user_id: String,
+    pub date: String,
+}
+
+fn brief_effective_time_zone_is_refreshable(effective_time_zone: &str) -> bool {
+    briefs::canonical_supported_time_zone(effective_time_zone).is_some()
+        || parse_fixed_offset_label(effective_time_zone).is_some()
+}
+
+pub async fn load_brief_content_refresh_candidates(
+    state: &AppState,
+) -> Result<Vec<BriefContentRefreshCandidate>> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct BriefContentRefreshCandidateRow {
+        id: String,
+        user_id: String,
+        date: String,
+        effective_time_zone: Option<String>,
+    }
+
+    let rows = sqlx::query_as::<_, BriefContentRefreshCandidateRow>(
         r#"
-        SELECT COUNT(*)
+        SELECT id, user_id, date, effective_time_zone
         FROM briefs
         WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
           AND window_start_utc IS NOT NULL
@@ -4259,11 +4281,35 @@ pub async fn brief_content_refresh_candidate_count(state: &AppState) -> Result<i
             OR content_markdown NOT LIKE '%## 项目更新%'
             OR content_markdown NOT LIKE '%## 获星与关注%'
           )
+        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
         "#,
     )
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
-    .context("failed to count brief content refresh candidates")
+    .context("failed to load brief content refresh candidates")?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let effective_time_zone = row.effective_time_zone?;
+            brief_effective_time_zone_is_refreshable(&effective_time_zone).then_some(
+                BriefContentRefreshCandidate {
+                    id: row.id,
+                    user_id: row.user_id,
+                    date: row.date,
+                },
+            )
+        })
+        .collect())
+}
+
+pub async fn brief_content_refresh_candidate_count(state: &AppState) -> Result<i64> {
+    let count = load_brief_content_refresh_candidates(state)
+        .await?
+        .len()
+        .try_into()
+        .context("brief content refresh candidate count overflowed i64")?;
+    Ok(count)
 }
 
 async fn load_stored_brief_release_ids(

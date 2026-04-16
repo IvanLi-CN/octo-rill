@@ -2276,14 +2276,9 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
 }
 
 async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> Result<Value> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct RefreshableBriefRow {
-        id: String,
-        user_id: String,
-        date: String,
-    }
-
-    let total = ai::brief_content_refresh_candidate_count(state).await?;
+    let rows = ai::load_brief_content_refresh_candidates(state).await?;
+    let total =
+        i64::try_from(rows.len()).context("brief refresh candidate count overflowed i64")?;
     append_task_event(
         state,
         task_id,
@@ -2320,28 +2315,6 @@ async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> 
             "canceled": false,
         }));
     }
-
-    let rows = sqlx::query_as::<_, RefreshableBriefRow>(
-        r#"
-        SELECT id, user_id, date
-        FROM briefs
-        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
-          AND window_start_utc IS NOT NULL
-          AND window_end_utc IS NOT NULL
-          AND effective_time_zone IS NOT NULL
-          AND effective_local_boundary IS NOT NULL
-          AND (
-            TRIM(content_markdown) LIKE '```%'
-            OR content_markdown LIKE '%## 概览%'
-            OR content_markdown NOT LIKE '%## 项目更新%'
-            OR content_markdown NOT LIKE '%## 获星与关注%'
-          )
-        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await
-    .context("failed to query briefs for content refresh")?;
 
     let mut processed = 0usize;
     let mut succeeded = 0usize;
@@ -4085,6 +4058,58 @@ mod tests {
         .await
         .expect("count refresh tasks");
         assert_eq!(queued, 1);
+    }
+
+    #[tokio::test]
+    async fn enqueue_brief_refresh_content_if_needed_skips_unrefreshable_time_zones() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1014, "brief-refresh-unsupported-tz").await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-unsupported-tz")
+        .bind("1014")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Mars/Olympus")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("## 概览\n\n- 旧格式\n")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert unsupported time zone candidate");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue brief refresh");
+
+        assert!(task_id.is_none());
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE task_type = ?
+            "#,
+        )
+        .bind(TASK_BRIEF_REFRESH_CONTENT)
+        .fetch_one(&pool)
+        .await
+        .expect("count refresh tasks");
+        assert_eq!(queued, 0);
     }
 
     #[tokio::test]
