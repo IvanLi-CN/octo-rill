@@ -70,7 +70,7 @@ export const DashboardWarmSkeleton: Story = {
 		docs: {
 			description: {
 				story:
-					"已识别为登录态、但当前路由还没有可复用热缓存时，Dashboard 显示接近真实工作台壳层的 layout skeleton：保留品牌与导航结构，但所有 tabs / controls 都改成中性占位，不再提前泄露具体文案。",
+					"已识别为登录态、但当前路由还没有可复用热缓存时，Dashboard 显示接近真实工作台壳层的 layout skeleton：保留品牌文案与导航结构，但 tabs / controls 仍改成中性占位，不再提前泄露具体导航文案。",
 			},
 		},
 	},
@@ -83,8 +83,9 @@ export const DashboardWarmSkeleton: Story = {
 			canvas.queryByRole("link", { name: "连接到 GitHub" }),
 		).not.toBeInTheDocument();
 		await expect(canvas.queryByText("octo-admin")).not.toBeInTheDocument();
-		await expect(canvas.queryByText("动态")).not.toBeInTheDocument();
-		await expect(canvas.queryByText("日报")).not.toBeInTheDocument();
+		await expect(
+			canvas.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
+		).toBeVisible();
 		await expect(canvas.queryByText("通知")).not.toBeInTheDocument();
 		expect(
 			canvasElement.querySelector("[data-dashboard-boot-tab-strip]"),

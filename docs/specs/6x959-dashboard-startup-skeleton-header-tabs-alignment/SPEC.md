@@ -16,7 +16,7 @@
 
 ### Goals
 
-- 让 Dashboard warm skeleton 的首屏页头明显收敛到真实 Dashboard 壳层：左侧回到 mascot + 标题层级，右侧恢复接近真实动作区的占位轮廓。
+- 让 Dashboard warm skeleton 的首屏页头明显收敛到真实 Dashboard 壳层：左侧回到 mascot + 标题 + 固定副标题文案层级，右侧恢复接近真实动作区的占位轮廓。
 - 删除 skeleton 中的用户 login pill，不再让用户身份信息长期占用品牌区。
 - 把 tabs / controls 改成中性占位块，只保留结构节奏，不再显示任何具体导航文案。
 - 补齐 Storybook 审阅断言与新的视觉证据，并把结果写回 spec。
@@ -47,7 +47,7 @@
 ### MUST
 
 - warm skeleton 页头不得再显示 `me.user.login` 或任何等价的 login pill。
-- warm skeleton 左侧品牌区必须回到“mascot + OctoRill 标题 + 中性副标题占位”的层级，整体观感需接近真实 Dashboard header。
+- warm skeleton 左侧品牌区必须回到“mascot + OctoRill 标题 + 固定副标题文案”的层级，整体观感需接近真实 Dashboard header。
 - warm skeleton 右侧主操作区必须补成与真实页头接近的占位簇，而不是只剩单个主题切换控件。
 - warm skeleton tabs / control band 只能渲染中性占位块，不得出现 `动态`、`日报`、`通知` 或其他具体 tabs 文案。
 - Storybook `Pages/App Boot / Dashboard Warm Skeleton` 必须补充审阅断言，明确校验“无 login pill、无具体 tabs 文案、无登录 CTA”。
@@ -67,7 +67,7 @@
 ### Core flows
 
 - 当用户已识别为登录态、但当前 Dashboard 路由还没有可复用热缓存时，页面继续显示 Dashboard layout skeleton。
-- skeleton 页头左侧只保留品牌识别层级：mascot、`OctoRill` 标题与弱化副标题占位，不再包含用户身份 pill。
+- skeleton 页头左侧保留真实品牌识别层级：mascot、`OctoRill` 标题与固定副标题文案，不再包含用户身份 pill。
 - skeleton 页头右侧显示一组中性动作占位，对齐真实页头的主题切换 / 主按钮 / 头像入口节奏，但不暴露真实操作文案。
 - skeleton control band 继续提示“这里是 Dashboard 主导航区域”，但通过无文案占位块表达，而不是提前显示具体 tabs 名称。
 
@@ -92,7 +92,7 @@
 
 - Given 更新后的视觉证据
   When 对照本轮前后的 warm skeleton
-  Then 可以直接看出“结构保留、内容去语义化、与真实 Dashboard 壳层更接近”。
+  Then 可以直接看出“品牌文案回归真实页头、tabs 仍保持去语义化、与真实 Dashboard 壳层更接近”。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -140,7 +140,7 @@
 
 ![Dashboard warm skeleton 顶部壳层已收敛](./assets/dashboard-warm-skeleton-top-shell.png)
 
-- 证明点：左侧品牌区已回到 mascot + `OctoRill` 标题层级，login pill 已移除；顶部 tabs / controls 只保留中性占位块，不再显示 `动态 / 日报 / 通知` 等具体文案。
+- 证明点：左侧品牌区已回到 mascot + `OctoRill` + 固定副标题文案层级，login pill 已移除；顶部 tabs / controls 只保留中性占位块，不再显示具体 tabs 文案。
 
 ## 实现里程碑（Milestones / Delivery checklist）
 

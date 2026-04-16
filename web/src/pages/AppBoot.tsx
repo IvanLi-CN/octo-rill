@@ -90,20 +90,19 @@ function DashboardBootHeader(_props: { me: MeResponse }) {
 						alt=""
 						className="size-10 shrink-0 sm:size-11 lg:size-12"
 					/>
-					<div className="min-w-0 space-y-2 pt-0.5">
+					<div className="min-w-0 space-y-1.5 pt-0.5">
 						<h1
 							className="min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]"
 							data-dashboard-boot-brand-heading
 						>
 							OctoRill
 						</h1>
-						<div
-							className="space-y-2"
-							data-dashboard-boot-brand-subtitle-skeleton
+						<p
+							className="text-muted-foreground text-sm font-medium leading-snug"
+							data-dashboard-boot-brand-subtitle
 						>
-							<PulseBlock className="h-3 w-56 rounded-full sm:w-64" />
-							<PulseBlock className="h-3 w-32 rounded-full sm:w-40" />
-						</div>
+							GitHub 动态 · 中文翻译 · 日报与 Inbox
+						</p>
 					</div>
 				</div>
 				<div
