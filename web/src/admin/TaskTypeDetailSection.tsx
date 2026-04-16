@@ -440,6 +440,22 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
+		case "brief.refresh_content": {
+			const diagnostics = detail.diagnostics?.brief_refresh_content ?? null;
+			return {
+				pageTitle: "日报内容修复详情页",
+				pageSummary:
+					"展示已标准化日报的正文刷新任务进度、成功/失败数量与当前处理对象。",
+				fields: buildFields(
+					field("总数", diagnostics ? `${diagnostics.total}` : null),
+					field("已处理", diagnostics ? `${diagnostics.processed}` : null),
+					field("成功", diagnostics ? `${diagnostics.succeeded}` : null),
+					field("失败", diagnostics ? `${diagnostics.failed}` : null),
+					field("当前 Brief", diagnostics?.current_brief_id),
+					field("最后错误", diagnostics?.last_error),
+				),
+			};
+		}
 		case "sync.subscriptions": {
 			const diagnostics = detail.diagnostics?.sync_subscriptions ?? null;
 			const skipped = diagnostics?.skipped ?? readBoolean(result, "skipped");
@@ -893,6 +909,29 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					{diagnostics.brief_history_recompute.last_error ? (
 						<p className="mt-2 text-sm font-medium text-red-700 dark:text-red-300">
 							最后错误：{diagnostics.brief_history_recompute.last_error}
+						</p>
+					) : null}
+				</div>
+			) : null}
+			{diagnostics?.brief_refresh_content ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">内容修复摘要</p>
+					<p className="mt-1 text-sm font-semibold">
+						已处理 {diagnostics.brief_refresh_content.processed}/
+						{diagnostics.brief_refresh_content.total}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						成功 {diagnostics.brief_refresh_content.succeeded} · 失败{" "}
+						{diagnostics.brief_refresh_content.failed}
+					</p>
+					{diagnostics.brief_refresh_content.current_brief_id ? (
+						<p className="text-muted-foreground mt-2 text-xs">
+							当前 Brief：{diagnostics.brief_refresh_content.current_brief_id}
+						</p>
+					) : null}
+					{diagnostics.brief_refresh_content.last_error ? (
+						<p className="mt-2 text-sm font-medium text-red-700 dark:text-red-300">
+							最后错误：{diagnostics.brief_refresh_content.last_error}
 						</p>
 					) : null}
 				</div>

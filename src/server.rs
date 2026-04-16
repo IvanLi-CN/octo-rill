@@ -316,6 +316,9 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         {
             tracing::warn!(?err, "failed to enqueue brief history recompute bootstrap");
         }
+        if let Err(err) = jobs::enqueue_brief_refresh_content_if_needed(app_state.as_ref()).await {
+            tracing::warn!(?err, "failed to enqueue brief content refresh bootstrap");
+        }
         let model_catalog_abort_handle = config
             .ai
             .as_ref()

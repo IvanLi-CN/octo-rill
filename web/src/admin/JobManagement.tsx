@@ -783,6 +783,8 @@ function taskTypeLabel(taskType: string) {
 			return "订阅同步";
 		case "brief.generate":
 			return "日报生成";
+		case "brief.refresh_content":
+			return "日报内容修复";
 		case "sync.all":
 			return "全量同步";
 		case "sync.access_refresh":

@@ -583,6 +583,44 @@ export const BriefHistoryRecompute: Story = {
 	},
 };
 
+export const BriefRefreshContent: Story = {
+	args: {
+		detail: buildDetail(
+			"brief.refresh_content",
+			{},
+			{},
+			[
+				{
+					stage: "refresh",
+					total: 9,
+					processed: 5,
+					succeeded: 4,
+					failed: 1,
+					brief_id: "brief_v2_05",
+				},
+			],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "partial",
+						label: "部分成功",
+						message: "日报内容修复已推进过半，仍有少量候选 brief 需要重试。",
+					},
+					brief_refresh_content: {
+						total: 9,
+						processed: 5,
+						succeeded: 4,
+						failed: 1,
+						current_brief_id: "brief_v2_05",
+						last_error: "unsupported brief effective_time_zone: Mars/Base-1",
+						canceled: false,
+					},
+				},
+			},
+		),
+	},
+};
+
 export const TranslateRelease: Story = {
 	args: {
 		detail: buildDetail(
