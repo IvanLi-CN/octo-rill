@@ -118,7 +118,13 @@ export function FeedList(
 			{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
 			{loadingInitial && items.length === 0 ? (
-				<div className="space-y-3 sm:space-y-4">
+				<div
+					className="space-y-3 sm:space-y-4"
+					data-feed-loading-skeleton="true"
+					aria-live="polite"
+					aria-busy="true"
+				>
+					<span className="sr-only">动态加载中</span>
 					{skeletons.map((i) => (
 						<div
 							key={i}

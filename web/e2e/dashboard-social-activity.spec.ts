@@ -314,6 +314,10 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	const starsResponseReady = new Promise<void>((resolve) => {
 		releaseStarsResponse = resolve;
 	});
+	let notificationsCalls = 0;
+	let briefsCalls = 0;
+	let reactionTokenStatusCalls = 0;
+	let starsFeedCalls = 0;
 
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -338,6 +342,7 @@ test("switching social tabs clears stale feed items before the next dataset reso
 		if (req.method() === "GET" && pathname === "/api/feed") {
 			const types = searchParams.get("types");
 			if (types === "stars") {
+				starsFeedCalls += 1;
 				await starsResponseReady;
 				return json(route, {
 					items: [
@@ -415,14 +420,17 @@ test("switching social tabs clears stale feed items before the next dataset reso
 		}
 
 		if (req.method() === "GET" && pathname === "/api/notifications") {
+			notificationsCalls += 1;
 			return json(route, []);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/briefs") {
+			briefsCalls += 1;
 			return json(route, []);
 		}
 
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			reactionTokenStatusCalls += 1;
 			return json(route, {
 				configured: false,
 				masked_token: null,
@@ -448,11 +456,30 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await page.goto("/");
 
 	await expect(page.getByText("octocat-old", { exact: true })).toBeVisible();
+	const notificationsCallsBeforeSwitch = notificationsCalls;
+	const briefsCallsBeforeSwitch = briefsCalls;
+	const reactionTokenStatusCallsBeforeSwitch = reactionTokenStatusCalls;
 
 	await page.getByRole("tab", { name: "加星" }).click();
 	await expect(page.getByText("octocat-old", { exact: true })).toHaveCount(0);
+	await expect(page).toHaveURL(/\/\?tab=stars$/);
+	await expect(
+		page.locator("[data-dashboard-secondary-controls]"),
+	).toBeVisible();
+	await expect(
+		page.locator('[data-feed-loading-skeleton="true"]'),
+	).toBeVisible();
+	await expect(page.locator("[data-dashboard-boot-header]")).toHaveCount(0);
+	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
+	expect(starsFeedCalls).toBe(1);
+	expect(notificationsCalls).toBe(notificationsCallsBeforeSwitch);
+	expect(briefsCalls).toBe(briefsCallsBeforeSwitch);
+	expect(reactionTokenStatusCalls).toBe(reactionTokenStatusCallsBeforeSwitch);
 
 	releaseStarsResponse();
 
 	await expect(page.getByText("octocat-new", { exact: true })).toBeVisible();
+	await expect(page.locator('[data-feed-loading-skeleton="true"]')).toHaveCount(
+		0,
+	);
 });
