@@ -1,6 +1,5 @@
 import type { MeResponse } from "@/api";
 import { BrandLogo } from "@/components/brand/BrandLogo";
-import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
@@ -69,29 +68,80 @@ export function AppBoot() {
 	);
 }
 
-function DashboardBootHeader(props: { me: MeResponse }) {
-	const { me } = props;
+const DASHBOARD_BOOT_TAB_PILLS = [
+	{ key: "all", width: "w-12" },
+	{ key: "releases", width: "w-16" },
+	{ key: "stars", width: "w-14" },
+	{ key: "followers", width: "w-16" },
+	{ key: "briefs", width: "w-12" },
+	{ key: "inbox", width: "w-14" },
+] as const;
 
+function DashboardBootHeader(_props: { me: MeResponse }) {
 	return (
-		<div className="flex flex-col gap-3 sm:gap-4">
-			<div className="flex items-center justify-between gap-3">
-				<div className="flex min-w-0 items-center gap-3">
-					<BrandLogo variant="wordmark" className="h-8 sm:h-10" />
-					<div className="hidden rounded-full border border-border/60 bg-background/75 px-3 py-1 text-xs text-muted-foreground sm:inline-flex">
-						{me.user.login}
+		<div className="flex flex-col gap-4 sm:gap-5" data-dashboard-boot-header>
+			<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+				<div
+					className="flex min-w-0 flex-1 items-start gap-3.5 sm:gap-4"
+					data-dashboard-boot-brand-block
+				>
+					<BrandLogo
+						variant="mark"
+						alt=""
+						className="size-10 shrink-0 sm:size-11 lg:size-12"
+					/>
+					<div className="min-w-0 space-y-2 pt-0.5">
+						<h1
+							className="min-w-0 text-2xl leading-[0.95] font-semibold tracking-tight text-[#495675] sm:text-[1.75rem] dark:text-[#dbe7ff]"
+							data-dashboard-boot-brand-heading
+						>
+							OctoRill
+						</h1>
+						<div
+							className="space-y-2"
+							data-dashboard-boot-brand-subtitle-skeleton
+						>
+							<PulseBlock className="h-3 w-56 rounded-full sm:w-64" />
+							<PulseBlock className="h-3 w-32 rounded-full sm:w-40" />
+						</div>
 					</div>
 				</div>
-				<ThemeToggle />
+				<div
+					className="flex items-center gap-2 self-start"
+					data-dashboard-boot-primary-actions
+				>
+					<PulseBlock className="h-10 w-28 rounded-full border border-border/60 bg-card/85" />
+					<PulseBlock className="h-10 w-[4.5rem] rounded-full border border-border/60 bg-card/85" />
+					<PulseBlock className="size-10 rounded-full border border-border/60 bg-card/85" />
+				</div>
 			</div>
-			<div className="flex items-center gap-2 overflow-x-auto pb-1 no-scrollbar">
-				{["动态", "日报", "通知"].map((label) => (
-					<div
-						key={label}
-						className="rounded-full border border-border/60 bg-card/80 px-3 py-1.5 text-xs text-muted-foreground"
-					>
-						{label}
-					</div>
-				))}
+
+			<div
+				className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+				data-dashboard-boot-control-band
+			>
+				<div
+					className="inline-flex max-w-full items-center gap-1 overflow-x-auto rounded-lg bg-muted/60 p-1 no-scrollbar"
+					data-dashboard-boot-tab-strip
+				>
+					{DASHBOARD_BOOT_TAB_PILLS.map((pill) => (
+						<PulseBlock
+							key={pill.key}
+							className={cn(
+								"h-8 shrink-0 rounded-md border border-border/60 bg-card/85",
+								pill.width,
+							)}
+						/>
+					))}
+				</div>
+
+				<div
+					className="hidden items-center gap-2 sm:flex"
+					data-dashboard-boot-secondary-controls
+				>
+					<PulseBlock className="h-9 w-24 rounded-full border border-border/60 bg-card/85" />
+					<PulseBlock className="h-9 w-20 rounded-full border border-border/60 bg-card/85" />
+				</div>
 			</div>
 		</div>
 	);
