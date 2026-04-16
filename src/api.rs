@@ -104,7 +104,10 @@ fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
 }
 
 fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
-    matches!(generation_source, "legacy" | "history_recompute_failed")
+    matches!(
+        generation_source,
+        "legacy" | "history_recompute_failed" | "content_refresh_failed"
+    )
 }
 
 async fn user_has_brief_access_to_release(
@@ -137,7 +140,7 @@ async fn user_has_brief_access_to_release(
         SELECT content_markdown
         FROM briefs
         WHERE user_id = ?
-          AND generation_source IN ('legacy', 'history_recompute_failed')
+          AND generation_source IN ('legacy', 'history_recompute_failed', 'content_refresh_failed')
           AND content_markdown LIKE ?
         "#,
     )
@@ -2004,6 +2007,9 @@ fn build_brief_refresh_content_diagnostics(
             continue;
         };
         match stage.as_str() {
+            "collect" => {
+                total_from_event = json_object_get_i64(payload_object, "total_briefs");
+            }
             "refresh" | "brief_succeeded" => {
                 current_brief_id = json_object_get_string(payload_object, "brief_id");
             }
@@ -13757,6 +13763,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_get_realtime_task_detail_reads_brief_refresh_collect_total_while_running() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("task-detail-brief-refresh-collect");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_BRIEF_REFRESH_CONTENT)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("tests")
+        .bind(test_user_id(2))
+        .bind(Option::<String>::None)
+        .bind("{}")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        for (event_id, payload_json, created_at) in [
+            (
+                "7777777777777777",
+                r#"{"stage":"collect","total_briefs":5}"#,
+                "2026-03-06T14:30:01Z",
+            ),
+            (
+                "8888888888888888",
+                r#"{"stage":"refresh","brief_id":"brief_running"}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload_json)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert task event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        let diagnostics = response.diagnostics.expect("diagnostics");
+        let brief_refresh = diagnostics
+            .brief_refresh_content
+            .expect("brief refresh diagnostics");
+        assert_eq!(brief_refresh.total, 5);
+        assert_eq!(brief_refresh.processed, 0);
+        assert_eq!(brief_refresh.succeeded, 0);
+        assert_eq!(brief_refresh.failed, 0);
+        assert_eq!(
+            brief_refresh.current_brief_id.as_deref(),
+            Some("brief_running")
+        );
+        assert_eq!(brief_refresh.last_error, None);
+    }
+
+    #[tokio::test]
     async fn admin_get_realtime_task_detail_uses_latest_subscription_events_window() {
         let pool = setup_pool().await;
         seed_user(&pool, 2, "admin", 1, 0).await;
@@ -14784,6 +14885,41 @@ line two",
             get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
                 .await
                 .expect("get release detail from brief link");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
+        assert!(detail.repo_visual.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_allows_content_refresh_failed_brief_link_without_membership() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-content-refresh-failed")
+        .bind(user_id.as_str())
+        .bind("2026-02-23")
+        .bind("content_refresh_failed")
+        .bind("- [v1.2.3](/?tab=briefs&release=120)")
+        .bind("2026-02-23T08:00:00Z")
+        .bind("2026-02-23T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("insert failed refresh brief");
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get release detail from failed refresh brief link");
 
         assert_eq!(detail.release_id, "120");
         assert_eq!(detail.repo_full_name.as_deref(), Some("openai/codex"));
