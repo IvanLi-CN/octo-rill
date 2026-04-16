@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { MeResponse } from "@/api";
@@ -32,12 +33,27 @@ const mockMe: MeResponse = {
 	},
 };
 
+const APP_BOOT_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	appBootMobileFold: {
+		name: "App boot mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+} as const;
+
 const meta = {
 	title: "Pages/App Boot",
 	component: AppBoot,
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: APP_BOOT_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -70,9 +86,26 @@ export const DashboardWarmSkeleton: Story = {
 		docs: {
 			description: {
 				story:
-					"已识别为登录态、但当前路由还没有可复用热缓存时，Dashboard 显示当前页面的 layout skeleton，而不是回到 Landing 登录页。",
+					"已识别为登录态、但当前路由还没有可复用热缓存时，Dashboard 显示接近真实工作台壳层的 layout skeleton：保留品牌文案与导航结构，但 tabs / controls 仍改成中性占位，不再提前泄露具体导航文案。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { level: 1, name: "OctoRill" }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByRole("link", { name: "连接到 GitHub" }),
+		).not.toBeInTheDocument();
+		await expect(canvas.queryByText("octo-admin")).not.toBeInTheDocument();
+		await expect(
+			canvas.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
+		).toBeVisible();
+		await expect(canvas.queryByText("通知")).not.toBeInTheDocument();
+		expect(
+			canvasElement.querySelector("[data-dashboard-boot-tab-strip]"),
+		).not.toBeNull();
 	},
 };
 
@@ -82,4 +115,40 @@ export const AdminUsersWarmSkeleton: Story = {
 
 export const AdminJobsWarmSkeleton: Story = {
 	render: () => <AdminJobsStartupSkeleton me={mockMe} />,
+};
+
+export const DashboardWarmSkeletonMobile: Story = {
+	name: "Dashboard Warm Skeleton / Mobile shell",
+	render: () => <DashboardStartupSkeleton me={mockMe} />,
+	globals: {
+		viewport: {
+			value: "appBootMobileFold",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端审阅入口：warm skeleton 的页头要对齐真实 Dashboard mobile shell——副标题隐藏、品牌与右侧 actions 同行，第二行才是 control band。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const subtitle = canvasElement.querySelector(
+			"[data-dashboard-boot-brand-subtitle]",
+		) as HTMLElement | null;
+		const mobileActions = canvasElement.querySelector(
+			"[data-dashboard-boot-primary-actions-mobile]",
+		) as HTMLElement | null;
+		const desktopActions = canvasElement.querySelector(
+			"[data-dashboard-boot-primary-actions]",
+		) as HTMLElement | null;
+		expect(subtitle).not.toBeVisible();
+		expect(mobileActions).toBeVisible();
+		expect(desktopActions).not.toBeVisible();
+		expect(
+			canvasElement.querySelector("[data-dashboard-boot-tab-strip]"),
+		).not.toBeNull();
+	},
 };
