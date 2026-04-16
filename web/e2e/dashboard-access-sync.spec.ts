@@ -40,6 +40,37 @@ function buildReleaseFeedItem(id: string) {
 	};
 }
 
+function buildReactionFooterReady() {
+	return {
+		counts: {
+			plus1: 4,
+			laugh: 1,
+			heart: 2,
+			hooray: 1,
+			rocket: 1,
+			eyes: 0,
+		},
+		viewer: {
+			plus1: true,
+			laugh: false,
+			heart: false,
+			hooray: false,
+			rocket: false,
+			eyes: false,
+		},
+		status: "ready",
+	};
+}
+
+function rectsIntersect(
+	a: { left: number; right: number; top: number; bottom: number },
+	b: { left: number; right: number; top: number; bottom: number },
+) {
+	return (
+		a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+	);
+}
+
 test("dashboard keeps sync as a single header action for admins", async ({
 	page,
 }) => {
@@ -416,6 +447,139 @@ test.describe("mobile dashboard shell", () => {
 		await expect(
 			page.locator("[data-app-meta-footer-hidden='false']"),
 		).toHaveCount(1);
+	});
+
+	test("grouped day divider keeps a safe gap below the reaction footer on mobile", async ({
+		page,
+	}) => {
+		await page.route("**/api/**", async (route) => {
+			const req = route.request();
+			const url = new URL(req.url());
+			const { pathname } = url;
+
+			if (req.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-admin",
+						name: "Octo Admin",
+						avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+						email: "admin@example.com",
+						is_admin: true,
+					}),
+				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/feed") {
+				return json(route, {
+					items: [
+						{
+							...buildReleaseFeedItem("30001"),
+							ts: "2026-04-09T16:40:00+08:00",
+							title: "Release 30001",
+							body: "- keep the reaction footer visible\n- preserve grouped feed divider spacing\n- do not let the next day header collide",
+							reactions: buildReactionFooterReady(),
+						},
+						{
+							...buildReleaseFeedItem("30002"),
+							ts: "2026-04-08T11:12:00+08:00",
+							title: "Release 30002",
+							body: "- historical group without a brief\n- still render the generate brief action on narrow screens",
+						},
+					],
+					next_cursor: null,
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/notifications") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/briefs") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+				return json(route, {
+					configured: false,
+					masked_token: null,
+					check: {
+						state: "idle",
+						message: null,
+						checked_at: null,
+					},
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/health") {
+				return json(route, { ok: true, version: "1.2.3" });
+			}
+
+			return json(
+				route,
+				{
+					error: {
+						code: "not_found",
+						message: `unhandled ${req.method()} ${pathname}`,
+					},
+				},
+				404,
+			);
+		});
+
+		await page.goto("/?tab=all");
+
+		const reactionFooter = page
+			.locator('[data-reaction-footer="true"]')
+			.first();
+		const dayLabel = page.getByText(/^2026-04-08 · 1 条 Release$/);
+		const dayHeader = dayLabel.locator(
+			"xpath=ancestor::*[@data-feed-day-header='true'][1]",
+		);
+		const actionSlot = dayHeader.locator('[data-feed-day-action-slot="true"]');
+		await expect(reactionFooter).toBeVisible();
+		await expect(dayHeader).toBeVisible();
+		await expect(dayLabel).toBeVisible();
+		await expect(
+			actionSlot.getByRole("button", { name: "生成日报" }),
+		).toBeVisible();
+
+		const footerBox = await reactionFooter.boundingBox();
+		const headerBox = await dayHeader.boundingBox();
+		const labelBox = await dayLabel.boundingBox();
+		const actionBox = await actionSlot.boundingBox();
+		expect(footerBox).not.toBeNull();
+		expect(headerBox).not.toBeNull();
+		expect(labelBox).not.toBeNull();
+		expect(actionBox).not.toBeNull();
+		if (!footerBox || !headerBox || !labelBox || !actionBox) {
+			throw new Error("Expected footer/header/label/action geometry");
+		}
+
+		expect(
+			headerBox.y - (footerBox.y + footerBox.height),
+		).toBeGreaterThanOrEqual(8);
+		expect(
+			Math.min(labelBox.y, actionBox.y) - (footerBox.y + footerBox.height),
+		).toBeGreaterThanOrEqual(8);
+		expect(
+			rectsIntersect(
+				{
+					left: labelBox.x,
+					right: labelBox.x + labelBox.width,
+					top: labelBox.y,
+					bottom: labelBox.y + labelBox.height,
+				},
+				{
+					left: actionBox.x,
+					right: actionBox.x + actionBox.width,
+					top: actionBox.y,
+					bottom: actionBox.y + actionBox.height,
+				},
+			),
+		).toBe(false);
 	});
 });
 
