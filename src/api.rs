@@ -2010,10 +2010,33 @@ fn build_brief_refresh_content_diagnostics(
             "collect" => {
                 total_from_event = json_object_get_i64(payload_object, "total_briefs");
             }
-            "refresh" | "brief_succeeded" => {
+            "refresh" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                current_brief_id = json_object_get_string(payload_object, "brief_id");
+            }
+            "brief_succeeded" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                succeeded_from_event = Some(succeeded_from_event.unwrap_or(0) + 1);
                 current_brief_id = json_object_get_string(payload_object, "brief_id");
             }
             "brief_failed" => {
+                if let Some(index) = json_object_get_i64(payload_object, "index") {
+                    processed_from_event = Some(processed_from_event.unwrap_or(0).max(index));
+                }
+                if let Some(total) = json_object_get_i64(payload_object, "total") {
+                    total_from_event = Some(total_from_event.unwrap_or(0).max(total));
+                }
+                failed_from_event = Some(failed_from_event.unwrap_or(0) + 1);
                 current_brief_id = json_object_get_string(payload_object, "brief_id");
                 last_error = json_object_get_string(payload_object, "error");
             }
@@ -13818,8 +13841,13 @@ mod tests {
             ),
             (
                 "8888888888888888",
-                r#"{"stage":"refresh","brief_id":"brief_running"}"#,
+                r#"{"stage":"refresh","brief_id":"brief_running","index":2,"total":5}"#,
                 "2026-03-06T14:30:02Z",
+            ),
+            (
+                "9999999999999999",
+                r#"{"stage":"brief_succeeded","brief_id":"brief_done","index":1,"total":5}"#,
+                "2026-03-06T14:30:03Z",
             ),
         ] {
             sqlx::query(
@@ -13847,12 +13875,12 @@ mod tests {
             .brief_refresh_content
             .expect("brief refresh diagnostics");
         assert_eq!(brief_refresh.total, 5);
-        assert_eq!(brief_refresh.processed, 0);
-        assert_eq!(brief_refresh.succeeded, 0);
+        assert_eq!(brief_refresh.processed, 2);
+        assert_eq!(brief_refresh.succeeded, 1);
         assert_eq!(brief_refresh.failed, 0);
         assert_eq!(
             brief_refresh.current_brief_id.as_deref(),
-            Some("brief_running")
+            Some("brief_done")
         );
         assert_eq!(brief_refresh.last_error, None);
     }

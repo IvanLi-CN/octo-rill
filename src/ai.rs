@@ -3483,6 +3483,58 @@ where
     Ok(releases)
 }
 
+async fn load_release_digests_for_repo_ids_in_window<'e, E>(
+    executor: E,
+    repo_ids: &[i64],
+    start_utc: &str,
+    end_utc: &str,
+) -> Result<Vec<ReleaseDigest>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if repo_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; repo_ids.len()].join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+          release_id,
+          repo_id,
+          tag_name,
+          name,
+          body,
+          html_url,
+          COALESCE(published_at, created_at, updated_at) AS published_at,
+          is_prerelease
+        FROM repo_releases
+        WHERE repo_id IN ({placeholders})
+          AND is_draft = 0
+          AND COALESCE(published_at, created_at, updated_at) >= ?
+          AND COALESCE(published_at, created_at, updated_at) < ?
+        ORDER BY
+          COALESCE(published_at, created_at, updated_at) DESC,
+          release_id DESC
+        LIMIT 300
+        "#
+    );
+
+    let mut query = sqlx::query_as::<_, ReleaseRow>(&sql);
+    for repo_id in repo_ids {
+        query = query.bind(*repo_id);
+    }
+
+    Ok(to_release_digest(
+        query
+            .bind(start_utc)
+            .bind(end_utc)
+            .fetch_all(executor)
+            .await
+            .context("failed to load brief releases by historical repo scope")?,
+    ))
+}
+
 fn contains_all_release_links(markdown: &str, release_ids: &[i64]) -> bool {
     let present = extract_internal_release_ids(markdown);
     release_ids.iter().all(|id| present.contains(id))
@@ -4175,7 +4227,7 @@ pub async fn load_brief_content_refresh_candidates(
         r#"
         SELECT id, user_id, date, effective_time_zone, content_markdown
         FROM briefs
-        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed', 'content_refresh_failed')
+        WHERE generation_source NOT IN ('legacy', 'history_recompute_failed')
           AND window_start_utc IS NOT NULL
           AND window_end_utc IS NOT NULL
           AND effective_time_zone IS NOT NULL
@@ -4211,6 +4263,14 @@ pub async fn brief_content_refresh_candidate_count(state: &AppState) -> Result<i
     Ok(count)
 }
 
+pub async fn refresh_existing_brief_snapshot_content(
+    state: &AppState,
+    brief_id: &str,
+    generation_source: &str,
+) -> Result<StoredBrief> {
+    refresh_existing_brief_snapshot(state, brief_id, generation_source).await
+}
+
 async fn load_stored_brief_release_ids(
     state: &AppState,
     brief_id: &str,
@@ -4244,30 +4304,74 @@ async fn load_stored_brief_release_ids(
     Ok(extract_internal_release_id_sequence(content_markdown))
 }
 
-pub async fn refresh_existing_brief_snapshot_content(
+async fn load_stored_brief_repo_ids(
+    state: &AppState,
+    brief_id: &str,
+    content_markdown: &str,
+) -> Result<Vec<i64>> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct ReleaseRepoRow {
+        release_id: i64,
+        repo_id: i64,
+    }
+
+    let release_ids = load_stored_brief_release_ids(state, brief_id, content_markdown).await?;
+    if release_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["?"; release_ids.len()].join(", ");
+    let sql = format!(
+        r#"
+        SELECT release_id, repo_id
+        FROM repo_releases
+        WHERE release_id IN ({placeholders})
+        "#
+    );
+    let mut query = sqlx::query_as::<_, ReleaseRepoRow>(&sql);
+    for release_id in &release_ids {
+        query = query.bind(*release_id);
+    }
+
+    let release_repo_map = query
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to map historical brief releases to repos")?
+        .into_iter()
+        .map(|row| (row.release_id, row.repo_id))
+        .collect::<HashMap<_, _>>();
+
+    let mut repo_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut missing = Vec::new();
+    for release_id in release_ids {
+        let Some(repo_id) = release_repo_map.get(&release_id).copied() else {
+            missing.push(release_id);
+            continue;
+        };
+        if seen.insert(repo_id) {
+            repo_ids.push(repo_id);
+        }
+    }
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "historical brief references release ids missing from repo_releases: {}",
+            missing
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    Ok(repo_ids)
+}
+
+async fn refresh_existing_brief_snapshot(
     state: &AppState,
     brief_id: &str,
     generation_source: &str,
-) -> Result<StoredBrief> {
-    refresh_existing_brief_snapshot_with_mode(
-        state,
-        brief_id,
-        generation_source,
-        ExistingBriefRefreshMode::PreserveStoredMemberships,
-    )
-    .await
-}
-
-enum ExistingBriefRefreshMode {
-    PreserveStoredMemberships,
-    RebuildWindow,
-}
-
-async fn refresh_existing_brief_snapshot_with_mode(
-    state: &AppState,
-    brief_id: &str,
-    generation_source: &str,
-    mode: ExistingBriefRefreshMode,
 ) -> Result<StoredBrief> {
     #[derive(Debug, sqlx::FromRow)]
     struct RefreshableBriefRow {
@@ -4318,24 +4422,20 @@ async fn refresh_existing_brief_snapshot_with_mode(
             .as_deref()
             .context("stored brief snapshot missing effective_local_boundary")?,
     )?;
-    let social = load_social_activity_digests_for_window(
-        state,
-        &row.user_id,
-        &window.start_utc.to_rfc3339(),
-        &window.end_utc.to_rfc3339(),
+    let historical_repo_ids =
+        load_stored_brief_repo_ids(state, brief_id, &row.content_markdown).await?;
+    let start_utc = window.start_utc.to_rfc3339();
+    let end_utc = window.end_utc.to_rfc3339();
+    let releases = load_release_digests_for_repo_ids_in_window(
+        &state.pool,
+        &historical_repo_ids,
+        &start_utc,
+        &end_utc,
     )
     .await?;
-    let built = match mode {
-        ExistingBriefRefreshMode::PreserveStoredMemberships => {
-            let release_ids =
-                load_stored_brief_release_ids(state, brief_id, &row.content_markdown).await?;
-            let releases = load_release_digests_by_ids(&state.pool, &release_ids).await?;
-            build_brief_content_from_digests(state, releases, social).await?
-        }
-        ExistingBriefRefreshMode::RebuildWindow => {
-            build_brief_content(state, &window, &row.user_id).await?
-        }
-    };
+    let social =
+        load_social_activity_digests_for_window(state, &row.user_id, &start_utc, &end_utc).await?;
+    let built = build_brief_content_from_digests(state, releases, social).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state
         .pool
@@ -4389,13 +4489,7 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
                 return Ok(stored);
             }
         }
-        return refresh_existing_brief_snapshot_with_mode(
-            state,
-            existing_id,
-            generation_source,
-            ExistingBriefRefreshMode::RebuildWindow,
-        )
-        .await;
+        return refresh_existing_brief_snapshot(state, existing_id, generation_source).await;
     }
     if state.config.ai.is_none() && existing_id.is_none() {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
@@ -6709,30 +6803,20 @@ mod tests {
 
         sqlx::query(
             r#"
-            INSERT INTO starred_repos (
-              id, user_id, repo_id, full_name, owner_login, name,
-              description, html_url, stargazed_at, is_private, updated_at,
-              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?)
             "#,
         )
-        .bind("star-existing-stale-no-ai")
-        .bind("user-brief-existing-stale-no-ai")
-        .bind(1_i64)
-        .bind("acme/rocket")
-        .bind("acme")
-        .bind("rocket")
-        .bind(Option::<String>::None)
-        .bind("https://github.com/acme/rocket")
-        .bind(now)
-        .bind(now)
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
+        .bind("brief-existing-stale-no-ai")
+        .bind(407_i64)
+        .bind("2026-03-06T12:00:00Z")
         .bind(0_i64)
+        .bind(now)
         .execute(&state.pool)
         .await
-        .expect("insert starred repo");
+        .expect("insert historical membership");
 
         let preferences = briefs::DailyBriefPreferences {
             local_time: NaiveTime::from_hms_opt(8, 0, 0).expect("08:00"),

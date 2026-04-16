@@ -4383,7 +4383,8 @@ mod tests {
         assert!(row.2.contains("## 获星与关注"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
-        assert!(row.2.contains("[v0.9.0](/?tab=briefs&release=999)"));
+        assert!(row.2.contains("[v1.0.0](/?tab=briefs&release=501)"));
+        assert!(!row.2.contains("release=999"));
         assert!(row.2.contains("[@alice](https://github.com/alice)"));
 
         let memberships = sqlx::query_scalar::<_, i64>(
@@ -4398,11 +4399,11 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("load refreshed memberships");
-        assert_eq!(memberships, vec![999]);
+        assert_eq!(memberships, vec![501]);
     }
 
     #[tokio::test]
-    async fn execute_brief_refresh_content_task_marks_failed_candidates_terminal() {
+    async fn execute_brief_refresh_content_task_keeps_failed_candidates_retryable() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let now = "2026-03-07T00:00:00Z";
@@ -4459,5 +4460,11 @@ mod tests {
         .await
         .expect("load failed refresh marker");
         assert_eq!(generation_source, "content_refresh_failed");
+
+        let retry_task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("re-enqueue refresh")
+            .expect("retry task id");
+        assert!(!retry_task_id.is_empty());
     }
 }
