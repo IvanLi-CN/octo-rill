@@ -116,12 +116,12 @@
   target_program: mock-only
   capture_scope: element
   sensitive_exclusion: N/A
-  submission_gate: pending-owner-approval
-  story_id_or_title: Pages/Dashboard / Evidence / Mobile Day Divider No Overlap
-  state: 375px mobile grouped feed
-  evidence_note: 证明当前日 reaction footer 下方与下一日 divider 保持安全间距，且历史日组的“生成日报” action 与日期标题不发生重叠。
+  submission_gate: approved
+  story_id_or_title: Pages/Dashboard / Evidence / Mobile Mixed Activity Day Divider No Overlap
+  state: 375px mobile grouped feed with mixed historical activity
+  evidence_note: 证明当前日 reaction footer 下方的历史 divider 已缩短为 `4 条动态`，并且右侧 `列表` action 与标题文本保持安全分离，桌面端对齐口径不回退。
   image:
-  ![Dashboard 移动端日分组标题防重叠证据图](./assets/mobile-day-divider-no-overlap.png)
+  ![Dashboard 移动端混合动态日分组标题防重叠证据图](./assets/mobile-mixed-activity-day-divider-no-overlap.png)
 
 ## 实现里程碑（Milestones / Delivery checklist）
 
