@@ -40,6 +40,40 @@ function buildReleaseFeedItem(id: string) {
 	};
 }
 
+function buildSocialFeedItem(
+	id: string,
+	kind: "repo_star_received" | "follower_received",
+) {
+	return {
+		kind,
+		ts: "2026-04-09T08:00:00Z",
+		id,
+		repo_full_name: kind === "repo_star_received" ? "owner/repo" : null,
+		title: null,
+		body: null,
+		body_truncated: false,
+		subtitle: null,
+		reason: null,
+		subject_type: null,
+		html_url: "https://github.com/octo-user",
+		unread: null,
+		actor: {
+			login: kind === "repo_star_received" ? "linus" : "yyx990803",
+			avatar_url: svgAvatarDataUrl(
+				kind === "repo_star_received" ? "LN" : "YY",
+				kind === "repo_star_received" ? "#6d4aff" : "#1d4ed8",
+			),
+			html_url:
+				kind === "repo_star_received"
+					? "https://github.com/linus"
+					: "https://github.com/yyx990803",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+	};
+}
+
 function buildReactionFooterReady() {
 	return {
 		counts: {
@@ -580,6 +614,166 @@ test.describe("mobile dashboard shell", () => {
 				},
 			),
 		).toBe(false);
+	});
+
+	test("grouped day divider keeps mixed activity label separate from the list action on mobile", async ({
+		page,
+	}) => {
+		await page.route("**/api/**", async (route) => {
+			const req = route.request();
+			const url = new URL(req.url());
+			const { pathname } = url;
+
+			if (req.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-admin",
+						name: "Octo Admin",
+						avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+						email: "admin@example.com",
+						is_admin: true,
+					}),
+				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/feed") {
+				return json(route, {
+					items: [
+						{
+							...buildReleaseFeedItem("31001"),
+							ts: "2026-04-04T16:40:00+08:00",
+							title: "Release 31001",
+							body: "- keep the reaction footer visible\n- the next divider also carries mixed activity counts\n- the list action must remain readable",
+							reactions: buildReactionFooterReady(),
+						},
+						{
+							...buildReleaseFeedItem("31002"),
+							ts: "2026-04-03T23:10:00+08:00",
+							title: "Release 31002",
+							body: "- first release inside the historical mixed-activity group",
+						},
+						{
+							...buildReleaseFeedItem("31003"),
+							ts: "2026-04-03T21:30:00+08:00",
+							title: "Release 31003",
+							body: "- second release inside the historical mixed-activity group",
+						},
+						{
+							...buildSocialFeedItem("star-31004", "repo_star_received"),
+							ts: "2026-04-03T22:10:00+08:00",
+						},
+						{
+							...buildSocialFeedItem("follow-31005", "follower_received"),
+							ts: "2026-04-03T18:45:00+08:00",
+						},
+					],
+					next_cursor: null,
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/notifications") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/briefs") {
+				return json(route, [
+					{
+						id: "brief-mobile-mixed-2026-04-04",
+						date: "2026-04-04",
+						window_start: "2026-04-03T08:00:00+08:00",
+						window_end: "2026-04-04T08:00:00+08:00",
+						effective_time_zone: "Asia/Shanghai",
+						effective_local_boundary: "08:00",
+						release_count: 2,
+						release_ids: ["31002", "31003"],
+						content_markdown:
+							"## 概览\n\n- 时间窗口（本地）：2026-04-03T08:00:00+08:00 → 2026-04-04T08:00:00+08:00\n- 更新项目：4 个\n- Release：2 条（预发布 0 条）\n- 其余动态：2 条\n",
+						created_at: "2026-04-04T08:00:03+08:00",
+					},
+				]);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+				return json(route, {
+					configured: false,
+					masked_token: null,
+					check: {
+						state: "idle",
+						message: null,
+						checked_at: null,
+					},
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/health") {
+				return json(route, { ok: true, version: "1.2.3" });
+			}
+
+			return json(
+				route,
+				{
+					error: {
+						code: "not_found",
+						message: `unhandled ${req.method()} ${pathname}`,
+					},
+				},
+				404,
+			);
+		});
+
+		await page.goto("/?tab=all");
+
+		const reactionFooter = page
+			.locator('[data-reaction-footer="true"]')
+			.first();
+		const listButton = page.getByRole("button", { name: "列表" }).first();
+		const dayHeader = listButton.locator(
+			"xpath=ancestor::*[@data-feed-day-header='true'][1]",
+		);
+		const dayLabel = dayHeader.locator('[data-feed-day-label="true"]').first();
+		const actionSlot = dayHeader.locator('[data-feed-day-action-slot="true"]');
+		await expect(reactionFooter).toBeVisible();
+		await expect(listButton).toBeVisible();
+		await expect(dayLabel).toBeVisible();
+		await expect(dayLabel).toHaveText("2026-04-04 · 4 条动态");
+
+		const footerBox = await reactionFooter.boundingBox();
+		const labelBox = await dayLabel.boundingBox();
+		const actionBox = await actionSlot.boundingBox();
+		const buttonBox = await listButton.boundingBox();
+		expect(footerBox).not.toBeNull();
+		expect(labelBox).not.toBeNull();
+		expect(actionBox).not.toBeNull();
+		expect(buttonBox).not.toBeNull();
+		if (!footerBox || !labelBox || !actionBox || !buttonBox) {
+			throw new Error("Expected footer/label/action/button geometry");
+		}
+
+		expect(
+			Math.min(labelBox.y, actionBox.y) - (footerBox.y + footerBox.height),
+		).toBeGreaterThanOrEqual(8);
+		expect(
+			rectsIntersect(
+				{
+					left: labelBox.x,
+					right: labelBox.x + labelBox.width,
+					top: labelBox.y,
+					bottom: labelBox.y + labelBox.height,
+				},
+				{
+					left: buttonBox.x,
+					right: buttonBox.x + buttonBox.width,
+					top: buttonBox.y,
+					bottom: buttonBox.y + buttonBox.height,
+				},
+			),
+		).toBe(false);
+		expect(
+			actionBox.x + actionBox.width - (buttonBox.x + buttonBox.width),
+		).toBeLessThanOrEqual(4);
 	});
 });
 
