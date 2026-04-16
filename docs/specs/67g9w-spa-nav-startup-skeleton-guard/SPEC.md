@@ -117,6 +117,7 @@
 - `cd /Users/ivan/.codex/worktrees/1edd/octo-rill/web && bun run build`
 - `cd /Users/ivan/.codex/worktrees/1edd/octo-rill/web && bun run storybook:build`
 - `cd /Users/ivan/.codex/worktrees/1edd/octo-rill/web && bun run e2e -- dashboard-social-activity.spec.ts app-auth-boot.spec.ts`
+- `cd /Users/ivan/.codex/worktrees/1edd/octo-rill && codex -m gpt-5.4 -c model_reasoning_effort="medium" -a never review --base main`（latest PR head merge-proof，无新的可操作回归）
 
 ### UI / Storybook (if applicable)
 
@@ -139,6 +140,7 @@
 ## Visual Evidence
 
 - 主人已明确选择“不需要截图”；本轮以稳定 Storybook pending story 作为回归入口，并通过本地浏览器手测完成验收。
+- 主人已在真实应用页 `http://127.0.0.1:55174/` 手测 `全部 -> 加星` 的 SPA 切换链路，确认壳层持续保留且未再回退全局 startup skeleton。
 - 验收关注点：Dashboard 已完成首屏 hydration 后，切到 `加星` 时只让主列进入局部 skeleton；页头、tabs、notice 与 footer 继续保留，不再回退到全局 startup skeleton。
 
 ## 实现里程碑（Milestones / Delivery checklist）
