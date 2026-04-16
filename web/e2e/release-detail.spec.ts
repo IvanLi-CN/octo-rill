@@ -747,7 +747,7 @@ test("reaction fallback opens PAT dialog with accessible controls", async ({
 	await installApiMocks(page, { withReactionFeed: true });
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -776,7 +776,7 @@ test("reaction buttons stay circular and render count badges outside the trigger
 	await installApiMocks(page, { withReactionFeed: true });
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -878,7 +878,7 @@ test("feed smart lane auto generates for visible cards by default", async ({
 	});
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1046,7 +1046,7 @@ test("feed page default prefetch stays idle outside release tabs", async ({
 	});
 
 	await page.goto("/?tab=inbox");
-	await expect(page.getByRole("tab", { name: "Inbox" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "收件箱" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1081,7 +1081,7 @@ test("feed smart loading keeps original body visible while the smart option puls
 	});
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1109,7 +1109,7 @@ test("feed translated tab triggers on-demand translation when data was not prehe
 	});
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1148,7 +1148,7 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 	});
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1193,7 +1193,7 @@ test("feed smart retry treats insufficient result as a successful collapse", asy
 	});
 
 	await page.goto("/?tab=releases");
-	await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
@@ -1259,7 +1259,7 @@ test.describe("localized timestamps", () => {
 			await installApiMocks(page, { withReactionFeed: true });
 
 			await page.goto("/?tab=releases");
-			await expect(page.getByRole("tab", { name: "Releases" })).toHaveAttribute(
+			await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
 				"aria-selected",
 				"true",
 			);

@@ -1367,7 +1367,7 @@ export const ReleasesGroupedByDay: Story = {
 		docs: {
 			description: {
 				story:
-					"`Releases` tab 只在日组切换处显示弱化分隔线：首组不画前置分隔，历史日组继续用日期与当日 Release 数提示边界。",
+					"`发布` tab 只在日组切换处显示弱化分隔线：首组不画前置分隔，历史日组继续用日期与当日 Release 数提示边界。",
 			},
 		},
 	},
@@ -2150,7 +2150,7 @@ export const StarsTab: Story = {
 		docs: {
 			description: {
 				story:
-					"`被加星` tab 只显示 repo star 收到记录，不混入 release 或 follower。",
+					"`加星` tab 只显示 repo star 收到记录，不混入 release 或 follower。",
 			},
 		},
 	},
@@ -2189,7 +2189,7 @@ export const FollowersTab: Story = {
 		docs: {
 			description: {
 				story:
-					"`被关注` tab 只显示 follower 收到记录，并保留头像 + GitHub CTA 的轻量卡片样式；followers 不展示时间文案。",
+					"`关注` tab 只显示 follower 收到记录，并保留头像 + GitHub CTA 的轻量卡片样式；followers 不展示时间文案。",
 			},
 		},
 	},
@@ -2242,7 +2242,7 @@ export const LegacyRecoveredStarsTab: Story = {
 		docs: {
 			description: {
 				story:
-					"旧账号恢复可见性后，`被加星` tab 继续只显示 repo star 记录，并保留真实时间。",
+					"旧账号恢复可见性后，`加星` tab 继续只显示 repo star 记录，并保留真实时间。",
 			},
 		},
 	},
@@ -2256,7 +2256,7 @@ export const LegacyRecoveredFollowersTab: Story = {
 		docs: {
 			description: {
 				story:
-					"旧账号恢复可见性后，`被关注` tab 继续只显示 follower 记录，且不展示时间文案。",
+					"旧账号恢复可见性后，`关注` tab 继续只显示 follower 记录，且不展示时间文案。",
 			},
 		},
 	},

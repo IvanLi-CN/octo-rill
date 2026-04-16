@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-04-10
-- Last: 2026-04-10
+- Last: 2026-04-16
 
 ## 背景 / 问题陈述
 
@@ -16,7 +16,7 @@
 
 ### Goals
 
-- 新增 `被加星`、`被关注` 两个 Dashboard 顶层 tab。
+- 新增 `加星`、`关注` 两个 Dashboard 顶层 tab。
 - 将 `全部` tab 改为 `release + repo_star_received + follower_received` 三类记录按统一时间倒序混排。
 - `/api/feed` 支持返回混合活动流，并支持 `types=releases|stars|followers` 过滤。
 - 社交记录在写入时快照 `actor.login`、`actor.avatar_url`、`actor.html_url`，前端直接渲染头像，不额外查询 GitHub 用户资料。
@@ -29,8 +29,8 @@
 
 - 不统计组织仓库被加星或组织成员变更。
 - 不引入 GitHub Events API、Webhook 或其他实时推送机制。
-- 不在 `日报` / `Inbox` tab 内复用社交活动列表。
-- 不给 `Sync starred` 单独增加“被加星 / 被关注”能力。
+- 不在 `日报` / `收件箱` tab 内复用社交活动列表。
+- 不给 `Sync starred` 单独增加“加星 / 关注”能力。
 - 不追加“空 social tab 再自动触发一次同步”的前端策略。
 - 不做一次性生产 SQL 补写；旧账号通过下一次正常 social sync 自动完成可见性迁移。
 
@@ -65,8 +65,8 @@
 ### MUST
 
 - `全部` tab 必须混排 `release`、`repo_star_received`、`follower_received` 三类记录。
-- `Releases` tab 必须继续只展示 release cards，保留原文 / 翻译 / 智能 lane 与 reactions。
-- `被加星` tab 必须只展示 `repo_star_received` 记录；`被关注` tab 必须只展示 `follower_received` 记录。
+- `发布` tab 必须继续只展示 release cards，保留原文 / 翻译 / 智能 lane 与 reactions。
+- `加星` tab 必须只展示 `repo_star_received` 记录；`关注` tab 必须只展示 `follower_received` 记录。
 - 社交记录卡片必须展示对方头像、login 与单个 GitHub CTA。
 - `repo_star_received` 记录必须展示目标仓库名。
 - `repo_star_received` 记录必须展示真实 `starred_at`。
@@ -92,8 +92,8 @@
 ### Core flows
 
 - 用户打开 Dashboard 默认进入 `全部` tab 时，主列按统一日边界分组，并在每个日组内按 `ts DESC` 混排三类记录。
-- 用户切到 `被加星` tab 时，只看到“谁给哪个个人仓库加了星”的记录列表；release 与 follower 记录不会出现。
-- 用户切到 `被关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
+- 用户切到 `加星` tab 时，只看到“谁给哪个个人仓库加了星”的记录列表；release 与 follower 记录不会出现。
+- 用户切到 `关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
 - 用户点击顶部 `同步` 时，系统继续沿用既有 `starred -> releases -> notifications` 主体验，并在 release 同步完成后补跑社交活动 diff，再刷新页面。
 - access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab。
 - 若账号在升级前已经持有 `follower_current_members` 或 `repo_star_current_members`，但历史 `social_activity_events` 为空，则下一次正常 social sync 必须自动把当前快照补齐成可见事件。
@@ -150,7 +150,7 @@
   When 接口返回数据
   Then 结果只包含 `repo_star_received` 记录。
 
-- Given Dashboard `Releases` tab
+- Given Dashboard `发布` tab
   When 页面渲染完成
   Then 只显示 release cards，且仍支持原文 / 翻译 / 智能 lane 与 reactions。
 
@@ -239,7 +239,7 @@
 ## 方案概述（Approach, high-level）
 
 - 在同步层新增“本人个人仓库 stargazers + 本人 followers”的快照拉取与写入，首次与增量 snapshot 都进入 append-only `social_activity_events`。
-- `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`Releases / 被加星 / 被关注` 通过 `types` 请求服务端专属数据集，避免跨 tab 分页串味。
+- `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`发布 / 加星 / 关注` 通过 `types` 请求服务端专属数据集，避免跨 tab 分页串味。
 - 前端保持 release card 行为不变，为社交记录新增轻量只读卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行。
 - 历史日报组继续只概括 release，社交记录在同日组中以原始卡片单独呈现。
 

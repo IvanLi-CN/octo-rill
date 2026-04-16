@@ -21,11 +21,11 @@ export const DASHBOARD_TAB_OPTIONS: Array<{
 	desktopLabel: string;
 }> = [
 	{ value: "all", mobileLabel: "全部", desktopLabel: "全部" },
-	{ value: "releases", mobileLabel: "发布", desktopLabel: "Releases" },
-	{ value: "stars", mobileLabel: "加星", desktopLabel: "被加星" },
-	{ value: "followers", mobileLabel: "关注", desktopLabel: "被关注" },
+	{ value: "releases", mobileLabel: "发布", desktopLabel: "发布" },
+	{ value: "stars", mobileLabel: "加星", desktopLabel: "加星" },
+	{ value: "followers", mobileLabel: "关注", desktopLabel: "关注" },
 	{ value: "briefs", mobileLabel: "日报", desktopLabel: "日报" },
-	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "Inbox" },
+	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "收件箱" },
 ];
 
 function resolveLaneOption(lane: FeedLane) {
