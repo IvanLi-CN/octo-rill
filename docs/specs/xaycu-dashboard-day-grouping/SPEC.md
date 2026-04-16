@@ -4,11 +4,11 @@
 
 - Status: 已完成
 - Created: 2026-04-04
-- Last: 2026-04-04
+- Last: 2026-04-16
 
 ## 背景 / 问题陈述
 
-- Dashboard 首页当前把 `全部` 与 `Releases` 两个 tab 都渲染为同一条平铺 Release feed，缺少“按天阅读”的结构感。
+- Dashboard 首页当前把 `全部` 与 `发布` 两个 tab 都渲染为同一条平铺 Release feed，缺少“按天阅读”的结构感。
 - 用户在连续浏览多天 Release 时，很难快速分辨“今天”和“之前每天”的边界，也无法先看日报、再按需展开某一天的原始 Release 细节。
 - 现有前端只有 `/api/briefs` 返回的日报样本窗口，没有一个稳定的 Dashboard 启动期“日报边界”配置可用于对 feed 做统一分组。
 
@@ -16,10 +16,10 @@
 
 ### Goals
 
-- 让 `Releases` tab 按统一日报边界分组，并仅在日组切换处显示弱化的日期分隔线。
+- 让 `发布` tab 按统一日报边界分组，并仅在日组切换处显示弱化的日期分隔线。
 - 让 `全部` tab 保持“今天”直接展示原始 Release 卡片，而更早的日组优先以真实日报内容呈现。
 - 历史日组在命中对应日报时，允许用户在“日报视图”和“日期分界 + 原始 Release 列表”之间来回切换。
-- 当历史日组没有对应日报时，退回为 `Releases` tab 同款的日期分隔线 + 原始 Release 卡片。
+- 当历史日组没有对应日报时，退回为 `发布` tab 同款的日期分隔线 + 原始 Release 卡片。
 - 当历史日组没有对应日报时，允许用户按天手动触发日报生成，并在生成中看到占位日报卡片。
 - 补齐 Dashboard 启动期可消费的日报边界配置，并同步更新 Storybook 与视觉证据。
 
@@ -53,7 +53,7 @@
 ### MUST
 
 - Dashboard 必须拿到稳定的“日报边界本地时间”配置，不依赖从已有 brief 样本反推。
-- `Releases` tab 的 feed 必须按日报边界切分成多个日组。
+- `发布` tab 的 feed 必须按日报边界切分成多个日组。
 - 每个日组的分隔线必须显示日期与当日 Release 数，视觉上弱化为结构分隔，而不是主标题；首个可见日组不显示前置分隔。
 - `全部` tab 中，当前日组必须继续直接展示原始 Release 卡片。
 - `全部` tab 中，历史日组若有对应日报，默认只展示真实日报内容，并提供切换到原始 Release 列表的入口。
@@ -76,9 +76,9 @@
 
 ### Core flows
 
-- 用户进入 `Releases` tab 时，主列先按日报边界分组，再依序显示每个日组下的原始 Release 卡片。
+- 用户进入 `发布` tab 时，主列先按日报边界分组，再依序显示每个日组下的原始 Release 卡片。
 - 用户进入 `全部` tab 时，当前日组保持原始 Release feed；更早的日组若命中日报，则优先显示一个卡头继承 divider 语言的日报卡片。
-- 用户点击历史日组的“Releases”后，该组切换为“日期分界 + 原始 Release 列表”，不再同时显示日报卡片。
+- 用户点击历史日组的“列表”后，该组切换为“日期分界 + 原始 Release 列表”，不再同时显示日报卡片。
 - 用户点击历史日组分界右侧的“日报”后，该组重新切回日报卡片视图。
 - 用户点击历史日组分界右侧的“生成日报”后，按钮进入 spinning 状态，组内容切换为占位日报卡片；生成成功后占位内容被真实日报替换。
 - 用户点击嵌入日报中的内部 Release 链接时，沿用现有 Dashboard 行为：进入 `briefs` 上下文并打开 Release 详情弹窗。
@@ -110,7 +110,7 @@
 
 ## 验收标准（Acceptance Criteria）
 
-- Given `Releases` tab 存在跨多天的 Release 数据
+- Given `发布` tab 存在跨多天的 Release 数据
   When 页面渲染完成
   Then 首个可见日组不显示前置分隔，后续日组都会出现一个弱化分隔线，且分隔线文本包含日期与当日 Release 数。
 
@@ -127,7 +127,7 @@
   Then 该日组直接退回为分隔线 + 原始 Release 卡片，不显示伪日报。
 
 - Given 历史日组命中了对应日报
-  When 用户点击“Releases”
+  When 用户点击“列表”
   Then 该日组只显示日期分界与原始 Release 列表，日报卡片从当前组中移除，且分界右侧出现“日报”按钮。
 
 - Given 历史日组没有对应日报
@@ -155,7 +155,7 @@
 ### Visual verification
 
 - 使用 Storybook 稳定场景覆盖：
-  - `Releases` tab 按日报边界分组
+  - `发布` tab 按日报边界分组
   - `全部` tab 历史日报折叠
   - `全部` tab 历史组缺日报 fallback
   - `全部` tab 历史组手动生成日报
@@ -173,10 +173,10 @@
 
 ## Visual Evidence
 
-- 交互态细节（`Releases` 后切回原始列表、`生成日报` 的 spinning 与占位日报、生成完成后的替换）由 Storybook `play` 覆盖校验。
+- 交互态细节（`列表` 后切回原始列表、`生成日报` 的 spinning 与占位日报、生成完成后的替换）由 Storybook `play` 覆盖校验。
 
-- `Releases` tab 按日报边界分组
-![Releases tab 按日报边界分组](./assets/dashboard-releases-grouped.png)
+- `发布` tab 按日报边界分组
+![发布 tab 按日报边界分组](./assets/dashboard-releases-grouped.png)
 
 - `全部` tab 历史日报默认折叠为日报摘要
 ![全部 tab 历史日报默认折叠](./assets/dashboard-all-history-collapsed.png)
