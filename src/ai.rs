@@ -4463,6 +4463,9 @@ pub(crate) async fn generate_daily_brief_snapshot_for_window(
     if let Some(existing_id) = existing_id.as_deref()
         && window.end_utc.with_timezone(&chrono::Utc) <= chrono::Utc::now()
     {
+        if state.config.ai.is_none() {
+            return load_stored_brief_snapshot(state, existing_id).await;
+        }
         return refresh_existing_brief_snapshot_content(state, existing_id, generation_source)
             .await;
     }
@@ -6680,11 +6683,10 @@ mod tests {
             "manual",
         )
         .await
-        .expect("refresh stored snapshot before ai guard");
+        .expect("preserve stored snapshot when ai is unavailable");
 
         assert_eq!(stored.id, "brief-existing-no-ai");
-        assert!(stored.content_markdown.contains("## 项目更新"));
-        assert!(stored.content_markdown.contains("## 获星与关注"));
+        assert_eq!(stored.content_markdown, "existing snapshot");
         assert_eq!(stored.release_ids, vec![406]);
     }
 
