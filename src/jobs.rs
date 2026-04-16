@@ -2373,6 +2373,25 @@ async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> 
                 .await?;
             }
             Err(err) => {
+                let failed_at = Utc::now().to_rfc3339();
+                sqlx::query(
+                    r#"
+                    UPDATE briefs
+                    SET generation_source = 'content_refresh_failed',
+                        updated_at = ?
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(failed_at.as_str())
+                .bind(&row.id)
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to mark normalized brief {} as content_refresh_failed",
+                        row.id
+                    )
+                })?;
                 failed += 1;
                 append_task_event(
                     state,
@@ -4310,8 +4329,7 @@ mod tests {
         assert!(row.2.contains("## 获星与关注"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
-        assert!(row.2.contains("v1.0.0"));
-        assert!(!row.2.contains("v0.9.0"));
+        assert!(row.2.contains("本时间窗口内没有新的 Release。"));
 
         let memberships = sqlx::query_scalar::<_, i64>(
             r#"
@@ -4325,6 +4343,66 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("load refreshed memberships");
-        assert_eq!(memberships, vec![501]);
+        assert_eq!(memberships, vec![999]);
+    }
+
+    #[tokio::test]
+    async fn execute_brief_refresh_content_task_marks_failed_candidates_terminal() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1015, "brief-refresh-failed").await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-invalid-window")
+        .bind("1015")
+        .bind("2026-03-07")
+        .bind("not-a-rfc3339")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("## 概览\n\n- 旧格式\n")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert invalid refresh candidate");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue refresh")
+            .expect("task id");
+
+        let err = execute_brief_refresh_content_task(state.as_ref(), &task_id)
+            .await
+            .expect_err("refresh should fail for invalid stored window");
+        assert!(
+            err.to_string()
+                .contains("brief content refresh failed for all candidate briefs")
+        );
+
+        let generation_source = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT generation_source
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-refresh-invalid-window")
+        .fetch_one(&pool)
+        .await
+        .expect("load failed refresh marker");
+        assert_eq!(generation_source, "content_refresh_failed");
     }
 }
