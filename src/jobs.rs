@@ -4329,7 +4329,8 @@ mod tests {
         assert!(row.2.contains("## 获星与关注"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
-        assert!(row.2.contains("本时间窗口内没有新的 Release。"));
+        assert!(row.2.contains("[v1.0.0](/?tab=briefs&release=501)"));
+        assert!(row.2.contains("[@alice](https://github.com/alice)"));
 
         let memberships = sqlx::query_scalar::<_, i64>(
             r#"
@@ -4343,7 +4344,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("load refreshed memberships");
-        assert_eq!(memberships, vec![999]);
+        assert_eq!(memberships, vec![501]);
     }
 
     #[tokio::test]
