@@ -613,6 +613,7 @@ export const BriefRefreshContent: Story = {
 						failed: 1,
 						current_brief_id: "brief_v2_05",
 						last_error: "unsupported brief effective_time_zone: Mars/Base-1",
+						canceled: false,
 					},
 				},
 			},

@@ -329,6 +329,7 @@ export type AdminBriefRefreshContentDiagnostics = {
 	failed: number;
 	current_brief_id: string | null;
 	last_error: string | null;
+	canceled: boolean;
 };
 export type AdminSyncSubscriptionsDiagnostics = {
 	trigger: string | null;

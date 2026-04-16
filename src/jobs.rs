@@ -4285,6 +4285,8 @@ mod tests {
         assert!(row.2.contains("## 获星与关注"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
+        assert!(row.2.contains("v1.0.0"));
+        assert!(!row.2.contains("v0.9.0"));
 
         let memberships = sqlx::query_scalar::<_, i64>(
             r#"
