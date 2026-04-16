@@ -1288,7 +1288,7 @@ test.describe("localized timestamps", () => {
 				briefWindowStart: "2026-07-22T00:00:00Z",
 				briefWindowEnd: "2026-07-23T00:00:00Z",
 				briefMarkdown:
-					"## 概览\n\n- 时间窗口：2026-07-22T00:00:00Z → 2026-07-23T00:00:00Z\n\n## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)",
+					"## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
 				briefCreatedAt: "2026-07-23T08:00:00Z",
 			});
 
@@ -1320,7 +1320,7 @@ test.describe("localized timestamps", () => {
 				briefWindowStart: "2026-07-22T00:00:00Z",
 				briefWindowEnd: "2026-07-23T00:00:00Z",
 				briefMarkdown:
-					"## 概览\n\n- 时间窗口：2026-07-22T00:00:00Z → 2026-07-23T00:00:00Z\n\n## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)",
+					"## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
 				briefCreatedAt: "2026-07-23T08:00:00Z",
 			});
 

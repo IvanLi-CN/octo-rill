@@ -108,3 +108,4 @@
 | 6x959 | Dashboard 启动骨架页头与 Tabs 占位收敛 | 已完成 | `6x959-dashboard-startup-skeleton-header-tabs-alignment/SPEC.md` | 2026-04-16 | fast-track follow-up to #y9qpf; warm skeleton shell alignment + visual evidence |
 | 67g9w | Dashboard SPA 导航避免回退启动骨架 | 已完成 | `67g9w-spa-nav-startup-skeleton-guard/SPEC.md` | 2026-04-17 | fast-track; shell hydration gate + local feed skeleton + visual evidence |
 | w9by9 | Dashboard 移动端日分组标题防重叠修复 | 部分完成（3/4） | `w9by9-dashboard-mobile-day-divider-overlap/SPEC.md` | 2026-04-16 | fast-track; local implementation + visual evidence + review clear; PR pending screenshot push approval |
+| qvfxq | Release 日报内容格式 V2 与历史快照修复 | 部分完成（3/4） | `qvfxq-release-daily-brief-v2/SPEC.md` | 2026-04-16 | fast-track / brief body v2 + historical refresh landed / visual evidence captured |
