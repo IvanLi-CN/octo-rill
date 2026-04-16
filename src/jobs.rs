@@ -4132,6 +4132,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_brief_refresh_content_if_needed_ignores_heading_text_inside_code_block() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1016, "brief-refresh-code-fence").await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-code-fence")
+        .bind("1016")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind(
+            "## 项目更新\n\n```md\n## 概览\n```\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n",
+        )
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert valid v2 brief with code block");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue brief refresh");
+
+        assert!(task_id.is_none());
+        let queued = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM job_tasks
+            WHERE task_type = ?
+            "#,
+        )
+        .bind(TASK_BRIEF_REFRESH_CONTENT)
+        .fetch_one(&pool)
+        .await
+        .expect("count refresh tasks");
+        assert_eq!(queued, 0);
+    }
+
+    #[tokio::test]
     async fn execute_brief_refresh_content_task_updates_existing_snapshot_in_place() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -4329,7 +4383,7 @@ mod tests {
         assert!(row.2.contains("## 获星与关注"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
-        assert!(row.2.contains("[v1.0.0](/?tab=briefs&release=501)"));
+        assert!(row.2.contains("[v0.9.0](/?tab=briefs&release=999)"));
         assert!(row.2.contains("[@alice](https://github.com/alice)"));
 
         let memberships = sqlx::query_scalar::<_, i64>(
@@ -4344,7 +4398,7 @@ mod tests {
         .fetch_all(&pool)
         .await
         .expect("load refreshed memberships");
-        assert_eq!(memberships, vec![501]);
+        assert_eq!(memberships, vec![999]);
     }
 
     #[tokio::test]

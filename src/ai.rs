@@ -2618,11 +2618,26 @@ fn strip_outer_markdown_fence(raw: &str) -> &str {
     &body_with_closing[..closing_start]
 }
 
+fn markdown_has_heading(markdown: &str, heading: &str) -> bool {
+    let mut in_fence = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence && trimmed == heading {
+            return true;
+        }
+    }
+    false
+}
+
 fn brief_content_matches_v2_signature(markdown: &str) -> bool {
     let stripped = strip_outer_markdown_fence(markdown);
-    stripped.contains("## 项目更新")
-        && stripped.contains("## 获星与关注")
-        && !stripped.contains("## 概览")
+    markdown_has_heading(stripped, "## 项目更新")
+        && markdown_has_heading(stripped, "## 获星与关注")
+        && !markdown_has_heading(stripped, "## 概览")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4153,23 +4168,18 @@ pub async fn load_brief_content_refresh_candidates(
         user_id: String,
         date: String,
         effective_time_zone: Option<String>,
+        content_markdown: String,
     }
 
     let rows = sqlx::query_as::<_, BriefContentRefreshCandidateRow>(
         r#"
-        SELECT id, user_id, date, effective_time_zone
+        SELECT id, user_id, date, effective_time_zone, content_markdown
         FROM briefs
         WHERE generation_source NOT IN ('legacy', 'history_recompute_failed', 'content_refresh_failed')
           AND window_start_utc IS NOT NULL
           AND window_end_utc IS NOT NULL
           AND effective_time_zone IS NOT NULL
           AND effective_local_boundary IS NOT NULL
-          AND (
-            TRIM(content_markdown) LIKE '```%'
-            OR content_markdown LIKE '%## 概览%'
-            OR content_markdown NOT LIKE '%## 项目更新%'
-            OR content_markdown NOT LIKE '%## 获星与关注%'
-          )
         ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
         "#,
     )
@@ -4181,13 +4191,13 @@ pub async fn load_brief_content_refresh_candidates(
         .into_iter()
         .filter_map(|row| {
             let effective_time_zone = row.effective_time_zone?;
-            brief_effective_time_zone_is_refreshable(&effective_time_zone).then_some(
-                BriefContentRefreshCandidate {
-                    id: row.id,
-                    user_id: row.user_id,
-                    date: row.date,
-                },
-            )
+            (brief_effective_time_zone_is_refreshable(&effective_time_zone)
+                && brief_content_needs_refresh(&row.content_markdown))
+            .then_some(BriefContentRefreshCandidate {
+                id: row.id,
+                user_id: row.user_id,
+                date: row.date,
+            })
         })
         .collect())
 }
@@ -4232,117 +4242,6 @@ async fn load_stored_brief_release_ids(
     }
 
     Ok(extract_internal_release_id_sequence(content_markdown))
-}
-
-async fn load_repo_ids_by_release_ids<'e, E>(executor: E, release_ids: &[i64]) -> Result<Vec<i64>>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
-{
-    #[derive(Debug, sqlx::FromRow)]
-    struct ReleaseRepoRow {
-        release_id: i64,
-        repo_id: i64,
-    }
-
-    if release_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let placeholders = vec!["?"; release_ids.len()].join(", ");
-    let sql = format!(
-        r#"
-        SELECT release_id, repo_id
-        FROM repo_releases
-        WHERE release_id IN ({placeholders})
-        "#
-    );
-
-    let mut query = sqlx::query_as::<_, ReleaseRepoRow>(&sql);
-    for release_id in release_ids {
-        query = query.bind(*release_id);
-    }
-
-    let rows = query
-        .fetch_all(executor)
-        .await
-        .context("failed to load repo ids for historical releases")?;
-    let by_release_id = rows
-        .iter()
-        .map(|row| (row.release_id, row.repo_id))
-        .collect::<HashMap<_, _>>();
-
-    let mut repo_ids = Vec::new();
-    let mut seen_repo_ids = HashSet::new();
-    let mut missing = Vec::new();
-    for release_id in release_ids {
-        if let Some(repo_id) = by_release_id.get(release_id) {
-            if seen_repo_ids.insert(*repo_id) {
-                repo_ids.push(*repo_id);
-            }
-        } else {
-            missing.push(*release_id);
-        }
-    }
-
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "historical brief references release ids missing from repo_releases: {}",
-            missing
-                .into_iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    Ok(repo_ids)
-}
-
-async fn load_release_digests_for_window_by_repo_ids(
-    state: &AppState,
-    repo_ids: &[i64],
-    start_utc: &str,
-    end_utc: &str,
-) -> Result<Vec<ReleaseDigest>> {
-    if repo_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let placeholders = vec!["?"; repo_ids.len()].join(", ");
-    let sql = format!(
-        r#"
-        SELECT
-          release_id,
-          repo_id,
-          tag_name,
-          name,
-          body,
-          html_url,
-          COALESCE(published_at, created_at, updated_at) AS published_at,
-          is_prerelease
-        FROM repo_releases
-        WHERE repo_id IN ({placeholders})
-          AND is_draft = 0
-          AND COALESCE(published_at, created_at, updated_at) >= ?
-          AND COALESCE(published_at, created_at, updated_at) < ?
-        ORDER BY
-          COALESCE(published_at, created_at, updated_at) DESC,
-          release_id DESC
-        LIMIT 300
-        "#
-    );
-
-    let mut query = sqlx::query_as::<_, ReleaseRow>(&sql);
-    for repo_id in repo_ids {
-        query = query.bind(*repo_id);
-    }
-    query = query.bind(start_utc).bind(end_utc);
-
-    let rows = query
-        .fetch_all(&state.pool)
-        .await
-        .context("failed to query historical releases for brief refresh")?;
-    Ok(to_release_digest(rows))
 }
 
 pub async fn refresh_existing_brief_snapshot_content(
@@ -4407,14 +4306,7 @@ pub async fn refresh_existing_brief_snapshot_content(
     )
     .await?;
     let release_ids = load_stored_brief_release_ids(state, brief_id, &row.content_markdown).await?;
-    let repo_ids = load_repo_ids_by_release_ids(&state.pool, &release_ids).await?;
-    let releases = load_release_digests_for_window_by_repo_ids(
-        state,
-        &repo_ids,
-        &window.start_utc.to_rfc3339(),
-        &window.end_utc.to_rfc3339(),
-    )
-    .await?;
+    let releases = load_release_digests_by_ids(&state.pool, &release_ids).await?;
     let built = build_brief_content_from_digests(state, releases, social).await?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut tx = state
@@ -6010,6 +5902,9 @@ mod tests {
         ));
         assert!(brief_content_needs_refresh(
             "```markdown\n## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n```"
+        ));
+        assert!(!brief_content_needs_refresh(
+            "## 项目更新\n\n```md\n## 概览\n```\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n"
         ));
         assert!(!brief_content_needs_refresh(
             "## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n"
