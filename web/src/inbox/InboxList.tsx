@@ -14,11 +14,18 @@ import type { NotificationItem } from "@/sidebar/InboxQuickList";
 
 export function InboxList(props: {
 	notifications: NotificationItem[];
+	loading?: boolean;
 	busy?: boolean;
 	syncing?: boolean;
 	onSync?: () => void;
 }) {
-	const { notifications, busy = false, syncing = false, onSync } = props;
+	const {
+		notifications,
+		loading = false,
+		busy = false,
+		syncing = false,
+		onSync,
+	} = props;
 	const showSync = Boolean(onSync);
 
 	return (
@@ -69,7 +76,9 @@ export function InboxList(props: {
 			</CardHeader>
 
 			<CardContent className="pt-0">
-				{notifications.length === 0 ? (
+				{loading && notifications.length === 0 ? (
+					<p className="text-muted-foreground text-sm">正在加载收件箱…</p>
+				) : notifications.length === 0 ? (
 					showSync ? (
 						<p className="text-muted-foreground text-sm">
 							暂无通知。可以点击 <span className="font-mono">Sync inbox</span>{" "}

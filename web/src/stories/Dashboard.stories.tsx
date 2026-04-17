@@ -37,6 +37,7 @@ import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { InternalLink } from "@/lib/internalNavigation";
 import { AppShell } from "@/layout/AppShell";
+import { useMediaQuery } from "@/lib/useMediaQuery";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import type { RepoVisual } from "@/lib/repoVisual";
 import {
@@ -1085,12 +1086,15 @@ function DashboardPreview(props: {
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
 	);
+	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
 	);
 	const [resolvedDeferredFeedTabs, setResolvedDeferredFeedTabs] = useState<
 		Set<Tab>
 	>(() => new Set<Tab>());
+	const renderSidebarInbox = hasDesktopSidebar;
+	const renderSidebar = tab === "briefs" || renderSidebarInbox;
 
 	const visibleItems = (mode: "all" | "releases" | "stars" | "followers") => {
 		switch (mode) {
@@ -1382,16 +1386,22 @@ function DashboardPreview(props: {
 							</TabsContent>
 						</section>
 
-						<aside className="space-y-4 sm:space-y-6">
-							{tab === "briefs" ? (
-								<BriefListCard
-									briefs={storyBriefs}
-									selectedId={selectedBriefId}
-									onSelectId={(id) => setSelectedBriefId(id)}
-								/>
-							) : null}
-							<InboxQuickList notifications={notifications} />
-						</aside>
+						{renderSidebar ? (
+							<aside className="space-y-4 sm:space-y-6">
+								{tab === "briefs" ? (
+									<BriefListCard
+										briefs={storyBriefs}
+										selectedId={selectedBriefId}
+										onSelectId={(id) => setSelectedBriefId(id)}
+									/>
+								) : null}
+								{renderSidebarInbox ? (
+									<div data-dashboard-sidebar-inbox="true">
+										<InboxQuickList notifications={notifications} />
+									</div>
+								) : null}
+							</aside>
+						) : null}
 					</div>
 				</Tabs>
 
@@ -2126,6 +2136,31 @@ export const InboxEmpty: Story = {
 			canvas.getByRole("button", { name: "Sync inbox" }),
 		).toBeVisible();
 		await expect(canvas.getByText(/暂无通知。可以点击/)).toBeVisible();
+	},
+};
+
+export const MobileInboxTabWithoutSidebarQuickList: Story = {
+	args: {
+		initialTab: "inbox",
+	},
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobileDivider375",
+		},
+		docs: {
+			description: {
+				story:
+					"移动端只保留收件箱 tab 内的主列表，不再在折叠后的侧栏位置重复渲染 Inbox Quick List。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("heading", { name: "Inbox" })).toBeVisible();
+		await expect(
+			canvasElement.querySelector("[data-dashboard-sidebar-inbox='true']"),
+		).toBeNull();
+		await expect(canvas.getByText("Build failed on main")).toBeVisible();
 	},
 };
 
