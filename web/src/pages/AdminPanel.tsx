@@ -29,7 +29,7 @@ export function AdminPanel(props: {
 		>
 			<div className="space-y-3 sm:space-y-4">
 				<p className="text-muted-foreground text-sm">
-					这是独立的管理员界面，当前包含用户管理与任务中心两个模块。
+					这里聚焦用户资料与账号状态治理；若需查看整体运营指标，请切换到仪表盘。
 				</p>
 				<UserManagement
 					currentUserId={me.user.id}

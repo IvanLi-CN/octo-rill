@@ -19,7 +19,7 @@ type AdminHeaderUser = {
 };
 
 type AdminNavItem = {
-	key: "users" | "jobs";
+	key: "dashboard" | "users" | "jobs";
 	label: string;
 	href: string;
 };
@@ -30,7 +30,8 @@ type AdminHeaderProps = {
 };
 
 const ADMIN_NAV_ITEMS: AdminNavItem[] = [
-	{ key: "users", label: "用户管理", href: "/admin" },
+	{ key: "dashboard", label: "仪表盘", href: "/admin" },
+	{ key: "users", label: "用户管理", href: "/admin/users" },
 	{ key: "jobs", label: "任务中心", href: "/admin/jobs" },
 ];
 

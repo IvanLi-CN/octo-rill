@@ -223,6 +223,57 @@ export type AdminJobsOverviewResponse = {
 	enabled_scheduled_slots: number;
 	total_scheduled_slots: number;
 };
+export type AdminDashboardTaskStatusItem = {
+	task_type: string;
+	label: string;
+	queued: number;
+	running: number;
+	succeeded: number;
+	failed: number;
+	canceled: number;
+	total: number;
+	success_rate: number;
+};
+export type AdminDashboardTrendPoint = {
+	date: string;
+	label: string;
+	total_users: number;
+	active_users: number;
+	translations_total: number;
+	translations_failed: number;
+	summaries_total: number;
+	summaries_failed: number;
+	briefs_total: number;
+	briefs_failed: number;
+};
+export type AdminDashboardResponse = {
+	generated_at: string;
+	time_zone: string;
+	window_start: string;
+	window_end: string;
+	kpis: {
+		total_users: number;
+		active_users_today: number;
+		ongoing_tasks_total: number;
+		queued_tasks: number;
+		running_tasks: number;
+		ongoing_by_task: {
+			translations: number;
+			summaries: number;
+			briefs: number;
+		};
+	};
+	today: {
+		queued_total: number;
+		running_total: number;
+		succeeded_total: number;
+		failed_total: number;
+		canceled_total: number;
+		total: number;
+		task_status: AdminDashboardTaskStatusItem[];
+	};
+	trends: AdminDashboardTrendPoint[];
+};
 export type AdminRealtimeTaskItem = {
 	id: string;
 	task_type: string;
@@ -516,6 +567,17 @@ export async function apiPatchMeProfile(
 	body: DailyBriefProfilePatchRequest,
 ): Promise<MeProfileResponse> {
 	return apiPatchJson<MeProfileResponse>("/api/me/profile", body);
+}
+export async function apiGetAdminDashboard(
+	timeZone: string,
+): Promise<AdminDashboardResponse> {
+	const params = new URLSearchParams();
+	if (timeZone.trim()) {
+		params.set("time_zone", timeZone.trim());
+	}
+	return apiGet<AdminDashboardResponse>(
+		`/api/admin/dashboard${params.size > 0 ? `?${params.toString()}` : ""}`,
+	);
 }
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");

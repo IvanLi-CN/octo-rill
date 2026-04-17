@@ -9,6 +9,8 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
+use chrono::{Datelike, TimeZone};
+use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, sync::mpsc};
@@ -20,6 +22,12 @@ use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
+const ADMIN_DASHBOARD_ROLLUP_DAYS: i64 = 7;
+const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
+    (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
+    (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "智能摘要"),
+    (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
+];
 
 fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
     let parsed = Url::parse(html_url).ok()?;
@@ -947,6 +955,588 @@ pub async fn admin_jobs_overview(
         succeeded_24h,
         enabled_scheduled_slots,
         total_scheduled_slots,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminDashboardQuery {
+    time_zone: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardResponse {
+    generated_at: String,
+    time_zone: String,
+    window_start: String,
+    window_end: String,
+    kpis: AdminDashboardKpis,
+    today: AdminDashboardTodaySnapshot,
+    trends: Vec<AdminDashboardTrendPoint>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardKpis {
+    total_users: i64,
+    active_users_today: i64,
+    ongoing_tasks_total: i64,
+    queued_tasks: i64,
+    running_tasks: i64,
+    ongoing_by_task: AdminDashboardOngoingTaskBreakdown,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardOngoingTaskBreakdown {
+    translations: i64,
+    summaries: i64,
+    briefs: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardTodaySnapshot {
+    queued_total: i64,
+    running_total: i64,
+    succeeded_total: i64,
+    failed_total: i64,
+    canceled_total: i64,
+    total: i64,
+    task_status: Vec<AdminDashboardTaskStatusItem>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AdminDashboardTaskStatusItem {
+    task_type: String,
+    label: String,
+    queued: i64,
+    running: i64,
+    succeeded: i64,
+    failed: i64,
+    canceled: i64,
+    total: i64,
+    success_rate: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardTrendPoint {
+    date: String,
+    label: String,
+    total_users: i64,
+    active_users: i64,
+    translations_total: i64,
+    translations_failed: i64,
+    summaries_total: i64,
+    summaries_failed: i64,
+    briefs_total: i64,
+    briefs_failed: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminDashboardRollupRow {
+    rollup_date: String,
+    task_type: String,
+    total_users: i64,
+    active_users: i64,
+    queued_count: i64,
+    running_count: i64,
+    succeeded_count: i64,
+    failed_count: i64,
+    canceled_count: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AdminDashboardStatusCountRow {
+    queued_count: i64,
+    running_count: i64,
+    succeeded_count: i64,
+    failed_count: i64,
+    canceled_count: i64,
+}
+
+fn admin_dashboard_default_time_zone(state: &AppState) -> Tz {
+    briefs::default_daily_brief_time_zone(&state.config)
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::UTC)
+}
+
+fn resolve_admin_dashboard_time_zone(state: &AppState, raw: Option<&str>) -> Result<Tz, ApiError> {
+    let trimmed = raw.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return Ok(admin_dashboard_default_time_zone(state));
+    }
+    trimmed
+        .parse::<Tz>()
+        .map_err(|_| ApiError::bad_request("invalid time_zone"))
+}
+
+fn local_day_bounds_utc(
+    time_zone: Tz,
+    day: chrono::NaiveDate,
+) -> Result<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>), ApiError> {
+    let start_local = time_zone
+        .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
+        .single()
+        .or_else(|| {
+            time_zone
+                .with_ymd_and_hms(day.year(), day.month(), day.day(), 0, 0, 0)
+                .earliest()
+        })
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("invalid local day start")))?;
+    let next_day = day
+        .succ_opt()
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("invalid next local day")))?;
+    let end_local = time_zone
+        .with_ymd_and_hms(next_day.year(), next_day.month(), next_day.day(), 0, 0, 0)
+        .single()
+        .or_else(|| {
+            time_zone
+                .with_ymd_and_hms(next_day.year(), next_day.month(), next_day.day(), 0, 0, 0)
+                .earliest()
+        })
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("invalid local day end")))?;
+    Ok((
+        start_local.with_timezone(&chrono::Utc),
+        end_local.with_timezone(&chrono::Utc),
+    ))
+}
+
+async fn count_admin_dashboard_total_users_at(
+    pool: &sqlx::SqlitePool,
+    end_at: &str,
+) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM users
+        WHERE datetime(created_at) < datetime(?)
+        "#,
+    )
+    .bind(end_at)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn count_admin_dashboard_active_users_between(
+    pool: &sqlx::SqlitePool,
+    start_at: &str,
+    end_at: &str,
+) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM users
+        WHERE last_active_at IS NOT NULL
+          AND datetime(last_active_at) >= datetime(?)
+          AND datetime(last_active_at) < datetime(?)
+        "#,
+    )
+    .bind(start_at)
+    .bind(end_at)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_admin_dashboard_task_status_counts(
+    pool: &sqlx::SqlitePool,
+    task_type: &str,
+    start_at: &str,
+    end_at: &str,
+) -> Result<AdminDashboardStatusCountRow, ApiError> {
+    sqlx::query_as::<_, AdminDashboardStatusCountRow>(
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+          COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
+          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+          COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled_count
+        FROM job_tasks
+        WHERE task_type = ?
+          AND datetime(created_at) >= datetime(?)
+          AND datetime(created_at) < datetime(?)
+        "#,
+    )
+    .bind(task_type)
+    .bind(start_at)
+    .bind(end_at)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn upsert_admin_dashboard_rollup_for_day(
+    state: &AppState,
+    time_zone: Tz,
+    day: chrono::NaiveDate,
+) -> Result<(), ApiError> {
+    let (start_utc, end_utc) = local_day_bounds_utc(time_zone, day)?;
+    let start_at = start_utc.to_rfc3339();
+    let end_at = end_utc.to_rfc3339();
+    let total_users = count_admin_dashboard_total_users_at(&state.pool, end_at.as_str()).await?;
+    let active_users =
+        count_admin_dashboard_active_users_between(&state.pool, start_at.as_str(), end_at.as_str())
+            .await?;
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    let day_value = day.format("%Y-%m-%d").to_string();
+    let time_zone_value = time_zone.name().to_owned();
+
+    for (task_type, _) in ADMIN_DASHBOARD_TASK_TYPES {
+        let counts = load_admin_dashboard_task_status_counts(
+            &state.pool,
+            task_type,
+            start_at.as_str(),
+            end_at.as_str(),
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT INTO admin_dashboard_daily_rollups (
+              rollup_date,
+              time_zone,
+              task_type,
+              total_users,
+              active_users,
+              queued_count,
+              running_count,
+              succeeded_count,
+              failed_count,
+              canceled_count,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(rollup_date, time_zone, task_type)
+            DO UPDATE SET
+              total_users = excluded.total_users,
+              active_users = excluded.active_users,
+              queued_count = excluded.queued_count,
+              running_count = excluded.running_count,
+              succeeded_count = excluded.succeeded_count,
+              failed_count = excluded.failed_count,
+              canceled_count = excluded.canceled_count,
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(day_value.as_str())
+        .bind(time_zone_value.as_str())
+        .bind(task_type)
+        .bind(total_users)
+        .bind(active_users)
+        .bind(counts.queued_count)
+        .bind(counts.running_count)
+        .bind(counts.succeeded_count)
+        .bind(counts.failed_count)
+        .bind(counts.canceled_count)
+        .bind(updated_at.as_str())
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    Ok(())
+}
+
+fn build_admin_dashboard_task_status_item(
+    task_type: &str,
+    label: &str,
+    counts: &AdminDashboardStatusCountRow,
+) -> AdminDashboardTaskStatusItem {
+    let total = counts.queued_count
+        + counts.running_count
+        + counts.succeeded_count
+        + counts.failed_count
+        + counts.canceled_count;
+    let finished_total = counts.succeeded_count + counts.failed_count + counts.canceled_count;
+    let success_rate = if finished_total <= 0 {
+        0.0
+    } else {
+        counts.succeeded_count as f64 / finished_total as f64
+    };
+
+    AdminDashboardTaskStatusItem {
+        task_type: task_type.to_owned(),
+        label: label.to_owned(),
+        queued: counts.queued_count,
+        running: counts.running_count,
+        succeeded: counts.succeeded_count,
+        failed: counts.failed_count,
+        canceled: counts.canceled_count,
+        total,
+        success_rate,
+    }
+}
+
+async fn load_admin_dashboard_rollups(
+    pool: &sqlx::SqlitePool,
+    time_zone: Tz,
+    start_date: &str,
+    end_date: &str,
+) -> Result<Vec<AdminDashboardRollupRow>, ApiError> {
+    sqlx::query_as::<_, AdminDashboardRollupRow>(
+        r#"
+        SELECT
+          rollup_date,
+          task_type,
+          total_users,
+          active_users,
+          queued_count,
+          running_count,
+          succeeded_count,
+          failed_count,
+          canceled_count
+        FROM admin_dashboard_daily_rollups
+        WHERE time_zone = ?
+          AND rollup_date >= ?
+          AND rollup_date <= ?
+        ORDER BY rollup_date ASC, task_type ASC
+        "#,
+    )
+    .bind(time_zone.name())
+    .bind(start_date)
+    .bind(end_date)
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_admin_dashboard_ongoing_counts(
+    pool: &sqlx::SqlitePool,
+) -> Result<AdminDashboardOngoingTaskBreakdown, ApiError> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT task_type, COUNT(*) AS total
+        FROM job_tasks
+        WHERE status IN ('queued', 'running')
+          AND task_type IN (?, ?, ?)
+        GROUP BY task_type
+        "#,
+    )
+    .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+    .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let mut translations = 0_i64;
+    let mut summaries = 0_i64;
+    let mut briefs = 0_i64;
+    for (task_type, total) in rows {
+        match task_type.as_str() {
+            jobs::TASK_TRANSLATE_RELEASE_BATCH => translations = total,
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => summaries = total,
+            jobs::TASK_BRIEF_DAILY_SLOT => briefs = total,
+            _ => {}
+        }
+    }
+    Ok(AdminDashboardOngoingTaskBreakdown {
+        translations,
+        summaries,
+        briefs,
+    })
+}
+
+async fn count_admin_dashboard_live_tasks_by_status(
+    pool: &sqlx::SqlitePool,
+    status: &str,
+) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE status = ?
+          AND task_type IN (?, ?, ?)
+        "#,
+    )
+    .bind(status)
+    .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+    .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+    .bind(jobs::TASK_BRIEF_DAILY_SLOT)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+pub async fn admin_dashboard(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminDashboardQuery>,
+) -> Result<Json<AdminDashboardResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let time_zone = resolve_admin_dashboard_time_zone(state.as_ref(), query.time_zone.as_deref())?;
+    let now_local = chrono::Utc::now().with_timezone(&time_zone);
+    let end_day = now_local.date_naive();
+    let start_day = end_day
+        .checked_sub_signed(chrono::Duration::days(ADMIN_DASHBOARD_ROLLUP_DAYS - 1))
+        .ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!("invalid admin dashboard rollup range"))
+        })?;
+
+    let mut day = start_day;
+    loop {
+        upsert_admin_dashboard_rollup_for_day(state.as_ref(), time_zone, day).await?;
+        if day >= end_day {
+            break;
+        }
+        day = day.succ_opt().ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!("invalid admin dashboard day iteration"))
+        })?;
+    }
+
+    let rollups = load_admin_dashboard_rollups(
+        &state.pool,
+        time_zone,
+        start_day.format("%Y-%m-%d").to_string().as_str(),
+        end_day.format("%Y-%m-%d").to_string().as_str(),
+    )
+    .await?;
+    let ongoing_by_task = load_admin_dashboard_ongoing_counts(&state.pool).await?;
+    let queued_tasks =
+        count_admin_dashboard_live_tasks_by_status(&state.pool, jobs::STATUS_QUEUED).await?;
+    let running_tasks =
+        count_admin_dashboard_live_tasks_by_status(&state.pool, jobs::STATUS_RUNNING).await?;
+    let ongoing_tasks_total =
+        ongoing_by_task.translations + ongoing_by_task.summaries + ongoing_by_task.briefs;
+
+    let today_value = end_day.format("%Y-%m-%d").to_string();
+    let mut today_rows_by_type = HashMap::<String, AdminDashboardRollupRow>::new();
+    let mut trend_points_by_date = HashMap::<String, AdminDashboardTrendPoint>::new();
+    for row in rollups {
+        let point = trend_points_by_date
+            .entry(row.rollup_date.clone())
+            .or_insert_with(|| AdminDashboardTrendPoint {
+                label: row
+                    .rollup_date
+                    .get(5..)
+                    .unwrap_or(row.rollup_date.as_str())
+                    .to_owned(),
+                date: row.rollup_date.clone(),
+                total_users: row.total_users,
+                active_users: row.active_users,
+                translations_total: 0,
+                translations_failed: 0,
+                summaries_total: 0,
+                summaries_failed: 0,
+                briefs_total: 0,
+                briefs_failed: 0,
+            });
+        point.total_users = row.total_users;
+        point.active_users = row.active_users;
+        match row.task_type.as_str() {
+            jobs::TASK_TRANSLATE_RELEASE_BATCH => {
+                point.translations_total = row.queued_count
+                    + row.running_count
+                    + row.succeeded_count
+                    + row.failed_count
+                    + row.canceled_count;
+                point.translations_failed = row.failed_count;
+            }
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
+                point.summaries_total = row.queued_count
+                    + row.running_count
+                    + row.succeeded_count
+                    + row.failed_count
+                    + row.canceled_count;
+                point.summaries_failed = row.failed_count;
+            }
+            jobs::TASK_BRIEF_DAILY_SLOT => {
+                point.briefs_total = row.queued_count
+                    + row.running_count
+                    + row.succeeded_count
+                    + row.failed_count
+                    + row.canceled_count;
+                point.briefs_failed = row.failed_count;
+            }
+            _ => {}
+        }
+        if row.rollup_date == today_value {
+            today_rows_by_type.insert(row.task_type.clone(), row);
+        }
+    }
+
+    let mut today_task_status = Vec::with_capacity(ADMIN_DASHBOARD_TASK_TYPES.len());
+    for (task_type, label) in ADMIN_DASHBOARD_TASK_TYPES {
+        let row = today_rows_by_type.get(task_type).ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!("dashboard rollup row missing for today"))
+        })?;
+        today_task_status.push(build_admin_dashboard_task_status_item(
+            task_type,
+            label,
+            &AdminDashboardStatusCountRow {
+                queued_count: row.queued_count,
+                running_count: row.running_count,
+                succeeded_count: row.succeeded_count,
+                failed_count: row.failed_count,
+                canceled_count: row.canceled_count,
+            },
+        ));
+    }
+
+    let total_users = today_task_status
+        .first()
+        .and_then(|_| {
+            today_rows_by_type
+                .values()
+                .next()
+                .map(|row| row.total_users)
+        })
+        .unwrap_or(0);
+    let active_users_today = today_task_status
+        .first()
+        .and_then(|_| {
+            today_rows_by_type
+                .values()
+                .next()
+                .map(|row| row.active_users)
+        })
+        .unwrap_or(0);
+    let queued_total = today_task_status
+        .iter()
+        .map(|item| item.queued)
+        .sum::<i64>();
+    let running_total = today_task_status
+        .iter()
+        .map(|item| item.running)
+        .sum::<i64>();
+    let succeeded_total = today_task_status
+        .iter()
+        .map(|item| item.succeeded)
+        .sum::<i64>();
+    let failed_total = today_task_status
+        .iter()
+        .map(|item| item.failed)
+        .sum::<i64>();
+    let canceled_total = today_task_status
+        .iter()
+        .map(|item| item.canceled)
+        .sum::<i64>();
+    let total = today_task_status.iter().map(|item| item.total).sum::<i64>();
+
+    let mut trends = trend_points_by_date.into_values().collect::<Vec<_>>();
+    trends.sort_by(|left, right| left.date.cmp(&right.date));
+
+    Ok(Json(AdminDashboardResponse {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        time_zone: time_zone.name().to_owned(),
+        window_start: start_day.format("%Y-%m-%d").to_string(),
+        window_end: today_value,
+        kpis: AdminDashboardKpis {
+            total_users,
+            active_users_today,
+            ongoing_tasks_total,
+            queued_tasks,
+            running_tasks,
+            ongoing_by_task,
+        },
+        today: AdminDashboardTodaySnapshot {
+            queued_total,
+            running_total,
+            succeeded_total,
+            failed_total,
+            canceled_total,
+            total,
+            task_status: today_task_status,
+        },
+        trends,
     }))
 }
 
@@ -10423,14 +11013,17 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Datelike, TimeZone};
+
     use super::{
-        ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminLlmCallListScope,
-        AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest, AdminRealtimeTaskDetailItem,
-        AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
-        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow,
-        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
-        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
-        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
+        ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
+        AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
+        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem,
+        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        FeedQuery, FeedRow, GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile,
+        GitHubCompareResponse, GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC,
+        RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO,
+        TranslateBatchItem, TranslationCacheRow, TranslationUpsert, admin_dashboard,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
@@ -11468,6 +12061,58 @@ mod tests {
         .expect("seed access refresh task");
     }
 
+    async fn seed_admin_dashboard_task(
+        pool: &SqlitePool,
+        task_id: &str,
+        task_type: &str,
+        status: &str,
+        requested_by: &str,
+        created_at: &str,
+    ) {
+        let started_at = match status {
+            jobs::STATUS_RUNNING | jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED => Some(created_at),
+            _ => None,
+        };
+        let finished_at = match status {
+            jobs::STATUS_SUCCEEDED | jobs::STATUS_FAILED | jobs::STATUS_CANCELED => {
+                Some(created_at)
+            }
+            _ => None,
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, 'tests', ?, NULL, '{}', NULL, NULL, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id)
+        .bind(task_type)
+        .bind(status)
+        .bind(requested_by)
+        .bind(created_at)
+        .bind(started_at)
+        .bind(finished_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed admin dashboard task");
+    }
+
     async fn seed_llm_call(
         pool: &SqlitePool,
         call_id: &str,
@@ -11871,6 +12516,115 @@ mod tests {
             ids,
             vec!["task-new-failed", "task-mid-succeeded", "task-old-running"]
         );
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_rolls_up_today_metrics_and_persists_rows() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_user(&pool, 2, "operator", 0, 0).await;
+
+        let time_zone = chrono_tz::Asia::Shanghai;
+        let now_local = chrono::Utc::now().with_timezone(&time_zone);
+        let today_local = now_local.date_naive();
+        let task_time = time_zone
+            .with_ymd_and_hms(
+                today_local.year(),
+                today_local.month(),
+                today_local.day(),
+                9,
+                0,
+                0,
+            )
+            .single()
+            .expect("build local dashboard task time")
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339();
+
+        set_last_active_at(&pool, test_user_id(1).as_str(), Some(task_time.as_str())).await;
+        set_last_active_at(&pool, test_user_id(2).as_str(), Some(task_time.as_str())).await;
+
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-translate-queued",
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_QUEUED,
+            test_user_id(1).as_str(),
+            task_time.as_str(),
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-summary-running",
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+            jobs::STATUS_RUNNING,
+            test_user_id(1).as_str(),
+            task_time.as_str(),
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-summary-failed",
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+            jobs::STATUS_FAILED,
+            test_user_id(1).as_str(),
+            task_time.as_str(),
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-brief-succeeded",
+            jobs::TASK_BRIEF_DAILY_SLOT,
+            jobs::STATUS_SUCCEEDED,
+            test_user_id(2).as_str(),
+            task_time.as_str(),
+        )
+        .await;
+
+        let state = setup_state(pool.clone());
+        let session = setup_session(1).await;
+
+        let Json(resp) = admin_dashboard(
+            State(state),
+            session,
+            Query(AdminDashboardQuery {
+                time_zone: Some("Asia/Shanghai".to_owned()),
+            }),
+        )
+        .await
+        .expect("admin dashboard should succeed");
+
+        assert_eq!(resp.time_zone, "Asia/Shanghai");
+        assert_eq!(resp.kpis.total_users, 2);
+        assert_eq!(resp.kpis.active_users_today, 2);
+        assert_eq!(resp.kpis.ongoing_tasks_total, 2);
+        assert_eq!(resp.kpis.ongoing_by_task.translations, 1);
+        assert_eq!(resp.kpis.ongoing_by_task.summaries, 1);
+        assert_eq!(resp.kpis.ongoing_by_task.briefs, 0);
+        assert_eq!(resp.today.queued_total, 1);
+        assert_eq!(resp.today.running_total, 1);
+        assert_eq!(resp.today.succeeded_total, 1);
+        assert_eq!(resp.today.failed_total, 1);
+        assert_eq!(resp.today.total, 4);
+        assert_eq!(resp.today.task_status.len(), 3);
+
+        let today_rollup_rows = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM admin_dashboard_daily_rollups
+            WHERE time_zone = 'Asia/Shanghai'
+              AND rollup_date = ?
+            "#,
+        )
+        .bind(today_local.format("%Y-%m-%d").to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count persisted dashboard rollups");
+        assert_eq!(today_rollup_rows, 3);
     }
 
     #[tokio::test]
