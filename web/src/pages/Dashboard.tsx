@@ -58,6 +58,7 @@ import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { InternalLink } from "@/lib/internalNavigation";
 import { normalizeReleaseId } from "@/lib/releaseId";
+import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
 	DashboardMobileControlBand,
 	type DashboardTab as Tab,
@@ -432,9 +433,18 @@ export function Dashboard(props: {
 	const [briefs, setBriefs] = useState<BriefItem[]>(
 		() => warmStart?.briefs ?? [],
 	);
+	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
+	const initialNotificationBootstrapRef = useRef(
+		hasDesktopSidebar || tab === "inbox",
+	);
+	const notificationsBootstrapRequestedRef = useRef(
+		initialNotificationBootstrapRef.current,
+	);
+	const notificationsRequestInFlightRef = useRef(false);
 	const [sidebarLoading, setSidebarLoading] = useState(
 		() => !bootedFromWarmStart,
 	);
+	const [notificationsLoading, setNotificationsLoading] = useState(false);
 	const [profileDialogOpen, setProfileDialogOpen] = useState(false);
 	const [briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
 		null,
@@ -465,17 +475,33 @@ export function Dashboard(props: {
 		}
 	}, []);
 
+	const loadNotifications = useCallback(async () => {
+		if (notificationsRequestInFlightRef.current) {
+			return;
+		}
+		notificationsRequestInFlightRef.current = true;
+		try {
+			const items = await apiGet<NotificationItem[]>("/api/notifications");
+			setNotifications(sortNotifications(items));
+		} finally {
+			notificationsRequestInFlightRef.current = false;
+		}
+	}, []);
 	const refreshSidebar = useCallback(
-		async (options?: { background?: boolean }) => {
+		async (options?: {
+			background?: boolean;
+			includeNotifications?: boolean;
+		}) => {
 			if (!options?.background) {
 				setSidebarLoading(true);
 			}
 			try {
-				const [n, b] = await Promise.all([
-					apiGet<NotificationItem[]>("/api/notifications"),
+				const [b] = await Promise.all([
 					apiGet<BriefItem[]>("/api/briefs"),
+					options?.includeNotifications
+						? loadNotifications()
+						: Promise.resolve(),
 				]);
-				setNotifications(sortNotifications(n));
 				setBriefs(b);
 				setSelectedBriefId((prev) => {
 					if (prev && b.some((x) => x.id === prev)) return prev;
@@ -485,7 +511,20 @@ export function Dashboard(props: {
 				setSidebarLoading(false);
 			}
 		},
-		[],
+		[loadNotifications],
+	);
+	const refreshNotifications = useCallback(
+		async (options?: { background?: boolean }) => {
+			if (!options?.background) {
+				setNotificationsLoading(true);
+			}
+			try {
+				await loadNotifications();
+			} finally {
+				setNotificationsLoading(false);
+			}
+		},
+		[loadNotifications],
 	);
 	const refreshDashboardBoundary = useCallback(async () => {
 		const latestMe = await apiGet<MeResponse>("/api/me");
@@ -514,8 +553,13 @@ export function Dashboard(props: {
 
 	const refreshAll = useCallback(async () => {
 		setBootError(null);
-		await Promise.all([refreshFeed(), refreshSidebar()]);
-	}, [refreshFeed, refreshSidebar]);
+		await Promise.all([
+			refreshFeed(),
+			refreshSidebar({
+				includeNotifications: hasDesktopSidebar || tab === "inbox",
+			}),
+		]);
+	}, [hasDesktopSidebar, refreshFeed, refreshSidebar, tab]);
 
 	const ensureTaskWaiter = useCallback((taskId: string) => {
 		const existing = taskWaitersRef.current.get(taskId);
@@ -606,13 +650,31 @@ export function Dashboard(props: {
 	}, [loadInitialFeed]);
 
 	useEffect(() => {
-		void refreshSidebar({ background: bootedFromWarmStart }).catch((err) => {
+		void refreshSidebar({
+			background: bootedFromWarmStart,
+			includeNotifications: initialNotificationBootstrapRef.current,
+		}).catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 		void loadReactionTokenStatus().catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [bootedFromWarmStart, loadReactionTokenStatus, refreshSidebar]);
+
+	useEffect(() => {
+		const shouldLoadNotifications = hasDesktopSidebar || tab === "inbox";
+		if (
+			!shouldLoadNotifications ||
+			notificationsBootstrapRequestedRef.current
+		) {
+			return;
+		}
+		notificationsBootstrapRequestedRef.current = true;
+		void refreshNotifications({ background: tab !== "inbox" }).catch((err) => {
+			notificationsBootstrapRequestedRef.current = false;
+			setBootError(err instanceof Error ? err.message : String(err));
+		});
+	}, [hasDesktopSidebar, refreshNotifications, tab]);
 
 	useEffect(() => {
 		window.localStorage.setItem(PAGE_DEFAULT_LANE_STORAGE_KEY, pageDefaultLane);
@@ -1273,6 +1335,8 @@ export function Dashboard(props: {
 		);
 	}, [setRouteState, tab]);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
+	const renderSidebarInbox = hasDesktopSidebar;
+	const renderSidebar = tab === "briefs" || renderSidebarInbox;
 
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
@@ -1558,6 +1622,7 @@ export function Dashboard(props: {
 							<TabsContent value="inbox" className="mt-0 min-w-0">
 								<InboxList
 									notifications={notifications}
+									loading={notificationsLoading}
 									busy={Boolean(busy)}
 									syncing={syncingInbox}
 									onSync={tab === "inbox" ? onSyncInbox : undefined}
@@ -1565,16 +1630,22 @@ export function Dashboard(props: {
 							</TabsContent>
 						</section>
 
-						<aside className="space-y-4 sm:space-y-6">
-							{tab === "briefs" ? (
-								<BriefListCard
-									briefs={briefs}
-									selectedId={selectedBriefId}
-									onSelectId={(id) => setSelectedBriefId(id)}
-								/>
-							) : null}
-							<InboxQuickList notifications={notifications} />
-						</aside>
+						{renderSidebar ? (
+							<aside className="space-y-4 sm:space-y-6">
+								{tab === "briefs" ? (
+									<BriefListCard
+										briefs={briefs}
+										selectedId={selectedBriefId}
+										onSelectId={(id) => setSelectedBriefId(id)}
+									/>
+								) : null}
+								{renderSidebarInbox ? (
+									<div data-dashboard-sidebar-inbox="true">
+										<InboxQuickList notifications={notifications} />
+									</div>
+								) : null}
+							</aside>
+						) : null}
 					</div>
 				</Tabs>
 

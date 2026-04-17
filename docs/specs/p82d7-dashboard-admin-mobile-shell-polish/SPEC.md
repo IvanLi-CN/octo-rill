@@ -74,6 +74,8 @@
 - Dashboard 移动端不再在次级控制区显示“管理员面板”按钮；管理员入口改放进用户信息浮层。
 - Dashboard / Admin 的移动端 footer 在页面离开顶部后自动收起，回到顶部再恢复。
 - Dashboard 小屏内容区、卡片边距、卡片内 padding 和 reaction 区 spacing 都要比当前版本更紧凑。
+- Dashboard 右侧 `Inbox` quick list 仅在桌面侧栏显示；移动端不得在主内容下方重复渲染。
+- 当右侧 `Inbox` quick list 不显示时，不得为了该卡片在启动期预取 `/api/notifications`；移动端只在进入 `收件箱` tab 后再加载通知数据。
 - Storybook 与 Playwright 必须补齐移动端回归与视觉证据。
 
 ### SHOULD
@@ -94,6 +96,7 @@
    - 页头默认隐藏副标题，保留品牌、主题切换、同步与头像入口。
    - 一级 tabs 与阅读模式控件合并为单行 sticky rail。
    - 主内容与卡片 padding 按移动端收紧。
+   - `Inbox` quick list 不再出现在主内容下方。
 
 2. **Dashboard 移动端滚动**
    - 用户向下滚动浏览内容时，footer 收起；sticky rail 贴在当前页头下方。
@@ -113,6 +116,7 @@
 - 不在顶部时 footer 一律保持隐藏，不因滚动停止自动弹回。
 - Compact header 仅在移动端、且页面已离开顶部并继续向下滚动浏览内容时生效。
 - Dashboard sticky rail 只在移动端启用；桌面端继续使用原有顶部控制区布局。
+- 移动端默认首屏与非 `收件箱` tab 不得主动请求 `/api/notifications`；只有右侧桌面侧栏可见或用户切进 `收件箱` tab 时才允许加载。
 - Landing 不启用移动壳层状态，也不继承 footer auto-hide。
 
 ## 接口契约（Interfaces & Contracts）
@@ -147,6 +151,10 @@
 - Given 用户是管理员并处于移动端 Dashboard
   When 打开头像浮层
   Then 可在浮层内看到“管理员面板”入口与“退出登录”动作。
+
+- Given 用户在移动端打开 Dashboard 的默认 `全部` tab
+  When 页面完成首屏渲染
+  Then 页面下方不存在右侧 `Inbox` quick list，且在用户点击 `收件箱` tab 前不会请求 `/api/notifications`。
 
 - Given 移动端 Admin Users 或 Admin Jobs 页面
   When 页面离开顶部后继续向下滚动浏览内容
@@ -215,6 +223,13 @@
   PR: include
   image:
   ![Admin 移动端共享壳层](./assets/admin-mobile-shell-compact-light.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: `pages-dashboard--mobile-inbox-tab-without-sidebar-quick-list`
+  state: inbox tab only on mobile
+  evidence_note: 验证移动端进入 `收件箱` tab 时只保留主内容里的 Inbox 列表，不再在主内容下方重复渲染右侧 quick list。
+  image:
+  ![Dashboard 移动端仅在收件箱 tab 展示 Inbox 列表](./assets/dashboard-mobile-inbox-tab-only-light.png)
 
 ## 资产晋升（Asset promotion）
 
