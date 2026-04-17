@@ -577,6 +577,12 @@ test.describe("mobile dashboard shell", () => {
 			page.locator("[data-dashboard-sidebar-inbox='true']"),
 		).toHaveCount(0);
 		await expect(page.getByText("Build failed on main")).toBeVisible();
+		const syncInboxButton = page.getByRole("button", { name: "Sync inbox" });
+		const githubLink = page.getByRole("link", { name: "GitHub" }).first();
+		const syncInboxBox = await syncInboxButton.boundingBox();
+		const githubBox = await githubLink.boundingBox();
+		expect(syncInboxBox?.width ?? 0).toBeLessThanOrEqual(36);
+		expect(githubBox?.width ?? 0).toBeLessThanOrEqual(36);
 		expect(notificationCalls).toBe(1);
 	});
 
