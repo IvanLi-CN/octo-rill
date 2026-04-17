@@ -6,7 +6,13 @@ import {
 	UserPlus,
 	UserRound,
 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import {
+	type CSSProperties,
+	type ReactNode,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
 
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
@@ -332,26 +338,118 @@ function SocialRepoAvatar(props: {
 	);
 }
 
+function middleEllipsis(value: string, head: number, tail: number) {
+	if (value.length <= head + tail + 1) {
+		return value;
+	}
+	return `${value.slice(0, head)}…${value.slice(-tail)}`;
+}
+
+function compactRepoFullName(repoFullName: string) {
+	const slashIndex = repoFullName.indexOf("/");
+	if (slashIndex > 0) {
+		const owner = repoFullName.slice(0, slashIndex);
+		const repo = repoFullName.slice(slashIndex + 1);
+		const tail = 8;
+		const desiredVisible = 36;
+		const ownerVisible = owner.length + 1;
+		const head = Math.max(8, desiredVisible - ownerVisible - tail);
+		return `${owner}/${middleEllipsis(repo, head, tail)}`;
+	}
+	return middleEllipsis(repoFullName, 13, 10);
+}
+
+let inlineMeasureCanvas: HTMLCanvasElement | null = null;
+
+function getInlineMeasureContext() {
+	if (!inlineMeasureCanvas) {
+		inlineMeasureCanvas = document.createElement("canvas");
+	}
+	return inlineMeasureCanvas.getContext("2d");
+}
+
+function measureInlineEntityWidth(group: HTMLElement): number {
+	const avatarWidth =
+		group.firstElementChild instanceof HTMLElement
+			? group.firstElementChild.getBoundingClientRect().width
+			: 0;
+	const label = group.querySelector<HTMLElement>("[data-social-card-primary]");
+	const gap =
+		Number.parseFloat(window.getComputedStyle(group).columnGap || "0") || 0;
+	let labelWidth = 0;
+	if (label) {
+		const computedStyle = window.getComputedStyle(label);
+		const text =
+			label.dataset.socialCardPrimaryMobile ??
+			label.dataset.socialCardPrimaryFull ??
+			label.textContent ??
+			"";
+		const context = getInlineMeasureContext();
+		if (context) {
+			context.font = computedStyle.font;
+			const letterSpacing =
+				Number.parseFloat(computedStyle.letterSpacing || "0") || 0;
+			labelWidth =
+				context.measureText(text).width +
+				Math.max(0, text.length - 1) * letterSpacing;
+		} else {
+			labelWidth = Math.max(
+				label.scrollWidth,
+				label.getBoundingClientRect().width,
+			);
+		}
+	}
+	return Math.ceil(avatarWidth + gap + labelWidth);
+}
+
 function SocialEntityCard(props: {
 	href?: string | null;
 	avatar: ReactNode;
 	primary: string;
 	mono?: boolean;
+	segment?: "actor" | "target";
+	className?: string;
+	primaryClassName?: string;
 }) {
-	const { href, avatar, primary, mono = false } = props;
+	const {
+		href,
+		avatar,
+		primary,
+		mono = false,
+		segment,
+		className,
+		primaryClassName,
+	} = props;
 	return (
-		<div className="relative z-10 flex min-w-0 items-center gap-3 rounded-2xl border border-border/65 bg-background/78 px-3 py-3 shadow-sm">
+		<div
+			data-social-card-segment={segment}
+			className={cn(
+				"relative z-10 flex min-w-0 items-center gap-1.5 rounded-xl border border-border/65 bg-background/78 px-2 py-2 shadow-sm",
+				"sm:gap-3 sm:rounded-2xl sm:px-3 sm:py-3",
+				className,
+			)}
+		>
 			<div className="shrink-0">{avatar}</div>
-			<div className="min-w-0">
+			<div className="min-w-0 flex-1">
 				<div className="flex min-w-0 items-center gap-0.5">
-					<p
-						className={cn(
-							"truncate text-sm font-semibold text-foreground sm:text-[15px]",
-							mono && "font-mono font-medium",
-						)}
+					<div
+						data-social-card-primary="true"
+						data-social-card-primary-full={primary}
+						data-social-card-primary-mobile={primary}
+						title={primary}
+						className="min-w-0 flex-1"
 					>
-						{primary}
-					</p>
+						<p
+							className={cn(
+								"truncate text-sm font-semibold text-foreground md:text-[15px]",
+								mono && "sm:font-mono sm:font-medium",
+								primaryClassName,
+							)}
+							data-social-card-primary-full-label="true"
+						>
+							{primary}
+						</p>
+					</div>
 					{href ? (
 						<a
 							href={href}
@@ -369,20 +467,49 @@ function SocialEntityCard(props: {
 	);
 }
 
+function SocialActionChip(props: {
+	icon: typeof Star;
+	title: string;
+	style?: CSSProperties;
+}) {
+	const { icon: Icon, title, style } = props;
+	return (
+		<div
+			data-social-card-segment="action"
+			role="img"
+			aria-label={title}
+			title={title}
+			style={style}
+			className="flex size-8 shrink-0 items-center justify-center rounded-full bg-muted/45 text-muted-foreground"
+		>
+			<Icon className="size-4" />
+		</div>
+	);
+}
+
 function SocialActionBridge(props: {
 	icon: typeof Star;
 	title: string;
 	subtitle?: string;
+	className?: string;
 }) {
-	const { icon: Icon, title, subtitle } = props;
+	const { icon: Icon, title, subtitle, className } = props;
 
 	return (
-		<div className="flex flex-col items-center justify-center gap-2 text-center">
-			<div className="flex size-11 shrink-0 items-center justify-center rounded-full border border-border/65 bg-background shadow-sm">
-				<Icon className="size-5 text-foreground/80" />
+		<div
+			data-social-card-segment="action"
+			className={cn(
+				"flex min-w-0 flex-col items-center justify-center gap-1 text-center",
+				className,
+			)}
+		>
+			<div className="flex size-[30px] shrink-0 items-center justify-center rounded-full border border-border/65 bg-background shadow-sm sm:size-10 md:size-11">
+				<Icon className="size-[15px] text-foreground/80 sm:size-[18px] md:size-5" />
 			</div>
-			<div className="space-y-0.5">
-				<p className="text-sm font-semibold text-foreground">{title}</p>
+			<div className="space-y-0">
+				<p className="text-[10px] leading-none font-semibold text-foreground sm:text-xs md:text-sm">
+					{title}
+				</p>
 				{subtitle ? (
 					<p className="text-xs text-muted-foreground">{subtitle}</p>
 				) : null}
@@ -406,28 +533,315 @@ function SocialActivityCard(props: {
 	const actorCardHref = actorHref;
 	const targetCardHref = isRepoStar ? repoHref : null;
 	const targetViewer: FeedActor = currentViewer ?? {
-		login: "你",
+		login: "",
 		avatar_url: null,
 		html_url: null,
 	};
+	const targetViewerHref =
+		targetViewer.html_url ??
+		(targetViewer.login ? `https://github.com/${targetViewer.login}` : null);
+	const actorMobileLabel = actor.login;
+	const targetMobileLabel = isRepoStar
+		? compactRepoFullName(item.repo_full_name ?? "你的仓库")
+		: targetViewer.login;
+	const mobileRowRef = useRef<HTMLDivElement | null>(null);
+	const mobileActorGroupRef = useRef<HTMLSpanElement | null>(null);
+	const mobileTargetGroupRef = useRef<HTMLSpanElement | null>(null);
+	const mobileActionShellRef = useRef<HTMLDivElement | null>(null);
+	const [mobileGridTemplate, setMobileGridTemplate] = useState(
+		"minmax(0,1fr) auto minmax(0,1fr)",
+	);
+	const [mobileBalanceMode, setMobileBalanceMode] = useState<
+		"centered" | "adaptive"
+	>("centered");
+
+	useLayoutEffect(() => {
+		const row = mobileRowRef.current;
+		const actorGroup = mobileActorGroupRef.current;
+		const targetGroup = mobileTargetGroupRef.current;
+		const actionShell = mobileActionShellRef.current;
+		if (!row || !actorGroup || !targetGroup || !actionShell) {
+			return;
+		}
+
+		const computeTemplate = () => {
+			const style = window.getComputedStyle(row);
+			const gap = Number.parseFloat(style.columnGap || style.gap || "0") || 0;
+			const actionWidth = actionShell.getBoundingClientRect().width;
+			const availableWidth = row.clientWidth - actionWidth - gap * 2;
+			if (availableWidth <= 0) {
+				setMobileGridTemplate("minmax(0,1fr) auto minmax(0,1fr)");
+				setMobileBalanceMode("centered");
+				return;
+			}
+
+			const inlineWidthSafetyRoom = 6;
+			const actorNaturalWidth =
+				measureInlineEntityWidth(actorGroup) + inlineWidthSafetyRoom;
+			const targetNaturalWidth =
+				measureInlineEntityWidth(targetGroup) + inlineWidthSafetyRoom;
+			const centeredWidth = availableWidth / 2;
+			const centeredSafetyRoom = 8;
+			const centeredFits =
+				actorNaturalWidth < centeredWidth - centeredSafetyRoom &&
+				targetNaturalWidth < centeredWidth - centeredSafetyRoom;
+			const adaptiveFits =
+				actorNaturalWidth + targetNaturalWidth <= availableWidth;
+
+			let leftWidth = centeredWidth;
+			let rightWidth = centeredWidth;
+			let nextBalanceMode: "centered" | "adaptive" = "centered";
+
+			if (!centeredFits && adaptiveFits) {
+				nextBalanceMode = "adaptive";
+				leftWidth = actorNaturalWidth;
+				rightWidth = targetNaturalWidth;
+			}
+
+			setMobileGridTemplate(
+				`minmax(0, ${leftWidth}px) auto minmax(0, ${rightWidth}px)`,
+			);
+			setMobileBalanceMode(nextBalanceMode);
+		};
+
+		computeTemplate();
+
+		const resizeObserver = new ResizeObserver(() => {
+			computeTemplate();
+		});
+		resizeObserver.observe(row);
+		resizeObserver.observe(actorGroup);
+		resizeObserver.observe(targetGroup);
+		resizeObserver.observe(actionShell);
+		window.addEventListener("resize", computeTemplate);
+		return () => {
+			resizeObserver.disconnect();
+			window.removeEventListener("resize", computeTemplate);
+		};
+	}, []);
 
 	return (
 		<div
 			className="space-y-0 px-1 py-1"
+			data-feed-item-id={item.id}
 			data-social-card-kind={item.kind}
+			data-social-card-layout="inline-compact"
 			data-social-card-time-visible={showTimestamp ? "true" : "false"}
 		>
 			{showTimestamp ? (
 				<p
-					className="mb-0.5 font-mono text-xs leading-none text-muted-foreground"
+					className="mb-1 font-mono text-[11px] leading-none text-muted-foreground sm:mb-0.5 sm:text-xs"
 					data-social-card-timestamp
 				>
 					{formatIsoShortLocal(item.ts)}
 				</p>
 			) : null}
-			<div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)] md:items-center">
+			<div
+				ref={mobileRowRef}
+				data-social-card-row="true"
+				data-social-card-balance-mode={mobileBalanceMode}
+				className={cn(
+					"w-full min-w-0 items-center gap-2 rounded-[20px] border border-border/65 bg-background/84 px-2.5 py-1.5 shadow-sm backdrop-blur-[2px] sm:hidden",
+					mobileBalanceMode === "adaptive" ? "flex justify-between" : "grid",
+				)}
+				style={
+					mobileBalanceMode === "adaptive"
+						? undefined
+						: { gridTemplateColumns: mobileGridTemplate }
+				}
+			>
+				{isRepoStar ? (
+					<>
+						<a
+							href={actorCardHref}
+							target="_blank"
+							rel="noreferrer"
+							data-social-card-segment="actor"
+							aria-label={`打开 ${actor.login}`}
+							title={actor.login}
+							className={cn(
+								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+								mobileBalanceMode === "adaptive"
+									? "shrink-0 justify-start"
+									: "w-full justify-start",
+							)}
+						>
+							<span
+								ref={mobileActorGroupRef}
+								className="flex min-w-0 max-w-full items-center gap-2"
+							>
+								<SocialActorAvatar
+									key={actor.avatar_url ?? actor.login}
+									actor={actor}
+									className="size-7"
+								/>
+								<p
+									data-social-card-primary="true"
+									data-social-card-primary-full={actor.login}
+									data-social-card-primary-mobile={actorMobileLabel}
+									title={actor.login}
+									className="min-w-0 truncate text-[10px] leading-none font-medium tracking-tight text-foreground/78"
+								>
+									<span data-social-card-primary-mobile-label="true">
+										{actorMobileLabel}
+									</span>
+								</p>
+							</span>
+						</a>
+						<div
+							ref={mobileActionShellRef}
+							className="flex items-center justify-center"
+						>
+							<SocialActionChip icon={Star} title="标星" />
+						</div>
+						<a
+							href={targetCardHref ?? undefined}
+							target="_blank"
+							rel="noreferrer"
+							data-social-card-segment="target"
+							className={cn(
+								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+								mobileBalanceMode === "adaptive"
+									? "shrink-0 justify-end"
+									: "w-full justify-start",
+							)}
+						>
+							<span
+								ref={mobileTargetGroupRef}
+								className="flex min-w-0 max-w-full items-center gap-2"
+							>
+								<SocialRepoAvatar
+									key={[
+										item.repo_visual?.owner_avatar_url ?? "",
+										item.repo_visual?.open_graph_image_url ?? "",
+										item.repo_visual?.uses_custom_open_graph_image ? "1" : "0",
+										item.repo_full_name ?? "",
+									].join("|")}
+									repoVisual={item.repo_visual}
+									className="size-7 border-border/60"
+								/>
+								<p
+									data-social-card-primary="true"
+									data-social-card-primary-full={
+										item.repo_full_name ?? "你的仓库"
+									}
+									data-social-card-primary-mobile={targetMobileLabel}
+									title={item.repo_full_name ?? "你的仓库"}
+									className="min-w-0 truncate font-mono text-[10px] leading-none font-medium tracking-tight text-foreground"
+								>
+									<span data-social-card-primary-mobile-label="true">
+										{targetMobileLabel}
+									</span>
+								</p>
+							</span>
+						</a>
+					</>
+				) : (
+					<>
+						<a
+							href={actorCardHref}
+							target="_blank"
+							rel="noreferrer"
+							data-social-card-segment="actor"
+							className={cn(
+								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+								mobileBalanceMode === "adaptive"
+									? "shrink-0 justify-start"
+									: "w-full justify-start",
+							)}
+						>
+							<span
+								ref={mobileActorGroupRef}
+								className="flex min-w-0 max-w-full items-center gap-2"
+							>
+								<SocialActorAvatar
+									key={actor.avatar_url ?? actor.login}
+									actor={actor}
+									className="size-7"
+								/>
+								<p
+									data-social-card-primary="true"
+									data-social-card-primary-full={actor.login}
+									data-social-card-primary-mobile={actorMobileLabel}
+									title={actor.login}
+									className="min-w-0 truncate text-[10px] leading-none font-semibold tracking-tight text-foreground"
+								>
+									<span data-social-card-primary-mobile-label="true">
+										{actorMobileLabel}
+									</span>
+								</p>
+							</span>
+						</a>
+						<div
+							ref={mobileActionShellRef}
+							className="flex items-center justify-center"
+						>
+							<SocialActionChip icon={UserPlus} title="关注" />
+						</div>
+						{targetViewerHref ? (
+							<a
+								href={targetViewerHref}
+								target="_blank"
+								rel="noreferrer"
+								data-social-card-segment="target"
+								className={cn(
+									"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+									mobileBalanceMode === "adaptive"
+										? "shrink-0 justify-end"
+										: "w-full justify-start",
+								)}
+							>
+								<span
+									ref={mobileTargetGroupRef}
+									className="flex min-w-0 max-w-full items-center gap-2"
+								>
+									<SocialActorAvatar
+										key={targetViewer.avatar_url ?? targetViewer.login}
+										actor={targetViewer}
+										className="size-7"
+									/>
+									<p
+										data-social-card-primary="true"
+										data-social-card-primary-full={targetViewer.login}
+										data-social-card-primary-mobile={targetViewer.login}
+										title={targetViewer.login}
+										className="min-w-0 truncate text-[10px] leading-none font-medium text-foreground"
+									>
+										<span data-social-card-primary-mobile-label="true">
+											{targetViewer.login}
+										</span>
+									</p>
+								</span>
+							</a>
+						) : (
+							<div
+								data-social-card-segment="target"
+								className={cn(
+									"flex min-w-0 max-w-full items-center gap-2",
+									mobileBalanceMode === "adaptive"
+										? "shrink-0 justify-end"
+										: "w-full justify-start",
+								)}
+							>
+								<SocialActorAvatar
+									key={targetViewer.avatar_url ?? "viewer"}
+									actor={targetViewer}
+									className="size-7"
+								/>
+							</div>
+						)}
+					</>
+				)}
+			</div>
+			<div
+				data-social-card-row="true"
+				className={cn(
+					"hidden min-w-0 items-center gap-2 sm:grid sm:grid-cols-[minmax(0,1fr)_5.75rem_minmax(0,1fr)] sm:gap-3 md:grid-cols-[minmax(0,1fr)_164px_minmax(0,1fr)]",
+				)}
+			>
 				<SocialEntityCard
 					href={actorCardHref}
+					segment="actor"
 					avatar={
 						<SocialActorAvatar
 							key={actor.avatar_url ?? actor.login}
@@ -440,10 +854,12 @@ function SocialActivityCard(props: {
 				<SocialActionBridge
 					icon={isRepoStar ? Star : UserPlus}
 					title={isRepoStar ? "标星" : "关注"}
+					className="px-0"
 				/>
 				{isRepoStar ? (
 					<SocialEntityCard
 						href={targetCardHref}
+						segment="target"
 						avatar={
 							<SocialRepoAvatar
 								key={[
@@ -462,6 +878,7 @@ function SocialActivityCard(props: {
 				) : (
 					<SocialEntityCard
 						href={null}
+						segment="target"
 						avatar={
 							<SocialActorAvatar
 								key={targetViewer.avatar_url ?? targetViewer.login}
