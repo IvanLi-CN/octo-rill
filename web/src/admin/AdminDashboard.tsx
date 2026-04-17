@@ -25,10 +25,10 @@ import {
 import {
 	type AdminDashboardResponse,
 	type AdminDashboardTaskStatusItem,
+	type AdminDashboardWindowValue,
 	ApiError,
 	apiGetAdminDashboard,
 } from "@/api";
-import { readBrowserTimeZone } from "@/briefs/DailyBriefProfileForm";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -38,6 +38,7 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 const NUMBER_FORMATTER = new Intl.NumberFormat();
@@ -54,8 +55,8 @@ const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 });
 
 const TASK_COLORS = {
-	翻译: "#6366f1",
-	智能摘要: "#06b6d4",
+	翻译: "#4f46e5",
+	智能摘要: "#0891b2",
 	日报: "#f59e0b",
 } as const;
 
@@ -74,6 +75,10 @@ const STATUS_LABELS = {
 	failed: "失败",
 	canceled: "取消",
 } as const;
+const WINDOW_LABELS: Record<AdminDashboardWindowValue, string> = {
+	"7d": "近 7 天",
+	"30d": "近 30 天",
+};
 const OVERVIEW_SKELETON_HERO_KEYS = [
 	"hero-kpi-users",
 	"hero-kpi-active",
@@ -235,10 +240,14 @@ export function AdminDashboard() {
 	const [loading, setLoading] = useState(true);
 	const [refreshing, setRefreshing] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const timeZone = useMemo(() => readBrowserTimeZone(), []);
+	const [windowValue, setWindowValue] =
+		useState<AdminDashboardWindowValue>("7d");
 
 	const loadDashboard = useCallback(
-		async (mode: "initial" | "refresh" = "initial") => {
+		async (
+			window: AdminDashboardWindowValue,
+			mode: "initial" | "refresh" = "initial",
+		) => {
 			if (mode === "initial") {
 				setLoading(true);
 			} else {
@@ -246,7 +255,7 @@ export function AdminDashboard() {
 			}
 			setError(null);
 			try {
-				const next = await apiGetAdminDashboard(timeZone);
+				const next = await apiGetAdminDashboard(window);
 				setData(next);
 			} catch (err) {
 				if (err instanceof ApiError) {
@@ -259,16 +268,17 @@ export function AdminDashboard() {
 				setRefreshing(false);
 			}
 		},
-		[timeZone],
+		[],
 	);
 
 	useEffect(() => {
-		void loadDashboard("initial");
-	}, [loadDashboard]);
+		void loadDashboard(windowValue, "initial");
+	}, [loadDashboard, windowValue]);
 
+	const statusItems = data?.status_breakdown.items ?? [];
 	const todayChartData = useMemo(
 		() =>
-			(data?.today.task_status ?? []).map((item) => ({
+			statusItems.map((item) => ({
 				label: item.label,
 				queued: item.queued,
 				running: item.running,
@@ -276,12 +286,12 @@ export function AdminDashboard() {
 				failed: item.failed,
 				canceled: item.canceled,
 			})),
-		[data],
+		[statusItems],
 	);
 
 	const trendChartData = useMemo(
 		() =>
-			(data?.trends ?? []).map((item) => ({
+			(data?.trend_points ?? []).map((item) => ({
 				label: item.label,
 				翻译: item.translations_total,
 				智能摘要: item.summaries_total,
@@ -294,23 +304,26 @@ export function AdminDashboard() {
 
 	const shareChartData = useMemo(
 		() =>
-			(data?.today.task_status ?? [])
+			(data?.task_share ?? [])
 				.filter((item) => item.total > 0)
 				.map((item) => ({
 					name: item.label,
 					value: item.total,
 					fill: chartTaskColor(item.label),
+					share_ratio: item.share_ratio,
 				})),
 		[data],
 	);
 
 	const highestVolumeTask = useMemo(() => {
-		const items = data?.today.task_status ?? [];
-		return items.reduce<AdminDashboardTaskStatusItem | null>((best, item) => {
-			if (!best || item.total > best.total) return item;
-			return best;
-		}, null);
-	}, [data]);
+		return statusItems.reduce<AdminDashboardTaskStatusItem | null>(
+			(best, item) => {
+				if (!best || item.total > best.total) return item;
+				return best;
+			},
+			null,
+		);
+	}, [statusItems]);
 
 	if (loading && !data) {
 		return <OverviewSkeleton />;
@@ -319,13 +332,16 @@ export function AdminDashboard() {
 	return (
 		<div className="space-y-4" data-admin-dashboard-shell="true">
 			{error ? (
-				<div className="rounded-2xl border border-rose-300 bg-rose-100/80 px-4 py-3 text-sm text-rose-900 dark:border-rose-500/60 dark:bg-rose-500/15 dark:text-rose-100">
+				<div
+					role="alert"
+					className="rounded-2xl border border-rose-300 bg-rose-100/80 px-4 py-3 text-sm text-rose-900 dark:border-rose-500/60 dark:bg-rose-500/15 dark:text-rose-100"
+				>
 					<div className="flex flex-wrap items-center justify-between gap-3">
 						<span>仪表盘数据加载失败：{error}</span>
 						<Button
 							size="sm"
 							variant="outline"
-							onClick={() => void loadDashboard("refresh")}
+							onClick={() => void loadDashboard(windowValue, "refresh")}
 						>
 							重试
 						</Button>
@@ -338,7 +354,7 @@ export function AdminDashboard() {
 					className="relative overflow-hidden border-border/80 bg-card/88 shadow-sm"
 					data-admin-dashboard-hero="true"
 				>
-					<div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-[radial-gradient(circle_at_top_left,rgba(99,102,241,0.18),transparent_48%),radial-gradient(circle_at_top_right,rgba(6,182,212,0.18),transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.18),transparent)] dark:bg-[radial-gradient(circle_at_top_left,rgba(99,102,241,0.22),transparent_48%),radial-gradient(circle_at_top_right,rgba(6,182,212,0.18),transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.04),transparent)]" />
+					<div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-[radial-gradient(circle_at_top_left,rgba(79,70,229,0.18),transparent_48%),radial-gradient(circle_at_top_right,rgba(8,145,178,0.16),transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.18),transparent)] dark:bg-[radial-gradient(circle_at_top_left,rgba(79,70,229,0.22),transparent_48%),radial-gradient(circle_at_top_right,rgba(8,145,178,0.2),transparent_42%),linear-gradient(180deg,rgba(255,255,255,0.04),transparent)]" />
 					<CardHeader className="relative gap-3">
 						<div className="flex flex-wrap items-start justify-between gap-3">
 							<div className="space-y-2">
@@ -350,36 +366,59 @@ export function AdminDashboard() {
 										管理仪表盘
 									</Badge>
 									<Badge variant="outline" className="bg-background/70">
-										Rollup 已记录
+										预聚合 + 今日实时覆盖
 									</Badge>
 								</div>
 								<CardTitle className="text-2xl tracking-tight md:text-[1.9rem]">
 									运营总览与任务态势一屏收口
 								</CardTitle>
 								<CardDescription className="max-w-3xl text-sm leading-6">
-									聚焦用户规模、今日活跃、翻译 / 智能摘要 /
-									日报三条任务链路的执行态势， 并使用按天 rollup
-									的趋势记录来支撑统计分析。
+									按系统时区统一展示用户规模、今日活跃与翻译 / 智能摘要 /
+									日报三条任务链路，历史趋势基于定时
+									rollup，今日指标使用实时覆盖。
 								</CardDescription>
 							</div>
-							<div className="flex flex-wrap items-center gap-2">
-								<Badge variant="outline" className="bg-background/70">
-									时区 {data?.time_zone ?? timeZone}
-								</Badge>
-								<Button
-									size="sm"
-									variant="secondary"
-									disabled={refreshing}
-									onClick={() => void loadDashboard("refresh")}
+							<div className="flex flex-col items-start gap-2 sm:items-end">
+								<div className="flex flex-wrap items-center gap-2">
+									<Badge variant="outline" className="bg-background/70">
+										系统时区 {data?.time_zone ?? "-"}
+									</Badge>
+									<Button
+										size="sm"
+										variant="secondary"
+										disabled={refreshing}
+										onClick={() => void loadDashboard(windowValue, "refresh")}
+									>
+										<RefreshCw
+											className={cn(
+												"mr-1.5 size-4",
+												refreshing && "animate-spin",
+											)}
+										/>
+										刷新
+									</Button>
+								</div>
+								<Tabs
+									value={windowValue}
+									onValueChange={(value) => {
+										setWindowValue(value as AdminDashboardWindowValue);
+									}}
 								>
-									<RefreshCw
-										className={cn(
-											"mr-1.5 size-4",
-											refreshing && "animate-spin",
-										)}
-									/>
-									刷新
-								</Button>
+									<TabsList className="h-9 gap-1 rounded-full border border-border/60 bg-background/75 p-1 shadow-sm">
+										<TabsTrigger
+											value="7d"
+											className="rounded-full px-3 text-xs"
+										>
+											近 7 天
+										</TabsTrigger>
+										<TabsTrigger
+											value="30d"
+											className="rounded-full px-3 text-xs"
+										>
+											近 30 天
+										</TabsTrigger>
+									</TabsList>
+								</Tabs>
 							</div>
 						</div>
 					</CardHeader>
@@ -387,36 +426,46 @@ export function AdminDashboard() {
 						<div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
 							<StatCard
 								label="用户总数"
-								value={formatCount(data?.kpis.total_users)}
-								description="累计注册并纳入后台可管理范围的账号总量。"
+								value={formatCount(data?.summary.total_users)}
+								description="当前后台可管理用户规模，用于衡量整体盘子大小。"
 								accentClass="bg-gradient-to-br from-indigo-500/14 via-card to-card"
 								icon={Users}
 							/>
 							<StatCard
 								label="今日活跃用户"
-								value={formatCount(data?.kpis.active_users_today)}
-								description="按当前查看时区统计，当日发生过站内活动的用户数。"
+								value={formatCount(data?.summary.active_users_today)}
+								description="按系统时区统计，今天截至当前已发生站内活动的用户数。"
 								accentClass="bg-gradient-to-br from-cyan-500/12 via-card to-card"
 								icon={Sparkles}
 							/>
 							<StatCard
 								label="进行中任务"
-								value={formatCount(data?.kpis.ongoing_tasks_total)}
-								description={`排队 ${formatCount(data?.kpis.queued_tasks)} · 运行中 ${formatCount(data?.kpis.running_tasks)}`}
+								value={formatCount(data?.summary.ongoing_tasks_total)}
+								description={`排队 ${formatCount(data?.summary.queued_tasks)} · 运行中 ${formatCount(data?.summary.running_tasks)}`}
 								accentClass="bg-gradient-to-br from-amber-500/14 via-card to-card"
 								icon={Activity}
 							/>
 							<StatCard
 								label="今日任务总量"
-								value={formatCount(data?.today.total)}
-								description={`成功 ${formatCount(data?.today.succeeded_total)} · 失败 ${formatCount(data?.today.failed_total)}`}
+								value={formatCount(data?.status_breakdown.total)}
+								description={`成功 ${formatCount(data?.status_breakdown.succeeded_total)} · 失败 ${formatCount(data?.status_breakdown.failed_total)}`}
 								accentClass="bg-gradient-to-br from-emerald-500/14 via-card to-card"
 								icon={RefreshCw}
 							/>
 						</div>
 						<div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
 							<span>
-								统计窗口 {data?.window_start ?? "-"} → {data?.window_end ?? "-"}
+								窗口 {data?.window_meta.window_start ?? "-"} →{" "}
+								{data?.window_meta.window_end ?? "-"}
+							</span>
+							<span>·</span>
+							<span>
+								{
+									WINDOW_LABELS[
+										data?.window_meta.selected_window ?? windowValue
+									]
+								}
+								趋势
 							</span>
 							<span>·</span>
 							<span>最近更新 {formatGeneratedAt(data?.generated_at)}</span>
@@ -428,7 +477,7 @@ export function AdminDashboard() {
 					<CardHeader>
 						<CardTitle>进行中链路</CardTitle>
 						<CardDescription>
-							以当前队列实时状态补充今日 rollup 视图，优先暴露运营阻塞点。
+							实时查询当前队列，专门补齐今日与历史预聚合之间的时效差。
 						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-3">
@@ -436,17 +485,17 @@ export function AdminDashboard() {
 							{[
 								{
 									label: "翻译",
-									value: data?.kpis.ongoing_by_task.translations ?? 0,
+									value: data?.summary.ongoing_by_task.translations ?? 0,
 									description: "发布翻译批任务",
 								},
 								{
 									label: "智能摘要",
-									value: data?.kpis.ongoing_by_task.summaries ?? 0,
+									value: data?.summary.ongoing_by_task.summaries ?? 0,
 									description: "发布摘要批任务",
 								},
 								{
 									label: "日报",
-									value: data?.kpis.ongoing_by_task.briefs ?? 0,
+									value: data?.summary.ongoing_by_task.briefs ?? 0,
 									description: "日报生成任务",
 								},
 							].map((item) => (
@@ -483,12 +532,10 @@ export function AdminDashboard() {
 						<div className="rounded-2xl border border-border/70 bg-background/70 p-4">
 							<div className="flex items-center justify-between gap-3">
 								<div>
-									<p className="text-muted-foreground text-xs">
-										今日主视图焦点
-									</p>
+									<p className="text-muted-foreground text-xs">今日实时焦点</p>
 									<p className="mt-1 text-base font-semibold">
 										{highestVolumeTask
-											? `${highestVolumeTask.label} 任务量最高`
+											? `${highestVolumeTask.label} 当前任务量最高`
 											: "暂无今日任务数据"}
 									</p>
 								</div>
@@ -517,7 +564,9 @@ export function AdminDashboard() {
 										className={statusBadgeClass(status)}
 									>
 										{STATUS_LABELS[status]}{" "}
-										{formatCount(data?.today[`${status}_total` as const] ?? 0)}
+										{formatCount(
+											data?.status_breakdown[`${status}_total` as const] ?? 0,
+										)}
 									</Badge>
 								))}
 							</div>
@@ -531,7 +580,7 @@ export function AdminDashboard() {
 					<CardHeader>
 						<CardTitle>今日执行状态分布</CardTitle>
 						<CardDescription>
-							按任务类型拆分今日队列 / 运行 / 成功 / 失败 / 取消情况。
+							按任务类型拆分今日排队 / 运行 / 成功 / 失败 / 取消的实时状态。
 						</CardDescription>
 					</CardHeader>
 					<CardContent>
@@ -549,6 +598,7 @@ export function AdminDashboard() {
 									<Legend />
 									<Bar
 										dataKey="queued"
+										name="排队"
 										stackId="status"
 										fill={STATUS_COLORS.queued}
 										radius={[8, 8, 0, 0]}
@@ -556,24 +606,28 @@ export function AdminDashboard() {
 									/>
 									<Bar
 										dataKey="running"
+										name="运行中"
 										stackId="status"
 										fill={STATUS_COLORS.running}
 										isAnimationActive={false}
 									/>
 									<Bar
 										dataKey="succeeded"
+										name="成功"
 										stackId="status"
 										fill={STATUS_COLORS.succeeded}
 										isAnimationActive={false}
 									/>
 									<Bar
 										dataKey="failed"
+										name="失败"
 										stackId="status"
 										fill={STATUS_COLORS.failed}
 										isAnimationActive={false}
 									/>
 									<Bar
 										dataKey="canceled"
+										name="取消"
 										stackId="status"
 										fill={STATUS_COLORS.canceled}
 										radius={[8, 8, 0, 0]}
@@ -589,7 +643,7 @@ export function AdminDashboard() {
 					<CardHeader>
 						<CardTitle>今日任务占比</CardTitle>
 						<CardDescription>
-							快速判断今天压力主要落在哪条链路上。
+							快速判断今天的压力主要落在哪条链路上。
 						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-4">
@@ -616,21 +670,32 @@ export function AdminDashboard() {
 							</ResponsiveContainer>
 						</div>
 						<div className="grid gap-2">
-							{shareChartData.map((item) => (
-								<div
-									key={item.name}
-									className="flex items-center justify-between rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-sm"
-								>
-									<div className="flex items-center gap-2">
-										<span
-											className="size-2.5 rounded-full"
-											style={{ backgroundColor: item.fill }}
-										/>
-										<span>{item.name}</span>
+							{shareChartData.length > 0 ? (
+								shareChartData.map((item) => (
+									<div
+										key={item.name}
+										className="flex items-center justify-between rounded-xl border border-border/70 bg-background/70 px-3 py-2 text-sm"
+									>
+										<div className="flex items-center gap-2">
+											<span
+												className="size-2.5 rounded-full"
+												style={{ backgroundColor: item.fill }}
+											/>
+											<span>{item.name}</span>
+										</div>
+										<div className="text-right">
+											<p className="font-medium">{formatCount(item.value)}</p>
+											<p className="text-muted-foreground text-xs">
+												{formatPercent(item.share_ratio)}
+											</p>
+										</div>
 									</div>
-									<span className="font-medium">{formatCount(item.value)}</span>
+								))
+							) : (
+								<div className="rounded-xl border border-dashed border-border/70 bg-background/70 px-3 py-4 text-sm text-muted-foreground">
+									今日暂无可视化任务占比数据。
 								</div>
-							))}
+							)}
 						</div>
 					</CardContent>
 				</Card>
@@ -639,9 +704,10 @@ export function AdminDashboard() {
 			<div className="grid gap-4 2xl:grid-cols-[1.45fr_0.95fr]">
 				<Card className="border-border/80 bg-card/88 shadow-sm">
 					<CardHeader>
-						<CardTitle>近 7 日任务趋势</CardTitle>
+						<CardTitle>{WINDOW_LABELS[windowValue]}任务趋势</CardTitle>
 						<CardDescription>
-							趋势图基于每日 rollup，适合快速观察波峰与链路偏移。
+							历史序列来自定时
+							rollup，今日点位用实时数据覆盖，避免今日数据延迟。
 						</CardDescription>
 					</CardHeader>
 					<CardContent>
@@ -705,7 +771,12 @@ export function AdminDashboard() {
 										</linearGradient>
 									</defs>
 									<CartesianGrid strokeDasharray="3 3" strokeOpacity={0.24} />
-									<XAxis dataKey="label" tickLine={false} axisLine={false} />
+									<XAxis
+										dataKey="label"
+										tickLine={false}
+										axisLine={false}
+										minTickGap={windowValue === "30d" ? 18 : 8}
+									/>
 									<YAxis
 										tickLine={false}
 										axisLine={false}
@@ -747,7 +818,7 @@ export function AdminDashboard() {
 					<CardHeader>
 						<CardTitle>活跃用户与规模</CardTitle>
 						<CardDescription>
-							辅助判断活跃波动是否与任务量变化同步。
+							辅助判断用户活跃波动是否与任务量变化同步。
 						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-4">
@@ -755,7 +826,12 @@ export function AdminDashboard() {
 							<ResponsiveContainer width="100%" height="100%">
 								<BarChart data={trendChartData}>
 									<CartesianGrid strokeDasharray="3 3" strokeOpacity={0.24} />
-									<XAxis dataKey="label" tickLine={false} axisLine={false} />
+									<XAxis
+										dataKey="label"
+										tickLine={false}
+										axisLine={false}
+										minTickGap={windowValue === "30d" ? 18 : 8}
+									/>
 									<YAxis
 										tickLine={false}
 										axisLine={false}
@@ -786,14 +862,14 @@ export function AdminDashboard() {
 								<div>
 									<p className="text-muted-foreground text-xs">活跃 / 总用户</p>
 									<p className="mt-1 text-lg font-semibold">
-										{formatCount(data?.kpis.active_users_today)} /{" "}
-										{formatCount(data?.kpis.total_users)}
+										{formatCount(data?.today_live.active_users)} /{" "}
+										{formatCount(data?.today_live.total_users)}
 									</p>
 								</div>
 								<div>
 									<p className="text-muted-foreground text-xs">实时进行中</p>
 									<p className="mt-1 text-lg font-semibold">
-										{formatCount(data?.kpis.ongoing_tasks_total)}
+										{formatCount(data?.today_live.ongoing_tasks_total)}
 									</p>
 								</div>
 							</div>
@@ -824,7 +900,7 @@ export function AdminDashboard() {
 								</tr>
 							</thead>
 							<tbody>
-								{(data?.today.task_status ?? []).map((item) => (
+								{statusItems.map((item) => (
 									<tr key={item.task_type} className="rounded-2xl bg-muted/25">
 										<td className="rounded-l-2xl border-y border-l border-border/70 px-3 py-3">
 											<div className="flex items-center gap-3">

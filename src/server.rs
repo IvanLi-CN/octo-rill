@@ -313,6 +313,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             sync::spawn_repo_release_recovery_worker(app_state.clone());
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
+        jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
         {
             tracing::warn!(?err, "failed to enqueue brief history recompute bootstrap");
