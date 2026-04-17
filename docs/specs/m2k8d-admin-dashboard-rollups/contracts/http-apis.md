@@ -1,20 +1,20 @@
 # HTTP API contracts
 
-## New: `GET /api/admin/dashboard`
+## `GET /api/admin/dashboard`
 
 ### Query params
 
-- `time_zone` (optional): IANA time zone string. When omitted, server falls back to the configured default daily brief time zone.
+- `window` (optional): `7d` or `30d`.
+  - Omitted: defaults to `7d`
+  - Invalid value: responds with validation error
 
 ### Response
 
 ```json
 {
-  "generated_at": "2026-04-18T02:30:00Z",
+  "generated_at": "2026-04-18T03:00:00Z",
   "time_zone": "Asia/Shanghai",
-  "window_start": "2026-04-12",
-  "window_end": "2026-04-18",
-  "kpis": {
+  "summary": {
     "total_users": 128,
     "active_users_today": 36,
     "ongoing_tasks_total": 9,
@@ -26,14 +26,22 @@
       "briefs": 2
     }
   },
-  "today": {
+  "today_live": {
+    "date": "2026-04-18",
+    "total_users": 128,
+    "active_users": 36,
+    "ongoing_tasks_total": 9,
+    "queued_tasks": 4,
+    "running_tasks": 5
+  },
+  "status_breakdown": {
     "queued_total": 6,
     "running_total": 5,
     "succeeded_total": 42,
     "failed_total": 3,
     "canceled_total": 1,
     "total": 57,
-    "task_status": [
+    "items": [
       {
         "task_type": "translate.release.batch",
         "label": "翻译",
@@ -47,7 +55,16 @@
       }
     ]
   },
-  "trends": [
+  "task_share": [
+    {
+      "task_type": "translate.release.batch",
+      "label": "翻译",
+      "total": 30,
+      "share_ratio": 0.52,
+      "success_rate": 0.96
+    }
+  ],
+  "trend_points": [
     {
       "date": "2026-04-18",
       "label": "04-18",
@@ -60,12 +77,21 @@
       "briefs_total": 9,
       "briefs_failed": 1
     }
-  ]
+  ],
+  "window_meta": {
+    "selected_window": "30d",
+    "available_windows": ["7d", "30d"],
+    "window_start": "2026-03-20",
+    "window_end": "2026-04-18",
+    "point_count": 30
+  }
 }
 ```
 
 ### Notes
 
 - Requires admin session.
-- Response always covers a rolling 7-day window ending at the current local date under the resolved time zone.
-- `task_status` and `trends` are limited to translation, smart summary, and daily brief tasks.
+- Statistics always use the configured system time zone, not the browser time zone.
+- `summary` and `today_live` reflect today's real-time snapshot.
+- `trend_points` come from rollups, but the point for today is overwritten by live stats.
+- `status_breakdown.items`, `task_share`, and `trend_points` are limited to translation, smart summary, and daily brief tasks.

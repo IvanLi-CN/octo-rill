@@ -1,6 +1,6 @@
 # Database contract
 
-## New table
+## Table
 
 `admin_dashboard_daily_rollups`
 
@@ -26,8 +26,9 @@ Index:
 
 ## Upsert rules
 
-- Rollups are written per local day, per time zone, per task type.
-- Reads of `GET /api/admin/dashboard` must upsert the latest 7-day window before returning the response.
-- `total_users` is counted from users created before the end of the target local day.
-- `active_users` is counted from users whose `last_active_at` falls within the target local day.
+- Rollups are written per local day, per system time zone, per task type.
+- Scheduler refreshes the latest 30-day window and upserts every row idempotently.
+- `total_users` counts users created before the end of the target local day.
+- `active_users` counts users whose `last_active_at` falls within the target local day.
 - Task status counts are computed from `job_tasks.created_at` within the target local day.
+- Time boundary comparisons use SQLite `julianday(...)` semantics so sub-second timestamps are preserved correctly.

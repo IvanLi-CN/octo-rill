@@ -234,6 +234,13 @@ export type AdminDashboardTaskStatusItem = {
 	total: number;
 	success_rate: number;
 };
+export type AdminDashboardTaskShareItem = {
+	task_type: string;
+	label: string;
+	total: number;
+	share_ratio: number;
+	success_rate: number;
+};
 export type AdminDashboardTrendPoint = {
 	date: string;
 	label: string;
@@ -246,12 +253,11 @@ export type AdminDashboardTrendPoint = {
 	briefs_total: number;
 	briefs_failed: number;
 };
+export type AdminDashboardWindowValue = "7d" | "30d";
 export type AdminDashboardResponse = {
 	generated_at: string;
 	time_zone: string;
-	window_start: string;
-	window_end: string;
-	kpis: {
+	summary: {
 		total_users: number;
 		active_users_today: number;
 		ongoing_tasks_total: number;
@@ -263,16 +269,32 @@ export type AdminDashboardResponse = {
 			briefs: number;
 		};
 	};
-	today: {
+	today_live: {
+		date: string;
+		total_users: number;
+		active_users: number;
+		ongoing_tasks_total: number;
+		queued_tasks: number;
+		running_tasks: number;
+	};
+	status_breakdown: {
 		queued_total: number;
 		running_total: number;
 		succeeded_total: number;
 		failed_total: number;
 		canceled_total: number;
 		total: number;
-		task_status: AdminDashboardTaskStatusItem[];
+		items: AdminDashboardTaskStatusItem[];
 	};
-	trends: AdminDashboardTrendPoint[];
+	task_share: AdminDashboardTaskShareItem[];
+	trend_points: AdminDashboardTrendPoint[];
+	window_meta: {
+		selected_window: AdminDashboardWindowValue;
+		available_windows: AdminDashboardWindowValue[];
+		window_start: string;
+		window_end: string;
+		point_count: number;
+	};
 };
 export type AdminRealtimeTaskItem = {
 	id: string;
@@ -569,12 +591,10 @@ export async function apiPatchMeProfile(
 	return apiPatchJson<MeProfileResponse>("/api/me/profile", body);
 }
 export async function apiGetAdminDashboard(
-	timeZone: string,
+	window: AdminDashboardWindowValue,
 ): Promise<AdminDashboardResponse> {
 	const params = new URLSearchParams();
-	if (timeZone.trim()) {
-		params.set("time_zone", timeZone.trim());
-	}
+	params.set("window", window);
 	return apiGet<AdminDashboardResponse>(
 		`/api/admin/dashboard${params.size > 0 ? `?${params.toString()}` : ""}`,
 	);
