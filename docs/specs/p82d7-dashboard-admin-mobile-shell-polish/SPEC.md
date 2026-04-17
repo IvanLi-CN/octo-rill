@@ -76,6 +76,7 @@
 - Dashboard 小屏内容区、卡片边距、卡片内 padding 和 reaction 区 spacing 都要比当前版本更紧凑。
 - Dashboard 右侧 `Inbox` quick list 仅在桌面侧栏显示；移动端不得在主内容下方重复渲染。
 - 当右侧 `Inbox` quick list 不显示时，不得为了该卡片在启动期预取 `/api/notifications`；移动端只在进入 `收件箱` tab 后再加载通知数据。
+- Dashboard 移动端 `收件箱` tab 头部的 `Sync inbox` / `GitHub` 次级操作应收敛为 icon-only 按钮，避免和标题抢横向空间。
 - Storybook 与 Playwright 必须补齐移动端回归与视觉证据。
 
 ### SHOULD
@@ -156,6 +157,10 @@
   When 页面完成首屏渲染
   Then 页面下方不存在右侧 `Inbox` quick list，且在用户点击 `收件箱` tab 前不会请求 `/api/notifications`。
 
+- Given 用户在小屏幕进入 Dashboard 的 `收件箱` tab
+  When 收件箱列表头部出现 `Sync inbox` 与 `GitHub` 次级操作
+  Then 两个操作都应展示为仅图标按钮，不再显示文字标签。
+
 - Given 移动端 Admin Users 或 Admin Jobs 页面
   When 页面离开顶部后继续向下滚动浏览内容
   Then 共享 footer auto-hide 与 compact header 生效，同时管理员导航仍可见。
@@ -227,7 +232,7 @@
 - source_type: storybook_canvas
   story_id_or_title: `pages-dashboard--mobile-inbox-tab-without-sidebar-quick-list`
   state: inbox tab only on mobile
-  evidence_note: 验证移动端进入 `收件箱` tab 时只保留主内容里的 Inbox 列表，不再在主内容下方重复渲染右侧 quick list。
+  evidence_note: 验证移动端进入 `收件箱` tab 时只保留主内容里的 Inbox 列表，同时 `Sync inbox` / `GitHub` 次级操作都已收敛为 icon-only 按钮，不再占用额外横向空间。
   image:
   ![Dashboard 移动端仅在收件箱 tab 展示 Inbox 列表](./assets/dashboard-mobile-inbox-tab-only-light.png)
 

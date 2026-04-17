@@ -46,21 +46,21 @@ export function InboxList(props: {
 							<Button
 								variant="outline"
 								size="sm"
-								className="font-mono text-xs"
+								className="h-8 w-8 px-0 font-mono text-xs sm:w-auto sm:px-3"
 								disabled={busy}
 								onClick={onSync}
 							>
 								<RefreshCcw
 									className={syncing ? "size-4 animate-spin" : "size-4"}
 								/>
-								Sync inbox
+								<span className="sr-only sm:not-sr-only">Sync inbox</span>
 							</Button>
 						) : null}
 						<Button
 							asChild
 							variant="outline"
 							size="sm"
-							className="font-mono text-xs"
+							className="h-8 w-8 px-0 font-mono text-xs sm:w-auto sm:px-3"
 						>
 							<a
 								href="https://github.com/notifications"
@@ -68,7 +68,7 @@ export function InboxList(props: {
 								rel="noreferrer"
 							>
 								<ArrowUpRight className="size-4" />
-								GitHub
+								<span className="sr-only sm:not-sr-only">GitHub</span>
 							</a>
 						</Button>
 					</div>

@@ -2161,6 +2161,12 @@ export const MobileInboxTabWithoutSidebarQuickList: Story = {
 			canvasElement.querySelector("[data-dashboard-sidebar-inbox='true']"),
 		).toBeNull();
 		await expect(canvas.getByText("Build failed on main")).toBeVisible();
+		const syncButton = canvas.getByRole("button", { name: "Sync inbox" });
+		const githubLink = canvas.getByRole("link", { name: "GitHub" });
+		const syncRect = syncButton.getBoundingClientRect();
+		const githubRect = githubLink.getBoundingClientRect();
+		expect(Math.round(syncRect.width)).toBeLessThanOrEqual(36);
+		expect(Math.round(githubRect.width)).toBeLessThanOrEqual(36);
 	},
 };
 
