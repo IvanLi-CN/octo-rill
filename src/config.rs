@@ -98,6 +98,7 @@ pub struct AppConfig {
     pub job_worker_concurrency: usize,
     pub encryption_key: EncryptionKey,
     pub github: GitHubOAuthConfig,
+    pub linuxdo: Option<LinuxDoOAuthConfig>,
     pub ai: Option<AiConfig>,
     pub ai_max_concurrency: usize,
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
@@ -106,6 +107,13 @@ pub struct AppConfig {
 
 #[derive(Clone)]
 pub struct GitHubOAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_url: Url,
+}
+
+#[derive(Clone)]
+pub struct LinuxDoOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: Url,
@@ -138,6 +146,16 @@ impl fmt::Debug for GitHubOAuthConfig {
     }
 }
 
+impl fmt::Debug for LinuxDoOAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LinuxDoOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_url", &self.redirect_url)
+            .finish()
+    }
+}
+
 impl fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppConfig")
@@ -148,6 +166,7 @@ impl fmt::Debug for AppConfig {
             .field("task_log_dir", &self.task_log_dir)
             .field("job_worker_concurrency", &self.job_worker_concurrency)
             .field("github", &self.github)
+            .field("linuxdo", &self.linuxdo)
             .field("ai", &self.ai)
             .field("ai_max_concurrency", &self.ai_max_concurrency)
             .field("ai_daily_at_local", &self.ai_daily_at_local)
@@ -198,6 +217,38 @@ impl AppConfig {
             .context("GITHUB_OAUTH_REDIRECT_URL is required")?;
         let github_redirect_url =
             Url::parse(&github_redirect_url).context("invalid GITHUB_OAUTH_REDIRECT_URL")?;
+
+        let linuxdo = {
+            let client_id = env::var("LINUXDO_CLIENT_ID")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let client_secret = env::var("LINUXDO_CLIENT_SECRET")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            let redirect_url = env::var("LINUXDO_OAUTH_REDIRECT_URL")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+
+            match (client_id, client_secret, redirect_url) {
+                (None, None, None) => None,
+                (Some(client_id), Some(client_secret), Some(redirect_url)) => {
+                    Some(LinuxDoOAuthConfig {
+                        client_id,
+                        client_secret,
+                        redirect_url: Url::parse(&redirect_url)
+                            .context("invalid LINUXDO_OAUTH_REDIRECT_URL")?,
+                    })
+                }
+                _ => {
+                    anyhow::bail!(
+                        "LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET, and LINUXDO_OAUTH_REDIRECT_URL must be set together"
+                    )
+                }
+            }
+        };
 
         let ai = {
             let api_key = env::var("AI_API_KEY")
@@ -266,6 +317,7 @@ impl AppConfig {
                 client_secret: github_client_secret,
                 redirect_url: github_redirect_url,
             },
+            linuxdo,
             ai,
             ai_max_concurrency,
             ai_daily_at_local,
@@ -300,6 +352,9 @@ mod tests {
             env::remove_var("AI_MAX_CONCURRENCY");
             env::remove_var("APP_DEFAULT_TIME_ZONE");
             env::remove_var("OCTORILL_TASK_WORKERS");
+            env::remove_var("LINUXDO_CLIENT_ID");
+            env::remove_var("LINUXDO_CLIENT_SECRET");
+            env::remove_var("LINUXDO_OAUTH_REDIRECT_URL");
         }
     }
 
@@ -410,6 +465,48 @@ mod tests {
         assert!(
             err.to_string().contains(
                 "invalid APP_DEFAULT_TIME_ZONE (expected whole-hour IANA time zone year-round)"
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_accepts_linuxdo_oauth_when_all_vars_exist() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("LINUXDO_CLIENT_ID", "linuxdo-client-id");
+            env::set_var("LINUXDO_CLIENT_SECRET", "linuxdo-client-secret");
+            env::set_var(
+                "LINUXDO_OAUTH_REDIRECT_URL",
+                "http://127.0.0.1:58090/auth/linuxdo/callback",
+            );
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(
+            config
+                .linuxdo
+                .as_ref()
+                .map(|entry| entry.client_id.as_str()),
+            Some("linuxdo-client-id")
+        );
+    }
+
+    #[test]
+    fn from_env_rejects_partial_linuxdo_oauth_config() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("LINUXDO_CLIENT_ID", "linuxdo-client-id");
+        }
+
+        let err = AppConfig::from_env().expect_err("partial linuxdo oauth config should fail");
+
+        assert!(
+            err.to_string().contains(
+                "LINUXDO_CLIENT_ID, LINUXDO_CLIENT_SECRET, and LINUXDO_OAUTH_REDIRECT_URL must be set together"
             ),
             "unexpected error: {err:?}"
         );

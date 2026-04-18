@@ -8,6 +8,7 @@ mod crypto;
 mod error;
 mod github;
 mod jobs;
+mod linuxdo;
 mod local_id;
 mod runtime;
 mod server;

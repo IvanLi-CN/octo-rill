@@ -49,12 +49,126 @@ cp .env.example .env.local
   - `GITHUB_CLIENT_ID`
   - `GITHUB_CLIENT_SECRET`
   - `GITHUB_OAUTH_REDIRECT_URL`
+- LinuxDO Connect（可选；用于账号绑定）：
+  - `LINUXDO_CLIENT_ID`
+  - `LINUXDO_CLIENT_SECRET`
+  - `LINUXDO_OAUTH_REDIRECT_URL`
 - AI（可选；用于翻译与日报）：
   - `AI_API_KEY`
   - `AI_BASE_URL`
   - `AI_MODEL`
   - `AI_MAX_CONCURRENCY`（可选，单进程 LLM 最大并行数，默认 `1`）
   - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界；不配置时默认 `08:00`）
+
+### LinuxDO Connect（可选，自托管部署）
+
+如果你的自托管实例需要启用 LinuxDO 账号绑定，请按下面的部署顺序完成；这是一套完整的自托管落地方案，不只是环境变量清单。
+
+#### 1) 确定公开访问地址
+
+- 假设你的 OctoRill 对外地址是 `https://octorill.example.com`
+- LinuxDO OAuth 回调地址就固定为：
+
+```text
+https://octorill.example.com/auth/linuxdo/callback
+```
+
+- 这里必须使用 **LinuxDO Connect 能访问到的公开地址**
+- 不要填写 `127.0.0.1`、容器内地址、内网 IP、宿主机私网端口
+
+#### 2) 确认反向代理会把 callback 打到后端
+
+如果你前面有 Nginx / Caddy / Traefik，至少要保证：
+
+- `/auth/linuxdo/callback` 会被代理到 OctoRill backend
+- 用户最终访问的协议、域名、端口，与 LinuxDO Connect 后台登记的 callback 完全一致
+
+最常见的错误就是：
+
+- 页面用的是 `https://octorill.example.com`
+- 但回调地址登记成了 `http://127.0.0.1:58090/auth/linuxdo/callback`
+
+这样授权一定回不来。
+
+#### 3) 在 LinuxDO Connect 后台创建应用
+
+- 打开 LinuxDO Connect 后台，申请新接入 / 编辑已有应用
+- 把回调地址填写成上面的完整 callback URL
+- 保存后拿到 `Client Id` 和 `Client Secret`
+
+LinuxDO Wiki 官方说明见：
+
+- [Linux DO Connect](https://wiki.linux.do/Community/LinuxDoConnect)
+
+#### 4) 在 OctoRill 服务端同时设置这三项环境变量
+
+缺一不可：
+
+```bash
+LINUXDO_CLIENT_ID=<linuxdo-client-id>
+LINUXDO_CLIENT_SECRET=<linuxdo-client-secret>
+LINUXDO_OAUTH_REDIRECT_URL=https://octorill.example.com/auth/linuxdo/callback
+```
+
+规则是：
+
+- 三项都为空：LinuxDO 绑定保持关闭
+- 三项都存在：LinuxDO 绑定启用
+- 只填一部分：OctoRill 启动失败
+
+#### 5) 常见部署写法
+
+如果你用 `docker compose`，可以直接这样写：
+
+```yaml
+services:
+  octorill:
+    image: <your-octorill-image>
+    env_file:
+      - .env.local
+    environment:
+      LINUXDO_CLIENT_ID: ${LINUXDO_CLIENT_ID}
+      LINUXDO_CLIENT_SECRET: ${LINUXDO_CLIENT_SECRET}
+      LINUXDO_OAUTH_REDIRECT_URL: ${LINUXDO_OAUTH_REDIRECT_URL}
+```
+
+如果你用 `systemd`，可以把三项写进 environment file，例如：
+
+```ini
+LINUXDO_CLIENT_ID=your-linuxdo-client-id
+LINUXDO_CLIENT_SECRET=your-linuxdo-client-secret
+LINUXDO_OAUTH_REDIRECT_URL=https://octorill.example.com/auth/linuxdo/callback
+```
+
+然后重启 OctoRill 后端进程，使配置生效。
+
+#### 6) 部署后验证
+
+以已登录用户身份打开 `/settings?section=linuxdo`，逐项检查：
+
+- 页面不再显示“暂未启用 LinuxDO 绑定”
+- 点击“连接 LinuxDO”会跳转到 LinuxDO Connect 授权页
+- 授权完成后会回到 `/settings?section=linuxdo`
+- 设置页显示绑定后的 LinuxDO 快照
+
+如果你点“连接 LinuxDO”后根本没有跳到授权页，通常是服务端没配全。
+
+#### 7) 停用 / 回滚
+
+停用 LinuxDO 绑定时，请 **同时移除这三项环境变量**；只保留其中一部分会导致服务启动失败。
+
+#### 8) 自托管最常见的错误
+
+- `LINUXDO_OAUTH_REDIRECT_URL` 与 LinuxDO Connect 后台登记的 callback URL 不完全一致
+- 公网部署仍然把 callback 写成 `127.0.0.1`、内网地址或错误端口
+- 反向代理没有把 `/auth/linuxdo/callback` 转发到后端
+- 把 `LINUXDO_CLIENT_SECRET` 暴露到前端或提交进仓库
+
+#### 9) OctoRill 实际会保存什么
+
+OctoRill 只会持久化 LinuxDO 绑定快照，不会保存 LinuxDO access token、refresh token 或 `api_key`。
+
+更细的部署口径见：`docs/specs/y9ngx-linuxdo-user-settings/contracts/deployment.md`。
 
 ### 2) 启动后端
 
