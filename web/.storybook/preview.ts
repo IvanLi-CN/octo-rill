@@ -66,7 +66,10 @@ function isStorybookAppLink(
 		return true;
 	}
 	return (
-		url.pathname === "/auth/github/login" || url.pathname === "/auth/logout"
+		url.pathname === "/settings" ||
+		url.pathname === "/auth/github/login" ||
+		url.pathname === "/auth/linuxdo/login" ||
+		url.pathname === "/auth/logout"
 	);
 }
 
