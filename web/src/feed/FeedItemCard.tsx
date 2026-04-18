@@ -554,6 +554,14 @@ function SocialActivityCard(props: {
 	const [mobileBalanceMode, setMobileBalanceMode] = useState<
 		"centered" | "adaptive"
 	>("centered");
+	const mobileActorSegmentClass =
+		mobileBalanceMode === "adaptive"
+			? "shrink-0 justify-start"
+			: "w-full justify-start";
+	const mobileTargetSegmentClass =
+		mobileBalanceMode === "adaptive"
+			? "shrink-0 justify-end"
+			: "w-full justify-end";
 
 	useLayoutEffect(() => {
 		const row = mobileRowRef.current;
@@ -661,13 +669,12 @@ function SocialActivityCard(props: {
 							title={actor.login}
 							className={cn(
 								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
-								mobileBalanceMode === "adaptive"
-									? "shrink-0 justify-start"
-									: "w-full justify-start",
+								mobileActorSegmentClass,
 							)}
 						>
 							<span
 								ref={mobileActorGroupRef}
+								data-social-card-entity-group="actor"
 								className="flex min-w-0 max-w-full items-center gap-2"
 							>
 								<SocialActorAvatar
@@ -701,13 +708,12 @@ function SocialActivityCard(props: {
 							data-social-card-segment="target"
 							className={cn(
 								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
-								mobileBalanceMode === "adaptive"
-									? "shrink-0 justify-end"
-									: "w-full justify-start",
+								mobileTargetSegmentClass,
 							)}
 						>
 							<span
 								ref={mobileTargetGroupRef}
+								data-social-card-entity-group="target"
 								className="flex min-w-0 max-w-full items-center gap-2"
 							>
 								<SocialRepoAvatar
@@ -745,13 +751,12 @@ function SocialActivityCard(props: {
 							data-social-card-segment="actor"
 							className={cn(
 								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
-								mobileBalanceMode === "adaptive"
-									? "shrink-0 justify-start"
-									: "w-full justify-start",
+								mobileActorSegmentClass,
 							)}
 						>
 							<span
 								ref={mobileActorGroupRef}
+								data-social-card-entity-group="actor"
 								className="flex min-w-0 max-w-full items-center gap-2"
 							>
 								<SocialActorAvatar
@@ -786,13 +791,12 @@ function SocialActivityCard(props: {
 								data-social-card-segment="target"
 								className={cn(
 									"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
-									mobileBalanceMode === "adaptive"
-										? "shrink-0 justify-end"
-										: "w-full justify-start",
+									mobileTargetSegmentClass,
 								)}
 							>
 								<span
 									ref={mobileTargetGroupRef}
+									data-social-card-entity-group="target"
 									className="flex min-w-0 max-w-full items-center gap-2"
 								>
 									<SocialActorAvatar
@@ -818,16 +822,19 @@ function SocialActivityCard(props: {
 								data-social-card-segment="target"
 								className={cn(
 									"flex min-w-0 max-w-full items-center gap-2",
-									mobileBalanceMode === "adaptive"
-										? "shrink-0 justify-end"
-										: "w-full justify-start",
+									mobileTargetSegmentClass,
 								)}
 							>
-								<SocialActorAvatar
-									key={targetViewer.avatar_url ?? "viewer"}
-									actor={targetViewer}
-									className="size-7"
-								/>
+								<span
+									data-social-card-entity-group="target"
+									className="flex min-w-0 max-w-full items-center gap-2"
+								>
+									<SocialActorAvatar
+										key={targetViewer.avatar_url ?? "viewer"}
+										actor={targetViewer}
+										className="size-7"
+									/>
+								</span>
 							</div>
 						)}
 					</>
