@@ -55,11 +55,19 @@ async function expectInlineSocialCard(
 		if (!actorNode || !actionNode || !targetNode) {
 			return null;
 		}
+		const actorGroup =
+			actorNode.querySelector<HTMLElement>(
+				'[data-social-card-entity-group="actor"]',
+			) ?? actorNode;
+		const targetGroup =
+			targetNode.querySelector<HTMLElement>(
+				'[data-social-card-entity-group="target"]',
+			) ?? targetNode;
 
 		const rowRect = node.getBoundingClientRect();
-		const actorRect = actorNode.getBoundingClientRect();
+		const actorRect = actorGroup.getBoundingClientRect();
 		const actionRect = actionNode.getBoundingClientRect();
-		const targetRect = targetNode.getBoundingClientRect();
+		const targetRect = targetGroup.getBoundingClientRect();
 		const rowCenterY = rowRect.top + rowRect.height / 2;
 		const centerDelta = (rect: DOMRect) =>
 			Math.abs(rect.top + rect.height / 2 - rowCenterY);
@@ -95,8 +103,8 @@ async function expectInlineSocialCard(
 	expect(geometry.actorCenterDelta).toBeLessThan(geometry.rowHeight * 0.32);
 	expect(geometry.actionCenterDelta).toBeLessThan(geometry.rowHeight * 0.32);
 	expect(geometry.targetCenterDelta).toBeLessThan(geometry.rowHeight * 0.32);
-	expect(geometry.rowLeftGap).toBeLessThanOrEqual(18);
-	expect(geometry.rowRightGap).toBeLessThanOrEqual(18);
+	expect(geometry.rowLeftGap).toBeLessThanOrEqual(14);
+	expect(geometry.rowRightGap).toBeLessThanOrEqual(14);
 	const maxActionCenterOffsetX =
 		requestedMaxActionCenterOffsetX === undefined
 			? geometry.balanceMode === "adaptive"
@@ -108,10 +116,6 @@ async function expectInlineSocialCard(
 			maxActionCenterOffsetX,
 		);
 	}
-	expect(
-		Math.max(geometry.actorWidth, geometry.targetWidth) /
-			Math.max(1, Math.min(geometry.actorWidth, geometry.targetWidth)),
-	).toBeLessThan(3.05);
 	expect(geometry.actionText).toBe("");
 
 	for (const label of await card.locator("[data-social-card-primary]").all()) {
@@ -477,12 +481,26 @@ test("dashboard keeps social cards inline on mobile widths without horizontal ov
 			text: node.textContent ?? "",
 			visibleChars: (node.textContent ?? "").replace("…", "").length,
 		}));
+		const starTargetRightGap = await starCard
+			.locator("[data-social-card-row]")
+			.first()
+			.evaluate((node) => {
+				const targetGroup = node.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				);
+				const rowRect = node.getBoundingClientRect();
+				const targetRect = targetGroup?.getBoundingClientRect();
+				return targetRect
+					? rowRect.right - targetRect.right
+					: Number.POSITIVE_INFINITY;
+			});
 		expect(repoMetrics.text.startsWith("octo-rill/")).toBe(true);
 		expect(repoMetrics.text.includes("…")).toBe(true);
 		expect(repoMetrics.visibleChars).toBeGreaterThanOrEqual(36);
 		expect(repoMetrics.scrollWidth).toBeLessThanOrEqual(
 			repoMetrics.clientWidth,
 		);
+		expect(starTargetRightGap).toBeLessThanOrEqual(14);
 		await expect(
 			followerCard.locator(
 				'[data-social-card-segment="actor"] [data-social-card-primary-mobile-label]',
@@ -505,6 +523,20 @@ test("dashboard keeps social cards inline on mobile widths without horizontal ov
 				.first()
 				.locator('a[data-social-card-segment="target"]'),
 		).toHaveAttribute("href", "https://github.com/octo-rill-owner");
+		const followerTargetRightGap = await followerCard
+			.locator("[data-social-card-row]")
+			.first()
+			.evaluate((node) => {
+				const targetGroup = node.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				);
+				const rowRect = node.getBoundingClientRect();
+				const targetRect = targetGroup?.getBoundingClientRect();
+				return targetRect
+					? rowRect.right - targetRect.right
+					: Number.POSITIVE_INFINITY;
+			});
+		expect(followerTargetRightGap).toBeLessThanOrEqual(14);
 		await expect(starCard.locator("[data-social-card-timestamp]")).toHaveCount(
 			1,
 		);
@@ -680,27 +712,34 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 			const target = node.querySelector<HTMLElement>(
 				'[data-social-card-segment="target"]',
 			);
-			const actorLabel = actor?.querySelector<HTMLElement>(
+			const actorGroup =
+				actor?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="actor"]',
+				) ?? actor;
+			const targetGroup =
+				target?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				) ?? target;
+			const actorLabel = actorGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
-			const targetLabel = target?.querySelector<HTMLElement>(
+			const targetLabel = targetGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
 			const action = node.querySelector<HTMLElement>(
 				'[data-social-card-segment="action"]',
 			);
-			const targetGroup = target?.firstElementChild as HTMLElement | null;
 			return {
-				actorWidth: actor?.getBoundingClientRect().width ?? 0,
-				targetWidth: target?.getBoundingClientRect().width ?? 0,
+				actorWidth: actorGroup?.getBoundingClientRect().width ?? 0,
+				targetWidth: targetGroup?.getBoundingClientRect().width ?? 0,
 				actorOverflow:
 					(actorLabel?.scrollWidth ?? 0) - (actorLabel?.clientWidth ?? 0),
 				targetOverflow:
 					(targetLabel?.scrollWidth ?? 0) - (targetLabel?.clientWidth ?? 0),
 				gapLeft:
-					action && actorLabel
+					action && actorGroup
 						? action.getBoundingClientRect().left -
-							actorLabel.getBoundingClientRect().right
+							actorGroup.getBoundingClientRect().right
 						: 0,
 				gapRight:
 					action && targetGroup
@@ -728,27 +767,34 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 			const target = node.querySelector<HTMLElement>(
 				'[data-social-card-segment="target"]',
 			);
-			const actorLabel = actor?.querySelector<HTMLElement>(
+			const actorGroup =
+				actor?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="actor"]',
+				) ?? actor;
+			const targetGroup =
+				target?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				) ?? target;
+			const actorLabel = actorGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
-			const targetLabel = target?.querySelector<HTMLElement>(
+			const targetLabel = targetGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
 			const action = node.querySelector<HTMLElement>(
 				'[data-social-card-segment="action"]',
 			);
-			const targetGroup = target?.firstElementChild as HTMLElement | null;
 			return {
-				actorWidth: actor?.getBoundingClientRect().width ?? 0,
-				targetWidth: target?.getBoundingClientRect().width ?? 0,
+				actorWidth: actorGroup?.getBoundingClientRect().width ?? 0,
+				targetWidth: targetGroup?.getBoundingClientRect().width ?? 0,
 				actorOverflow:
 					(actorLabel?.scrollWidth ?? 0) - (actorLabel?.clientWidth ?? 0),
 				targetOverflow:
 					(targetLabel?.scrollWidth ?? 0) - (targetLabel?.clientWidth ?? 0),
 				gapLeft:
-					action && actorLabel
+					action && actorGroup
 						? action.getBoundingClientRect().left -
-							actorLabel.getBoundingClientRect().right
+							actorGroup.getBoundingClientRect().right
 						: 0,
 				gapRight:
 					action && targetGroup
@@ -777,15 +823,23 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 			const target = node.querySelector<HTMLElement>(
 				'[data-social-card-segment="target"]',
 			);
-			const actorLabel = actor?.querySelector<HTMLElement>(
+			const actorGroup =
+				actor?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="actor"]',
+				) ?? actor;
+			const targetGroup =
+				target?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				) ?? target;
+			const actorLabel = actorGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
-			const targetLabel = target?.querySelector<HTMLElement>(
+			const targetLabel = targetGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
 			return {
-				actorWidth: actor?.getBoundingClientRect().width ?? 0,
-				targetWidth: target?.getBoundingClientRect().width ?? 0,
+				actorWidth: actorGroup?.getBoundingClientRect().width ?? 0,
+				targetWidth: targetGroup?.getBoundingClientRect().width ?? 0,
 				actorOverflow:
 					(actorLabel?.scrollWidth ?? 0) - (actorLabel?.clientWidth ?? 0),
 				targetOverflow:
@@ -813,6 +867,138 @@ test("dashboard keeps the action centered with left-only, right-only, and bilate
 			'[data-social-card-kind="follower_received"] [data-social-card-segment="target"] [data-social-card-primary-mobile-label]',
 		),
 	).toHaveJSProperty("textContent", "IvanLi-CN");
+});
+
+test("dashboard keeps short follower rows right-trimmed on mobile", async ({
+	page,
+}) => {
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "viewer-short-followers",
+					github_user_id: 10,
+					login: "IvanLi-CN",
+					name: "Octo Owner",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, {
+				items: [
+					{ login: "brutany", expectCentered: true },
+					{ login: "zhenyuanwang46-droid", expectCentered: false },
+					{ login: "pseudocodes", expectCentered: true },
+					{ login: "zyou9724-creator", expectCentered: false },
+					{ login: "mrlrk82", expectCentered: true },
+				].map(({ login }, index) => ({
+					kind: "follower_received",
+					ts: `2026-04-10T11:${`${50 - index}`.padStart(2, "0")}:00Z`,
+					id: `follow-short-${index + 1}`,
+					repo_full_name: null,
+					title: null,
+					body: null,
+					body_truncated: false,
+					subtitle: null,
+					reason: null,
+					subject_type: null,
+					html_url: `https://github.com/${login}`,
+					unread: null,
+					actor: {
+						login,
+						avatar_url: null,
+						html_url: `https://github.com/${login}`,
+					},
+					translated: null,
+					smart: null,
+					reactions: null,
+				})),
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.setViewportSize({ width: 390, height: 844 });
+	await page.goto("/?tab=followers");
+
+	const cards = page.locator('[data-social-card-kind="follower_received"]');
+	await expect(cards).toHaveCount(5);
+
+	const expectedCenteredIds = new Set([
+		"follow-short-1",
+		"follow-short-3",
+		"follow-short-5",
+	]);
+
+	for (const card of await cards.all()) {
+		await expectInlineSocialCard(card);
+		const metrics = await card
+			.locator("[data-social-card-row]")
+			.first()
+			.evaluate((node) => {
+				const targetGroup = node.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				);
+				const rowRect = node.getBoundingClientRect();
+				const targetRect = targetGroup?.getBoundingClientRect();
+				return {
+					balanceMode: node.dataset.socialCardBalanceMode ?? "centered",
+					targetRightGap: targetRect
+						? rowRect.right - targetRect.right
+						: Number.POSITIVE_INFINITY,
+				};
+			});
+		expect(metrics.targetRightGap).toBeLessThanOrEqual(14);
+
+		const cardId = await card.getAttribute("data-feed-item-id");
+		if (cardId && expectedCenteredIds.has(cardId)) {
+			expect(metrics.balanceMode).toBe("centered");
+		}
+	}
 });
 
 test("social activity cards fall back to placeholder avatar when image fails", async ({

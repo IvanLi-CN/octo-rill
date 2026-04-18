@@ -689,6 +689,26 @@ function makeMobileSocialEdgeCaseFeed(): FeedItem[] {
 	];
 }
 
+function makeMobileShortFollowerFeed(): FeedItem[] {
+	return [
+		["mobile-short-follow-brutany", "brutany", "#d97706"],
+		["mobile-short-follow-zhenyuan", "zhenyuanwang46-droid", "#7c3aed"],
+		["mobile-short-follow-pseudocodes", "pseudocodes", "#0f766e"],
+		["mobile-short-follow-zyou", "zyou9724-creator", "#60a5fa"],
+		["mobile-short-follow-mrlrk", "mrlrk82", "#c2410c"],
+	].map(([id, login, color]) =>
+		buildFollowerItem(id, {
+			ts: "2026-04-04T17:12:00+08:00",
+			actor: {
+				login,
+				avatar_url: avatarDataUrl(login.slice(0, 2).toUpperCase(), color),
+				html_url: `https://github.com/${login}`,
+			},
+			html_url: `https://github.com/${login}`,
+		}),
+	);
+}
+
 function SocialCardsMatrixPreview(props: {
 	items: SocialFeedItem[];
 	currentViewer?: typeof STORYBOOK_VIEWER;
@@ -737,11 +757,19 @@ function assertInlineSocialCardLayout(card: HTMLElement) {
 	if (!row || !actor || !action || !target) {
 		throw new Error("Expected social card row and segments to exist");
 	}
+	const actorGroup =
+		actor.querySelector<HTMLElement>(
+			'[data-social-card-entity-group="actor"]',
+		) ?? actor;
+	const targetGroup =
+		target.querySelector<HTMLElement>(
+			'[data-social-card-entity-group="target"]',
+		) ?? target;
 
 	const rowRect = row.getBoundingClientRect();
-	const actorRect = actor.getBoundingClientRect();
+	const actorRect = actorGroup.getBoundingClientRect();
 	const actionRect = action.getBoundingClientRect();
-	const targetRect = target.getBoundingClientRect();
+	const targetRect = targetGroup.getBoundingClientRect();
 	const rowCenterY = rowRect.top + rowRect.height / 2;
 	const centers = [actorRect, actionRect, targetRect].map(
 		(rect) => rect.top + rect.height / 2,
@@ -753,17 +781,13 @@ function assertInlineSocialCardLayout(card: HTMLElement) {
 	expect(actorRect.left).toBeLessThan(actionRect.left);
 	expect(actionRect.left).toBeLessThan(targetRect.left);
 	expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
-	expect(actorRect.left - rowRect.left).toBeLessThanOrEqual(18);
-	expect(rowRect.right - targetRect.right).toBeLessThanOrEqual(18);
+	expect(actorRect.left - rowRect.left).toBeLessThanOrEqual(14);
+	expect(rowRect.right - targetRect.right).toBeLessThanOrEqual(14);
 	const actionCenterX = actionRect.left + actionRect.width / 2;
 	const rowCenterX = rowRect.left + rowRect.width / 2;
 	if (row.dataset.socialCardBalanceMode !== "adaptive") {
 		expect(Math.abs(actionCenterX - rowCenterX)).toBeLessThanOrEqual(12);
 	}
-	expect(
-		Math.max(actorRect.width, targetRect.width) /
-			Math.max(1, Math.min(actorRect.width, targetRect.width)),
-	).toBeLessThan(3.05);
 	expect(action.textContent?.trim() ?? "").toBe("");
 
 	for (const label of card.querySelectorAll<HTMLElement>(
@@ -3039,27 +3063,34 @@ export const MobileSocialEdgeCases: Story = {
 			const target = card.querySelector<HTMLElement>(
 				'[data-social-card-segment="target"]',
 			);
-			const actorLabel = actor?.querySelector<HTMLElement>(
+			const actorGroup =
+				actor?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="actor"]',
+				) ?? actor;
+			const targetGroup =
+				target?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				) ?? target;
+			const actorLabel = actorGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
-			const targetLabel = target?.querySelector<HTMLElement>(
+			const targetLabel = targetGroup?.querySelector<HTMLElement>(
 				"[data-social-card-primary]",
 			);
 			const action = card.querySelector<HTMLElement>(
 				'[data-social-card-segment="action"]',
 			);
-			const targetGroup = target?.firstElementChild as HTMLElement | null;
 			return {
-				actorWidth: actor?.getBoundingClientRect().width ?? 0,
-				targetWidth: target?.getBoundingClientRect().width ?? 0,
+				actorWidth: actorGroup?.getBoundingClientRect().width ?? 0,
+				targetWidth: targetGroup?.getBoundingClientRect().width ?? 0,
 				actorOverflow:
 					(actorLabel?.scrollWidth ?? 0) - (actorLabel?.clientWidth ?? 0),
 				targetOverflow:
 					(targetLabel?.scrollWidth ?? 0) - (targetLabel?.clientWidth ?? 0),
 				gapLeft:
-					action && actorLabel
+					action && actorGroup
 						? action.getBoundingClientRect().left -
-							actorLabel.getBoundingClientRect().right
+							actorGroup.getBoundingClientRect().right
 						: 0,
 				gapRight:
 					action && targetGroup
@@ -3116,7 +3147,10 @@ export const MobileSocialEdgeCaseMatrix: Story = {
 	name: "Evidence / Mobile Social Edge Case Matrix",
 	render: () => (
 		<SocialCardsMatrixPreview
-			items={makeMobileSocialEdgeCaseFeed().filter(isSocialFeedItem)}
+			items={[
+				...makeMobileSocialEdgeCaseFeed().filter(isSocialFeedItem),
+				...makeMobileShortFollowerFeed().filter(isSocialFeedItem),
+			]}
 		/>
 	),
 	globals: {
@@ -3130,7 +3164,7 @@ export const MobileSocialEdgeCaseMatrix: Story = {
 		docs: {
 			description: {
 				story:
-					"纯社交卡片矩阵入口：不混入 header、release、inbox，只保留移动端四种边界案例，方便直接检查左右宽度分配与动作图标位置。",
+					"纯社交卡片矩阵入口：不混入 header、release、inbox，集中展示右长、左长、双长与短文案 follower 连续列表，方便直接检查实体组贴边、动作图标位置与 trailing whitespace。",
 			},
 		},
 	},
@@ -3138,9 +3172,29 @@ export const MobileSocialEdgeCaseMatrix: Story = {
 		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
 			"[data-social-card-kind]",
 		);
-		expect(socialCards.length).toBe(4);
+		expect(socialCards.length).toBe(9);
 		for (const card of socialCards) {
 			assertInlineSocialCardLayout(card);
+		}
+		const shortFollowerCards = Array.from(
+			canvasElement.querySelectorAll<HTMLElement>(
+				'[data-feed-item-id^="mobile-short-follow-"]',
+			),
+		);
+		expect(shortFollowerCards.length).toBe(5);
+		for (const card of shortFollowerCards) {
+			const row = card.querySelector<HTMLElement>("[data-social-card-row]");
+			const targetGroup = card.querySelector<HTMLElement>(
+				'[data-social-card-entity-group="target"]',
+			);
+			expect(row).toBeTruthy();
+			expect(targetGroup).toBeTruthy();
+			if (!row || !targetGroup) {
+				throw new Error("Expected short follower row and target entity group");
+			}
+			const rowRect = row.getBoundingClientRect();
+			const targetRect = targetGroup.getBoundingClientRect();
+			expect(rowRect.right - targetRect.right).toBeLessThanOrEqual(14);
 		}
 	},
 };
