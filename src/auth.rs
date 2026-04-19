@@ -12,9 +12,13 @@ use sqlx::{Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
 
-use crate::{briefs, crypto::EncryptedSecret, error::ApiError, github, local_id, state::AppState};
+use crate::{
+    api::require_active_user_id, briefs, config::AppConfig, crypto::EncryptedSecret,
+    error::ApiError, github, linuxdo, local_id, state::AppState,
+};
 
 const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
+const SESSION_KEY_LINUXDO_OAUTH_STATE: &str = "linuxdo_oauth_state";
 const SESSION_KEY_USER_ID: &str = "user_id";
 
 async fn promote_first_admin(
@@ -190,7 +194,7 @@ pub async fn github_login(
     session: Session,
 ) -> Result<impl IntoResponse, ApiError> {
     let (auth_url, csrf_token) = state
-        .oauth
+        .github_oauth
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("read:user".to_owned()))
         .add_scope(Scope::new("user:email".to_owned()))
@@ -232,7 +236,7 @@ pub async fn github_callback(
         .map_err(ApiError::internal)?;
 
     let token = state
-        .oauth
+        .github_oauth
         .exchange_code(AuthorizationCode::new(query.code))
         .request_async(&state.http)
         .await
@@ -353,6 +357,186 @@ pub async fn github_callback(
     info!(user_id = internal_user_id, github_user_id = user.id, login = %user.login, "login ok");
 
     Ok(Redirect::to(state.config.public_base_url.as_str()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinuxDoCallbackQuery {
+    pub code: String,
+    pub state: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LinuxDoOwnerRow {
+    user_id: String,
+}
+
+fn settings_redirect(config: &AppConfig, status: Option<&str>) -> String {
+    let mut url = config
+        .public_base_url
+        .join("settings")
+        .expect("settings route should join public base url");
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("section", "linuxdo");
+        if let Some(status) = status {
+            pairs.append_pair("linuxdo", status);
+        }
+    }
+    url.into()
+}
+
+async fn upsert_linuxdo_connection(
+    state: &AppState,
+    user_id: &str,
+    user: &linuxdo::LinuxDoUser,
+) -> Result<(), ApiError> {
+    if let Some(owner) = sqlx::query_as::<_, LinuxDoOwnerRow>(
+        r#"
+        SELECT user_id
+        FROM linuxdo_connections
+        WHERE linuxdo_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+        && owner.user_id != user_id
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "linuxdo_already_bound",
+            "linuxdo account already bound to another user",
+        ));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO linuxdo_connections (
+          user_id, linuxdo_user_id, username, name, avatar_url, trust_level,
+          active, silenced, linked_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          linuxdo_user_id = excluded.linuxdo_user_id,
+          username = excluded.username,
+          name = excluded.name,
+          avatar_url = excluded.avatar_url,
+          trust_level = excluded.trust_level,
+          active = excluded.active,
+          silenced = excluded.silenced,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(user.id)
+    .bind(user.username.as_str())
+    .bind(linuxdo::normalize_display_name(user.name.as_deref()))
+    .bind(linuxdo::resolve_avatar_url(&user.avatar_template, 96))
+    .bind(user.trust_level)
+    .bind(user.active)
+    .bind(user.silenced)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(())
+}
+
+pub async fn linuxdo_login(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<impl IntoResponse, ApiError> {
+    let _user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let Some(client) = state.linuxdo_oauth.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "linuxdo_oauth_not_configured",
+            "linuxdo oauth is not configured",
+        ));
+    };
+
+    let (auth_url, csrf_token) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("user".to_owned()))
+        .url();
+
+    session
+        .insert(SESSION_KEY_LINUXDO_OAUTH_STATE, csrf_token.secret())
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Redirect::to(auth_url.as_str()))
+}
+
+pub async fn linuxdo_callback(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<LinuxDoCallbackQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let Some(client) = state.linuxdo_oauth.as_ref() else {
+        return Ok(Redirect::to(
+            settings_redirect(&state.config, Some("not_configured")).as_str(),
+        ));
+    };
+
+    let expected_state = session
+        .get::<String>(SESSION_KEY_LINUXDO_OAUTH_STATE)
+        .await
+        .map_err(ApiError::internal)?;
+    let _ = session
+        .remove::<String>(SESSION_KEY_LINUXDO_OAUTH_STATE)
+        .await;
+    if expected_state.as_deref() != Some(query.state.as_str()) {
+        return Ok(Redirect::to(
+            settings_redirect(&state.config, Some("state_mismatch")).as_str(),
+        ));
+    }
+
+    let token = match client
+        .exchange_code(AuthorizationCode::new(query.code))
+        .request_async(&state.http)
+        .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(error = %err, "linuxdo oauth token exchange failed");
+            return Ok(Redirect::to(
+                settings_redirect(&state.config, Some("exchange_failed")).as_str(),
+            ));
+        }
+    };
+
+    let access_token = token.access_token().secret();
+    let linuxdo_user = match linuxdo::fetch_user(&state.http, access_token).await {
+        Ok(user) => user,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to fetch linuxdo user");
+            return Ok(Redirect::to(
+                settings_redirect(&state.config, Some("fetch_user_failed")).as_str(),
+            ));
+        }
+    };
+
+    match upsert_linuxdo_connection(state.as_ref(), &user_id, &linuxdo_user).await {
+        Ok(()) => Ok(Redirect::to(
+            settings_redirect(&state.config, Some("connected")).as_str(),
+        )),
+        Err(err) if err.code() == "linuxdo_already_bound" => Ok(Redirect::to(
+            settings_redirect(&state.config, Some("already_bound")).as_str(),
+        )),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to persist linuxdo binding");
+            Ok(Redirect::to(
+                settings_redirect(&state.config, Some("save_failed")).as_str(),
+            ))
+        }
+    }
 }
 
 pub async fn logout(

@@ -196,13 +196,14 @@ export const Default: Story = {
 		await expect(canvas.getByText("@storybook-admin")).toBeVisible();
 		await expect(canvas.getByText("storybook-admin@example.com")).toBeVisible();
 		await expect(within(userCard).getByLabelText("管理员")).toBeVisible();
+		await expect(canvas.getByRole("link", { name: "设置" })).toBeVisible();
 		await expect(canvas.getByRole("link", { name: "退出登录" })).toBeVisible();
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"默认状态：品牌位先展示 OctoRill 与面向前台用户的核心能力概括；右侧只显示同步与头像入口，账号详情与退出登录收进头像浮层。",
+					"默认状态：品牌位先展示 OctoRill 与面向前台用户的核心能力概括；右侧只显示同步与头像入口，账号浮层内提供设置与退出登录等低频动作。",
 			},
 		},
 	},
