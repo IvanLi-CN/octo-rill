@@ -197,9 +197,16 @@ pub async fn recover_repo_release_runtime_state_on_startup(state: &AppState) -> 
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct StarredRepoRow {
+struct ReleaseVisibleRepoRow {
     repo_id: i64,
     full_name: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseVisibleRepoAggregationRow {
+    repo_id: i64,
+    full_name: String,
+    is_private: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -775,6 +782,8 @@ pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarred
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
     let before_release_ids = load_release_ids_for_user(state, user_id).await?;
+    let _owned_release_visibility_refreshed =
+        refresh_owned_repo_release_visibility(state, user_id).await?;
     let demand = attach_and_wait_for_user_release_demand(
         state,
         None,
@@ -1031,12 +1040,14 @@ pub async fn sync_access_refresh(
     task_id: &str,
     user_id: &str,
 ) -> Result<SyncAccessRefreshResult> {
-    let before_repos = load_user_starred_repo_rows(state, user_id).await?;
+    let before_repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let before_repo_ids = before_repos
         .iter()
         .map(|repo| repo.repo_id)
         .collect::<HashSet<_>>();
     let starred = sync_starred(state, user_id).await?;
+    let _owned_release_visibility_refreshed =
+        refresh_owned_repo_release_visibility(state, user_id).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -1162,14 +1173,14 @@ struct RepoReleaseWatcherUpsert<'a> {
     now_rfc3339: &'a str,
 }
 
-async fn load_user_starred_repo_rows(
+async fn load_user_release_visible_repo_rows(
     state: &AppState,
     user_id: &str,
-) -> Result<Vec<StarredRepoRow>> {
-    sqlx::query_as::<_, StarredRepoRow>(
+) -> Result<Vec<ReleaseVisibleRepoRow>> {
+    sqlx::query_as::<_, ReleaseVisibleRepoRow>(
         r#"
         SELECT repo_id, full_name
-        FROM starred_repos
+        FROM user_release_visible_repos
         WHERE user_id = ?
         ORDER BY
           CASE WHEN stargazed_at IS NULL THEN 1 ELSE 0 END ASC,
@@ -1180,7 +1191,65 @@ async fn load_user_starred_repo_rows(
     .bind(user_id)
     .fetch_all(&state.pool)
     .await
-    .context("failed to query starred repos")
+    .context("failed to query release-visible repos")
+}
+
+async fn load_user_release_visible_repo_aggregation_rows(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<ReleaseVisibleRepoAggregationRow>> {
+    sqlx::query_as::<_, ReleaseVisibleRepoAggregationRow>(
+        r#"
+        SELECT repo_id, full_name, is_private
+        FROM user_release_visible_repos
+        WHERE user_id = ?
+        ORDER BY full_name ASC, repo_id ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query release-visible repos for aggregation")
+}
+
+async fn user_includes_own_releases(state: &AppState, user_id: &str) -> Result<bool> {
+    let include_own_releases = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT include_own_releases
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to query include_own_releases")?
+    .unwrap_or(0);
+    Ok(include_own_releases != 0)
+}
+
+async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) -> Result<bool> {
+    if !user_includes_own_releases(state, user_id).await? {
+        return Ok(false);
+    }
+
+    let token = load_access_token_or_classified(state, user_id)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    let owned_repos = fetch_owned_repo_snapshot(state, &token)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    let empty_repo_members: &[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)] = &[];
+    apply_social_activity_snapshot_partial(
+        state,
+        user_id,
+        Some(owned_repos.as_slice()),
+        Some(empty_repo_members),
+        None,
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn apply_social_activity_snapshot(
@@ -1914,7 +1983,7 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         "#,
     )
@@ -1966,7 +2035,7 @@ async fn load_user_relevant_release_ids(
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = 
         "#,
     );
@@ -2000,7 +2069,7 @@ async fn load_recent_release_ids_for_user(
         r#"
         SELECT DISTINCT r.release_id
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) DESC, r.release_id DESC
         LIMIT ?
@@ -2112,7 +2181,7 @@ async fn attach_and_wait_for_user_release_demand(
     origin: RepoReleaseOrigin,
     reason: &str,
 ) -> Result<SharedReleaseDemandResult> {
-    let repos = load_user_starred_repo_rows(state, user_id).await?;
+    let repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let previous_repo_ids = task_context
         .as_ref()
         .map(|(_, ids)| ids.clone())
@@ -2672,7 +2741,7 @@ pub async fn sync_subscriptions(
     )
     .await?;
 
-    let repos = aggregate_repos(&successful_users);
+    let repos = aggregate_release_visible_repos(&context, &successful_users).await?;
     let repo_ids = repos.iter().map(|repo| repo.repo_id).collect::<Vec<_>>();
     let before_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
     jobs::append_task_event(
@@ -3142,6 +3211,26 @@ where
     unreachable!("star sync retry loop must return before exhausting attempts")
 }
 
+fn sort_aggregated_repos(repos: &mut [AggregatedRepo]) {
+    for repo in repos.iter_mut() {
+        repo.related_users.sort_by(|left, right| {
+            cmp_last_active_desc(
+                left.last_active_at.as_deref(),
+                right.last_active_at.as_deref(),
+            )
+            .then_with(|| left.user_id.cmp(&right.user_id))
+        });
+    }
+    repos.sort_by(|left, right| {
+        right
+            .related_users
+            .len()
+            .cmp(&left.related_users.len())
+            .then_with(|| left.full_name.cmp(&right.full_name))
+    });
+}
+
+#[cfg(test)]
 fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
     let mut grouped = HashMap::<i64, AggregatedRepo>::new();
     for user in users {
@@ -3163,23 +3252,53 @@ fn aggregate_repos(users: &[StarPhaseSuccess]) -> Vec<AggregatedRepo> {
     }
 
     let mut repos = grouped.into_values().collect::<Vec<_>>();
-    for repo in &mut repos {
-        repo.related_users.sort_by(|left, right| {
-            cmp_last_active_desc(
-                left.last_active_at.as_deref(),
-                right.last_active_at.as_deref(),
-            )
-            .then_with(|| left.user_id.cmp(&right.user_id))
-        });
-    }
-    repos.sort_by(|left, right| {
-        right
-            .related_users
-            .len()
-            .cmp(&left.related_users.len())
-            .then_with(|| left.full_name.cmp(&right.full_name))
-    });
+    sort_aggregated_repos(&mut repos);
     repos
+}
+
+async fn aggregate_release_visible_repos(
+    context: &SubscriptionRunContext,
+    users: &[StarPhaseSuccess],
+) -> Result<Vec<AggregatedRepo>> {
+    let mut grouped = HashMap::<i64, AggregatedRepo>::new();
+
+    for user in users {
+        if let Err(err) =
+            refresh_owned_repo_release_visibility(context.state.as_ref(), user.user_id.as_str())
+                .await
+        {
+            tracing::warn!(
+                ?err,
+                user_id = user.user_id.as_str(),
+                "sync.subscriptions: refresh owned repo release visibility failed"
+            );
+        }
+
+        let repos = load_user_release_visible_repo_aggregation_rows(
+            context.state.as_ref(),
+            user.user_id.as_str(),
+        )
+        .await?;
+        for repo in repos {
+            let entry = grouped
+                .entry(repo.repo_id)
+                .or_insert_with(|| AggregatedRepo {
+                    repo_id: repo.repo_id,
+                    full_name: repo.full_name.clone(),
+                    is_private: repo.is_private != 0,
+                    related_users: Vec::new(),
+                });
+            entry.is_private = entry.is_private || repo.is_private != 0;
+            entry.related_users.push(RelatedUserRef {
+                user_id: user.user_id.clone(),
+                last_active_at: user.last_active_at.clone(),
+            });
+        }
+    }
+
+    let mut repos = grouped.into_values().collect::<Vec<_>>();
+    sort_aggregated_repos(&mut repos);
+    Ok(repos)
 }
 
 async fn run_release_phase(
@@ -3875,7 +3994,7 @@ async fn execute_repo_release_work_item(
     let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
         r#"
         SELECT DISTINCT u.id AS user_id, u.last_active_at
-        FROM starred_repos sr
+        FROM user_release_visible_repos sr
         JOIN users u ON u.id = sr.user_id
         WHERE sr.repo_id = ?
           AND u.is_disabled = 0

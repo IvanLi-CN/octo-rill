@@ -67,9 +67,11 @@ async function installSettingsMocks(
 		reactionTokenMasked?: string | null;
 		reactionTokenState?: "idle" | "valid" | "invalid" | "error";
 		reactionTokenMessage?: string | null;
+		includeOwnReleases?: boolean;
 		withReactionFeed?: boolean;
 	},
 ) {
+	let includeOwnReleases = options?.includeOwnReleases ?? false;
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -132,15 +134,21 @@ async function installSettingsMocks(
 				daily_brief_local_time: "08:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				last_active_at: "2026-04-18T08:00:00+08:00",
+				include_own_releases: includeOwnReleases,
 			});
 		}
 
 		if (req.method() === "PATCH" && pathname === "/api/me/profile") {
+			const payload = req.postDataJSON() as
+				| { include_own_releases?: boolean }
+				| undefined;
+			includeOwnReleases = payload?.include_own_releases ?? includeOwnReleases;
 			return json(route, {
 				user_id: "storybook-user",
 				daily_brief_local_time: "08:00",
 				daily_brief_time_zone: "Asia/Shanghai",
 				last_active_at: "2026-04-18T08:00:00+08:00",
+				include_own_releases: includeOwnReleases,
 			});
 		}
 
@@ -222,4 +230,30 @@ test("settings shows bound linuxdo snapshot", async ({ page }) => {
 	await expect(
 		linuxdoSection.getByRole("button", { name: "解绑 LinuxDO" }),
 	).toBeVisible();
+});
+
+test("settings deep link saves my releases opt-in", async ({ page }) => {
+	await installSettingsMocks(page, {
+		includeOwnReleases: false,
+	});
+
+	await page.goto("/settings?section=my-releases");
+
+	await expect(page).toHaveURL(/section=my-releases/);
+	const myReleasesSection = page.locator(
+		'[data-settings-section="my-releases"]',
+	);
+	await expect(myReleasesSection).toContainText("仅显示已加星仓库");
+
+	const switchControl = myReleasesSection.getByRole("switch", {
+		name: "我的发布",
+	});
+	await expect(switchControl).toHaveAttribute("aria-checked", "false");
+	await switchControl.click();
+	await myReleasesSection
+		.getByRole("button", { name: "保存“我的发布”" })
+		.click();
+
+	await expect(switchControl).toHaveAttribute("aria-checked", "true");
+	await expect(myReleasesSection).toContainText("已纳入我的发布");
 });

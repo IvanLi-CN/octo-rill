@@ -1,5 +1,6 @@
 export const SETTINGS_SECTIONS = [
 	"linuxdo",
+	"my-releases",
 	"github-pat",
 	"daily-brief",
 ] as const;
