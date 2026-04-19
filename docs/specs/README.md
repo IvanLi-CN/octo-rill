@@ -111,5 +111,5 @@
 | qvfxq | Release 日报内容格式 V2 与历史快照修复 | 已完成 | `qvfxq-release-daily-brief-v2/SPEC.md` | 2026-04-19 | fast-track / canonical brief markdown validator + refresh drift repair landed |
 | n4x7e | Dashboard 历史日报折叠补齐与社交空态裁剪 | 已完成 | `n4x7e-dashboard-brief-social-folding/SPEC.md` | 2026-04-19 | PR #96; fast-track follow-up to #xaycu / #qvfxq merged with historical social folding, optional social brief sections, and visual evidence |
 | cm2je | 移除项目内 UI UX Pro Max skill | 已完成 | `cm2je-remove-ui-ux-pro-max-skill/SPEC.md` | 2026-04-18 | local implementation completed; removed project-local skill assets and obsolete install spec |
-| em5uh | 公开文档体系重写与职责收口 | 部分完成（2/3） | `em5uh-public-docs-rewrite/SPEC.md` | 2026-04-19 | docs rewrite + validation done; PR handoff pending |
+| em5uh | 公开文档体系重写与职责收口 | 已完成 | `em5uh-public-docs-rewrite/SPEC.md` | 2026-04-19 | PR #95; fast-track / public docs rewrite / PR ready |
 | y9ngx | LinuxDO 绑定与用户设置页改造 | 已完成 | `y9ngx-linuxdo-user-settings/SPEC.md` | 2026-04-19 | PR #94; fast-track / unified settings page + LinuxDO binding + inline PAT fallback |
