@@ -19,7 +19,7 @@ type AdminHeaderUser = {
 };
 
 type AdminNavItem = {
-	key: "users" | "jobs";
+	key: "dashboard" | "users" | "jobs";
 	label: string;
 	href: string;
 };
@@ -30,7 +30,8 @@ type AdminHeaderProps = {
 };
 
 const ADMIN_NAV_ITEMS: AdminNavItem[] = [
-	{ key: "users", label: "用户管理", href: "/admin" },
+	{ key: "dashboard", label: "仪表盘", href: "/admin" },
+	{ key: "users", label: "用户管理", href: "/admin/users" },
 	{ key: "jobs", label: "任务中心", href: "/admin/jobs" },
 ];
 
@@ -69,6 +70,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			}
 			data-admin-header-compact={useMobileCompact ? "true" : "false"}
 		>
+			<h1 className="sr-only">管理后台</h1>
 			<div
 				className={cn(
 					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
@@ -85,7 +87,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			>
 				<div
 					className={cn(
-						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-6",
+						"flex min-w-0 flex-col gap-2 lg:flex-row lg:items-center lg:gap-4",
 						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 					)}
@@ -97,46 +99,56 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							: undefined
 					}
 				>
-					<div className="flex min-w-0 flex-wrap items-center gap-2">
-						<h1
-							className={cn(
-								"text-lg font-semibold tracking-tight",
-								!disableHeaderMotion &&
-									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
-								disableHeaderMotion && "transition-none",
-							)}
-							style={
-								isMobileViewport
-									? {
-											fontSize: `${mix(18, 16, mobileHeaderProgress)}px`,
-										}
-									: undefined
-							}
+					<div
+						className={cn(
+							"flex min-w-0 items-center gap-3 lg:gap-4",
+							!disableHeaderMotion &&
+								"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+							disableHeaderMotion && "transition-none",
+						)}
+						style={
+							isMobileViewport
+								? {
+										gap: `${mix(12, 8, mobileHeaderProgress)}px`,
+									}
+								: undefined
+						}
+					>
+						<InternalLink
+							href="/admin"
+							to="/admin"
+							aria-label="OctoRill 管理后台"
+							className="shrink-0"
 						>
-							管理后台
-						</h1>
+							<div
+								style={
+									isMobileViewport
+										? {
+												height: `${mix(20, 18, mobileHeaderProgress)}px`,
+											}
+										: undefined
+								}
+							>
+								<BrandLogo
+									variant="wordmark"
+									className={cn(
+										"h-5",
+										!disableHeaderMotion &&
+											"motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
+										disableHeaderMotion && "transition-none",
+										isMobileViewport && "h-full",
+										useMobileCompact && "h-[18px]",
+									)}
+									alt="OctoRill"
+								/>
+							</div>
+						</InternalLink>
 						<div
-							style={
-								isMobileViewport
-									? {
-											height: `${mix(20, 18, mobileHeaderProgress)}px`,
-										}
-									: undefined
-							}
-						>
-							<BrandLogo
-								variant="wordmark"
-								className={cn(
-									"h-5",
-									!disableHeaderMotion &&
-										"motion-safe:transition-[height,transform] motion-safe:duration-200 motion-safe:ease-out",
-									disableHeaderMotion && "transition-none",
-									isMobileViewport && "h-full",
-									useMobileCompact && "h-[18px]",
-								)}
-								alt="OctoRill"
-							/>
-						</div>
+							className={cn(
+								"hidden h-5 w-px shrink-0 rounded-full bg-border/80 lg:block",
+								useMobileCompact && "hidden",
+							)}
+						/>
 					</div>
 
 					<nav

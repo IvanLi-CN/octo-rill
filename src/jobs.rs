@@ -115,6 +115,7 @@ struct DueDailySlotUser {
 }
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
+const ADMIN_DASHBOARD_ROLLUP_SCHEDULER_INTERVAL: Duration = Duration::from_secs(15 * 60);
 static TASK_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -193,6 +194,22 @@ pub fn spawn_subscription_scheduler(state: Arc<AppState>) {
                 tracing::warn!(?err, "subscription scheduler: enqueue due run failed");
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    });
+}
+
+pub fn spawn_admin_dashboard_rollup_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = api::refresh_admin_dashboard_rollups(
+                state.as_ref(),
+                api::ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
+            )
+            .await
+            {
+                tracing::warn!(?err, "admin dashboard scheduler: refresh rollups failed");
+            }
+            tokio::time::sleep(ADMIN_DASHBOARD_ROLLUP_SCHEDULER_INTERVAL).await;
         }
     });
 }
