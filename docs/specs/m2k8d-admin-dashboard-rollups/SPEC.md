@@ -183,6 +183,6 @@
 - `src/api.rs`
 - `src/jobs.rs`
 - `src/server.rs`
-- `migrations/0036_admin_dashboard_rollups.sql`
+- `migrations/0037_admin_dashboard_rollups.sql`
 - `web/src/admin/AdminDashboard.tsx`
 - `web/src/stories/AdminDashboard.stories.tsx`
