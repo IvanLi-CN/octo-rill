@@ -29,28 +29,31 @@ export default defineConfig({
 		},
 	},
 	title: "OctoRill 文档",
-	description: "OctoRill 的快速开始、配置参考、产品说明与 Storybook 入口。",
+	description: "OctoRill 的启动、配置、产品说明与 Storybook 入口。",
 	lang: "zh",
 	themeConfig: {
 		search: true,
 		nav: [
-			{ text: "首页", link: "/" },
+			{ text: "文档", link: "/" },
 			{ text: "快速开始", link: "/quick-start" },
-			{ text: "配置参考", link: "/config" },
-			{ text: "产品说明", link: "/product" },
+			{ text: "配置", link: "/config" },
+			{ text: "产品", link: "/product" },
 			{ text: "Storybook", link: "/storybook.html" },
 			{ text: "GitHub", link: "https://github.com/IvanLi-CN/octo-rill" },
 		],
 		sidebar: {
 			"/": [
 				{
-					text: "入门",
+					text: "开始使用",
 					items: [
 						{ text: "文档首页", link: "/" },
 						{ text: "快速开始", link: "/quick-start" },
 						{ text: "配置参考", link: "/config" },
-						{ text: "产品说明", link: "/product" },
 					],
+				},
+				{
+					text: "理解产品",
+					items: [{ text: "产品说明", link: "/product" }],
 				},
 				{
 					text: "预览与源码",
