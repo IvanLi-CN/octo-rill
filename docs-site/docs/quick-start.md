@@ -37,6 +37,12 @@ cp .env.example .env.local
 - `GITHUB_CLIENT_SECRET`
 - `GITHUB_OAUTH_REDIRECT_URL`
 
+如果这次不测试 LinuxDO 绑定，先把下面三项都留空。`.env.example` 默认给了 callback 示例值，只保留其中一项会让后端拒绝启动：
+
+- `LINUXDO_CLIENT_ID`
+- `LINUXDO_CLIENT_SECRET`
+- `LINUXDO_OAUTH_REDIRECT_URL`
+
 如果你还要联调 LinuxDO 绑定，再额外补齐：
 
 - `LINUXDO_CLIENT_ID`
