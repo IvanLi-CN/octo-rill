@@ -398,6 +398,18 @@ export function Dashboard(props: {
 		releaseId: string;
 		content: ReactionContent;
 	} | null>(null);
+	const handleReactionTokenStatusLoaded = useCallback(
+		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
+			setReactionTokenConfigured(isReactionTokenUsable(status));
+		},
+		[],
+	);
+	const handleReactionTokenSaved = useCallback(
+		(status: Parameters<typeof isReactionTokenUsable>[0]) => {
+			setReactionTokenConfigured(isReactionTokenUsable(status));
+		},
+		[],
+	);
 	const {
 		reactionTokenMasked,
 		patInput,
@@ -412,12 +424,8 @@ export function Dashboard(props: {
 		clearPatDraft,
 	} = useReactionTokenEditor({
 		autoLoad: false,
-		onStatusLoaded: (status) => {
-			setReactionTokenConfigured(isReactionTokenUsable(status));
-		},
-		onPatSaved: (status) => {
-			setReactionTokenConfigured(isReactionTokenUsable(status));
-		},
+		onStatusLoaded: handleReactionTokenStatusLoaded,
+		onPatSaved: handleReactionTokenSaved,
 	});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>(
@@ -430,6 +438,7 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebar || tab === "inbox",
 	);
+	const startupBootstrapRequestedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
 		initialNotificationBootstrapRef.current,
 	);
@@ -590,13 +599,21 @@ export function Dashboard(props: {
 	}, [loadInitialFeed]);
 
 	useEffect(() => {
+		if (startupBootstrapRequestedRef.current) {
+			return;
+		}
+		startupBootstrapRequestedRef.current = true;
 		void refreshSidebar({
 			background: bootedFromWarmStart,
 			includeNotifications: initialNotificationBootstrapRef.current,
 		}).catch((err) => {
+			startupBootstrapRequestedRef.current = false;
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-		void loadReactionToken();
+		void loadReactionToken().catch((err) => {
+			startupBootstrapRequestedRef.current = false;
+			setBootError(err instanceof Error ? err.message : String(err));
+		});
 	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
 
 	useEffect(() => {
