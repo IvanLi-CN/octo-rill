@@ -19,7 +19,11 @@ export type StartupPresentation =
 	| "warm-cache"
 	| "route-skeleton"
 	| "live";
-export type StartupRouteFamily = "dashboard" | "admin-users" | "admin-jobs";
+export type StartupRouteFamily =
+	| "dashboard"
+	| "admin-dashboard"
+	| "admin-users"
+	| "admin-jobs";
 type FeedRequestType = "all" | "releases" | "stars" | "followers";
 
 export type DashboardWarmRouteState = {
@@ -115,8 +119,11 @@ export function deriveStartupRouteFamily(pathname: string): StartupRouteFamily {
 	if (pathname.startsWith("/admin/jobs")) {
 		return "admin-jobs";
 	}
-	if (pathname.startsWith("/admin")) {
+	if (pathname.startsWith("/admin/users")) {
 		return "admin-users";
+	}
+	if (pathname.startsWith("/admin")) {
+		return "admin-dashboard";
 	}
 	return "dashboard";
 }

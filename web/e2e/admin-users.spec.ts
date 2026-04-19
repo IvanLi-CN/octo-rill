@@ -300,9 +300,11 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(
 		page.getByRole("navigation", { name: "管理员导航" }),
 	).toBeVisible();
+	await page.getByRole("link", { name: "用户管理" }).click();
+	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(
 		page.getByText(
-			"这是独立的管理员界面，当前包含用户管理与任务中心两个模块。",
+			"这里聚焦用户资料与账号状态治理；若需查看整体运营指标，请切换到仪表盘。",
 		),
 	).toBeVisible();
 	await expect(
@@ -360,6 +362,8 @@ test("admin action error remains visible after list refresh", async ({
 	await page.goto("/");
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
+	await page.getByRole("link", { name: "用户管理" }).click();
+	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
 
 	const userRow = page
@@ -380,7 +384,8 @@ test("self-demoted admin is redirected out of admin panel", async ({
 	await page.goto("/");
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
-	await expect(page).toHaveURL(/\/admin$/);
+	await page.getByRole("link", { name: "用户管理" }).click();
+	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(
 		page.getByText("管理账号角色与状态：支持筛选、升降管理员、启用/禁用。"),
 	).toBeVisible();
@@ -422,7 +427,7 @@ test.describe("mobile admin shell", () => {
 		await installBaseMocks(page, { isAdmin: true, extraUsers: 10 });
 		await page.goto("/admin");
 
-		await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
+		await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
 		await expect(
 			page.getByRole("navigation", { name: "管理员导航" }),
 		).toBeVisible();
@@ -468,6 +473,7 @@ test.describe("daily brief time formatting", () => {
 			await page.goto("/");
 
 			await page.getByRole("link", { name: "管理员面板" }).click();
+			await page.getByRole("link", { name: "用户管理" }).click();
 			const userRow = page
 				.getByText("octo-user", { exact: false })
 				.first()
@@ -493,6 +499,7 @@ test.describe("daily brief time formatting", () => {
 			await page.goto("/");
 
 			await page.getByRole("link", { name: "管理员面板" }).click();
+			await page.getByRole("link", { name: "用户管理" }).click();
 			const userRow = page
 				.getByText("octo-user", { exact: false })
 				.first()
