@@ -636,6 +636,10 @@ export const WindowSwitch: Story = {
 
 export const EvidenceOverview: Story = {
 	name: "Evidence / Overview",
+	args: {
+		variant: "busy",
+		initialWindow: "30d",
+	},
 	parameters: {
 		docs: {
 			disable: true,
