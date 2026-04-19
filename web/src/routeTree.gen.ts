@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as AdminRouteRouteImport } from './routes/admin/route'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
@@ -21,6 +22,11 @@ import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jo
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
 import { Route as AdminJobsTasksTaskIdLlmCallIdRouteImport } from './routes/admin/jobs/tasks/$taskId/llm/$callId'
 
+const SettingsRoute = SettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AdminRouteRoute = AdminRouteRouteImport.update({
   id: '/admin',
   path: '/admin',
@@ -83,6 +89,7 @@ const AdminJobsTasksTaskIdLlmCallIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/admin': typeof AdminRouteRouteWithChildren
+  '/settings': typeof SettingsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
@@ -95,6 +102,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/settings': typeof SettingsRoute
   '/admin': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -107,6 +115,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/admin': typeof AdminRouteRouteWithChildren
+  '/settings': typeof SettingsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
@@ -122,6 +131,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/admin'
+    | '/settings'
     | '/admin/jobs'
     | '/admin/'
     | '/admin/jobs/llm'
@@ -134,6 +144,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/settings'
     | '/admin'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -145,6 +156,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/admin'
+    | '/settings'
     | '/admin/jobs'
     | '/admin/'
     | '/admin/jobs/llm'
@@ -159,10 +171,18 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRouteRoute: typeof AdminRouteRouteWithChildren
+  SettingsRoute: typeof SettingsRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/settings': {
+      id: '/settings'
+      path: '/settings'
+      fullPath: '/settings'
+      preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin': {
       id: '/admin'
       path: '/admin'
@@ -296,6 +316,7 @@ const AdminRouteRouteWithChildren = AdminRouteRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRouteRoute: AdminRouteRouteWithChildren,
+  SettingsRoute: SettingsRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

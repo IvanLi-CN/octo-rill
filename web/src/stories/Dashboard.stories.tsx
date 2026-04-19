@@ -4,10 +4,6 @@ import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
-import {
-	DailyBriefProfileForm,
-	readHourAlignedBrowserTimeZone,
-} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -48,6 +44,7 @@ import {
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
+import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -1226,7 +1223,6 @@ function isFeedBackedTab(
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
-	initialProfileDialogOpen?: boolean;
 	syncingAll?: boolean;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
@@ -1247,7 +1243,6 @@ function DashboardPreview(props: {
 	const {
 		initialTab = "all",
 		initialPatDialogOpen = false,
-		initialProfileDialogOpen = false,
 		syncingAll = false,
 		showEmptyInbox = false,
 		emptyState = "content",
@@ -1317,16 +1312,6 @@ function DashboardPreview(props: {
 	);
 	const [tab, setTab] = useState<Tab>(initialTab);
 	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
-	const [profileDialogOpen, setProfileDialogOpen] = useState(
-		initialProfileDialogOpen,
-	);
-	const [profileDraft, setProfileDraft] = useState({
-		daily_brief_local_time: dailyBoundaryLocal,
-		daily_brief_time_zone:
-			dailyBoundaryTimeZone ??
-			readHourAlignedBrowserTimeZone() ??
-			"Asia/Shanghai",
-	});
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
@@ -1377,16 +1362,6 @@ function DashboardPreview(props: {
 			return storyBriefs[0]?.id ?? null;
 		});
 	}, [storyBriefs]);
-
-	useEffect(() => {
-		setProfileDraft({
-			daily_brief_local_time: dailyBoundaryLocal,
-			daily_brief_time_zone:
-				dailyBoundaryTimeZone ??
-				readHourAlignedBrowserTimeZone() ??
-				"Asia/Shanghai",
-		});
-	}, [dailyBoundaryLocal, dailyBoundaryTimeZone]);
 
 	useEffect(() => {
 		if (!pendingFeedTab || !isFeedBackedTab(pendingFeedTab)) {
@@ -1588,14 +1563,6 @@ function DashboardPreview(props: {
 								/>
 							) : null}
 							<Button
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-								onClick={() => setProfileDialogOpen(true)}
-							>
-								日报设置
-							</Button>
-							<Button
 								asChild
 								variant="outline"
 								size="sm"
@@ -1665,87 +1632,62 @@ function DashboardPreview(props: {
 					onClose={() => setActiveReleaseId(null)}
 				/>
 
-				<Dialog open={profileDialogOpen} onOpenChange={setProfileDialogOpen}>
-					<DialogContent className="max-w-lg">
-						<DialogHeader>
-							<DialogTitle>日报设置</DialogTitle>
-							<DialogDescription>
-								之后新生成的日报会按这里的“本地整点 + IANA 时区”切窗口；
-								历史快照不会被回写。
-							</DialogDescription>
-						</DialogHeader>
-						<DailyBriefProfileForm
-							localTime={profileDraft.daily_brief_local_time}
-							timeZone={profileDraft.daily_brief_time_zone}
-							helperText="Storybook 里只演示入口与表单布局；真实页面会走 /api/me/profile。"
-							onLocalTimeChange={(value) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_local_time: value,
-								}))
-							}
-							onTimeZoneChange={(value) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: value,
-								}))
-							}
-							onUseBrowserTimeZone={(timeZone) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: timeZone,
-								}))
-							}
-						/>
-						<DialogFooter>
-							<Button
-								variant="outline"
-								onClick={() => setProfileDialogOpen(false)}
-							>
-								取消
-							</Button>
-							<Button>保存设置</Button>
-						</DialogFooter>
-					</DialogContent>
-				</Dialog>
-
 				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
-					<DialogContent
-						showCloseButton={false}
-						className="max-w-2xl"
-						onInteractOutside={(event) => event.preventDefault()}
-					>
+					<DialogContent className="max-w-md">
 						<DialogHeader>
-							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogTitle>配置 GitHub PAT</DialogTitle>
 							<DialogDescription>
-								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+								不用跳走，直接在这里补齐就行。
 							</DialogDescription>
 						</DialogHeader>
-						<div className="bg-muted/40 rounded-lg border p-3">
-							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-							<p className="text-muted-foreground mt-1 font-mono text-xs">
-								Settings → Developer settings → Personal access tokens → Tokens
-								(classic)
+						<div className="space-y-4">
+							<p className="text-sm text-foreground">
+								先补齐 GitHub PAT，才能继续使用站内反馈。
 							</p>
+							<div className="space-y-2">
+								<div className="flex items-center justify-between gap-3">
+									<Label htmlFor="story-pat-input">GitHub PAT</Label>
+									<span className="text-muted-foreground font-mono text-xs">
+										已保存：ghp_****wxyz
+									</span>
+								</div>
+								<Input
+									id="story-pat-input"
+									type="password"
+									value="ghp_example_valid_token"
+									readOnly
+									className="h-10 font-mono text-sm"
+								/>
+							</div>
+							<div className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2.5">
+								<p className="text-sm font-medium">GitHub PAT 可用</p>
+								<p className="text-muted-foreground mt-1 text-xs leading-5">
+									输入后会在 800ms 后自动校验；通过后才能保存。
+								</p>
+							</div>
+							<div className="text-muted-foreground flex items-center justify-between gap-3 text-xs">
+								<span>最近检查：2026/4/18 19:20:38</span>
+								<Button
+									asChild
+									variant="ghost"
+									size="sm"
+									className="h-auto px-0 text-xs"
+								>
+									<InternalLink
+										href={buildSettingsHref("github-pat")}
+										to="/settings"
+										search={buildSettingsSearch("github-pat")}
+									>
+										去完整设置
+									</InternalLink>
+								</Button>
+							</div>
 						</div>
-						<div className="space-y-2">
-							<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
-							<Input
-								id="storybook-reaction-pat"
-								type="password"
-								value="ghp_mock_dashboard_storybook_token"
-								readOnly
-								className="font-mono text-sm"
-							/>
-						</div>
-						<p className="text-xs text-emerald-600">
-							Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
-						</p>
 						<DialogFooter>
 							<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
-								稍后再说
+								取消
 							</Button>
-							<Button>保存并继续</Button>
+							<Button>保存 GitHub PAT</Button>
 						</DialogFooter>
 					</DialogContent>
 				</Dialog>
@@ -1766,14 +1708,13 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。当前同步入口统一收敛为一个顶部主按钮，这组 stories 用来确认默认、同步中与空态文案是否保持一致。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
+					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 reaction fallback 快速补录弹层，是 OctoRill 登录后的主工作台。当前同步入口统一收敛为一个顶部主按钮，这组 stories 用来确认默认、同步中与空态文案是否保持一致。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
 			},
 		},
 	},
 	args: {
 		initialTab: "all",
 		initialPatDialogOpen: false,
-		initialProfileDialogOpen: false,
 		syncingAll: false,
 		showEmptyInbox: false,
 		emptyState: "content",
@@ -1828,8 +1769,8 @@ export const Default: Story = {
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
 		await expect(
-			canvas.getByRole("button", { name: "日报设置" }),
-		).toBeVisible();
+			canvas.queryByRole("button", { name: "日报设置" }),
+		).not.toBeInTheDocument();
 	},
 };
 
@@ -2200,20 +2141,6 @@ export const EvidenceMobileMixedActivityDayDividerNoOverlap: Story = {
 	},
 };
 
-export const EvidenceDailyBriefProfileOpen: Story = {
-	name: "Evidence / Daily Brief Profile Open",
-	args: {
-		initialTab: "all",
-		initialProfileDialogOpen: true,
-		showFooter: false,
-	},
-	parameters: {
-		docs: {
-			disable: true,
-		},
-	},
-};
-
 export const BriefsFocused: Story = {
 	args: {
 		initialTab: "briefs",
@@ -2488,7 +2415,7 @@ export const PatDialogOpen: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
+				story: "直接展示 reaction fallback 快速补录 GitHub PAT 的弹层状态。",
 			},
 		},
 	},
@@ -2916,16 +2843,16 @@ export const PostBootStarsTabSwitchKeepsShell: Story = {
 		);
 		expect(secondaryControls).not.toBeNull();
 		await expect(
-			canvas.getByRole("button", { name: "日报设置" }),
-		).toBeVisible();
+			canvas.queryByRole("button", { name: "日报设置" }),
+		).not.toBeInTheDocument();
 		await step("switch to stars without dropping the app shell", async () => {
 			await canvas.getByRole("tab", { name: "加星" }).click();
 			expect(
 				canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
 			).not.toBeNull();
 			await expect(
-				canvas.getByRole("button", { name: "日报设置" }),
-			).toBeVisible();
+				canvas.queryByRole("button", { name: "日报设置" }),
+			).not.toBeInTheDocument();
 			expect(
 				canvasElement.querySelector("[data-dashboard-boot-header]"),
 			).toBeNull();

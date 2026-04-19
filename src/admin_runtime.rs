@@ -438,14 +438,15 @@ mod tests {
     }
 
     fn setup_state(pool: SqlitePool, config: AppConfig) -> Arc<AppState> {
-        let oauth = build_oauth_client(&config).expect("build oauth client");
+        let github_oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(TranslationSchedulerController::new(
                 TranslationRuntimeConfig::default(),
             )),
             http: reqwest::Client::new(),
-            oauth,
+            github_oauth,
+            linuxdo_oauth: None,
             encryption_key: config.encryption_key.clone(),
             runtime_owner_id: generate_local_id(),
             pool,
@@ -473,6 +474,7 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
+            linuxdo: None,
             ai: None,
             ai_max_concurrency,
             ai_daily_at_local: None,
