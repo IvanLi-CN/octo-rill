@@ -5,153 +5,79 @@
 
 # OctoRill
 
-OctoRill 是一个面向个人 GitHub 动态的聚合与阅读界面：在同一工作区集中展示发布更新、个人仓库获星、账号被关注等动态；发布内容支持中文翻译与要点整理，并提供日报与 Inbox 快捷入口。
+OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅读的工作区：集中查看发布更新、获星与关注动态、日报，以及 Inbox 入口；发布内容支持中文翻译与要点整理。
 
-更多产品与交互说明见：`docs/product.md`。
+## 先去哪里看
 
-## Tech stack
+- 公共文档站：[`ivanli-cn.github.io/octo-rill`](https://ivanli-cn.github.io/octo-rill/)
+- 本地启动步骤：[`docs-site/docs/quick-start.md`](./docs-site/docs/quick-start.md)
+- 配置参考：[`docs-site/docs/config.md`](./docs-site/docs/config.md)
+- 公开产品说明：[`docs-site/docs/product.md`](./docs-site/docs/product.md)
+- 内部产品参考：[`docs/product.md`](./docs/product.md)
+- 前端与 Storybook 贡献说明：[`web/README.md`](./web/README.md)
 
-- Backend: Rust (axum) + SQLite (sqlx)
-- Frontend: React (Vite) + Bun
+## 仓库结构
 
-## Dev
+- `src/`：Rust 后端，负责 OAuth、同步、翻译、日报、通知与管理员任务接口。
+- `web/`：React + Vite 前端，以及 Storybook。
+- `docs-site/`：Rspress 文档站；发布时与 Storybook 组装到同一个 GitHub Pages 站点。
+- `docs/specs/`：工作项规格与追踪台账，不是公开文档入口。
+- `migrations/`：SQLite schema 迁移。
+- `brand/`：品牌资源与导出文件。
 
-### 0) 安装仓库级开发工具与 Git hooks
+## 本地最短启动路径
 
-```bash
-bun install
-```
+1. 在仓库根目录安装仓库级工具与 hooks：
 
-- 请优先在主工作区根目录执行 `bun install`；它会安装本仓库的 Git tooling，并通过 `prepare` 自动把 hooks 装到共享 `.git/hooks`。
-- 当前这套 repo-local hooks / worktree bootstrap 安装入口以 POSIX shell 为前提，仅承诺 `macOS/Linux`；原生 `PowerShell-only Windows` 不在支持范围。
-- 若你在 linked worktree 内执行 `bun install`，安装脚本会尝试复用主工作区解析出的 hook 安装入口与 `lefthook` 二进制；若主工作区尚未完成初始化，会提示你先回主工作区执行一次。
-- hooks 安装后会优先使用仓库内解析出的 `lefthook` 二进制，避免被全局 `lefthook` 抢占；若之前固定的二进制已不存在，hook 会自动回退到当前环境里的可用 `lefthook`。
-- 安装脚本会把主工作区根目录记录到共享 Git 配置里，因此 `git clone --separate-git-dir=...` 这类布局下，新 linked worktree 依然能回源复制本地资源。
-- 安装脚本会把 repo-local `core.hooksPath` 收敛到共享 hook 目录；若仓库原本已有自定义 hook 目录，或默认 `.git/hooks` 下已有自定义 hook，会把既有 hook 链接进共享目录，避免 `bun install` 后把原有 hook 链静默关掉。
-- 当 `lefthook.yml`、`package.json` 或根目录依赖发生变化时，重新执行 `bun install` 或 `bun run hooks:install`；若变更发生在 linked worktree 内，安装脚本会按当前 worktree 的 `lefthook.yml` 生成共享 wrappers，并优先固定到当前 worktree 已安装的 repo-local `lefthook`，再回退到主工作区二进制。
+   ```bash
+   bun install
+   ```
 
-### 1) 配置环境变量
+2. 复制环境变量模板并填写最少必需项：
 
-推荐复制 `.env.example` 到 `.env.local` 并填写本地 secrets：
+   ```bash
+   cp .env.example .env.local
+   ```
 
-```bash
-cp .env.example .env.local
-```
+   至少补齐：`OCTORILL_ENCRYPTION_KEY_BASE64`、`GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URL`。如果这次不测试 LinuxDO，记得把 `LINUXDO_CLIENT_ID`、`LINUXDO_CLIENT_SECRET`、`LINUXDO_OAUTH_REDIRECT_URL` 三项都清空；如果要测试 LinuxDO 绑定，则三项必须同时出现。
 
-- 应用启动顺序是先读取 `.env.local`，再读取 `.env`；`.env.local` 更适合每位开发者自己的配置。
-- 安装 hooks 后，新的 linked worktree 在首次 checkout 时会自动补齐清单中缺失的资源（当前默认包含 `.env.local` 与 `.env`）。
-- 若要扩展自动同步的资源，请编辑 `scripts/worktree-sync.paths`，只添加适合“缺失时复制”的本地文件或目录。
-- 非常规 Git 布局可通过 `git config --local codex.worktree-sync.source-root <path>` 指定源目录；`<path>` 支持绝对路径和相对仓库根目录的写法。
+3. 启动后端：
 
-关键配置项：
+   ```bash
+   cargo run
+   ```
 
-- GitHub OAuth：
-  - `GITHUB_CLIENT_ID`
-  - `GITHUB_CLIENT_SECRET`
-  - `GITHUB_OAUTH_REDIRECT_URL`
-- AI（可选；用于翻译与日报）：
-  - `AI_API_KEY`
-  - `AI_BASE_URL`
-  - `AI_MODEL`
-  - `AI_MAX_CONCURRENCY`（可选，单进程 LLM 最大并行数，默认 `1`）
-  - `AI_DAILY_AT_LOCAL`（例如 `08:00`，用于“昨日更新”窗口边界；不配置时默认 `08:00`）
+   默认监听 `http://127.0.0.1:58090`。
 
-### 2) 启动后端
+4. 启动前端：
 
-```bash
-cargo run
-```
+   ```bash
+   cd web
+   bun install
+   bun run dev
+   ```
 
-### 3) 启动前端
+   打开 `http://127.0.0.1:55174`。首次成功时，你会先看到 GitHub 登录页；已有会话时会直接进入 Dashboard。
 
-```bash
-cd web
-bun install
-bun run dev
-```
+可选本地入口：
 
-Then open `http://127.0.0.1:55174`.
+- Storybook：`cd web && bun run storybook` → `http://127.0.0.1:55176`
+- 文档站：`cd docs-site && bun install && bun run dev` → `http://127.0.0.1:50885`
 
-### 4) 启动 Storybook（可选）
+## 常用命令
 
 ```bash
-cd web
-bun run storybook
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --locked --all-targets --all-features
+(cd web && bun run lint)
+(cd web && bun run storybook:build)
+(cd docs-site && bun run build)
 ```
 
-Then open `http://127.0.0.1:55176`.
+## 开发流程提醒
 
-### 5) 启动 docs-site（可选）
-
-```bash
-cd docs-site
-bun install
-bun run dev
-```
-
-Then open `http://127.0.0.1:50885`.
-
-`docs-site` 单独运行时只承载文档壳层；如果同机已经执行 `cd web && bun run storybook`，文档里的 Storybook 入口会自动跳到本地 Storybook dev server。若你改过本地端口，可额外设置 `VITE_STORYBOOK_DEV_ORIGIN` 或 `VITE_DOCS_SITE_ORIGIN`。若要验证发布后的 `/storybook/` 子路径，请先构建 docs-site 与 Storybook，再执行 `.github/scripts/assemble-pages-site.sh` 进行装配预览。
-
-## Auth model
-
-- OAuth（默认登录通道）：仅用于登录、读取与同步（Feed / Notifications / Starred / Releases / Followers / owned repo stargazers）。
-- OAuth scope 策略：采用最小授权，默认不为站内反馈申请额外写权限。
-- Release 反馈（👍 😄 ❤️ 🎉 🚀 👀）写操作：要求用户额外提供 GitHub PAT（Personal Access Token）。
-  - Fine-grained PAT：按 GitHub Reactions 文档可不额外申请 repository permissions，但 token 仍需覆盖目标仓库。
-  - Classic PAT：公共仓库建议 `public_repo`，私有仓库需 `repo`。
-
-## Docs & Storybook
-
-- Public docs site source lives in `docs-site/` and is built with Rspress.
-- Storybook stays under `web/` and is published as a nested static site at `/storybook/`; the primary docs navigation goes through `/storybook.html` and immediately redirects to `/storybook/index.html`; the curated hub page lives at `/storybook-guide.html`.
-- `Docs Pages` GitHub Actions workflow builds the docs site and Storybook separately, then assembles them into one GitHub Pages artifact.
-- For project Pages deployments, `DOCS_BASE` must be set to `/<repo>/`; the workflow computes this automatically.
-- `CI Pipeline` also runs docs-site build plus the assembled-site smoke check, so base-path regressions can fail in PR before Pages deploy.
-
-## Notes
-
-- OAuth callback is handled by the backend (`/auth/github/callback`).
-- Local data (SQLite) lives under `./.data/`.
-- Local application primary keys now use 16-character NanoIDs; older SQLite files created before the NanoID cutover are not compatible and should be rebuilt (for the default path, remove `./.data/octo-rill.db` before restarting).
-- For OpenAI-compatible gateways, `AI_MODEL` usually needs to match an ID from `/v1/models` (often case-sensitive).
-- 模型输入上限会按内置目录解析，并固定每天同步外部目录（OpenRouter + LiteLLM）；如需手动覆盖，请在管理员任务中心 `LLM 调度` 页签的“配置 LLM 运行参数”里保存 `LLM 输入长度上限（tokens）`。
-- LLM 调度默认只允许单进程内 `1` 个上游请求并行；如需提速，可通过 `AI_MAX_CONCURRENCY` 提高 permit 并发上限。
-- 管理员任务中心支持在线调整 LLM 并发上限，以及翻译 worker 数量 / 可选的模型输入上限；首次启动时这些值以 env/default 或空值为种子，管理员保存后会持久化到数据库，并在后续重启时继续生效。
-- Release 数据按“共享事实语义”处理：取消 Star 只影响当前用户列表可见性，不影响历史日报里的 release 详情访问与详情翻译。
-- 日报落库前会做 `release_id` 内链完整性校验与补齐，按查询参数做精确匹配（避免 `12/123` 前缀误判）。
-
-## Release automation (PR label driven)
-
-Releases are decided by PR labels and executed only after `CI Pipeline` succeeds on `main`.
-
-### Required PR labels
-
-Every PR must contain exactly one `type:*` label and one `channel:*` label:
-
-- `type:*`: `type:docs`, `type:skip`, `type:patch`, `type:minor`, `type:major`
-- `channel:*`: `channel:stable`, `channel:rc`
-
-### Decision matrix
-
-| Type label | Channel label | Release result |
-| --- | --- | --- |
-| `type:docs` / `type:skip` | `channel:stable` / `channel:rc` | No release |
-| `type:patch` / `type:minor` / `type:major` | `channel:stable` | Stable release (`vX.Y.Z`) |
-| `type:patch` / `type:minor` / `type:major` | `channel:rc` | Prerelease (`vX.Y.Z-rc.<sha7>`) |
-
-### Image tags
-
-- Stable release: publish `${image}:vX.Y.Z` and `${image}:latest`
-- RC release: publish `${image}:vX.Y.Z-rc.<sha7>` only (no `latest`)
-
-### Troubleshooting
-
-- `PR Label Gate` fails:
-  - Missing or conflicting `type:*` / `channel:*` labels
-  - Unknown labels under `type:*` or `channel:*`
-- `Release` workflow skips:
-  - Commit cannot be mapped to exactly one PR
-  - GitHub API lookup failure for PR mapping/labels
-- `Release` workflow fails:
-  - Invalid label combination detected by `.github/scripts/release-intent.sh`
+- 变更代码时同步更新文档；不要让 README、docs-site 与行为实现分叉。
+- 合到 `main` 的 PR 需要且只能有一个 `type:*` 标签和一个 `channel:*` 标签；文档改动通常使用 `type:docs`。
+- LinuxDO 绑定、自托管 callback 与 AI 配置的细项统一写在 [`docs-site/docs/config.md`](./docs-site/docs/config.md)，不要再把 README 扩写成部署手册。
+- 如果改动影响页面或 Storybook 文档入口，先验证 docs-site build、Storybook build 与 assembled Pages smoke check。

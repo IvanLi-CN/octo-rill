@@ -75,7 +75,6 @@
 | x4k7m | 发布有效版本显示修复（API + Footer + Release 注入闭环） | 已完成 | `x4k7m-effective-version-surfacing/SPEC.md` | 2026-04-15 | PR #20；新增 `/api/version`，health/version 同源，footer 回退 health；release web-builder fallback + build gate docker smoke + historical backfill overlay |
 | 9vb46 | 管理员任务中心刷新闪烁修复 | 已完成 | `9vb46-admin-jobs-refresh-flicker-fix/SPEC.md` | 2026-03-07 | PR #23、PR #26；已补齐首载后筛选复载不闪烁，且后台刷新期间旧行交互已禁用 |
 | vj7sr | 管理端任务详情可观测性增强（Release 批量翻译 + 日报） | 已完成 | `vj7sr-admin-job-detail-observability/SPEC.md` | 2026-03-08 | task drawer route outlet + in-drawer LLM detail navigation; recent-events browser-timezone sync + merge-gate evidence aligned |
-| ejdn8 | 项目内安装 UI UX Pro Max skill 并放开 skills 跟踪 | 已完成 | `ejdn8-uipro-skill-install/SPEC.md` | 2026-02-26 | local installation + gitignore rule update |
 | 3s4jc | Landing 登录页移除开发提示 | 已完成 | `3s4jc-landing-login-remove-dev-tip/SPEC.md` | 2026-02-26 | PR #15; review-loop added bootError e2e |
 | g4456 | LLM 批处理效率改造 | 已完成 | `g4456-llm-batch-efficiency/SPEC.md` | 2026-03-30 | local implementation completed; batching/dedupe contract landed; runtime input-limit source superseded by #y2yf8 |
 | 3k9fd | Release Feed 正文卡片与同步后后台翻译 | 重新设计（#y2yf8） | `3k9fd-release-feed-body-translation/SPEC.md` | 2026-04-13 | historical body-limit contract superseded by #y2yf8 LLM-input-budget chunk translation |
@@ -104,9 +103,14 @@
 | jfkcf | Release reaction 反馈图标轻量收敛 | 已完成 | `jfkcf-release-reaction-compact-size/SPEC.md` | 2026-04-12 | local implementation completed; compact reaction trigger + Storybook canvas evidence |
 | p82d7 | Dashboard / Admin 移动端壳层与顶栏收敛优化 | 部分完成（4/4） | `p82d7-dashboard-admin-mobile-shell-polish/SPEC.md` | 2026-04-14 | PR #77; visual evidence refreshed and mobile shell gesture polish landed |
 | y9qpf | TanStack Router 接管前端路由并消除登录页闪现 | 已完成 | `y9qpf-tanstack-router-auth-boot-no-login-flicker/SPEC.md` | 2026-04-15 | PR #80; fast-track; TanStack Router SPA routing + three-layer startup model + build-time version monitor landed |
+| 2bhas | Dashboard 社交卡片移动端横向紧凑重设计 | 已完成 | `2bhas-dashboard-social-mobile-compact-layout/SPEC.md` | 2026-04-18 | local follow-up fixes target entity-group trailing whitespace; refreshed Storybook edge-case evidence pending owner approval before push |
 | gzyja | 全局字标路径化与几何对齐修复 | 部分完成（2/3） | `gzyja-wordmark-path-geometry-fix/SPEC.md` | 2026-04-15 | fast-track follow-up to #tvujt; local implementation + visual evidence landed; PR pending screenshot push approval |
 | 6x959 | Dashboard 启动骨架页头与 Tabs 占位收敛 | 已完成 | `6x959-dashboard-startup-skeleton-header-tabs-alignment/SPEC.md` | 2026-04-16 | fast-track follow-up to #y9qpf; warm skeleton shell alignment + visual evidence |
 | 67g9w | Dashboard SPA 导航避免回退启动骨架 | 已完成 | `67g9w-spa-nav-startup-skeleton-guard/SPEC.md` | 2026-04-17 | fast-track; shell hydration gate + local feed skeleton + visual evidence |
 | w9by9 | Dashboard 移动端日分组标题防重叠修复 | 部分完成（3/4） | `w9by9-dashboard-mobile-day-divider-overlap/SPEC.md` | 2026-04-16 | fast-track; local implementation + visual evidence + review clear; PR pending screenshot push approval |
-| qvfxq | Release 日报内容格式 V2 与历史快照修复 | 部分完成（3/4） | `qvfxq-release-daily-brief-v2/SPEC.md` | 2026-04-16 | fast-track / brief body v2 + historical refresh landed / visual evidence captured |
+| qvfxq | Release 日报内容格式 V2 与历史快照修复 | 已完成 | `qvfxq-release-daily-brief-v2/SPEC.md` | 2026-04-19 | fast-track / canonical brief markdown validator + refresh drift repair landed |
 | m2k8d | 管理后台仪表盘与 rollup 统计 | 已完成 | `m2k8d-admin-dashboard-rollups/SPEC.md` | 2026-04-18 | local implementation completed; Recharts dashboard + daily rollup analytics |
+| n4x7e | Dashboard 历史日报折叠补齐与社交空态裁剪 | 已完成 | `n4x7e-dashboard-brief-social-folding/SPEC.md` | 2026-04-19 | PR #96; fast-track follow-up to #xaycu / #qvfxq merged with historical social folding, optional social brief sections, and visual evidence |
+| cm2je | 移除项目内 UI UX Pro Max skill | 已完成 | `cm2je-remove-ui-ux-pro-max-skill/SPEC.md` | 2026-04-18 | local implementation completed; removed project-local skill assets and obsolete install spec |
+| em5uh | 公开文档体系重写与职责收口 | 已完成 | `em5uh-public-docs-rewrite/SPEC.md` | 2026-04-19 | PR #95; fast-track / public docs rewrite / PR ready |
+| y9ngx | LinuxDO 绑定与用户设置页改造 | 已完成 | `y9ngx-linuxdo-user-settings/SPEC.md` | 2026-04-19 | PR #94; fast-track / unified settings page + LinuxDO binding + inline PAT fallback |

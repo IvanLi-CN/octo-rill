@@ -3,6 +3,7 @@ import {
 	ArrowUpRight,
 	LogOut,
 	RefreshCcw,
+	Settings,
 	ShieldCheck,
 	Sparkles,
 } from "lucide-react";
@@ -174,6 +175,19 @@ function DashboardUserInfoCard(props: {
 			) : null}
 
 			<div className="mt-4 border-t border-border/70 pt-3">
+				<Button asChild variant="ghost" className="w-full justify-start px-2">
+					<InternalLink
+						href="/settings"
+						to="/settings"
+						data-dashboard-settings-entry="true"
+					>
+						<Settings className="size-4" />
+						设置
+					</InternalLink>
+				</Button>
+			</div>
+
+			<div className="mt-2 border-t border-border/70 pt-3">
 				<Button asChild variant="ghost" className="w-full justify-start px-2">
 					<a aria-label="退出登录" href={logoutHref}>
 						<LogOut className="size-4" />

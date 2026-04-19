@@ -14,13 +14,16 @@ use crate::{
 
 pub type GitHubOAuthClient =
     BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+pub type LinuxDoOAuthClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub pool: SqlitePool,
     pub http: reqwest::Client,
-    pub oauth: GitHubOAuthClient,
+    pub github_oauth: GitHubOAuthClient,
+    pub linuxdo_oauth: Option<LinuxDoOAuthClient>,
     pub encryption_key: EncryptionKey,
     pub llm_scheduler: Arc<LlmScheduler>,
     pub translation_scheduler: Arc<TranslationSchedulerController>,
@@ -68,6 +71,27 @@ pub fn build_oauth_client(config: &AppConfig) -> Result<GitHubOAuthClient> {
         .set_redirect_uri(redirect_url);
 
     Ok(client)
+}
+
+pub fn build_linuxdo_oauth_client(config: &AppConfig) -> Result<Option<LinuxDoOAuthClient>> {
+    let Some(linuxdo) = config.linuxdo.as_ref() else {
+        return Ok(None);
+    };
+
+    let auth_url = AuthUrl::new("https://connect.linux.do/oauth2/authorize".to_owned())
+        .context("invalid linuxdo auth url")?;
+    let token_url = TokenUrl::new("https://connect.linux.do/oauth2/token".to_owned())
+        .context("invalid linuxdo token url")?;
+    let redirect_url = RedirectUrl::new(linuxdo.redirect_url.to_string())
+        .context("invalid linuxdo redirect url")?;
+
+    let client = BasicClient::new(ClientId::new(linuxdo.client_id.clone()))
+        .set_client_secret(ClientSecret::new(linuxdo.client_secret.clone()))
+        .set_auth_uri(auth_url)
+        .set_token_uri(token_url)
+        .set_redirect_uri(redirect_url);
+
+    Ok(Some(client))
 }
 
 pub fn normalize_origin(url: &Url) -> Result<Url> {
