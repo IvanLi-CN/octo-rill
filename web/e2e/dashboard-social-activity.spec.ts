@@ -1243,6 +1243,8 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await page.goto("/");
 
 	await expect(socialPrimaryDesktop(page, "octocat-old")).toBeVisible();
+	await expect.poll(() => _briefsCalls).toBe(1);
+	await expect.poll(() => _reactionTokenStatusCalls).toBe(1);
 	await page.getByRole("tab", { name: "加星" }).click();
 	await expect(socialPrimaryDesktop(page, "octocat-old")).toHaveCount(0);
 	await expect(page).toHaveURL(/\/\?tab=stars$/);
@@ -1255,6 +1257,8 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await expect(page.locator("[data-dashboard-boot-header]")).toHaveCount(0);
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
 	expect(starsFeedCalls).toBe(1);
+	expect(_briefsCalls).toBe(1);
+	expect(_reactionTokenStatusCalls).toBe(1);
 
 	releaseStarsResponse();
 
@@ -1262,4 +1266,6 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await expect(page.locator('[data-feed-loading-skeleton="true"]')).toHaveCount(
 		0,
 	);
+	await expect.poll(() => _briefsCalls).toBe(1);
+	await expect.poll(() => _reactionTokenStatusCalls).toBe(1);
 });
