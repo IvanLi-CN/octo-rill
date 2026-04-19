@@ -1,35 +1,30 @@
 ---
-title: OctoRill 文档首页
-description: OctoRill 中文文档入口。
+title: OctoRill 文档
+description: OctoRill 的启动、配置、产品说明与 Storybook 入口。
 ---
 
 # OctoRill 文档
 
-OctoRill 是一个面向个人 GitHub 动态的聚合与阅读界面：把发布更新、获星与关注动态、日报与 Inbox 整理成更适合日常查看的工作区；发布内容支持中文翻译与要点整理。
+OctoRill 是一个面向个人 GitHub 动态的阅读工作区：把发布更新、获星与关注动态、日报和 Inbox 入口放到同一个界面里，减少在多个 GitHub 页面之间来回跳转。
 
-## 先看这 4 件事
+## 按任务进入
 
-1. 如果你第一次运行项目，先读 [快速开始](/quick-start)。
-2. 需要填写环境变量时，直接跳到 [配置参考](/config)。
-3. 想理解产品的信息架构与核心体验，看 [产品说明](/product)。
-4. 想预览 UI 组件与页面状态，打开 [Storybook](/storybook.html)。
+- **我要先跑起来**：看 [快速开始](/quick-start)。
+- **我要配置 OAuth、AI 或运行参数**：看 [配置参考](/config)。
+- **我要先理解产品在解决什么问题**：看 [产品说明](/product)。
+- **我要核对页面状态或组件外观**：看 [Storybook 导览](/storybook-guide.html) 或直接打开 [Storybook](/storybook.html)。
 
-## 文档导航
+## 这套文档覆盖什么
 
-- [快速开始](/quick-start)
-- [配置参考](/config)
-- [产品说明](/product)
-- [Storybook 导览](/storybook-guide.html)
+- 本地启动路径与常用验证入口。
+- 运行配置、默认值与文档站/Storybook 相关环境变量。
+- 产品定位、主要界面和权限边界。
+- Storybook 的常用故事入口与使用方式。
+
+公开站点不维护历史 specs、实现跟踪或内部决策记录；这些内容保留在仓库内的 `docs/specs/` 与相关实现文档中。
+
+## 相关入口
+
 - [GitHub 仓库](https://github.com/IvanLi-CN/octo-rill)
-
-## 适合谁看
-
-- 新接手仓库的开发者：先通过本文档梳理启动方式、核心页面与依赖关系。
-- 需要验证 UI 或交互状态的同学：直接进入 Storybook，对照页面故事查看边界状态。
-- 需要理解项目定位的协作者：用产品说明快速了解发布更新、社交动态、日报、Inbox 与管理侧能力的边界。
-
-## 当前首版范围
-
-- 中文单语文档。
-- 面向开发者与协作者的最小公开文档集合。
-- Storybook 与文档站合并发布到同一个 GitHub Pages 站点。
+- [仓库 README](https://github.com/IvanLi-CN/octo-rill/blob/main/README.md)
+- [内部产品参考](https://github.com/IvanLi-CN/octo-rill/blob/main/docs/product.md)
