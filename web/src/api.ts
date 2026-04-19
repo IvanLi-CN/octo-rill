@@ -267,6 +267,79 @@ export type AdminJobsOverviewResponse = {
 	enabled_scheduled_slots: number;
 	total_scheduled_slots: number;
 };
+export type AdminDashboardTaskStatusItem = {
+	task_type: string;
+	label: string;
+	queued: number;
+	running: number;
+	succeeded: number;
+	failed: number;
+	canceled: number;
+	total: number;
+	success_rate: number;
+};
+export type AdminDashboardTaskShareItem = {
+	task_type: string;
+	label: string;
+	total: number;
+	share_ratio: number;
+	success_rate: number;
+};
+export type AdminDashboardTrendPoint = {
+	date: string;
+	label: string;
+	total_users: number;
+	active_users: number;
+	translations_total: number;
+	translations_failed: number;
+	summaries_total: number;
+	summaries_failed: number;
+	briefs_total: number;
+	briefs_failed: number;
+};
+export type AdminDashboardWindowValue = "7d" | "30d";
+export type AdminDashboardResponse = {
+	generated_at: string;
+	time_zone: string;
+	summary: {
+		total_users: number;
+		active_users_today: number;
+		ongoing_tasks_total: number;
+		queued_tasks: number;
+		running_tasks: number;
+		ongoing_by_task: {
+			translations: number;
+			summaries: number;
+			briefs: number;
+		};
+	};
+	today_live: {
+		date: string;
+		total_users: number;
+		active_users: number;
+		ongoing_tasks_total: number;
+		queued_tasks: number;
+		running_tasks: number;
+	};
+	status_breakdown: {
+		queued_total: number;
+		running_total: number;
+		succeeded_total: number;
+		failed_total: number;
+		canceled_total: number;
+		total: number;
+		items: AdminDashboardTaskStatusItem[];
+	};
+	task_share: AdminDashboardTaskShareItem[];
+	trend_points: AdminDashboardTrendPoint[];
+	window_meta: {
+		selected_window: AdminDashboardWindowValue;
+		available_windows: AdminDashboardWindowValue[];
+		window_start: string;
+		window_end: string;
+		point_count: number;
+	};
+};
 export type AdminRealtimeTaskItem = {
 	id: string;
 	task_type: string;
@@ -560,6 +633,15 @@ export async function apiPatchMeProfile(
 	body: DailyBriefProfilePatchRequest,
 ): Promise<MeProfileResponse> {
 	return apiPatchJson<MeProfileResponse>("/api/me/profile", body);
+}
+export async function apiGetAdminDashboard(
+	window: AdminDashboardWindowValue,
+): Promise<AdminDashboardResponse> {
+	const params = new URLSearchParams();
+	params.set("window", window);
+	return apiGet<AdminDashboardResponse>(
+		`/api/admin/dashboard${params.size > 0 ? `?${params.toString()}` : ""}`,
+	);
 }
 export async function apiGetMeLinuxDo(): Promise<MeLinuxDoResponse> {
 	return apiGet<MeLinuxDoResponse>("/api/me/linuxdo");

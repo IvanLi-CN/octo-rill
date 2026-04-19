@@ -1,24 +1,26 @@
 import { createFileRoute } from "@tanstack/react-router";
 
-import { readAdminUsersWarmSnapshot } from "@/auth/startupCache";
-import { AdminPanel } from "@/pages/AdminPanel";
+import { useAuthBootstrap } from "@/auth/AuthBootstrap";
+import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
+import { AdminDashboardStartupSkeleton } from "@/pages/AppBoot";
 
 import { useRequiredAdmin } from "../-adminGuard";
 
 export const Route = createFileRoute("/admin/")({
-	component: AdminUsersRouteComponent,
+	component: AdminDashboardRouteComponent,
 });
 
-function AdminUsersRouteComponent() {
+function AdminDashboardRouteComponent() {
+	const auth = useAuthBootstrap();
 	const me = useRequiredAdmin();
 
 	if (!me) {
 		return null;
 	}
 
-	const warmStart = readAdminUsersWarmSnapshot({
-		userId: me.user.id,
-	});
+	if (auth.isBootstrapping && auth.bootPresentation !== "live") {
+		return <AdminDashboardStartupSkeleton me={me} />;
+	}
 
-	return <AdminPanel me={me} userManagementWarmStart={warmStart} />;
+	return <AdminDashboardPage me={me} />;
 }

@@ -1466,7 +1466,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	const llmTab = page.getByRole("tab", { name: "LLM调度" });
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
-	await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
+	await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
+	await expect(
+		page.getByRole("navigation", { name: "管理员导航" }),
+	).toBeVisible();
 	await expect(page.getByRole("heading", { name: "任务总览" })).toBeVisible();
 	await expect(realtimeTab).toHaveAttribute("aria-selected", "true");
 	await expect(
