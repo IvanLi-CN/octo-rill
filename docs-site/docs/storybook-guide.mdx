@@ -1,56 +1,22 @@
 ---
-title: Storybook 导览
-description: 从公开文档进入 OctoRill Storybook 的最短路径。
+title: Storybook 旧入口
+description: 旧的 Storybook 导览链接已迁移到直接入口。
 ---
 
-# Storybook 导览
+import { useEffect } from "react";
 
-在 OctoRill 里，Storybook 用来回答三个问题：页面有哪些稳定状态、管理员界面如何在复杂数据下表现、基础组件在业务语境里长什么样。
+export const LegacyStorybookGuideRedirect = () => {
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.location.replace("./storybook.html");
+  }, []);
 
-## 什么时候打开 Storybook
+  return (
+    <>
+      <h1>旧入口已迁移</h1>
+      <p>Storybook 导览页已经移除；如果没有自动跳转，请直接打开 <a href="./storybook.html">Storybook</a>。</p>
+    </>
+  );
+};
 
-- 你在改 UI，需要先确认现有页面状态。
-- 你在补 stories、docs 或交互覆盖。
-- 你想验证某个文案、空态、加载态或抽屉状态，而不想先跑完整业务数据。
-
-## 入口
-
-<ul>
-  <li><a href="./storybook.html">打开 Storybook</a></li>
-  <li><a href="./storybook.html?path=/docs/pages-landing--docs">Storybook Docs 首页</a></li>
-</ul>
-
-如果你是在本地单独运行 `docs-site`，记得先在 `web/` 启动 Storybook dev server；这里的链接会自动跳到本机 Storybook。
-
-## 核心故事入口
-
-### 页面
-
-<ul>
-  <li><a href="./storybook.html?path=/docs/pages-landing--docs">Landing</a></li>
-  <li><a href="./storybook.html?path=/docs/pages-dashboard--docs">Dashboard</a></li>
-</ul>
-
-### 管理界面
-
-<ul>
-  <li><a href="./storybook.html?path=/docs/admin-admin-panel--docs">Admin Panel</a></li>
-  <li><a href="./storybook.html?path=/docs/admin-admin-jobs--docs">Admin Jobs</a></li>
-  <li><a href="./storybook.html?path=/docs/admin-task-type-detail--docs">Task Type Detail</a></li>
-</ul>
-
-### 布局与基础组件
-
-<ul>
-  <li><a href="./storybook.html?path=/docs/layout-app-meta-footer--docs">App Meta Footer</a></li>
-  <li><a href="./storybook.html?path=/docs/ui-primitives--docs">UI Primitives</a></li>
-  <li><a href="./storybook.html?path=/docs/ui-button--docs">Button</a></li>
-  <li><a href="./storybook.html?path=/docs/ui-card--docs">Card</a></li>
-</ul>
-
-## 与公开文档的分工
-
-- 公开文档解释产品、启动方式和配置。
-- Storybook 展示页面状态、组件组合和视觉边界。
-
-当你需要“解释为什么有这个页面”，先回到 [产品说明](/product)；当你需要“确认这个状态长什么样”，直接留在 Storybook。
+<LegacyStorybookGuideRedirect />

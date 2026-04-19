@@ -29,7 +29,7 @@ export default defineConfig({
 		},
 	},
 	title: "OctoRill 文档",
-	description: "OctoRill 的启动、配置、产品说明与 Storybook 入口。",
+	description: "OctoRill 的启动、配置、产品说明与常用入口。",
 	lang: "zh",
 	themeConfig: {
 		search: true,
@@ -56,9 +56,9 @@ export default defineConfig({
 					items: [{ text: "产品说明", link: "/product" }],
 				},
 				{
-					text: "预览与源码",
+					text: "其他入口",
 					items: [
-						{ text: "Storybook 导览", link: "/storybook-guide.html" },
+						{ text: "Storybook", link: "/storybook.html" },
 						{ text: "GitHub 仓库", link: "https://github.com/IvanLi-CN/octo-rill" },
 					],
 				},
