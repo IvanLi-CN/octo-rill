@@ -1,6 +1,6 @@
 ---
 title: OctoRill 文档
-description: OctoRill 的启动、配置、产品说明与 Storybook 入口。
+description: OctoRill 的启动、配置、产品说明与常用入口。
 ---
 
 # OctoRill 文档
@@ -12,14 +12,14 @@ OctoRill 是一个面向个人 GitHub 动态的阅读工作区：把发布更新
 - **我要先跑起来**：看 [快速开始](/quick-start)。
 - **我要配置 OAuth、AI 或运行参数**：看 [配置参考](/config)。
 - **我要先理解产品在解决什么问题**：看 [产品说明](/product)。
-- **我要核对页面状态或组件外观**：看 [Storybook 导览](/storybook-guide.html) 或直接打开 [Storybook](/storybook.html)。
+- **我要核对页面状态或组件外观**：直接打开 [Storybook](/storybook.html)。
 
 ## 这套文档覆盖什么
 
 - 本地启动路径与常用验证入口。
 - 运行配置、默认值与文档站/Storybook 相关环境变量。
 - 产品定位、主要界面和权限边界。
-- Storybook 的常用故事入口与使用方式。
+- 指向 Storybook 与仓库源码的直接入口。
 
 公开站点不维护历史 specs、实现跟踪或内部决策记录；这些内容保留在仓库内的 `docs/specs/` 与相关实现文档中。
 
