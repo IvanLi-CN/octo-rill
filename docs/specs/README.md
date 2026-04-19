@@ -113,3 +113,4 @@
 | cm2je | 移除项目内 UI UX Pro Max skill | 已完成 | `cm2je-remove-ui-ux-pro-max-skill/SPEC.md` | 2026-04-18 | local implementation completed; removed project-local skill assets and obsolete install spec |
 | em5uh | 公开文档体系重写与职责收口 | 已完成 | `em5uh-public-docs-rewrite/SPEC.md` | 2026-04-19 | PR #95; fast-track / public docs rewrite / PR ready |
 | y9ngx | LinuxDO 绑定与用户设置页改造 | 已完成 | `y9ngx-linuxdo-user-settings/SPEC.md` | 2026-04-19 | PR #94; fast-track / unified settings page + LinuxDO binding + inline PAT fallback |
+| gms6p | 移除公开文档中的 Storybook 导览页 | 已完成 | `gms6p-remove-storybook-guide-page/SPEC.md` | 2026-04-19 | fast-track follow-up to #em5uh; docs-site now links directly to Storybook without guide page |

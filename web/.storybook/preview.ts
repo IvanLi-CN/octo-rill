@@ -14,7 +14,6 @@ const LOCAL_DOCS_SITE_PATHS = new Set([
 	"/config.html",
 	"/product.html",
 	"/storybook.html",
-	"/storybook-guide.html",
 ]);
 
 declare global {

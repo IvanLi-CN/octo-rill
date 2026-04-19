@@ -105,7 +105,7 @@ bun run storybook
 
 打开 `http://127.0.0.1:55176`。
 
-适合在改 UI、补 stories、核对边界状态时使用。入口说明见 [Storybook 导览](/storybook-guide.html)。
+适合在改 UI、补 stories、核对边界状态时使用。
 
 ### 文档站
 
