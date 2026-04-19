@@ -2635,9 +2635,7 @@ fn markdown_has_heading(markdown: &str, heading: &str) -> bool {
 
 fn brief_content_matches_v2_signature(markdown: &str) -> bool {
     let stripped = strip_outer_markdown_fence(markdown);
-    markdown_has_heading(stripped, "## 项目更新")
-        && markdown_has_heading(stripped, "## 获星与关注")
-        && !markdown_has_heading(stripped, "## 概览")
+    markdown_has_heading(stripped, "## 项目更新") && !markdown_has_heading(stripped, "## 概览")
 }
 
 fn trim_trailing_blank_lines<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
@@ -2677,6 +2675,13 @@ fn is_canonical_release_detail_line(line: &str) -> bool {
 
 fn is_canonical_social_summary_line(line: &str) -> bool {
     line.starts_with("- ") && line.trim().len() > 2
+}
+
+fn is_social_empty_state_line(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        "- 本时间窗口内没有新的获星动态。" | "- 本时间窗口内没有新的关注动态。"
+    )
 }
 
 fn brief_project_section_is_canonical(lines: &[&str]) -> bool {
@@ -2747,46 +2752,58 @@ fn brief_project_section_is_canonical(lines: &[&str]) -> bool {
 
 fn brief_social_section_is_canonical(lines: &[&str]) -> bool {
     let lines = trim_trailing_blank_lines(lines);
-    if lines.len() < 7 || !lines[0].trim().is_empty() {
+    if lines.len() < 4 || !lines[0].trim().is_empty() {
         return false;
     }
 
     let mut i = 1usize;
-    if lines[i] != "### 获星" {
-        return false;
-    }
-    i += 1;
-    if i >= lines.len() || !lines[i].trim().is_empty() {
-        return false;
-    }
-    i += 1;
-    if i >= lines.len() || !is_canonical_social_summary_line(lines[i]) {
-        return false;
-    }
-    while i < lines.len() && is_canonical_social_summary_line(lines[i]) {
+    let mut saw_any_section = false;
+    let mut saw_stars_section = false;
+    let mut saw_follows_section = false;
+
+    while i < lines.len() {
+        match lines[i] {
+            "### 获星" if !saw_stars_section && !saw_follows_section => {
+                saw_stars_section = true;
+            }
+            "### 关注" if !saw_follows_section => {
+                saw_follows_section = true;
+            }
+            _ => return false,
+        }
+        saw_any_section = true;
+
         i += 1;
+        if i >= lines.len() || !lines[i].trim().is_empty() {
+            return false;
+        }
+        i += 1;
+        if i >= lines.len()
+            || !is_canonical_social_summary_line(lines[i])
+            || is_social_empty_state_line(lines[i])
+        {
+            return false;
+        }
+        while i < lines.len() && is_canonical_social_summary_line(lines[i]) {
+            if is_social_empty_state_line(lines[i]) {
+                return false;
+            }
+            i += 1;
+        }
+
+        if i >= lines.len() {
+            break;
+        }
+        if !lines[i].trim().is_empty() {
+            return false;
+        }
+        i += 1;
+        if i >= lines.len() {
+            return false;
+        }
     }
 
-    if i >= lines.len() || !lines[i].trim().is_empty() {
-        return false;
-    }
-    i += 1;
-    if i >= lines.len() || lines[i] != "### 关注" {
-        return false;
-    }
-    i += 1;
-    if i >= lines.len() || !lines[i].trim().is_empty() {
-        return false;
-    }
-    i += 1;
-    if i >= lines.len() || !is_canonical_social_summary_line(lines[i]) {
-        return false;
-    }
-    while i < lines.len() && is_canonical_social_summary_line(lines[i]) {
-        i += 1;
-    }
-
-    i == lines.len()
+    saw_any_section && i == lines.len()
 }
 
 fn brief_content_is_canonical(markdown: &str) -> bool {
@@ -2800,15 +2817,19 @@ fn brief_content_is_canonical(markdown: &str) -> bool {
     let Some(project_idx) = lines.iter().position(|line| line.trim() == "## 项目更新") else {
         return false;
     };
-    let Some(social_idx) = lines.iter().position(|line| line.trim() == "## 获星与关注") else {
-        return false;
-    };
-    if project_idx != 0 || social_idx <= project_idx {
+    let social_idx = lines.iter().position(|line| line.trim() == "## 获星与关注");
+    if project_idx != 0 {
         return false;
     }
 
-    brief_project_section_is_canonical(&lines[project_idx + 1..social_idx])
-        && brief_social_section_is_canonical(&lines[social_idx + 1..])
+    match social_idx {
+        Some(social_idx) => {
+            social_idx > project_idx
+                && brief_project_section_is_canonical(&lines[project_idx + 1..social_idx])
+                && brief_social_section_is_canonical(&lines[social_idx + 1..])
+        }
+        None => brief_project_section_is_canonical(&lines[project_idx + 1..]),
+    }
 }
 
 fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
@@ -3503,11 +3524,15 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
         }
     }
 
-    out.push_str("\n## 获星与关注\n\n");
-    out.push_str("### 获星\n\n");
-    if social.repo_stars.is_empty() {
-        out.push_str("- 本时间窗口内没有新的获星动态。\n");
-    } else {
+    let has_repo_stars = !social.repo_stars.is_empty();
+    let has_followers = !social.followers.is_empty();
+
+    if has_repo_stars || has_followers {
+        out.push_str("\n## 获星与关注\n\n");
+    }
+
+    if has_repo_stars {
+        out.push_str("### 获星\n\n");
         for repo in &social.repo_stars {
             let actors = render_social_actor_list(&repo.actors, 4);
             out.push_str(&format!(
@@ -3517,10 +3542,12 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
         }
     }
 
-    out.push_str("\n### 关注\n\n");
-    if social.followers.is_empty() {
-        out.push_str("- 本时间窗口内没有新的关注动态。\n");
-    } else {
+    if has_repo_stars && has_followers {
+        out.push('\n');
+    }
+
+    if has_followers {
+        out.push_str("### 关注\n\n");
         let actors = render_social_actor_list(&social.followers, 6);
         out.push_str(&format!("- {}\n", actors));
     }
@@ -3715,8 +3742,11 @@ fn contains_all_release_links(markdown: &str, release_ids: &[i64]) -> bool {
     release_ids.iter().all(|id| present.contains(id))
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct SocialSummaryItems {
+    has_section: bool,
+    has_stars_section: bool,
+    has_follows_section: bool,
     stars: Vec<String>,
     follows: Vec<String>,
 }
@@ -3733,11 +3763,20 @@ fn extract_social_summary_items(markdown: &str) -> SocialSummaryItems {
     for line in markdown.lines() {
         let trimmed = line.trim();
         match trimmed {
+            "## 获星与关注" => {
+                items.has_section = true;
+                section = Section::None;
+                continue;
+            }
             "### 获星" => {
+                items.has_section = true;
+                items.has_stars_section = true;
                 section = Section::Stars;
                 continue;
             }
             "### 关注" => {
+                items.has_section = true;
+                items.has_follows_section = true;
                 section = Section::Follows;
                 continue;
             }
@@ -3762,16 +3801,7 @@ fn extract_social_summary_items(markdown: &str) -> SocialSummaryItems {
 }
 
 fn preserves_social_summary_items(source: &str, candidate: &str) -> bool {
-    let source_items = extract_social_summary_items(source);
-    let candidate_items = extract_social_summary_items(candidate);
-    source_items
-        .stars
-        .iter()
-        .all(|item| candidate_items.stars.contains(item))
-        && source_items
-            .follows
-            .iter()
-            .all(|item| candidate_items.follows.contains(item))
+    extract_social_summary_items(source) == extract_social_summary_items(candidate)
 }
 
 fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> String {
@@ -3807,8 +3837,37 @@ async fn polish_brief_markdown(
     markdown: &str,
     release_ids: &[i64],
 ) -> Option<String> {
+    let social_structure_rule = match extract_social_summary_items(markdown) {
+        SocialSummaryItems {
+            has_section: true,
+            has_stars_section: true,
+            has_follows_section: true,
+            ..
+        } => {
+            "2) 保留“## 项目更新”和“## 获星与关注”两个章节，并同时保留“### 获星”“### 关注”两个小节；"
+        }
+        SocialSummaryItems {
+            has_section: true,
+            has_stars_section: true,
+            has_follows_section: false,
+            ..
+        } => {
+            "2) 保留“## 项目更新”和“## 获星与关注”两个章节；社交摘要里只能保留“### 获星”小节，禁止新增“### 关注”；"
+        }
+        SocialSummaryItems {
+            has_section: true,
+            has_stars_section: false,
+            has_follows_section: true,
+            ..
+        } => {
+            "2) 保留“## 项目更新”和“## 获星与关注”两个章节；社交摘要里只能保留“### 关注”小节，禁止新增“### 获星”；"
+        }
+        _ => {
+            "2) 只保留原文已有章节；若原文没有“## 获星与关注”章节，禁止新增任何社交摘要章节或小节；"
+        }
+    };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n2) 保留“## 项目更新”和“## 获星与关注”两个章节；\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/?tab=briefs&release=...)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n{social_structure_rule}\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/?tab=briefs&release=...)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -6215,7 +6274,7 @@ mod tests {
             "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: keep formatting stable  \n  related: paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n"
         ));
         assert!(!brief_content_needs_refresh(
-            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n"
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n"
         ));
     }
 
@@ -6272,6 +6331,20 @@ mod tests {
 
         assert!(!preserves_social_summary_items(source, candidate));
         assert!(preserves_social_summary_items(source, source));
+    }
+
+    #[test]
+    fn preserves_social_summary_items_rejects_adding_empty_social_sections() {
+        let source = concat!("## 项目更新\n\n", "- 本时间窗口内没有新的 Release。\n",);
+        let candidate = concat!(
+            "## 项目更新\n\n",
+            "- 本时间窗口内没有新的 Release。\n\n",
+            "## 获星与关注\n\n",
+            "### 关注\n\n",
+            "- 本时间窗口内没有新的关注动态。\n",
+        );
+
+        assert!(!preserves_social_summary_items(source, candidate));
     }
 
     #[test]
@@ -6369,11 +6442,11 @@ mod tests {
 
         let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
         assert!(markdown.contains("- [v1.0 \\[beta\\]\\(rc\\)](/?tab=briefs&release=42)"));
-        assert!(markdown.contains("## 获星与关注"));
+        assert!(!markdown.contains("## 获星与关注"));
     }
 
     #[test]
-    fn build_brief_markdown_renders_social_summary_and_empty_states() {
+    fn build_brief_markdown_renders_only_present_social_sections() {
         let social = SocialSummaryRendered {
             repo_stars: vec![RepoStarRendered {
                 full_name: "acme/rocket".to_owned(),
@@ -6407,6 +6480,15 @@ mod tests {
         assert!(markdown.contains("[acme/rocket](https://github.com/acme/rocket)：[@alice]"));
         assert!(markdown.contains("### 关注"));
         assert!(markdown.contains("[@carol](https://github.com/carol)"));
+    }
+
+    #[test]
+    fn build_brief_markdown_omits_social_section_when_empty() {
+        let markdown = build_brief_markdown(&[], &SocialSummaryRendered::default());
+        assert!(markdown.contains("- 本时间窗口内没有新的 Release。"));
+        assert!(!markdown.contains("## 获星与关注"));
+        assert!(!markdown.contains("### 获星"));
+        assert!(!markdown.contains("### 关注"));
     }
 
     #[tokio::test]
@@ -6478,6 +6560,9 @@ mod tests {
                 .content_markdown
                 .contains("fix: keep formatting stable  \n")
         );
+        assert!(built.content_markdown.contains("## 获星与关注"));
+        assert!(built.content_markdown.contains("### 关注"));
+        assert!(!built.content_markdown.contains("### 获星"));
         assert_eq!(
             extract_internal_release_id_sequence(&built.content_markdown),
             vec![42]
@@ -6827,7 +6912,7 @@ mod tests {
         assert_eq!(stored.window_start, "2026-03-06T00:00:00+00:00");
         assert_eq!(stored.window_end, "2026-03-07T00:00:00+00:00");
         assert!(stored.content_markdown.contains("## 项目更新"));
-        assert!(stored.content_markdown.contains("## 获星与关注"));
+        assert!(!stored.content_markdown.contains("## 获星与关注"));
         assert!(!stored.content_markdown.contains("## 概览"));
 
         let row = sqlx::query_as::<_, (String, String, String, String)>(
@@ -6972,6 +7057,7 @@ mod tests {
                 .contains("[v2.0.0](/?tab=briefs&release=406)")
         );
         assert!(!stored.content_markdown.contains("## 概览"));
+        assert!(!stored.content_markdown.contains("## 获星与关注"));
         assert_eq!(stored.release_ids, vec![406]);
     }
 
@@ -7092,7 +7178,7 @@ mod tests {
 
         assert_eq!(stored.id, "brief-existing-stale-no-ai");
         assert!(stored.content_markdown.contains("## 项目更新"));
-        assert!(stored.content_markdown.contains("## 获星与关注"));
+        assert!(!stored.content_markdown.contains("## 获星与关注"));
         assert!(!stored.content_markdown.contains("## 概览"));
         assert!(
             stored

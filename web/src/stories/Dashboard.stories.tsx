@@ -1023,6 +1023,20 @@ const mockBriefs: BriefItem[] = [
 	}),
 ];
 
+const projectOnlyBriefs: BriefItem[] = [
+	makeBrief({
+		id: "brief-project-only-2026-04-05",
+		date: "2026-04-05",
+		window_start: "2026-04-04T08:00:00+08:00",
+		window_end: "2026-04-05T08:00:00+08:00",
+		release_count: 1,
+		release_ids: ["10006"],
+		content_markdown:
+			"## 项目更新\n\n### [acme/relay](https://github.com/acme/relay)\n\n- [stability lane release](/?tab=briefs&release=10006) · 2026-04-04T20:15:00+08:00 · [GitHub Release](https://github.com/acme/relay/releases/tag/stability-lane-release)\n  - 收敛日报刷新流程，避免历史摘要与卡片重复呈现。\n  - 相关链接：[#13888](https://github.com/acme/relay/pull/13888)\n",
+		created_at: "2026-04-05T08:00:03+08:00",
+	}),
+];
+
 const longBriefMarkdown = [
 	"## 项目更新",
 	"",
@@ -1093,7 +1107,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 		release_count: 1,
 		release_ids: ["10005"],
 		content_markdown:
-			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
+			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
 		created_at: "2026-04-03T08:00:03+08:00",
 	}),
 };
@@ -1418,8 +1432,7 @@ function DashboardPreview(props: {
 				date,
 				window_start: null,
 				window_end: null,
-				content_markdown:
-					"## 项目更新\n\n- 本时间窗口内没有新的 Release。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。",
+				content_markdown: "## 项目更新\n\n- 本时间窗口内没有新的 Release。",
 				created_at: `${date}T08:00:03+08:00`,
 			});
 		setStoryBriefs((current) =>
@@ -1882,14 +1895,17 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		await expect(
 			canvas.queryByText(HISTORY_RAW_MARKER),
 		).not.toBeInTheDocument();
+		const historicalGroup = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
+		);
+		expect(historicalGroup).toBeTruthy();
+		if (!historicalGroup) {
+			throw new Error("Expected 2026-04-04 historical group to exist");
+		}
+		expect(
+			historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+		).toBe(0);
 		await step("expand historical releases", async () => {
-			const historicalGroup = canvasElement.querySelector<HTMLElement>(
-				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
-			);
-			expect(historicalGroup).toBeTruthy();
-			if (!historicalGroup) {
-				throw new Error("Expected 2026-04-04 historical group to exist");
-			}
 			const beforeSlot = historicalGroup.querySelector<HTMLElement>(
 				"[data-feed-day-action-slot]",
 			);
@@ -1906,6 +1922,9 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			await expandButton.click();
 			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
 			await expect(canvas.queryByText("## 获星与关注")).not.toBeInTheDocument();
+			expect(
+				historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+			).toBeGreaterThan(0);
 			const afterSlot = historicalGroup.querySelector<HTMLElement>(
 				"[data-feed-day-action-slot]",
 			);
@@ -1988,6 +2007,18 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 			await expect(
 				await canvas.findByText(/回补这一天的日报摘要/),
 			).toBeVisible();
+			await expect(canvas.getByText("### 关注")).toBeVisible();
+			await expect(canvas.queryByText("### 获星")).not.toBeInTheDocument();
+			const historicalGroup = canvasElement.querySelector<HTMLElement>(
+				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
+			);
+			expect(historicalGroup).toBeTruthy();
+			if (!historicalGroup) {
+				throw new Error("Expected 2026-04-03 historical group to exist");
+			}
+			expect(
+				historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+			).toBe(0);
 		});
 	},
 };
@@ -2192,6 +2223,43 @@ export const BriefsFocused: Story = {
 			description: {
 				story: "把初始焦点切到 Briefs，用来验证日报与摘要场景的可读性。",
 			},
+		},
+	},
+};
+
+export const BriefsProjectOnly: Story = {
+	render: () => (
+		<DashboardPreview initialTab="briefs" briefs={projectOnlyBriefs} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"当日报窗口内只有 Release、没有获星或关注时，正文只保留 `## 项目更新`，不再渲染社交空态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("## 项目更新")).toBeVisible();
+		await expect(canvas.queryByText("## 获星与关注")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("### 获星")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("### 关注")).not.toBeInTheDocument();
+	},
+};
+
+export const EvidenceBriefsProjectOnly: Story = {
+	name: "Evidence / Briefs Project Only",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={projectOnlyBriefs}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };

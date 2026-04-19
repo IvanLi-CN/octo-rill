@@ -109,4 +109,5 @@
 | 67g9w | Dashboard SPA 导航避免回退启动骨架 | 已完成 | `67g9w-spa-nav-startup-skeleton-guard/SPEC.md` | 2026-04-17 | fast-track; shell hydration gate + local feed skeleton + visual evidence |
 | w9by9 | Dashboard 移动端日分组标题防重叠修复 | 部分完成（3/4） | `w9by9-dashboard-mobile-day-divider-overlap/SPEC.md` | 2026-04-16 | fast-track; local implementation + visual evidence + review clear; PR pending screenshot push approval |
 | qvfxq | Release 日报内容格式 V2 与历史快照修复 | 已完成 | `qvfxq-release-daily-brief-v2/SPEC.md` | 2026-04-19 | fast-track / canonical brief markdown validator + refresh drift repair landed |
+| n4x7e | Dashboard 历史日报折叠补齐与社交空态裁剪 | 部分完成（3/4） | `n4x7e-dashboard-brief-social-folding/SPEC.md` | 2026-04-19 | fast-track follow-up to #xaycu / #qvfxq; local implementation + visual evidence landed, pending owner approval before screenshot-bearing push |
 | cm2je | 移除项目内 UI UX Pro Max skill | 已完成 | `cm2je-remove-ui-ux-pro-max-skill/SPEC.md` | 2026-04-18 | local implementation completed; removed project-local skill assets and obsolete install spec |
