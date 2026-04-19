@@ -1419,7 +1419,7 @@ function DashboardPreview(props: {
 				window_start: null,
 				window_end: null,
 				content_markdown:
-					"## 项目更新\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。",
+					"## 项目更新\n\n- 本时间窗口内没有新的 Release。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。",
 				created_at: `${date}T08:00:03+08:00`,
 			});
 		setStoryBriefs((current) =>

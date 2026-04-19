@@ -2640,11 +2640,186 @@ fn brief_content_matches_v2_signature(markdown: &str) -> bool {
         && !markdown_has_heading(stripped, "## 概览")
 }
 
+fn trim_trailing_blank_lines<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    &lines[..end]
+}
+
+fn first_markdown_link_target(line: &str) -> Option<&str> {
+    let text_end = line.find("](")?;
+    let rest = &line[text_end + 2..];
+    let url_end = rest.find(')')?;
+    Some(&rest[..url_end])
+}
+
+fn is_canonical_repo_heading_line(line: &str) -> bool {
+    line.starts_with("### [")
+        && first_markdown_link_target(line.trim_start_matches("### "))
+            .is_some_and(|target| target.starts_with("https://github.com/"))
+}
+
+fn is_canonical_release_line(line: &str) -> bool {
+    if !line.starts_with("- [") || !line.contains("[GitHub Release](") {
+        return false;
+    }
+
+    first_markdown_link_target(line.trim_start_matches("- "))
+        .and_then(parse_internal_release_id)
+        .is_some()
+}
+
+fn is_canonical_release_detail_line(line: &str) -> bool {
+    line.starts_with("  - ") && line.trim().len() > 3
+}
+
+fn is_canonical_social_summary_line(line: &str) -> bool {
+    line.starts_with("- ") && line.trim().len() > 2
+}
+
+fn brief_project_section_is_canonical(lines: &[&str]) -> bool {
+    let lines = trim_trailing_blank_lines(lines);
+    if lines.len() < 2 || !lines[0].trim().is_empty() {
+        return false;
+    }
+
+    if lines[1] == "- 本时间窗口内没有新的 Release。" {
+        return lines.len() == 2;
+    }
+
+    let mut i = 1usize;
+    while i < lines.len() {
+        if !is_canonical_repo_heading_line(lines[i]) {
+            return false;
+        }
+        i += 1;
+
+        if i >= lines.len() || !lines[i].trim().is_empty() {
+            return false;
+        }
+        i += 1;
+
+        if i >= lines.len() || !is_canonical_release_line(lines[i]) {
+            return false;
+        }
+
+        loop {
+            i += 1;
+            while i < lines.len() && is_canonical_release_detail_line(lines[i]) {
+                i += 1;
+            }
+
+            if i >= lines.len() {
+                break;
+            }
+
+            if !lines[i].trim().is_empty() {
+                if is_canonical_release_line(lines[i]) {
+                    continue;
+                }
+                if is_canonical_repo_heading_line(lines[i]) {
+                    break;
+                }
+                return false;
+            }
+
+            i += 1;
+            if i >= lines.len() {
+                return false;
+            }
+            if lines[i].trim().is_empty() || is_canonical_release_detail_line(lines[i]) {
+                return false;
+            }
+            if is_canonical_release_line(lines[i]) {
+                continue;
+            }
+            if is_canonical_repo_heading_line(lines[i]) {
+                break;
+            }
+            return false;
+        }
+    }
+
+    true
+}
+
+fn brief_social_section_is_canonical(lines: &[&str]) -> bool {
+    let lines = trim_trailing_blank_lines(lines);
+    if lines.len() < 7 || !lines[0].trim().is_empty() {
+        return false;
+    }
+
+    let mut i = 1usize;
+    if lines[i] != "### 获星" {
+        return false;
+    }
+    i += 1;
+    if i >= lines.len() || !lines[i].trim().is_empty() {
+        return false;
+    }
+    i += 1;
+    if i >= lines.len() || !is_canonical_social_summary_line(lines[i]) {
+        return false;
+    }
+    while i < lines.len() && is_canonical_social_summary_line(lines[i]) {
+        i += 1;
+    }
+
+    if i >= lines.len() || !lines[i].trim().is_empty() {
+        return false;
+    }
+    i += 1;
+    if i >= lines.len() || lines[i] != "### 关注" {
+        return false;
+    }
+    i += 1;
+    if i >= lines.len() || !lines[i].trim().is_empty() {
+        return false;
+    }
+    i += 1;
+    if i >= lines.len() || !is_canonical_social_summary_line(lines[i]) {
+        return false;
+    }
+    while i < lines.len() && is_canonical_social_summary_line(lines[i]) {
+        i += 1;
+    }
+
+    i == lines.len()
+}
+
+fn brief_content_is_canonical(markdown: &str) -> bool {
+    let stripped = strip_outer_markdown_fence(markdown);
+    if !brief_content_matches_v2_signature(stripped) {
+        return false;
+    }
+
+    let normalized = stripped.replace("\r\n", "\n");
+    let lines = normalized.lines().collect::<Vec<_>>();
+    let Some(project_idx) = lines.iter().position(|line| line.trim() == "## 项目更新") else {
+        return false;
+    };
+    let Some(social_idx) = lines.iter().position(|line| line.trim() == "## 获星与关注") else {
+        return false;
+    };
+    if project_idx != 0 || social_idx <= project_idx {
+        return false;
+    }
+
+    brief_project_section_is_canonical(&lines[project_idx + 1..social_idx])
+        && brief_social_section_is_canonical(&lines[social_idx + 1..])
+}
+
+fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
+    extract_internal_release_id_sequence(source) == extract_internal_release_id_sequence(candidate)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn brief_content_needs_refresh(markdown: &str) -> bool {
     let trimmed = markdown.trim();
     let stripped = strip_outer_markdown_fence(markdown);
-    stripped != trimmed || !brief_content_matches_v2_signature(stripped)
+    stripped != trimmed || !brief_content_is_canonical(stripped)
 }
 
 fn strip_markdown_links_to_text(input: &str) -> String {
@@ -3633,7 +3808,7 @@ async fn polish_brief_markdown(
     release_ids: &[i64],
 ) -> Option<String> {
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n2) 保留“## 项目更新”和“## 获星与关注”两个章节；\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) 可以调整语句、去重和压缩重复表达。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n2) 保留“## 项目更新”和“## 获星与关注”两个章节；\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/?tab=briefs&release=...)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -3648,10 +3823,13 @@ async fn polish_brief_markdown(
     let stripped = strip_outer_markdown_fence(&polished);
     let sanitized = sanitize_markdown_links(stripped);
 
-    if !brief_content_matches_v2_signature(&sanitized) {
+    if !brief_content_is_canonical(&sanitized) {
         return None;
     }
     if !contains_all_release_links(&sanitized, release_ids) {
+        return None;
+    }
+    if !preserves_release_link_sequence(markdown, &sanitized) {
         return None;
     }
     if !preserves_social_summary_items(markdown, &sanitized) {
@@ -6033,11 +6211,11 @@ mod tests {
         assert!(brief_content_needs_refresh(
             "```markdown\n## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n```"
         ));
-        assert!(!brief_content_needs_refresh(
-            "## 项目更新\n\n```md\n## 概览\n```\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n"
+        assert!(brief_content_needs_refresh(
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: keep formatting stable  \n  related: paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n"
         ));
         assert!(!brief_content_needs_refresh(
-            "## 项目更新\n\n- foo\n\n## 获星与关注\n\n### 获星\n\n- bar\n\n### 关注\n\n- baz\n"
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)\n  - fix: keep formatting stable\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459)\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n"
         ));
     }
 
@@ -6229,6 +6407,81 @@ mod tests {
         assert!(markdown.contains("[acme/rocket](https://github.com/acme/rocket)：[@alice]"));
         assert!(markdown.contains("### 关注"));
         assert!(markdown.contains("[@carol](https://github.com/carol)"));
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_falls_back_when_polish_breaks_canonical_structure() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let prompt = payload["messages"][1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+
+                let content = if prompt.contains("对下面日报做一次统一润色") {
+                    "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=42) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: keep formatting stable  \n  paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- [@alice](https://github.com/alice)"
+                        .to_owned()
+                } else {
+                    serde_json::json!({
+                        "items": [{
+                            "release_id": 42,
+                            "summary_bullets": ["fix: keep formatting stable"]
+                        }]
+                    })
+                    .to_string()
+                };
+
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": content }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+
+        let built = build_brief_content_from_digests(
+            state.as_ref(),
+            vec![ReleaseDigest {
+                release_id: 42,
+                full_name: "acme/rocket".to_owned(),
+                title: "v1.0.0".to_owned(),
+                body: "fix: keep formatting stable".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+                published_at: "2026-03-06T12:00:00Z".to_owned(),
+                is_prerelease: false,
+            }],
+            vec![SocialActivityDigest {
+                kind: "follower_received".to_owned(),
+                repo_full_name: None,
+                actor_github_user_id: 1,
+                actor_login: "alice".to_owned(),
+                actor_html_url: Some("https://github.com/alice".to_owned()),
+                occurred_at: "2026-03-06T18:00:00Z".to_owned(),
+            }],
+        )
+        .await
+        .expect("build brief content");
+
+        assert!(brief_content_is_canonical(&built.content_markdown));
+        assert!(
+            built
+                .content_markdown
+                .contains("  - fix: keep formatting stable")
+        );
+        assert!(
+            !built
+                .content_markdown
+                .contains("fix: keep formatting stable  \n")
+        );
+        assert_eq!(
+            extract_internal_release_id_sequence(&built.content_markdown),
+            vec![42]
+        );
     }
 
     #[tokio::test]
