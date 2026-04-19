@@ -1,42 +1,61 @@
 ---
 title: 快速开始
-description: 在本地启动 OctoRill 后端、前端与 Storybook。
+description: 用一条最短路径在本地启动 OctoRill。
 ---
 
 # 快速开始
 
-## 环境要求
+这份快速开始只覆盖一条最短可用路径：启动后端、启动前端，然后进入登录页或 Dashboard。可选工具（Storybook、docs-site）放在文末。
 
-- Rust 工具链（仓库当前使用 `1.91.0`）。
-- Bun（前端、Storybook 与 docs-site 都依赖 Bun）。
-- SQLite 开发库（CI 使用 `pkg-config` 与 `libsqlite3-dev`）。
+## 准备环境
 
-## 1. 安装根仓库工具与 hooks
+- Rust 工具链 `1.91.0`（CI 与仓库约定版本）
+- Bun `1.x`
+- SQLite 开发库（CI 使用 `pkg-config` 与 `libsqlite3-dev`）
+- 一个可用的 GitHub OAuth App
+
+## 1. 安装仓库级工具与 hooks
+
+在仓库根目录运行：
 
 ```bash
 bun install
 ```
 
-这一步会安装仓库级 Git tooling，并通过 `prepare` 自动安装共享 hooks。
+这一步会安装仓库级开发工具，并通过 `prepare` 自动写入共享 Git hooks。
 
-## 2. 配置环境变量
+## 2. 复制环境变量模板
 
 ```bash
 cp .env.example .env.local
 ```
 
-优先填写这些关键项：
+先补齐这些必需项：
 
+- `OCTORILL_ENCRYPTION_KEY_BASE64`
 - `GITHUB_CLIENT_ID`
 - `GITHUB_CLIENT_SECRET`
 - `GITHUB_OAUTH_REDIRECT_URL`
-- `AI_API_KEY`（可选，用于翻译与日报）
-- `AI_BASE_URL`（可选）
-- `AI_MODEL`（可选）
-- `AI_MAX_CONCURRENCY`（可选，默认 `1`）
 
-更多变量说明见 [配置参考](/config)。
-首次启动后，管理员也可以在 `/admin/jobs` 里直接调整 LLM 并发上限与翻译 worker 数量；保存后的值会落到数据库，并作为后续重启时的实际运行配置。
+如果这次不测试 LinuxDO 绑定，先把下面三项都留空。`.env.example` 默认给了 callback 示例值，只保留其中一项会让后端拒绝启动：
+
+- `LINUXDO_CLIENT_ID`
+- `LINUXDO_CLIENT_SECRET`
+- `LINUXDO_OAUTH_REDIRECT_URL`
+
+如果你还要联调 LinuxDO 绑定，再额外补齐：
+
+- `LINUXDO_CLIENT_ID`
+- `LINUXDO_CLIENT_SECRET`
+- `LINUXDO_OAUTH_REDIRECT_URL`
+
+如果你要测试翻译与日报，再补：
+
+- `AI_API_KEY`
+- `AI_BASE_URL`
+- `AI_MODEL`
+
+变量解释见 [配置参考](/config)。
 
 ## 3. 启动后端
 
@@ -44,7 +63,13 @@ cp .env.example .env.local
 cargo run
 ```
 
-默认后端会负责 OAuth callback、API 与本地 SQLite 数据目录初始化。
+默认情况下：
+
+- 后端监听 `127.0.0.1:58090`
+- OAuth callback 由后端处理
+- SQLite 默认写到 `./.data/octo-rill.db`
+
+如果这里启动失败，先检查 `.env.local` 是否缺少加密密钥或 OAuth 配置。
 
 ## 4. 启动前端
 
@@ -54,18 +79,35 @@ bun install
 bun run dev
 ```
 
-然后访问 `http://127.0.0.1:55174`。
+打开 `http://127.0.0.1:55174`。
 
-## 5. 启动 Storybook（可选）
+你应该看到：
+
+- 未登录：Landing 登录页，包含 GitHub 登录入口
+- 已登录：Dashboard
+
+## 5. 完成一次最小验证
+
+推荐至少确认下面三件事：
+
+- 登录页可以正常打开
+- GitHub OAuth 跳转地址和本地配置一致
+- 登录后能进入 Dashboard，而不是停在空白页或 callback 错误页
+
+## 可选本地入口
+
+### Storybook
 
 ```bash
 cd web
 bun run storybook
 ```
 
-然后访问 `http://127.0.0.1:55176`。
+打开 `http://127.0.0.1:55176`。
 
-## 6. 启动 docs-site（可选）
+适合在改 UI、补 stories、核对边界状态时使用。入口说明见 [Storybook 导览](/storybook-guide.html)。
+
+### 文档站
 
 ```bash
 cd docs-site
@@ -73,4 +115,6 @@ bun install
 bun run dev
 ```
 
-然后访问 `http://127.0.0.1:50885`。
+打开 `http://127.0.0.1:50885`。
+
+这是公开文档站的本地预览；如果你已经同时启动了 Storybook，本地文档里的 Storybook 链接会自动跳到本机 Storybook 服务。

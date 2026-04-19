@@ -1,32 +1,37 @@
 ---
 title: Storybook 导览
-description: OctoRill Storybook 导览与核心故事深链。
+description: 从公开文档进入 OctoRill Storybook 的最短路径。
 ---
 
 # Storybook 导览
 
-这里集中提供 OctoRill Storybook 的总入口，以及最常用的公开文档深链。
+在 OctoRill 里，Storybook 用来回答三个问题：页面有哪些稳定状态、管理员界面如何在复杂数据下表现、基础组件在业务语境里长什么样。
 
-若你正在访问 GitHub Pages 或装配后的静态预览，请直接使用本页的 Storybook 链接。
-若你正在单独运行 `docs-site`（`bun run dev` / `bun run preview`），请先在 `web/` 启动 Storybook dev server；本页链接会自动跳到对应的本地 Storybook 页面。
+## 什么时候打开 Storybook
 
-## Storybook 入口
+- 你在改 UI，需要先确认现有页面状态。
+- 你在补 stories、docs 或交互覆盖。
+- 你想验证某个文案、空态、加载态或抽屉状态，而不想先跑完整业务数据。
+
+## 入口
 
 <ul>
-  <li><a href="./storybook.html">打开 OctoRill Storybook</a></li>
-  <li><a href="./storybook.html?path=/docs/pages-landing--docs">查看 Storybook Docs 首页</a></li>
+  <li><a href="./storybook.html">打开 Storybook</a></li>
+  <li><a href="./storybook.html?path=/docs/pages-landing--docs">Storybook Docs 首页</a></li>
 </ul>
+
+如果你是在本地单独运行 `docs-site`，记得先在 `web/` 启动 Storybook dev server；这里的链接会自动跳到本机 Storybook。
 
 ## 核心故事入口
 
-### Pages
+### 页面
 
 <ul>
   <li><a href="./storybook.html?path=/docs/pages-landing--docs">Landing</a></li>
   <li><a href="./storybook.html?path=/docs/pages-dashboard--docs">Dashboard</a></li>
 </ul>
 
-### Admin
+### 管理界面
 
 <ul>
   <li><a href="./storybook.html?path=/docs/admin-admin-panel--docs">Admin Panel</a></li>
@@ -34,7 +39,7 @@ description: OctoRill Storybook 导览与核心故事深链。
   <li><a href="./storybook.html?path=/docs/admin-task-type-detail--docs">Task Type Detail</a></li>
 </ul>
 
-### Layout 与 UI
+### 布局与基础组件
 
 <ul>
   <li><a href="./storybook.html?path=/docs/layout-app-meta-footer--docs">App Meta Footer</a></li>
@@ -43,8 +48,9 @@ description: OctoRill Storybook 导览与核心故事深链。
   <li><a href="./storybook.html?path=/docs/ui-card--docs">Card</a></li>
 </ul>
 
-## 何时看 Storybook
+## 与公开文档的分工
 
-- 想核对页面状态与占位文案时，优先看 `Pages/*` 与 `Admin/*`。
-- 想确认组件密度、基础控件或版本信息回退时，优先看 `Layout/*` 与 `UI/*`。
-- 想回到公开文档上下文，可使用顶部导航返回“快速开始 / 配置参考 / 产品说明”。
+- 公开文档解释产品、启动方式和配置。
+- Storybook 展示页面状态、组件组合和视觉边界。
+
+当你需要“解释为什么有这个页面”，先回到 [产品说明](/product)；当你需要“确认这个状态长什么样”，直接留在 Storybook。
