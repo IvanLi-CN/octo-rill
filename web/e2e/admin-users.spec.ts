@@ -427,7 +427,7 @@ test.describe("mobile admin shell", () => {
 		await installBaseMocks(page, { isAdmin: true, extraUsers: 10 });
 		await page.goto("/admin");
 
-		await expect(page.getByRole("heading", { name: "管理后台" })).toBeVisible();
+		await expect(page.getByRole("img", { name: "OctoRill" })).toBeVisible();
 		await expect(
 			page.getByRole("navigation", { name: "管理员导航" }),
 		).toBeVisible();

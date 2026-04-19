@@ -274,6 +274,41 @@ function OverviewSummaryStrip(props: {
 	);
 }
 
+function TrendSnapshotStrip(props: {
+	items: Array<{
+		label: string;
+		value: string;
+		description: string;
+		dotClass: string;
+	}>;
+}) {
+	return (
+		<div className="overflow-hidden rounded-lg border bg-background/70 shadow-sm">
+			<div className="grid gap-px bg-border sm:grid-cols-3">
+				{props.items.map((item) => (
+					<div
+						key={item.label}
+						className="bg-background/95 px-4 py-3 sm:min-h-[5.5rem]"
+					>
+						<div className="flex items-center gap-2">
+							<span className={cn("size-2 rounded-full", item.dotClass)} />
+							<p className="text-muted-foreground font-mono text-xs">
+								{item.label}
+							</p>
+						</div>
+						<p className="mt-2 text-2xl font-semibold tracking-tight">
+							{item.value}
+						</p>
+						<p className="text-muted-foreground mt-1 text-[11px] leading-5">
+							{item.description}
+						</p>
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
+
 function ProgressTrack(props: { value: number; color: string }) {
 	return (
 		<div className="bg-muted mt-2 h-1.5 overflow-hidden rounded-full">
@@ -933,36 +968,36 @@ export function AdminDashboard() {
 
 					<Card>
 						<CardHeader className="gap-3">
-							<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-								<div>
-									<CardTitle>{WINDOW_LABELS[windowValue]}任务趋势</CardTitle>
-									<CardDescription>
-										历史序列来自定时 rollup，今日点位用实时数据覆盖。
-									</CardDescription>
-								</div>
-								<div className="grid gap-2 sm:grid-cols-3">
-									<MiniMetric
-										label="翻译"
-										value={formatCount(latestTrendPoint?.翻译)}
-										description="最新日翻译任务量"
-										dotClass="bg-sky-500"
-									/>
-									<MiniMetric
-										label="智能摘要"
-										value={formatCount(latestTrendPoint?.智能摘要)}
-										description="最新日摘要任务量"
-										dotClass="bg-indigo-500"
-									/>
-									<MiniMetric
-										label="日报"
-										value={formatCount(latestTrendPoint?.日报)}
-										description="最新日日报任务量"
-										dotClass="bg-emerald-500"
-									/>
-								</div>
+							<div>
+								<CardTitle>{WINDOW_LABELS[windowValue]}任务趋势</CardTitle>
+								<CardDescription>
+									历史序列来自定时 rollup，今日点位用实时数据覆盖。
+								</CardDescription>
 							</div>
 						</CardHeader>
-						<CardContent>
+						<CardContent className="space-y-3">
+							<TrendSnapshotStrip
+								items={[
+									{
+										label: "翻译",
+										value: formatCount(latestTrendPoint?.翻译),
+										description: "最新日翻译任务量",
+										dotClass: "bg-sky-500",
+									},
+									{
+										label: "智能摘要",
+										value: formatCount(latestTrendPoint?.智能摘要),
+										description: "最新日摘要任务量",
+										dotClass: "bg-indigo-500",
+									},
+									{
+										label: "日报",
+										value: formatCount(latestTrendPoint?.日报),
+										description: "最新日日报任务量",
+										dotClass: "bg-emerald-500",
+									},
+								]}
+							/>
 							<div
 								className={cn(SUBPANEL_CLASS, "h-[16rem] sm:h-[17rem]")}
 								data-admin-dashboard-chart-trend="true"
