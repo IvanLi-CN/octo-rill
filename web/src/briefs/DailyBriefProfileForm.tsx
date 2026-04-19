@@ -3,6 +3,7 @@ import { useId, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import {
 	Select,
 	SelectContent,
@@ -108,6 +109,7 @@ export function DailyBriefProfileForm(props: {
 	disabled?: boolean;
 	error?: string | null;
 	helperText?: ReactNode;
+	compact?: boolean;
 	onLocalTimeChange: (value: string) => void;
 	onTimeZoneChange: (value: string) => void;
 	onUseBrowserTimeZone?: (timeZone: string) => void;
@@ -118,6 +120,7 @@ export function DailyBriefProfileForm(props: {
 		disabled = false,
 		error,
 		helperText,
+		compact = false,
 		onLocalTimeChange,
 		onTimeZoneChange,
 		onUseBrowserTimeZone,
@@ -128,77 +131,92 @@ export function DailyBriefProfileForm(props: {
 
 	return (
 		<div className="space-y-4">
-			<div className="space-y-2">
-				<Label htmlFor={`${timeZoneListId}-time`}>日报时间</Label>
-				<Select
-					value={localTime}
-					onValueChange={onLocalTimeChange}
-					disabled={disabled}
-				>
-					<SelectTrigger id={`${timeZoneListId}-time`}>
-						<SelectValue placeholder="选择整点时间" />
-					</SelectTrigger>
-					<SelectContent>
-						{HOUR_OPTIONS.map((option) => (
-							<SelectItem key={option.value} value={option.value}>
-								{option.label}
-							</SelectItem>
-						))}
-					</SelectContent>
-				</Select>
-				<p className="text-muted-foreground text-xs">
-					当前只支持整点；时区也只支持全年保持整点 UTC 偏移的 IANA
-					名称，未来生成都会按这个本地时间作为窗口边界。
-				</p>
-			</div>
-
-			<div className="space-y-2">
-				<div className="flex items-center justify-between gap-2">
-					<Label htmlFor={`${timeZoneListId}-zone`}>IANA 时区</Label>
-					{onUseBrowserTimeZone ? (
-						<Button
-							type="button"
-							variant="outline"
-							size="sm"
-							disabled={disabled || !supportedBrowserTimeZone}
-							onClick={() => {
-								if (supportedBrowserTimeZone) {
-									onUseBrowserTimeZone(supportedBrowserTimeZone);
-								}
-							}}
-						>
-							使用浏览器时区
-						</Button>
-					) : null}
+			<div
+				className={cn(
+					"space-y-4",
+					compact &&
+						"grid gap-4 lg:grid-cols-[180px_minmax(0,1fr)] lg:items-start",
+				)}
+			>
+				<div className="space-y-2">
+					<Label htmlFor={`${timeZoneListId}-time`}>日报时间</Label>
+					<Select
+						value={localTime}
+						onValueChange={onLocalTimeChange}
+						disabled={disabled}
+					>
+						<SelectTrigger id={`${timeZoneListId}-time`}>
+							<SelectValue placeholder="选择整点时间" />
+						</SelectTrigger>
+						<SelectContent>
+							{HOUR_OPTIONS.map((option) => (
+								<SelectItem key={option.value} value={option.value}>
+									{option.label}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
+					<p className="text-muted-foreground text-xs">
+						当前只支持整点；时区也只支持全年保持整点 UTC 偏移的 IANA
+						名称，未来生成都会按这个本地时间作为窗口边界。
+					</p>
 				</div>
-				<Input
-					id={`${timeZoneListId}-zone`}
-					list={SUPPORTED_TIME_ZONES.length > 0 ? timeZoneListId : undefined}
-					value={timeZone}
-					disabled={disabled}
-					onChange={(event) => onTimeZoneChange(event.target.value)}
-					placeholder="例如 Asia/Shanghai"
-					autoCapitalize="none"
-					autoCorrect="off"
-					spellCheck={false}
-				/>
-				{SUPPORTED_TIME_ZONES.length > 0 ? (
-					<datalist id={timeZoneListId}>
-						{SUPPORTED_TIME_ZONES.map((zone) => (
-							<option key={zone} value={zone} />
-						))}
-					</datalist>
-				) : null}
-				<p className="text-muted-foreground text-xs">
-					浏览器当前识别为 <code>{browserTimeZone}</code>
-					{supportedBrowserTimeZone
-						? "。"
-						: "；该时区当前不满足“全年整点 UTC 偏移”约束，请手动选择受支持的 IANA 时区。"}
-				</p>
+
+				<div className="space-y-2">
+					<div className="flex items-center justify-between gap-2">
+						<Label htmlFor={`${timeZoneListId}-zone`}>IANA 时区</Label>
+						{onUseBrowserTimeZone ? (
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								disabled={disabled || !supportedBrowserTimeZone}
+								onClick={() => {
+									if (supportedBrowserTimeZone) {
+										onUseBrowserTimeZone(supportedBrowserTimeZone);
+									}
+								}}
+							>
+								使用浏览器时区
+							</Button>
+						) : null}
+					</div>
+					<Input
+						id={`${timeZoneListId}-zone`}
+						list={SUPPORTED_TIME_ZONES.length > 0 ? timeZoneListId : undefined}
+						value={timeZone}
+						disabled={disabled}
+						onChange={(event) => onTimeZoneChange(event.target.value)}
+						placeholder="例如 Asia/Shanghai"
+						autoCapitalize="none"
+						autoCorrect="off"
+						spellCheck={false}
+					/>
+					{SUPPORTED_TIME_ZONES.length > 0 ? (
+						<datalist id={timeZoneListId}>
+							{SUPPORTED_TIME_ZONES.map((zone) => (
+								<option key={zone} value={zone} />
+							))}
+						</datalist>
+					) : null}
+					<p className="text-muted-foreground text-xs">
+						浏览器当前识别为 <code>{browserTimeZone}</code>
+						{supportedBrowserTimeZone
+							? "。"
+							: "；该时区当前不满足“全年整点 UTC 偏移”约束，请手动选择受支持的 IANA 时区。"}
+					</p>
+				</div>
 			</div>
 
 			{helperText ? (
-				<div className="text-muted-foreground rounded-lg border p-3 text-xs">
+				<div
+					className={cn(
+						"text-muted-foreground text-xs leading-5",
+						compact
+							? "rounded-lg border border-border/60 bg-muted/20 px-3 py-2"
+							: "rounded-lg border p-3",
+					)}
+				>
 					{helperText}
 				</div>
 			) : null}

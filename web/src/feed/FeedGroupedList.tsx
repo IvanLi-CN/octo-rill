@@ -35,6 +35,12 @@ const FEED_DAY_ACTION_BUTTON_CLASS =
 const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
 
+function briefHasSection(markdown: string | undefined, heading: string) {
+	if (!markdown) return false;
+	const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`^${escaped}$`, "m").test(markdown);
+}
+
 function formatGroupCountLabel(releaseCount: number, activityCount: number) {
 	if (releaseCount > 0 && activityCount > 0) {
 		return `${releaseCount + activityCount} 条动态`;
@@ -234,26 +240,38 @@ function FeedHistoricalDayGroup(props: {
 	}
 
 	const hiddenReleaseIds = new Set(brief?.release_ids ?? []);
-	const firstHiddenReleaseIndex = items.findIndex(
-		(item) => isReleaseFeedItem(item) && hiddenReleaseIds.has(item.id),
+	const briefCoversRepoStars = briefHasSection(
+		brief?.content_markdown,
+		"### 获星",
 	);
+	const briefCoversFollowers = briefHasSection(
+		brief?.content_markdown,
+		"### 关注",
+	);
+	const shouldHideItem = (item: FeedItem) => {
+		if (isReleaseFeedItem(item)) {
+			return hiddenReleaseIds.has(item.id);
+		}
+		if (item.kind === "repo_star_received") {
+			return briefCoversRepoStars;
+		}
+		if (item.kind === "follower_received") {
+			return briefCoversFollowers;
+		}
+		return false;
+	};
+	const firstHiddenItemIndex = items.findIndex((item) => shouldHideItem(item));
 	const leadingItems =
-		firstHiddenReleaseIndex > 0
+		firstHiddenItemIndex > 0
 			? items
-					.slice(0, firstHiddenReleaseIndex)
-					.filter(
-						(item) =>
-							!isReleaseFeedItem(item) || !hiddenReleaseIds.has(item.id),
-					)
+					.slice(0, firstHiddenItemIndex)
+					.filter((item) => !shouldHideItem(item))
 			: [];
 	const trailingItems =
-		firstHiddenReleaseIndex >= 0
+		firstHiddenItemIndex >= 0
 			? items
-					.slice(firstHiddenReleaseIndex + 1)
-					.filter(
-						(item) =>
-							!isReleaseFeedItem(item) || !hiddenReleaseIds.has(item.id),
-					)
+					.slice(firstHiddenItemIndex + 1)
+					.filter((item) => !shouldHideItem(item))
 			: items;
 
 	return (

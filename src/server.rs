@@ -76,7 +76,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     );
     let deletion_abort_handle = deletion_task.abort_handle();
 
-    let oauth = state::build_oauth_client(&config)?;
+    let github_oauth = state::build_oauth_client(&config)?;
+    let linuxdo_oauth = state::build_linuxdo_oauth_client(&config)?;
     let http = reqwest::Client::builder()
         .user_agent("OctoRill")
         .redirect(reqwest::redirect::Policy::none())
@@ -94,7 +95,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         config: config.clone(),
         pool: pool.clone(),
         http,
-        oauth,
+        github_oauth,
+        linuxdo_oauth,
         encryption_key: config.encryption_key.clone(),
         runtime_owner_id: crate::local_id::generate_local_id(),
     });
@@ -206,6 +208,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(translations::admin_get_translation_batch_detail),
         )
         .route("/reaction-token/status", get(api::reaction_token_status))
+        .route(
+            "/me/linuxdo",
+            get(api::me_get_linuxdo).delete(api::me_delete_linuxdo),
+        )
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
         .route(
@@ -261,6 +267,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .nest("/api", api_router)
         .route("/auth/github/login", get(auth::github_login))
         .route("/auth/github/callback", get(auth::github_callback))
+        .route("/auth/linuxdo/login", get(auth::linuxdo_login))
+        .route("/auth/linuxdo/callback", get(auth::linuxdo_callback))
         .route("/auth/logout", get(auth::logout))
         .with_state(app_state.clone())
         .layer(session_layer);

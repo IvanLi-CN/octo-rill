@@ -3631,12 +3631,13 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
+            linuxdo: None,
             ai: None,
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
-        let oauth = build_oauth_client(&config).expect("build oauth client");
+        let github_oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -3647,7 +3648,8 @@ mod tests {
             config,
             pool,
             http: reqwest::Client::new(),
-            oauth,
+            github_oauth,
+            linuxdo_oauth: None,
             encryption_key,
             runtime_owner_id: "jobs-test-runtime-owner".to_owned(),
         })
@@ -4149,12 +4151,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_brief_refresh_content_if_needed_ignores_heading_text_inside_code_block() {
+    async fn enqueue_brief_refresh_content_if_needed_detects_v2_structure_drift() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
         let now = "2026-03-07T00:00:00Z";
 
-        seed_user(&pool, 1016, "brief-refresh-code-fence").await;
+        seed_user(&pool, 1016, "brief-refresh-structure-drift").await;
         sqlx::query(
             r#"
             INSERT INTO briefs (
@@ -4166,7 +4168,7 @@ mod tests {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind("brief-refresh-code-fence")
+        .bind("brief-refresh-structure-drift")
         .bind("1016")
         .bind("2026-03-07")
         .bind("2026-03-06T00:00:00Z")
@@ -4175,19 +4177,20 @@ mod tests {
         .bind("08:00")
         .bind("scheduled")
         .bind(
-            "## 项目更新\n\n```md\n## 概览\n```\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n",
+            "## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.0.0](/?tab=briefs&release=501) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.0.0)  \n  fix: release lines should stay nested  \n  paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n",
         )
         .bind(now)
         .bind(now)
         .execute(&pool)
         .await
-        .expect("insert valid v2 brief with code block");
+        .expect("insert structure drift brief");
 
         let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
             .await
-            .expect("enqueue brief refresh");
+            .expect("enqueue brief refresh")
+            .expect("task id");
 
-        assert!(task_id.is_none());
+        assert!(!task_id.is_empty());
         let queued = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT COUNT(*)
@@ -4199,7 +4202,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count refresh tasks");
-        assert_eq!(queued, 0);
+        assert_eq!(queued, 1);
     }
 
     #[tokio::test]
@@ -4398,6 +4401,8 @@ mod tests {
         assert_eq!(row.1, "content_refresh");
         assert!(row.2.contains("## 项目更新"));
         assert!(row.2.contains("## 获星与关注"));
+        assert!(row.2.contains("### 关注"));
+        assert!(!row.2.contains("### 获星"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
         assert!(row.2.contains("[v1.0.0](/?tab=briefs&release=501)"));
@@ -4417,6 +4422,137 @@ mod tests {
         .await
         .expect("load refreshed memberships");
         assert_eq!(memberships, vec![501]);
+    }
+
+    #[tokio::test]
+    async fn execute_brief_refresh_content_task_rewrites_v2_structure_drift_in_place() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = "2026-03-07T00:00:00Z";
+
+        seed_user(&pool, 1017, "brief-refresh-v2-drift").await;
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET daily_brief_utc_time = ?, daily_brief_local_time = ?, daily_brief_time_zone = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("00:00")
+        .bind("08:00")
+        .bind("Asia/Shanghai")
+        .bind("1017")
+        .execute(&pool)
+        .await
+        .expect("update brief refresh user prefs");
+
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at,
+              owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-refresh-v2-drift")
+        .bind("1017")
+        .bind(1_i64)
+        .bind("acme/rocket")
+        .bind("acme")
+        .bind("rocket")
+        .bind(Option::<String>::None)
+        .bind("https://github.com/acme/rocket")
+        .bind(now)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .execute(&pool)
+        .await
+        .expect("insert starred repo");
+
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-refresh-v2-drift")
+        .bind(1_i64)
+        .bind(601_i64)
+        .bind("node-refresh-v2-drift")
+        .bind("v1.1.0")
+        .bind("v1.1.0")
+        .bind("fix: keep nested bullets stable")
+        .bind("https://github.com/acme/rocket/releases/tag/v1.1.0")
+        .bind("2026-03-06T12:00:00Z")
+        .bind("2026-03-06T12:00:00Z")
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert repo release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date,
+              window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary,
+              generation_source, content_markdown, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-refresh-v2-drift")
+        .bind("1017")
+        .bind("2026-03-07")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-07T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("scheduled")
+        .bind("## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [v1.1.0](/?tab=briefs&release=601) · 2026-03-06T12:00:00Z · [GitHub Release](https://github.com/acme/rocket/releases/tag/v1.1.0)  \n  fix: keep nested bullets stable  \n  paragraph drift\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。\n")
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert v2 drift brief");
+
+        let task_id = enqueue_brief_refresh_content_if_needed(state.as_ref())
+            .await
+            .expect("enqueue refresh")
+            .expect("task id");
+
+        let result = execute_brief_refresh_content_task(state.as_ref(), &task_id)
+            .await
+            .expect("execute refresh task");
+        assert_eq!(result["succeeded"].as_u64(), Some(1));
+        assert_eq!(result["failed"].as_u64(), Some(0));
+
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            r#"
+            SELECT id, generation_source, content_markdown
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-refresh-v2-drift")
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed brief");
+        assert_eq!(row.0, "brief-refresh-v2-drift");
+        assert_eq!(row.1, "content_refresh");
+        assert!(row.2.contains("  - fix: keep nested bullets stable"));
+        assert!(!row.2.contains("stable  \n"));
+        assert!(row.2.contains("[v1.1.0](/?tab=briefs&release=601)"));
+        assert!(!row.2.contains("## 获星与关注"));
     }
 
     #[tokio::test]

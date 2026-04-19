@@ -861,6 +861,80 @@ pub async fn me_patch_profile(
     ))
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct LinuxDoConnectionResponse {
+    linuxdo_user_id: i64,
+    username: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    trust_level: i64,
+    active: bool,
+    silenced: bool,
+    linked_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeLinuxDoResponse {
+    available: bool,
+    connection: Option<LinuxDoConnectionResponse>,
+}
+
+pub async fn me_get_linuxdo(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeLinuxDoResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let connection = sqlx::query_as::<_, LinuxDoConnectionResponse>(
+        r#"
+        SELECT
+          linuxdo_user_id,
+          username,
+          name,
+          avatar_url,
+          trust_level,
+          active,
+          silenced,
+          linked_at,
+          updated_at
+        FROM linuxdo_connections
+        WHERE user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(MeLinuxDoResponse {
+        available: state.config.linuxdo.is_some(),
+        connection,
+    }))
+}
+
+pub async fn me_delete_linuxdo(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeLinuxDoResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    sqlx::query(
+        r#"
+        DELETE FROM linuxdo_connections
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(MeLinuxDoResponse {
+        available: state.config.linuxdo.is_some(),
+        connection: None,
+    }))
+}
+
 pub async fn admin_get_user_profile(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -11405,12 +11479,13 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
+            linuxdo: None,
             ai: None,
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
-        let oauth = build_oauth_client(&config).expect("build oauth client");
+        let github_oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11421,7 +11496,8 @@ mod tests {
             config,
             pool,
             http: reqwest::Client::new(),
-            oauth,
+            github_oauth,
+            linuxdo_oauth: None,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })
@@ -11447,6 +11523,7 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
+            linuxdo: None,
             ai: Some(AiConfig {
                 base_url,
                 model: "test-model".to_owned(),
@@ -11456,7 +11533,7 @@ mod tests {
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
-        let oauth = build_oauth_client(&config).expect("build oauth client");
+        let github_oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11467,7 +11544,8 @@ mod tests {
             config,
             pool,
             http: reqwest::Client::new(),
-            oauth,
+            github_oauth,
+            linuxdo_oauth: None,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })

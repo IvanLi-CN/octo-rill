@@ -268,6 +268,9 @@ async function installApiMocks(
 	const translationRequestPolls = new Map<string, number>();
 	let autoTranslateResolveFailureCount =
 		cfg.autoTranslateResolveFailureCount ?? 0;
+	let reactionTokenConfigured = false;
+	let reactionTokenMasked: string | null = null;
+	let reactionTokenCheckedAt: string | null = null;
 	const tracker: MockApiTracker = {
 		translationResolveRequests: [],
 		translationBatchEntityIds: [],
@@ -384,12 +387,78 @@ async function installApiMocks(
 
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
 			return json(route, {
-				configured: false,
-				masked_token: null,
+				configured: reactionTokenConfigured,
+				masked_token: reactionTokenMasked,
 				check: {
-					state: "idle",
-					message: null,
-					checked_at: null,
+					state: reactionTokenConfigured ? "valid" : "idle",
+					message: reactionTokenConfigured ? "token is valid" : null,
+					checked_at: reactionTokenCheckedAt,
+				},
+			});
+		}
+
+		if (req.method() === "POST" && pathname === "/api/reaction-token/check") {
+			const body = req.postDataJSON() as { token?: string };
+			const token = String(body.token ?? "");
+			const valid = token.startsWith("ghp_") && token.length >= 12;
+			return json(route, {
+				state: valid ? "valid" : "invalid",
+				message: valid ? "token is valid" : "token is invalid",
+			});
+		}
+
+		if (req.method() === "PUT" && pathname === "/api/reaction-token") {
+			const body = req.postDataJSON() as { token?: string };
+			const token = String(body.token ?? "");
+			reactionTokenConfigured = true;
+			reactionTokenMasked = `${token.slice(0, 4)}****${token.slice(-4)}`;
+			reactionTokenCheckedAt = "2026-02-21T16:00:00Z";
+			return json(route, {
+				configured: true,
+				masked_token: reactionTokenMasked,
+				check: {
+					state: "valid",
+					message: "token is valid",
+					checked_at: reactionTokenCheckedAt,
+				},
+			});
+		}
+
+		if (
+			req.method() === "POST" &&
+			pathname === "/api/release/reactions/toggle"
+		) {
+			if (!reactionTokenConfigured) {
+				return json(
+					route,
+					{
+						error: {
+							code: "pat_required",
+							message: "release reactions require a GitHub PAT",
+						},
+					},
+					400,
+				);
+			}
+			return json(route, {
+				reactions: {
+					counts: {
+						plus1: 3,
+						laugh: 0,
+						heart: 0,
+						hooray: 0,
+						rocket: 0,
+						eyes: 0,
+					},
+					viewer: {
+						plus1: true,
+						laugh: false,
+						heart: false,
+						hooray: false,
+						rocket: false,
+						eyes: false,
+					},
+					status: "ready",
 				},
 			});
 		}
@@ -741,7 +810,7 @@ test("detail translate keeps polling an in-flight request until the result is re
 	await expect(page.getByText("translation wait timeout")).toHaveCount(0);
 });
 
-test("reaction fallback opens PAT dialog with accessible controls", async ({
+test("reaction fallback lets users configure PAT inline from the dialog", async ({
 	page,
 }) => {
 	await installApiMocks(page, { withReactionFeed: true });
@@ -760,13 +829,22 @@ test("reaction fallback opens PAT dialog with accessible controls", async ({
 	await page.getByTitle("赞").click();
 
 	const patDialog = page.getByRole("dialog", {
-		name: "配置 GitHub PAT 以启用反馈表情",
+		name: "配置 GitHub PAT",
 	});
 	await expect(patDialog).toBeVisible();
+	await expect(
+		patDialog.getByText(/先补齐 GitHub PAT，才能继续使用站内反馈/),
+	).toBeVisible();
 	await expect(patDialog.getByLabel("GitHub PAT")).toBeVisible();
-	await expect(page.getByRole("button", { name: "稍后再说" })).toBeVisible();
-	await expect(page.getByRole("button", { name: "保存并继续" })).toBeDisabled();
-	await page.getByRole("button", { name: "稍后再说" }).click();
+	await expect(page.getByRole("link", { name: "去完整设置" })).toHaveAttribute(
+		"href",
+		"/settings?section=github-pat",
+	);
+	await patDialog.getByLabel("GitHub PAT").fill("ghp_valid_token_1234");
+	await expect(
+		patDialog.getByText("GitHub PAT 可用", { exact: true }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "保存 GitHub PAT" }).click();
 	await expect(patDialog).toHaveCount(0);
 });
 
@@ -1220,7 +1298,7 @@ test("feed smart retry button spins and disables while request is in flight", as
 		smartResolveStatuses: {
 			[releaseId]: "ready",
 		},
-		smartResolveDelayMs: 600,
+		smartResolveDelayMs: 3000,
 	});
 
 	await page.goto("/?tab=releases");
@@ -1230,18 +1308,20 @@ test("feed smart retry button spins and disables while request is in flight", as
 
 	await retryButton.dblclick();
 
+	await expect
+		.poll(
+			() =>
+				tracker.translationResolveRequests.filter(
+					(request) =>
+						request.kinds.includes("release_smart") &&
+						request.entityIds.includes(releaseId),
+				).length,
+		)
+		.toBe(1);
 	await expect(retryButton).toBeDisabled();
 	await expect(retryButton).toHaveAttribute("aria-busy", "true");
 	await expect(retryButton.locator("svg").first()).toHaveClass(/animate-spin/);
 	await expect(retryButton).toHaveText("重试智能整理");
-	await expect
-		.poll(
-			() =>
-				tracker.translationResolveRequests.filter((request) =>
-					request.kinds.includes("release_smart"),
-				).length,
-		)
-		.toBe(1);
 
 	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
 	await expect(
@@ -1288,7 +1368,7 @@ test.describe("localized timestamps", () => {
 				briefWindowStart: "2026-07-22T00:00:00Z",
 				briefWindowEnd: "2026-07-23T00:00:00Z",
 				briefMarkdown:
-					"## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
+					"## 项目更新\n\n### [owner/repo](https://github.com/owner/repo)\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n  - 校验浏览器时区下的 brief 时间戳展示。\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
 				briefCreatedAt: "2026-07-23T08:00:00Z",
 			});
 
@@ -1320,7 +1400,7 @@ test.describe("localized timestamps", () => {
 				briefWindowStart: "2026-07-22T00:00:00Z",
 				briefWindowEnd: "2026-07-23T00:00:00Z",
 				briefMarkdown:
-					"## 项目更新\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
+					"## 项目更新\n\n### [owner/repo](https://github.com/owner/repo)\n\n- [repo/v1.2.3](/?tab=briefs&release=123) · 2026-07-22T11:22:33Z · [GitHub Release](https://github.com/owner/repo/releases/tag/v1.2.3)\n  - 校验浏览器时区下的 brief 时间戳展示。\n\n## 获星与关注\n\n### 获星\n\n- [owner/repo](https://github.com/owner/repo)：[@alice](https://github.com/alice)\n\n### 关注\n\n- [@bob](https://github.com/bob)",
 				briefCreatedAt: "2026-07-23T08:00:00Z",
 			});
 

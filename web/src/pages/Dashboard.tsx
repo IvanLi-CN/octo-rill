@@ -1,25 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import {
-	type DailyBriefProfilePatchRequest,
-	type MeResponse,
-	type MeProfileResponse,
-	ApiError,
-	apiGet,
-	apiGetMeProfile,
-	apiPatchMeProfile,
-	apiPost,
-	apiPostJson,
-	apiPutJson,
-} from "@/api";
+import { type MeResponse, ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import {
 	persistDashboardWarmSnapshot,
 	type DashboardWarmSnapshot,
 } from "@/auth/startupCache";
-import {
-	DailyBriefProfileForm,
-	readHourAlignedBrowserTimeZone,
-} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -66,6 +51,11 @@ import {
 } from "@/pages/DashboardControlBand";
 import { DashboardStartupSkeleton } from "@/pages/AppBoot";
 import { DashboardHeader } from "@/pages/DashboardHeader";
+import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
+import {
+	isReactionTokenUsable,
+	useReactionTokenEditor,
+} from "@/settings/reactionTokenEditor";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -135,21 +125,6 @@ type BriefGenerateResponse = {
 	release_count: number;
 	release_ids: string[];
 	content_markdown: string;
-};
-
-type ReactionTokenStatusResponse = {
-	configured: boolean;
-	masked_token: string | null;
-	check: {
-		state: "idle" | "valid" | "invalid" | "error";
-		message: string | null;
-		checked_at: string | null;
-	};
-};
-
-type ReactionTokenCheckResponse = {
-	state: "valid" | "invalid";
-	message: string;
 };
 
 const SYNC_ALL_LABEL = "同步";
@@ -236,6 +211,12 @@ function sessionExpiredHint() {
 	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
 }
 
+function formatDateTime(value: string | null | undefined) {
+	if (!value) return "—";
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
 function buildOptimisticReactions(
 	current: ReleaseReactions,
 	content: ReactionContent,
@@ -287,13 +268,13 @@ export function Dashboard(props: {
 	} = props;
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
-	const [dailyBoundaryLocal, setDailyBoundaryLocal] = useState(
+	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
 		me.dashboard.daily_boundary_local,
 	);
-	const [dailyBoundaryTimeZone, setDailyBoundaryTimeZone] = useState(
+	const [dailyBoundaryTimeZone, _setDailyBoundaryTimeZone] = useState(
 		me.dashboard.daily_boundary_time_zone,
 	);
-	const [dailyBoundaryUtcOffsetMinutes, setDailyBoundaryUtcOffsetMinutes] =
+	const [dailyBoundaryUtcOffsetMinutes, _setDailyBoundaryUtcOffsetMinutes] =
 		useState(me.dashboard.daily_boundary_utc_offset_minutes);
 	const accessSync = me.access_sync ?? {
 		task_id: null,
@@ -411,21 +392,33 @@ export function Dashboard(props: {
 	>({});
 	const [reactionTokenConfigured, setReactionTokenConfigured] =
 		useState<boolean>(false);
-	const [reactionTokenMasked, setReactionTokenMasked] = useState<string | null>(
-		null,
-	);
-	const [patDialogOpen, setPatDialogOpen] = useState<boolean>(false);
-	const [patInput, setPatInput] = useState<string>("");
-	const [patCheckState, setPatCheckState] = useState<
-		"idle" | "checking" | "valid" | "invalid"
-	>("idle");
-	const [patCheckMessage, setPatCheckMessage] = useState<string | null>(null);
-	const [patSaving, setPatSaving] = useState<boolean>(false);
-	const [pendingReaction, setPendingReaction] = useState<{
-		item: FeedItem;
+	const [patGuideOpen, setPatGuideOpen] = useState<boolean>(false);
+	const [patGuideMessage, setPatGuideMessage] = useState<string | null>(null);
+	const pendingReactionRef = useRef<{
+		releaseId: string;
 		content: ReactionContent;
 	} | null>(null);
-	const patCheckSeqRef = useRef(0);
+	const {
+		reactionTokenMasked,
+		patInput,
+		setPatInput,
+		patCheckState,
+		patCheckMessage,
+		patCheckedAt,
+		patSaving,
+		canSavePat,
+		loadReactionToken,
+		savePat,
+		clearPatDraft,
+	} = useReactionTokenEditor({
+		autoLoad: false,
+		onStatusLoaded: (status) => {
+			setReactionTokenConfigured(isReactionTokenUsable(status));
+		},
+		onPatSaved: (status) => {
+			setReactionTokenConfigured(isReactionTokenUsable(status));
+		},
+	});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>(
 		() => warmStart?.notifications ?? [],
@@ -445,35 +438,6 @@ export function Dashboard(props: {
 		() => !bootedFromWarmStart,
 	);
 	const [notificationsLoading, setNotificationsLoading] = useState(false);
-	const [profileDialogOpen, setProfileDialogOpen] = useState(false);
-	const [briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
-		null,
-	);
-	const [briefProfileDraft, setBriefProfileDraft] =
-		useState<DailyBriefProfilePatchRequest>({
-			daily_brief_local_time: dailyBoundaryLocal,
-			daily_brief_time_zone:
-				dailyBoundaryTimeZone ??
-				readHourAlignedBrowserTimeZone() ??
-				"Asia/Shanghai",
-		});
-	const [briefProfileLoading, setBriefProfileLoading] = useState(false);
-	const [briefProfileSaving, setBriefProfileSaving] = useState(false);
-	const [briefProfileError, setBriefProfileError] = useState<string | null>(
-		null,
-	);
-
-	const loadReactionTokenStatus = useCallback(async () => {
-		const res = await apiGet<ReactionTokenStatusResponse>(
-			"/api/reaction-token/status",
-		);
-		setReactionTokenConfigured(res.configured && res.check.state === "valid");
-		setReactionTokenMasked(res.masked_token);
-		if (!res.configured) {
-			setPatCheckState("idle");
-			setPatCheckMessage(null);
-		}
-	}, []);
 
 	const loadNotifications = useCallback(async () => {
 		if (notificationsRequestInFlightRef.current) {
@@ -526,30 +490,6 @@ export function Dashboard(props: {
 		},
 		[loadNotifications],
 	);
-	const refreshDashboardBoundary = useCallback(async () => {
-		const latestMe = await apiGet<MeResponse>("/api/me");
-		setDailyBoundaryLocal(latestMe.dashboard.daily_boundary_local);
-		setDailyBoundaryTimeZone(latestMe.dashboard.daily_boundary_time_zone);
-		setDailyBoundaryUtcOffsetMinutes(
-			latestMe.dashboard.daily_boundary_utc_offset_minutes,
-		);
-	}, []);
-	const loadBriefProfile = useCallback(async () => {
-		setBriefProfileLoading(true);
-		setBriefProfileError(null);
-		try {
-			const profile = await apiGetMeProfile();
-			setBriefProfile(profile);
-			setBriefProfileDraft({
-				daily_brief_local_time: profile.daily_brief_local_time,
-				daily_brief_time_zone: profile.daily_brief_time_zone,
-			});
-		} catch (err) {
-			setBriefProfileError(err instanceof Error ? err.message : String(err));
-		} finally {
-			setBriefProfileLoading(false);
-		}
-	}, []);
 
 	const refreshAll = useCallback(async () => {
 		setBootError(null);
@@ -656,10 +596,8 @@ export function Dashboard(props: {
 		}).catch((err) => {
 			setBootError(err instanceof Error ? err.message : String(err));
 		});
-		void loadReactionTokenStatus().catch((err) => {
-			setBootError(err instanceof Error ? err.message : String(err));
-		});
-	}, [bootedFromWarmStart, loadReactionTokenStatus, refreshSidebar]);
+		void loadReactionToken();
+	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebar || tab === "inbox";
@@ -955,6 +893,31 @@ export function Dashboard(props: {
 		},
 		[registerSmart, registerTranslate],
 	);
+	const openPatDialog = useCallback(
+		(
+			message: string,
+			pending?: { releaseId: string; content: ReactionContent },
+		) => {
+			if (pending) {
+				pendingReactionRef.current = pending;
+			}
+			setPatGuideMessage(message);
+			setPatGuideOpen(true);
+		},
+		[],
+	);
+	const closePatDialog = useCallback(() => {
+		setPatGuideOpen(false);
+		setPatGuideMessage(null);
+		clearPatDraft();
+		pendingReactionRef.current = null;
+	}, [clearPatDraft]);
+	const onSavePatFromDialog = useCallback(() => {
+		void savePat().then((status) => {
+			if (!status || !isReactionTokenUsable(status)) return;
+			closePatDialog();
+		});
+	}, [closePatDialog, savePat]);
 
 	const flushPendingReactions = useCallback(
 		(key: string) => {
@@ -987,8 +950,6 @@ export function Dashboard(props: {
 				.then((res) => {
 					reactionServerByKeyRef.current.set(key, res.reactions);
 					setReactionTokenConfigured(true);
-					setPatCheckState("valid");
-					setPatCheckMessage("PAT 可用");
 					setReactionErrorByKey((prev) => {
 						if (!(key in prev)) return prev;
 						const next = { ...prev };
@@ -1024,16 +985,14 @@ export function Dashboard(props: {
 						}
 						if (err.code === "pat_required" || err.code === "pat_invalid") {
 							setReactionTokenConfigured(false);
-							const retryItem = feed.items.find((it) => itemKey(it) === key);
-							if (retryItem) {
-								setPendingReaction({ item: retryItem, content });
-							}
-							setPatDialogOpen(true);
-							setPatCheckState(err.code === "pat_invalid" ? "invalid" : "idle");
-							setPatCheckMessage(
+							openPatDialog(
 								err.code === "pat_invalid"
-									? "PAT 无效或已过期，请重新填写并校验。"
-									: "需要先配置 PAT 才能使用站内反馈。",
+									? "当前 GitHub PAT 无效或已过期，请重新校验后保存。"
+									: "先补齐 GitHub PAT，才能继续使用站内反馈。",
+								{
+									releaseId: item.id,
+									content,
+								},
 							);
 							return;
 						}
@@ -1068,7 +1027,7 @@ export function Dashboard(props: {
 					}
 				});
 		},
-		[feed],
+		[feed, openPatDialog],
 	);
 
 	const scheduleReactionFlush = useCallback(
@@ -1119,57 +1078,17 @@ export function Dashboard(props: {
 	const onToggleReaction = useCallback(
 		(item: FeedItem, content: ReactionContent) => {
 			if (!reactionTokenConfigured) {
-				setPendingReaction({ item, content });
-				setPatDialogOpen(true);
-				setPatCheckState("idle");
-				setPatCheckMessage("需要先配置 PAT 才能使用站内反馈。");
+				if (!isReleaseFeedItem(item)) return;
+				openPatDialog("先补齐 GitHub PAT，才能继续使用站内反馈。", {
+					releaseId: item.id,
+					content,
+				});
 				return;
 			}
 			performReactionToggle(item, content);
 		},
-		[performReactionToggle, reactionTokenConfigured],
+		[openPatDialog, performReactionToggle, reactionTokenConfigured],
 	);
-
-	useEffect(() => {
-		if (!patDialogOpen) return;
-		const token = patInput.trim();
-		patCheckSeqRef.current += 1;
-		const seq = patCheckSeqRef.current;
-		if (!token) {
-			setPatCheckState("idle");
-			setPatCheckMessage(null);
-			return;
-		}
-
-		setPatCheckState("checking");
-		setPatCheckMessage("正在检查 PAT 可用性…");
-		const timer = window.setTimeout(() => {
-			void apiPostJson<ReactionTokenCheckResponse>(
-				"/api/reaction-token/check",
-				{
-					token,
-				},
-			)
-				.then((res) => {
-					if (seq !== patCheckSeqRef.current) return;
-					setPatCheckState(res.state);
-					setPatCheckMessage(res.message);
-				})
-				.catch((err) => {
-					if (seq !== patCheckSeqRef.current) return;
-					if (err instanceof ApiError && err.status === 401) {
-						setPatCheckState("invalid");
-						setPatCheckMessage(sessionExpiredHint());
-						return;
-					}
-					const message = err instanceof Error ? err.message : String(err);
-					setPatCheckState("invalid");
-					setPatCheckMessage(message);
-				});
-		}, 800);
-
-		return () => window.clearTimeout(timer);
-	}, [patDialogOpen, patInput]);
 
 	useEffect(
 		() => () => {
@@ -1180,43 +1099,6 @@ export function Dashboard(props: {
 		},
 		[],
 	);
-
-	const onSavePat = useCallback(() => {
-		if (patCheckState !== "valid") return;
-		const token = patInput.trim();
-		if (!token) return;
-
-		setPatSaving(true);
-		void apiPutJson<ReactionTokenStatusResponse>("/api/reaction-token", {
-			token,
-		})
-			.then((res) => {
-				setReactionTokenConfigured(res.configured);
-				setReactionTokenMasked(res.masked_token);
-				setPatDialogOpen(false);
-				setPatInput("");
-				setPatCheckState("idle");
-				setPatCheckMessage(null);
-				if (pendingReaction) {
-					const next = pendingReaction;
-					setPendingReaction(null);
-					performReactionToggle(next.item, next.content);
-				}
-			})
-			.catch((err) => {
-				if (err instanceof ApiError && err.status === 401) {
-					setPatCheckState("invalid");
-					setPatCheckMessage(sessionExpiredHint());
-					return;
-				}
-				const message = err instanceof Error ? err.message : String(err);
-				setPatCheckState("invalid");
-				setPatCheckMessage(message);
-			})
-			.finally(() => {
-				setPatSaving(false);
-			});
-	}, [patCheckState, patInput, pendingReaction, performReactionToggle]);
 
 	const onGenerateBrief = useCallback(() => {
 		void run("Generate brief", async () => {
@@ -1234,31 +1116,6 @@ export function Dashboard(props: {
 		},
 		[refreshSidebar],
 	);
-	const onOpenProfileDialog = useCallback(() => {
-		setProfileDialogOpen(true);
-		void loadBriefProfile();
-	}, [loadBriefProfile]);
-	const onSaveBriefProfile = useCallback(() => {
-		if (!briefProfile) return;
-		setBriefProfileSaving(true);
-		setBriefProfileError(null);
-		void apiPatchMeProfile(briefProfileDraft)
-			.then(async (profile) => {
-				setBriefProfile(profile);
-				setBriefProfileDraft({
-					daily_brief_local_time: profile.daily_brief_local_time,
-					daily_brief_time_zone: profile.daily_brief_time_zone,
-				});
-				await refreshDashboardBoundary();
-				setProfileDialogOpen(false);
-			})
-			.catch((err) => {
-				setBriefProfileError(err instanceof Error ? err.message : String(err));
-			})
-			.finally(() => {
-				setBriefProfileSaving(false);
-			});
-	}, [briefProfile, briefProfileDraft, refreshDashboardBoundary]);
 	const onSyncInbox = useCallback(() => {
 		void run("Sync inbox", async () => {
 			const task = await apiPost<TaskAcceptedResponse>(
@@ -1286,24 +1143,6 @@ export function Dashboard(props: {
 		);
 		return Boolean(any);
 	}, [feed.items]);
-
-	const resetPatDialogState = useCallback(() => {
-		setPatDialogOpen(false);
-		setPatInput("");
-		setPatCheckState("idle");
-		setPatCheckMessage(null);
-	}, []);
-
-	const onPatDialogOpenChange = useCallback(
-		(open: boolean) => {
-			if (open) {
-				setPatDialogOpen(true);
-				return;
-			}
-			resetPatDialogState();
-		},
-		[resetPatDialogState],
-	);
 
 	const onSelectTab = useCallback(
 		(nextTab: Tab) => {
@@ -1573,14 +1412,6 @@ export function Dashboard(props: {
 									{busy}…
 								</span>
 							) : null}
-							<Button
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-								onClick={onOpenProfileDialog}
-							>
-								日报设置
-							</Button>
 							{isAdmin ? (
 								<Button
 									asChild
@@ -1649,143 +1480,110 @@ export function Dashboard(props: {
 					</div>
 				</Tabs>
 
-				<Dialog
-					open={profileDialogOpen}
-					onOpenChange={(open) => {
-						setProfileDialogOpen(open);
-						if (!open) {
-							setBriefProfileError(null);
-						}
-					}}
-				>
-					<DialogContent className="max-w-lg">
-						<DialogHeader>
-							<DialogTitle>日报设置</DialogTitle>
-							<DialogDescription>
-								之后新生成的日报会按这里的“本地整点 + IANA
-								时区”切窗口；历史快照不会被回写。
-							</DialogDescription>
-						</DialogHeader>
-						<DailyBriefProfileForm
-							localTime={briefProfileDraft.daily_brief_local_time}
-							timeZone={briefProfileDraft.daily_brief_time_zone}
-							disabled={briefProfileLoading || briefProfileSaving}
-							error={briefProfileError}
-							helperText={
-								briefProfile?.last_active_at
-									? `最近活动：${new Date(briefProfile.last_active_at).toLocaleString()}`
-									: "保存时会严格校验 IANA 时区；非法值不会降级成 offset。"
-							}
-							onLocalTimeChange={(value) =>
-								setBriefProfileDraft((current) => ({
-									...current,
-									daily_brief_local_time: value,
-								}))
-							}
-							onTimeZoneChange={(value) =>
-								setBriefProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: value,
-								}))
-							}
-							onUseBrowserTimeZone={(timeZone) =>
-								setBriefProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: timeZone,
-								}))
-							}
-						/>
-						<DialogFooter>
-							<Button
-								variant="outline"
-								onClick={() => setProfileDialogOpen(false)}
-								disabled={briefProfileSaving}
-							>
-								取消
-							</Button>
-							<Button
-								onClick={onSaveBriefProfile}
-								disabled={
-									briefProfileLoading || briefProfileSaving || !briefProfile
-								}
-							>
-								{briefProfileSaving ? "保存中…" : "保存设置"}
-							</Button>
-						</DialogFooter>
-					</DialogContent>
-				</Dialog>
-
 				<ReleaseDetailCard
 					releaseId={activeReleaseId}
 					onClose={onCloseReleaseDetail}
 				/>
 
-				<Dialog open={patDialogOpen} onOpenChange={onPatDialogOpenChange}>
-					<DialogContent
-						showCloseButton={false}
-						className="max-w-2xl"
-						onInteractOutside={(event) => event.preventDefault()}
-					>
+				<Dialog
+					open={patGuideOpen}
+					onOpenChange={(open) => {
+						if (open) {
+							setPatGuideOpen(true);
+							return;
+						}
+						closePatDialog();
+					}}
+				>
+					<DialogContent className="max-w-md">
 						<DialogHeader>
-							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogTitle>配置 GitHub PAT</DialogTitle>
 							<DialogDescription>
-								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+								不用跳走，直接在这里补齐就行。
 							</DialogDescription>
 						</DialogHeader>
 
-						<div className="bg-muted/40 rounded-lg border p-3">
-							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-							<p className="text-muted-foreground mt-1 font-mono text-xs">
-								Settings → Developer settings → Personal access tokens → Tokens
-								(classic)
-							</p>
-							<p className="text-muted-foreground mt-2 text-xs">
-								最小权限：公共仓库用{" "}
-								<span className="font-mono">public_repo</span>； 私有仓库用{" "}
-								<span className="font-mono">repo</span>。
-							</p>
-							{reactionTokenMasked ? (
-								<p className="text-muted-foreground mt-2 text-xs">
-									当前已保存：
-									<span className="font-mono">{reactionTokenMasked}</span>
-								</p>
+						<div className="space-y-4">
+							{patGuideMessage ? (
+								<p className="text-sm text-foreground">{patGuideMessage}</p>
 							) : null}
-						</div>
 
-						<div className="space-y-2">
-							<Label htmlFor="reaction-pat">GitHub PAT</Label>
-							<Input
-								id="reaction-pat"
-								type="password"
-								value={patInput}
-								onChange={(event) => setPatInput(event.target.value)}
-								placeholder="粘贴 PAT 后将自动校验（800ms 防抖）"
-								className="font-mono text-sm"
-							/>
-						</div>
+							<div className="space-y-2">
+								<div className="flex items-center justify-between gap-3">
+									<Label htmlFor="dashboard-reaction-pat">GitHub PAT</Label>
+									{reactionTokenMasked ? (
+										<span className="text-muted-foreground font-mono text-xs">
+											已保存：{reactionTokenMasked}
+										</span>
+									) : null}
+								</div>
+								<Input
+									id="dashboard-reaction-pat"
+									type="password"
+									value={patInput}
+									onChange={(event) => setPatInput(event.target.value)}
+									placeholder="粘贴 classic PAT"
+									autoCapitalize="none"
+									autoCorrect="off"
+									spellCheck={false}
+									autoFocus
+									className="h-10 font-mono text-sm"
+								/>
+							</div>
 
-						<p
-							className={
-								patCheckState === "valid"
-									? "text-xs text-emerald-600"
-									: patCheckState === "invalid"
-										? "text-xs text-red-600"
-										: "text-muted-foreground text-xs"
-							}
-						>
-							{patCheckMessage ??
-								"输入后会自动检查 PAT 是否可用；仅最后一次输入结果生效。"}
-						</p>
+							<div className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2.5">
+								<p className="text-sm font-medium">
+									{patCheckState === "checking"
+										? "正在校验 GitHub PAT"
+										: patCheckState === "valid"
+											? "GitHub PAT 可用"
+											: patCheckState === "invalid"
+												? "GitHub PAT 无效"
+												: patCheckState === "error"
+													? "GitHub PAT 校验失败"
+													: reactionTokenConfigured
+														? "已保存 GitHub PAT"
+														: "还没有可用的 GitHub PAT"}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs leading-5">
+									{patCheckMessage ??
+										"输入后会在 800ms 后自动校验；通过后才能保存。"}
+								</p>
+							</div>
+
+							<div className="text-muted-foreground flex items-center justify-between gap-3 text-xs">
+								<span>
+									{patCheckedAt
+										? `最近检查：${formatDateTime(patCheckedAt)}`
+										: "需要 classic PAT"}
+								</span>
+								<Button
+									asChild
+									variant="ghost"
+									size="sm"
+									className="h-auto px-0 text-xs"
+									onClick={closePatDialog}
+								>
+									<InternalLink
+										href={buildSettingsHref("github-pat")}
+										to="/settings"
+										search={buildSettingsSearch("github-pat")}
+									>
+										去完整设置
+									</InternalLink>
+								</Button>
+							</div>
+						</div>
 
 						<DialogFooter>
-							<Button variant="outline" onClick={resetPatDialogState}>
-								稍后再说
+							<Button variant="outline" onClick={closePatDialog}>
+								取消
 							</Button>
 							<Button
-								onClick={onSavePat}
-								disabled={patSaving || patCheckState !== "valid"}
+								disabled={patSaving || !canSavePat}
+								onClick={onSavePatFromDialog}
 							>
-								{patSaving ? "保存中…" : "保存并继续"}
+								{patSaving ? "保存中…" : "保存 GitHub PAT"}
 							</Button>
 						</DialogFooter>
 					</DialogContent>

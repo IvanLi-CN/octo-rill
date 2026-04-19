@@ -4,10 +4,6 @@ import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
-import {
-	DailyBriefProfileForm,
-	readHourAlignedBrowserTimeZone,
-} from "@/briefs/DailyBriefProfileForm";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -22,6 +18,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import { FeedGroupedList } from "@/feed/FeedGroupedList";
+import { FeedItemCard } from "@/feed/FeedItemCard";
 import {
 	DEFAULT_PAGE_LANE,
 	resolveDisplayLaneForFeed,
@@ -33,6 +30,7 @@ import type {
 	ReleaseFeedItem,
 	SocialFeedItem,
 } from "@/feed/types";
+import { isSocialFeedItem } from "@/feed/types";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { InternalLink } from "@/lib/internalNavigation";
@@ -46,6 +44,7 @@ import {
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
+import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -81,6 +80,22 @@ const STORYBOOK_VERSION_STATE = {
 const DASHBOARD_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
 	dashboardMobileDivider375: {
+		name: "Dashboard mobile divider 375x667",
+		styles: {
+			height: "667px",
+			width: "375px",
+		},
+		type: "mobile",
+	},
+	dashboardMobile390: {
+		name: "Dashboard mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+	dashboardMobile375: {
 		name: "Dashboard mobile 375x667",
 		styles: {
 			height: "667px",
@@ -128,14 +143,33 @@ function socialPreviewDataUrl(title: string, accent: string, body: string) {
 	)}`;
 }
 
+function avatarDataUrl(
+	label: string,
+	background: string,
+	foreground = "#ffffff",
+) {
+	return `data:image/svg+xml;utf8,${encodeURIComponent(
+		`<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="120" fill="${background}"/><text x="120" y="132" font-family="Inter,Arial,sans-serif" font-size="44" font-weight="700" text-anchor="middle" fill="${foreground}">${label}</text></svg>`,
+	)}`;
+}
+
 function githubAvatarUrl(username: string, size = 96) {
 	return `https://github.com/${username}.png?size=${size}`;
 }
 
+function githubAvatarUrlByUserId(userId: number, size = 96) {
+	return `https://avatars.githubusercontent.com/u/${userId}?v=4&size=${size}`;
+}
+
+const PROJECT_OWNER_LOGIN = "IvanLi-CN" as const;
+const PROJECT_OWNER_GITHUB_USER_ID = 30215105 as const;
+const PROJECT_REPO_FULL_NAME = "IvanLi-CN/octo-rill" as const;
+const PROJECT_REPO_URL = "https://github.com/IvanLi-CN/octo-rill" as const;
+
 const STORYBOOK_VIEWER = {
-	login: "sindresorhus",
-	avatar_url: githubAvatarUrl("sindresorhus"),
-	html_url: "https://github.com/sindresorhus",
+	login: PROJECT_OWNER_LOGIN,
+	avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
+	html_url: "https://github.com/IvanLi-CN",
 } as const;
 
 const repoVisualFixtures: Record<
@@ -143,7 +177,7 @@ const repoVisualFixtures: Record<
 	RepoVisual | null
 > = {
 	social: {
-		owner_avatar_url: githubAvatarUrl("github"),
+		owner_avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
 		open_graph_image_url: socialPreviewDataUrl(
 			"Rocket Release",
 			"#2563eb",
@@ -177,7 +211,7 @@ function buildFeedItem(
 		kind: "release",
 		ts: "2026-02-21T08:05:00Z",
 		id,
-		repo_full_name: "acme/rocket",
+		repo_full_name: PROJECT_REPO_FULL_NAME,
 		repo_visual: repoVisualFixtures.social,
 		title: `v${id}`,
 		body: "- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
@@ -185,7 +219,7 @@ function buildFeedItem(
 		subtitle: null,
 		reason: null,
 		subject_type: null,
-		html_url: `https://github.com/acme/rocket/releases/tag/${id}`,
+		html_url: `${PROJECT_REPO_URL}/releases/tag/${id}`,
 		unread: null,
 		actor: null,
 		translated: {
@@ -228,7 +262,7 @@ function makeMockFeed(): FeedItem[] {
 		buildFeedItem("10001", {
 			ts: "2026-04-04T16:16:29+08:00",
 			title: "v2.63.0",
-			html_url: "https://github.com/acme/rocket/releases/tag/v2.63.0",
+			html_url: `${PROJECT_REPO_URL}/releases/tag/v2.63.0`,
 			repo_visual: repoVisualFixtures.social,
 			smart: {
 				lang: "zh-CN",
@@ -289,8 +323,7 @@ function makeMockFeed(): FeedItem[] {
 			ts: "2026-04-04T07:10:00+08:00",
 			title: "nightly guardrails",
 			body: `- ${HISTORY_RAW_MARKER}\n- Tighten upload guardrails\n- Normalize rollout order`,
-			html_url:
-				"https://github.com/acme/rocket/releases/tag/nightly-guardrails",
+			html_url: `${PROJECT_REPO_URL}/releases/tag/nightly-guardrails`,
 		}),
 		buildFeedItem("10004", {
 			ts: "2026-04-03T21:30:00+08:00",
@@ -480,7 +513,7 @@ function buildRepoStarItem(
 		kind: "repo_star_received",
 		ts: "2026-04-04T14:20:00+08:00",
 		id,
-		repo_full_name: "acme/rocket",
+		repo_full_name: PROJECT_REPO_FULL_NAME,
 		repo_visual: repoVisualFixtures.social,
 		title: null,
 		body: null,
@@ -537,7 +570,7 @@ function makeMixedSocialFeed(): FeedItem[] {
 		...makeMockFeed(),
 		buildRepoStarItem("star-10001", {
 			ts: "2026-04-04T16:06:00+08:00",
-			repo_full_name: "acme/rocket",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
 		}),
 		buildFollowerItem("follow-10001", {
 			ts: "2026-04-04T14:48:00+08:00",
@@ -565,6 +598,212 @@ function makeMixedSocialFeed(): FeedItem[] {
 	];
 }
 
+function makeMobileCompactSocialFeed(): FeedItem[] {
+	return [
+		buildRepoStarItem("mobile-star-proof", {
+			ts: "2026-04-04T18:06:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_visual: {
+				owner_avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
+				open_graph_image_url: null,
+				uses_custom_open_graph_image: false,
+			},
+			actor: {
+				login: "frontend-systems-maintainer",
+				avatar_url: avatarDataUrl("MS", "#7c3aed"),
+				html_url: "https://github.com/frontend-systems-maintainer",
+			},
+			html_url: "https://github.com/frontend-systems-maintainer",
+		}),
+		buildFollowerItem("mobile-follow-proof", {
+			ts: "2026-04-04T17:48:00+08:00",
+			actor: {
+				login: "design-ops-collaborator",
+				avatar_url: avatarDataUrl("MF", "#0f766e"),
+				html_url: "https://github.com/design-ops-collaborator",
+			},
+			html_url: "https://github.com/design-ops-collaborator",
+		}),
+		buildFeedItem("mobile-proof-release", {
+			ts: "2026-04-04T16:12:00+08:00",
+			title: "移动端社交卡片重设计验证版",
+		}),
+	];
+}
+
+function makeMobileSocialEdgeCaseFeed(): FeedItem[] {
+	return [
+		buildRepoStarItem("mobile-edge-right-long", {
+			ts: "2026-04-04T18:30:00+08:00",
+			repo_full_name: "IvanLi-CN/mobile-dashboard-social-adaptive-case",
+			repo_visual: {
+				owner_avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
+				open_graph_image_url: null,
+				uses_custom_open_graph_image: false,
+			},
+			actor: {
+				login: "ms",
+				avatar_url: avatarDataUrl("MS", "#7c3aed"),
+				html_url: "https://github.com/ms",
+			},
+			html_url: "https://github.com/ms",
+		}),
+		buildFollowerItem("mobile-edge-left-long", {
+			ts: "2026-04-04T18:12:00+08:00",
+			actor: {
+				login: "design-ops-collaborator-case",
+				avatar_url: avatarDataUrl("MF", "#0f766e"),
+				html_url: "https://github.com/design-ops-collaborator-case",
+			},
+			html_url: "https://github.com/design-ops-collaborator-case",
+		}),
+		buildRepoStarItem("mobile-edge-bilateral-long", {
+			ts: "2026-04-04T17:54:00+08:00",
+			repo_full_name:
+				"IvanLi-CN/mobile-dashboard-social-activity-feed-bilateral-proof",
+			repo_visual: {
+				owner_avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
+				open_graph_image_url: null,
+				uses_custom_open_graph_image: false,
+			},
+			actor: {
+				login: "frontend-systems-maintainer-centered-proof",
+				avatar_url: avatarDataUrl("FL", "#2563eb"),
+				html_url:
+					"https://github.com/frontend-systems-maintainer-centered-proof",
+			},
+			html_url: "https://github.com/frontend-systems-maintainer-centered-proof",
+		}),
+		buildFollowerItem("mobile-edge-balanced", {
+			ts: "2026-04-04T17:36:00+08:00",
+			actor: {
+				login: "design-ops-collaborator",
+				avatar_url: avatarDataUrl("MF", "#0f766e"),
+				html_url: "https://github.com/design-ops-collaborator",
+			},
+			html_url: "https://github.com/design-ops-collaborator",
+		}),
+	];
+}
+
+function makeMobileShortFollowerFeed(): FeedItem[] {
+	return [
+		["mobile-short-follow-brutany", "brutany", "#d97706"],
+		["mobile-short-follow-zhenyuan", "zhenyuanwang46-droid", "#7c3aed"],
+		["mobile-short-follow-pseudocodes", "pseudocodes", "#0f766e"],
+		["mobile-short-follow-zyou", "zyou9724-creator", "#60a5fa"],
+		["mobile-short-follow-mrlrk", "mrlrk82", "#c2410c"],
+	].map(([id, login, color]) =>
+		buildFollowerItem(id, {
+			ts: "2026-04-04T17:12:00+08:00",
+			actor: {
+				login,
+				avatar_url: avatarDataUrl(login.slice(0, 2).toUpperCase(), color),
+				html_url: `https://github.com/${login}`,
+			},
+			html_url: `https://github.com/${login}`,
+		}),
+	);
+}
+
+function SocialCardsMatrixPreview(props: {
+	items: SocialFeedItem[];
+	currentViewer?: typeof STORYBOOK_VIEWER;
+}) {
+	const { items, currentViewer = STORYBOOK_VIEWER } = props;
+	return (
+		<div className="bg-background min-h-screen px-3 py-4">
+			<div className="mx-auto w-full max-w-[390px] space-y-3">
+				{items.map((item) => (
+					<FeedItemCard
+						key={item.id}
+						item={item}
+						currentViewer={currentViewer}
+						activeLane={DEFAULT_PAGE_LANE}
+						isTranslating={false}
+						isSmartGenerating={false}
+						isReactionBusy={false}
+						reactionError={null}
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={() => {}}
+						onToggleReaction={() => {}}
+					/>
+				))}
+			</div>
+		</div>
+	);
+}
+
+function assertInlineSocialCardLayout(card: HTMLElement) {
+	const row = card.querySelector<HTMLElement>("[data-social-card-row]");
+	const actor = card.querySelector<HTMLElement>(
+		'[data-social-card-segment="actor"]',
+	);
+	const action = card.querySelector<HTMLElement>(
+		'[data-social-card-segment="action"]',
+	);
+	const target = card.querySelector<HTMLElement>(
+		'[data-social-card-segment="target"]',
+	);
+	expect(card.dataset.socialCardLayout).toBe("inline-compact");
+	expect(row).toBeTruthy();
+	expect(actor).toBeTruthy();
+	expect(action).toBeTruthy();
+	expect(target).toBeTruthy();
+	if (!row || !actor || !action || !target) {
+		throw new Error("Expected social card row and segments to exist");
+	}
+	const actorGroup =
+		actor.querySelector<HTMLElement>(
+			'[data-social-card-entity-group="actor"]',
+		) ?? actor;
+	const targetGroup =
+		target.querySelector<HTMLElement>(
+			'[data-social-card-entity-group="target"]',
+		) ?? target;
+
+	const rowRect = row.getBoundingClientRect();
+	const actorRect = actorGroup.getBoundingClientRect();
+	const actionRect = action.getBoundingClientRect();
+	const targetRect = targetGroup.getBoundingClientRect();
+	const rowCenterY = rowRect.top + rowRect.height / 2;
+	const centers = [actorRect, actionRect, targetRect].map(
+		(rect) => rect.top + rect.height / 2,
+	);
+	for (const centerY of centers) {
+		expect(Math.abs(centerY - rowCenterY)).toBeLessThan(rowRect.height * 0.32);
+	}
+
+	expect(actorRect.left).toBeLessThan(actionRect.left);
+	expect(actionRect.left).toBeLessThan(targetRect.left);
+	expect(row.scrollWidth - row.clientWidth).toBeLessThanOrEqual(1);
+	expect(actorRect.left - rowRect.left).toBeLessThanOrEqual(14);
+	expect(rowRect.right - targetRect.right).toBeLessThanOrEqual(14);
+	const actionCenterX = actionRect.left + actionRect.width / 2;
+	const rowCenterX = rowRect.left + rowRect.width / 2;
+	if (row.dataset.socialCardBalanceMode !== "adaptive") {
+		expect(Math.abs(actionCenterX - rowCenterX)).toBeLessThanOrEqual(12);
+	}
+	expect(action.textContent?.trim() ?? "").toBe("");
+
+	for (const label of card.querySelectorAll<HTMLElement>(
+		"[data-social-card-primary]",
+	)) {
+		const style = window.getComputedStyle(label);
+		expect(style.whiteSpace).toBe("nowrap");
+		expect(style.overflow).toBe("hidden");
+		expect(label.dataset.socialCardPrimaryFull).toBeTruthy();
+		expect(label.dataset.socialCardPrimaryMobile).toBeTruthy();
+	}
+}
+
+function countVisibleGithubLinks(card: HTMLElement) {
+	return Array.from(
+		card.querySelectorAll<HTMLAnchorElement>('a[href^="https://github.com/"]'),
+	).filter((link) => window.getComputedStyle(link).display !== "none").length;
+}
+
 function makeVisibleWindowFeed(
 	mode: "visible-window-queued" | "visible-window-settling",
 ): FeedItem[] {
@@ -573,7 +812,7 @@ function makeVisibleWindowFeed(
 		return buildFeedItem(`200${seq}`, {
 			ts: `2026-02-21T0${(index % 6) + 1}:15:00Z`,
 			title: `v2.0.${seq}`,
-			html_url: `https://github.com/acme/rocket/releases/tag/v2.0.${seq}`,
+			html_url: `${PROJECT_REPO_URL}/releases/tag/v2.0.${seq}`,
 			body: [
 				`- Release lane ${seq}`,
 				"- Includes UI polish and API cleanup",
@@ -781,6 +1020,20 @@ const mockBriefs: BriefItem[] = [
 	}),
 ];
 
+const projectOnlyBriefs: BriefItem[] = [
+	makeBrief({
+		id: "brief-project-only-2026-04-05",
+		date: "2026-04-05",
+		window_start: "2026-04-04T08:00:00+08:00",
+		window_end: "2026-04-05T08:00:00+08:00",
+		release_count: 1,
+		release_ids: ["10006"],
+		content_markdown:
+			"## 项目更新\n\n### [acme/relay](https://github.com/acme/relay)\n\n- [stability lane release](/?tab=briefs&release=10006) · 2026-04-04T20:15:00+08:00 · [GitHub Release](https://github.com/acme/relay/releases/tag/stability-lane-release)\n  - 收敛日报刷新流程，避免历史摘要与卡片重复呈现。\n  - 相关链接：[#13888](https://github.com/acme/relay/pull/13888)\n",
+		created_at: "2026-04-05T08:00:03+08:00",
+	}),
+];
+
 const longBriefMarkdown = [
 	"## 项目更新",
 	"",
@@ -851,7 +1104,7 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 		release_count: 1,
 		release_ids: ["10005"],
 		content_markdown:
-			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
+			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
 		created_at: "2026-04-03T08:00:03+08:00",
 	}),
 };
@@ -970,7 +1223,6 @@ function isFeedBackedTab(
 function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
-	initialProfileDialogOpen?: boolean;
 	syncingAll?: boolean;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
@@ -991,7 +1243,6 @@ function DashboardPreview(props: {
 	const {
 		initialTab = "all",
 		initialPatDialogOpen = false,
-		initialProfileDialogOpen = false,
 		syncingAll = false,
 		showEmptyInbox = false,
 		emptyState = "content",
@@ -1061,16 +1312,6 @@ function DashboardPreview(props: {
 	);
 	const [tab, setTab] = useState<Tab>(initialTab);
 	const [patDialogOpen, setPatDialogOpen] = useState(initialPatDialogOpen);
-	const [profileDialogOpen, setProfileDialogOpen] = useState(
-		initialProfileDialogOpen,
-	);
-	const [profileDraft, setProfileDraft] = useState({
-		daily_brief_local_time: dailyBoundaryLocal,
-		daily_brief_time_zone:
-			dailyBoundaryTimeZone ??
-			readHourAlignedBrowserTimeZone() ??
-			"Asia/Shanghai",
-	});
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
 	>({});
@@ -1123,16 +1364,6 @@ function DashboardPreview(props: {
 	}, [storyBriefs]);
 
 	useEffect(() => {
-		setProfileDraft({
-			daily_brief_local_time: dailyBoundaryLocal,
-			daily_brief_time_zone:
-				dailyBoundaryTimeZone ??
-				readHourAlignedBrowserTimeZone() ??
-				"Asia/Shanghai",
-		});
-	}, [dailyBoundaryLocal, dailyBoundaryTimeZone]);
-
-	useEffect(() => {
 		if (!pendingFeedTab || !isFeedBackedTab(pendingFeedTab)) {
 			return;
 		}
@@ -1176,8 +1407,7 @@ function DashboardPreview(props: {
 				date,
 				window_start: null,
 				window_end: null,
-				content_markdown:
-					"## 项目更新\n\n- 这是一条 Storybook 生成的占位日报，用于验证日组交互。\n\n## 获星与关注\n\n### 获星\n\n- 本时间窗口内没有新的获星动态。\n\n### 关注\n\n- 本时间窗口内没有新的关注动态。",
+				content_markdown: "## 项目更新\n\n- 本时间窗口内没有新的 Release。",
 				created_at: `${date}T08:00:03+08:00`,
 			});
 		setStoryBriefs((current) =>
@@ -1333,14 +1563,6 @@ function DashboardPreview(props: {
 								/>
 							) : null}
 							<Button
-								variant="outline"
-								size="sm"
-								className="font-mono text-xs"
-								onClick={() => setProfileDialogOpen(true)}
-							>
-								日报设置
-							</Button>
-							<Button
 								asChild
 								variant="outline"
 								size="sm"
@@ -1410,87 +1632,62 @@ function DashboardPreview(props: {
 					onClose={() => setActiveReleaseId(null)}
 				/>
 
-				<Dialog open={profileDialogOpen} onOpenChange={setProfileDialogOpen}>
-					<DialogContent className="max-w-lg">
-						<DialogHeader>
-							<DialogTitle>日报设置</DialogTitle>
-							<DialogDescription>
-								之后新生成的日报会按这里的“本地整点 + IANA 时区”切窗口；
-								历史快照不会被回写。
-							</DialogDescription>
-						</DialogHeader>
-						<DailyBriefProfileForm
-							localTime={profileDraft.daily_brief_local_time}
-							timeZone={profileDraft.daily_brief_time_zone}
-							helperText="Storybook 里只演示入口与表单布局；真实页面会走 /api/me/profile。"
-							onLocalTimeChange={(value) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_local_time: value,
-								}))
-							}
-							onTimeZoneChange={(value) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: value,
-								}))
-							}
-							onUseBrowserTimeZone={(timeZone) =>
-								setProfileDraft((current) => ({
-									...current,
-									daily_brief_time_zone: timeZone,
-								}))
-							}
-						/>
-						<DialogFooter>
-							<Button
-								variant="outline"
-								onClick={() => setProfileDialogOpen(false)}
-							>
-								取消
-							</Button>
-							<Button>保存设置</Button>
-						</DialogFooter>
-					</DialogContent>
-				</Dialog>
-
 				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>
-					<DialogContent
-						showCloseButton={false}
-						className="max-w-2xl"
-						onInteractOutside={(event) => event.preventDefault()}
-					>
+					<DialogContent className="max-w-md">
 						<DialogHeader>
-							<DialogTitle>配置 GitHub PAT 以启用反馈表情</DialogTitle>
+							<DialogTitle>配置 GitHub PAT</DialogTitle>
 							<DialogDescription>
-								当前 OAuth 登录仅用于读取与同步。站内点按反馈需要额外配置 PAT。
+								不用跳走，直接在这里补齐就行。
 							</DialogDescription>
 						</DialogHeader>
-						<div className="bg-muted/40 rounded-lg border p-3">
-							<p className="font-medium text-sm">创建路径（不限仓库口径）</p>
-							<p className="text-muted-foreground mt-1 font-mono text-xs">
-								Settings → Developer settings → Personal access tokens → Tokens
-								(classic)
+						<div className="space-y-4">
+							<p className="text-sm text-foreground">
+								先补齐 GitHub PAT，才能继续使用站内反馈。
 							</p>
+							<div className="space-y-2">
+								<div className="flex items-center justify-between gap-3">
+									<Label htmlFor="story-pat-input">GitHub PAT</Label>
+									<span className="text-muted-foreground font-mono text-xs">
+										已保存：ghp_****wxyz
+									</span>
+								</div>
+								<Input
+									id="story-pat-input"
+									type="password"
+									value="ghp_example_valid_token"
+									readOnly
+									className="h-10 font-mono text-sm"
+								/>
+							</div>
+							<div className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2.5">
+								<p className="text-sm font-medium">GitHub PAT 可用</p>
+								<p className="text-muted-foreground mt-1 text-xs leading-5">
+									输入后会在 800ms 后自动校验；通过后才能保存。
+								</p>
+							</div>
+							<div className="text-muted-foreground flex items-center justify-between gap-3 text-xs">
+								<span>最近检查：2026/4/18 19:20:38</span>
+								<Button
+									asChild
+									variant="ghost"
+									size="sm"
+									className="h-auto px-0 text-xs"
+								>
+									<InternalLink
+										href={buildSettingsHref("github-pat")}
+										to="/settings"
+										search={buildSettingsSearch("github-pat")}
+									>
+										去完整设置
+									</InternalLink>
+								</Button>
+							</div>
 						</div>
-						<div className="space-y-2">
-							<Label htmlFor="storybook-reaction-pat">GitHub PAT</Label>
-							<Input
-								id="storybook-reaction-pat"
-								type="password"
-								value="ghp_mock_dashboard_storybook_token"
-								readOnly
-								className="font-mono text-sm"
-							/>
-						</div>
-						<p className="text-xs text-emerald-600">
-							Storybook 中使用固定有效态，便于回归 Dialog / Input / Label 布局。
-						</p>
 						<DialogFooter>
 							<Button variant="outline" onClick={() => setPatDialogOpen(false)}>
-								稍后再说
+								取消
 							</Button>
-							<Button>保存并继续</Button>
+							<Button>保存 GitHub PAT</Button>
 						</DialogFooter>
 					</DialogContent>
 				</Dialog>
@@ -1511,14 +1708,13 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 PAT 对话框，是 OctoRill 登录后的主工作台。当前同步入口统一收敛为一个顶部主按钮，这组 stories 用来确认默认、同步中与空态文案是否保持一致。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
+					"Dashboard 组合了 Feed、Brief、Inbox、Release 详情与 reaction fallback 快速补录弹层，是 OctoRill 登录后的主工作台。当前同步入口统一收敛为一个顶部主按钮，这组 stories 用来确认默认、同步中与空态文案是否保持一致。\n\n相关公开文档：[产品说明](../product.html) · [配置参考](../config.html)",
 			},
 		},
 	},
 	args: {
 		initialTab: "all",
 		initialPatDialogOpen: false,
-		initialProfileDialogOpen: false,
 		syncingAll: false,
 		showEmptyInbox: false,
 		emptyState: "content",
@@ -1573,8 +1769,8 @@ export const Default: Story = {
 			canvas.queryByRole("button", { name: "Sync inbox" }),
 		).not.toBeInTheDocument();
 		await expect(
-			canvas.getByRole("button", { name: "日报设置" }),
-		).toBeVisible();
+			canvas.queryByRole("button", { name: "日报设置" }),
+		).not.toBeInTheDocument();
 	},
 };
 
@@ -1640,14 +1836,17 @@ export const AllHistoryCollapsedToBriefs: Story = {
 		await expect(
 			canvas.queryByText(HISTORY_RAW_MARKER),
 		).not.toBeInTheDocument();
+		const historicalGroup = canvasElement.querySelector<HTMLElement>(
+			'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
+		);
+		expect(historicalGroup).toBeTruthy();
+		if (!historicalGroup) {
+			throw new Error("Expected 2026-04-04 historical group to exist");
+		}
+		expect(
+			historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+		).toBe(0);
 		await step("expand historical releases", async () => {
-			const historicalGroup = canvasElement.querySelector<HTMLElement>(
-				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-04"]',
-			);
-			expect(historicalGroup).toBeTruthy();
-			if (!historicalGroup) {
-				throw new Error("Expected 2026-04-04 historical group to exist");
-			}
 			const beforeSlot = historicalGroup.querySelector<HTMLElement>(
 				"[data-feed-day-action-slot]",
 			);
@@ -1664,6 +1863,9 @@ export const AllHistoryCollapsedToBriefs: Story = {
 			await expandButton.click();
 			await expect(canvas.getByText(HISTORY_RAW_MARKER)).toBeVisible();
 			await expect(canvas.queryByText("## 获星与关注")).not.toBeInTheDocument();
+			expect(
+				historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+			).toBeGreaterThan(0);
 			const afterSlot = historicalGroup.querySelector<HTMLElement>(
 				"[data-feed-day-action-slot]",
 			);
@@ -1746,6 +1948,18 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 			await expect(
 				await canvas.findByText(/回补这一天的日报摘要/),
 			).toBeVisible();
+			await expect(canvas.getByText("### 关注")).toBeVisible();
+			await expect(canvas.queryByText("### 获星")).not.toBeInTheDocument();
+			const historicalGroup = canvasElement.querySelector<HTMLElement>(
+				'[data-feed-group-type="historical"][data-feed-brief-date="2026-04-03"]',
+			);
+			expect(historicalGroup).toBeTruthy();
+			if (!historicalGroup) {
+				throw new Error("Expected 2026-04-03 historical group to exist");
+			}
+			expect(
+				historicalGroup.querySelectorAll("[data-social-card-kind]").length,
+			).toBe(0);
 		});
 	},
 };
@@ -1927,20 +2141,6 @@ export const EvidenceMobileMixedActivityDayDividerNoOverlap: Story = {
 	},
 };
 
-export const EvidenceDailyBriefProfileOpen: Story = {
-	name: "Evidence / Daily Brief Profile Open",
-	args: {
-		initialTab: "all",
-		initialProfileDialogOpen: true,
-		showFooter: false,
-	},
-	parameters: {
-		docs: {
-			disable: true,
-		},
-	},
-};
-
 export const BriefsFocused: Story = {
 	args: {
 		initialTab: "briefs",
@@ -1950,6 +2150,43 @@ export const BriefsFocused: Story = {
 			description: {
 				story: "把初始焦点切到 Briefs，用来验证日报与摘要场景的可读性。",
 			},
+		},
+	},
+};
+
+export const BriefsProjectOnly: Story = {
+	render: () => (
+		<DashboardPreview initialTab="briefs" briefs={projectOnlyBriefs} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"当日报窗口内只有 Release、没有获星或关注时，正文只保留 `## 项目更新`，不再渲染社交空态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("## 项目更新")).toBeVisible();
+		await expect(canvas.queryByText("## 获星与关注")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("### 获星")).not.toBeInTheDocument();
+		await expect(canvas.queryByText("### 关注")).not.toBeInTheDocument();
+	},
+};
+
+export const EvidenceBriefsProjectOnly: Story = {
+	name: "Evidence / Briefs Project Only",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={projectOnlyBriefs}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };
@@ -2178,7 +2415,7 @@ export const PatDialogOpen: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "直接展示 Release 反馈 PAT 对话框打开时的交互状态。",
+				story: "直接展示 reaction fallback 快速补录 GitHub PAT 的弹层状态。",
 			},
 		},
 	},
@@ -2543,9 +2780,7 @@ export const AllMixedSocialActivity: Story = {
 				for (const card of socialCards) {
 					const expectedLinks =
 						card.dataset.socialCardKind === "repo_star_received" ? 2 : 1;
-					expect(
-						card.querySelectorAll('a[href^="https://github.com/"]').length,
-					).toBe(expectedLinks);
+					expect(countVisibleGithubLinks(card)).toBe(expectedLinks);
 				}
 			},
 		);
@@ -2568,7 +2803,7 @@ export const StarsTab: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
 		await expect(
-			canvas.getByText("acme/rocket", { exact: true }),
+			canvas.getByText(PROJECT_REPO_FULL_NAME, { exact: true }),
 		).toBeVisible();
 		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
 		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
@@ -2576,9 +2811,7 @@ export const StarsTab: Story = {
 		);
 		expect(socialCards.length).toBeGreaterThan(0);
 		for (const card of socialCards) {
-			expect(
-				card.querySelectorAll('a[href^="https://github.com/"]').length,
-			).toBe(2);
+			expect(countVisibleGithubLinks(card)).toBe(2);
 			expect(card.dataset.socialCardTimeVisible).toBe("true");
 			expect(card.querySelector("[data-social-card-timestamp]")).not.toBeNull();
 		}
@@ -2610,16 +2843,16 @@ export const PostBootStarsTabSwitchKeepsShell: Story = {
 		);
 		expect(secondaryControls).not.toBeNull();
 		await expect(
-			canvas.getByRole("button", { name: "日报设置" }),
-		).toBeVisible();
+			canvas.queryByRole("button", { name: "日报设置" }),
+		).not.toBeInTheDocument();
 		await step("switch to stars without dropping the app shell", async () => {
 			await canvas.getByRole("tab", { name: "加星" }).click();
 			expect(
 				canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
 			).not.toBeNull();
 			await expect(
-				canvas.getByRole("button", { name: "日报设置" }),
-			).toBeVisible();
+				canvas.queryByRole("button", { name: "日报设置" }),
+			).not.toBeInTheDocument();
 			expect(
 				canvasElement.querySelector("[data-dashboard-boot-header]"),
 			).toBeNull();
@@ -2686,15 +2919,278 @@ export const FollowersTab: Story = {
 		);
 		expect(socialCards.length).toBeGreaterThan(0);
 		for (const card of socialCards) {
-			expect(
-				card.querySelectorAll('a[href^="https://github.com/"]').length,
-			).toBe(1);
+			expect(countVisibleGithubLinks(card)).toBe(1);
 			expect(card.dataset.socialCardTimeVisible).toBe("false");
 			expect(card.querySelector("[data-social-card-timestamp]")).toBeNull();
 		}
 		await expect(
 			canvas.queryByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const MobileSocialCompact: Story = {
+	name: "Evidence / Mobile Social Compact",
+	render: () => (
+		<DashboardPreview
+			initialTab="all"
+			feedItems={makeMobileCompactSocialFeed()}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端证据入口：390px 宽度下把 star / follower 社交卡片改成单条横向信息流，动作区只保留图标，左右信息块维持更均衡的视觉重量。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "移动端社交卡片重设计验证版" }),
+		).toBeVisible();
+
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			"[data-social-card-kind]",
+		);
+		expect(socialCards.length).toBeGreaterThanOrEqual(2);
+
+		const starActorMobile = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"] [data-social-card-segment="actor"] [data-social-card-primary-mobile-label]',
+		);
+		const starRepoMobile = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"] [data-social-card-segment="target"] [data-social-card-primary-mobile-label]',
+		);
+		const followerActorMobile = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="follower_received"] [data-social-card-segment="actor"] [data-social-card-primary-mobile-label]',
+		);
+		const followerTargetMobile = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="follower_received"] [data-social-card-segment="target"] [data-social-card-primary-mobile-label]',
+		);
+		expect(starActorMobile?.textContent?.trim()).toBe(
+			"frontend-systems-maintainer",
+		);
+		expect(starRepoMobile?.textContent?.trim()).toBe(PROJECT_REPO_FULL_NAME);
+		expect(starRepoMobile?.scrollWidth).toBeLessThanOrEqual(
+			starRepoMobile?.clientWidth ?? 0,
+		);
+		expect(followerActorMobile?.textContent?.trim()).toBe(
+			"design-ops-collaborator",
+		);
+		expect(followerTargetMobile?.textContent?.trim()).toBe(PROJECT_OWNER_LOGIN);
+		for (const card of socialCards) {
+			const row = card.querySelector<HTMLElement>("[data-social-card-row]");
+			const action = row?.querySelector<HTMLElement>(
+				'[data-social-card-segment="action"]',
+			);
+			expect(action?.textContent?.trim() ?? "").toBe("");
+			expect(row?.querySelector(".lucide-arrow-up-right")).toBeNull();
+		}
+		expect(
+			canvasElement.querySelector("[data-social-card-secondary-mobile-label]"),
+		).toBeNull();
+
+		for (const card of socialCards) {
+			assertInlineSocialCardLayout(card);
+		}
+	},
+};
+
+export const MobileSocialEdgeCases: Story = {
+	name: "Evidence / Mobile Social Edge Cases",
+	render: () => (
+		<DashboardPreview
+			initialTab="all"
+			feedItems={makeMobileSocialEdgeCaseFeed()}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端社交卡片边界条件入口：集中展示右长、左长、双边都长与常规平衡四种场景，便于直接检查宽度分配与图标位置是否符合预期。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			"[data-social-card-kind]",
+		);
+		expect(socialCards.length).toBe(4);
+
+		for (const card of socialCards) {
+			assertInlineSocialCardLayout(card);
+		}
+
+		const rightLongCard = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"][data-feed-item-id="mobile-edge-right-long"]',
+		);
+		const leftLongCard = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="follower_received"][data-feed-item-id="mobile-edge-left-long"]',
+		);
+		const bilateralLongCard = canvasElement.querySelector<HTMLElement>(
+			'[data-social-card-kind="repo_star_received"][data-feed-item-id="mobile-edge-bilateral-long"]',
+		);
+		expect(rightLongCard).toBeTruthy();
+		expect(leftLongCard).toBeTruthy();
+		expect(bilateralLongCard).toBeTruthy();
+		if (!rightLongCard || !leftLongCard || !bilateralLongCard) {
+			throw new Error("Expected all mobile social edge-case cards to render");
+		}
+
+		const measureWidths = (card: HTMLElement) => {
+			const actor = card.querySelector<HTMLElement>(
+				'[data-social-card-segment="actor"]',
+			);
+			const target = card.querySelector<HTMLElement>(
+				'[data-social-card-segment="target"]',
+			);
+			const actorGroup =
+				actor?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="actor"]',
+				) ?? actor;
+			const targetGroup =
+				target?.querySelector<HTMLElement>(
+					'[data-social-card-entity-group="target"]',
+				) ?? target;
+			const actorLabel = actorGroup?.querySelector<HTMLElement>(
+				"[data-social-card-primary]",
+			);
+			const targetLabel = targetGroup?.querySelector<HTMLElement>(
+				"[data-social-card-primary]",
+			);
+			const action = card.querySelector<HTMLElement>(
+				'[data-social-card-segment="action"]',
+			);
+			return {
+				actorWidth: actorGroup?.getBoundingClientRect().width ?? 0,
+				targetWidth: targetGroup?.getBoundingClientRect().width ?? 0,
+				actorOverflow:
+					(actorLabel?.scrollWidth ?? 0) - (actorLabel?.clientWidth ?? 0),
+				targetOverflow:
+					(targetLabel?.scrollWidth ?? 0) - (targetLabel?.clientWidth ?? 0),
+				gapLeft:
+					action && actorGroup
+						? action.getBoundingClientRect().left -
+							actorGroup.getBoundingClientRect().right
+						: 0,
+				gapRight:
+					action && targetGroup
+						? targetGroup.getBoundingClientRect().left -
+							action.getBoundingClientRect().right
+						: 0,
+			};
+		};
+
+		const rightLongWidths = measureWidths(rightLongCard);
+		const leftLongWidths = measureWidths(leftLongCard);
+		const bilateralLongWidths = measureWidths(bilateralLongCard);
+
+		const rightLongBalanceMode = rightLongCard.querySelector<HTMLElement>(
+			"[data-social-card-row]",
+		)?.dataset.socialCardBalanceMode;
+		expect(
+			leftLongCard.querySelector<HTMLElement>("[data-social-card-row]")?.dataset
+				.socialCardBalanceMode,
+		).toBe("adaptive");
+		expect(
+			bilateralLongCard.querySelector<HTMLElement>("[data-social-card-row]")
+				?.dataset.socialCardBalanceMode,
+		).toBe("centered");
+		expect(leftLongWidths.actorWidth).toBeGreaterThanOrEqual(
+			leftLongWidths.targetWidth,
+		);
+		expect(["centered", "adaptive"]).toContain(rightLongBalanceMode);
+		if (rightLongBalanceMode === "adaptive") {
+			expect(
+				Math.abs(rightLongWidths.gapLeft - rightLongWidths.gapRight),
+			).toBeLessThanOrEqual(2);
+		} else {
+			expect(rightLongWidths.targetOverflow).toBeGreaterThan(1);
+		}
+		expect(
+			Math.abs(leftLongWidths.gapLeft - leftLongWidths.gapRight),
+		).toBeLessThanOrEqual(2);
+		expect(
+			Math.abs(
+				bilateralLongWidths.actorWidth - bilateralLongWidths.targetWidth,
+			),
+		).toBeLessThanOrEqual(18);
+		expect(
+			Math.max(
+				bilateralLongWidths.actorOverflow,
+				bilateralLongWidths.targetOverflow,
+			),
+		).toBeGreaterThan(1);
+	},
+};
+
+export const MobileSocialEdgeCaseMatrix: Story = {
+	name: "Evidence / Mobile Social Edge Case Matrix",
+	render: () => (
+		<SocialCardsMatrixPreview
+			items={[
+				...makeMobileSocialEdgeCaseFeed().filter(isSocialFeedItem),
+				...makeMobileShortFollowerFeed().filter(isSocialFeedItem),
+			]}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		layout: "fullscreen",
+		docs: {
+			description: {
+				story:
+					"纯社交卡片矩阵入口：不混入 header、release、inbox，集中展示右长、左长、双长与短文案 follower 连续列表，方便直接检查实体组贴边、动作图标位置与 trailing whitespace。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const socialCards = canvasElement.querySelectorAll<HTMLElement>(
+			"[data-social-card-kind]",
+		);
+		expect(socialCards.length).toBe(9);
+		for (const card of socialCards) {
+			assertInlineSocialCardLayout(card);
+		}
+		const shortFollowerCards = Array.from(
+			canvasElement.querySelectorAll<HTMLElement>(
+				'[data-feed-item-id^="mobile-short-follow-"]',
+			),
+		);
+		expect(shortFollowerCards.length).toBe(5);
+		for (const card of shortFollowerCards) {
+			const row = card.querySelector<HTMLElement>("[data-social-card-row]");
+			const targetGroup = card.querySelector<HTMLElement>(
+				'[data-social-card-entity-group="target"]',
+			);
+			expect(row).toBeTruthy();
+			expect(targetGroup).toBeTruthy();
+			if (!row || !targetGroup) {
+				throw new Error("Expected short follower row and target entity group");
+			}
+			const rowRect = row.getBoundingClientRect();
+			const targetRect = targetGroup.getBoundingClientRect();
+			expect(rowRect.right - targetRect.right).toBeLessThanOrEqual(14);
+		}
 	},
 };
 

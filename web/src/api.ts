@@ -176,6 +176,22 @@ export async function apiPatchJson<T>(
 	}
 	return (await res.json()) as T;
 }
+export async function apiDeleteJson<T>(
+	path: string,
+	body?: unknown,
+): Promise<T> {
+	const res = await fetch(path, {
+		method: "DELETE",
+		credentials: "include",
+		headers:
+			body === undefined ? undefined : { "content-type": "application/json" },
+		body: body === undefined ? undefined : JSON.stringify(body),
+	});
+	if (!res.ok) {
+		throw toApiError(res, await parseJson(res));
+	}
+	return (await res.json()) as T;
+}
 export type LocalUserId = string;
 export type MeResponse = {
 	user: {
@@ -214,6 +230,34 @@ export type MeProfileResponse = {
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
+};
+export type LinuxDoConnectionResponse = {
+	linuxdo_user_id: number;
+	username: string;
+	name: string | null;
+	avatar_url: string | null;
+	trust_level: number;
+	active: boolean;
+	silenced: boolean;
+	linked_at: string;
+	updated_at: string;
+};
+export type MeLinuxDoResponse = {
+	available: boolean;
+	connection: LinuxDoConnectionResponse | null;
+};
+export type ReactionTokenStatusResponse = {
+	configured: boolean;
+	masked_token: string | null;
+	check: {
+		state: "idle" | "valid" | "invalid" | "error";
+		message: string | null;
+		checked_at: string | null;
+	};
+};
+export type ReactionTokenCheckResponse = {
+	state: "valid" | "invalid";
+	message: string;
 };
 export type AdminJobsOverviewResponse = {
 	queued: number;
@@ -598,6 +642,29 @@ export async function apiGetAdminDashboard(
 	return apiGet<AdminDashboardResponse>(
 		`/api/admin/dashboard${params.size > 0 ? `?${params.toString()}` : ""}`,
 	);
+}
+export async function apiGetMeLinuxDo(): Promise<MeLinuxDoResponse> {
+	return apiGet<MeLinuxDoResponse>("/api/me/linuxdo");
+}
+export async function apiDeleteMeLinuxDo(): Promise<MeLinuxDoResponse> {
+	return apiDeleteJson<MeLinuxDoResponse>("/api/me/linuxdo");
+}
+export async function apiGetReactionTokenStatus(): Promise<ReactionTokenStatusResponse> {
+	return apiGet<ReactionTokenStatusResponse>("/api/reaction-token/status");
+}
+export async function apiCheckReactionToken(
+	token: string,
+): Promise<ReactionTokenCheckResponse> {
+	return apiPostJson<ReactionTokenCheckResponse>("/api/reaction-token/check", {
+		token,
+	});
+}
+export async function apiPutReactionToken(
+	token: string,
+): Promise<ReactionTokenStatusResponse> {
+	return apiPutJson<ReactionTokenStatusResponse>("/api/reaction-token", {
+		token,
+	});
 }
 export async function apiGetAdminJobsOverview(): Promise<AdminJobsOverviewResponse> {
 	return apiGet<AdminJobsOverviewResponse>("/api/admin/jobs/overview");
