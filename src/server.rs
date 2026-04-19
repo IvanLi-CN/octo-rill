@@ -142,6 +142,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/admin/users/{user_id}/profile",
             get(api::admin_get_user_profile).patch(api::admin_patch_user_profile),
         )
+        .route("/admin/dashboard", get(api::admin_dashboard))
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
         .route("/admin/jobs/events", get(api::admin_jobs_events_sse))
         .route("/admin/jobs/realtime", get(api::admin_list_realtime_tasks))
@@ -320,6 +321,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             sync::spawn_repo_release_recovery_worker(app_state.clone());
         jobs::spawn_hourly_scheduler(app_state.clone());
         jobs::spawn_subscription_scheduler(app_state.clone());
+        jobs::spawn_admin_dashboard_rollup_scheduler(app_state.clone());
         if let Err(err) = jobs::enqueue_brief_history_recompute_if_needed(app_state.as_ref()).await
         {
             tracing::warn!(?err, "failed to enqueue brief history recompute bootstrap");

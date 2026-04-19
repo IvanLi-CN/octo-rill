@@ -175,6 +175,21 @@ const ADMIN_PRIMARY_SKELETON_KEYS = [
 	"primary-5",
 ] as const;
 const ADMIN_ASIDE_SKELETON_KEYS = ["aside-1", "aside-2", "aside-3"] as const;
+const ADMIN_DASHBOARD_HERO_SKELETON_KEYS = [
+	"dashboard-hero-users",
+	"dashboard-hero-active",
+	"dashboard-hero-ongoing",
+	"dashboard-hero-total",
+] as const;
+const ADMIN_DASHBOARD_LANE_SKELETON_KEYS = [
+	"dashboard-lane-translate",
+	"dashboard-lane-summary",
+	"dashboard-lane-brief",
+] as const;
+const ADMIN_DASHBOARD_CHART_SKELETON_KEYS = [
+	"dashboard-chart-today",
+	"dashboard-chart-trend",
+] as const;
 
 function DashboardSkeletonGrid() {
 	return (
@@ -251,8 +266,62 @@ export function DashboardStartupSkeleton(props: { me: MeResponse }) {
 	);
 }
 
-function AdminSkeletonGrid(props: { variant: "users" | "jobs" }) {
+function AdminSkeletonGrid(props: { variant: "dashboard" | "users" | "jobs" }) {
 	const { variant } = props;
+
+	if (variant === "dashboard") {
+		return (
+			<div className="space-y-4">
+				<div className="grid gap-4 xl:grid-cols-[1.55fr_1fr]">
+					<div className="rounded-[28px] border border-border/70 bg-card/78 p-5 shadow-sm sm:p-6">
+						<div className="space-y-2">
+							<PulseBlock className="h-4 w-28 rounded-full" />
+							<PulseBlock className="h-7 w-72 rounded-2xl" />
+						</div>
+						<div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+							{ADMIN_DASHBOARD_HERO_SKELETON_KEYS.map((key) => (
+								<div
+									key={key}
+									className="rounded-[24px] border border-border/70 bg-card/72 p-4"
+								>
+									<PulseBlock className="h-3 w-20 rounded-full" />
+									<PulseBlock className="mt-4 h-8 w-20 rounded-2xl" />
+									<PulseBlock className="mt-3 h-3 w-28 rounded-full" />
+								</div>
+							))}
+						</div>
+					</div>
+					<div className="rounded-[28px] border border-border/70 bg-card/78 p-5 shadow-sm sm:p-6">
+						<PulseBlock className="h-4 w-24 rounded-full" />
+						<div className="mt-5 grid gap-3 sm:grid-cols-3 xl:grid-cols-1">
+							{ADMIN_DASHBOARD_LANE_SKELETON_KEYS.map((key) => (
+								<div
+									key={key}
+									className="rounded-[24px] border border-border/70 bg-card/72 p-4"
+								>
+									<PulseBlock className="h-3 w-16 rounded-full" />
+									<PulseBlock className="mt-4 h-7 w-14 rounded-2xl" />
+									<PulseBlock className="mt-3 h-3 w-24 rounded-full" />
+								</div>
+							))}
+						</div>
+					</div>
+				</div>
+
+				<div className="grid gap-4 xl:grid-cols-2">
+					{ADMIN_DASHBOARD_CHART_SKELETON_KEYS.map((key) => (
+						<div
+							key={key}
+							className="rounded-[28px] border border-border/70 bg-card/78 p-5 shadow-sm sm:p-6"
+						>
+							<PulseBlock className="h-4 w-24 rounded-full" />
+							<PulseBlock className="mt-5 h-64 w-full rounded-[24px]" />
+						</div>
+					))}
+				</div>
+			</div>
+		);
+	}
 
 	return (
 		<div className="space-y-4">
@@ -310,6 +379,20 @@ function AdminSkeletonGrid(props: { variant: "users" | "jobs" }) {
 				</div>
 			</div>
 		</div>
+	);
+}
+
+export function AdminDashboardStartupSkeleton(props: { me: MeResponse }) {
+	const { me } = props;
+	return (
+		<AppShell
+			header={<AdminHeader user={me.user} activeNav="dashboard" />}
+			notice={<VersionUpdateNotice />}
+			footer={<AppMetaFooter />}
+			mobileChrome
+		>
+			<AdminSkeletonGrid variant="dashboard" />
+		</AppShell>
 	);
 }
 
