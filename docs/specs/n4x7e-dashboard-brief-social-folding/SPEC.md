@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-19
 - Last: 2026-04-19
 
@@ -167,7 +167,7 @@
 - [x] M1: 新建 follow-up spec 并冻结历史 brief 折叠 / 社交空态 contract。
 - [x] M2: 后端 brief 生成、validator 与 refresh 判定支持可选社交章节。
 - [x] M3: Dashboard 历史组折叠 + Storybook mock / play 收敛。
-- [ ] M4: 视觉证据、快车道交付与文档收口完成。
+- [x] M4: 视觉证据、快车道交付与文档收口完成。
 
 ## 方案概述（Approach, high-level）
 
