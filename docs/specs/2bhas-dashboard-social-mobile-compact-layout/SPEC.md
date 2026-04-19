@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-04-16
-- Last: 2026-04-16
+- Last: 2026-04-18
 
 ## 背景 / 问题陈述
 
@@ -62,6 +62,8 @@
   - `data-social-card-row`
   - `data-social-card-segment`
   - `data-social-card-primary`
+  - `data-social-card-entity-group="actor"`
+  - `data-social-card-entity-group="target"`
 
 ## 功能与行为规格（Functional/Behavior Spec）
 
@@ -71,6 +73,8 @@
 - actor 与 target 两侧卡片继续复用统一实体卡片样式，但移动端尺寸收紧。
 - 中央动作桥继续保留图标 + 文案识别，但移动端改成更小的圆形节点与更紧凑的标签。
 - 长 login / repo 名只允许单行截断，不得把三段结构挤成换行或纵向拆层。
+- `centered` 模式下，左右两列可以继续等宽，但判定“贴边”的对象必须是**头像 + 文本实体组**，而不是可点击外框；左组贴左，右组贴右。
+- `adaptive` 模式下，长边可以吃掉更多宽度，但右侧实体组仍必须真实贴右，不能出现文本结束后还残留大片 trailing whitespace。
 
 ### 语义与回退保持不变
 
@@ -103,6 +107,14 @@
   When 列表展示社交卡片
   Then 都复用同一套移动端横向紧凑布局，而不是分裂成不同样式。
 
+- Given 移动端 `centered` 或 `adaptive` 社交卡片渲染完成
+  When 测量 `[data-social-card-entity-group="target"]` 的真实右边缘
+  Then 该实体组到卡片内边距的 gap 必须 `<= 14px`，不得再出现右侧整块 trailing whitespace。
+
+- Given `被关注` tab 展示连续短文案 follower 列表
+  When 检查短用户名与 viewer 实体组
+  Then 右侧实体组仍真实贴右，不会因为 segment 外框占位而在名称后方留下大片空白。
+
 - Given Storybook 与 Playwright 回归执行
   When 检查移动端社交卡片几何
   Then 可以稳定证明三段元素位于同一 row，且 `scrollWidth <= clientWidth + 1`。
@@ -114,7 +126,7 @@
 - `cd /Users/ivan/.codex/worktrees/5abc/octo-rill/web && bun run build`
 - `cd /Users/ivan/.codex/worktrees/5abc/octo-rill/web && bun run storybook:build`
 - `cd /Users/ivan/.codex/worktrees/5abc/octo-rill/web && bun run e2e -- dashboard-social-activity.spec.ts`
-- `cd /Users/ivan/.codex/worktrees/5abc/octo-rill/web && bun x @biomejs/biome check ./src/feed/FeedItemCard.tsx ./src/stories/Dashboard.stories.tsx ./e2e/dashboard-social-activity.spec.ts`
+- `cd /Users/ivan/.codex/worktrees/5abc/octo-rill/web && bun run lint`
 
 ### Visual verification
 
@@ -137,9 +149,9 @@
 ## Visual Evidence
 
 - source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Mobile Social Compact
-  state: mobile inline compact social cards
-  evidence_note: 验证在 390px 移动端宽度下，star / follower 社交卡片已改为同排横向三段式，并且长 login / repo 名只截断不换列。
+  story_id_or_title: Pages/Dashboard · Evidence / Mobile Social Edge Case Matrix
+  state: mobile social cards with entity-group edge alignment
+  evidence_note: 验证在 390px 移动端宽度下，右长、左长、双长与短 follower 连续列表都以真实实体组为贴边基准；右侧实体组的 trailing whitespace 已收敛。
 
 ![Mobile social compact storybook evidence](./assets/mobile-social-compact-storybook.png)
 
