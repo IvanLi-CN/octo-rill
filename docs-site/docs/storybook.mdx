@@ -3,7 +3,7 @@ title: Storybook
 description: 跳转到 OctoRill Storybook 静态站点。
 ---
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 export const DEFAULT_LOCAL_STORYBOOK_DEV_ORIGIN = "http://127.0.0.1:55176";
 export const DOCS_ORIGIN_QUERY_KEY = "docsOrigin";
@@ -34,7 +34,13 @@ export function buildStorybookTarget(currentHref) {
   return target;
 }
 
+export function buildStorybookProbeUrl(currentHref) {
+  const currentUrl = new URL(currentHref);
+  return new URL("/", getLocalStorybookDevOrigin(currentUrl));
+}
+
 export const StorybookRedirect = () => {
+  const [localStatus, setLocalStatus] = useState("checking");
   const fallbackHref = useMemo(() => {
     if (typeof window === "undefined") return "./storybook/index.html";
     return buildStorybookTarget(window.location.href).toString();
@@ -42,14 +48,41 @@ export const StorybookRedirect = () => {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
-    window.location.replace(buildStorybookTarget(window.location.href).toString());
+    const target = buildStorybookTarget(window.location.href).toString();
+    const currentUrl = new URL(window.location.href);
+
+    if (!isStandaloneDocsServer(currentUrl)) {
+      window.location.replace(target);
+      return;
+    }
+
+    let cancelled = false;
+
+    fetch(buildStorybookProbeUrl(window.location.href).toString(), {
+      mode: "no-cors",
+    })
+      .then(() => {
+        if (cancelled) return;
+        setLocalStatus("ready");
+        window.location.replace(target);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLocalStatus("manual");
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
     <>
-      <h1>正在跳转到 Storybook…</h1>
+      <h1>
+        {localStatus === "manual" ? "先启动本地 Storybook" : "正在跳转到 Storybook…"}
+      </h1>
       <p>如果没有自动跳转，请直接打开 <a href={fallbackHref}>OctoRill Storybook</a>。</p>
-      <p>如需查看文档导览页，请打开 <a href="./storybook-guide.html">Storybook 导览</a>。</p>
+      <p>如果你是在本地单独运行 docs-site，先在 <code>web/</code> 执行 <code>bun run storybook</code>，再回到这个入口。</p>
     </>
   );
 };
