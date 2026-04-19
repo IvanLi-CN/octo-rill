@@ -5303,6 +5303,7 @@ mod tests {
                 redirect_url: Url::parse("http://127.0.0.1:58090/auth/callback")
                     .expect("parse github redirect"),
             },
+            linuxdo: None,
             ai: base_url.map(|base_url| AiConfig {
                 base_url,
                 model: "gpt-test".to_owned(),
@@ -5312,7 +5313,7 @@ mod tests {
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
-        let oauth = build_oauth_client(&config).expect("build oauth client");
+        let github_oauth = build_oauth_client(&config).expect("build oauth client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -5323,7 +5324,8 @@ mod tests {
             config,
             pool,
             http: reqwest::Client::new(),
-            oauth,
+            github_oauth,
+            linuxdo_oauth: None,
             encryption_key,
             runtime_owner_id: "ai-test-runtime-owner".to_owned(),
         })
