@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-16
-- Last: 2026-04-16
+- Last: 2026-04-19
 
 ## 背景 / 问题陈述
 
@@ -59,9 +59,11 @@
 - 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
 - `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
+- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
 - related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
 - 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
+- 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown。
 - 已存在的标准化 brief 命中同一窗口时，重新生成必须更新原有行，而不是直接 no-op 复用旧内容。
 - 历史修复任务必须能够扫描并刷新命中旧格式签名的可重建 brief。
 
@@ -82,14 +84,15 @@
 - 用户手动生成日报或定时任务生成日报时，服务端会按同一窗口查询 Release 与 social activity，并输出 V2 markdown 结构。
 - 若同一窗口已经存在标准化 brief，新的生成结果会原位更新该行的 markdown、memberships 与 `updated_at`，同时保留原 `brief_id` 与 `created_at`。
 - 服务端启动后，既有 legacy history recompute 继续只处理 `generation_source=legacy/history_recompute_failed` 的快照；新增的内容刷新任务只处理已有窗口信息的过期 brief。
-- 历史内容刷新任务命中旧签名（例如含 `## 概览`、缺少 `## 获星与关注`、或正文被整篇 markdown fence 包裹）时，会按存量窗口重建 V2 内容并原位覆盖。
+- 历史内容刷新任务命中旧签名（例如含 `## 概览`、缺少 `## 获星与关注`、正文被整篇 markdown fence 包裹、或 V2 章节齐全但 release 正文层级漂移）时，会按存量窗口重建 V2 内容并原位覆盖。
+- `build_brief_markdown()` 生成的 canonical markdown 是唯一结构基线；LLM 润色只能改写既有 bullet 文案，不能改变 repo / release / 子 bullet 层级或主动新增空行。
 - 前台 Storybook / E2E 读取新的 brief markdown 后，只看到 `## 项目更新` 与 `## 获星与关注`，不再在正文里出现时间窗口行。
 
 ### Edge cases / errors
 
 - 当窗口内没有任何 Release 时，`## 项目更新` 仍需输出“本时间窗口内没有新的 Release。”。
 - 当窗口内没有任何获星 / 关注时，`## 获星与关注` 仍需输出“本时间窗口内没有新的获星或关注动态。”。
-- 当 LLM 润色结果缺少必需章节、丢失内部 release 链接或产出空白内容时，必须回退到 deterministic markdown。
+- 当 LLM 润色结果缺少必需章节、丢失内部 release 链接、打乱 release 顺序、把子 bullet 改成段落/硬换行文本，或产出空白内容时，必须回退到 deterministic markdown。
 - legacy brief 若既没有存储窗口也无法从正文解析窗口，仍由原有 history recompute 失败语义处理，不进入内容刷新任务。
 
 ## 接口契约（Interfaces & Contracts）
@@ -127,6 +130,10 @@ None
 - Given 后台存在可重建窗口的历史旧格式 brief
   When 内容刷新任务执行完成
   Then 命中旧签名的快照会被更新成 V2 正文，未命中的标准化快照保持不变。
+
+- Given LLM 返回的润色结果仍保留两个章节，但把 release 子 bullet 改写成段落、硬换行文本或额外空白块
+  When 服务端校验润色结果
+  Then 该结果会被拒绝，并回退到 canonical nested-bullet markdown。
 
 ## 实现前置条件（Definition of Ready / Preconditions）
 
@@ -214,7 +221,7 @@ None
 - [x] M1: 新建 spec 并冻结日报 V2 / 历史修复 contract。
 - [x] M2: 后端生成链路升级为 V2 正文，并补齐短链接 / fence 清洗 / 原位刷新。
 - [x] M3: 内容刷新任务、admin diagnostics 与相关回归测试落地。
-- [ ] M4: Storybook、文档、视觉证据与快车道收口完成。
+- [x] M4: Storybook、文档、视觉证据与快车道收口完成。
 
 ## 方案概述（Approach, high-level）
 
@@ -233,6 +240,7 @@ None
 ## 变更记录（Change log）
 
 - 2026-04-16: 创建规格，冻结“移除概览/窗口、补社交摘要、支持历史内容刷新”的实现口径。
+- 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
 
 ## 参考（References）
 
