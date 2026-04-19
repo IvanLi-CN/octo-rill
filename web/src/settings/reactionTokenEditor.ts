@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+} from "react";
 
 import {
 	ApiError,
@@ -71,10 +77,25 @@ export function useReactionTokenEditor(
 	const [patSaving, setPatSaving] = useState(false);
 	const patCheckSeqRef = useRef(0);
 	const patInputRef = useRef("");
+	const patCheckStateRef = useRef<PatCheckState>("idle");
+	const onStatusLoadedRef = useRef<typeof onStatusLoaded>(onStatusLoaded);
+	const onPatSavedRef = useRef<typeof onPatSaved>(onPatSaved);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		patInputRef.current = patInput;
 	}, [patInput]);
+
+	useLayoutEffect(() => {
+		patCheckStateRef.current = patCheckState;
+	}, [patCheckState]);
+
+	useLayoutEffect(() => {
+		onStatusLoadedRef.current = onStatusLoaded;
+	}, [onStatusLoaded]);
+
+	useLayoutEffect(() => {
+		onPatSavedRef.current = onPatSaved;
+	}, [onPatSaved]);
 
 	const loadReactionToken = useCallback(async () => {
 		setReactionTokenLoading(true);
@@ -89,7 +110,7 @@ export function useReactionTokenEditor(
 				setPatCheckMessage(normalized.message);
 				setPatCheckedAt(res.check.checked_at);
 			}
-			onStatusLoaded?.(res);
+			onStatusLoadedRef.current?.(res);
 			return res;
 		} catch (err) {
 			if (patInputRef.current.trim().length > 0) {
@@ -102,7 +123,7 @@ export function useReactionTokenEditor(
 		} finally {
 			setReactionTokenLoading(false);
 		}
-	}, [onStatusLoaded]);
+	}, []);
 
 	useEffect(() => {
 		if (!autoLoad) return;
@@ -159,8 +180,8 @@ export function useReactionTokenEditor(
 	}, []);
 
 	const savePat = useCallback(async () => {
-		const token = patInput.trim();
-		if (!token || patCheckState !== "valid") return null;
+		const token = patInputRef.current.trim();
+		if (!token || patCheckStateRef.current !== "valid") return null;
 		setPatSaving(true);
 		try {
 			const res = await apiPutReactionToken(token);
@@ -171,7 +192,7 @@ export function useReactionTokenEditor(
 			setPatCheckMessage(normalized.message);
 			setPatCheckedAt(res.check.checked_at);
 			setPatInput("");
-			onPatSaved?.(res);
+			onPatSavedRef.current?.(res);
 			return res;
 		} catch (err) {
 			if (err instanceof ApiError && err.status === 401) {
@@ -185,7 +206,7 @@ export function useReactionTokenEditor(
 		} finally {
 			setPatSaving(false);
 		}
-	}, [onPatSaved, patCheckState, patInput]);
+	}, []);
 
 	return {
 		reactionTokenLoading,
