@@ -1,26 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
-
-import { useAuthBootstrap } from "@/auth/AuthBootstrap";
-import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
-import { AdminDashboardStartupSkeleton } from "@/pages/AppBoot";
-
-import { useRequiredAdmin } from "../-adminGuard";
+import { AdminRoutePending } from "./-pending";
 
 export const Route = createFileRoute("/admin/")({
-	component: AdminDashboardRouteComponent,
+	pendingMs: 0,
+	pendingMinMs: 200,
+	pendingComponent: AdminDashboardRoutePendingComponent,
 });
 
-function AdminDashboardRouteComponent() {
-	const auth = useAuthBootstrap();
-	const me = useRequiredAdmin();
-
-	if (!me) {
-		return null;
-	}
-
-	if (auth.isBootstrapping && auth.bootPresentation !== "live") {
-		return <AdminDashboardStartupSkeleton me={me} />;
-	}
-
-	return <AdminDashboardPage me={me} />;
+function AdminDashboardRoutePendingComponent() {
+	return <AdminRoutePending variant="dashboard" />;
 }

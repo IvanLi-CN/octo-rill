@@ -4,67 +4,19 @@ import { useRouter } from "@tanstack/react-router";
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import {
 	type AdminJobsPrimaryTab,
+	type AdminJobsSearchInput,
+	buildAdminJobsRouteState,
+	buildAdminJobsRouteUrl,
 	type AdminJobsRouteState,
-	type TranslationViewTab,
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_JOBS_LLM_PATH,
 	ADMIN_JOBS_SCHEDULED_PATH,
 	ADMIN_JOBS_TRANSLATIONS_PATH,
-	buildAdminJobsRouteUrl,
-} from "@/admin/JobManagement";
+} from "@/admin/jobsRouteState";
 import { AdminJobs } from "@/pages/AdminJobs";
 import { AdminJobsStartupSkeleton } from "@/pages/AppBoot";
 
 import { useRequiredAdmin } from "../../-adminGuard";
-
-export type AdminJobsSearchInput = {
-	from?: string;
-	view?: string;
-};
-
-function isPrimaryTab(value: string | undefined): value is AdminJobsPrimaryTab {
-	return (
-		value === "realtime" ||
-		value === "scheduled" ||
-		value === "llm" ||
-		value === "translations"
-	);
-}
-
-function parseTranslationView(value: string | undefined): TranslationViewTab {
-	return value === "history" ? "history" : "queue";
-}
-
-export function buildAdminJobsRouteState(input: {
-	primaryTab: AdminJobsPrimaryTab;
-	search: AdminJobsSearchInput;
-	taskId?: string;
-	llmCallId?: string;
-}): AdminJobsRouteState {
-	const translationView = parseTranslationView(input.search.view);
-	const drawerFromTab = isPrimaryTab(input.search.from)
-		? input.search.from
-		: null;
-
-	if (input.taskId) {
-		return {
-			primaryTab: drawerFromTab ?? "realtime",
-			translationView,
-			taskDrawerRoute: {
-				taskId: input.taskId,
-				llmCallId: input.llmCallId ?? null,
-			},
-			drawerFromTab,
-		};
-	}
-
-	return {
-		primaryTab: input.primaryTab,
-		translationView,
-		taskDrawerRoute: null,
-		drawerFromTab: null,
-	};
-}
 
 function buildAdminJobsCanonicalSearch(routeState: AdminJobsRouteState) {
 	if (routeState.taskDrawerRoute) {
@@ -155,7 +107,10 @@ export function AdminJobsRoutePage(props: {
 						? canonicalSearch.from
 						: routeState.drawerFromTab,
 		});
-		router.history.replace(canonicalUrl);
+		void router.navigate({
+			href: canonicalUrl,
+			replace: true,
+		});
 	}, [canonicalSearch, routeState, router, search]);
 
 	if (!me) {
@@ -172,21 +127,13 @@ export function AdminJobsRoutePage(props: {
 			routeState={routeState}
 			onNavigateRoute={(nextRoute, options) => {
 				const routeUrl = buildAdminJobsRouteUrl(nextRoute);
-				if (options?.replace) {
-					router.history.replace(routeUrl);
-					return;
-				}
-				router.history.push(routeUrl);
+				void router.navigate({
+					href: routeUrl,
+					replace: options?.replace,
+				});
 			}}
 		/>
 	);
-}
-
-export function validateAdminJobsSearch(search: Record<string, unknown>) {
-	return {
-		from: typeof search.from === "string" ? search.from : undefined,
-		view: typeof search.view === "string" ? search.view : undefined,
-	};
 }
 
 export const ADMIN_JOBS_ROUTE_PATHS = {

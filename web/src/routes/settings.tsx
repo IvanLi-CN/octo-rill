@@ -1,16 +1,9 @@
-import { useEffect } from "react";
-import { createFileRoute, useRouter } from "@tanstack/react-router";
-
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
-import { Landing } from "@/pages/Landing";
-import { SettingsPage } from "@/pages/Settings";
-import {
-	buildSettingsSearch,
-	normalizeSettingsSection,
-} from "@/settings/routeState";
+import { createFileRoute } from "@tanstack/react-router";
+import { AppBoot, SettingsStartupSkeleton } from "@/pages/AppBoot";
+import { normalizeSettingsSection } from "@/settings/routeState";
 
 export const Route = createFileRoute("/settings")({
-	component: SettingsRouteComponent,
 	validateSearch: (search: Record<string, unknown>) => ({
 		section:
 			typeof search.section === "string"
@@ -18,49 +11,16 @@ export const Route = createFileRoute("/settings")({
 				: undefined,
 		linuxdo: typeof search.linuxdo === "string" ? search.linuxdo : undefined,
 	}),
+	pendingMs: 0,
+	pendingMinMs: 200,
+	pendingComponent: SettingsRoutePendingComponent,
 });
 
-function SettingsRouteComponent() {
+function SettingsRoutePendingComponent() {
 	const auth = useAuthBootstrap();
-	const router = useRouter();
-	const search = Route.useSearch();
-	const section = normalizeSettingsSection(search.section);
-
-	useEffect(() => {
-		const expectedSearch = buildSettingsSearch(section, {
-			linuxdo: search.linuxdo,
-		});
-		if (
-			(search.section ?? undefined) === expectedSearch.section &&
-			(search.linuxdo ?? undefined) === expectedSearch.linuxdo
-		) {
-			return;
-		}
-		void router.navigate({
-			to: "/settings",
-			search: expectedSearch as never,
-			replace: true,
-		});
-	}, [router, search.linuxdo, search.section, section]);
-
-	if (!auth.isAuthenticated || !auth.me) {
-		return <Landing bootError={auth.bootError} />;
+	if (auth.isAuthenticated && auth.me) {
+		return <SettingsStartupSkeleton me={auth.me} />;
 	}
 
-	return (
-		<SettingsPage
-			me={auth.me}
-			section={section}
-			linuxdoStatus={search.linuxdo}
-			onSectionChange={(nextSection) => {
-				void router.navigate({
-					to: "/settings",
-					search: buildSettingsSearch(nextSection) as never,
-				});
-			}}
-			onProfileSaved={async () => {
-				await auth.refreshAuth();
-			}}
-		/>
-	);
+	return <AppBoot />;
 }

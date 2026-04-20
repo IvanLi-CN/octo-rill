@@ -4,6 +4,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
+	ADMIN_JOBS_BASE_PATH,
+	buildAdminJobsRouteUrl,
+	parseAdminJobsRoute,
+	type AdminJobsPrimaryTab,
+	type AdminJobsRouteState,
+	type TranslationViewTab,
+} from "@/admin/jobsRouteState";
+import {
 	type AdminLlmCallDetailResponse,
 	type AdminLlmCallItem,
 	type AdminLlmCallStreamEvent,
@@ -1140,12 +1148,6 @@ type RealtimeStatusFilter =
 	| "canceled";
 
 type LlmStatusFilter = "all" | "queued" | "running" | "failed" | "succeeded";
-export type AdminJobsPrimaryTab =
-	| "realtime"
-	| "scheduled"
-	| "llm"
-	| "translations";
-export type TranslationViewTab = "queue" | "history";
 
 const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPES = new Set([
@@ -1154,146 +1156,11 @@ const SCHEDULED_TASK_TYPES = new Set([
 ]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
-export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
-export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
-export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
-export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
-const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
-const TASK_DRAWER_ROUTE_PATTERN =
-	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
 
 type StreamStatus = "connecting" | "connected" | "reconnecting";
-export type TaskDrawerRoute = {
-	taskId: string;
-	llmCallId: string | null;
-};
-export type AdminJobsRouteState = {
-	primaryTab: AdminJobsPrimaryTab;
-	translationView: TranslationViewTab;
-	taskDrawerRoute: TaskDrawerRoute | null;
-	drawerFromTab: AdminJobsPrimaryTab | null;
-};
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
-}
-
-function isPrimaryTab(value: string | null): value is AdminJobsPrimaryTab {
-	return (
-		value === "realtime" ||
-		value === "scheduled" ||
-		value === "llm" ||
-		value === "translations"
-	);
-}
-
-export function parseTranslationView(
-	searchParams: URLSearchParams,
-): TranslationViewTab {
-	return searchParams.get("view") === "history" ? "history" : "queue";
-}
-
-export function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
-	switch (primaryTab) {
-		case "scheduled":
-			return ADMIN_JOBS_SCHEDULED_PATH;
-		case "llm":
-			return ADMIN_JOBS_LLM_PATH;
-		case "translations":
-			return ADMIN_JOBS_TRANSLATIONS_PATH;
-		default:
-			return ADMIN_JOBS_BASE_PATH;
-	}
-}
-
-export function buildTaskDrawerPath(taskId: string, llmCallId?: string | null) {
-	const base = `${ADMIN_JOBS_BASE_PATH}/tasks/${encodeURIComponent(taskId)}`;
-	if (!llmCallId) return base;
-	return `${base}/llm/${encodeURIComponent(llmCallId)}`;
-}
-
-export function parseTaskDrawerRoute(pathname: string): TaskDrawerRoute | null {
-	const normalized = normalizePathname(pathname);
-	const matched = normalized.match(TASK_DRAWER_ROUTE_PATTERN);
-	if (!matched) return null;
-	try {
-		return {
-			taskId: decodeURIComponent(matched[1] ?? ""),
-			llmCallId: matched[2] ? decodeURIComponent(matched[2]) : null,
-		};
-	} catch {
-		return null;
-	}
-}
-
-export function parseAdminJobsRoute(
-	pathname: string,
-	search: string,
-): AdminJobsRouteState {
-	const searchParams = new URLSearchParams(search);
-	const translationView = parseTranslationView(searchParams);
-	const rawDrawerFromTab = searchParams.get("from");
-	const drawerFromTab = isPrimaryTab(rawDrawerFromTab)
-		? rawDrawerFromTab
-		: null;
-	const taskDrawerRoute = parseTaskDrawerRoute(pathname);
-
-	if (taskDrawerRoute) {
-		return {
-			primaryTab: drawerFromTab ?? "realtime",
-			translationView,
-			taskDrawerRoute,
-			drawerFromTab,
-		};
-	}
-
-	const normalizedPath = normalizePathname(pathname);
-	let primaryTab: AdminJobsPrimaryTab = "realtime";
-	if (normalizedPath === ADMIN_JOBS_SCHEDULED_PATH) {
-		primaryTab = "scheduled";
-	} else if (normalizedPath === ADMIN_JOBS_LLM_PATH) {
-		primaryTab = "llm";
-	} else if (normalizedPath === ADMIN_JOBS_TRANSLATIONS_PATH) {
-		primaryTab = "translations";
-	}
-
-	return {
-		primaryTab,
-		translationView,
-		taskDrawerRoute: null,
-		drawerFromTab: null,
-	};
-}
-
-export function buildAdminJobsRouteUrl(
-	route: AdminJobsRouteState,
-	currentSearch = "",
-) {
-	const searchParams = new URLSearchParams(currentSearch);
-	const pathname = route.taskDrawerRoute
-		? buildTaskDrawerPath(
-				route.taskDrawerRoute.taskId,
-				route.taskDrawerRoute.llmCallId,
-			)
-		: buildAdminJobsBasePath(route.primaryTab);
-
-	for (const key of ADMIN_JOBS_ROUTE_QUERY_KEYS) {
-		searchParams.delete(key);
-	}
-
-	if (route.taskDrawerRoute) {
-		if (route.drawerFromTab) {
-			searchParams.set("from", route.drawerFromTab);
-			if (route.drawerFromTab === "translations") {
-				searchParams.set("view", route.translationView);
-			}
-		}
-	} else if (route.primaryTab === "translations") {
-		searchParams.set("view", route.translationView);
-	}
-
-	const query = searchParams.toString();
-	return `${pathname}${query ? `?${query}` : ""}`;
 }
 
 type JobManagementProps = {

@@ -423,3 +423,57 @@ export function AdminJobsStartupSkeleton(props: { me: MeResponse }) {
 		</AppShell>
 	);
 }
+
+export function SettingsStartupSkeleton(_props: { me: MeResponse }) {
+	return (
+		<AppShell
+			header={
+				<div className="flex flex-wrap items-center justify-between gap-3">
+					<div className="flex min-w-0 items-center gap-3">
+						<div className="size-9 shrink-0 rounded-2xl border border-border/60 bg-card p-1.5 shadow-sm">
+							<BrandLogo
+								variant="mark"
+								alt=""
+								className="size-full"
+								imgClassName="size-full"
+							/>
+						</div>
+						<div className="min-w-0 space-y-2">
+							<PulseBlock className="h-3 w-16 rounded-full" />
+							<PulseBlock className="h-7 w-32 rounded-2xl" />
+						</div>
+					</div>
+					<div className="flex items-center gap-2">
+						<PulseBlock className="size-9 rounded-2xl border border-border/60 bg-card/85" />
+						<PulseBlock className="h-9 w-28 rounded-xl border border-border/60 bg-card/85" />
+					</div>
+				</div>
+			}
+			footer={<AppMetaFooter />}
+			mobileChrome
+		>
+			<div className="mx-auto max-w-3xl space-y-4">
+				<div className="rounded-2xl border border-border/70 bg-card/95 p-2 shadow-sm">
+					<div className="flex flex-wrap gap-2">
+						<PulseBlock className="h-9 w-28 rounded-xl" />
+						<PulseBlock className="h-9 w-28 rounded-xl" />
+						<PulseBlock className="h-9 w-28 rounded-xl" />
+						<PulseBlock className="h-9 w-28 rounded-xl" />
+					</div>
+				</div>
+				<div className="rounded-[28px] border border-border/70 bg-card/78 p-5 shadow-sm sm:p-6">
+					<div className="space-y-2">
+						<PulseBlock className="h-4 w-28 rounded-full" />
+						<PulseBlock className="h-7 w-52 rounded-2xl" />
+					</div>
+					<div className="mt-5 grid gap-3 sm:grid-cols-2">
+						<PulseBlock className="h-20 w-full rounded-2xl" />
+						<PulseBlock className="h-20 w-full rounded-2xl" />
+						<PulseBlock className="h-20 w-full rounded-2xl" />
+						<PulseBlock className="h-20 w-full rounded-2xl" />
+					</div>
+				</div>
+			</div>
+		</AppShell>
+	);
+}

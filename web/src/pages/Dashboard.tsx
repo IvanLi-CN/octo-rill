@@ -42,8 +42,11 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { InternalLink } from "@/lib/internalNavigation";
-import { normalizeReleaseId } from "@/lib/releaseId";
 import { useMediaQuery } from "@/lib/useMediaQuery";
+import {
+	type DashboardRouteState,
+	parseDashboardRouteState,
+} from "@/dashboard/routeState";
 import {
 	DashboardMobileControlBand,
 	type DashboardTab as Tab,
@@ -148,46 +151,6 @@ function sortNotifications(items: NotificationItem[]) {
 		const bt = b.updated_at ?? "";
 		return bt.localeCompare(at);
 	});
-}
-
-export type DashboardRouteState = {
-	tab: Tab;
-	activeReleaseId: string | null;
-};
-
-export function parseDashboardRouteState(search: {
-	tab?: string | null;
-	release?: string | null;
-}): DashboardRouteState {
-	const releaseId = normalizeReleaseId(search.release);
-	if (releaseId) {
-		return { tab: "briefs", activeReleaseId: releaseId };
-	}
-
-	const rawTab = search.tab;
-	const tab: Tab =
-		rawTab === "releases" ||
-		rawTab === "stars" ||
-		rawTab === "followers" ||
-		rawTab === "briefs" ||
-		rawTab === "inbox"
-			? rawTab
-			: "all";
-	return { tab, activeReleaseId: null };
-}
-
-export function buildDashboardSearch(routeState: DashboardRouteState) {
-	if (routeState.activeReleaseId) {
-		return {
-			tab: "briefs" as const,
-			release: routeState.activeReleaseId,
-		};
-	}
-
-	return {
-		tab: routeState.tab === "all" ? undefined : routeState.tab,
-		release: undefined,
-	};
 }
 
 function parseDashboardQuery() {

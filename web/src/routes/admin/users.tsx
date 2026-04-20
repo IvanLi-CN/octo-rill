@@ -1,24 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
-
-import { readAdminUsersWarmSnapshot } from "@/auth/startupCache";
-import { AdminPanel } from "@/pages/AdminPanel";
-
-import { useRequiredAdmin } from "../-adminGuard";
+import { AdminRoutePending } from "./-pending";
 
 export const Route = createFileRoute("/admin/users")({
-	component: AdminUsersRouteComponent,
+	pendingMs: 0,
+	pendingMinMs: 200,
+	pendingComponent: AdminUsersRoutePendingComponent,
 });
 
-function AdminUsersRouteComponent() {
-	const me = useRequiredAdmin();
-
-	if (!me) {
-		return null;
-	}
-
-	const warmStart = readAdminUsersWarmSnapshot({
-		userId: me.user.id,
-	});
-
-	return <AdminPanel me={me} userManagementWarmStart={warmStart} />;
+function AdminUsersRoutePendingComponent() {
+	return <AdminRoutePending variant="users" />;
 }
