@@ -219,17 +219,20 @@ export type AdminUserProfileResponse = {
 	user_id: LocalUserId;
 	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
+	include_own_releases: boolean;
 	last_active_at: string | null;
 };
 export type MeProfileResponse = {
 	user_id: LocalUserId;
 	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
+	include_own_releases: boolean;
 	last_active_at: string | null;
 };
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
+	include_own_releases?: boolean;
 };
 export type LinuxDoConnectionResponse = {
 	linuxdo_user_id: number;

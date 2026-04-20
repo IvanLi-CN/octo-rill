@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useLayoutEffect, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -106,6 +106,7 @@ const DASHBOARD_VIEWPORTS = {
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
+const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · owner release opt-in";
 
 function makeBrief(
 	brief: Omit<
@@ -596,6 +597,58 @@ function makeMixedSocialFeed(): FeedItem[] {
 			html_url: "https://github.com/yyx990803",
 		}),
 	];
+}
+
+function makeOwnReleaseOptInFeed(includeOwnRelease: boolean): FeedItem[] {
+	const items: FeedItem[] = [
+		buildFeedItem("own-release-external", {
+			ts: "2026-04-04T17:32:00+08:00",
+			repo_full_name: "lobehub/lobe-chat",
+			repo_visual: repoVisualFixtures.avatar,
+			title: "桌面版 Stable v2.1.47",
+			body: "- external starred release\n- stays visible regardless of owner opt-in",
+			html_url: "https://github.com/lobehub/lobe-chat/releases/tag/v2.1.47",
+		}),
+		buildRepoStarItem("own-release-star", {
+			ts: "2026-04-04T16:42:00+08:00",
+			repo_full_name: "lobehub/lobe-chat",
+			repo_visual: repoVisualFixtures.avatar,
+			actor: {
+				login: "gaearon",
+				avatar_url: githubAvatarUrl("gaearon"),
+				html_url: "https://github.com/gaearon",
+			},
+			html_url: "https://github.com/gaearon",
+		}),
+	];
+
+	if (includeOwnRelease) {
+		items.unshift(
+			buildFeedItem("own-release-owner", {
+				ts: "2026-04-04T18:12:00+08:00",
+				repo_full_name: PROJECT_REPO_FULL_NAME,
+				repo_visual: repoVisualFixtures.social,
+				title: OWNER_RELEASE_OPT_IN_TITLE,
+				body: "- owner-only release\n- visible only when `我的发布` is enabled",
+				html_url: `${PROJECT_REPO_URL}/releases/tag/v2.64.0`,
+				translated: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "v2.64.0 · 自有仓库发布",
+					summary: "- 开启“我的发布”后进入发布流\n- 不会污染真实加星列表",
+				},
+				smart: {
+					lang: "zh-CN",
+					status: "ready",
+					title: "v2.64.0 · 版本变化",
+					summary:
+						"- 仅 release 能见面扩展到 owner repo\n- Feed/详情/日报使用统一可见性来源",
+				},
+			}),
+		);
+	}
+
+	return items;
 }
 
 function makeMobileCompactSocialFeed(): FeedItem[] {
@@ -3264,5 +3317,71 @@ export const SocialAvatarFallback: Story = {
 			'[data-social-avatar-fallback="true"]',
 		);
 		expect(fallback).not.toBeNull();
+	},
+};
+
+export const OwnerReleasesOptInOff: Story = {
+	args: {
+		initialTab: "all",
+		feedItems: makeOwnReleaseOptInFeed(false),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"“我的发布”关闭时，owner-only release 不会出现在 `全部 / 发布`，页面仍只展示真实已加星仓库的发布与社交动态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.queryByText(OWNER_RELEASE_OPT_IN_TITLE),
+		).not.toBeInTheDocument();
+		await expect(canvas.getByText("桌面版 Stable v2.1.47")).toBeVisible();
+	},
+};
+
+export const OwnerReleasesOptInOn: Story = {
+	args: {
+		initialTab: "all",
+		feedItems: makeOwnReleaseOptInFeed(true),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"“我的发布”开启后，owner-only release 会进入 `全部 / 发布`，但切到 `加星` 时仍只显示真实社交动态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText(OWNER_RELEASE_OPT_IN_TITLE)).toBeVisible();
+
+		await userEvent.click(canvas.getAllByRole("tab", { name: "发布" })[0]);
+		await expect(canvas.getByText(OWNER_RELEASE_OPT_IN_TITLE)).toBeVisible();
+
+		await userEvent.click(canvas.getAllByRole("tab", { name: "加星" })[0]);
+		await expect(
+			canvas.queryByText(OWNER_RELEASE_OPT_IN_TITLE),
+		).not.toBeInTheDocument();
+		await expect(canvas.getByText("lobehub/lobe-chat")).toBeVisible();
+	},
+};
+
+export const OwnerReleasesEvidenceAllTab: Story = {
+	name: "Evidence / Owner Releases All Tab",
+	args: {
+		initialTab: "all",
+		feedItems: makeOwnReleaseOptInFeed(true),
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"用于视觉验收：`我的发布` 开启后，owner-only release 会直接出现在 `全部` 时间线。",
+			},
+		},
 	},
 };

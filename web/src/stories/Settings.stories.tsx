@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useRef } from "react";
-import { expect, within } from "storybook/test";
+import { useEffect, useRef, useState } from "react";
+import { expect, userEvent, within } from "storybook/test";
 
 import type {
 	LinuxDoConnectionResponse,
@@ -53,6 +53,7 @@ function buildMockProfile(): MeProfileResponse {
 		daily_brief_local_time: "08:00",
 		daily_brief_time_zone: "Asia/Shanghai",
 		last_active_at: "2026-04-18T08:00:00+08:00",
+		include_own_releases: false,
 	};
 }
 
@@ -68,6 +69,11 @@ type SettingsStoryArgs = {
 function SettingsStoryScene(args: SettingsStoryArgs) {
 	const me = buildMockMeResponse();
 	const originalFetchRef = useRef(globalThis.fetch);
+	const [profile, setProfile] = useState(args.profile);
+
+	useEffect(() => {
+		setProfile(args.profile);
+	}, [args.profile]);
 
 	globalThis.fetch = async (input, init) => {
 		const requestUrl =
@@ -94,10 +100,16 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 			});
 		}
 		if (request.pathname === "/api/me/profile" && method === "GET") {
-			return jsonResponse(args.profile);
+			return jsonResponse(profile);
 		}
 		if (request.pathname === "/api/me/profile" && method === "PATCH") {
-			return jsonResponse(args.profile);
+			const patch = init?.body ? JSON.parse(String(init.body)) : {};
+			const nextProfile = {
+				...profile,
+				...patch,
+			};
+			setProfile(nextProfile);
+			return jsonResponse(nextProfile);
 		}
 		if (request.pathname === "/api/reaction-token/status" && method === "GET") {
 			return jsonResponse(args.reactionTokenStatus);
@@ -178,7 +190,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Settings 页面统一承载 LinuxDO Connect 绑定、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
+					"Settings 页面统一承载 LinuxDO Connect 绑定、我的发布开关、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
 			},
 		},
 	},
@@ -206,9 +218,10 @@ export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			canvas.getByRole("heading", { name: "设置与账号绑定" }),
+			canvas.getByRole("heading", { name: "账号与偏好" }),
 		).toBeVisible();
 		await expect(canvas.getByText("LinuxDO 绑定")).toBeVisible();
+		await expect(canvas.getByText("我的发布")).toBeVisible();
 		await expect(canvas.getByText("GitHub PAT")).toBeVisible();
 		await expect(canvas.getByText("日报设置")).toBeVisible();
 		await expect(
@@ -236,7 +249,7 @@ export const ConnectedAndConfigured: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("LinuxDO 已绑定")).toBeVisible();
 		await expect(canvas.getByText("@linuxdo-storybook")).toBeVisible();
-		await expect(canvas.getByText("Trust Level 3")).toBeVisible();
+		await expect(canvas.getByText("3")).toBeVisible();
 		await expect(canvas.getByText("ghp_****_storybook")).toBeVisible();
 	},
 };
@@ -272,5 +285,37 @@ export const DeepLinkedGitHubPat: Story = {
 		await expect(
 			canvas.getByText("当前环境未配置 LinuxDO Connect，按钮已禁用。"),
 		).toBeVisible();
+	},
+};
+
+export const DeepLinkedMyReleases: Story = {
+	args: {
+		section: "my-releases",
+		profile: {
+			...buildMockProfile(),
+			include_own_releases: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"深链到 `section=my-releases` 时，应展示独立的“我的发布”开关，并允许用户保存后立即回显开启状态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const switchControl = canvas.getByRole("switch", { name: "我的发布" });
+		await expect(switchControl).toHaveAttribute("aria-checked", "false");
+		await expect(canvas.getByText("仅显示已加星仓库")).toBeVisible();
+
+		await userEvent.click(switchControl);
+		await userEvent.click(
+			canvas.getByRole("button", { name: "保存“我的发布”" }),
+		);
+
+		await expect(switchControl).toHaveAttribute("aria-checked", "true");
+		await expect(canvas.getByText("已纳入我的发布")).toBeVisible();
 	},
 };

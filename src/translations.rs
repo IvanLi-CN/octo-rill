@@ -4939,7 +4939,7 @@ async fn build_canonical_feed_request_item(
               ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
             ) AS previous_tag_name
           FROM repo_releases r
-          JOIN starred_repos sr
+          JOIN user_release_visible_repos sr
             ON sr.user_id = ? AND sr.repo_id = r.repo_id
         )
         WHERE release_id = ?
