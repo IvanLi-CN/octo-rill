@@ -86,8 +86,11 @@ function resolveLaneForItem(
 	item: FeedItem,
 	selectedLaneByKey: Record<string, FeedLane>,
 	pageDefaultLane: FeedLane,
+	allowItemOverride = true,
 ): FeedLane {
-	const selected = selectedLaneByKey[feedItemKey(item)];
+	const selected = allowItemOverride
+		? selectedLaneByKey[feedItemKey(item)]
+		: undefined;
 	if (selected) {
 		return resolvePreferredLaneForItem(item, selected);
 	}
@@ -434,6 +437,7 @@ export function Dashboard(props: {
 	const [briefs, setBriefs] = useState<BriefItem[]>(
 		() => warmStart?.briefs ?? [],
 	);
+	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebar || tab === "inbox",
@@ -1254,7 +1258,12 @@ export function Dashboard(props: {
 					selectedLaneByKey={Object.fromEntries(
 						filteredItems.map((item) => [
 							feedItemKey(item),
-							resolveLaneForItem(item, selectedLaneByKey, pageDefaultLane),
+							resolveLaneForItem(
+								item,
+								selectedLaneByKey,
+								pageDefaultLane,
+								allowReleaseItemLaneOverride,
+							),
 						]),
 					)}
 					onSelectLane={onSelectLane}
@@ -1302,15 +1311,24 @@ export function Dashboard(props: {
 			return;
 		}
 		for (const item of feed.items) {
-			if (selectedLaneByKey[feedItemKey(item)]) {
+			if (
+				allowReleaseItemLaneOverride &&
+				selectedLaneByKey[feedItemKey(item)]
+			) {
 				continue;
 			}
 			requestLaneIfNeeded(
 				item,
-				resolvePreferredLaneForItem(item, pageDefaultLane),
+				resolveLaneForItem(
+					item,
+					selectedLaneByKey,
+					pageDefaultLane,
+					allowReleaseItemLaneOverride,
+				),
 			);
 		}
 	}, [
+		allowReleaseItemLaneOverride,
 		feed.items,
 		feed.loadingInitial,
 		pageDefaultLane,
