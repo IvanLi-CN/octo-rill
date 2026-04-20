@@ -27,7 +27,7 @@ const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any).lazy(() => import('./routes/settings.lazy').then((d) => d.Route))
 const AdminRouteRoute = AdminRouteRouteImport.update({
   id: '/admin',
   path: '/admin',
@@ -37,17 +37,17 @@ const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
-} as any)
+} as any).lazy(() => import('./routes/index.lazy').then((d) => d.Route))
 const AdminIndexRoute = AdminIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => AdminRouteRoute,
-} as any)
+} as any).lazy(() => import('./routes/admin/index.lazy').then((d) => d.Route))
 const AdminUsersRoute = AdminUsersRouteImport.update({
   id: '/users',
   path: '/users',
   getParentRoute: () => AdminRouteRoute,
-} as any)
+} as any).lazy(() => import('./routes/admin/users.lazy').then((d) => d.Route))
 const AdminJobsRouteRoute = AdminJobsRouteRouteImport.update({
   id: '/jobs',
   path: '/jobs',
@@ -57,22 +57,30 @@ const AdminJobsIndexRoute = AdminJobsIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => AdminJobsRouteRoute,
-} as any)
+} as any).lazy(() =>
+  import('./routes/admin/jobs/index.lazy').then((d) => d.Route),
+)
 const AdminJobsTranslationsRoute = AdminJobsTranslationsRouteImport.update({
   id: '/translations',
   path: '/translations',
   getParentRoute: () => AdminJobsRouteRoute,
-} as any)
+} as any).lazy(() =>
+  import('./routes/admin/jobs/translations.lazy').then((d) => d.Route),
+)
 const AdminJobsScheduledRoute = AdminJobsScheduledRouteImport.update({
   id: '/scheduled',
   path: '/scheduled',
   getParentRoute: () => AdminJobsRouteRoute,
-} as any)
+} as any).lazy(() =>
+  import('./routes/admin/jobs/scheduled.lazy').then((d) => d.Route),
+)
 const AdminJobsLlmRoute = AdminJobsLlmRouteImport.update({
   id: '/llm',
   path: '/llm',
   getParentRoute: () => AdminJobsRouteRoute,
-} as any)
+} as any).lazy(() =>
+  import('./routes/admin/jobs/llm.lazy').then((d) => d.Route),
+)
 const AdminJobsTasksTaskIdRouteRoute =
   AdminJobsTasksTaskIdRouteRouteImport.update({
     id: '/tasks/$taskId',
@@ -84,13 +92,19 @@ const AdminJobsTasksTaskIdIndexRoute =
     id: '/',
     path: '/',
     getParentRoute: () => AdminJobsTasksTaskIdRouteRoute,
-  } as any)
+  } as any).lazy(() =>
+    import('./routes/admin/jobs/tasks/$taskId/index.lazy').then((d) => d.Route),
+  )
 const AdminJobsTasksTaskIdLlmCallIdRoute =
   AdminJobsTasksTaskIdLlmCallIdRouteImport.update({
     id: '/llm/$callId',
     path: '/llm/$callId',
     getParentRoute: () => AdminJobsTasksTaskIdRouteRoute,
-  } as any)
+  } as any).lazy(() =>
+    import('./routes/admin/jobs/tasks/$taskId/llm/$callId.lazy').then(
+      (d) => d.Route,
+    ),
+  )
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute

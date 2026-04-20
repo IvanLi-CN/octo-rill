@@ -1,4 +1,5 @@
-import { type AdminJobsRouteState, JobManagement } from "@/admin/JobManagement";
+import { JobManagement } from "@/admin/JobManagement";
+import type { AdminJobsRouteState } from "@/admin/jobsRouteState";
 import type { MeResponse } from "@/api";
 import { AdminHeader } from "@/layout/AdminHeader";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
