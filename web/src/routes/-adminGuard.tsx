@@ -9,6 +9,7 @@ export function useRequiredAdmin() {
 
 	useEffect(() => {
 		if (auth.status === "pending") return;
+		if (auth.isBootstrapping && auth.bootPresentation !== "live") return;
 		if (auth.isAuthenticated && auth.me?.user.is_admin) return;
 		void router.navigate({
 			to: "/",
@@ -18,7 +19,14 @@ export function useRequiredAdmin() {
 			},
 			replace: true,
 		});
-	}, [auth.isAuthenticated, auth.me?.user.is_admin, auth.status, router]);
+	}, [
+		auth.bootPresentation,
+		auth.isAuthenticated,
+		auth.isBootstrapping,
+		auth.me?.user.is_admin,
+		auth.status,
+		router,
+	]);
 
 	if (!auth.isAuthenticated || !auth.me?.user.is_admin) {
 		return null;
