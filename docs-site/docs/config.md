@@ -13,6 +13,7 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 
 - `OCTORILL_BIND_ADDR`：后端监听地址。默认 `127.0.0.1:58090`。
 - `OCTORILL_PUBLIC_BASE_URL`：前端和 OAuth 等对外使用的基础 URL。默认根据 `OCTORILL_BIND_ADDR` 推导；本地默认是 `http://127.0.0.1:58090`，模板里通常改成前端地址 `http://127.0.0.1:55174` 便于本地联调。
+- `OCTORILL_SESSION_COOKIE_NAME`：可选的固定 session cookie 名。未设置时继续按公开入口 host + port 推导；公网部署建议固定成单值（例如 `octo_rill_sid_prod`），避免未来调整入口后批量踢掉已有登录态。
 - `DATABASE_URL`：数据库连接串。默认 `sqlite:./.data/octo-rill.db`。
 - `OCTORILL_TASK_LOG_DIR`：后台任务日志目录。默认 `.data/task-logs`。
 - `OCTORILL_TASK_WORKERS`：后台任务 worker 数量。默认 `4`，必须是正整数。
@@ -34,6 +35,15 @@ http://127.0.0.1:58090/auth/github/callback
 ```
 
 如果 OAuth App 上登记的 callback 与这里不一致，登录一定会失败。
+
+## 登录会话持久化
+
+- OctoRill 的 session cookie 默认采用 **30 天不活跃滑动过期**：只要用户在 30 天窗口内继续访问，后端就会通过节流 touch 持续续期 cookie 与服务端 session，避免把 SQLite 写放大到每个请求。
+- 浏览器关闭再打开、服务重启、容器重建都不会主动清空登录态；真正前提是 SQLite 数据库持久化，且部署时不要重置 `OCTORILL_ENCRYPTION_KEY_BASE64`。
+- 公开部署建议同时固定以下三个值，避免升级后“看起来像掉登录”：
+  - `DATABASE_URL` 指向持久卷
+  - `OCTORILL_ENCRYPTION_KEY_BASE64` 固定不变
+  - `OCTORILL_SESSION_COOKIE_NAME` 固定不变
 
 ## LinuxDO 绑定（可选）
 

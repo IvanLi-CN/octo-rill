@@ -2,7 +2,7 @@ import { createLazyFileRoute } from "@tanstack/react-router";
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
-import { AdminDashboardStartupSkeleton } from "@/pages/AppBoot";
+import { AdminDashboardStartupSkeleton, AppBoot } from "@/pages/AppBoot";
 
 import { useRequiredAdmin } from "../-adminGuard";
 
@@ -13,6 +13,10 @@ export const Route = createLazyFileRoute("/admin/")({
 function AdminDashboardRouteComponent() {
 	const auth = useAuthBootstrap();
 	const me = useRequiredAdmin();
+
+	if (auth.isBootstrapping && auth.bootPresentation !== "live" && !me) {
+		return <AppBoot />;
+	}
 
 	if (!me) {
 		return null;

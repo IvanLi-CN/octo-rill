@@ -8,7 +8,7 @@ const DASHBOARD_CACHE_KEY = "octo-rill.dashboard-warm.v1";
 const ADMIN_USERS_CACHE_KEY = "octo-rill.admin-users-warm.v1";
 
 export const STARTUP_WARM_TTL_MS = 60 * 60 * 1000;
-const STARTUP_LAST_AUTH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const PERSISTENT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_WARM_FEED_ITEMS = 8;
 const MAX_WARM_NOTIFICATIONS = 8;
 const MAX_WARM_BRIEFS = 8;
@@ -115,6 +115,16 @@ function isFresh(savedAt: number, ttlMs: number, now = Date.now()) {
 	return now - savedAt <= ttlMs;
 }
 
+function stripPrivilegedStartupFields(me: MeResponse): MeResponse {
+	return {
+		...me,
+		user: {
+			...me.user,
+			is_admin: false,
+		},
+	};
+}
+
 export function deriveStartupRouteFamily(pathname: string): StartupRouteFamily {
 	if (pathname.startsWith("/admin/jobs")) {
 		return "admin-jobs";
@@ -142,9 +152,12 @@ export function readStartupPresentationSeed(now = Date.now()): {
 		};
 	}
 
-	if (isFresh(cached.savedAt, STARTUP_LAST_AUTH_TTL_MS, now)) {
+	// This longer-lived seed only helps the shell choose a better startup
+	// surface. The server-side session remains the source of truth and will
+	// reconcile on the next `/api/me`.
+	if (isFresh(cached.savedAt, PERSISTENT_SESSION_TTL_MS, now)) {
 		return {
-			me: cached.me,
+			me: stripPrivilegedStartupFields(cached.me),
 			presentation: "route-skeleton",
 		};
 	}

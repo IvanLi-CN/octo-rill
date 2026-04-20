@@ -123,3 +123,4 @@
 | wt8rb | 前台错误呈现分层改造 | 已完成 | `wt8rb-frontend-error-presentation/SPEC.md` | 2026-04-20 | fast-track / frontend error surfaces / visual evidence landed |
 | kgepw | Dashboard「全部」tab 移动端页头意外上滑修复 | 已完成 | `kgepw-dashboard-all-tab-mobile-header-scroll/SPEC.md` | 2026-04-20 | viewport-height shell fix, Storybook evidence, mobile regression coverage, and owner approval all landed |
 | yhyaj | 共享 Markdown GitHub 链接短标签与自动换行防裁剪 | 已完成 | `yhyaj-shared-markdown-github-link-wrap/SPEC.md` | 2026-04-21 | PR #109; shared Markdown GitHub autolink compaction + wrap guards + Storybook/Playwright coverage |
+| gr8kr | GitHub 登录态持久化与稳定 session cookie | 部分完成（3/4） | `gr8kr-persistent-session-auth/SPEC.md` | 2026-04-21 | fast-track / 30d sliding session + stable cookie-name config |

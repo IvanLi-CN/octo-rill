@@ -34,6 +34,8 @@ export type AuthBootstrapValue = AuthSnapshot & {
 const AuthBootstrapContext = createContext<AuthBootstrapValue | null>(null);
 
 const startupSeed = readStartupPresentationSeed();
+const canReuseStartupSeedOnTransientError =
+	startupSeed?.presentation === "warm-cache";
 
 let cachedSnapshot: AuthSnapshot | null = startupSeed
 	? {
@@ -66,7 +68,14 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 			};
 		}
 
-		if (cachedSnapshot?.status === "authenticated" && cachedSnapshot.me) {
+		const canReuseCachedAuth =
+			cachedSnapshot?.status === "authenticated" &&
+			cachedSnapshot.me &&
+			(cachedSnapshotOrigin === "network" ||
+				(cachedSnapshotOrigin === "seed" &&
+					canReuseStartupSeedOnTransientError));
+
+		if (canReuseCachedAuth) {
 			return {
 				status: "authenticated",
 				me: cachedSnapshot.me,
