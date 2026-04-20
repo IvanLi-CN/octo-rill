@@ -203,7 +203,10 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(
 		page.locator('[data-settings-section="github-pat"]'),
 	).toContainText("ghp_****_saved");
-	await expect(page.getByLabel("GitHub PAT")).toBeVisible();
+	await expect(page.getByLabel("GitHub PAT")).toHaveAttribute(
+		"autocomplete",
+		"new-password",
+	);
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {

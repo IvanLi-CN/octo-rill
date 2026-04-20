@@ -835,7 +835,10 @@ test("reaction fallback lets users configure PAT inline from the dialog", async 
 	await expect(
 		patDialog.getByText(/先补齐 GitHub PAT，才能继续使用站内反馈/),
 	).toBeVisible();
-	await expect(patDialog.getByLabel("GitHub PAT")).toBeVisible();
+	await expect(patDialog.getByLabel("GitHub PAT")).toHaveAttribute(
+		"autocomplete",
+		"new-password",
+	);
 	await expect(page.getByRole("link", { name: "去完整设置" })).toHaveAttribute(
 		"href",
 		"/settings?section=github-pat",

@@ -420,6 +420,7 @@ export const DialogOpen: Story = {
 						<Input
 							id="storybook-pat"
 							type="password"
+							autoComplete="new-password"
 							value="ghp_****************"
 							readOnly
 						/>
@@ -457,6 +458,7 @@ export const DialogInvalidState: Story = {
 						<Input
 							id="storybook-invalid-pat"
 							type="password"
+							autoComplete="new-password"
 							value="ghp_invalid_demo_token"
 							readOnly
 							aria-invalid="true"
