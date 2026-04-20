@@ -78,6 +78,14 @@ const STORYBOOK_VERSION_STATE = {
 	hasUpdate: false,
 	refreshPage: () => {},
 } as const;
+const RAW_GITHUB_PULL_URL =
+	"https://github.com/CherryHQ/cherry-studio/pull/14247";
+const RAW_GITHUB_COMMIT_URL =
+	"https://github.com/CherryHQ/cherry-studio/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999";
+const RAW_EXTERNAL_DOCS_URL =
+	"https://docs.example.com/releases/cherry-studio/2026/04/21/notes/with/a/very/long/path/that/should/wrap/inside/the/dashboard/brief/card?source=dashboard&view=full&lang=zh-CN";
+const RAW_EXTERNAL_STATUS_URL =
+	"https://status.example.com/incidents/cherry-studio/2026/04/21/with/a/very/long/path/that/should/stay/fully-readable/in/the/release/detail/dialog?ref=dashboard&channel=storybook";
 const DASHBOARD_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
 	dashboardMobileDivider375: {
@@ -133,6 +141,23 @@ function dispatchSyntheticTouchEvent(
 	Object.defineProperty(event, "targetTouches", { value: [touchPoint] });
 	Object.defineProperty(event, "changedTouches", { value: [touchPoint] });
 	target.dispatchEvent(event);
+}
+
+function expectNoHorizontalOverflow(element: Element | null, tolerance = 1) {
+	expect(element).not.toBeNull();
+	if (!(element instanceof HTMLElement)) {
+		throw new Error(
+			"Expected an HTMLElement when checking horizontal overflow",
+		);
+	}
+	expect(element.scrollWidth - element.clientWidth).toBeLessThanOrEqual(
+		tolerance,
+	);
+}
+
+function expectLinkWraps(link: HTMLElement) {
+	const styles = window.getComputedStyle(link);
+	expect(styles.overflowWrap).toBe("anywhere");
 }
 
 function makeBrief(
@@ -1194,6 +1219,34 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 	}),
 };
 
+const githubAutolinkWrapBriefs: BriefItem[] = [
+	makeBrief({
+		id: "brief-github-autolink-wrap-2026-04-21",
+		date: "2026-04-21",
+		window_start: "2026-04-20T08:00:00+08:00",
+		window_end: "2026-04-21T08:00:00+08:00",
+		release_count: 1,
+		release_ids: ["14247"],
+		content_markdown: [
+			"## 项目更新",
+			"",
+			"### [CherryHQ/cherry-studio](https://github.com/CherryHQ/cherry-studio)",
+			"",
+			"- [skills workspace links](/?tab=briefs&release=14247) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)",
+			`  - 原始 GitHub PR autolink 会被压缩成短标签：${RAW_GITHUB_PULL_URL}`,
+			"  - 已有自定义标签保持原样：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
+			`  - 非 GitHub 长链接继续保留原文，但必须允许自动换行：${RAW_EXTERNAL_DOCS_URL}`,
+			"",
+			"## 获星与关注",
+			"",
+			"### 关注",
+			"",
+			"- [@DeJeune](https://github.com/DeJeune)",
+		].join("\n"),
+		created_at: "2026-04-21T08:00:03+08:00",
+	}),
+];
+
 const longReleaseDetail: ReleaseDetailResponse = {
 	release_id: LONG_BRIEF_RELEASE_ID,
 	repo_full_name: "acme/rocket",
@@ -1236,6 +1289,30 @@ const longReleaseDetail: ReleaseDetailResponse = {
 				].join("\n");
 			}),
 		].join("\n"),
+	},
+};
+
+const githubAutolinkWrapReleaseDetail: ReleaseDetailResponse = {
+	release_id: "14247",
+	repo_full_name: "CherryHQ/cherry-studio",
+	repo_visual: repoVisualFixtures.social,
+	tag_name: "v1.0.0",
+	name: "feat(skills): workspace link follow-up",
+	body: [
+		"## Release detail",
+		"",
+		`- Raw commit autolink should compact to a short SHA: ${RAW_GITHUB_COMMIT_URL}`,
+		`- Long external incident links should remain readable and wrap safely: ${RAW_EXTERNAL_STATUS_URL}`,
+	].join("\n"),
+	html_url: "https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0",
+	published_at: "2026-04-20T15:18:00Z",
+	is_prerelease: 0,
+	is_draft: 0,
+	translated: {
+		lang: "zh-CN",
+		status: "missing",
+		title: null,
+		summary: null,
 	},
 };
 
@@ -2378,6 +2455,87 @@ export const EvidenceBriefsProjectOnly: Story = {
 		docs: {
 			disable: true,
 		},
+	},
+};
+
+export const EvidenceBriefsGithubAutolinkWrap: Story = {
+	name: "Evidence / Briefs GitHub Autolink Wrap",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={githubAutolinkWrapBriefs}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("link", { name: "#14247" })).toBeVisible();
+		await expect(canvas.getByRole("link", { name: "#13840" })).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "GitHub Release" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: RAW_EXTERNAL_DOCS_URL }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText(RAW_GITHUB_PULL_URL, { exact: true }),
+		).not.toBeInTheDocument();
+
+		const markdownRoot = canvasElement.querySelector(
+			'[data-markdown-root="true"]',
+		);
+		expectNoHorizontalOverflow(markdownRoot);
+
+		const externalLink = canvas.getByRole("link", {
+			name: RAW_EXTERNAL_DOCS_URL,
+		});
+		expectLinkWraps(externalLink);
+	},
+};
+
+export const EvidenceBriefsGithubAutolinkWrapDetail: Story = {
+	name: "Evidence / Briefs GitHub Autolink Wrap Detail",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={githubAutolinkWrapBriefs}
+			initialReleaseId="14247"
+			releaseDetail={githubAutolinkWrapReleaseDetail}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const dialog = await body.findByRole("dialog");
+		const dialogScope = within(dialog);
+
+		await expect(
+			dialogScope.getByRole("link", { name: "4d8f459" }),
+		).toBeVisible();
+		await expect(
+			dialogScope.getByRole("link", { name: RAW_EXTERNAL_STATUS_URL }),
+		).toBeVisible();
+		await expect(
+			dialogScope.queryByText(RAW_GITHUB_COMMIT_URL, { exact: true }),
+		).not.toBeInTheDocument();
+
+		const markdownRoot = dialog.querySelector('[data-markdown-root="true"]');
+		expectNoHorizontalOverflow(markdownRoot);
+
+		const externalLink = dialogScope.getByRole("link", {
+			name: RAW_EXTERNAL_STATUS_URL,
+		});
+		expectLinkWraps(externalLink);
 	},
 };
 

@@ -122,3 +122,4 @@
 | bydfx | Web 前端懒路由与按需拆包 | 待实现 | `bydfx-web-lazy-route-code-splitting/SPEC.md` | 2026-04-20 | fast-track / lazy routes + branch-level split |
 | wt8rb | 前台错误呈现分层改造 | 已完成 | `wt8rb-frontend-error-presentation/SPEC.md` | 2026-04-20 | fast-track / frontend error surfaces / visual evidence landed |
 | kgepw | Dashboard「全部」tab 移动端页头意外上滑修复 | 已完成 | `kgepw-dashboard-all-tab-mobile-header-scroll/SPEC.md` | 2026-04-20 | viewport-height shell fix, Storybook evidence, mobile regression coverage, and owner approval all landed |
+| yhyaj | 共享 Markdown GitHub 链接短标签与自动换行防裁剪 | 已完成 | `yhyaj-shared-markdown-github-link-wrap/SPEC.md` | 2026-04-21 | PR #109; shared Markdown GitHub autolink compaction + wrap guards + Storybook/Playwright coverage |

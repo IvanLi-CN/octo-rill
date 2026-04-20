@@ -1,4 +1,10 @@
-import { type Page, type Route, expect, test } from "@playwright/test";
+import {
+	type Locator,
+	type Page,
+	type Route,
+	expect,
+	test,
+} from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -70,6 +76,26 @@ function json(route: Route, payload: unknown, status = 200) {
 		contentType: "application/json",
 		body: JSON.stringify(payload),
 	});
+}
+
+async function expectNoHorizontalOverflow(locator: Locator) {
+	const metrics = await locator.evaluate((node) => {
+		if (!(node instanceof HTMLElement)) {
+			throw new Error("expected HTMLElement");
+		}
+		const firstLink = node.querySelector("a");
+		return {
+			clientWidth: node.clientWidth,
+			scrollWidth: node.scrollWidth,
+			firstLinkOverflowWrap:
+				firstLink instanceof HTMLElement
+					? window.getComputedStyle(firstLink).overflowWrap
+					: null,
+		};
+	});
+
+	expect(metrics.firstLinkOverflowWrap).toBe("anywhere");
+	expect(metrics.scrollWidth - metrics.clientWidth).toBeLessThanOrEqual(1);
 }
 
 function makeAutoTranslateReleaseId(index: number) {
@@ -861,6 +887,65 @@ test("detail translate button updates card content", async ({ page }) => {
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
+});
+
+test("shared markdown compacts raw GitHub links and keeps long links wrapped", async ({
+	page,
+}) => {
+	const rawPrUrl = "https://github.com/CherryHQ/cherry-studio/pull/14247";
+	const rawCommitUrl =
+		"https://github.com/CherryHQ/cherry-studio/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999";
+	const rawDocsUrl =
+		"https://docs.example.com/releases/cherry-studio/2026/04/21/notes/with/a/very/long/path/that/should/wrap/inside/the/dashboard/brief/card?source=dashboard&view=full&lang=zh-CN";
+	const rawStatusUrl =
+		"https://status.example.com/incidents/cherry-studio/2026/04/21/with/a/very/long/path/that/should/stay/fully-readable/in/the/release/detail/dialog?ref=dashboard&channel=playwright";
+
+	await installApiMocks(page, {
+		briefMarkdown: [
+			"## 项目更新",
+			"",
+			"### [CherryHQ/cherry-studio](https://github.com/CherryHQ/cherry-studio)",
+			"",
+			"- [skills workspace links](/?tab=briefs&release=123) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)",
+			`  - 原始 GitHub PR autolink 会被压缩成短标签：${rawPrUrl}`,
+			"  - 已有短标签保持不变：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
+			`  - 长文档链接继续保留原文并允许换行：${rawDocsUrl}`,
+		].join("\n"),
+		translatedSummary: [
+			`- 原始 commit autolink 会压缩成短 SHA：${rawCommitUrl}`,
+			`- 长状态页链接继续保留原文并允许换行：${rawStatusUrl}`,
+		].join("\n"),
+	});
+
+	await page.goto("/?tab=briefs");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+
+	const briefPanel = page.getByRole("tabpanel", { name: "日报" });
+	await expect(briefPanel.getByRole("link", { name: "#14247" })).toBeVisible();
+	await expect(briefPanel.getByRole("link", { name: "#13840" })).toBeVisible();
+	await expect(
+		briefPanel.getByRole("link", { name: "GitHub Release" }),
+	).toBeVisible();
+	await expect(briefPanel.locator(`a[href="${rawDocsUrl}"]`)).toBeVisible();
+	await expect(briefPanel).not.toContainText(rawPrUrl);
+	await expectNoHorizontalOverflow(
+		briefPanel.locator('[data-markdown-root="true"]').first(),
+	);
+
+	await briefPanel
+		.getByRole("link", { name: "skills workspace links" })
+		.click();
+	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(detailDialog).toBeVisible();
+	await detailDialog.getByRole("button", { name: "翻译" }).click();
+	await expect(
+		detailDialog.getByRole("link", { name: "4d8f459" }),
+	).toBeVisible();
+	await expect(detailDialog.locator(`a[href="${rawStatusUrl}"]`)).toBeVisible();
+	await expect(detailDialog).not.toContainText(rawCommitUrl);
+	await expectNoHorizontalOverflow(
+		detailDialog.locator('[data-markdown-root="true"]').first(),
+	);
 });
 
 test("detail translate keeps polling an in-flight request until the result is ready", async ({
