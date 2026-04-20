@@ -92,6 +92,7 @@ fn resolve_app_default_time_zone(
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
     pub public_base_url: Url,
+    pub session_cookie_name: Option<String>,
     pub database_url: String,
     pub static_dir: Option<PathBuf>,
     pub task_log_dir: PathBuf,
@@ -161,6 +162,7 @@ impl fmt::Debug for AppConfig {
         f.debug_struct("AppConfig")
             .field("bind_addr", &self.bind_addr)
             .field("public_base_url", &self.public_base_url)
+            .field("session_cookie_name", &self.session_cookie_name)
             .field("database_url", &self.database_url)
             .field("static_dir", &self.static_dir)
             .field("task_log_dir", &self.task_log_dir)
@@ -192,6 +194,10 @@ impl AppConfig {
             .unwrap_or_else(|_| format!("http://{}:{}", default_host, bind_addr.port()));
         let public_base_url =
             Url::parse(&public_base_url).context("invalid OCTORILL_PUBLIC_BASE_URL")?;
+        let session_cookie_name = env::var("OCTORILL_SESSION_COOKIE_NAME")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./.data/octo-rill.db".to_owned());
@@ -307,6 +313,7 @@ impl AppConfig {
         Ok(Self {
             bind_addr,
             public_base_url,
+            session_cookie_name,
             database_url,
             static_dir,
             task_log_dir,
@@ -352,6 +359,7 @@ mod tests {
             env::remove_var("AI_MAX_CONCURRENCY");
             env::remove_var("APP_DEFAULT_TIME_ZONE");
             env::remove_var("OCTORILL_TASK_WORKERS");
+            env::remove_var("OCTORILL_SESSION_COOKIE_NAME");
             env::remove_var("LINUXDO_CLIENT_ID");
             env::remove_var("LINUXDO_CLIENT_SECRET");
             env::remove_var("LINUXDO_OAUTH_REDIRECT_URL");
@@ -467,6 +475,32 @@ mod tests {
                 "invalid APP_DEFAULT_TIME_ZONE (expected whole-hour IANA time zone year-round)"
             ),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_session_cookie_name_to_none() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.session_cookie_name, None);
+    }
+
+    #[test]
+    fn from_env_trims_custom_session_cookie_name() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("OCTORILL_SESSION_COOKIE_NAME", "  octo_rill_sid_prod  ");
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(
+            config.session_cookie_name.as_deref(),
+            Some("octo_rill_sid_prod")
         );
     }
 

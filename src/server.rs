@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, path::Path, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr, path::Path, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -15,6 +18,7 @@ use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
+use time::Duration;
 use tokio::task::AbortHandle;
 use tower::ServiceExt;
 use tower_http::{
@@ -22,9 +26,9 @@ use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
-use tower_sessions::SessionManagerLayer;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::session_store::ExpiredDeletion;
+use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::info;
 
@@ -36,6 +40,7 @@ use crate::{
 };
 
 const SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
+const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 const STATIC_ASSET_EXTENSIONS: &[&str] = &[
     "avif",
     "bmp",
@@ -101,7 +106,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let deletion_task = tokio::spawn(
         session_store
             .clone()
-            .continuously_delete_expired(Duration::from_secs(60)),
+            .continuously_delete_expired(StdDuration::from_secs(60)),
     );
     let deletion_abort_handle = deletion_task.abort_handle();
 
@@ -140,7 +145,8 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let session_layer = SessionManagerLayer::new(session_store)
         .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
-        .with_same_site(SameSite::Lax);
+        .with_same_site(SameSite::Lax)
+        .with_expiry(session_inactivity_expiry());
 
     let api_router = Router::new()
         .route(
@@ -659,6 +665,10 @@ fn accepts_html_document(headers: &HeaderMap) -> bool {
 }
 
 fn build_session_cookie_name(config: &AppConfig) -> String {
+    if let Some(session_cookie_name) = config.session_cookie_name.as_ref() {
+        return session_cookie_name.clone();
+    }
+
     let host = config.public_base_url.host_str().unwrap_or("localhost");
     let port = config
         .public_base_url
@@ -676,20 +686,60 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
         .collect::<String>()
 }
 
+fn session_inactivity_expiry() -> Expiry {
+    Expiry::OnInactivity(Duration::seconds(SESSION_COOKIE_MAX_AGE_SECS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SQLITE_POOL_MAX_CONNECTIONS, accepts_html_document, api_health, api_version,
-        apply_no_store_headers, attach_static_site_routes, build_sqlite_connect_options,
+        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite,
+        accepts_html_document, api_health, api_version, apply_no_store_headers,
+        attach_static_site_routes, build_session_cookie_name, build_sqlite_connect_options,
         build_sqlite_pool_options, looks_like_static_asset_path, read_sqlite_runtime_pragmas,
-        should_serve_spa_shell,
+        session_inactivity_expiry, should_serve_spa_shell,
     };
     use axum::{
         Router,
+        body::Body,
         http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
         routing::get,
     };
     use std::{fs, time::SystemTime};
+    use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+
+    async fn create_test_session(session: Session) -> StatusCode {
+        session
+            .insert("user_id", "test-user")
+            .await
+            .expect("insert user id into session");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn read_test_session(session: Session) -> StatusCode {
+        match session
+            .get::<String>("user_id")
+            .await
+            .expect("read user id from session")
+        {
+            Some(_) => {
+                session
+                    .insert("activity_touched_at", chrono::Utc::now().timestamp())
+                    .await
+                    .expect("touch session activity");
+                StatusCode::NO_CONTENT
+            }
+            None => StatusCode::UNAUTHORIZED,
+        }
+    }
+
+    fn test_session_layer(cookie_name: &'static str) -> SessionManagerLayer<MemoryStore> {
+        SessionManagerLayer::new(MemoryStore::default())
+            .with_name(cookie_name.to_owned())
+            .with_same_site(SameSite::Lax)
+            .with_expiry(session_inactivity_expiry())
+    }
 
     #[tokio::test]
     async fn api_version_reports_non_empty_version_and_source() {
@@ -744,6 +794,119 @@ mod tests {
             headers.get(header::EXPIRES),
             Some(&HeaderValue::from_static("0"))
         );
+    }
+
+    #[test]
+    fn session_cookie_name_can_be_overridden_by_config() {
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
+            public_base_url: url::Url::parse("https://octo-rill.ivanli.cc")
+                .expect("parse public base url"),
+            session_cookie_name: Some("octo_rill_sid_prod".to_owned()),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: crate::crypto::EncryptionKey::from_base64(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )
+            .expect("build encryption key"),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: url::Url::parse("https://octo-rill.ivanli.cc/auth/github/callback")
+                    .expect("parse redirect url"),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+        };
+
+        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid_prod");
+    }
+
+    #[tokio::test]
+    async fn session_layer_sets_persistent_cookie_and_refreshes_on_valid_request() {
+        let app = Router::new()
+            .route("/login", get(create_test_session))
+            .route("/me", get(read_test_session))
+            .layer(test_session_layer("octo_rill_sid_test"));
+
+        let login_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .expect("build login request"),
+            )
+            .await
+            .expect("login response");
+        let login_cookie = login_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("login set-cookie header");
+
+        assert!(login_cookie.contains("octo_rill_sid_test="));
+        assert!(login_cookie.contains(&format!("Max-Age={SESSION_COOKIE_MAX_AGE_SECS}")));
+
+        let cookie_header = login_cookie
+            .split(';')
+            .next()
+            .expect("cookie pair")
+            .to_owned();
+
+        let me_response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/me")
+                    .header(header::COOKIE, cookie_header)
+                    .body(Body::empty())
+                    .expect("build me request"),
+            )
+            .await
+            .expect("me response");
+
+        assert_eq!(me_response.status(), StatusCode::NO_CONTENT);
+
+        let refresh_cookie = me_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("refresh set-cookie header");
+        assert!(refresh_cookie.contains("octo_rill_sid_test="));
+        assert!(refresh_cookie.contains(&format!("Max-Age={SESSION_COOKIE_MAX_AGE_SECS}")));
+    }
+
+    #[tokio::test]
+    async fn session_layer_clears_unknown_cookie_values() {
+        let app = Router::new()
+            .route("/me", get(read_test_session))
+            .layer(test_session_layer("octo_rill_sid_test"));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/me")
+                    .header(header::COOKIE, "octo_rill_sid_test=missing-session")
+                    .body(Body::empty())
+                    .expect("build me request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let clear_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .expect("clear set-cookie header");
+        assert!(clear_cookie.contains("octo_rill_sid_test="));
+        assert!(clear_cookie.contains("Max-Age=0"));
     }
 
     #[tokio::test]

@@ -22,6 +22,8 @@ use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
+const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
+const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
     (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "智能摘要"),
@@ -11183,7 +11185,27 @@ async fn require_user_id(session: &Session) -> Result<String, ApiError> {
             "not logged in",
         ));
     };
+    touch_authenticated_session(session).await?;
     parse_local_id_param(user_id, "user_id")
+}
+
+async fn touch_authenticated_session(session: &Session) -> Result<(), ApiError> {
+    let now = chrono::Utc::now().timestamp();
+    let last_touched_at = session
+        .get::<i64>(SESSION_ACTIVITY_TOUCHED_AT)
+        .await
+        .map_err(ApiError::internal)?;
+
+    if last_touched_at
+        .is_some_and(|value| now.saturating_sub(value) < SESSION_ACTIVITY_TOUCH_INTERVAL_SECS)
+    {
+        return Ok(());
+    }
+
+    session
+        .insert(SESSION_ACTIVITY_TOUCHED_AT, now)
+        .await
+        .map_err(ApiError::internal)
 }
 
 fn ensure_account_enabled(is_disabled: bool) -> Result<(), ApiError> {
@@ -11521,6 +11543,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            session_cookie_name: None,
             database_url: "sqlite::memory:".to_owned(),
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
@@ -11565,6 +11588,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            session_cookie_name: None,
             database_url: "sqlite::memory:".to_owned(),
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),

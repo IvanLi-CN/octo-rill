@@ -1,3 +1,4 @@
+import { clearAllWarmStartupCaches } from "@/auth/startupCache";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
@@ -34,6 +35,10 @@ const ADMIN_NAV_ITEMS: AdminNavItem[] = [
 	{ key: "users", label: "用户管理", href: "/admin/users" },
 	{ key: "jobs", label: "任务中心", href: "/admin/jobs" },
 ];
+
+function clearStartupCacheBeforeLogout() {
+	clearAllWarmStartupCaches();
+}
 
 export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 	const {
@@ -316,7 +321,12 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 									: undefined
 							}
 						>
-							<a href="/auth/logout" aria-label="退出登录" title="退出登录">
+							<a
+								href="/auth/logout"
+								aria-label="退出登录"
+								title="退出登录"
+								onClick={clearStartupCacheBeforeLogout}
+							>
 								<LogOut className="size-4" />
 							</a>
 						</Button>

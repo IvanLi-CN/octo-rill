@@ -14,7 +14,7 @@ import {
 	ADMIN_JOBS_TRANSLATIONS_PATH,
 } from "@/admin/jobsRouteState";
 import { AdminJobs } from "@/pages/AdminJobs";
-import { AdminJobsStartupSkeleton } from "@/pages/AppBoot";
+import { AdminJobsStartupSkeleton, AppBoot } from "@/pages/AppBoot";
 
 import { useRequiredAdmin } from "../../-adminGuard";
 
@@ -112,6 +112,10 @@ export function AdminJobsRoutePage(props: {
 			replace: true,
 		});
 	}, [canonicalSearch, routeState, router, search]);
+
+	if (auth.isBootstrapping && auth.bootPresentation !== "live" && !me) {
+		return <AppBoot />;
+	}
 
 	if (!me) {
 		return null;

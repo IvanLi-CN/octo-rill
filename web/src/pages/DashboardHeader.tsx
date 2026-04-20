@@ -12,6 +12,7 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import { clearAllWarmStartupCaches } from "@/auth/startupCache";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
@@ -45,6 +46,10 @@ function resolveUserInitials(login: string, name?: string | null) {
 		return `${parts[0][0] ?? ""}${parts[1][0] ?? ""}`.toUpperCase();
 	}
 	return source.slice(0, 2).toUpperCase();
+}
+
+function clearStartupCacheBeforeLogout() {
+	clearAllWarmStartupCaches();
 }
 
 function DashboardUserAvatar(props: {
@@ -189,7 +194,11 @@ function DashboardUserInfoCard(props: {
 
 			<div className="mt-2 border-t border-border/70 pt-3">
 				<Button asChild variant="ghost" className="w-full justify-start px-2">
-					<a aria-label="退出登录" href={logoutHref}>
+					<a
+						aria-label="退出登录"
+						href={logoutHref}
+						onClick={clearStartupCacheBeforeLogout}
+					>
 						<LogOut className="size-4" />
 						退出登录
 					</a>

@@ -7,7 +7,7 @@ import {
 
 import { useAuthBootstrap } from "@/auth/AuthBootstrap";
 import { Landing } from "@/pages/Landing";
-import { SettingsStartupSkeleton } from "@/pages/AppBoot";
+import { AppBoot, SettingsStartupSkeleton } from "@/pages/AppBoot";
 import { SettingsPage } from "@/pages/Settings";
 import {
 	buildSettingsSearch,
@@ -42,6 +42,10 @@ function SettingsRouteComponent() {
 			replace: true,
 		});
 	}, [router, search.linuxdo, search.section, section]);
+
+	if (auth.status === "pending") {
+		return <AppBoot />;
+	}
 
 	if (!auth.isAuthenticated || !auth.me) {
 		return <Landing bootError={auth.bootError} />;
