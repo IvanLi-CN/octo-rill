@@ -86,7 +86,7 @@ function buildSocialFeedItem(
 	};
 }
 
-async function tapLocator(page: Page, locator: Locator) {
+async function getLocatorCenter(locator: Locator) {
 	const box = await locator.evaluate((element) => {
 		const rect = element.getBoundingClientRect();
 		return {
@@ -98,6 +98,11 @@ async function tapLocator(page: Page, locator: Locator) {
 	});
 	expect(box.width).toBeGreaterThan(0);
 	expect(box.height).toBeGreaterThan(0);
+	return box;
+}
+
+async function tapLocator(page: Page, locator: Locator) {
+	const box = await getLocatorCenter(locator);
 	await page.touchscreen.tap(box.x, box.y);
 }
 
@@ -399,6 +404,115 @@ test.describe("mobile dashboard shell", () => {
 				.locator("[data-dashboard-mobile-control-band-row='lane']")
 				.count(),
 		).toBe(0);
+		await page.evaluate(() => {
+			const trigger = document.querySelector(
+				"[data-dashboard-mobile-lane-menu-trigger]",
+			);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(trigger instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected mobile lane trigger and app shell header");
+			}
+			const touchStates: string[] = [];
+			trigger.addEventListener(
+				"touchstart",
+				() => {
+					touchStates.push(
+						shell.getAttribute("data-app-shell-header-interacting") ??
+							"missing",
+					);
+				},
+				{ once: true, passive: true },
+			);
+			(
+				window as Window & { __laneMenuTouchHeaderStates?: string[] }
+			).__laneMenuTouchHeaderStates = touchStates;
+		});
+
+		await page.evaluate(() => {
+			const trigger = document.querySelector(
+				"[data-dashboard-mobile-lane-menu-trigger]",
+			);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(trigger instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected mobile lane trigger and app shell header");
+			}
+			const rect = trigger.getBoundingClientRect();
+			const createTouchEvent = (
+				type: "touchstart" | "touchmove",
+				offsetX = 0,
+				offsetY = 0,
+			) => {
+				const touchPoint = {
+					clientX: rect.left + rect.width / 2 + offsetX,
+					clientY: rect.top + rect.height / 2 + offsetY,
+				};
+				const event = new Event(type, {
+					bubbles: true,
+					cancelable: true,
+				}) as Event & {
+					touches: Array<typeof touchPoint>;
+					targetTouches: Array<typeof touchPoint>;
+					changedTouches: Array<typeof touchPoint>;
+				};
+				Object.defineProperty(event, "touches", { value: [touchPoint] });
+				Object.defineProperty(event, "targetTouches", {
+					value: [touchPoint],
+				});
+				Object.defineProperty(event, "changedTouches", {
+					value: [touchPoint],
+				});
+				return event;
+			};
+			trigger.dispatchEvent(createTouchEvent("touchstart"));
+			trigger.dispatchEvent(createTouchEvent("touchmove", 10, 0));
+			(
+				window as Window & { __laneMenuSyntheticHorizontalHeaderState?: string }
+			).__laneMenuSyntheticHorizontalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+			trigger.dispatchEvent(createTouchEvent("touchmove", 0, -10));
+			(
+				window as Window & { __laneMenuSyntheticVerticalHeaderState?: string }
+			).__laneMenuSyntheticVerticalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+		});
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuSyntheticHorizontalHeaderState?: string;
+							}
+						).__laneMenuSyntheticHorizontalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuSyntheticVerticalHeaderState?: string;
+							}
+						).__laneMenuSyntheticVerticalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
 
 		await page.evaluate(() => {
 			const trigger = document.querySelector(
@@ -447,6 +561,88 @@ test.describe("mobile dashboard shell", () => {
 				.locator("[data-dashboard-mobile-lane-menu-popover]")
 				.getByRole("menuitemradio", { name: "原文" }),
 		).toBeVisible();
+		await page.evaluate(() => {
+			const translatedOption = document
+				.querySelector("[data-dashboard-mobile-lane-menu-popover]")
+				?.querySelector(
+					'[role="menuitemradio"][data-feed-page-lane="translated"]',
+				);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(translatedOption instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected translated lane option and app shell header");
+			}
+			const rect = translatedOption.getBoundingClientRect();
+			const createTouchEvent = (
+				type: "touchstart" | "touchmove",
+				offsetX = 0,
+				offsetY = 0,
+			) => {
+				const touchPoint = {
+					clientX: rect.left + rect.width / 2 + offsetX,
+					clientY: rect.top + rect.height / 2 + offsetY,
+				};
+				const event = new Event(type, {
+					bubbles: true,
+					cancelable: true,
+				}) as Event & {
+					touches: Array<typeof touchPoint>;
+					targetTouches: Array<typeof touchPoint>;
+					changedTouches: Array<typeof touchPoint>;
+				};
+				Object.defineProperty(event, "touches", { value: [touchPoint] });
+				Object.defineProperty(event, "targetTouches", {
+					value: [touchPoint],
+				});
+				Object.defineProperty(event, "changedTouches", {
+					value: [touchPoint],
+				});
+				return event;
+			};
+			translatedOption.dispatchEvent(createTouchEvent("touchstart"));
+			translatedOption.dispatchEvent(createTouchEvent("touchmove", 10, 0));
+			(
+				window as Window & {
+					__laneMenuOptionSyntheticHorizontalHeaderState?: string;
+				}
+			).__laneMenuOptionSyntheticHorizontalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+			translatedOption.dispatchEvent(createTouchEvent("touchmove", 0, -10));
+			(
+				window as Window & {
+					__laneMenuOptionSyntheticVerticalHeaderState?: string;
+				}
+			).__laneMenuOptionSyntheticVerticalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+		});
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuOptionSyntheticHorizontalHeaderState?: string;
+							}
+						).__laneMenuOptionSyntheticHorizontalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuOptionSyntheticVerticalHeaderState?: string;
+							}
+						).__laneMenuOptionSyntheticVerticalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
 		await page
 			.locator("[data-dashboard-mobile-lane-menu-popover]")
 			.getByRole("menuitemradio", { name: "翻译" })

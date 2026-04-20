@@ -33,13 +33,18 @@ const DASHBOARD_HEADER_VIEWPORTS = {
 	},
 } as const;
 
-function dispatchSyntheticTouchStart(target: HTMLElement) {
+function dispatchSyntheticTouchEvent(
+	target: HTMLElement,
+	type: "touchstart" | "touchmove",
+	offsetX = 0,
+	offsetY = 0,
+) {
 	const rect = target.getBoundingClientRect();
 	const touchPoint = {
-		clientX: rect.left + rect.width / 2,
-		clientY: rect.top + rect.height / 2,
+		clientX: rect.left + rect.width / 2 + offsetX,
+		clientY: rect.top + rect.height / 2 + offsetY,
 	};
-	const event = new Event("touchstart", {
+	const event = new Event(type, {
 		bubbles: true,
 		cancelable: true,
 	}) as Event & {
@@ -307,7 +312,13 @@ export const EvidenceMobileShell: Story = {
 		const laneMenuTrigger = canvas.getByRole("button", {
 			name: "当前阅读模式：智能",
 		}) as HTMLButtonElement;
-		dispatchSyntheticTouchStart(laneMenuTrigger);
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchstart");
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 0, -10);
 		await expect(appShellHeader).toHaveAttribute(
 			"data-app-shell-header-interacting",
 			"false",
@@ -317,7 +328,22 @@ export const EvidenceMobileShell: Story = {
 		await expect(
 			canvas.getByRole("menu", { name: "选择阅读模式" }),
 		).toBeVisible();
-		await userEvent.click(canvas.getByRole("menuitemradio", { name: "翻译" }));
+		const laneMenu = canvas.getByRole("menu", { name: "选择阅读模式" });
+		const translatedOption = within(laneMenu).getByRole("menuitemradio", {
+			name: "翻译",
+		}) as HTMLButtonElement;
+		dispatchSyntheticTouchEvent(translatedOption, "touchstart");
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 0, -10);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		await userEvent.click(translatedOption);
 		await expect(
 			canvas.queryByRole("menu", { name: "选择阅读模式" }),
 		).not.toBeInTheDocument();

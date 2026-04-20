@@ -57,19 +57,8 @@ type AppShellProps = {
 	mobileChrome?: boolean;
 };
 
-const MOBILE_HEADER_INTERACTIVE_TARGET_SELECTOR = [
-	"button",
-	"a",
-	"input",
-	"select",
-	"textarea",
-	'[role="button"]',
-	'[role="tab"]',
-	'[role="menuitemradio"]',
-	"[aria-haspopup]",
-	"[data-dashboard-mobile-lane-menu]",
-	"[data-dashboard-user-menu]",
-].join(",");
+const MOBILE_HEADER_GESTURE_GUARD_SELECTOR = "[data-app-shell-gesture-guard]";
+const GUARDED_TOUCH_DRAG_THRESHOLD_PX = 12;
 
 function resolveGestureTargetElement(
 	target: EventTarget | null,
@@ -86,8 +75,27 @@ function resolveGestureTargetElement(
 function isInteractiveGestureTarget(target: EventTarget | null): boolean {
 	return (
 		resolveGestureTargetElement(target)?.closest(
-			MOBILE_HEADER_INTERACTIVE_TARGET_SELECTOR,
+			MOBILE_HEADER_GESTURE_GUARD_SELECTOR,
 		) !== null
+	);
+}
+
+function shouldPromoteGuardedTouchSequence({
+	clientX,
+	clientY,
+	startClientX,
+	startClientY,
+}: {
+	clientX: number;
+	clientY: number;
+	startClientX: number;
+	startClientY: number;
+}) {
+	const horizontalDelta = Math.abs(clientX - startClientX);
+	const verticalDelta = Math.abs(clientY - startClientY);
+	return (
+		verticalDelta >= GUARDED_TOUCH_DRAG_THRESHOLD_PX &&
+		verticalDelta >= horizontalDelta
 	);
 }
 
@@ -129,6 +137,9 @@ export function AppShell({
 	const gestureStartTopRef = useRef(0);
 	const gestureStartProgressRef = useRef(0);
 	const gestureStartClientYRef = useRef(0);
+	const ignoreInteractiveTouchSequenceRef = useRef(false);
+	const guardedTouchStartClientXRef = useRef(0);
+	const guardedTouchStartClientYRef = useRef(0);
 	const touchFallbackTimeoutRef = useRef<number | null>(null);
 	const transitionSuppressionTimeoutRef = useRef<number | null>(null);
 	const lastWheelAtRef = useRef(Number.NEGATIVE_INFINITY);
@@ -192,6 +203,9 @@ export function AppShell({
 			gestureStartTopRef.current = 0;
 			gestureStartProgressRef.current = 0;
 			gestureStartClientYRef.current = 0;
+			ignoreInteractiveTouchSequenceRef.current = false;
+			guardedTouchStartClientXRef.current = 0;
+			guardedTouchStartClientYRef.current = 0;
 			lastWheelAtRef.current = Number.NEGATIVE_INFINITY;
 			wheelDeltaAccumulatorRef.current = 0;
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
@@ -266,6 +280,12 @@ export function AppShell({
 			progressDirectionRef.current = "idle";
 		};
 
+		const clearGuardedTouchSequence = () => {
+			ignoreInteractiveTouchSequenceRef.current = false;
+			guardedTouchStartClientXRef.current = 0;
+			guardedTouchStartClientYRef.current = 0;
+		};
+
 		const applySettledState = (nextCompact: boolean, currentTop: number) => {
 			if (settleTimeoutRef.current !== null) {
 				window.clearTimeout(settleTimeoutRef.current);
@@ -286,6 +306,7 @@ export function AppShell({
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
 			wheelDeltaAccumulatorRef.current = 0;
 			activePointerTypeRef.current = null;
+			clearGuardedTouchSequence();
 		};
 
 		const settleHeaderState = (
@@ -493,6 +514,7 @@ export function AppShell({
 			clearTransitionSuppression();
 			setHeaderInteracting(true);
 			headerInteractingRef.current = true;
+			clearGuardedTouchSequence();
 			discreteLockUntilRef.current = Number.NEGATIVE_INFINITY;
 			activePointerTypeRef.current = options?.pointerType ?? "touch";
 			gestureStartTopRef.current = window.scrollY;
@@ -511,6 +533,7 @@ export function AppShell({
 			clearTouchFallback();
 			setHeaderInteracting(false);
 			headerInteractingRef.current = false;
+			clearGuardedTouchSequence();
 			activePointerTypeRef.current = null;
 			activeTouchPointerIdRef.current = null;
 			gestureStartClientYRef.current = 0;
@@ -526,8 +549,9 @@ export function AppShell({
 		};
 
 		const handlePointerDown = (event: PointerEvent) => {
+			const isTouchPointer = event.pointerType === "touch";
 			const isDirectPointer =
-				event.pointerType === "touch" ||
+				isTouchPointer ||
 				(isMobileViewport &&
 					event.pointerType === "mouse" &&
 					event.isPrimary &&
@@ -535,8 +559,18 @@ export function AppShell({
 			if (!isDirectPointer) {
 				return;
 			}
-			if (isInteractiveGestureTarget(event.target)) {
-				return;
+			if (isTouchPointer) {
+				ignoreInteractiveTouchSequenceRef.current = isInteractiveGestureTarget(
+					event.target,
+				);
+				if (ignoreInteractiveTouchSequenceRef.current) {
+					guardedTouchStartClientXRef.current = event.clientX;
+					guardedTouchStartClientYRef.current = event.clientY;
+					activeTouchPointerIdRef.current = null;
+					return;
+				}
+			} else {
+				clearGuardedTouchSequence();
 			}
 
 			activeTouchPointerIdRef.current = event.pointerId;
@@ -547,6 +581,14 @@ export function AppShell({
 		};
 
 		const handlePointerUp = (event: PointerEvent) => {
+			if (
+				event.pointerType === "touch" &&
+				ignoreInteractiveTouchSequenceRef.current &&
+				activeTouchPointerIdRef.current !== event.pointerId
+			) {
+				clearGuardedTouchSequence();
+				return;
+			}
 			if (activeTouchPointerIdRef.current !== event.pointerId) {
 				return;
 			}
@@ -562,6 +604,14 @@ export function AppShell({
 		};
 
 		const handlePointerCancel = (event: PointerEvent) => {
+			if (
+				event.pointerType === "touch" &&
+				ignoreInteractiveTouchSequenceRef.current &&
+				activeTouchPointerIdRef.current !== event.pointerId
+			) {
+				clearGuardedTouchSequence();
+				return;
+			}
 			if (activeTouchPointerIdRef.current !== event.pointerId) {
 				return;
 			}
@@ -603,13 +653,24 @@ export function AppShell({
 		};
 
 		const handleTouchStart = (event: TouchEvent) => {
-			if (isInteractiveGestureTarget(event.target)) {
+			ignoreInteractiveTouchSequenceRef.current = isInteractiveGestureTarget(
+				event.target,
+			);
+			if (ignoreInteractiveTouchSequenceRef.current) {
+				const primaryTouch = event.touches[0];
+				guardedTouchStartClientXRef.current = primaryTouch?.clientX ?? 0;
+				guardedTouchStartClientYRef.current = primaryTouch?.clientY ?? 0;
 				return;
 			}
+			clearGuardedTouchSequence();
 			promoteToTouchInteraction(event.touches[0]?.clientY ?? 0);
 		};
 
 		const handleTouchEnd = (event: TouchEvent) => {
+			if (ignoreInteractiveTouchSequenceRef.current) {
+				clearGuardedTouchSequence();
+				return;
+			}
 			if (event.touches.length > 0) {
 				return;
 			}
@@ -617,12 +678,29 @@ export function AppShell({
 		};
 
 		const handleTouchMove = (event: TouchEvent) => {
-			if (!headerInteractingRef.current) {
+			const primaryTouch = event.touches[0];
+			if (!primaryTouch) {
 				return;
 			}
 
-			const primaryTouch = event.touches[0];
-			if (!primaryTouch) {
+			if (ignoreInteractiveTouchSequenceRef.current) {
+				if (
+					!shouldPromoteGuardedTouchSequence({
+						clientX: primaryTouch.clientX,
+						clientY: primaryTouch.clientY,
+						startClientX: guardedTouchStartClientXRef.current,
+						startClientY: guardedTouchStartClientYRef.current,
+					})
+				) {
+					return;
+				}
+
+				ignoreInteractiveTouchSequenceRef.current = false;
+				promoteToTouchInteraction(guardedTouchStartClientYRef.current);
+				updateInteractiveGestureProgress(primaryTouch.clientY);
+				return;
+			}
+			if (!headerInteractingRef.current) {
 				return;
 			}
 
@@ -634,6 +712,10 @@ export function AppShell({
 		};
 
 		const handleTouchCancel = () => {
+			if (ignoreInteractiveTouchSequenceRef.current) {
+				clearGuardedTouchSequence();
+				return;
+			}
 			activeTouchPointerIdRef.current = null;
 			scheduleTouchFallbackSettle();
 		};
@@ -694,6 +776,7 @@ export function AppShell({
 			}
 			clearTouchFallback();
 			clearTransitionSuppression();
+			clearGuardedTouchSequence();
 		};
 	}, [mobileChrome, isMobileViewport]);
 
@@ -712,6 +795,9 @@ export function AppShell({
 			activePointerTypeRef.current = null;
 			activeTouchPointerIdRef.current = null;
 			gestureStartClientYRef.current = 0;
+			ignoreInteractiveTouchSequenceRef.current = false;
+			guardedTouchStartClientXRef.current = 0;
+			guardedTouchStartClientYRef.current = 0;
 			setCompactHeader(false);
 			setHeaderProgress(0);
 			setHeaderInteracting(false);

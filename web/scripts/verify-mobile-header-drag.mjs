@@ -5,7 +5,7 @@ const STORY_URL =
 	"http://127.0.0.1:55176/iframe.html?id=pages-dashboard-header--verification-mobile-shell-drag&viewMode=story&globals=viewport.value%3AdashboardHeaderMobile390";
 const LANE_SWITCH_STORY_URL =
 	process.env.STORYBOOK_MOBILE_LANE_SWITCH_URL ??
-	"http://127.0.0.1:55176/iframe.html?id=pages-dashboard--page-default-lane-switching-mobile&viewMode=story&globals=viewport.value%3AdashboardMobile390";
+	"http://127.0.0.1:55176/iframe.html?id=pages-dashboard--verification-mobile-lane-switching&viewMode=story&globals=viewport.value%3AdashboardMobile390";
 
 function assert(condition, message) {
 	if (!condition) {
@@ -66,10 +66,29 @@ async function dispatchTouch(client, type, y) {
 	});
 }
 
+async function dispatchTouchPoint(client, type, x, y) {
+	await client.send("Input.dispatchTouchEvent", {
+		type,
+		touchPoints:
+			type === "touchEnd"
+				? []
+				: [{ x, y, radiusX: 5, radiusY: 5, force: 1, id: 1 }],
+	});
+}
+
 async function tapLocator(page, locator) {
 	const box = await locator.boundingBox();
 	assert(box, "expected locator to expose a bounding box");
 	await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+}
+
+async function getLocatorCenter(locator) {
+	const box = await locator.boundingBox();
+	assert(box, "expected locator to expose a bounding box");
+	return {
+		x: box.x + box.width / 2,
+		y: box.y + box.height / 2,
+	};
 }
 
 async function expectTouchGuard(selector, page) {
@@ -154,6 +173,37 @@ async function verifyMouseDrag(page) {
 	);
 }
 
+async function verifyMouseDragFromInteractiveControl(page) {
+	await openStory(page);
+	const laneMenuTrigger = page.getByRole("button", {
+		name: "当前阅读模式：智能",
+	});
+	const center = await getLocatorCenter(laneMenuTrigger);
+
+	await page.mouse.move(center.x, center.y);
+	await page.mouse.down();
+	await page.mouse.move(center.x, center.y - 84, { steps: 8 });
+	await page.waitForTimeout(80);
+
+	const midState = await readHeaderState(page);
+	assert(
+		midState.interacting,
+		"mouse drag that starts on the lane menu should still enter header interaction",
+	);
+	assert(
+		midState.progress > 0.05,
+		`interactive mouse drag should move header progress, got ${midState.progress}`,
+	);
+
+	await page.mouse.up();
+	await page.waitForTimeout(200);
+	const settledState = await readHeaderState(page);
+	assert(
+		!settledState.interacting,
+		"interactive mouse drag should settle after pointer up",
+	);
+}
+
 async function verifyTouchDrag(page) {
 	await openStory(page);
 	const client = await createTouchClient(page);
@@ -181,6 +231,35 @@ async function verifyTouchDrag(page) {
 		`touch drag release should snap to compact state, got ${JSON.stringify(
 			settledState,
 		)}`,
+	);
+}
+
+async function verifyTouchDragFromGuardedTab(page) {
+	await openStory(page);
+	const guardedTab = page.getByRole("tab", { name: "全部" });
+	const center = await getLocatorCenter(guardedTab);
+	const client = await createTouchClient(page);
+
+	await dispatchTouchPoint(client, "touchStart", center.x, center.y);
+	await dispatchTouchPoint(client, "touchMove", center.x, center.y - 28);
+	await page.waitForTimeout(80);
+
+	const midState = await readHeaderState(page);
+	assert(
+		midState.interacting,
+		"touch drag that starts on the guarded tab should still enter header interaction after crossing the tap slop",
+	);
+	assert(
+		midState.progress > 0.05,
+		`guarded tab drag should move header progress, got ${midState.progress}`,
+	);
+
+	await dispatchTouchPoint(client, "touchEnd", center.x, center.y - 28);
+	await page.waitForTimeout(240);
+	const settledState = await readHeaderState(page);
+	assert(
+		!settledState.interacting,
+		"guarded tab drag should settle after touch release",
 	);
 }
 
@@ -237,15 +316,21 @@ async function verifyWheelHysteresis(page) {
 	const settledCompact = compactSamples.at(-1);
 	assert(Boolean(settledCompact), "wheel down should produce samples");
 	assert(
-		compactSamples.every(
-			(sample) => sample.progress === 0 || sample.progress === 1,
-		),
-		`wheel down should not jitter through mid states, got ${JSON.stringify(
+		compactSamples.every((sample) => !sample.interacting),
+		`wheel down should not enter an interaction state, got ${JSON.stringify(
 			compactSamples,
 		)}`,
 	);
 	assert(
-		settledCompact.compact && !settledCompact.interacting,
+		compactSamples.some((sample) => sample.compact),
+		`wheel down should eventually compact the header, got ${JSON.stringify(
+			compactSamples,
+		)}`,
+	);
+	assert(
+		settledCompact.compact &&
+			!settledCompact.interacting &&
+			settledCompact.progress >= 0.8,
 		`wheel down should settle to compact, got ${JSON.stringify(
 			settledCompact,
 		)}`,
@@ -260,15 +345,19 @@ async function verifyWheelHysteresis(page) {
 	const settledExpanded = expandedSamples.at(-1);
 	assert(Boolean(settledExpanded), "wheel up should produce samples");
 	assert(
-		expandedSamples.every(
-			(sample) => sample.progress === 0 || sample.progress === 1,
-		),
-		`wheel up should not jitter through mid states, got ${JSON.stringify(
+		expandedSamples.every((sample) => !sample.interacting),
+		`wheel up should not enter an interaction state, got ${JSON.stringify(
 			expandedSamples,
 		)}`,
 	);
 	assert(
-		settledExpanded.progress === 0 && !settledExpanded.compact,
+		expandedSamples.some((sample) => sample.progress <= 0.1),
+		`wheel up should eventually reopen the header, got ${JSON.stringify(
+			expandedSamples,
+		)}`,
+	);
+	assert(
+		settledExpanded.progress <= 0.15 && !settledExpanded.compact,
 		`wheel up should settle to expanded, got ${JSON.stringify(
 			settledExpanded,
 		)}`,
@@ -282,7 +371,70 @@ async function verifyLaneMenuTouchGuard(page) {
 	const laneMenuTrigger = page.locator(
 		"[data-dashboard-mobile-lane-menu-trigger]",
 	);
-	await tapLocator(page, laneMenuTrigger);
+	const center = await getLocatorCenter(laneMenuTrigger);
+	const client = await createTouchClient(page);
+
+	await dispatchTouchPoint(client, "touchStart", center.x, center.y);
+	await dispatchTouchPoint(client, "touchMove", center.x + 10, center.y);
+	await page.waitForTimeout(80);
+	const guardedHorizontalState = await page.evaluate(() => {
+		const shell = document.querySelector("[data-app-shell-header-interacting]");
+		if (!(shell instanceof HTMLElement)) {
+			throw new Error("missing [data-app-shell-header-interacting]");
+		}
+		return shell.getAttribute("data-app-shell-header-interacting");
+	});
+	assert(
+		guardedHorizontalState === "false",
+		`lane menu horizontal touchmove should stay ignored, got ${guardedHorizontalState}`,
+	);
+	await dispatchTouchPoint(client, "touchEnd", center.x + 10, center.y);
+	await page.waitForTimeout(80);
+
+	await openLaneSwitchStory(page);
+	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);
+	const verticalClient = await createTouchClient(page);
+	const verticalCenter = await getLocatorCenter(
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
+	await dispatchTouchPoint(
+		verticalClient,
+		"touchStart",
+		verticalCenter.x,
+		verticalCenter.y,
+	);
+	await dispatchTouchPoint(
+		verticalClient,
+		"touchMove",
+		verticalCenter.x,
+		verticalCenter.y - 10,
+	);
+	await page.waitForTimeout(80);
+	const guardedMoveState = await page.evaluate(() => {
+		const shell = document.querySelector("[data-app-shell-header-interacting]");
+		if (!(shell instanceof HTMLElement)) {
+			throw new Error("missing [data-app-shell-header-interacting]");
+		}
+		return shell.getAttribute("data-app-shell-header-interacting");
+	});
+	assert(
+		guardedMoveState === "false",
+		`lane menu touchmove should stay ignored, got ${guardedMoveState}`,
+	);
+	await dispatchTouchPoint(
+		verticalClient,
+		"touchEnd",
+		verticalCenter.x,
+		verticalCenter.y - 10,
+	);
+	await page.waitForTimeout(80);
+
+	await openLaneSwitchStory(page);
+	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);
+	await tapLocator(
+		page,
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
 	await page.waitForSelector("[data-dashboard-mobile-lane-menu-popover]");
 
 	const touchStates = await readTouchGuardStates(page);
@@ -293,11 +445,107 @@ async function verifyLaneMenuTouchGuard(page) {
 		)}`,
 	);
 
+	const translatedOption = page
+		.locator("[data-dashboard-mobile-lane-menu-popover]")
+		.getByRole("menuitemradio", {
+			name: "翻译",
+		});
+	const optionCenter = await getLocatorCenter(translatedOption);
+	const optionClient = await createTouchClient(page);
+	await dispatchTouchPoint(
+		optionClient,
+		"touchStart",
+		optionCenter.x,
+		optionCenter.y,
+	);
+	await dispatchTouchPoint(
+		optionClient,
+		"touchMove",
+		optionCenter.x + 10,
+		optionCenter.y,
+	);
+	await page.waitForTimeout(80);
+	const optionHorizontalState = await page.evaluate(() => {
+		const shell = document.querySelector("[data-app-shell-header-interacting]");
+		if (!(shell instanceof HTMLElement)) {
+			throw new Error("missing [data-app-shell-header-interacting]");
+		}
+		return shell.getAttribute("data-app-shell-header-interacting");
+	});
+	assert(
+		optionHorizontalState === "false",
+		`lane option horizontal touchmove should stay ignored, got ${optionHorizontalState}`,
+	);
+	await dispatchTouchPoint(
+		optionClient,
+		"touchEnd",
+		optionCenter.x + 10,
+		optionCenter.y,
+	);
+	await page.waitForTimeout(80);
+
+	await openLaneSwitchStory(page);
+	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);
 	await tapLocator(
 		page,
-		page.getByRole("menuitemradio", {
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
+	await page.waitForSelector("[data-dashboard-mobile-lane-menu-popover]");
+	const optionVerticalClient = await createTouchClient(page);
+	const refreshedTranslatedOption = page
+		.locator("[data-dashboard-mobile-lane-menu-popover]")
+		.getByRole("menuitemradio", {
 			name: "翻译",
-		}),
+		});
+	const refreshedOptionCenter = await getLocatorCenter(
+		refreshedTranslatedOption,
+	);
+	await dispatchTouchPoint(
+		optionVerticalClient,
+		"touchStart",
+		refreshedOptionCenter.x,
+		refreshedOptionCenter.y,
+	);
+	await dispatchTouchPoint(
+		optionVerticalClient,
+		"touchMove",
+		refreshedOptionCenter.x,
+		refreshedOptionCenter.y - 10,
+	);
+	await page.waitForTimeout(80);
+	const optionVerticalState = await page.evaluate(() => {
+		const shell = document.querySelector("[data-app-shell-header-interacting]");
+		if (!(shell instanceof HTMLElement)) {
+			throw new Error("missing [data-app-shell-header-interacting]");
+		}
+		return shell.getAttribute("data-app-shell-header-interacting");
+	});
+	assert(
+		optionVerticalState === "false",
+		`lane option vertical touchmove should stay ignored, got ${optionVerticalState}`,
+	);
+	await dispatchTouchPoint(
+		optionVerticalClient,
+		"touchEnd",
+		refreshedOptionCenter.x,
+		refreshedOptionCenter.y - 10,
+	);
+	await page.waitForTimeout(80);
+
+	await openLaneSwitchStory(page);
+	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);
+	await tapLocator(
+		page,
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
+	await page.waitForSelector("[data-dashboard-mobile-lane-menu-popover]");
+	await tapLocator(
+		page,
+		page
+			.locator("[data-dashboard-mobile-lane-menu-popover]")
+			.getByRole("menuitemradio", {
+				name: "翻译",
+			}),
 	);
 	await page.waitForTimeout(120);
 	await page
@@ -344,8 +592,16 @@ const page = await context.newPage();
 try {
 	await verifyMouseDrag(page);
 	console.log("✓ mouse drag exposes a mid header state before release");
+	await verifyMouseDragFromInteractiveControl(page);
+	console.log(
+		"✓ mouse drag still works when it starts from the lane menu button",
+	);
 	await verifyTouchDrag(page);
 	console.log("✓ touch drag exposes a mid header state before release");
+	await verifyTouchDragFromGuardedTab(page);
+	console.log(
+		"✓ guarded mobile tabs still allow drag after the touch crosses the tap slop",
+	);
 	await verifySlowTouchExpansion(page);
 	console.log("✓ slow touch pull stays stable before release");
 	await verifyWheelHysteresis(page);
