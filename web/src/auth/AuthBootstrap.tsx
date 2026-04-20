@@ -74,11 +74,13 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 			(cachedSnapshotOrigin === "network" ||
 				(cachedSnapshotOrigin === "seed" &&
 					canReuseStartupSeedOnTransientError));
+		const cachedAuthenticatedMe =
+			canReuseCachedAuth && cachedSnapshot?.me ? cachedSnapshot.me : null;
 
-		if (canReuseCachedAuth) {
+		if (cachedAuthenticatedMe) {
 			return {
 				status: "authenticated",
-				me: cachedSnapshot.me,
+				me: cachedAuthenticatedMe,
 				bootError: err instanceof Error ? err.message : String(err),
 			};
 		}
