@@ -214,6 +214,14 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveAttribute("type", "text");
 	await expect(input).toHaveAttribute("data-secret-visible", "true");
+	const guide = page.getByTestId("github-pat-guide-card");
+	await expect(guide).toBeVisible();
+	await expect(guide.getByRole("textbox", { name: "Note" })).toHaveValue(
+		"OctoRill release feedback",
+	);
+	await expect(
+		guide.getByRole("button", { name: "No expiration" }),
+	).toBeVisible();
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {
@@ -267,6 +275,7 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 	await expect(switchControl).toHaveAttribute("aria-checked", "true");
 	await expect(myReleasesSection).toContainText("已纳入我的发布");
 });
+
 
 test("unknown app route shows not-found page after app shell boot", async ({
 	page,

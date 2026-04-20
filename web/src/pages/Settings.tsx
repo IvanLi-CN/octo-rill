@@ -47,11 +47,9 @@ import {
 	buildSettingsSearch,
 	type SettingsSection,
 } from "@/settings/routeState";
-import {
-	PAT_CREATE_PATH,
-	useReactionTokenEditor,
-} from "@/settings/reactionTokenEditor";
+import { GitHubPatGuideCard } from "@/settings/GitHubPatGuideCard";
 import { GitHubPatInput } from "@/settings/GitHubPatInput";
+import { useReactionTokenEditor } from "@/settings/reactionTokenEditor";
 
 const SECTION_META: Record<
 	SettingsSection,
@@ -434,7 +432,7 @@ export function SettingsPage(props: {
 			footer={<AppMetaFooter />}
 			mobileChrome
 		>
-			<div className="mx-auto max-w-3xl space-y-4">
+			<div className="mx-auto max-w-6xl space-y-4">
 				{activeStatusMeta?.tone === "error" ? (
 					<section
 						className={cn(
@@ -454,14 +452,41 @@ export function SettingsPage(props: {
 					</section>
 				) : null}
 
-				<nav className="flex flex-wrap gap-2 rounded-2xl border border-border/70 bg-card/95 p-2 shadow-sm">
+				<nav data-settings-nav className="grid grid-cols-2 gap-2 md:hidden">
+					{sectionNavItems.map((item) => {
+						const active = section === item.id;
+						return (
+							<InternalLink
+								key={item.id}
+								href={buildSettingsHref(item.id)}
+								to="/settings"
+								search={buildSettingsSearch(item.id)}
+								onClick={() => onSectionChange(item.id)}
+								className={cn(
+									"flex h-11 w-full items-center gap-2 rounded-xl border px-3 text-sm font-medium transition-colors",
+									active
+										? "border-foreground/90 bg-foreground text-background shadow-sm"
+										: "border-border/70 bg-background/85 text-foreground",
+								)}
+							>
+								{item.icon}
+								<span className="truncate">{SECTION_META[item.id].label}</span>
+							</InternalLink>
+						);
+					})}
+				</nav>
+
+				<nav
+					data-settings-nav
+					className="hidden flex-wrap rounded-2xl border border-border/70 bg-card/95 p-2 shadow-sm md:flex"
+				>
 					{sectionNavItems.map((item) => (
 						<Button
 							key={item.id}
 							asChild
 							variant={section === item.id ? "default" : "ghost"}
 							size="sm"
-							className="h-9 rounded-xl px-3"
+							className="h-9 w-auto rounded-xl px-3"
 						>
 							<InternalLink
 								href={buildSettingsHref(item.id)}
@@ -476,11 +501,11 @@ export function SettingsPage(props: {
 					))}
 				</nav>
 
-				<div className="min-w-0">
+				<div className="min-w-0 max-md:border-t max-md:border-border/60 max-md:pt-4">
 					{section === "linuxdo" ? (
 						<section id="settings-linuxdo" data-settings-section="linuxdo">
-							<Card className="border-border/70 shadow-sm">
-								<CardHeader className="border-b border-border/60 p-5">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
 									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 										<div className="flex flex-wrap items-center gap-2">
 											<CardTitle className="text-lg">
@@ -516,7 +541,7 @@ export function SettingsPage(props: {
 										)}
 									</div>
 								</CardHeader>
-								<CardContent className="space-y-4 p-5">
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									{linuxdoError ? (
 										<div
 											className={cn(
@@ -597,8 +622,8 @@ export function SettingsPage(props: {
 							id="settings-my-releases"
 							data-settings-section="my-releases"
 						>
-							<Card className="border-border/70 shadow-sm">
-								<CardHeader className="border-b border-border/60 p-5">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
 									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 										<div className="flex flex-wrap items-center gap-2">
 											<CardTitle className="text-lg">
@@ -624,7 +649,7 @@ export function SettingsPage(props: {
 										</Button>
 									</div>
 								</CardHeader>
-								<CardContent className="space-y-4 p-5">
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									<div className="flex items-start justify-between gap-4 rounded-2xl border border-border/70 bg-muted/20 px-4 py-3">
 										<div className="space-y-1.5">
 											<p className="text-sm font-medium text-foreground">
@@ -680,8 +705,8 @@ export function SettingsPage(props: {
 							id="settings-github-pat"
 							data-settings-section="github-pat"
 						>
-							<Card className="border-border/70 shadow-sm">
-								<CardHeader className="border-b border-border/60 p-5">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
 									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 										<div className="flex flex-wrap items-center gap-2">
 											<CardTitle className="text-lg">
@@ -705,18 +730,19 @@ export function SettingsPage(props: {
 										</Button>
 									</div>
 								</CardHeader>
-								<CardContent className="space-y-4 p-5">
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									<div className="space-y-2">
 										<Label htmlFor="settings-reaction-pat">GitHub PAT</Label>
-										<GitHubPatInput
+										<Input
 											id="settings-reaction-pat"
+											type="password"
 											value={patInput}
 											onChange={(event) => setPatInput(event.target.value)}
 											placeholder="粘贴新的 classic PAT"
 											autoCapitalize="none"
 											autoCorrect="off"
 											spellCheck={false}
-											inputClassName="h-10 font-mono text-sm"
+											className="h-10 font-mono text-sm"
 										/>
 									</div>
 
@@ -760,14 +786,7 @@ export function SettingsPage(props: {
 										/>
 									</div>
 
-									<details className="rounded-xl border border-border/70 px-3 py-2.5 text-sm">
-										<summary className="cursor-pointer font-medium">
-											创建 classic PAT
-										</summary>
-										<p className="text-muted-foreground mt-2 font-mono text-xs leading-5">
-											{PAT_CREATE_PATH}
-										</p>
-									</details>
+									<GitHubPatGuideCard compact />
 								</CardContent>
 							</Card>
 						</section>
@@ -778,8 +797,8 @@ export function SettingsPage(props: {
 							id="settings-daily-brief"
 							data-settings-section="daily-brief"
 						>
-							<Card className="border-border/70 shadow-sm">
-								<CardHeader className="border-b border-border/60 p-5">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
 									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
 										<div className="flex flex-wrap items-center gap-2">
 											<CardTitle className="text-lg">
@@ -801,7 +820,7 @@ export function SettingsPage(props: {
 										</Button>
 									</div>
 								</CardHeader>
-								<CardContent className="space-y-4 p-5">
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									<DailyBriefProfileForm
 										localTime={briefProfileDraft.daily_brief_local_time}
 										timeZone={briefProfileDraft.daily_brief_time_zone}
