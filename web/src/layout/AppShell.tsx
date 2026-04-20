@@ -61,6 +61,7 @@ type AppShellProps = {
 const MOBILE_HEADER_GESTURE_GUARD_SELECTOR = "[data-app-shell-gesture-guard]";
 const GUARDED_TOUCH_DRAG_THRESHOLD_PX = 12;
 const GUARDED_TOUCH_CLICK_SUPPRESSION_WINDOW_MS = 750;
+const MOBILE_SOFTWARE_KEYBOARD_HEIGHT_THRESHOLD_PX = 120;
 
 function resolveGestureTargetElement(
 	target: EventTarget | null,
@@ -105,6 +106,40 @@ function shouldPromoteGuardedTouchSequence({
 		verticalDelta >= GUARDED_TOUCH_DRAG_THRESHOLD_PX &&
 		verticalDelta >= horizontalDelta
 	);
+}
+
+function isTextEditableElement(target: Element | null): boolean {
+	if (!(target instanceof HTMLElement)) {
+		return false;
+	}
+
+	if (target.isContentEditable || target.getAttribute("role") === "textbox") {
+		return true;
+	}
+
+	if (target instanceof HTMLTextAreaElement) {
+		return true;
+	}
+
+	if (target instanceof HTMLInputElement) {
+		switch (target.type) {
+			case "button":
+			case "checkbox":
+			case "color":
+			case "file":
+			case "hidden":
+			case "image":
+			case "radio":
+			case "range":
+			case "reset":
+			case "submit":
+				return false;
+			default:
+				return true;
+		}
+	}
+
+	return false;
 }
 
 export function AppShell({
@@ -202,11 +237,20 @@ export function AppShell({
 				visualViewport && visualViewport.height > 0
 					? Math.round(visualViewport.height)
 					: Math.round(window.innerHeight);
+			const keyboardLikelyVisible =
+				visualViewport &&
+				visualViewport.height > 0 &&
+				isTextEditableElement(document.activeElement) &&
+				window.innerHeight - visualViewport.height >=
+					MOBILE_SOFTWARE_KEYBOARD_HEIGHT_THRESHOLD_PX;
+			const appliedViewportHeight = keyboardLikelyVisible
+				? Math.round(window.innerHeight)
+				: nextHeight;
 			setViewportHeight((current) =>
-				current === nextHeight ? current : nextHeight,
+				current === appliedViewportHeight ? current : appliedViewportHeight,
 			);
 			setViewportHeightSource(
-				visualViewport && visualViewport.height > 0
+				!keyboardLikelyVisible && visualViewport && visualViewport.height > 0
 					? "visual-viewport"
 					: "window-inner-height",
 			);
