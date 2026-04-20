@@ -1,10 +1,11 @@
-use std::{net::SocketAddr, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    body::Body,
     extract::Request,
-    http::{HeaderValue, Method},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::Response,
     routing::{get, patch, post, put},
@@ -15,6 +16,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 use tokio::task::AbortHandle;
+use tower::ServiceExt;
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -34,6 +36,33 @@ use crate::{
 };
 
 const SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
+const STATIC_ASSET_EXTENSIONS: &[&str] = &[
+    "avif",
+    "bmp",
+    "css",
+    "eot",
+    "gif",
+    "html",
+    "ico",
+    "jpeg",
+    "jpg",
+    "js",
+    "json",
+    "map",
+    "mjs",
+    "otf",
+    "pdf",
+    "png",
+    "svg",
+    "ttf",
+    "txt",
+    "wasm",
+    "webmanifest",
+    "webp",
+    "woff",
+    "woff2",
+    "xml",
+];
 
 pub async fn serve(config: AppConfig) -> Result<()> {
     ensure_sqlite_dir(&config.database_url)?;
@@ -274,13 +303,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .layer(session_layer);
 
     if let Some(static_dir) = config.static_dir.clone() {
-        let index = static_dir.join("index.html");
-        let spa_shell = ServeFile::new(index.clone());
-        app = app
-            .route_service("/", spa_shell.clone())
-            .route_service("/admin", spa_shell.clone())
-            .route_service("/admin/{*path}", spa_shell)
-            .fallback_service(ServeDir::new(static_dir).not_found_service(ServeFile::new(index)));
+        app = attach_static_site_routes(app, static_dir);
     }
 
     let cors_origin = state::normalize_origin(&config.public_base_url)?;
@@ -529,6 +552,112 @@ async fn version_no_store_cache(req: Request, next: Next) -> Response {
     response
 }
 
+fn attach_static_site_routes(app: Router, static_dir: PathBuf) -> Router {
+    let index = static_dir.join("index.html");
+    let spa_shell = ServeFile::new(index.clone());
+    let spa_static = Arc::new(SpaStaticPaths {
+        static_dir,
+        index_path: index,
+    });
+
+    app.route_service("/", spa_shell.clone())
+        .route_service("/admin", spa_shell.clone())
+        .route_service("/admin/{*path}", spa_shell)
+        .fallback({
+            move |request: Request| {
+                let spa_static = Arc::clone(&spa_static);
+                async move { spa_document_fallback_handler(request, spa_static).await }
+            }
+        })
+}
+
+#[derive(Clone)]
+struct SpaStaticPaths {
+    static_dir: PathBuf,
+    index_path: PathBuf,
+}
+
+async fn spa_document_fallback_handler(
+    request: Request,
+    spa_static: Arc<SpaStaticPaths>,
+) -> Response {
+    if looks_like_static_asset_path(request.uri().path()) {
+        return match ServeDir::new(spa_static.static_dir.clone())
+            .oneshot(request)
+            .await
+        {
+            Ok(response) => into_axum_body(response),
+            Err(err) => match err {},
+        };
+    }
+
+    if should_serve_spa_shell(request.method(), request.uri(), request.headers()) {
+        return match ServeFile::new(spa_static.index_path.clone())
+            .oneshot(request)
+            .await
+        {
+            Ok(response) => into_axum_body(response),
+            Err(err) => match err {},
+        };
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::empty())
+        .expect("404 fallback response should build")
+}
+
+fn into_axum_body<B>(response: axum::http::Response<B>) -> Response
+where
+    B: axum::body::HttpBody<Data = axum::body::Bytes> + Send + 'static,
+    B::Error: Into<axum::BoxError>,
+{
+    response.map(Body::new)
+}
+
+fn should_serve_spa_shell(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
+    matches!(*method, Method::GET | Method::HEAD)
+        && !is_reserved_backend_path(uri.path())
+        && !looks_like_static_asset_path(uri.path())
+        && accepts_html_document(headers)
+}
+
+fn is_reserved_backend_path(path: &str) -> bool {
+    path == "/api" || path.starts_with("/api/") || path == "/auth" || path.starts_with("/auth/")
+}
+
+fn looks_like_static_asset_path(path: &str) -> bool {
+    let Some(segment) = path.rsplit('/').next() else {
+        return false;
+    };
+    if segment.is_empty() {
+        return false;
+    }
+
+    let Some((_, extension)) = segment.rsplit_once('.') else {
+        return false;
+    };
+
+    STATIC_ASSET_EXTENSIONS
+        .iter()
+        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn accepts_html_document(headers: &HeaderMap) -> bool {
+    if headers
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("document"))
+    {
+        return true;
+    }
+
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("text/html") || value.contains("application/xhtml+xml"))
+}
+
 fn build_session_cookie_name(config: &AppConfig) -> String {
     let host = config.public_base_url.host_str().unwrap_or("localhost");
     let port = config
@@ -550,10 +679,17 @@ fn build_session_cookie_name(config: &AppConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        SQLITE_POOL_MAX_CONNECTIONS, api_health, api_version, apply_no_store_headers,
-        build_sqlite_connect_options, build_sqlite_pool_options, read_sqlite_runtime_pragmas,
+        SQLITE_POOL_MAX_CONNECTIONS, accepts_html_document, api_health, api_version,
+        apply_no_store_headers, attach_static_site_routes, build_sqlite_connect_options,
+        build_sqlite_pool_options, looks_like_static_asset_path, read_sqlite_runtime_pragmas,
+        should_serve_spa_shell,
     };
-    use axum::http::{HeaderMap, HeaderValue, header};
+    use axum::{
+        Router,
+        http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+        routing::get,
+    };
+    use std::{fs, time::SystemTime};
 
     #[tokio::test]
     async fn api_version_reports_non_empty_version_and_source() {
@@ -637,5 +773,205 @@ mod tests {
     fn sqlite_pool_uses_single_connection_to_avoid_self_contention() {
         let _ = build_sqlite_pool_options();
         assert_eq!(SQLITE_POOL_MAX_CONNECTIONS, 1);
+    }
+
+    #[test]
+    fn html_navigation_accept_header_is_detected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml"),
+        );
+
+        assert!(accepts_html_document(&headers));
+    }
+
+    #[test]
+    fn sec_fetch_document_header_is_detected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
+
+        assert!(accepts_html_document(&headers));
+    }
+
+    #[test]
+    fn path_with_extension_is_treated_as_static_asset() {
+        assert!(looks_like_static_asset_path("/assets/index-abc123.js"));
+        assert!(looks_like_static_asset_path("/favicon.ico"));
+        assert!(!looks_like_static_asset_path("/settings"));
+        assert!(!looks_like_static_asset_path("/admin/jobs"));
+        assert!(!looks_like_static_asset_path(
+            "/admin/jobs/tasks/task-sync.subscriptions"
+        ));
+    }
+
+    #[test]
+    fn spa_shell_fallback_only_applies_to_html_navigation_paths() {
+        let html_headers = HeaderMap::from_iter([(
+            header::ACCEPT,
+            HeaderValue::from_static("text/html,application/xhtml+xml"),
+        )]);
+        let json_headers =
+            HeaderMap::from_iter([(header::ACCEPT, HeaderValue::from_static("application/json"))]);
+
+        assert!(should_serve_spa_shell(
+            &Method::GET,
+            &Uri::from_static("/settings"),
+            &html_headers,
+        ));
+        assert!(should_serve_spa_shell(
+            &Method::GET,
+            &Uri::from_static("/does-not-exist"),
+            &html_headers,
+        ));
+        assert!(!should_serve_spa_shell(
+            &Method::GET,
+            &Uri::from_static("/assets/index.js"),
+            &html_headers,
+        ));
+        assert!(!should_serve_spa_shell(
+            &Method::GET,
+            &Uri::from_static("/auth/missing"),
+            &html_headers,
+        ));
+        assert!(!should_serve_spa_shell(
+            &Method::GET,
+            &Uri::from_static("/settings"),
+            &json_headers,
+        ));
+    }
+
+    #[tokio::test]
+    async fn static_routes_fallback_to_spa_shell_without_masking_assets_or_api_404s() {
+        let fixture_root = std::env::temp_dir().join(format!(
+            "octo-rill-static-fixture-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("fixture time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(fixture_root.join("assets")).expect("create assets dir");
+        fs::write(
+            fixture_root.join("index.html"),
+            "<!doctype html><html><body>spa-shell</body></html>",
+        )
+        .expect("write index.html");
+        fs::write(
+            fixture_root.join("assets/app.js"),
+            "console.log('asset-ok');",
+        )
+        .expect("write asset file");
+
+        let app = attach_static_site_routes(
+            Router::new()
+                .nest(
+                    "/api",
+                    Router::new().route("/health", get(|| async { "api-ok" })),
+                )
+                .route("/auth/logout", get(|| async { "bye" })),
+            fixture_root.clone(),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("resolve test listener addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let client = reqwest::Client::new();
+
+        let settings_response = client
+            .get(format!("http://{addr}/settings?section=github-pat"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request settings");
+        assert_eq!(settings_response.status(), StatusCode::OK);
+        assert!(
+            settings_response
+                .text()
+                .await
+                .expect("read settings body")
+                .contains("spa-shell")
+        );
+
+        let unknown_app_route = client
+            .get(format!("http://{addr}/does-not-exist"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request unknown app route");
+        assert_eq!(unknown_app_route.status(), StatusCode::OK);
+        assert!(
+            unknown_app_route
+                .text()
+                .await
+                .expect("read unknown app route body")
+                .contains("spa-shell")
+        );
+
+        let dotted_admin_route = client
+            .get(format!(
+                "http://{addr}/admin/jobs/tasks/task-sync.subscriptions"
+            ))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request dotted admin route");
+        assert_eq!(dotted_admin_route.status(), StatusCode::OK);
+        assert!(
+            dotted_admin_route
+                .text()
+                .await
+                .expect("read dotted admin route body")
+                .contains("spa-shell")
+        );
+
+        let asset_response = client
+            .get(format!("http://{addr}/assets/app.js"))
+            .send()
+            .await
+            .expect("request asset");
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        assert_eq!(
+            asset_response.text().await.expect("read asset body"),
+            "console.log('asset-ok');"
+        );
+
+        let missing_asset_response = client
+            .get(format!("http://{addr}/assets/missing.js"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request missing asset");
+        assert_eq!(missing_asset_response.status(), StatusCode::NOT_FOUND);
+
+        let missing_api_response = client
+            .get(format!("http://{addr}/api/missing"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request missing api");
+        assert_eq!(missing_api_response.status(), StatusCode::NOT_FOUND);
+
+        let missing_auth_response = client
+            .get(format!("http://{addr}/auth/missing"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request missing auth");
+        assert_eq!(missing_auth_response.status(), StatusCode::NOT_FOUND);
+
+        let head_settings_response = client
+            .head(format!("http://{addr}/settings"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("head settings");
+        assert_eq!(head_settings_response.status(), StatusCode::OK);
+
+        fs::remove_dir_all(fixture_root).expect("remove static fixture");
     }
 }

@@ -260,3 +260,18 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 	await expect(switchControl).toHaveAttribute("aria-checked", "true");
 	await expect(myReleasesSection).toContainText("已纳入我的发布");
 });
+
+test("unknown app route shows not-found page after app shell boot", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/does-not-exist");
+
+	await expect(page.getByRole("heading", { name: "页面不存在" })).toBeVisible();
+	await expect(page.locator("[data-not-found-surface]")).toContainText(
+		"/does-not-exist",
+	);
+	await expect(page.getByRole("link", { name: "返回工作台" })).toBeVisible();
+	await expect(page.getByRole("link", { name: "打开设置" })).toBeVisible();
+});
