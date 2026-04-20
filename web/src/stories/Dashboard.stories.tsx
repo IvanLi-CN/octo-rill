@@ -2241,6 +2241,96 @@ export const EvidenceMobileMixedActivityDayDividerNoOverlap: Story = {
 	},
 };
 
+export const MobileAllTabStickyShell: Story = {
+	name: "Evidence / Mobile all tab sticky shell",
+	render: () => (
+		<DashboardPreview
+			initialTab="all"
+			feedItems={makeMobileMixedActivityDividerProofFeed()}
+			briefs={MOBILE_MIXED_ACTIVITY_DIVIDER_PROOF_BRIEFS}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端 `全部` tab 的长内容场景：顶部壳层会跟随真实 viewport 高度更新，滚动进入 compact header 后仍保持吸顶，不再因为高度链失真而整段滑出视口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const storyWindow = canvasElement.ownerDocument.defaultView;
+		const shell = canvasElement.querySelector<HTMLElement>(
+			"[data-app-shell-mobile-chrome='true']",
+		);
+		const headerState = canvasElement.querySelector<HTMLElement>(
+			"[data-dashboard-header-progress]",
+		);
+		const stickyHeader = canvasElement.querySelector<HTMLElement>(
+			"[data-app-shell-header='true']",
+		);
+		if (!storyWindow || !shell || !headerState || !stickyHeader) {
+			throw new Error(
+				"Expected story window, app shell, dashboard header state, and sticky header",
+			);
+		}
+
+		await expect(canvas.getByRole("tab", { name: "全部" })).toBeVisible();
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+		const initialViewportHeight = Math.round(
+			storyWindow.visualViewport?.height ?? storyWindow.innerHeight,
+		);
+		expect(
+			Math.abs(
+				Number(shell.dataset.appShellViewportHeight ?? "0") -
+					initialViewportHeight,
+			),
+		).toBeLessThanOrEqual(1);
+
+		storyWindow.scrollTo({ top: 420, behavior: "auto" });
+		await new Promise((resolve) => storyWindow.setTimeout(resolve, 280));
+
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"true",
+		);
+		expect(
+			Math.abs(stickyHeader.getBoundingClientRect().top),
+		).toBeLessThanOrEqual(1);
+		const compactViewportHeight = Math.round(
+			storyWindow.visualViewport?.height ?? storyWindow.innerHeight,
+		);
+		expect(
+			Math.abs(
+				Number(shell.dataset.appShellViewportHeight ?? "0") -
+					compactViewportHeight,
+			),
+		).toBeLessThanOrEqual(1);
+	},
+};
+
+export const VerificationMobileAllTabStickyShell: Story = {
+	name: "Verification / Mobile all tab sticky shell",
+	render: MobileAllTabStickyShell.render,
+	globals: MobileAllTabStickyShell.globals,
+	play: MobileAllTabStickyShell.play,
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
 export const BriefsFocused: Story = {
 	args: {
 		initialTab: "briefs",

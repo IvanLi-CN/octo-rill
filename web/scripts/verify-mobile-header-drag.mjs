@@ -6,6 +6,9 @@ const STORY_URL =
 const LANE_SWITCH_STORY_URL =
 	process.env.STORYBOOK_MOBILE_LANE_SWITCH_URL ??
 	"http://127.0.0.1:55176/iframe.html?id=pages-dashboard--verification-mobile-lane-switching&viewMode=story&globals=viewport.value%3AdashboardMobile390";
+const ALL_TAB_SHELL_STORY_URL =
+	process.env.STORYBOOK_MOBILE_ALL_TAB_SHELL_URL ??
+	"http://127.0.0.1:55176/iframe.html?id=pages-dashboard--verification-mobile-all-tab-sticky-shell&viewMode=story&globals=viewport.value%3AdashboardMobile390";
 
 function assert(condition, message) {
 	if (!condition) {
@@ -48,6 +51,16 @@ async function openLaneSwitchStory(page) {
 		timeout: 60_000,
 	});
 	await page.waitForSelector("[data-dashboard-mobile-lane-menu-trigger]", {
+		timeout: 60_000,
+	});
+}
+
+async function openAllTabShellStory(page) {
+	await page.goto(ALL_TAB_SHELL_STORY_URL, {
+		waitUntil: "domcontentloaded",
+		timeout: 60_000,
+	});
+	await page.waitForSelector("[data-dashboard-header-progress]", {
 		timeout: 60_000,
 	});
 }
@@ -700,6 +713,74 @@ async function verifyUserMenuTouchGuard(page) {
 	);
 }
 
+async function verifyAllTabStickyShell(page) {
+	await openAllTabShellStory(page);
+
+	const readViewportBinding = async () =>
+		page.evaluate(() => {
+			const shell = document.querySelector(
+				"[data-app-shell-mobile-chrome='true']",
+			);
+			const headerState = document.querySelector(
+				"[data-dashboard-header-progress]",
+			);
+			const stickyHeader = document.querySelector(
+				"[data-app-shell-header='true']",
+			);
+			if (
+				!(shell instanceof HTMLElement) ||
+				!(headerState instanceof HTMLElement) ||
+				!(stickyHeader instanceof HTMLElement)
+			) {
+				throw new Error("missing app shell or dashboard header");
+			}
+
+			return {
+				boundViewportHeight: Number.parseInt(
+					shell.getAttribute("data-app-shell-viewport-height") ?? "0",
+					10,
+				),
+				viewportHeight: Math.round(
+					window.visualViewport?.height ?? window.innerHeight,
+				),
+				headerTop: Math.round(stickyHeader.getBoundingClientRect().top),
+				compact:
+					headerState.getAttribute("data-dashboard-header-compact") === "true",
+			};
+		});
+
+	const beforeScroll = await readViewportBinding();
+	assert(
+		Math.abs(beforeScroll.boundViewportHeight - beforeScroll.viewportHeight) <=
+			1,
+		`all-tab shell should bind to the current viewport height before scroll, got ${JSON.stringify(
+			beforeScroll,
+		)}`,
+	);
+	assert(
+		Math.abs(beforeScroll.headerTop) <= 1,
+		`all-tab shell header should start pinned to the viewport top, got ${JSON.stringify(
+			beforeScroll,
+		)}`,
+	);
+
+	await page.setViewportSize({ width: 430, height: 860 });
+	await page.waitForTimeout(220);
+	const afterResize = await readViewportBinding();
+	assert(
+		Math.abs(afterResize.boundViewportHeight - afterResize.viewportHeight) <= 1,
+		`all-tab shell should update its viewport-height binding after a viewport resize, got ${JSON.stringify(
+			afterResize,
+		)}`,
+	);
+	assert(
+		Math.abs(afterResize.headerTop) <= 1,
+		`all-tab shell header should stay pinned to the viewport top after resize, got ${JSON.stringify(
+			afterResize,
+		)}`,
+	);
+}
+
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
 	viewport: { width: 430, height: 932 },
@@ -736,6 +817,10 @@ try {
 	await verifyUserMenuTouchGuard(page);
 	console.log(
 		"✓ user menu tap keeps header gesture idle while opening the account popover",
+	);
+	await verifyAllTabStickyShell(page);
+	console.log(
+		"✓ all-tab mobile shell keeps the header pinned while tracking the live viewport height",
 	);
 } finally {
 	await browser.close();

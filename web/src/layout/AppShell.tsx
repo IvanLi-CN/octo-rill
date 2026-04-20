@@ -166,6 +166,10 @@ export function AppShell({
 	const [headerTransitionSuppressed, setHeaderTransitionSuppressed] =
 		useState(false);
 	const [headerHeight, setHeaderHeight] = useState(0);
+	const [viewportHeight, setViewportHeight] = useState<number | null>(null);
+	const [viewportHeightSource, setViewportHeightSource] = useState<
+		"css-fallback" | "visual-viewport" | "window-inner-height"
+	>("css-fallback");
 
 	useEffect(() => {
 		if (!mobileChrome || typeof window === "undefined") {
@@ -182,6 +186,40 @@ export function AppShell({
 		mediaQuery.addEventListener("change", updateViewport);
 		return () => {
 			mediaQuery.removeEventListener("change", updateViewport);
+		};
+	}, [mobileChrome]);
+
+	useEffect(() => {
+		if (!mobileChrome || typeof window === "undefined") {
+			setViewportHeight(null);
+			setViewportHeightSource("css-fallback");
+			return;
+		}
+
+		const visualViewport = window.visualViewport;
+		const resolveViewportHeight = () => {
+			const nextHeight =
+				visualViewport && visualViewport.height > 0
+					? Math.round(visualViewport.height)
+					: Math.round(window.innerHeight);
+			setViewportHeight((current) =>
+				current === nextHeight ? current : nextHeight,
+			);
+			setViewportHeightSource(
+				visualViewport && visualViewport.height > 0
+					? "visual-viewport"
+					: "window-inner-height",
+			);
+		};
+
+		resolveViewportHeight();
+		window.addEventListener("resize", resolveViewportHeight);
+		visualViewport?.addEventListener("resize", resolveViewportHeight);
+		visualViewport?.addEventListener("scroll", resolveViewportHeight);
+		return () => {
+			window.removeEventListener("resize", resolveViewportHeight);
+			visualViewport?.removeEventListener("resize", resolveViewportHeight);
+			visualViewport?.removeEventListener("scroll", resolveViewportHeight);
 		};
 	}, [mobileChrome]);
 
@@ -1008,9 +1046,15 @@ export function AppShell({
 				data-app-shell-header-progress={chromeState.headerProgress.toFixed(3)}
 				data-app-shell-header-interacting={headerInteracting ? "true" : "false"}
 				data-app-shell-footer-hidden={footerHidden ? "true" : "false"}
+				data-app-shell-viewport-height={
+					viewportHeight !== null ? String(viewportHeight) : "fallback"
+				}
+				data-app-shell-viewport-height-source={viewportHeightSource}
 				style={
 					{
 						"--app-shell-header-height": `${headerHeight}px`,
+						minHeight:
+							viewportHeight !== null ? `${viewportHeight}px` : undefined,
 					} as React.CSSProperties
 				}
 			>
@@ -1018,6 +1062,7 @@ export function AppShell({
 					<header
 						ref={headerRef}
 						className="supports-[backdrop-filter]:bg-background/70 bg-background/90 sticky top-0 z-20 border-b backdrop-blur motion-safe:transition-[background-color,border-color,box-shadow] motion-safe:duration-200 motion-safe:ease-out"
+						data-app-shell-header="true"
 					>
 						<div
 							className={cn(
