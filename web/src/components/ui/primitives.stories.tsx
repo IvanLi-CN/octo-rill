@@ -1,6 +1,13 @@
 import type { ReactNode } from "react";
+import { useEffect, useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 
+import {
+	AppToastViewportHost,
+	useAppToast,
+} from "@/components/feedback/AppToast";
+import { ErrorBubble } from "@/components/feedback/ErrorBubble";
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -522,4 +529,71 @@ export const AlertDialogOpen: Story = {
 			</AlertDialogContent>
 		</AlertDialog>
 	),
+};
+
+function ErrorFeedbackShowcase() {
+	const { pushErrorToast } = useAppToast();
+	const [bubbleOpen, setBubbleOpen] = useState(!isDocsMode());
+
+	useEffect(() => {
+		const id = window.setTimeout(() => {
+			pushErrorToast("后台同步失败", "刚刚的同步没有完成，当前内容已保留。", {
+				detail:
+					"task stream recovery timed out after 5000ms while waiting for /api/tasks/123/events",
+			});
+		}, 80);
+		return () => window.clearTimeout(id);
+	}, [pushErrorToast]);
+
+	return (
+		<div className="relative w-[min(100vw-2rem,960px)] space-y-6 rounded-[28px] border bg-card/70 p-6 shadow-sm">
+			<div className="space-y-2">
+				<p className="font-medium text-sm">错误反馈示例</p>
+				<p className="text-muted-foreground text-xs">
+					以下示例使用接近真实产品的文案，分别展示区域错误、局部错误和全局提示。
+				</p>
+			</div>
+
+			<div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
+				<ErrorStatePanel
+					title="动态加载失败"
+					summary="这部分内容暂时没有加载出来，请重试。"
+					detail="GET /api/feed?types=releases returned 502 Bad Gateway while list was empty"
+					actionLabel="重试"
+					onAction={() => undefined}
+				/>
+
+				<div className="rounded-[1.4rem] border bg-background/78 p-4">
+					<p className="mb-3 text-sm font-medium">局部交互失败</p>
+					<ErrorBubble
+						open={bubbleOpen}
+						onOpenChange={setBubbleOpen}
+						title="反馈提交失败"
+						summary="这次反馈没有发出去，请稍后再试。"
+						detail="github denied reaction access for this repository (OAuth app restrictions or org policy)"
+						align="start"
+						side="bottom"
+					>
+						<Button variant="outline" size="sm" className="font-mono text-xs">
+							反馈失败
+						</Button>
+					</ErrorBubble>
+				</div>
+			</div>
+
+			<AppToastViewportHost />
+		</div>
+	);
+}
+
+export const ErrorFeedbackSurfaces: Story = {
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"集中审阅前台错误反馈分层：阻塞内容区使用 ErrorStatePanel、局部操作失败使用 ErrorBubble、后台异步失败使用 destructive toast。",
+			},
+		},
+	},
+	render: () => <ErrorFeedbackShowcase />,
 };

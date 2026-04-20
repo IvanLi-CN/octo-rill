@@ -52,6 +52,9 @@ function mapTranslationItemToFeedTranslated(item: {
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md?: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 }): TranslatedItem | null {
 	const translatedBody = item.body_md ?? item.summary_md;
 	switch (item.status) {
@@ -61,6 +64,9 @@ function mapTranslationItemToFeedTranslated(item: {
 				status: "ready",
 				title: item.title_zh,
 				summary: translatedBody,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 			};
 		case "disabled":
 			return {
@@ -68,6 +74,9 @@ function mapTranslationItemToFeedTranslated(item: {
 				status: "disabled",
 				title: null,
 				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 			};
 		case "missing":
 			return {
@@ -75,6 +84,9 @@ function mapTranslationItemToFeedTranslated(item: {
 				status: "missing",
 				title: null,
 				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 				auto_translate: false,
 			};
 		case "error":
@@ -83,6 +95,9 @@ function mapTranslationItemToFeedTranslated(item: {
 				status: "error",
 				title: null,
 				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 				auto_translate: false,
 			};
 		default:
@@ -231,7 +246,11 @@ function buildVisibleWindowKeys(
 }
 
 function resultLabel(result: TranslationResultItem) {
-	return result.error ?? `translate returned ${result.status}`;
+	return (
+		result.error_summary ??
+		result.error ??
+		`translate returned ${result.status}`
+	);
 }
 
 function isTerminalTranslationResultStatus(

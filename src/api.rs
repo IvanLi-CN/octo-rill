@@ -4330,6 +4330,7 @@ pub async fn get_release_detail(
         trans_status: Option<String>,
         trans_title: Option<String>,
         trans_summary: Option<String>,
+        trans_error_text: Option<String>,
         trans_work_status: Option<String>,
     }
 
@@ -4353,6 +4354,7 @@ pub async fn get_release_detail(
           t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary,
+          t.error_text AS trans_error_text,
           tw.status AS trans_work_status
         FROM repo_releases r
         LEFT JOIN user_release_visible_repos sr
@@ -4415,13 +4417,7 @@ pub async fn get_release_detail(
         );
 
     let translated = if state.config.ai.is_none() {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "disabled".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: None,
-        })
+        Some(translated_item("disabled", None, None, None, None))
     } else {
         match (translation_fresh, row.trans_status.as_deref()) {
             (true, Some("ready"))
@@ -4430,20 +4426,28 @@ pub async fn get_release_detail(
                     row.trans_summary.as_deref(),
                 ) =>
             {
-                Some(TranslatedItem {
-                    lang: "zh-CN".to_owned(),
-                    status: "ready".to_owned(),
-                    title: row.trans_title.clone(),
-                    summary: row.trans_summary.clone(),
-                    auto_translate: None,
-                })
+                Some(translated_item(
+                    "ready",
+                    row.trans_title.clone(),
+                    row.trans_summary.clone(),
+                    None,
+                    None,
+                ))
             }
-            (true, Some("ready")) => Some(translated_missing_item(true)),
+            (true, Some("ready")) => Some(translated_item(
+                "error",
+                None,
+                None,
+                None,
+                Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR),
+            )),
             (false, Some("ready")) if refresh_in_flight => {
                 translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
                     .or_else(|| Some(translated_missing_item(false)))
             }
-            (true, Some(status)) => translated_terminal_item(status),
+            (true, Some(status)) => {
+                translated_terminal_item(status, row.trans_error_text.as_deref())
+            }
             _ => Some(translated_missing_item(true)),
         }
     };
@@ -5379,6 +5383,9 @@ pub struct TranslatedItem {
     status: String, // ready | missing | disabled | error
     title: Option<String>,
     summary: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    error_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
@@ -5389,6 +5396,9 @@ pub struct SmartItem {
     status: String, // ready | missing | disabled | error | insufficient
     title: Option<String>,
     summary: Option<String>,
+    error_code: Option<String>,
+    error_summary: Option<String>,
+    error_detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     auto_translate: Option<bool>,
 }
@@ -5455,11 +5465,13 @@ struct FeedRow {
     trans_status: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
+    trans_error_text: Option<String>,
     trans_work_status: Option<String>,
     detail_trans_source_hash: Option<String>,
     detail_trans_status: Option<String>,
     detail_trans_title: Option<String>,
     detail_trans_summary: Option<String>,
+    detail_trans_error_text: Option<String>,
     detail_trans_work_status: Option<String>,
     smart_source_hash: Option<String>,
     smart_status: Option<String>,
@@ -6024,11 +6036,13 @@ async fn fetch_feed_items(
           t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary,
+          t.error_text AS trans_error_text,
           tw.status AS trans_work_status,
           dt.source_hash AS detail_trans_source_hash,
           dt.status AS detail_trans_status,
           dt.title AS detail_trans_title,
           dt.summary AS detail_trans_summary,
+          dt.error_text AS detail_trans_error_text,
           dtw.status AS detail_trans_work_status,
           s.source_hash AS smart_source_hash,
           s.status AS smart_status,
@@ -6352,23 +6366,72 @@ async fn persist_release_reaction_counts(
 }
 
 const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
+const RELEASE_FEED_MARKDOWN_MISMATCH_ERROR: &str =
+    "release translation failed to preserve markdown structure";
+const RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR: &str =
+    "release detail translation failed to preserve markdown structure";
 
-fn translated_terminal_item(status: &str) -> Option<TranslatedItem> {
+fn translation_error_metadata(
+    error_text: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let classified = crate::translations::classify_translation_error(error_text);
+    (
+        classified.as_ref().map(|value| value.code.to_owned()),
+        classified.as_ref().map(|value| value.summary.to_owned()),
+        classified.map(|value| value.detail),
+    )
+}
+
+fn translated_item(
+    status: &str,
+    title: Option<String>,
+    summary: Option<String>,
+    auto_translate: Option<bool>,
+    error_text: Option<&str>,
+) -> TranslatedItem {
+    let (error_code, error_summary, error_detail) = translation_error_metadata(error_text);
+    TranslatedItem {
+        lang: "zh-CN".to_owned(),
+        status: status.to_owned(),
+        title,
+        summary,
+        error_code,
+        error_summary,
+        error_detail,
+        auto_translate,
+    }
+}
+
+fn smart_item(
+    status: &str,
+    title: Option<String>,
+    summary: Option<String>,
+    auto_translate: Option<bool>,
+    error_text: Option<&str>,
+) -> SmartItem {
+    let (error_code, error_summary, error_detail) = translation_error_metadata(error_text);
+    SmartItem {
+        lang: "zh-CN".to_owned(),
+        status: status.to_owned(),
+        title,
+        summary,
+        error_code,
+        error_summary,
+        error_detail,
+        auto_translate,
+    }
+}
+
+fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<TranslatedItem> {
     match status {
-        "disabled" => Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "disabled".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: None,
-        }),
-        "missing" | "error" => Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: status.to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: Some(false),
-        }),
+        "disabled" => Some(translated_item("disabled", None, None, None, None)),
+        "missing" | "error" => Some(translated_item(
+            status,
+            None,
+            None,
+            Some(false),
+            if status == "error" { error_text } else { None },
+        )),
         _ => None,
     }
 }
@@ -6382,13 +6445,13 @@ fn translated_ready_item(
     if title.is_none() && summary.is_none() {
         return None;
     }
-    Some(TranslatedItem {
-        lang: "zh-CN".to_owned(),
-        status: "ready".to_owned(),
+    Some(translated_item(
+        "ready",
         title,
         summary,
         auto_translate,
-    })
+        None,
+    ))
 }
 
 fn translated_release_feed_ready_item(
@@ -6398,62 +6461,52 @@ fn translated_release_feed_ready_item(
     auto_translate: Option<bool>,
 ) -> Option<TranslatedItem> {
     let (mut title, mut summary) = normalize_translation_fields(raw_title, raw_summary);
-    let mut status = "ready".to_owned();
+    let mut status = "ready";
+    let mut error_text = None;
     if title.is_none() && summary.is_none() {
-        status = "missing".to_owned();
+        status = "missing";
     }
     if status == "ready"
         && let (Some(src), Some(s)) = (body, summary.as_deref())
         && !markdown_structure_preserved(src, s)
     {
-        status = "missing".to_owned();
+        status = "error";
         title = None;
         summary = None;
+        error_text = Some(RELEASE_FEED_MARKDOWN_MISMATCH_ERROR);
     }
 
-    Some(TranslatedItem {
-        lang: "zh-CN".to_owned(),
+    Some(translated_item(
         status,
         title,
         summary,
-        auto_translate,
-    })
+        if status == "error" {
+            Some(false)
+        } else {
+            auto_translate
+        },
+        error_text,
+    ))
 }
 
 fn translated_missing_item(auto_translate: bool) -> TranslatedItem {
-    TranslatedItem {
-        lang: "zh-CN".to_owned(),
-        status: "missing".to_owned(),
-        title: None,
-        summary: None,
-        auto_translate: if auto_translate { None } else { Some(false) },
-    }
+    translated_item(
+        "missing",
+        None,
+        None,
+        if auto_translate { None } else { Some(false) },
+        None,
+    )
 }
 
 fn smart_terminal_item(status: &str, error_text: Option<&str>) -> Option<SmartItem> {
     match status {
-        "disabled" => Some(SmartItem {
-            lang: "zh-CN".to_owned(),
-            status: "disabled".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: None,
-        }),
-        "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => Some(SmartItem {
-            lang: "zh-CN".to_owned(),
-            status: "insufficient".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: Some(false),
-        }),
+        "disabled" => Some(smart_item("disabled", None, None, None, None)),
+        "missing" if error_text == Some(SMART_NO_VALUABLE_VERSION_INFO) => {
+            Some(smart_item("insufficient", None, None, Some(false), None))
+        }
         "error" if smart_error_is_retryable(error_text) => Some(smart_missing_item(Some(true))),
-        "missing" | "error" => Some(SmartItem {
-            lang: "zh-CN".to_owned(),
-            status: status.to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: Some(false),
-        }),
+        "missing" | "error" => Some(smart_item(status, None, None, Some(false), error_text)),
         _ => None,
     }
 }
@@ -6465,23 +6518,11 @@ fn smart_ready_item(
 ) -> Option<SmartItem> {
     let (title, summary) = normalize_translation_fields(raw_title, raw_summary);
     summary.as_ref()?;
-    Some(SmartItem {
-        lang: "zh-CN".to_owned(),
-        status: "ready".to_owned(),
-        title,
-        summary,
-        auto_translate,
-    })
+    Some(smart_item("ready", title, summary, auto_translate, None))
 }
 
 fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
-    SmartItem {
-        lang: "zh-CN".to_owned(),
-        status: "missing".to_owned(),
-        title: None,
-        summary: None,
-        auto_translate,
-    }
+    smart_item("missing", None, None, auto_translate, None)
 }
 
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
@@ -6560,13 +6601,7 @@ fn feed_item_from_row(
     };
 
     let translated = if !ai_enabled {
-        Some(TranslatedItem {
-            lang: "zh-CN".to_owned(),
-            status: "disabled".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: None,
-        })
+        Some(translated_item("disabled", None, None, None, None))
     } else {
         let current_hash = release_feed_translation_source_hash(
             r.repo_full_name.as_deref().unwrap_or(""),
@@ -6607,28 +6642,37 @@ fn feed_item_from_row(
                         None,
                     )
                 } else {
-                    translated_terminal_item(status)
+                    translated_terminal_item(status, r.detail_trans_error_text.as_deref())
                 }
             } else {
-                let (mut title, mut summary) = normalize_translation_fields(
+                let (title, summary) = normalize_translation_fields(
                     r.detail_trans_title.clone(),
                     r.detail_trans_summary.clone(),
                 );
-                let mut status = "ready".to_owned();
                 if !release_detail_translation_ready(r.release_body.as_deref(), summary.as_deref())
                 {
-                    status = "missing".to_owned();
-                    title = None;
-                    summary = None;
+                    if !body_truncated
+                        && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
+                        && r.trans_status.as_deref() == Some("ready")
+                    {
+                        translated_release_feed_ready_item(
+                            r.trans_title.clone(),
+                            r.trans_summary.clone(),
+                            body.as_deref(),
+                            None,
+                        )
+                    } else {
+                        Some(translated_item(
+                            "error",
+                            None,
+                            None,
+                            Some(false),
+                            Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR),
+                        ))
+                    }
+                } else {
+                    Some(translated_item("ready", title, summary, None, None))
                 }
-
-                Some(TranslatedItem {
-                    lang: "zh-CN".to_owned(),
-                    status,
-                    title,
-                    summary,
-                    auto_translate: None,
-                })
             }
         } else if detail_refresh_in_flight {
             translated_ready_item(
@@ -6641,8 +6685,8 @@ fn feed_item_from_row(
             if let Some(status) = r.trans_status.as_deref()
                 && status != "ready"
             {
-                if status == "disabled" {
-                    translated_terminal_item(status)
+                if matches!(status, "disabled" | "error") {
+                    translated_terminal_item(status, r.trans_error_text.as_deref())
                 } else {
                     Some(translated_missing_item(true))
                 }
@@ -6663,13 +6707,7 @@ fn feed_item_from_row(
     };
 
     let smart = if !ai_enabled {
-        Some(SmartItem {
-            lang: "zh-CN".to_owned(),
-            status: "disabled".to_owned(),
-            title: None,
-            summary: None,
-            auto_translate: None,
-        })
+        Some(smart_item("disabled", None, None, None, None))
     } else {
         let refresh_in_flight = r.smart_source_hash.as_deref() != Some(smart_current_hash.as_str())
             && r.smart_status.as_deref() == Some("ready")
@@ -11367,11 +11405,13 @@ mod tests {
             trans_status: None,
             trans_title: None,
             trans_summary: None,
+            trans_error_text: None,
             trans_work_status: None,
             detail_trans_source_hash: None,
             detail_trans_status: None,
             detail_trans_title: None,
             detail_trans_summary: None,
+            detail_trans_error_text: None,
             detail_trans_work_status: None,
             smart_source_hash: None,
             smart_status: None,
@@ -15326,11 +15366,25 @@ mod tests {
         );
         row.trans_source_hash = Some(ai::sha256_hex(&source));
         row.trans_status = Some("error".to_owned());
+        row.trans_error_text =
+            Some("release translation failed to preserve markdown structure".to_owned());
 
         let item = feed_item_from_row(row, true, None);
         let translated = item.translated.expect("translated item");
-        assert_eq!(translated.status, "missing");
-        assert_eq!(translated.auto_translate, None);
+        assert_eq!(translated.status, "error");
+        assert_eq!(
+            translated.error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            translated.error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            translated.error_detail.as_deref(),
+            Some("release translation failed to preserve markdown structure")
+        );
+        assert_eq!(translated.auto_translate, Some(false));
     }
 
     #[test]
@@ -15389,6 +15443,40 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_falls_back_to_legacy_ready_translation_when_detail_ready_is_invalid() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.5".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let body = release_feed_body(row.release_body.as_deref()).expect("release body");
+        let source = format!(
+            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            body,
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("ready".to_owned());
+        row.trans_title = Some("旧译文标题".to_owned());
+        row.trans_summary = Some("- 旧译文".to_owned());
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("坏掉的详情译文".to_owned());
+        row.detail_trans_summary = None;
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("旧译文标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 旧译文"));
+        assert_eq!(translated.auto_translate, None);
+    }
+
+    #[test]
     fn feed_item_from_row_does_not_fall_back_to_legacy_ready_translation_when_truncated_detail_failed()
      {
         let mut row = test_feed_row(Some("R_node"));
@@ -15423,6 +15511,42 @@ body={}
         assert!(item.body_truncated);
         assert_eq!(translated.status, "error");
         assert_eq!(translated.auto_translate, Some(false));
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
+    }
+
+    #[test]
+    fn feed_item_from_row_marks_invalid_detail_ready_as_terminal_error_when_truncated() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.6".to_owned());
+        row.release_body = Some("a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 1));
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("坏掉的详情译文".to_owned());
+        row.detail_trans_summary = None;
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert!(item.body_truncated);
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
+        assert_eq!(
+            translated.error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            translated.error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            translated.error_detail.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
         assert!(translated.title.is_none());
         assert!(translated.summary.is_none());
     }
@@ -16938,7 +17062,7 @@ line two",
     }
 
     #[tokio::test]
-    async fn get_release_detail_treats_invalid_fresh_ready_as_missing() {
+    async fn get_release_detail_treats_invalid_fresh_ready_as_error() {
         let pool = setup_pool().await;
         let user_id = test_user_id(1);
         seed_repo_release(&pool, 42, 120).await;
@@ -16971,7 +17095,19 @@ line two",
                 .expect("get release detail");
 
         let translated = detail.translated.expect("translated detail");
-        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.status, "error");
+        assert_eq!(
+            translated.error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            translated.error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            translated.error_detail.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
         assert!(translated.title.is_none());
         assert!(translated.summary.is_none());
     }

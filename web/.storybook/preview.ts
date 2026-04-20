@@ -1,5 +1,6 @@
 import type { Preview } from "@storybook/react-vite";
 import { createElement } from "react";
+import { AppToastProvider } from "@/components/feedback/AppToast";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider } from "@/theme/ThemeProvider";
 import { normalizeThemePreference } from "@/theme/theme";
@@ -277,7 +278,11 @@ const preview: Preview = {
 					key: `storybook-theme-${previewTheme}`,
 					persist: false,
 				},
-				createElement(TooltipProvider, null, Story()),
+				createElement(
+					TooltipProvider,
+					null,
+					createElement(AppToastProvider, null, Story()),
+				),
 			);
 		},
 	],

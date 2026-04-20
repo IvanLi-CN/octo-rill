@@ -9,6 +9,7 @@ import {
 	useState,
 } from "react";
 
+import { AppToastViewportHost } from "@/components/feedback/AppToast";
 import { cn } from "@/lib/utils";
 
 type AppShellScrollDirection = "idle" | "content-up" | "content-down";
@@ -816,6 +817,7 @@ export function AppShell({
 				>
 					{children}
 				</main>
+				<AppToastViewportHost />
 				{footer}
 			</div>
 		</AppShellChromeContext.Provider>
