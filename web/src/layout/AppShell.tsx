@@ -57,6 +57,40 @@ type AppShellProps = {
 	mobileChrome?: boolean;
 };
 
+const MOBILE_HEADER_INTERACTIVE_TARGET_SELECTOR = [
+	"button",
+	"a",
+	"input",
+	"select",
+	"textarea",
+	'[role="button"]',
+	'[role="tab"]',
+	'[role="menuitemradio"]',
+	"[aria-haspopup]",
+	"[data-dashboard-mobile-lane-menu]",
+	"[data-dashboard-user-menu]",
+].join(",");
+
+function resolveGestureTargetElement(
+	target: EventTarget | null,
+): Element | null {
+	if (target instanceof Element) {
+		return target;
+	}
+	if (target instanceof Node) {
+		return target.parentElement;
+	}
+	return null;
+}
+
+function isInteractiveGestureTarget(target: EventTarget | null): boolean {
+	return (
+		resolveGestureTargetElement(target)?.closest(
+			MOBILE_HEADER_INTERACTIVE_TARGET_SELECTOR,
+		) !== null
+	);
+}
+
 export function AppShell({
 	header,
 	notice,
@@ -501,6 +535,9 @@ export function AppShell({
 			if (!isDirectPointer) {
 				return;
 			}
+			if (isInteractiveGestureTarget(event.target)) {
+				return;
+			}
 
 			activeTouchPointerIdRef.current = event.pointerId;
 			beginTouchInteraction({
@@ -566,6 +603,9 @@ export function AppShell({
 		};
 
 		const handleTouchStart = (event: TouchEvent) => {
+			if (isInteractiveGestureTarget(event.target)) {
+				return;
+			}
 			promoteToTouchInteraction(event.touches[0]?.clientY ?? 0);
 		};
 

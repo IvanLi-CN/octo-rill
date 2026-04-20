@@ -108,6 +108,32 @@ const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · owner release opt-in";
 
+function dispatchSyntheticTouchEvent(
+	target: HTMLElement,
+	type: "touchstart" | "touchmove",
+	offsetX = 0,
+	offsetY = 0,
+) {
+	const rect = target.getBoundingClientRect();
+	const touchPoint = {
+		clientX: rect.left + rect.width / 2 + offsetX,
+		clientY: rect.top + rect.height / 2 + offsetY,
+	};
+	const event = new Event(type, {
+		bubbles: true,
+		cancelable: true,
+	}) as Event & {
+		touches: Array<typeof touchPoint>;
+		targetTouches: Array<typeof touchPoint>;
+		changedTouches: Array<typeof touchPoint>;
+	};
+
+	Object.defineProperty(event, "touches", { value: [touchPoint] });
+	Object.defineProperty(event, "targetTouches", { value: [touchPoint] });
+	Object.defineProperty(event, "changedTouches", { value: [touchPoint] });
+	target.dispatchEvent(event);
+}
+
 function makeBrief(
 	brief: Omit<
 		BriefItem,
@@ -2790,7 +2816,7 @@ export const MobileReleaseCardActionPolish: Story = {
 			},
 		},
 	},
-	play: async ({ canvasElement }) => {
+	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
 		await expect(
 			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
@@ -2835,6 +2861,111 @@ export const MobileReleaseCardActionPolish: Story = {
 		await expect(
 			releaseCardCanvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
 		).toBeVisible();
+	},
+};
+
+export const PageDefaultLaneSwitchingMobile: Story = {
+	name: "Evidence / Mobile lane switching",
+	args: {
+		initialTab: "releases",
+		feedMode: "default",
+	},
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"移动端页面级阅读模式切换入口：右上菜单按钮的触摸不会再误触发 header drag，选择“翻译”后当前 release feed 会立即切到翻译态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const appShellHeader = canvasElement.querySelector<HTMLElement>(
+			"[data-app-shell-header-interacting]",
+		);
+		expect(appShellHeader).not.toBeNull();
+		if (!appShellHeader) {
+			throw new Error("Expected app shell interaction state to exist");
+		}
+
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		const laneMenuTrigger = canvas.getByRole("button", {
+			name: "当前阅读模式：智能",
+		}) as HTMLButtonElement;
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchstart");
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 0, -10);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		await laneMenuTrigger.click();
+		await expect(
+			canvas.getByRole("menu", { name: "选择阅读模式" }),
+		).toBeVisible();
+		const laneMenu = canvas.getByRole("menu", { name: "选择阅读模式" });
+		const translatedOption = within(laneMenu).getByRole("menuitemradio", {
+			name: "翻译",
+		}) as HTMLButtonElement;
+		dispatchSyntheticTouchEvent(translatedOption, "touchstart");
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 0, -10);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		await translatedOption.click();
+		await expect(
+			canvas.queryByRole("menu", { name: "选择阅读模式" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
+		).toBeVisible();
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+	},
+};
+
+export const VerificationMobileLaneSwitching: Story = {
+	name: "Verification / Mobile lane switching",
+	args: {
+		initialTab: "releases",
+		feedMode: "default",
+	},
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
 	},
 };
 
