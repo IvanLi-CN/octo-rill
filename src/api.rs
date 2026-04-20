@@ -6480,7 +6480,11 @@ fn translated_release_feed_ready_item(
         status,
         title,
         summary,
-        auto_translate,
+        if status == "error" {
+            Some(false)
+        } else {
+            auto_translate
+        },
         error_text,
     ))
 }
@@ -6641,21 +6645,34 @@ fn feed_item_from_row(
                     translated_terminal_item(status, r.detail_trans_error_text.as_deref())
                 }
             } else {
-                let (mut title, mut summary) = normalize_translation_fields(
+                let (title, summary) = normalize_translation_fields(
                     r.detail_trans_title.clone(),
                     r.detail_trans_summary.clone(),
                 );
-                let mut status = "ready";
-                let mut error_text = None;
                 if !release_detail_translation_ready(r.release_body.as_deref(), summary.as_deref())
                 {
-                    status = "error";
-                    title = None;
-                    summary = None;
-                    error_text = Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR);
+                    if !body_truncated
+                        && r.trans_source_hash.as_deref() == Some(current_hash.as_str())
+                        && r.trans_status.as_deref() == Some("ready")
+                    {
+                        translated_release_feed_ready_item(
+                            r.trans_title.clone(),
+                            r.trans_summary.clone(),
+                            body.as_deref(),
+                            None,
+                        )
+                    } else {
+                        Some(translated_item(
+                            "error",
+                            None,
+                            None,
+                            Some(false),
+                            Some(RELEASE_DETAIL_MARKDOWN_MISMATCH_ERROR),
+                        ))
+                    }
+                } else {
+                    Some(translated_item("ready", title, summary, None, None))
                 }
-
-                Some(translated_item(status, title, summary, None, error_text))
             }
         } else if detail_refresh_in_flight {
             translated_ready_item(
@@ -15426,6 +15443,40 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_falls_back_to_legacy_ready_translation_when_detail_ready_is_invalid() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.5".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let body = release_feed_body(row.release_body.as_deref()).expect("release body");
+        let source = format!(
+            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            body,
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("ready".to_owned());
+        row.trans_title = Some("旧译文标题".to_owned());
+        row.trans_summary = Some("- 旧译文".to_owned());
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("坏掉的详情译文".to_owned());
+        row.detail_trans_summary = None;
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "ready");
+        assert_eq!(translated.title.as_deref(), Some("旧译文标题"));
+        assert_eq!(translated.summary.as_deref(), Some("- 旧译文"));
+        assert_eq!(translated.auto_translate, None);
+    }
+
+    #[test]
     fn feed_item_from_row_does_not_fall_back_to_legacy_ready_translation_when_truncated_detail_failed()
      {
         let mut row = test_feed_row(Some("R_node"));
@@ -15460,6 +15511,42 @@ body={}
         assert!(item.body_truncated);
         assert_eq!(translated.status, "error");
         assert_eq!(translated.auto_translate, Some(false));
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
+    }
+
+    #[test]
+    fn feed_item_from_row_marks_invalid_detail_ready_as_terminal_error_when_truncated() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.6".to_owned());
+        row.release_body = Some("a".repeat(RELEASE_FEED_BODY_MAX_CHARS + 1));
+        row.detail_trans_source_hash = Some(release_detail_source_hash(
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            row.release_body.as_deref().unwrap_or(""),
+        ));
+        row.detail_trans_status = Some("ready".to_owned());
+        row.detail_trans_title = Some("坏掉的详情译文".to_owned());
+        row.detail_trans_summary = None;
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert!(item.body_truncated);
+        assert_eq!(translated.status, "error");
+        assert_eq!(translated.auto_translate, Some(false));
+        assert_eq!(
+            translated.error_code.as_deref(),
+            Some("markdown_structure_mismatch")
+        );
+        assert_eq!(
+            translated.error_summary.as_deref(),
+            Some("Markdown 结构校验失败")
+        );
+        assert_eq!(
+            translated.error_detail.as_deref(),
+            Some("release detail translation failed to preserve markdown structure")
+        );
         assert!(translated.title.is_none());
         assert!(translated.summary.is_none());
     }
