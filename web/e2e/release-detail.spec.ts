@@ -920,6 +920,44 @@ test("detail translate failure keeps the last ready translation visible and fall
 	).toBeVisible();
 });
 
+test("detail retry failure stays visible after switching to the original text", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseDetailInitialStatus: "error",
+		releaseDetailInitialError: {
+			error: "release detail translation failed to preserve markdown structure",
+			error_code: "markdown_structure_mismatch",
+			error_summary: "Markdown 结构校验失败",
+			error_detail:
+				"release detail translation failed to preserve markdown structure",
+		},
+		releaseDetailRequestStatus: "error",
+		releaseDetailRequestError: {
+			error: "release detail translation failed to preserve markdown structure",
+			error_code: "markdown_structure_mismatch",
+			error_summary: "Markdown 结构校验失败",
+			error_detail:
+				"release detail translation failed to preserve markdown structure",
+		},
+	});
+
+	await page.goto("/?tab=briefs&release=123");
+	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
+
+	await page.getByRole("button", { name: "查看原文" }).click();
+	await expect(
+		page.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
+	await expect(page.getByText("fix A", { exact: true })).toBeVisible();
+
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
+	await expect(
+		page.getByText("Markdown 结构校验失败", { exact: true }),
+	).toBeVisible();
+});
+
 test("reaction fallback lets users configure PAT inline from the dialog", async ({
 	page,
 }) => {

@@ -170,9 +170,8 @@ export function ReleaseDetailCard(props: {
 		return toUiError(activeDetail.translated, "这次翻译没有成功完成。");
 	}, [activeDetail]);
 
-	const activeTranslationError = showOriginal
-		? null
-		: (translateError ?? detailTranslationError);
+	const activeTranslationError =
+		translateError ?? (showOriginal ? null : detailTranslationError);
 
 	const onTranslate = useCallback(() => {
 		if (!activeDetail || translating) return;
