@@ -161,6 +161,7 @@
   story_id_or_title: UI/Primitives · Error Feedback Surfaces
   state: 区域替换 + 锚定气泡 + destructive toast 同屏审阅
   evidence_note: 统一验证 ErrorStatePanel、ErrorBubble 与 AppToast 的最终层级与样式，不再把错误统一抬到顶部红字。
+PR: include
 
 ![Error feedback surfaces storybook evidence](./assets/error-feedback-surfaces-storybook.png)
 
@@ -168,6 +169,7 @@
   story_id_or_title: Pages/Dashboard · Evidence / Feed Initial Failure Surface
   state: feed 首载失败且当前列表为空
   evidence_note: 验证 Dashboard 主列直接切换为区域错误态，并保留就地重试动作，侧栏内容不被错误横幅挤压。
+PR: include
 
 ![Feed initial failure storybook evidence](./assets/feed-initial-failure-storybook.png)
 
@@ -182,6 +184,7 @@
   story_id_or_title: Pages/Dashboard · Evidence / Release Detail Translation Failure
   state: release detail 翻译失败正文区替换
   evidence_note: 验证 release detail modal 在翻译失败时切换为正文区 ErrorStatePanel，并保留重试、查看原文与 GitHub 动作。
+PR: include
 
 ![Release detail translation failure storybook evidence](./assets/release-detail-translation-failure-storybook.png)
 
