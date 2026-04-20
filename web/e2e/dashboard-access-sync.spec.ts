@@ -894,6 +894,183 @@ test.describe("mobile dashboard shell", () => {
 		expect(notificationCalls).toBe(1);
 	});
 
+	test("dashboard keeps the all-tab mobile shell pinned while tracking live viewport height changes", async ({
+		page,
+	}) => {
+		await page.route("**/api/**", async (route) => {
+			const req = route.request();
+			const url = new URL(req.url());
+			const { pathname } = url;
+
+			if (req.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-admin",
+						name: "Octo Admin",
+						avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+						email: "admin@example.com",
+						is_admin: true,
+					}),
+				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/feed") {
+				return json(route, {
+					items: [
+						buildReleaseFeedItem("41001", {
+							ts: "2026-04-09T16:40:00+08:00",
+							title: "Release 41001",
+							body: "- long all-tab mobile shell proof\n- keep the sticky header pinned\n- track the live viewport height",
+							reactions: buildReactionFooterReady(),
+						}),
+						...Array.from({ length: 10 }, (_, index) =>
+							buildReleaseFeedItem(String(41002 + index), {
+								ts: `2026-04-0${Math.min(8, index + 1)}T12:00:00+08:00`,
+								title: `Release ${41002 + index}`,
+							}),
+						),
+					],
+					next_cursor: null,
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/notifications") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/briefs") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+				return json(route, {
+					configured: false,
+					masked_token: null,
+					check: {
+						state: "idle",
+						message: null,
+						checked_at: null,
+					},
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/health") {
+				return json(route, { ok: true, version: "1.2.3" });
+			}
+
+			return json(
+				route,
+				{
+					error: {
+						code: "not_found",
+						message: `unhandled ${req.method()} ${pathname}`,
+					},
+				},
+				404,
+			);
+		});
+
+		await page.goto("/?tab=all");
+
+		const shell = page.locator("[data-app-shell-mobile-chrome='true']");
+		const headerState = page.locator("[data-dashboard-header-progress]");
+		const stickyHeader = page.locator("[data-app-shell-header='true']");
+		const readShellState = async () =>
+			page.evaluate(() => {
+				const shellElement = document.querySelector(
+					"[data-app-shell-mobile-chrome='true']",
+				);
+				const headerStateElement = document.querySelector(
+					"[data-dashboard-header-progress]",
+				);
+				const stickyHeaderElement = document.querySelector(
+					"[data-app-shell-header='true']",
+				);
+				if (
+					!(shellElement instanceof HTMLElement) ||
+					!(headerStateElement instanceof HTMLElement) ||
+					!(stickyHeaderElement instanceof HTMLElement)
+				) {
+					throw new Error("Expected shell and header elements");
+				}
+
+				return {
+					boundViewportHeight: Number.parseInt(
+						shellElement.getAttribute("data-app-shell-viewport-height") ?? "0",
+						10,
+					),
+					viewportHeight: Math.round(
+						window.visualViewport?.height ?? window.innerHeight,
+					),
+					headerTop: Math.round(
+						stickyHeaderElement.getBoundingClientRect().top,
+					),
+					compact:
+						headerStateElement.getAttribute("data-dashboard-header-compact") ===
+						"true",
+				};
+			});
+
+		await expect(shell).toHaveAttribute(
+			"data-app-shell-viewport-height-source",
+			/^(visual-viewport|window-inner-height)$/,
+		);
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+		const initialState = await readShellState();
+		expect(
+			Math.abs(initialState.boundViewportHeight - initialState.viewportHeight),
+		).toBeLessThanOrEqual(1);
+
+		await page.mouse.wheel(0, 460);
+		await page.waitForTimeout(320);
+
+		const compactState = await readShellState();
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"true",
+		);
+		expect(compactState.compact).toBe(true);
+		expect(Math.abs(compactState.headerTop)).toBeLessThanOrEqual(1);
+		expect(
+			Math.abs(compactState.boundViewportHeight - compactState.viewportHeight),
+		).toBeLessThanOrEqual(1);
+
+		await page.setViewportSize({ width: 390, height: 760 });
+		await page.waitForTimeout(220);
+		const resizedCompactState = await readShellState();
+		expect(resizedCompactState.compact).toBe(true);
+		expect(Math.abs(resizedCompactState.headerTop)).toBeLessThanOrEqual(1);
+		expect(
+			Math.abs(
+				resizedCompactState.boundViewportHeight -
+					resizedCompactState.viewportHeight,
+			),
+		).toBeLessThanOrEqual(1);
+
+		await page.evaluate(() => window.scrollTo({ top: 0, behavior: "auto" }));
+		await page.waitForTimeout(220);
+		await page.setViewportSize({ width: 390, height: 844 });
+		await page.waitForTimeout(220);
+		const restoredState = await readShellState();
+		expect(Math.abs(restoredState.headerTop)).toBeLessThanOrEqual(1);
+		expect(
+			Math.abs(
+				restoredState.boundViewportHeight - restoredState.viewportHeight,
+			),
+		).toBeLessThanOrEqual(1);
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"false",
+		);
+		await expect(stickyHeader).toBeVisible();
+	});
+
 	test("grouped day divider keeps a safe gap below the reaction footer on mobile", async ({
 		page,
 	}) => {

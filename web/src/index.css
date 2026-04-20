@@ -85,12 +85,22 @@
 }
 
 @layer base {
+	html {
+		min-height: 100%;
+	}
+
+	body,
+	#root {
+		min-height: 100%;
+	}
+
 	* {
 		@apply border-border outline-ring/50;
 	}
 	body {
 		@apply bg-background text-foreground antialiased;
 		font-family: var(--font-sans);
+		margin: 0;
 		background-image:
 			radial-gradient(
 				1200px circle at 15% 10%,
