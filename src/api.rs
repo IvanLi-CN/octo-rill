@@ -728,6 +728,7 @@ pub struct DailyBriefProfileResponse {
     user_id: String,
     daily_brief_local_time: String,
     daily_brief_time_zone: String,
+    include_own_releases: bool,
     last_active_at: Option<String>,
 }
 
@@ -738,12 +739,15 @@ pub type MeProfileResponse = DailyBriefProfileResponse;
 pub struct DailyBriefProfilePatchRequest {
     daily_brief_local_time: String,
     daily_brief_time_zone: String,
+    #[serde(default)]
+    include_own_releases: Option<bool>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct DailyBriefProfileRow {
     daily_brief_local_time: Option<String>,
     daily_brief_time_zone: Option<String>,
+    include_own_releases: i64,
     daily_brief_utc_time: String,
     last_active_at: Option<String>,
 }
@@ -757,6 +761,7 @@ async fn load_daily_brief_profile(
         SELECT
           daily_brief_local_time,
           daily_brief_time_zone,
+          include_own_releases,
           daily_brief_utc_time,
           last_active_at
         FROM users
@@ -789,6 +794,7 @@ async fn load_daily_brief_profile(
         user_id: user_id.to_owned(),
         daily_brief_local_time: briefs::format_daily_brief_local_time(preferences.local_time),
         daily_brief_time_zone: preferences.time_zone,
+        include_own_releases: row.include_own_releases != 0,
         last_active_at: row.last_active_at,
     })
 }
@@ -825,12 +831,19 @@ async fn persist_daily_brief_profile(
     sqlx::query(
         r#"
         UPDATE users
-        SET daily_brief_local_time = ?, daily_brief_time_zone = ?, updated_at = ?
+        SET daily_brief_local_time = ?,
+            daily_brief_time_zone = ?,
+            include_own_releases = COALESCE(?, include_own_releases),
+            updated_at = ?
         WHERE id = ?
         "#,
     )
     .bind(briefs::format_daily_brief_local_time(local_time))
     .bind(time_zone)
+    .bind(
+        req.include_own_releases
+            .map(|value| if value { 1_i64 } else { 0_i64 }),
+    )
     .bind(now.as_str())
     .bind(user_id)
     .execute(&state.pool)
@@ -4261,7 +4274,7 @@ pub async fn list_releases(
         r#"
         SELECT sr.full_name, r.tag_name, r.name, r.published_at, r.html_url, r.is_prerelease, r.is_draft
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         ORDER BY COALESCE(r.published_at, r.created_at) DESC
         LIMIT 200
@@ -4342,7 +4355,7 @@ pub async fn get_release_detail(
           t.summary AS trans_summary,
           tw.status AS trans_work_status
         FROM repo_releases r
-        LEFT JOIN starred_repos sr
+        LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
           ON t.user_id = ?
@@ -5953,7 +5966,7 @@ async fn fetch_feed_items(
               r.react_rocket AS react_rocket,
               r.react_eyes AS react_eyes
             FROM repo_releases r
-            JOIN starred_repos sr
+            JOIN user_release_visible_repos sr
               ON sr.user_id = ? AND sr.repo_id = r.repo_id
           )
           UNION ALL
@@ -7033,7 +7046,7 @@ pub async fn toggle_release_reaction(
         r#"
         SELECT rr.release_id, rr.node_id
         FROM repo_releases rr
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = rr.repo_id
         WHERE rr.release_id = ?
         "#,
@@ -8387,7 +8400,7 @@ async fn prepare_release_batch(
         r#"
         SELECT r.release_id, sr.full_name, r.tag_name, r.name, r.body
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = "#,
     );
     source_query.push_bind(user_id);
@@ -9251,7 +9264,7 @@ async fn prepare_release_smart_batch(
               ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
             ) AS previous_tag_name
           FROM repo_releases r
-          JOIN starred_repos sr
+          JOIN user_release_visible_repos sr
             ON sr.user_id = "#,
     );
     source_query.push_bind(user_id);
@@ -10290,7 +10303,7 @@ async fn translate_release_detail_internal(
         r#"
         SELECT r.repo_id, sr.repo_id AS starred_repo_id, r.html_url, r.tag_name, r.name, r.body
         FROM repo_releases r
-        LEFT JOIN starred_repos sr
+        LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         WHERE r.release_id = ?
         LIMIT 1
@@ -11243,7 +11256,7 @@ pub(crate) async fn ensure_owned_repo_visual_columns(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Datelike, TimeZone, Timelike};
+    use chrono::{Datelike, TimeZone};
 
     use super::{
         ADMIN_DASHBOARD_PREAGGREGATE_DAYS, ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT,
@@ -12006,33 +12019,6 @@ mod tests {
         assert_eq!(inflight, 1);
     }
 
-    async fn seed_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
-        let now = "2026-02-23T00:00:00Z";
-        sqlx::query(
-            r#"
-            INSERT INTO releases (
-              id, user_id, repo_id, release_id, tag_name, name, body, html_url,
-              published_at, created_at, is_prerelease, is_draft, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
-            "#,
-        )
-        .bind(format!("release-{repo_id}-{release_id}"))
-        .bind(test_user_id(1))
-        .bind(repo_id)
-        .bind(release_id)
-        .bind("v1.2.3")
-        .bind("Release v1.2.3")
-        .bind("- item")
-        .bind("https://github.com/openai/codex/releases/tag/v1.2.3")
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(pool)
-        .await
-        .expect("seed release");
-    }
-
     async fn seed_repo_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
         let now = "2026-02-23T00:00:00Z";
         sqlx::query(
@@ -12105,6 +12091,54 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed starred");
+    }
+
+    async fn seed_owned_repo_baseline(pool: &SqlitePool, repo_id: i64, full_name: &str) {
+        let now = "2026-02-23T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO owned_repo_star_baselines (
+              id,
+              user_id,
+              repo_id,
+              repo_full_name,
+              initialized_at,
+              updated_at,
+              members_snapshot_initialized,
+              owner_avatar_url,
+              open_graph_image_url,
+              uses_custom_open_graph_image
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            "#,
+        )
+        .bind(format!("owned-repo-{repo_id}"))
+        .bind(test_user_id(1))
+        .bind(repo_id)
+        .bind(full_name)
+        .bind(now)
+        .bind(now)
+        .bind("https://avatars.githubusercontent.com/u/30215105")
+        .bind("https://repository-images.githubusercontent.com/30215105/octo-rill")
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .expect("seed owned repo baseline");
+    }
+
+    async fn set_include_own_releases(pool: &SqlitePool, enabled: bool) {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET include_own_releases = ?, updated_at = '2026-02-23T00:00:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(if enabled { 1_i64 } else { 0_i64 })
+        .bind(test_user_id(1))
+        .execute(pool)
+        .await
+        .expect("update include_own_releases");
     }
 
     struct SeedSocialEventArgs<'a> {
@@ -12868,20 +12902,23 @@ mod tests {
             .expect("build yesterday task time")
             .with_timezone(&chrono::Utc)
             .to_rfc3339();
-        let safe_today_hour = now_local.hour().saturating_sub(1);
-        let today_time = time_zone
+        let today_window_start = time_zone
             .with_ymd_and_hms(
                 today_local.year(),
                 today_local.month(),
                 today_local.day(),
-                safe_today_hour,
+                0,
                 0,
                 0,
             )
             .single()
-            .expect("build today task time")
-            .with_timezone(&chrono::Utc)
-            .to_rfc3339();
+            .expect("build today window start");
+        let safe_today_local = if now_local > today_window_start + chrono::Duration::minutes(5) {
+            now_local - chrono::Duration::minutes(5)
+        } else {
+            today_window_start + chrono::Duration::seconds(1)
+        };
+        let today_time = safe_today_local.with_timezone(&chrono::Utc).to_rfc3339();
 
         set_last_active_at(&pool, test_user_id(1).as_str(), Some(today_time.as_str())).await;
         set_last_active_at(&pool, test_user_id(2).as_str(), Some(today_time.as_str())).await;
@@ -15793,40 +15830,39 @@ line two",
     }
 
     #[tokio::test]
-    async fn list_releases_query_keeps_star_visibility_filter() {
+    async fn release_visibility_view_hides_owned_repo_until_opted_in() {
         let pool = setup_pool().await;
-        seed_release(&pool, 42, 120).await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
 
-        let count_without_star: i64 = sqlx::query_scalar(
+        let count_without_opt_in: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM releases r
-            JOIN starred_repos sr
-              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-            WHERE r.user_id = ?
+            FROM repo_releases r
+            JOIN user_release_visible_repos vr
+              ON vr.user_id = ? AND vr.repo_id = r.repo_id
             "#,
         )
         .bind(test_user_id(1))
         .fetch_one(&pool)
         .await
-        .expect("count releases without star");
-        assert_eq!(count_without_star, 0);
+        .expect("count releases without opt-in");
+        assert_eq!(count_without_opt_in, 0);
 
-        seed_star(&pool, 42).await;
-        let count_with_star: i64 = sqlx::query_scalar(
+        set_include_own_releases(&pool, true).await;
+        let count_with_opt_in: i64 = sqlx::query_scalar(
             r#"
             SELECT COUNT(*)
-            FROM releases r
-            JOIN starred_repos sr
-              ON sr.user_id = r.user_id AND sr.repo_id = r.repo_id
-            WHERE r.user_id = ?
+            FROM repo_releases r
+            JOIN user_release_visible_repos vr
+              ON vr.user_id = ? AND vr.repo_id = r.repo_id
             "#,
         )
         .bind(test_user_id(1))
         .fetch_one(&pool)
         .await
-        .expect("count releases with star");
-        assert_eq!(count_with_star, 1);
+        .expect("count releases with opt-in");
+        assert_eq!(count_with_opt_in, 1);
     }
 
     #[tokio::test]
@@ -15984,6 +16020,37 @@ line two",
     }
 
     #[tokio::test]
+    async fn list_releases_hides_owned_only_repo_when_opt_in_disabled() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_releases(State(state), setup_session(1).await)
+            .await
+            .expect("list releases");
+
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_releases_includes_owned_only_repo_when_opted_in() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
+        set_include_own_releases(&pool, true).await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_releases(State(state), setup_session(1).await)
+            .await
+            .expect("list releases");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].full_name, "IvanLi-CN/octo-rill");
+        assert_eq!(items[0].tag_name, "v1.2.3");
+    }
+
+    #[tokio::test]
     async fn get_release_detail_reads_shared_repo_cache_for_starred_user() {
         let pool = setup_pool().await;
         seed_repo_release(&pool, 42, 120).await;
@@ -16014,6 +16081,49 @@ line two",
             detail.html_url,
             "https://github.com/openai/codex/releases/tag/v1.2.3"
         );
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_rejects_owned_only_repo_when_opt_in_disabled() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
+        let state = setup_state(pool);
+
+        let err = get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+            .await
+            .expect_err("owned-only release should stay hidden");
+
+        assert_eq!(err.code(), "not_found");
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_reads_owned_only_repo_when_opted_in() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
+        set_include_own_releases(&pool, true).await;
+        let state = setup_state(pool);
+
+        let Json(detail) =
+            get_release_detail(State(state), setup_session(1).await, Path("120".to_owned()))
+                .await
+                .expect("get owned release detail");
+
+        assert_eq!(
+            detail.repo_full_name.as_deref(),
+            Some("IvanLi-CN/octo-rill")
+        );
+        let repo_visual = detail.repo_visual.expect("repo visual");
+        assert_eq!(
+            repo_visual.owner_avatar_url.as_deref(),
+            Some("https://avatars.githubusercontent.com/u/30215105")
+        );
+        assert_eq!(
+            repo_visual.open_graph_image_url.as_deref(),
+            Some("https://repository-images.githubusercontent.com/30215105/octo-rill")
+        );
+        assert!(repo_visual.uses_custom_open_graph_image);
     }
 
     #[tokio::test]
@@ -17258,6 +17368,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_local_time: "08:00".to_owned(),
                 daily_brief_time_zone: "America/New_York".to_owned(),
+                include_own_releases: None,
             },
         )
         .await
@@ -17278,6 +17389,7 @@ echo should_not_be_in_excerpt
             super::DailyBriefProfilePatchRequest {
                 daily_brief_local_time: "08:00".to_owned(),
                 daily_brief_time_zone: "America/New_York".to_owned(),
+                include_own_releases: None,
             },
         )
         .await
@@ -17285,10 +17397,11 @@ echo should_not_be_in_excerpt
 
         assert_eq!(profile.daily_brief_local_time, "08:00");
         assert_eq!(profile.daily_brief_time_zone, "America/New_York");
+        assert!(!profile.include_own_releases);
 
-        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>, i64)>(
             r#"
-            SELECT daily_brief_local_time, daily_brief_time_zone
+            SELECT daily_brief_local_time, daily_brief_time_zone, include_own_releases
             FROM users
             WHERE id = ?
             "#,
@@ -17300,5 +17413,73 @@ echo should_not_be_in_excerpt
 
         assert_eq!(row.0.as_deref(), Some("08:00"));
         assert_eq!(row.1.as_deref(), Some("America/New_York"));
+        assert_eq!(row.2, 0);
+    }
+
+    #[tokio::test]
+    async fn load_daily_brief_profile_defaults_include_own_releases_to_false() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let profile = super::load_daily_brief_profile(state.as_ref(), test_user_id(1).as_str())
+            .await
+            .expect("load profile");
+
+        assert!(!profile.include_own_releases);
+    }
+
+    #[tokio::test]
+    async fn persist_daily_brief_profile_updates_include_own_releases_when_present() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let profile = super::persist_daily_brief_profile(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            super::DailyBriefProfilePatchRequest {
+                daily_brief_local_time: "09:00".to_owned(),
+                daily_brief_time_zone: "Asia/Shanghai".to_owned(),
+                include_own_releases: Some(true),
+            },
+        )
+        .await
+        .expect("profile update should succeed");
+
+        assert!(profile.include_own_releases);
+
+        let include_own_releases = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT include_own_releases
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(test_user_id(1))
+        .fetch_one(&pool)
+        .await
+        .expect("load include_own_releases");
+
+        assert_eq!(include_own_releases, 1);
+    }
+
+    #[tokio::test]
+    async fn persist_daily_brief_profile_preserves_include_own_releases_when_omitted() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        let state = setup_state(pool.clone());
+
+        let profile = super::persist_daily_brief_profile(
+            state.as_ref(),
+            test_user_id(1).as_str(),
+            super::DailyBriefProfilePatchRequest {
+                daily_brief_local_time: "10:00".to_owned(),
+                daily_brief_time_zone: "Asia/Tokyo".to_owned(),
+                include_own_releases: None,
+            },
+        )
+        .await
+        .expect("profile update should preserve include_own_releases");
+
+        assert!(profile.include_own_releases);
     }
 }

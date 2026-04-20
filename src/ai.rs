@@ -3975,7 +3975,7 @@ async fn build_brief_content(
           COALESCE(r.published_at, r.created_at, r.updated_at) AS published_at,
           r.is_prerelease
         FROM repo_releases r
-        JOIN starred_repos sr
+        JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         WHERE sr.user_id = ?
           AND r.is_draft = 0

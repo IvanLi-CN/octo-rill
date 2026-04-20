@@ -5,6 +5,7 @@ import {
 	KeyRound,
 	LoaderCircle,
 	Link2,
+	Package,
 	ShieldAlert,
 	Unlink2,
 } from "lucide-react";
@@ -36,6 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
@@ -62,6 +64,11 @@ const SECTION_META: Record<
 		label: "LinuxDO 绑定",
 		description:
 			"绑定 LinuxDO Connect 账号，只保存本地快照，不存 LinuxDO PAT。",
+	},
+	"my-releases": {
+		label: "我的发布",
+		description:
+			"把你自己 owner 的仓库发布也纳入 release 阅读面，但不会写进真实加星列表。",
 	},
 	"github-pat": {
 		label: "GitHub PAT",
@@ -202,6 +209,7 @@ export function SettingsPage(props: {
 
 	const [briefProfileLoading, setBriefProfileLoading] = useState(true);
 	const [briefProfileSaving, setBriefProfileSaving] = useState(false);
+	const [ownReleaseSaving, setOwnReleaseSaving] = useState(false);
 	const [_briefProfile, setBriefProfile] = useState<MeProfileResponse | null>(
 		null,
 	);
@@ -216,6 +224,7 @@ export function SettingsPage(props: {
 				readHourAlignedBrowserTimeZone() ??
 				"Asia/Shanghai",
 		});
+	const [includeOwnReleases, setIncludeOwnReleases] = useState(false);
 
 	const activeStatusMeta = linuxdoStatus
 		? (LINUXDO_STATUS_META[linuxdoStatus] ?? null)
@@ -245,6 +254,7 @@ export function SettingsPage(props: {
 				daily_brief_local_time: profile.daily_brief_local_time,
 				daily_brief_time_zone: profile.daily_brief_time_zone,
 			});
+			setIncludeOwnReleases(profile.include_own_releases);
 		} catch (err) {
 			setBriefProfileError(err instanceof Error ? err.message : String(err));
 		} finally {
@@ -283,13 +293,17 @@ export function SettingsPage(props: {
 	const onSaveBriefProfile = useCallback(() => {
 		setBriefProfileSaving(true);
 		setBriefProfileError(null);
-		void apiPatchMeProfile(briefProfileDraft)
+		void apiPatchMeProfile({
+			...briefProfileDraft,
+			include_own_releases: includeOwnReleases,
+		})
 			.then(async (profile) => {
 				setBriefProfile(profile);
 				setBriefProfileDraft({
 					daily_brief_local_time: profile.daily_brief_local_time,
 					daily_brief_time_zone: profile.daily_brief_time_zone,
 				});
+				setIncludeOwnReleases(profile.include_own_releases);
 				await onProfileSaved?.();
 			})
 			.catch((err) => {
@@ -298,7 +312,31 @@ export function SettingsPage(props: {
 			.finally(() => {
 				setBriefProfileSaving(false);
 			});
-	}, [briefProfileDraft, onProfileSaved]);
+	}, [briefProfileDraft, includeOwnReleases, onProfileSaved]);
+
+	const onSaveOwnReleases = useCallback(() => {
+		setOwnReleaseSaving(true);
+		setBriefProfileError(null);
+		void apiPatchMeProfile({
+			...briefProfileDraft,
+			include_own_releases: includeOwnReleases,
+		})
+			.then(async (profile) => {
+				setBriefProfile(profile);
+				setBriefProfileDraft({
+					daily_brief_local_time: profile.daily_brief_local_time,
+					daily_brief_time_zone: profile.daily_brief_time_zone,
+				});
+				setIncludeOwnReleases(profile.include_own_releases);
+				await onProfileSaved?.();
+			})
+			.catch((err) => {
+				setBriefProfileError(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => {
+				setOwnReleaseSaving(false);
+			});
+	}, [briefProfileDraft, includeOwnReleases, onProfileSaved]);
 
 	const patTone = useMemo(() => {
 		if (patCheckState === "valid") return "success";
@@ -316,6 +354,9 @@ export function SettingsPage(props: {
 		briefProfileDraft.daily_brief_time_zone,
 		briefProfileLoading,
 	]);
+	const ownReleaseSummary = includeOwnReleases ? "已开启" : "已关闭";
+	const profileBusy =
+		briefProfileLoading || briefProfileSaving || ownReleaseSaving;
 
 	const linuxdoStatusBadge = linuxdoLoading
 		? { label: "读取中", variant: "outline" as const }
@@ -342,6 +383,10 @@ export function SettingsPage(props: {
 		{
 			id: "daily-brief" as const,
 			icon: <CalendarClock className="size-4" />,
+		},
+		{
+			id: "my-releases" as const,
+			icon: <Package className="size-4" />,
 		},
 		{
 			id: "github-pat" as const,
@@ -547,6 +592,89 @@ export function SettingsPage(props: {
 						</section>
 					) : null}
 
+					{section === "my-releases" ? (
+						<section
+							id="settings-my-releases"
+							data-settings-section="my-releases"
+						>
+							<Card className="border-border/70 shadow-sm">
+								<CardHeader className="border-b border-border/60 p-5">
+									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+										<div className="flex flex-wrap items-center gap-2">
+											<CardTitle className="text-lg">
+												{SECTION_META["my-releases"].label}
+											</CardTitle>
+											<Badge
+												variant={includeOwnReleases ? "secondary" : "outline"}
+											>
+												{ownReleaseSummary}
+											</Badge>
+										</div>
+										<Button
+											size="sm"
+											disabled={profileBusy}
+											onClick={onSaveOwnReleases}
+										>
+											{ownReleaseSaving ? (
+												<LoaderCircle className="size-4 animate-spin" />
+											) : (
+												<Package className="size-4" />
+											)}
+											保存“我的发布”
+										</Button>
+									</div>
+								</CardHeader>
+								<CardContent className="space-y-4 p-5">
+									<div className="flex items-start justify-between gap-4 rounded-2xl border border-border/70 bg-muted/20 px-4 py-3">
+										<div className="space-y-1.5">
+											<p className="text-sm font-medium text-foreground">
+												把自己的仓库发布也纳入发布流
+											</p>
+											<p className="text-muted-foreground text-sm leading-6">
+												开启后，当前 GitHub 账号本人 owner 的仓库 release
+												会像已加星仓库一样进入 “全部 /
+												发布”、详情、翻译、智能总结与日报链路；真实“加星”列表和社交动态不会被污染。
+											</p>
+										</div>
+										<Switch
+											checked={includeOwnReleases}
+											onCheckedChange={setIncludeOwnReleases}
+											aria-label="我的发布"
+											disabled={profileBusy}
+										/>
+									</div>
+
+									{briefProfileError ? (
+										<div
+											className={cn(
+												"rounded-xl border px-3 py-2.5 text-sm",
+												statusToneClassName("error"),
+											)}
+										>
+											{briefProfileError}
+										</div>
+									) : null}
+
+									<div className="grid gap-3 sm:grid-cols-2">
+										<DetailItem
+											label="当前状态"
+											value={
+												includeOwnReleases
+													? "已纳入我的发布"
+													: "仅显示已加星仓库"
+											}
+										/>
+										<DetailItem
+											label="影响范围"
+											value="发布列表 / Release 详情 / 翻译与智能总结 / 日报"
+											hint="不影响真实加星列表，也不会新增社交事件。"
+										/>
+									</div>
+								</CardContent>
+							</Card>
+						</section>
+					) : null}
+
 					{section === "github-pat" ? (
 						<section
 							id="settings-github-pat"
@@ -662,7 +790,7 @@ export function SettingsPage(props: {
 										</div>
 										<Button
 											size="sm"
-											disabled={briefProfileLoading || briefProfileSaving}
+											disabled={profileBusy}
 											onClick={onSaveBriefProfile}
 										>
 											{briefProfileSaving ? (
@@ -678,7 +806,7 @@ export function SettingsPage(props: {
 									<DailyBriefProfileForm
 										localTime={briefProfileDraft.daily_brief_local_time}
 										timeZone={briefProfileDraft.daily_brief_time_zone}
-										disabled={briefProfileLoading || briefProfileSaving}
+										disabled={profileBusy}
 										error={briefProfileError}
 										compact
 										helperText={null}
