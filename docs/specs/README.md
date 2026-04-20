@@ -119,3 +119,4 @@
 | w5gaz | “我的发布”开关与自有仓库 Release 可见性扩展 | 部分完成（3/4） | `w5gaz-owned-release-opt-in/SPEC.md` | 2026-04-20 | PR #101 open; local implementation + validation + owner-facing evidence landed |
 | 7yr2m | Dashboard 移动端 release 卡片操作收敛 | 部分完成（3/4） | `7yr2m-dashboard-mobile-release-card-action-polish/SPEC.md` | 2026-04-20 | local implementation + storybook/mobile e2e + visual evidence landed; push/PR pending owner screenshot approval |
 | 25pe9 | SPA document fallback 与全局 404 页面收口 | 部分完成（3/4） | `25pe9-spa-document-fallback/SPEC.md` | 2026-04-20 | local implementation + regression coverage complete; PR path proceeds without persisted screenshot assets |
+| bydfx | Web 前端懒路由与按需拆包 | 待实现 | `bydfx-web-lazy-route-code-splitting/SPEC.md` | 2026-04-20 | fast-track / lazy routes + branch-level split |

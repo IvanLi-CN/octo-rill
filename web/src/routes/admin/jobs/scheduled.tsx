@@ -1,14 +1,15 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { validateAdminJobsSearch } from "@/admin/jobsRouteState";
 
-import { AdminJobsRoutePage, validateAdminJobsSearch } from "./-helpers";
+import { AdminRoutePending } from "../-pending";
 
 export const Route = createFileRoute("/admin/jobs/scheduled")({
-	component: AdminJobsScheduledRouteComponent,
 	validateSearch: validateAdminJobsSearch,
+	pendingMs: 0,
+	pendingMinMs: 200,
+	pendingComponent: AdminJobsRoutePendingComponent,
 });
 
-function AdminJobsScheduledRouteComponent() {
-	const search = Route.useSearch();
-
-	return <AdminJobsRoutePage primaryTab="scheduled" search={search} />;
+function AdminJobsRoutePendingComponent() {
+	return <AdminRoutePending variant="jobs" />;
 }

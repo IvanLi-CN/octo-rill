@@ -4,10 +4,12 @@ import { expect, within } from "storybook/test";
 
 import type { MeResponse } from "@/api";
 import {
+	AdminDashboardStartupSkeleton,
 	AdminJobsStartupSkeleton,
 	AdminUsersStartupSkeleton,
 	AppBoot,
 	DashboardStartupSkeleton,
+	SettingsStartupSkeleton,
 } from "@/pages/AppBoot";
 
 const mockMe: MeResponse = {
@@ -80,6 +82,19 @@ export const ColdInit: Story = {
 	},
 };
 
+export const LandingLazyPending: Story = {
+	render: () => <AppBoot />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"匿名访问 `/` 且 auth 已完成、但 Landing route chunk 仍在拉取时的 fallback。这里继续复用中性的 AppBoot，而不是提前露出登录卡或白屏。",
+			},
+		},
+	},
+	play: ColdInit.play,
+};
+
 export const DashboardWarmSkeleton: Story = {
 	render: () => <DashboardStartupSkeleton me={mockMe} />,
 	parameters: {
@@ -109,12 +124,43 @@ export const DashboardWarmSkeleton: Story = {
 	},
 };
 
+export const AdminDashboardWarmSkeleton: Story = {
+	render: () => <AdminDashboardStartupSkeleton me={mockMe} />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"管理员访问 `/admin` 且 route chunk 尚未就绪时的稳定 fallback，保留 admin shell 轮廓但不提前渲染真实 dashboard 内容。",
+			},
+		},
+	},
+};
+
 export const AdminUsersWarmSkeleton: Story = {
 	render: () => <AdminUsersStartupSkeleton me={mockMe} />,
 };
 
 export const AdminJobsWarmSkeleton: Story = {
 	render: () => <AdminJobsStartupSkeleton me={mockMe} />,
+};
+
+export const SettingsWarmSkeleton: Story = {
+	render: () => <SettingsStartupSkeleton me={mockMe} />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"访问 `/settings` 且 chunk 仍在拉取时的轻量 shell-level skeleton，用来避免白屏，同时不回退到 Landing 登录页。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("contentinfo")).toBeVisible();
+		expect(
+			canvasElement.querySelector("[data-app-shell-header]"),
+		).not.toBeNull();
+	},
 };
 
 export const DashboardWarmSkeletonMobile: Story = {
