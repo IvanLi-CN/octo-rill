@@ -542,6 +542,11 @@ async function verifyLaneMenuTouchGuard(page) {
 			.count()) === 0,
 		"lane menu drag promotion should suppress the pending tap/click",
 	);
+	await tapLocator(
+		page,
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
+	await page.waitForSelector("[data-dashboard-mobile-lane-menu-popover]");
 
 	await openLaneSwitchStory(page);
 	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);

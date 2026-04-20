@@ -630,6 +630,7 @@ export function AppShell({
 			if (!isDirectPointer) {
 				return;
 			}
+			clearSuppressedGuardedClick();
 			if (isTouchPointer) {
 				ignoreInteractiveTouchSequenceRef.current = isInteractiveGestureTarget(
 					event.target,
@@ -747,6 +748,7 @@ export function AppShell({
 		};
 
 		const handleTouchStart = (event: TouchEvent) => {
+			clearSuppressedGuardedClick();
 			ignoreInteractiveTouchSequenceRef.current = isInteractiveGestureTarget(
 				event.target,
 			);
