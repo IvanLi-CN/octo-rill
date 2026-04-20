@@ -117,3 +117,4 @@
 | gms6p | 移除公开文档中的 Storybook 导览页 | 已完成 | `gms6p-remove-storybook-guide-page/SPEC.md` | 2026-04-19 | fast-track follow-up to #em5uh; docs-site now links directly to Storybook without guide page |
 | pnzd2 | Dashboard 启动期请求风暴热修复 | 已完成 | `pnzd2-dashboard-startup-request-storm/SPEC.md` | 2026-04-20 | fast-track / dashboard bootstrap request storm hotfix |
 | w5gaz | “我的发布”开关与自有仓库 Release 可见性扩展 | 部分完成（3/4） | `w5gaz-owned-release-opt-in/SPEC.md` | 2026-04-20 | PR #101 open; local implementation + validation + owner-facing evidence landed |
+| 7yr2m | Dashboard 移动端 release 卡片操作收敛 | 部分完成（3/4） | `7yr2m-dashboard-mobile-release-card-action-polish/SPEC.md` | 2026-04-20 | local implementation + storybook/mobile e2e + visual evidence landed; push/PR pending owner screenshot approval |
