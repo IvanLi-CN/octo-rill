@@ -154,7 +154,7 @@ export function useAppToast() {
 
 export function AppToastViewportHost() {
 	const { toasts, dismissToast } = useAppToast();
-	const { headerHeight } = useAppShellChrome();
+	const { headerHeight, viewportTopInset } = useAppShellChrome();
 	const topOffset = headerHeight > 0 ? headerHeight + 12 : 16;
 
 	return (
@@ -199,7 +199,7 @@ export function AppToastViewportHost() {
 			))}
 			<ToastViewport
 				style={{
-					top: `calc(env(safe-area-inset-top, 0px) + ${topOffset}px)`,
+					top: `calc(env(safe-area-inset-top, 0px) + ${viewportTopInset}px + ${topOffset}px)`,
 				}}
 			/>
 		</>
