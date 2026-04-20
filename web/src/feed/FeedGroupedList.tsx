@@ -9,12 +9,15 @@ import {
 } from "react";
 
 import { Markdown } from "@/components/Markdown";
+import { ErrorBubble } from "@/components/feedback/ErrorBubble";
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Button } from "@/components/ui/button";
 import { FeedItems, type FeedCardListProps } from "@/feed/FeedList";
 import {
 	type BriefSnapshotCandidate,
 	groupFeedItemsByDay,
 } from "@/feed/dayGroups";
+import type { FeedLoadError } from "@/feed/useFeed";
 import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 
@@ -305,11 +308,12 @@ function FeedHistoricalDayGroup(props: {
 export function FeedGroupedList(
 	props: FeedCardListProps & {
 		items: FeedItem[];
-		error: string | null;
+		error: FeedLoadError | null;
 		loadingInitial: boolean;
 		loadingMore: boolean;
 		hasMore: boolean;
 		onLoadMore: () => void;
+		onRetryInitial: () => void;
 		mode: "all" | "releases" | "stars" | "followers";
 		briefs: BriefLike[];
 		dailyBoundaryLocal: string | null | undefined;
@@ -327,6 +331,7 @@ export function FeedGroupedList(
 		loadingMore,
 		hasMore,
 		onLoadMore,
+		onRetryInitial,
 		mode,
 		briefs,
 		dailyBoundaryLocal,
@@ -346,9 +351,13 @@ export function FeedGroupedList(
 	const [pendingGroupIds, setPendingGroupIds] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
+	const [loadMoreBubbleOpen, setLoadMoreBubbleOpen] = useState(false);
+	const blockingError =
+		error?.phase === "initial" && items.length === 0 ? error : null;
+	const appendError = error?.phase === "append" ? error : null;
 
 	useEffect(() => {
-		if (!hasMore || loadingInitial || loadingMore) return;
+		if (!hasMore || loadingInitial || loadingMore || appendError) return;
 		const el = sentinelRef.current;
 		if (!el) return;
 
@@ -369,7 +378,13 @@ export function FeedGroupedList(
 
 		obs.observe(el);
 		return () => obs.disconnect();
-	}, [hasMore, loadingInitial, loadingMore, onLoadMore]);
+	}, [appendError, hasMore, loadingInitial, loadingMore, onLoadMore]);
+
+	useEffect(() => {
+		if (appendError) {
+			setLoadMoreBubbleOpen(true);
+		}
+	}, [appendError]);
 
 	const groups = useMemo(
 		() =>
@@ -439,9 +454,16 @@ export function FeedGroupedList(
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
-			{error ? <p className="text-destructive text-sm">{error}</p> : null}
+			{blockingError ? (
+				<ErrorStatePanel
+					title="动态加载失败"
+					summary={blockingError.message}
+					actionLabel="重试"
+					onAction={onRetryInitial}
+				/>
+			) : null}
 
-			{loadingInitial && items.length === 0 ? (
+			{!blockingError && loadingInitial && items.length === 0 ? (
 				<div
 					className="space-y-3 sm:space-y-4"
 					data-feed-loading-skeleton="true"
@@ -619,7 +641,31 @@ export function FeedGroupedList(
 				<p className="text-muted-foreground font-mono text-xs">加载中…</p>
 			) : null}
 
-			{!hasMore && items.length > 0 ? (
+			{appendError ? (
+				<div className="flex justify-center pt-1">
+					<ErrorBubble
+						open={loadMoreBubbleOpen}
+						onOpenChange={setLoadMoreBubbleOpen}
+						title="继续加载失败"
+						summary={appendError.message}
+					>
+						<Button
+							type="button"
+							variant="outline"
+							size="sm"
+							className="font-mono text-xs"
+							onClick={() => {
+								setLoadMoreBubbleOpen(false);
+								onLoadMore();
+							}}
+						>
+							继续加载
+						</Button>
+					</ErrorBubble>
+				</div>
+			) : null}
+
+			{!appendError && !hasMore && items.length > 0 ? (
 				<p className="text-muted-foreground font-mono text-xs">
 					已到尽头（共 {items.length} 条）
 				</p>

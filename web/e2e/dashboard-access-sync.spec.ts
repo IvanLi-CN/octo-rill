@@ -108,6 +108,8 @@ function rectsIntersect(
 test("dashboard keeps sync as a single header action for admins", async ({
 	page,
 }) => {
+	test.slow();
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -1749,4 +1751,285 @@ test("dashboard inbox cards ignore stale repo-homepage html_url values until rep
 	await expect(
 		page.getByRole("link", { name: /Stale repo homepage link/i }).first(),
 	).toHaveAttribute("href", "https://github.com/notifications/threads/90004");
+});
+
+test("dashboard retries the initial sidebar bootstrap after a transient briefs failure", async ({
+	page,
+}) => {
+	let briefsCalls = 0;
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "brief-retry-user",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			briefsCalls += 1;
+			if (briefsCalls === 1) {
+				return json(
+					route,
+					{
+						error: {
+							code: "briefs_temporarily_unavailable",
+							message: "briefs bootstrap failed once",
+						},
+					},
+					503,
+				);
+			}
+
+			return json(route, [
+				{
+					id: "brief-retry-2026-04-09",
+					date: "2026-04-09",
+					window_start: "2026-04-08T08:00:00+08:00",
+					window_end: "2026-04-09T08:00:00+08:00",
+					effective_time_zone: "Asia/Shanghai",
+					effective_local_boundary: "08:00",
+					release_count: 1,
+					release_ids: ["retry-brief-release"],
+					content_markdown: "## 概览\n\n- retry brief loaded\n",
+					created_at: "2026-04-09T08:01:00+08:00",
+				},
+			]);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/?tab=briefs");
+
+	await expect.poll(() => briefsCalls).toBeGreaterThanOrEqual(2);
+	await expect(
+		page.getByRole("button", { name: /#2026-04-09/i }),
+	).toBeVisible();
+});
+
+test("dashboard retries the initial sidebar bootstrap after a transient inbox failure", async ({
+	page,
+}) => {
+	let notificationCalls = 0;
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "inbox-retry-user",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			notificationCalls += 1;
+			if (notificationCalls === 1) {
+				return json(
+					route,
+					{
+						error: {
+							code: "notifications_temporarily_unavailable",
+							message: "notifications bootstrap failed once",
+						},
+					},
+					503,
+				);
+			}
+
+			return json(route, [
+				{
+					thread_id: "93001",
+					repo_full_name: "owner/repo",
+					subject_title: "Recovered inbox thread",
+					subject_type: "PullRequest",
+					reason: "review_requested",
+					updated_at: "2026-04-09T08:02:00Z",
+					unread: 1,
+					html_url: "https://github.com/owner/repo/pull/93001",
+				},
+			]);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/?tab=inbox");
+
+	await expect.poll(() => notificationCalls).toBeGreaterThanOrEqual(2);
+	await expect(page.getByText("Recovered inbox thread").first()).toBeVisible();
+});
+
+test("dashboard reaction dialog keeps PAT status unknown when the PAT status fetch fails", async ({
+	page,
+}) => {
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "reaction-pat-status-user",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, {
+				items: [
+					{
+						...buildReleaseFeedItem("reaction-500"),
+						reactions: buildReactionFooterReady(),
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(
+				route,
+				{
+					error: {
+						code: "pat_status_unavailable",
+						message: "GitHub PAT 状态读取失败，请稍后重试或在这里重新校验。",
+					},
+				},
+				503,
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+
+	await page.locator('[data-reaction-trigger="plus1"]').first().click();
+
+	const dialog = page.getByRole("dialog", { name: "配置 GitHub PAT" });
+	await expect(dialog).toBeVisible();
+	await expect(dialog).toContainText(
+		"GitHub PAT 状态读取失败，请稍后重试或在这里重新校验。",
+	);
+	await expect(dialog).toContainText("GitHub PAT 校验失败");
+	await expect(dialog).not.toContainText("先补齐 GitHub PAT");
 });

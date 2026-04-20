@@ -748,6 +748,9 @@ export type ReleaseDetailTranslated = {
 	status: "ready" | "missing" | "disabled" | "error";
 	title: string | null;
 	summary: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 	auto_translate?: boolean;
 };
 export type ReleaseDetailResponse = {
@@ -825,6 +828,9 @@ export type TranslationResultItem = {
 	summary_md: string | null;
 	body_md: string | null;
 	error: string | null;
+	error_code: string | null;
+	error_summary: string | null;
+	error_detail: string | null;
 	work_item_id: string | null;
 	batch_id: string | null;
 };
@@ -843,14 +849,22 @@ export function isPendingTranslationResultStatus(
 export function mapTranslationResultToReleaseDetailTranslated(
 	result: TranslationResultItem,
 ): ReleaseDetailTranslated | null {
-	if (result.status !== "ready" && result.status !== "disabled") {
+	if (
+		result.status !== "ready" &&
+		result.status !== "disabled" &&
+		result.status !== "missing" &&
+		result.status !== "error"
+	) {
 		return null;
 	}
 	return {
 		lang: "zh-CN",
-		status: result.status === "disabled" ? "disabled" : "ready",
+		status: result.status,
 		title: result.title_zh,
 		summary: result.body_md,
+		error_code: result.error_code,
+		error_summary: result.error_summary,
+		error_detail: result.error_detail,
 	};
 }
 export type TranslationBatchSubmitItemResponse = {
