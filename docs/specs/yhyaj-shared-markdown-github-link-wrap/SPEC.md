@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-21
 - Last: 2026-04-21
 
@@ -138,7 +138,7 @@
 
 - 本地实现、Storybook 证据、Playwright 回归、`bun run lint`、`bun run build` 与 `bun run storybook:build` 均已完成。
 - `codex review --base origin/main` 已收敛到 clear；最后一轮未发现新的离散可执行问题。
-- 下一步仅剩 owner-facing 证据图展示与截图 push 授权；在拿到明确授权前，保持 `部分完成（3/4）`，不推进远端 push / PR。
+- 主人已确认截图资产可以随改动提交；分支已推送，并已创建 ready PR：`#109`。
 
 ## References
 
