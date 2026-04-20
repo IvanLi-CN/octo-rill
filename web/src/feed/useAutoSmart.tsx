@@ -73,8 +73,12 @@ function mapTranslationItemToFeedSmart(item: {
 	summary_md: string | null;
 	body_md?: string | null;
 	error?: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 }): SmartItem | null {
 	const summary = item.body_md ?? item.summary_md;
+	const retrySignal = item.error_detail ?? item.error;
 	switch (item.status) {
 		case "ready":
 			return {
@@ -82,6 +86,9 @@ function mapTranslationItemToFeedSmart(item: {
 				status: "ready",
 				title: item.title_zh,
 				summary,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 			};
 		case "disabled":
 			return {
@@ -89,6 +96,9 @@ function mapTranslationItemToFeedSmart(item: {
 				status: "disabled",
 				title: null,
 				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 			};
 		case "missing":
 			return {
@@ -97,15 +107,21 @@ function mapTranslationItemToFeedSmart(item: {
 					item.error === SMART_INSUFFICIENT_REASON ? "insufficient" : "missing",
 				title: null,
 				summary: null,
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
 				auto_translate: false,
 			};
 		case "error":
 			return {
 				lang: "zh-CN",
-				status: smartErrorIsRetryable(item.error) ? "missing" : "error",
+				status: smartErrorIsRetryable(retrySignal) ? "missing" : "error",
 				title: null,
 				summary: null,
-				auto_translate: smartErrorIsRetryable(item.error),
+				error_code: item.error_code ?? null,
+				error_summary: item.error_summary ?? null,
+				error_detail: item.error_detail ?? null,
+				auto_translate: smartErrorIsRetryable(retrySignal),
 			};
 		default:
 			return null;
@@ -258,7 +274,11 @@ function buildVisibleWindowKeys(
 }
 
 function resultLabel(result: TranslationResultItem) {
-	return result.error ?? `translate returned ${result.status}`;
+	return (
+		result.error_summary ??
+		result.error ??
+		`translate returned ${result.status}`
+	);
 }
 
 function isTerminalTranslationResultStatus(

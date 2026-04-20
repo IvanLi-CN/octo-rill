@@ -1,5 +1,6 @@
 import { Sparkles } from "lucide-react";
 
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import { formatIsoRangeInTimeZone } from "@/lib/datetime";
@@ -36,10 +37,20 @@ export function ReleaseDailyCard(props: {
 	briefs: BriefItem[];
 	selectedId: string | null;
 	busy: boolean;
+	error?: string | null;
 	onGenerate: () => void;
+	onRetry?: () => void;
 	onOpenRelease?: (releaseId: string) => void;
 }) {
-	const { briefs, selectedId, busy, onGenerate, onOpenRelease } = props;
+	const {
+		briefs,
+		selectedId,
+		busy,
+		error = null,
+		onGenerate,
+		onRetry,
+		onOpenRelease,
+	} = props;
 
 	const selected = (() => {
 		if (selectedId) {
@@ -89,7 +100,15 @@ export function ReleaseDailyCard(props: {
 			</CardHeader>
 
 			<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
-				{briefs.length === 0 ? (
+				{error && briefs.length === 0 ? (
+					<ErrorStatePanel
+						title="日报加载失败"
+						summary={error}
+						size="compact"
+						actionLabel={onRetry ? "重试" : undefined}
+						onAction={onRetry}
+					/>
+				) : briefs.length === 0 ? (
 					<p className="text-muted-foreground text-sm">
 						提示：日报会按你保存的“本地整点 + IANA
 						时区”生成快照，历史窗口不会因为之后改设置而漂移。

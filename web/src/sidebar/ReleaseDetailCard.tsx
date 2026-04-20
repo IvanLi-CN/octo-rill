@@ -11,6 +11,8 @@ import {
 	isPendingTranslationResultStatus,
 	mapTranslationResultToReleaseDetailTranslated,
 } from "@/api";
+import { useAppToast } from "@/components/feedback/AppToast";
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Button } from "@/components/ui/button";
@@ -22,11 +24,21 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { formatIsoShortLocal } from "@/lib/datetime";
+import {
+	describeUnknownError,
+	resolveErrorDetail,
+	resolveErrorSummary,
+} from "@/lib/errorPresentation";
 import { normalizeReleaseId } from "@/lib/releaseId";
 
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
+
+type ReleaseDetailUiError = {
+	summary: string;
+	detail?: string | null;
+};
 
 function sleep(ms: number) {
 	return new Promise((resolve) => {
@@ -41,26 +53,97 @@ function isMissingTranslationRequestError(error: unknown) {
 	);
 }
 
+function toUiError(
+	value:
+		| {
+				error?: string | null;
+				error_summary?: string | null;
+				error_detail?: string | null;
+		  }
+		| null
+		| undefined,
+	fallback: string,
+): ReleaseDetailUiError {
+	return {
+		summary: resolveErrorSummary(value, fallback),
+		detail: resolveErrorDetail(value),
+	};
+}
+
+function toUnknownUiError(
+	error: unknown,
+	fallback: string,
+): ReleaseDetailUiError {
+	return {
+		summary: describeUnknownError(error, fallback),
+		detail: error instanceof Error ? error.message : null,
+	};
+}
+
+function hasReadyTranslatedContent(
+	translated: ReleaseDetailResponse["translated"] | null | undefined,
+) {
+	if (translated?.status !== "ready") {
+		return false;
+	}
+	return Boolean(translated.title?.trim() || translated.summary?.trim());
+}
+
 export function ReleaseDetailCard(props: {
 	releaseId: string | null;
 	onClose: () => void;
 }) {
 	const { releaseId, onClose } = props;
+	const { pushErrorToast } = useAppToast();
 	const normalizedReleaseId = useMemo(
 		() => normalizeReleaseId(releaseId),
 		[releaseId],
 	);
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
-	const [loadError, setLoadError] = useState<string | null>(null);
-	const [translateError, setTranslateError] = useState<string | null>(null);
+	const [loadError, setLoadError] = useState<ReleaseDetailUiError | null>(null);
+	const [translateError, setTranslateError] =
+		useState<ReleaseDetailUiError | null>(null);
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const translateRequestSeqRef = useRef(0);
+	const loadRequestSeqRef = useRef(0);
 	const pendingTranslationRequestRef = useRef<{
 		releaseId: string;
 		requestId: string;
 	} | null>(null);
+
+	const loadDetail = useCallback(
+		(targetReleaseId: string, options?: { resetDisplay?: boolean }) => {
+			const requestSeq = loadRequestSeqRef.current + 1;
+			loadRequestSeqRef.current = requestSeq;
+			pendingTranslationRequestRef.current = null;
+			setLoading(true);
+			setLoadError(null);
+			setTranslateError(null);
+			if (options?.resetDisplay !== false) {
+				setShowOriginal(false);
+				setDetail(null);
+			}
+			void apiGetReleaseDetail(targetReleaseId)
+				.then((response) => {
+					if (loadRequestSeqRef.current !== requestSeq) return;
+					setDetail(response);
+				})
+				.catch((error) => {
+					if (loadRequestSeqRef.current !== requestSeq) return;
+					setDetail(null);
+					setLoadError(
+						toUnknownUiError(error, "Release 详情加载失败，请稍后重试。"),
+					);
+				})
+				.finally(() => {
+					if (loadRequestSeqRef.current !== requestSeq) return;
+					setLoading(false);
+				});
+		},
+		[],
+	);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
@@ -72,43 +155,33 @@ export function ReleaseDetailCard(props: {
 			setTranslateError(null);
 			return;
 		}
-		let active = true;
-		pendingTranslationRequestRef.current = null;
-		setDetail(null);
-		setLoading(true);
-		setLoadError(null);
-		setTranslateError(null);
-		setShowOriginal(false);
-		void apiGetReleaseDetail(normalizedReleaseId)
-			.then((res) => {
-				if (!active) return;
-				setDetail(res);
-			})
-			.catch((err) => {
-				if (!active) return;
-				setLoadError(err instanceof Error ? err.message : String(err));
-				setDetail(null);
-			})
-			.finally(() => {
-				if (!active) return;
-				setLoading(false);
-			});
-
-		return () => {
-			active = false;
-		};
-	}, [normalizedReleaseId]);
+		loadDetail(normalizedReleaseId, { resetDisplay: true });
+	}, [loadDetail, normalizedReleaseId]);
 
 	const activeDetail = useMemo(() => {
 		if (!normalizedReleaseId || !detail) return null;
 		return detail.release_id === normalizedReleaseId ? detail : null;
 	}, [detail, normalizedReleaseId]);
 
+	const detailTranslationError = useMemo(() => {
+		if (activeDetail?.translated?.status !== "error") {
+			return null;
+		}
+		return toUiError(activeDetail.translated, "这次翻译没有成功完成。");
+	}, [activeDetail]);
+
+	const activeTranslationError = showOriginal
+		? null
+		: (translateError ?? detailTranslationError);
+
 	const onTranslate = useCallback(() => {
 		if (!activeDetail || translating) return;
 		const requestSeq = translateRequestSeqRef.current + 1;
 		translateRequestSeqRef.current = requestSeq;
 		const requestReleaseId = activeDetail.release_id;
+		const preserveReadyTranslation = hasReadyTranslatedContent(
+			activeDetail.translated,
+		);
 		setTranslating(true);
 		setTranslateError(null);
 		void (async () => {
@@ -156,23 +229,50 @@ export function ReleaseDetailCard(props: {
 				response.result,
 			);
 			if (!translated) {
-				throw new Error(response.result.error ?? "translate failed");
+				throw new Error(resolveErrorSummary(response.result, "翻译失败"));
+			}
+			if (preserveReadyTranslation && translated.status !== "ready") {
+				const failure =
+					translated.status === "disabled"
+						? toUiError(response.result, "AI 未配置，暂时无法重新翻译。")
+						: toUiError(response.result, "翻译失败，请稍后重试。");
+				pushErrorToast(
+					translated.status === "disabled" ? "翻译不可用" : "翻译失败",
+					failure.summary,
+					{ detail: failure.detail },
+				);
+				return;
 			}
 			setDetail((prev) => {
 				if (!prev) return prev;
 				if (prev.release_id !== requestReleaseId) return prev;
 				return { ...prev, translated };
 			});
+			setTranslateError(
+				translated.status === "error"
+					? toUiError(translated, "这次翻译没有成功完成。")
+					: null,
+			);
+			if (translated.status === "ready") {
+				setShowOriginal(false);
+			}
 		})()
-			.catch((err) => {
+			.catch((error) => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
-				setTranslateError(err instanceof Error ? err.message : String(err));
+				if (preserveReadyTranslation) {
+					const failure = toUnknownUiError(error, "翻译失败，请稍后重试。");
+					pushErrorToast("翻译失败", failure.summary, {
+						detail: failure.detail,
+					});
+					return;
+				}
+				setTranslateError(toUnknownUiError(error, "翻译失败，请稍后重试。"));
 			})
 			.finally(() => {
 				if (translateRequestSeqRef.current !== requestSeq) return;
 				setTranslating(false);
 			});
-	}, [activeDetail, translating]);
+	}, [activeDetail, pushErrorToast, translating]);
 
 	const display = useMemo(() => {
 		if (!activeDetail) return null;
@@ -203,11 +303,7 @@ export function ReleaseDetailCard(props: {
 	}, [activeDetail, showOriginal]);
 
 	const hasReadyTranslation = useMemo(() => {
-		if (!activeDetail || activeDetail.translated?.status !== "ready")
-			return false;
-		const titleReady = Boolean(activeDetail.translated.title?.trim());
-		const summaryReady = Boolean(activeDetail.translated.summary?.trim());
-		return titleReady || summaryReady;
+		return hasReadyTranslatedContent(activeDetail?.translated);
 	}, [activeDetail]);
 
 	if (!normalizedReleaseId) {
@@ -249,7 +345,7 @@ export function ReleaseDetailCard(props: {
 											variant="ghost"
 											size="sm"
 											className="font-mono text-xs"
-											onClick={() => setShowOriginal((v) => !v)}
+											onClick={() => setShowOriginal((value) => !value)}
 											disabled={loading || !activeDetail}
 										>
 											<Languages className="size-4" />
@@ -301,36 +397,104 @@ export function ReleaseDetailCard(props: {
 
 				<div className="overflow-y-auto px-6 py-5">
 					{loadError ? (
-						<p className="text-destructive text-sm">{loadError}</p>
+						<ErrorStatePanel
+							title="Release 详情加载失败"
+							summary={loadError.summary}
+							detail={loadError.detail}
+							actions={
+								<div className="flex flex-wrap gap-2">
+									<Button
+										variant="outline"
+										size="sm"
+										className="font-mono text-xs"
+										onClick={() =>
+											loadDetail(normalizedReleaseId, { resetDisplay: true })
+										}
+									>
+										<RefreshCcw className="size-4" />
+										重试
+									</Button>
+								</div>
+							}
+						/>
 					) : loading ? (
 						<p className="text-muted-foreground text-sm">
 							正在加载 release 详情…
 						</p>
-					) : display ? (
-						<div className="space-y-3">
-							{translateError ? (
-								<p className="text-destructive text-xs">{translateError}</p>
-							) : null}
-							<h3 className="text-sm font-semibold tracking-tight">
-								{display.title}
-							</h3>
-							<RepoIdentity
-								repoFullName={activeDetail?.repo_full_name ?? null}
-								repoVisual={activeDetail?.repo_visual ?? null}
-								className="max-w-full"
-								labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-								visualClassName="size-8"
+					) : activeDetail ? (
+						activeTranslationError ? (
+							<ErrorStatePanel
+								title="翻译失败"
+								summary={activeTranslationError.summary}
+								detail={activeTranslationError.detail}
+								actions={
+									<div className="flex flex-wrap gap-2">
+										<Button
+											variant="outline"
+											size="sm"
+											className="font-mono text-xs"
+											onClick={onTranslate}
+											disabled={translating}
+										>
+											<RefreshCcw className="size-4" />
+											{translating ? "翻译中…" : "重试翻译"}
+										</Button>
+										<Button
+											variant="ghost"
+											size="sm"
+											className="font-mono text-xs"
+											onClick={() => setShowOriginal(true)}
+										>
+											<Languages className="size-4" />
+											查看原文
+										</Button>
+										{activeDetail.html_url ? (
+											<Button
+												asChild
+												variant="outline"
+												size="sm"
+												className="font-mono text-xs"
+											>
+												<a
+													href={activeDetail.html_url}
+													target="_blank"
+													rel="noreferrer"
+												>
+													<ArrowUpRight className="size-4" />
+													GitHub
+												</a>
+											</Button>
+										) : null}
+									</div>
+								}
 							/>
-							{display.body ? (
-								<div className="bg-muted/10 rounded-lg border p-4">
-									<Markdown content={display.body} />
-								</div>
-							) : (
-								<p className="text-muted-foreground text-sm">
-									该 release 无正文。
-								</p>
-							)}
-						</div>
+						) : display ? (
+							<div className="space-y-3">
+								<h3 className="text-sm font-semibold tracking-tight">
+									{display.title}
+								</h3>
+								<RepoIdentity
+									repoFullName={activeDetail.repo_full_name ?? null}
+									repoVisual={activeDetail.repo_visual ?? null}
+									className="max-w-full"
+									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+									visualClassName="size-8"
+								/>
+								{display.body ? (
+									<div className="bg-muted/10 rounded-lg border p-4">
+										<Markdown content={display.body} />
+									</div>
+								) : (
+									<p className="text-muted-foreground text-sm">
+										该 release 无正文。
+									</p>
+								)}
+							</div>
+						) : (
+							<p className="text-muted-foreground text-sm">
+								未找到该 release。
+							</p>
+						)
 					) : (
 						<p className="text-muted-foreground text-sm">未找到该 release。</p>
 					)}

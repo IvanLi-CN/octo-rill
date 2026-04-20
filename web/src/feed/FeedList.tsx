@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { FeedItemCard } from "@/feed/FeedItemCard";
 import type {
 	FeedItem,
@@ -7,6 +8,7 @@ import type {
 	FeedViewer,
 	ReactionContent,
 } from "@/feed/types";
+import type { FeedLoadError } from "@/feed/useFeed";
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -72,11 +74,12 @@ export function FeedItems(props: FeedCardListProps) {
 
 export function FeedList(
 	props: FeedCardListProps & {
-		error: string | null;
+		error: FeedLoadError | null;
 		loadingInitial: boolean;
 		loadingMore: boolean;
 		hasMore: boolean;
 		onLoadMore: () => void;
+		onRetryInitial: () => void;
 	},
 ) {
 	const {
@@ -90,13 +93,17 @@ export function FeedList(
 		smartInFlightKeys,
 		registerItemRef,
 		onLoadMore,
+		onRetryInitial,
 		...feedCardProps
 	} = props;
+	const blockingError =
+		error?.phase === "initial" && items.length === 0 ? error : null;
 
 	const sentinelRef = useRef<HTMLDivElement | null>(null);
 
 	useEffect(() => {
-		if (!hasMore || loadingInitial || loadingMore) return;
+		if (!hasMore || loadingInitial || loadingMore || error?.phase === "append")
+			return;
 		const el = sentinelRef.current;
 		if (!el) return;
 
@@ -109,15 +116,22 @@ export function FeedList(
 
 		obs.observe(el);
 		return () => obs.disconnect();
-	}, [hasMore, loadingInitial, loadingMore, onLoadMore]);
+	}, [error?.phase, hasMore, loadingInitial, loadingMore, onLoadMore]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
-			{error ? <p className="text-destructive text-sm">{error}</p> : null}
+			{blockingError ? (
+				<ErrorStatePanel
+					title="动态加载失败"
+					summary={blockingError.message}
+					actionLabel="重试"
+					onAction={onRetryInitial}
+				/>
+			) : null}
 
-			{loadingInitial && items.length === 0 ? (
+			{!blockingError && loadingInitial && items.length === 0 ? (
 				<div
 					className="space-y-3 sm:space-y-4"
 					data-feed-loading-skeleton="true"

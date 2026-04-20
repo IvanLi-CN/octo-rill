@@ -11,6 +11,12 @@ import type {
 import { isReleaseFeedItem } from "@/feed/types";
 
 export type FeedRequestType = "all" | "releases" | "stars" | "followers";
+export type FeedLoadErrorPhase = "initial" | "append";
+export type FeedLoadError = {
+	phase: FeedLoadErrorPhase;
+	message: string;
+	at: number;
+};
 
 function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -100,7 +106,7 @@ export function useFeed(
 	);
 	const [loadingInitial, setLoadingInitial] = useState(!initialStateMatches);
 	const [loadingMore, setLoadingMore] = useState(false);
-	const [error, setError] = useState<string | null>(null);
+	const [error, setError] = useState<FeedLoadError | null>(null);
 
 	const reqIdRef = useRef(0);
 	const isCurrentType = dataType === type;
@@ -137,7 +143,11 @@ export function useFeed(
 			setNextCursor(res.next_cursor);
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
-			setError(err instanceof Error ? err.message : String(err));
+			setError({
+				phase: "initial",
+				message: err instanceof Error ? err.message : String(err),
+				at: Date.now(),
+			});
 		} finally {
 			if (reqId === reqIdRef.current) {
 				setLoadingInitial(false);
@@ -160,7 +170,11 @@ export function useFeed(
 			setNextCursor(res.next_cursor);
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
-			setError(err instanceof Error ? err.message : String(err));
+			setError({
+				phase: "append",
+				message: err instanceof Error ? err.message : String(err),
+				at: Date.now(),
+			});
 		} finally {
 			if (reqId === reqIdRef.current) {
 				setLoadingMore(false);
