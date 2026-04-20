@@ -5,6 +5,7 @@ import {
 	persistDashboardWarmSnapshot,
 	type DashboardWarmSnapshot,
 } from "@/auth/startupCache";
+import { useAppToast } from "@/components/feedback/AppToast";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -42,6 +43,7 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { InternalLink } from "@/lib/internalNavigation";
+import { describeUnknownError } from "@/lib/errorPresentation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
 	type DashboardRouteState,
@@ -79,6 +81,17 @@ type TaskStreamMode = "access" | "refresh";
 type TaskStreamState = {
 	taskId: string;
 	eventPath: string;
+};
+
+type DashboardSectionError = {
+	phase: "initial" | "refresh";
+	message: string;
+	at: number;
+};
+
+type SidebarBootstrapNotificationsError = {
+	kind: "sidebar-bootstrap-notifications";
+	cause: unknown;
 };
 
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
@@ -151,6 +164,17 @@ function sortNotifications(items: NotificationItem[]) {
 		const bt = b.updated_at ?? "";
 		return bt.localeCompare(at);
 	});
+}
+
+function isSidebarBootstrapNotificationsError(
+	error: unknown,
+): error is SidebarBootstrapNotificationsError {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"kind" in error &&
+		error.kind === "sidebar-bootstrap-notifications"
+	);
 }
 
 function parseDashboardQuery() {
@@ -232,6 +256,7 @@ export function Dashboard(props: {
 		onRouteStateChange,
 		warmStart = null,
 	} = props;
+	const { pushErrorToast } = useAppToast();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
@@ -257,7 +282,6 @@ export function Dashboard(props: {
 				}
 			: null;
 
-	const [bootError, setBootError] = useState<string | null>(null);
 	const [busy, setBusy] = useState<string | null>(null);
 	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
 		warmStart ? "warm-cache" : "network",
@@ -356,8 +380,9 @@ export function Dashboard(props: {
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
-	const [reactionTokenConfigured, setReactionTokenConfigured] =
-		useState<boolean>(false);
+	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
+		boolean | null
+	>(null);
 	const [patGuideOpen, setPatGuideOpen] = useState<boolean>(false);
 	const [patGuideMessage, setPatGuideMessage] = useState<string | null>(null);
 	const pendingReactionRef = useRef<{
@@ -401,11 +426,17 @@ export function Dashboard(props: {
 		() => warmStart?.briefs ?? [],
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
+	const [briefsError, setBriefsError] = useState<DashboardSectionError | null>(
+		null,
+	);
+	const [notificationsError, setNotificationsError] =
+		useState<DashboardSectionError | null>(null);
 	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebar || tab === "inbox",
 	);
 	const startupBootstrapRequestedRef = useRef(false);
+	const startupSidebarRetriedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
 		initialNotificationBootstrapRef.current,
 	);
@@ -414,19 +445,53 @@ export function Dashboard(props: {
 		() => !bootedFromWarmStart,
 	);
 	const [notificationsLoading, setNotificationsLoading] = useState(false);
+	const notifyGlobalError = useCallback(
+		(
+			title: string,
+			error: unknown,
+			fallback: string,
+			options?: {
+				actionLabel?: string;
+				onAction?: () => void;
+				detail?: string | null;
+			},
+		) => {
+			pushErrorToast(title, describeUnknownError(error, fallback), {
+				actionLabel: options?.actionLabel,
+				onAction: options?.onAction,
+				detail:
+					options?.detail ?? (error instanceof Error ? error.message : null),
+			});
+		},
+		[pushErrorToast],
+	);
 
-	const loadNotifications = useCallback(async () => {
-		if (notificationsRequestInFlightRef.current) {
-			return;
-		}
-		notificationsRequestInFlightRef.current = true;
-		try {
-			const items = await apiGet<NotificationItem[]>("/api/notifications");
-			setNotifications(sortNotifications(items));
-		} finally {
-			notificationsRequestInFlightRef.current = false;
-		}
-	}, []);
+	const loadNotifications = useCallback(
+		async (phase: DashboardSectionError["phase"] = "initial") => {
+			if (notificationsRequestInFlightRef.current) {
+				return;
+			}
+			notificationsRequestInFlightRef.current = true;
+			setNotificationsError(null);
+			try {
+				const items = await apiGet<NotificationItem[]>("/api/notifications");
+				setNotifications(sortNotifications(items));
+			} catch (error) {
+				const message = describeUnknownError(
+					error,
+					"Inbox 加载失败，请稍后重试。",
+				);
+				setNotificationsError({ phase, message, at: Date.now() });
+				if (phase === "refresh" || notifications.length > 0) {
+					notifyGlobalError("Inbox 刷新失败", error, message);
+				}
+				throw error;
+			} finally {
+				notificationsRequestInFlightRef.current = false;
+			}
+		},
+		[notifications.length, notifyGlobalError],
+	);
 	const refreshSidebar = useCallback(
 		async (options?: {
 			background?: boolean;
@@ -435,23 +500,59 @@ export function Dashboard(props: {
 			if (!options?.background) {
 				setSidebarLoading(true);
 			}
+			setBriefsError(null);
 			try {
-				const [b] = await Promise.all([
+				const phase: DashboardSectionError["phase"] = options?.background
+					? "refresh"
+					: "initial";
+				const [briefsResult, notificationsResult] = await Promise.allSettled([
 					apiGet<BriefItem[]>("/api/briefs"),
 					options?.includeNotifications
-						? loadNotifications()
+						? loadNotifications(phase)
 						: Promise.resolve(),
 				]);
+				if (
+					options?.includeNotifications &&
+					notificationsResult.status === "rejected"
+				) {
+					// `loadNotifications` has already updated inline/global feedback.
+					if (phase === "initial") {
+						throw {
+							kind: "sidebar-bootstrap-notifications",
+							cause: notificationsResult.reason,
+						} satisfies SidebarBootstrapNotificationsError;
+					}
+				}
+				if (briefsResult.status === "rejected") {
+					throw briefsResult.reason;
+				}
+				const b = briefsResult.value;
 				setBriefs(b);
 				setSelectedBriefId((prev) => {
 					if (prev && b.some((x) => x.id === prev)) return prev;
 					return b[0]?.id ?? null;
 				});
+			} catch (error) {
+				if (isSidebarBootstrapNotificationsError(error)) {
+					throw error.cause;
+				}
+				const message = describeUnknownError(
+					error,
+					"日报加载失败，请稍后重试。",
+				);
+				const phase: DashboardSectionError["phase"] = options?.background
+					? "refresh"
+					: "initial";
+				setBriefsError({ phase, message, at: Date.now() });
+				if (phase === "refresh" || briefs.length > 0) {
+					notifyGlobalError("侧栏刷新失败", error, message);
+				}
+				throw error;
 			} finally {
 				setSidebarLoading(false);
 			}
 		},
-		[loadNotifications],
+		[briefs.length, loadNotifications, notifyGlobalError],
 	);
 	const refreshNotifications = useCallback(
 		async (options?: { background?: boolean }) => {
@@ -459,7 +560,7 @@ export function Dashboard(props: {
 				setNotificationsLoading(true);
 			}
 			try {
-				await loadNotifications();
+				await loadNotifications(options?.background ? "refresh" : "initial");
 			} finally {
 				setNotificationsLoading(false);
 			}
@@ -468,7 +569,6 @@ export function Dashboard(props: {
 	);
 
 	const refreshAll = useCallback(async () => {
-		setBootError(null);
 		await Promise.all([
 			refreshFeed(),
 			refreshSidebar({
@@ -530,18 +630,37 @@ export function Dashboard(props: {
 		[ensureTaskWaiter],
 	);
 
-	const run = useCallback(async <T,>(label: string, fn: () => Promise<T>) => {
-		setBusy(label);
-		setBootError(null);
-		try {
-			return await fn();
-		} catch (err) {
-			setBootError(err instanceof Error ? err.message : String(err));
-			throw err;
-		} finally {
-			setBusy(null);
-		}
-	}, []);
+	const run = useCallback(
+		async <T,>(
+			label: string,
+			fn: () => Promise<T>,
+			options?: {
+				errorTitle?: string;
+				fallback?: string;
+				actionLabel?: string;
+				onAction?: () => void;
+			},
+		) => {
+			setBusy(label);
+			try {
+				return await fn();
+			} catch (error) {
+				notifyGlobalError(
+					options?.errorTitle ?? `${label}失败`,
+					error,
+					options?.fallback ?? `${label}失败，请稍后重试。`,
+					{
+						actionLabel: options?.actionLabel,
+						onAction: options?.onAction,
+					},
+				);
+				return null;
+			} finally {
+				setBusy(null);
+			}
+		},
+		[notifyGlobalError],
+	);
 
 	const {
 		register: registerTranslate,
@@ -569,18 +688,22 @@ export function Dashboard(props: {
 		if (startupBootstrapRequestedRef.current) {
 			return;
 		}
-		startupBootstrapRequestedRef.current = true;
-		void refreshSidebar({
-			background: bootedFromWarmStart,
-			includeNotifications: initialNotificationBootstrapRef.current,
-		}).catch((err) => {
-			startupBootstrapRequestedRef.current = false;
-			setBootError(err instanceof Error ? err.message : String(err));
-		});
-		void loadReactionToken().catch((err) => {
-			startupBootstrapRequestedRef.current = false;
-			setBootError(err instanceof Error ? err.message : String(err));
-		});
+		const startSidebarBootstrap = (allowRetry: boolean) => {
+			startupBootstrapRequestedRef.current = true;
+			void refreshSidebar({
+				background: bootedFromWarmStart,
+				includeNotifications: initialNotificationBootstrapRef.current,
+			}).catch(() => {
+				startupBootstrapRequestedRef.current = false;
+				if (!allowRetry || startupSidebarRetriedRef.current) {
+					return;
+				}
+				startupSidebarRetriedRef.current = true;
+				startSidebarBootstrap(false);
+			});
+		};
+		startSidebarBootstrap(true);
+		void loadReactionToken();
 	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
 
 	useEffect(() => {
@@ -592,9 +715,8 @@ export function Dashboard(props: {
 			return;
 		}
 		notificationsBootstrapRequestedRef.current = true;
-		void refreshNotifications({ background: tab !== "inbox" }).catch((err) => {
+		void refreshNotifications({ background: tab !== "inbox" }).catch(() => {
 			notificationsBootstrapRequestedRef.current = false;
-			setBootError(err instanceof Error ? err.message : String(err));
 		});
 	}, [hasDesktopSidebar, refreshNotifications, tab]);
 
@@ -603,16 +725,30 @@ export function Dashboard(props: {
 	}, [pageDefaultLane]);
 
 	useEffect(() => {
+		if (!feed.error) {
+			return;
+		}
+		if (feed.error.phase !== "initial" || feed.items.length === 0) {
+			return;
+		}
+		pushErrorToast("动态刷新失败", feed.error.message);
+	}, [feed.error?.at, feed.error, feed.items.length, pushErrorToast]);
+
+	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
 			return;
 		}
 		if (feed.loadingInitial || feed.items.length === 0) {
 			return;
 		}
-		void primeSmart(feed.items).catch((err) => {
-			setBootError(err instanceof Error ? err.message : String(err));
+		void primeSmart(feed.items).catch((error) => {
+			notifyGlobalError(
+				"智能整理预取失败",
+				error,
+				"智能整理预取失败，请稍后重试。",
+			);
 		});
-	}, [feed.items, feed.loadingInitial, primeSmart, tab]);
+	}, [feed.items, feed.loadingInitial, notifyGlobalError, primeSmart, tab]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;
@@ -625,8 +761,8 @@ export function Dashboard(props: {
 			reconnectTimer = null;
 		};
 		const refreshOnUi = () => {
-			void refreshAll().catch((err) => {
-				setBootError(err instanceof Error ? err.message : String(err));
+			void refreshAll().catch((error) => {
+				notifyGlobalError("页面刷新失败", error, "页面刷新失败，请稍后重试。");
 			});
 		};
 		const parsePayload = (event: MessageEvent<string>): TaskEventPayload => {
@@ -641,7 +777,7 @@ export function Dashboard(props: {
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
 			);
-			setBootError(message);
+			pushErrorToast("同步事件流已断开", message);
 			source.close();
 			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
 			setAccessTaskStream((current) =>
@@ -672,18 +808,23 @@ export function Dashboard(props: {
 				if (payload.status === "succeeded") {
 					try {
 						await refreshAll();
-					} catch (err) {
-						const error = err instanceof Error ? err : new Error(String(err));
-						setBootError(error.message);
+					} catch (error) {
+						const resolvedError =
+							error instanceof Error ? error : new Error(String(error));
+						notifyGlobalError(
+							"同步后刷新失败",
+							resolvedError,
+							"同步已完成，但页面刷新失败，请稍后重试。",
+						);
 						source.close();
-						settleTaskWaiter(completedTaskId, error);
+						settleTaskWaiter(completedTaskId, resolvedError);
 						setAccessTaskStream((current) =>
 							current?.taskId === completedTaskId ? null : current,
 						);
 						return;
 					}
 				} else if (payload.error) {
-					setBootError(payload.error);
+					pushErrorToast("后台同步失败", payload.error);
 				}
 				source.close();
 				settleTaskWaiter(completedTaskId, failed);
@@ -715,7 +856,13 @@ export function Dashboard(props: {
 			source.removeEventListener("task.completed", onCompleted);
 			source.close();
 		};
-	}, [accessTaskStream, refreshAll, settleTaskWaiter]);
+	}, [
+		accessTaskStream,
+		notifyGlobalError,
+		pushErrorToast,
+		refreshAll,
+		settleTaskWaiter,
+	]);
 
 	useEffect(() => {
 		if (refreshTaskStreams.length === 0) return;
@@ -750,7 +897,7 @@ export function Dashboard(props: {
 			};
 			const failStream = (message: string) => {
 				clearReconnectTimer();
-				setBootError(message);
+				pushErrorToast("后台同步事件流异常", message);
 				settleTaskWaiter(task.taskId, new Error(message));
 				close();
 			};
@@ -766,15 +913,20 @@ export function Dashboard(props: {
 					if (payload.status === "succeeded") {
 						try {
 							await refreshAll();
-						} catch (err) {
-							const error = err instanceof Error ? err : new Error(String(err));
-							setBootError(error.message);
-							settleTaskWaiter(completedTaskId, error);
+						} catch (error) {
+							const resolvedError =
+								error instanceof Error ? error : new Error(String(error));
+							notifyGlobalError(
+								"同步后刷新失败",
+								resolvedError,
+								"同步已完成，但页面刷新失败，请稍后重试。",
+							);
+							settleTaskWaiter(completedTaskId, resolvedError);
 							close();
 							return;
 						}
 					} else if (payload.error) {
-						setBootError(payload.error);
+						pushErrorToast("后台同步失败", payload.error);
 					}
 					settleTaskWaiter(completedTaskId, failed);
 					close();
@@ -796,7 +948,13 @@ export function Dashboard(props: {
 				}, TASK_STREAM_RECOVERY_GRACE_MS);
 			};
 		}
-	}, [refreshTaskStreams, refreshAll, settleTaskWaiter]);
+	}, [
+		notifyGlobalError,
+		pushErrorToast,
+		refreshTaskStreams,
+		refreshAll,
+		settleTaskWaiter,
+	]);
 
 	useEffect(() => {
 		return () => {
@@ -813,19 +971,23 @@ export function Dashboard(props: {
 
 	const onTranslateNow = useCallback(
 		(item: FeedItem) => {
-			void translateNow(item).catch((err) => {
-				setBootError(err instanceof Error ? err.message : String(err));
+			void translateNow(item).catch((error) => {
+				notifyGlobalError("翻译触发失败", error, "翻译触发失败，请稍后重试。");
 			});
 		},
-		[translateNow],
+		[notifyGlobalError, translateNow],
 	);
 	const onSmartNow = useCallback(
 		(item: FeedItem) => {
-			void smartNow(item).catch((err) => {
-				setBootError(err instanceof Error ? err.message : String(err));
+			void smartNow(item).catch((error) => {
+				notifyGlobalError(
+					"智能整理触发失败",
+					error,
+					"智能整理触发失败，请稍后重试。",
+				);
 			});
 		},
-		[smartNow],
+		[notifyGlobalError, smartNow],
 	);
 	const requestLaneIfNeeded = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
@@ -838,8 +1000,12 @@ export function Dashboard(props: {
 					(item.translated?.status === "error" &&
 						item.translated?.auto_translate !== false))
 			) {
-				void translateNow(item).catch((err) => {
-					setBootError(err instanceof Error ? err.message : String(err));
+				void translateNow(item).catch((error) => {
+					notifyGlobalError(
+						"翻译触发失败",
+						error,
+						"翻译触发失败，请稍后重试。",
+					);
 				});
 			}
 			if (
@@ -848,12 +1014,16 @@ export function Dashboard(props: {
 					(item.smart?.status === "error" &&
 						item.smart?.auto_translate !== false))
 			) {
-				void smartNow(item).catch((err) => {
-					setBootError(err instanceof Error ? err.message : String(err));
+				void smartNow(item).catch((error) => {
+					notifyGlobalError(
+						"智能整理触发失败",
+						error,
+						"智能整理触发失败，请稍后重试。",
+					);
 				});
 			}
 		},
-		[smartNow, translateNow],
+		[notifyGlobalError, smartNow, translateNow],
 	);
 	const onSelectLane = useCallback(
 		(item: FeedItem, lane: FeedLane) => {
@@ -1061,9 +1231,16 @@ export function Dashboard(props: {
 
 	const onToggleReaction = useCallback(
 		(item: FeedItem, content: ReactionContent) => {
-			if (!reactionTokenConfigured) {
+			if (reactionTokenConfigured !== true) {
 				if (!isReleaseFeedItem(item)) return;
-				openPatDialog("先补齐 GitHub PAT，才能继续使用站内反馈。", {
+				const message =
+					reactionTokenConfigured === false
+						? "先补齐 GitHub PAT，才能继续使用站内反馈。"
+						: patCheckState === "error"
+							? (patCheckMessage ??
+								"GitHub PAT 状态读取失败，请稍后重试或在这里重新校验。")
+							: "正在读取 GitHub PAT 状态，请稍后再试。";
+				openPatDialog(message, {
 					releaseId: item.id,
 					content,
 				});
@@ -1071,7 +1248,13 @@ export function Dashboard(props: {
 			}
 			performReactionToggle(item, content);
 		},
-		[openPatDialog, performReactionToggle, reactionTokenConfigured],
+		[
+			openPatDialog,
+			patCheckMessage,
+			patCheckState,
+			performReactionToggle,
+			reactionTokenConfigured,
+		],
 	);
 
 	useEffect(
@@ -1085,37 +1268,62 @@ export function Dashboard(props: {
 	);
 
 	const onGenerateBrief = useCallback(() => {
-		void run("Generate brief", async () => {
-			await apiPost<BriefGenerateResponse>("/api/briefs/generate");
-			await refreshSidebar();
-		});
+		void run(
+			"Generate brief",
+			async () => {
+				await apiPost<BriefGenerateResponse>("/api/briefs/generate");
+				await refreshSidebar();
+			},
+			{
+				errorTitle: "日报生成失败",
+				fallback: "日报生成失败，请稍后重试。",
+			},
+		);
 	}, [refreshSidebar, run]);
 	const onGenerateBriefForDate = useCallback(
 		async (date: string) => {
-			setBootError(null);
-			await apiPostJson<BriefGenerateResponse>("/api/briefs/generate", {
-				date,
-			});
-			await refreshSidebar();
+			try {
+				await apiPostJson<BriefGenerateResponse>("/api/briefs/generate", {
+					date,
+				});
+				await refreshSidebar();
+			} catch (error) {
+				notifyGlobalError("日报生成失败", error, "日报生成失败，请稍后重试。");
+				throw error;
+			}
 		},
-		[refreshSidebar],
+		[notifyGlobalError, refreshSidebar],
 	);
 	const onSyncInbox = useCallback(() => {
-		void run("Sync inbox", async () => {
-			const task = await apiPost<TaskAcceptedResponse>(
-				"/api/sync/notifications?return_mode=task_id",
-			);
-			await trackTaskStream(task, "refresh");
-		});
+		void run(
+			"Sync inbox",
+			async () => {
+				const task = await apiPost<TaskAcceptedResponse>(
+					"/api/sync/notifications?return_mode=task_id",
+				);
+				await trackTaskStream(task, "refresh");
+			},
+			{
+				errorTitle: "Inbox 同步失败",
+				fallback: "Inbox 同步失败，请稍后重试。",
+			},
+		);
 	}, [run, trackTaskStream]);
 
 	const onSyncAll = useCallback(() => {
-		void run(SYNC_ALL_LABEL, async () => {
-			const task = await apiPost<TaskAcceptedResponse>(
-				"/api/sync/all?return_mode=task_id",
-			);
-			await trackTaskStream(task, "access");
-		});
+		void run(
+			SYNC_ALL_LABEL,
+			async () => {
+				const task = await apiPost<TaskAcceptedResponse>(
+					"/api/sync/all?return_mode=task_id",
+				);
+				await trackTaskStream(task, "access");
+			},
+			{
+				errorTitle: "全量同步失败",
+				fallback: "全量同步失败，请稍后重试。",
+			},
+		);
 	}, [run, trackTaskStream]);
 	const syncingAll = busy === SYNC_ALL_LABEL;
 	const syncingInbox = busy === "Sync inbox";
@@ -1165,9 +1373,13 @@ export function Dashboard(props: {
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
 		const filteredItems = filterFeedItemsForTab(feed.items, mode);
+		const blockingFeedError =
+			feed.error?.phase === "initial" && filteredItems.length === 0;
 		return (
 			<>
-				{!feed.loadingInitial && filteredItems.length === 0 ? (
+				{!blockingFeedError &&
+				!feed.loadingInitial &&
+				filteredItems.length === 0 ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 						{accessSyncStage === "waiting" ||
 						accessSyncStage === "star_refreshed" ? (
@@ -1218,6 +1430,7 @@ export function Dashboard(props: {
 					smartInFlightKeys={smartInFlightKeys}
 					registerItemRef={registerFeedItem}
 					onLoadMore={feed.loadMore}
+					onRetryInitial={feed.loadInitial}
 					selectedLaneByKey={Object.fromEntries(
 						filteredItems.map((item) => [
 							feedItemKey(item),
@@ -1377,10 +1590,6 @@ export function Dashboard(props: {
 			mobileChrome
 		>
 			<div data-dashboard-hydration-source={hydrationSource}>
-				{bootError ? (
-					<p className="text-destructive mb-4 text-sm">{bootError}</p>
-				) : null}
-
 				<Tabs
 					value={tab}
 					onValueChange={(nextTab) => onSelectTab(nextTab as Tab)}
@@ -1444,7 +1653,18 @@ export function Dashboard(props: {
 									briefs={briefs}
 									selectedId={selectedBriefId}
 									busy={busy === "Generate brief"}
+									error={
+										briefsError?.phase === "initial"
+											? briefsError.message
+											: null
+									}
 									onGenerate={onGenerateBrief}
+									onRetry={() =>
+										void refreshSidebar({
+											includeNotifications:
+												hasDesktopSidebar || tab === "inbox",
+										})
+									}
 									onOpenRelease={onOpenReleaseDetail}
 								/>
 							</TabsContent>
@@ -1454,7 +1674,15 @@ export function Dashboard(props: {
 									loading={notificationsLoading}
 									busy={Boolean(busy)}
 									syncing={syncingInbox}
+									error={
+										notificationsError?.phase === "initial"
+											? notificationsError.message
+											: null
+									}
 									onSync={tab === "inbox" ? onSyncInbox : undefined}
+									onRetry={() =>
+										void refreshNotifications({ background: false })
+									}
 								/>
 							</TabsContent>
 						</section>
@@ -1540,9 +1768,11 @@ export function Dashboard(props: {
 												? "GitHub PAT 无效"
 												: patCheckState === "error"
 													? "GitHub PAT 校验失败"
-													: reactionTokenConfigured
+													: reactionTokenConfigured === true
 														? "已保存 GitHub PAT"
-														: "还没有可用的 GitHub PAT"}
+														: reactionTokenConfigured === false
+															? "还没有可用的 GitHub PAT"
+															: "正在读取 GitHub PAT 状态"}
 								</p>
 								<p className="text-muted-foreground mt-1 text-xs leading-5">
 									{patCheckMessage ??

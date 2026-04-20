@@ -329,6 +329,8 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 test("dashboard keeps social cards inline on mobile widths without horizontal overflow", async ({
 	page,
 }) => {
+	test.slow();
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());

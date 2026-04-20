@@ -13,6 +13,9 @@ export type TranslatedItem = {
 	status: TranslatedStatus;
 	title: string | null;
 	summary: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 	auto_translate?: boolean;
 };
 
@@ -21,6 +24,9 @@ export type SmartItem = {
 	status: SmartStatus;
 	title: string | null;
 	summary: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 	auto_translate?: boolean;
 };
 
