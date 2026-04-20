@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-21
 - Last: 2026-04-21
 
@@ -96,7 +96,11 @@
 - [x] M1: 创建并冻结持久 session 规格与文档入口。
 - [x] M2: 后端 session layer 支持 30 天不活跃滑动过期与固定 cookie 名。
 - [x] M3: 前端 startup cache 语义与公开配置文档同步收口。
-- [ ] M4: 验证、review-loop、PR 合并与 cleanup 完成。
+- [x] M4: 验证、review-loop、PR 合并与 cleanup 完成。
+
+## 交付记录
+
+- PR: #110 `fix: persist GitHub session cookies`
 
 ## 风险 / 假设
 
