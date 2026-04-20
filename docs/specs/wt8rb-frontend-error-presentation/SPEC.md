@@ -174,13 +174,6 @@ PR: include
 ![Feed initial failure storybook evidence](./assets/feed-initial-failure-storybook.png)
 
 - source_type: storybook_canvas
-  story_id_or_title: Pages/Dashboard · Evidence / Reaction Error Bubble
-  state: reaction 局部失败锚定在控制组附近
-  evidence_note: 验证内容仍保留可读时，错误气泡锚定在当前按钮附近，而不是回退到全局顶部错误条。
-
-![Reaction error bubble storybook evidence](./assets/reaction-error-bubble-storybook.png)
-
-- source_type: storybook_canvas
   story_id_or_title: Pages/Dashboard · Evidence / Release Detail Translation Failure
   state: release detail 翻译失败正文区替换
   evidence_note: 验证 release detail modal 在翻译失败时切换为正文区 ErrorStatePanel，并保留重试、查看原文与 GitHub 动作。
