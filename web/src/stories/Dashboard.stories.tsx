@@ -200,7 +200,12 @@ function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 function defaultLaneForItem(
 	item: FeedItem,
 	pageDefaultLane: FeedLane,
+	allowItemOverride = true,
+	selectedLane?: FeedLane,
 ): FeedLane {
+	if (allowItemOverride && selectedLane) {
+		return resolvePreferredLaneForItem(item, selectedLane);
+	}
 	return resolvePreferredLaneForItem(item, pageDefaultLane);
 }
 
@@ -1380,6 +1385,7 @@ function DashboardPreview(props: {
 	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
 		initialReleaseId,
 	);
+	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
@@ -1539,8 +1545,12 @@ function DashboardPreview(props: {
 				selectedLaneByKey={Object.fromEntries(
 					filteredItems.map((item) => [
 						feedItemKey(item),
-						selectedLaneByKey[feedItemKey(item)] ??
-							defaultLaneForItem(item, pageDefaultLane),
+						defaultLaneForItem(
+							item,
+							pageDefaultLane,
+							allowReleaseItemLaneOverride,
+							selectedLaneByKey[feedItemKey(item)],
+						),
 					]),
 				)}
 				onSelectLane={(item, lane) =>
@@ -2760,6 +2770,70 @@ export const PageDefaultLaneSwitching: Story = {
 		await canvas.getByRole("button", { name: "原文" }).click();
 		await expect(
 			canvas.getByRole("heading", { name: "v2.63.0" }),
+		).toBeVisible();
+	},
+};
+
+export const MobileReleaseCardActionPolish: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "default",
+	},
+	parameters: {
+		viewport: {
+			defaultViewport: "dashboardMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"移动端 release 卡片收起单卡内容切换，统一只保留顶部页面级阅读模式入口；GitHub 打开方式收敛到卡片右上角的 icon-only 链接。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		const releaseCard =
+			canvasElement.querySelector<HTMLElement>('[data-slot="card"]');
+		if (!releaseCard) {
+			throw new Error("Expected a release card in mobile story");
+		}
+		const releaseCardCanvas = within(releaseCard);
+		await expect(
+			releaseCardCanvas.queryByRole("tab", { name: "翻译" }),
+		).not.toBeInTheDocument();
+		await expect(
+			releaseCardCanvas.queryByRole("button", { name: "GitHub" }),
+		).not.toBeInTheDocument();
+
+		const mobileGithubLink = releaseCard.querySelector<HTMLElement>(
+			'[data-feed-mobile-github-link="true"]',
+		);
+		const title = releaseCardCanvas.getByRole("heading", {
+			name: "v2.63.0 · 版本变化",
+		});
+		if (!mobileGithubLink) {
+			throw new Error("Expected mobile GitHub icon link");
+		}
+		const githubRect = mobileGithubLink.getBoundingClientRect();
+		const titleRect = title.getBoundingClientRect();
+		expect(Math.round(githubRect.width)).toBeLessThanOrEqual(36);
+		expect(githubRect.top).toBeLessThan(titleRect.top);
+
+		const laneMenuTrigger = canvasElement.querySelector<HTMLElement>(
+			"[data-dashboard-mobile-lane-menu-trigger]",
+		);
+		if (!laneMenuTrigger) {
+			throw new Error("Expected mobile lane menu trigger");
+		}
+		await userEvent.click(laneMenuTrigger);
+		await userEvent.click(
+			await canvas.findByRole("menuitemradio", { name: "翻译" }),
+		);
+		await expect(
+			releaseCardCanvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
 		).toBeVisible();
 	},
 };

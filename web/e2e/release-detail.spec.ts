@@ -1214,6 +1214,48 @@ test("feed translated tab triggers on-demand translation when data was not prehe
 	).toBe(true);
 });
 
+test("mobile release cards hide per-card lane tabs and keep GitHub as a top-right icon link", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	const releaseId = makeAutoTranslateReleaseId(0);
+	await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateInitialReadyIds: [releaseId],
+		smartInitialReadyIds: [releaseId],
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+
+	const releaseCard = page.locator('[data-slot="card"]').first();
+	await expect(releaseCard).toBeVisible();
+	await expect(
+		releaseCard.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+	).toBeVisible();
+	await expect(releaseCard.getByRole("tab", { name: "翻译" })).toHaveCount(0);
+	await expect(releaseCard.getByRole("button", { name: "GitHub" })).toHaveCount(
+		0,
+	);
+
+	const mobileGithubLink = releaseCard.locator(
+		'[data-feed-mobile-github-link="true"]',
+	);
+	await expect(mobileGithubLink).toBeVisible();
+	const githubBox = await mobileGithubLink.boundingBox();
+	expect(githubBox?.width ?? 0).toBeLessThanOrEqual(36);
+
+	await page.locator("[data-dashboard-mobile-lane-menu-trigger]").click();
+	await page.getByRole("menuitemradio", { name: "翻译" }).click();
+	await expect(
+		releaseCard.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
+});
+
 test("feed smart insufficient result collapses the card to version-only mode", async ({
 	page,
 }) => {

@@ -942,34 +942,51 @@ function ReleaseFeedCard(props: {
 			)}
 		>
 			<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
-				<div className="min-w-0">
-					<div className="flex flex-wrap items-center gap-2">
-						{item.unread ? (
-							<span className="inline-flex items-center gap-1 text-[11px] font-medium">
-								<span className="size-1.5 rounded-full bg-primary" />
-								<span className="text-muted-foreground">未读</span>
-							</span>
-						) : null}
+				<div className="min-w-0 flex-1">
+					<div className="flex items-start gap-2">
+						<div className="min-w-0 flex-1">
+							<div className="flex flex-wrap items-center gap-2">
+								{item.unread ? (
+									<span className="inline-flex items-center gap-1 text-[11px] font-medium">
+										<span className="size-1.5 rounded-full bg-primary" />
+										<span className="text-muted-foreground">未读</span>
+									</span>
+								) : null}
 
-						<RepoIdentity
-							repoFullName={item.repo_full_name}
-							repoVisual={item.repo_visual}
-							className="min-w-0 min-h-8"
-							labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-							visualClassName="size-8"
-						/>
+								<RepoIdentity
+									repoFullName={item.repo_full_name}
+									repoVisual={item.repo_visual}
+									className="min-w-0 min-h-8"
+									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+									visualClassName="size-8"
+								/>
+							</div>
+
+							<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
+								{displayTitle}
+							</CardTitle>
+							<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
+								{formatIsoShortLocal(item.ts)}
+								{subtitle ? ` · ${subtitle}` : ""}
+							</p>
+						</div>
+
+						<a
+							href={item.html_url ?? "#"}
+							target="_blank"
+							rel="noreferrer"
+							aria-label="GitHub"
+							title="GitHub"
+							data-feed-mobile-github-link="true"
+							className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 sm:hidden"
+						>
+							<ArrowUpRight className="size-4" />
+							<span className="sr-only">GitHub</span>
+						</a>
 					</div>
-
-					<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
-						{displayTitle}
-					</CardTitle>
-					<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
-						{formatIsoShortLocal(item.ts)}
-						{subtitle ? ` · ${subtitle}` : ""}
-					</p>
 				</div>
 
-				<div className="flex flex-wrap items-center gap-2 sm:justify-end">
+				<div className="hidden flex-wrap items-center gap-2 sm:flex sm:justify-end">
 					{isVersionOnly ? null : (
 						<FeedCardLaneTabs
 							activeLane={activeLane}
