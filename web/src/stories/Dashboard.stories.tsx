@@ -1717,6 +1717,7 @@ function DashboardPreview(props: {
 								<Input
 									id="story-pat-input"
 									type="password"
+									autoComplete="new-password"
 									value="ghp_example_valid_token"
 									readOnly
 									className="h-10 font-mono text-sm"
@@ -2481,6 +2482,13 @@ export const PatDialogOpen: Story = {
 				story: "直接展示 reaction fallback 快速补录 GitHub PAT 的弹层状态。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByLabelText("GitHub PAT")).toHaveAttribute(
+			"autocomplete",
+			"new-password",
+		);
 	},
 };
 

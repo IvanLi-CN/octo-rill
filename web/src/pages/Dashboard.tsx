@@ -1555,6 +1555,7 @@ export function Dashboard(props: {
 								<Input
 									id="dashboard-reaction-pat"
 									type="password"
+									autoComplete="new-password"
 									value={patInput}
 									onChange={(event) => setPatInput(event.target.value)}
 									placeholder="粘贴 classic PAT"
