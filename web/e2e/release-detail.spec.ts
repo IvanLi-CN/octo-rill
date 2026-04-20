@@ -39,8 +39,13 @@ type ApiOptions = {
 	smartInitialReadyIds?: string[];
 	smartInitialErrorIds?: string[];
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
+	smartResolveErrors?: Record<string, TranslationErrorPayload>;
 	smartResolveDelayMs?: number;
 	releaseDetailPendingPolls?: number;
+	releaseDetailInitialStatus?: "ready" | "missing" | "error";
+	releaseDetailInitialError?: TranslationErrorPayload;
+	releaseDetailRequestStatus?: "ready" | "error" | "disabled";
+	releaseDetailRequestError?: TranslationErrorPayload;
 };
 
 type MockApiTracker = {
@@ -50,6 +55,13 @@ type MockApiTracker = {
 	}>;
 	translationBatchEntityIds: string[][];
 	translationSingleEntityIds: string[];
+};
+
+type TranslationErrorPayload = {
+	error?: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
 };
 
 function json(route: Route, payload: unknown, status = 200) {
@@ -216,8 +228,12 @@ function makeFeedTranslationPayload(
 function makeFeedSmartPayload(
 	releaseId: string,
 	status: "ready" | "missing" | "error" = "ready",
+	options?: {
+		errorPayload?: TranslationErrorPayload;
+	},
 ) {
 	const insufficient = status === "missing";
+	const errorPayload = options?.errorPayload;
 	return {
 		producer_ref: `feed.smart:release:${releaseId}`,
 		entity_id: releaseId,
@@ -232,12 +248,74 @@ function makeFeedSmartPayload(
 				: null,
 		error:
 			status === "error"
-				? "smart summary failed"
+				? (errorPayload?.error ?? "smart summary failed")
 				: insufficient
 					? "no_valuable_version_info"
 					: null,
+		error_code: status === "error" ? (errorPayload?.error_code ?? null) : null,
+		error_summary:
+			status === "error" ? (errorPayload?.error_summary ?? null) : null,
+		error_detail:
+			status === "error" ? (errorPayload?.error_detail ?? null) : null,
 		work_item_id: `work-smart-${releaseId}`,
 		batch_id: `batch-smart-${releaseId}`,
+	};
+}
+
+function makeReleaseDetailTranslatedPayload(
+	cfg: ApiOptions,
+	status: "ready" | "missing" | "error",
+) {
+	if (status === "ready") {
+		return {
+			lang: "zh-CN",
+			status: "ready" as const,
+			title: cfg.translatedTitle,
+			summary: cfg.translatedSummary,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
+		};
+	}
+	const errorPayload = cfg.releaseDetailInitialError;
+	return {
+		lang: "zh-CN",
+		status,
+		title: null,
+		summary: null,
+		error_code: status === "error" ? (errorPayload?.error_code ?? null) : null,
+		error_summary:
+			status === "error" ? (errorPayload?.error_summary ?? null) : null,
+		error_detail:
+			status === "error" ? (errorPayload?.error_detail ?? null) : null,
+	};
+}
+
+function makeReleaseDetailRequestResult(
+	cfg: ApiOptions,
+	status: "queued" | "running" | "ready" | "error" | "disabled",
+) {
+	const errorPayload = cfg.releaseDetailRequestError;
+	return {
+		producer_ref: `release_detail:${cfg.releaseId}`,
+		entity_id: cfg.releaseId,
+		kind: "release_detail",
+		variant: "detail_card",
+		status,
+		title_zh: status === "ready" ? cfg.translatedTitle : null,
+		summary_md: null,
+		body_md: status === "ready" ? cfg.translatedSummary : null,
+		error:
+			status === "error"
+				? (errorPayload?.error ?? "translate returned error")
+				: null,
+		error_code: status === "error" ? (errorPayload?.error_code ?? null) : null,
+		error_summary:
+			status === "error" ? (errorPayload?.error_summary ?? null) : null,
+		error_detail:
+			status === "error" ? (errorPayload?.error_detail ?? null) : null,
+		work_item_id: "work-detail-1",
+		batch_id: "batch-detail-1",
 	};
 }
 
@@ -262,6 +340,8 @@ async function installApiMocks(
 		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
 		briefCreatedAt: "2026-02-23T08:00:00Z",
 		releaseDetailPendingPolls: 0,
+		releaseDetailInitialStatus: "missing",
+		releaseDetailRequestStatus: "ready",
 		autoTranslateFeedCount: 18,
 		...options,
 	};
@@ -483,12 +563,10 @@ async function installApiMocks(
 				published_at: cfg.detailPublishedAt,
 				is_prerelease: 0,
 				is_draft: 0,
-				translated: {
-					lang: "zh-CN",
-					status: "missing",
-					title: null,
-					summary: null,
-				},
+				translated: makeReleaseDetailTranslatedPayload(
+					cfg,
+					cfg.releaseDetailInitialStatus ?? "missing",
+				),
 			});
 		}
 
@@ -523,6 +601,9 @@ async function installApiMocks(
 						return makeFeedSmartPayload(
 							entityId,
 							cfg.smartResolveStatuses?.[entityId] ?? "ready",
+							{
+								errorPayload: cfg.smartResolveErrors?.[entityId],
+							},
 						);
 					}
 					return makeFeedTranslationPayload(
@@ -565,49 +646,46 @@ async function installApiMocks(
 					request_id: requestId,
 					status: isPendingReleaseDetail ? "running" : "completed",
 					result: {
-						producer_ref:
-							item.producer_ref ??
-							(item.kind === "release_detail"
-								? `release_detail:${cfg.releaseId}`
-								: item.kind === "release_smart"
-									? `feed.smart:release:${cfg.releaseId}`
-									: `feed.auto_translate:release:${cfg.releaseId}`),
-						entity_id: cfg.releaseId,
-						kind: item.kind ?? "release_summary",
-						variant:
-							item.variant ??
-							(item.kind === "release_smart" ? "feed_card" : "feed_body"),
-						status: isPendingReleaseDetail ? "running" : "ready",
-						title_zh: isPendingReleaseDetail
-							? null
+						...(item.kind === "release_detail"
+							? makeReleaseDetailRequestResult(
+									cfg,
+									isPendingReleaseDetail
+										? "running"
+										: (cfg.releaseDetailRequestStatus ?? "ready"),
+								)
 							: item.kind === "release_smart"
-								? `智能摘要 ${cfg.releaseId}`
-								: cfg.translatedTitle,
-						summary_md:
-							item.kind === "release_detail" ||
-							item.kind === "release_smart" ||
-							isPendingReleaseDetail
-								? null
-								: cfg.translatedSummary,
-						body_md:
-							item.kind === "release_detail" && !isPendingReleaseDetail
-								? cfg.translatedSummary
-								: item.kind === "release_smart" && !isPendingReleaseDetail
-									? `- 智能总结 ${cfg.releaseId} 的版本变化。\n- 方便主人快速读懂 release。`
-									: null,
-						error: null,
-						work_item_id:
-							item.kind === "release_detail"
-								? "work-detail-1"
-								: item.kind === "release_smart"
-									? "work-smart-1"
-									: "work-feed-1",
-						batch_id:
-							item.kind === "release_detail"
-								? "batch-detail-1"
-								: item.kind === "release_smart"
-									? "batch-smart-1"
-									: "batch-feed-1",
+								? {
+										...makeFeedSmartPayload(cfg.releaseId),
+										status: isPendingReleaseDetail ? "running" : "ready",
+										title_zh: isPendingReleaseDetail
+											? null
+											: `智能摘要 ${cfg.releaseId}`,
+										body_md: isPendingReleaseDetail
+											? null
+											: `- 智能总结 ${cfg.releaseId} 的版本变化。\n- 方便主人快速读懂 release。`,
+									}
+								: {
+										producer_ref:
+											item.producer_ref ??
+											`feed.auto_translate:release:${cfg.releaseId}`,
+										entity_id: cfg.releaseId,
+										kind: item.kind ?? "release_summary",
+										variant: item.variant ?? "feed_body",
+										status: isPendingReleaseDetail ? "running" : "ready",
+										title_zh: isPendingReleaseDetail
+											? null
+											: cfg.translatedTitle,
+										summary_md: isPendingReleaseDetail
+											? null
+											: cfg.translatedSummary,
+										body_md: null,
+										error: null,
+										error_code: null,
+										error_summary: null,
+										error_detail: null,
+										work_item_id: "work-feed-1",
+										batch_id: "batch-feed-1",
+									}),
 					},
 				});
 			}
@@ -709,19 +787,12 @@ async function installApiMocks(
 			return json(route, {
 				request_id: requestId,
 				status: isPendingReleaseDetail ? "running" : "completed",
-				result: {
-					producer_ref: `release_detail:${cfg.releaseId}`,
-					entity_id: cfg.releaseId,
-					kind: "release_detail",
-					variant: "detail_card",
-					status: isPendingReleaseDetail ? "running" : "ready",
-					title_zh: isPendingReleaseDetail ? null : cfg.translatedTitle,
-					summary_md: null,
-					body_md: isPendingReleaseDetail ? null : cfg.translatedSummary,
-					error: null,
-					work_item_id: "work-detail-1",
-					batch_id: "batch-detail-1",
-				},
+				result: makeReleaseDetailRequestResult(
+					cfg,
+					isPendingReleaseDetail
+						? "running"
+						: (cfg.releaseDetailRequestStatus ?? "ready"),
+				),
 			});
 		}
 
@@ -808,6 +879,45 @@ test("detail translate keeps polling an in-flight request until the result is re
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
 	await expect(page.getByText("translation wait timeout")).toHaveCount(0);
+});
+
+test("detail translate failure keeps the last ready translation visible and falls back to toast", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseDetailInitialStatus: "ready",
+		releaseDetailRequestStatus: "error",
+		releaseDetailRequestError: {
+			error: "release detail translation failed to preserve markdown structure",
+			error_code: "markdown_structure_mismatch",
+			error_summary: "Markdown 结构校验失败",
+			error_detail:
+				"release detail translation failed to preserve markdown structure",
+		},
+	});
+
+	await page.goto("/?tab=briefs&release=123");
+	await expect(
+		page.getByRole("heading", { name: "发布说明 123" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+	).toBeVisible();
+
+	await page.getByRole("button", { name: "翻译" }).click();
+
+	await expect(
+		page.getByRole("heading", { name: "发布说明 123" }),
+	).toBeVisible();
+	await expect(
+		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
+	).toBeVisible();
+	await expect(page.getByRole("button", { name: "原文" })).toBeVisible();
+	await expect(page.getByRole("button", { name: "查看原文" })).toHaveCount(0);
+	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
+	await expect(
+		page.getByText("Markdown 结构校验失败", { exact: true }),
+	).toBeVisible();
 });
 
 test("reaction fallback lets users configure PAT inline from the dialog", async ({
@@ -1300,6 +1410,48 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 	).toHaveCount(0);
 	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
 	await expect(releaseCard.getByRole("button", { name: /赞/ })).toBeVisible();
+});
+
+test("feed smart localized retryable error falls back to the original card instead of terminal error", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartResolveStatuses: {
+			[releaseId]: "error",
+		},
+		smartResolveErrors: {
+			[releaseId]: {
+				error: "运行时租约失效",
+				error_summary: "运行时租约失效",
+				error_detail: "runtime_lease_expired",
+			},
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_smart") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	await expect(
+		page.getByRole("heading", { name: `Release ${releaseId}` }),
+	).toBeVisible();
+	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试智能整理" })).toHaveCount(
+		0,
+	);
 });
 
 test("feed smart retry treats insufficient result as a successful collapse", async ({

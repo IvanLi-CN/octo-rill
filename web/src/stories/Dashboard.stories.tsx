@@ -31,6 +31,7 @@ import type {
 	SocialFeedItem,
 } from "@/feed/types";
 import { isSocialFeedItem } from "@/feed/types";
+import type { FeedLoadError } from "@/feed/useFeed";
 import { InboxList } from "@/inbox/InboxList";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { InternalLink } from "@/lib/internalNavigation";
@@ -1297,6 +1298,8 @@ function DashboardPreview(props: {
 	deferredFeedTabs?: Tab[];
 	initialFeedTabLoading?: Tab | null;
 	deferredFeedLoadDelayMs?: number;
+	feedError?: FeedLoadError | null;
+	reactionErrorByKey?: Record<string, string>;
 }) {
 	const {
 		initialTab = "all",
@@ -1317,6 +1320,8 @@ function DashboardPreview(props: {
 		deferredFeedTabs = [],
 		initialFeedTabLoading = null,
 		deferredFeedLoadDelayMs = 1400,
+		feedError = null,
+		reactionErrorByKey = {},
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail);
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
@@ -1497,8 +1502,12 @@ function DashboardPreview(props: {
 		const isActiveMode = tab === mode;
 		const loadingInitial = isActiveMode && pendingFeedTab === mode;
 		const filteredItems = loadingInitial ? [] : visibleItems(mode);
+		const blockingFeedError =
+			feedError?.phase === "initial" && filteredItems.length === 0;
 
-		return filteredItems.length === 0 && !loadingInitial ? (
+		return filteredItems.length === 0 &&
+			!loadingInitial &&
+			!blockingFeedError ? (
 			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
 				{emptyState === "auto-sync" ? (
 					<>
@@ -1534,7 +1543,7 @@ function DashboardPreview(props: {
 				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
 				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
 				now={now}
-				error={null}
+				error={feedError}
 				loadingInitial={loadingInitial}
 				loadingMore={false}
 				hasMore={false}
@@ -1542,6 +1551,7 @@ function DashboardPreview(props: {
 				smartInFlightKeys={smartInFlightKeys}
 				registerItemRef={() => () => {}}
 				onLoadMore={() => {}}
+				onRetryInitial={() => {}}
 				selectedLaneByKey={Object.fromEntries(
 					filteredItems.map((item) => [
 						feedItemKey(item),
@@ -1562,7 +1572,7 @@ function DashboardPreview(props: {
 				onTranslateNow={() => {}}
 				onSmartNow={triggerSmartNow}
 				reactionBusyKeys={reactionBusyKeys}
-				reactionErrorByKey={{}}
+				reactionErrorByKey={reactionErrorByKey}
 				onToggleReaction={() => {}}
 				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
 				onGenerateBriefForDate={
@@ -3465,5 +3475,103 @@ export const OwnerReleasesEvidenceAllTab: Story = {
 					"用于视觉验收：`我的发布` 开启后，owner-only release 会直接出现在 `全部` 时间线。",
 			},
 		},
+	},
+};
+
+const releaseDetailTranslationError: ReleaseDetailResponse = {
+	...longReleaseDetail,
+	translated: {
+		lang: "zh-CN",
+		status: "error",
+		title: null,
+		summary: null,
+		error_code: "markdown_structure_mismatch",
+		error_summary: "Markdown 结构校验失败",
+		error_detail:
+			"release detail translation failed to preserve markdown structure",
+	},
+};
+
+export const ErrorFeedInitialFailure: Story = {
+	name: "Evidence / Feed Initial Failure Surface",
+	render: () => (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={[]}
+			feedError={{
+				phase: "initial",
+				message: "动态列表拉取失败，请稍后重试。",
+				at: 1,
+			}}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("动态加载失败")).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "重试" })).toBeVisible();
+	},
+};
+
+export const ErrorReactionBubble: Story = {
+	name: "Evidence / Reaction Error Bubble",
+	render: () => {
+		const item = buildFeedItem("error-reaction", {
+			reactions: {
+				counts: {
+					plus1: 2,
+					laugh: 0,
+					heart: 1,
+					hooray: 0,
+					rocket: 0,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: false,
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: false,
+					eyes: false,
+				},
+				status: "ready",
+			},
+		});
+		return (
+			<DashboardPreview
+				initialTab="releases"
+				feedItems={[item]}
+				reactionErrorByKey={{
+					[feedItemKey(item)]: "该仓库限制了站内反馈，请在 GitHub 页面操作。",
+				}}
+			/>
+		);
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			canvas.getByRole("button", { name: "反馈失败" }),
+		).toBeVisible();
+		await expect(body.getByText("反馈提交失败")).toBeVisible();
+		await expect(
+			body.getByText("该仓库限制了站内反馈，请在 GitHub 页面操作。"),
+		).toBeVisible();
+	},
+};
+
+export const ErrorReleaseDetailTranslationFailure: Story = {
+	name: "Evidence / Release Detail Translation Failure",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			initialReleaseId={LONG_BRIEF_RELEASE_ID}
+			releaseDetail={releaseDetailTranslationError}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(body.getByText("翻译失败")).toBeVisible();
+		await expect(body.getByText("Markdown 结构校验失败")).toBeVisible();
+		await expect(body.getByRole("button", { name: "重试翻译" })).toBeVisible();
 	},
 };

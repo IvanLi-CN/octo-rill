@@ -1,5 +1,6 @@
 import { ArrowUpRight, Inbox, RefreshCcw } from "lucide-react";
 
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Button } from "@/components/ui/button";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import {
@@ -17,14 +18,18 @@ export function InboxList(props: {
 	loading?: boolean;
 	busy?: boolean;
 	syncing?: boolean;
+	error?: string | null;
 	onSync?: () => void;
+	onRetry?: () => void;
 }) {
 	const {
 		notifications,
 		loading = false,
 		busy = false,
 		syncing = false,
+		error = null,
 		onSync,
+		onRetry,
 	} = props;
 	const showSync = Boolean(onSync);
 
@@ -76,7 +81,15 @@ export function InboxList(props: {
 			</CardHeader>
 
 			<CardContent className="pt-0">
-				{loading && notifications.length === 0 ? (
+				{error && notifications.length === 0 ? (
+					<ErrorStatePanel
+						title="Inbox 加载失败"
+						summary={error}
+						size="compact"
+						actionLabel={onRetry ? "重试" : undefined}
+						onAction={onRetry}
+					/>
+				) : loading && notifications.length === 0 ? (
 					<p className="text-muted-foreground text-sm">正在加载收件箱…</p>
 				) : notifications.length === 0 ? (
 					showSync ? (

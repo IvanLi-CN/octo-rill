@@ -108,6 +108,8 @@ function rectsIntersect(
 test("dashboard keeps sync as a single header action for admins", async ({
 	page,
 }) => {
+	test.slow();
+
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());

@@ -9,11 +9,14 @@ import {
 import {
 	type CSSProperties,
 	type ReactNode,
+	useEffect,
 	useLayoutEffect,
 	useRef,
 	useState,
 } from "react";
 
+import { ErrorBubble } from "@/components/feedback/ErrorBubble";
+import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Markdown } from "@/components/Markdown";
 import { RepoIdentity } from "@/components/repo/RepoIdentity";
 import { Button } from "@/components/ui/button";
@@ -44,6 +47,10 @@ import {
 } from "@/feed/types";
 import { withBaseAssetPath } from "@/lib/asset-path";
 import { formatIsoShortLocal } from "@/lib/datetime";
+import {
+	resolveErrorDetail,
+	resolveErrorSummary,
+} from "@/lib/errorPresentation";
 import { resolveRepoVisualCandidates, type RepoVisual } from "@/lib/repoVisual";
 import { cn } from "@/lib/utils";
 
@@ -180,11 +187,16 @@ function TranslatedLane(props: {
 
 	if (item.translated?.status === "error") {
 		return (
-			<EmptyPanel
+			<ErrorStatePanel
 				title="翻译失败"
-				description="这次翻译没有成功，可以重新触发一次。"
+				summary={resolveErrorSummary(
+					item.translated,
+					"这次翻译没有成功，可以重新触发一次。",
+				)}
+				detail={resolveErrorDetail(item.translated)}
 				actionLabel="重试翻译"
 				onAction={onTranslateNow}
+				size="compact"
 			/>
 		);
 	}
@@ -214,13 +226,18 @@ function SmartLane(props: {
 
 	if (item.smart?.status === "error") {
 		return (
-			<EmptyPanel
+			<ErrorStatePanel
 				title="智能整理失败"
-				description="这次智能整理没有成功完成，可以立即再试一次。"
+				summary={resolveErrorSummary(
+					item.smart,
+					"这次智能整理没有成功完成，可以立即再试一次。",
+				)}
+				detail={resolveErrorDetail(item.smart)}
 				actionLabel="重试智能整理"
 				onAction={onSmartNow}
 				disabled={isSmartGenerating}
 				loading={isSmartGenerating}
+				size="compact"
 			/>
 		);
 	}
@@ -933,6 +950,13 @@ function ReleaseFeedCard(props: {
 	const reactions = item.reactions;
 	const isVersionOnly = item.smart?.status === "insufficient";
 	const displayTitle = displayTitleForLane(item, activeLane);
+	const [reactionBubbleOpen, setReactionBubbleOpen] = useState(false);
+
+	useEffect(() => {
+		if (reactionError) {
+			setReactionBubbleOpen(true);
+		}
+	}, [reactionError]);
 
 	const header = (
 		<CardHeader
@@ -1083,9 +1107,24 @@ function ReleaseFeedCard(props: {
 			) : null}
 
 			{reactionError ? (
-				<span className="text-destructive w-full font-mono text-[11px]">
-					{reactionError}
-				</span>
+				<div className="ml-auto">
+					<ErrorBubble
+						open={reactionBubbleOpen}
+						onOpenChange={setReactionBubbleOpen}
+						title="反馈提交失败"
+						summary={reactionError}
+						align="end"
+					>
+						<Button
+							type="button"
+							variant="ghost"
+							size="sm"
+							className="text-destructive h-8 rounded-full px-3 font-mono text-[11px] hover:bg-destructive/8 hover:text-destructive"
+						>
+							反馈失败
+						</Button>
+					</ErrorBubble>
+				</div>
 			) : null}
 		</CardFooter>
 	) : null;

@@ -158,11 +158,27 @@ fn admin_translation_result_item(item: TranslationResultItem) -> AdminTranslatio
     }
 }
 
+fn public_translation_result_item(item: TranslationResultItem) -> PublicTranslationResultItem {
+    let classified = (item.status == "error")
+        .then(|| classify_translation_error(item.error.as_deref()))
+        .flatten();
+    let mut item = item;
+    if let Some(classified) = classified.as_ref() {
+        item.error = Some(classified.summary.to_owned());
+    }
+    PublicTranslationResultItem {
+        item,
+        error_code: classified.as_ref().map(|value| value.code.to_owned()),
+        error_summary: classified.as_ref().map(|value| value.summary.to_owned()),
+        error_detail: classified.map(|value| value.detail),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TranslationRequestResponse {
     pub request_id: String,
     pub status: String,
-    pub result: TranslationResultItem,
+    pub result: PublicTranslationResultItem,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,7 +198,7 @@ pub struct TranslationBatchSubmitResponse {
 
 #[derive(Debug, Serialize)]
 pub struct TranslationResolveResponse {
-    pub items: Vec<TranslationResultItem>,
+    pub items: Vec<PublicTranslationResultItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -193,9 +209,18 @@ struct TranslationRequestStreamEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     batch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<TranslationResultItem>,
+    result: Option<PublicTranslationResultItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicTranslationResultItem {
+    #[serde(flatten)]
+    pub item: TranslationResultItem,
+    pub error_code: Option<String>,
+    pub error_summary: Option<String>,
+    pub error_detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1483,7 +1508,12 @@ pub async fn resolve_translation_results(
     let items =
         resolve_translation_results_for_user(state.as_ref(), &user_id, &items, req.retry_on_error)
             .await?;
-    Ok(Json(TranslationResolveResponse { items }))
+    Ok(Json(TranslationResolveResponse {
+        items: items
+            .into_iter()
+            .map(public_translation_result_item)
+            .collect(),
+    }))
 }
 
 pub async fn stream_translation_request(
@@ -4328,15 +4358,16 @@ fn stream_translation_request_response(
                 Ok(detail) => {
                     let phase = derive_request_stream_phase(&detail);
                     if phase != last_phase {
+                        let public_result = public_translation_result_item(detail.result.clone());
                         let event = TranslationRequestStreamEvent {
                             event: phase.clone(),
                             request_id: request_id.clone(),
                             status: detail.request.effective_status().to_owned(),
                             batch_id: detail.result.batch_id.clone(),
                             result: matches!(phase.as_str(), "completed" | "failed")
-                                .then(|| detail.result.clone()),
+                                .then(|| public_result.clone()),
                             error: if phase == "failed" {
-                                detail.result.error.clone()
+                                public_result.item.error.clone()
                             } else {
                                 None
                             },
@@ -4432,7 +4463,7 @@ impl CreatedTranslationRequest {
         TranslationRequestResponse {
             request_id: self.request_id.clone(),
             status: self.status.clone(),
-            result: self.result.clone(),
+            result: public_translation_result_item(self.result.clone()),
         }
     }
 
@@ -4591,7 +4622,7 @@ fn detail_to_public_response(detail: LoadedRequestDetail) -> TranslationRequestR
     TranslationRequestResponse {
         request_id,
         status,
-        result: detail.result,
+        result: public_translation_result_item(detail.result),
     }
 }
 
@@ -5445,8 +5476,8 @@ mod tests {
         let response = created.to_public_response();
         assert_eq!(response.request_id, "req-1");
         assert_eq!(response.status, "queued");
-        assert_eq!(response.result.entity_id, item.entity_id);
-        assert_eq!(response.result.producer_ref, item.producer_ref);
+        assert_eq!(response.result.item.entity_id, item.entity_id);
+        assert_eq!(response.result.item.producer_ref, item.producer_ref);
     }
 
     #[tokio::test]
@@ -9637,7 +9668,8 @@ mod tests {
             request_id: detail.request.id.clone(),
             status: detail.request.effective_status().to_owned(),
             batch_id: detail.result.batch_id.clone(),
-            result: matches!(phase.as_str(), "completed" | "failed").then(|| detail.result.clone()),
+            result: matches!(phase.as_str(), "completed" | "failed")
+                .then(|| public_translation_result_item(detail.result.clone())),
             error: None,
         };
 
