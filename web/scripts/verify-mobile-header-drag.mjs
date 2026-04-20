@@ -82,6 +82,39 @@ async function tapLocator(page, locator) {
 	await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
 }
 
+async function dispatchPointerTouch(page, selector, events) {
+	await page.evaluate(
+		({ targetSelector, pointerEvents }) => {
+			const target = document.querySelector(targetSelector);
+			if (!(target instanceof HTMLElement)) {
+				throw new Error(`missing pointer target: ${targetSelector}`);
+			}
+			const rect = target.getBoundingClientRect();
+			const originX = rect.left + rect.width / 2;
+			const originY = rect.top + rect.height / 2;
+			for (const pointerEvent of pointerEvents) {
+				target.dispatchEvent(
+					new PointerEvent(pointerEvent.type, {
+						bubbles: true,
+						cancelable: true,
+						pointerId: 91,
+						pointerType: "touch",
+						isPrimary: true,
+						clientX: originX + (pointerEvent.offsetX ?? 0),
+						clientY: originY + (pointerEvent.offsetY ?? 0),
+						button: 0,
+						buttons: pointerEvent.type === "pointerup" ? 0 : 1,
+					}),
+				);
+			}
+		},
+		{
+			targetSelector: selector,
+			pointerEvents: events,
+		},
+	);
+}
+
 async function getLocatorCenter(locator) {
 	const box = await locator.boundingBox();
 	assert(box, "expected locator to expose a bounding box");
@@ -236,9 +269,13 @@ async function verifyTouchDrag(page) {
 
 async function verifyTouchDragFromGuardedTab(page) {
 	await openStory(page);
-	const guardedTab = page.getByRole("tab", { name: "全部" });
+	const guardedTab = page.getByRole("tab", { name: "发布" });
 	const center = await getLocatorCenter(guardedTab);
 	const client = await createTouchClient(page);
+	assert(
+		(await guardedTab.getAttribute("aria-selected")) === "false",
+		"the guarded tab should start inactive before the drag begins",
+	);
 
 	await dispatchTouchPoint(client, "touchStart", center.x, center.y);
 	await dispatchTouchPoint(client, "touchMove", center.x, center.y - 28);
@@ -260,6 +297,40 @@ async function verifyTouchDragFromGuardedTab(page) {
 	assert(
 		!settledState.interacting,
 		"guarded tab drag should settle after touch release",
+	);
+	assert(
+		(await guardedTab.getAttribute("aria-selected")) === "false",
+		"guarded tab drag should not activate the underlying tab",
+	);
+}
+
+async function verifyPointerOnlyGuardedTouchDrag(page) {
+	await openStory(page);
+	await dispatchPointerTouch(
+		page,
+		"[data-dashboard-mobile-lane-menu-trigger]",
+		[{ type: "pointerdown" }, { type: "pointermove", offsetY: -28 }],
+	);
+	await page.waitForTimeout(80);
+
+	const midState = await readHeaderState(page);
+	assert(
+		midState.interacting,
+		`guarded pointer-only drag should still enter header interaction, got ${JSON.stringify(
+			midState,
+		)}`,
+	);
+
+	await dispatchPointerTouch(
+		page,
+		"[data-dashboard-mobile-lane-menu-trigger]",
+		[{ type: "pointerup", offsetY: -28 }],
+	);
+	await page.waitForTimeout(240);
+	const settledState = await readHeaderState(page);
+	assert(
+		!settledState.interacting,
+		"guarded pointer-only drag should settle after pointer up",
 	);
 }
 
@@ -428,6 +499,49 @@ async function verifyLaneMenuTouchGuard(page) {
 		verticalCenter.y - 10,
 	);
 	await page.waitForTimeout(80);
+
+	await openLaneSwitchStory(page);
+	const promotedDragClient = await createTouchClient(page);
+	const promotedDragCenter = await getLocatorCenter(
+		page.locator("[data-dashboard-mobile-lane-menu-trigger]"),
+	);
+	await dispatchTouchPoint(
+		promotedDragClient,
+		"touchStart",
+		promotedDragCenter.x,
+		promotedDragCenter.y,
+	);
+	await dispatchTouchPoint(
+		promotedDragClient,
+		"touchMove",
+		promotedDragCenter.x,
+		promotedDragCenter.y - 28,
+	);
+	await page.waitForTimeout(80);
+	const promotedDragState = await page.evaluate(() => {
+		const shell = document.querySelector("[data-app-shell-header-interacting]");
+		if (!(shell instanceof HTMLElement)) {
+			throw new Error("missing [data-app-shell-header-interacting]");
+		}
+		return shell.getAttribute("data-app-shell-header-interacting");
+	});
+	assert(
+		promotedDragState === "true",
+		`lane menu drag beyond the tap slop should promote into header interaction, got ${promotedDragState}`,
+	);
+	await dispatchTouchPoint(
+		promotedDragClient,
+		"touchEnd",
+		promotedDragCenter.x,
+		promotedDragCenter.y - 28,
+	);
+	await page.waitForTimeout(120);
+	assert(
+		(await page
+			.locator("[data-dashboard-mobile-lane-menu-popover]")
+			.count()) === 0,
+		"lane menu drag promotion should suppress the pending tap/click",
+	);
 
 	await openLaneSwitchStory(page);
 	await expectTouchGuard("[data-dashboard-mobile-lane-menu-trigger]", page);
@@ -601,6 +715,10 @@ try {
 	await verifyTouchDragFromGuardedTab(page);
 	console.log(
 		"✓ guarded mobile tabs still allow drag after the touch crosses the tap slop",
+	);
+	await verifyPointerOnlyGuardedTouchDrag(page);
+	console.log(
+		"✓ guarded controls still promote into a header drag in pointer-only touch environments",
 	);
 	await verifySlowTouchExpansion(page);
 	console.log("✓ slow touch pull stays stable before release");
