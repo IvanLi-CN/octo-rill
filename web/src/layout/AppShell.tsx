@@ -61,6 +61,7 @@ type AppShellProps = {
 const MOBILE_HEADER_GESTURE_GUARD_SELECTOR = "[data-app-shell-gesture-guard]";
 const GUARDED_TOUCH_DRAG_THRESHOLD_PX = 12;
 const GUARDED_TOUCH_CLICK_SUPPRESSION_WINDOW_MS = 750;
+const MOBILE_SOFTWARE_KEYBOARD_HEIGHT_THRESHOLD_PX = 120;
 
 function resolveGestureTargetElement(
 	target: EventTarget | null,
@@ -105,6 +106,48 @@ function shouldPromoteGuardedTouchSequence({
 		verticalDelta >= GUARDED_TOUCH_DRAG_THRESHOLD_PX &&
 		verticalDelta >= horizontalDelta
 	);
+}
+
+function isTextEditableElement(target: Element | null): boolean {
+	if (!(target instanceof HTMLElement)) {
+		return false;
+	}
+
+	if (target.isContentEditable || target.getAttribute("role") === "textbox") {
+		return true;
+	}
+
+	if (target instanceof HTMLTextAreaElement) {
+		return true;
+	}
+
+	if (target instanceof HTMLInputElement) {
+		switch (target.type) {
+			case "button":
+			case "checkbox":
+			case "color":
+			case "file":
+			case "hidden":
+			case "image":
+			case "radio":
+			case "range":
+			case "reset":
+			case "submit":
+				return false;
+			default:
+				return true;
+		}
+	}
+
+	return false;
+}
+
+function isKeyboardModalTarget(target: Element | null): boolean {
+	if (!(target instanceof Element)) {
+		return false;
+	}
+
+	return target.closest("[role='dialog'], [role='alertdialog']") !== null;
 }
 
 export function AppShell({
@@ -166,6 +209,10 @@ export function AppShell({
 	const [headerTransitionSuppressed, setHeaderTransitionSuppressed] =
 		useState(false);
 	const [headerHeight, setHeaderHeight] = useState(0);
+	const [viewportHeight, setViewportHeight] = useState<number | null>(null);
+	const [viewportHeightSource, setViewportHeightSource] = useState<
+		"css-fallback" | "visual-viewport" | "window-inner-height"
+	>("css-fallback");
 
 	useEffect(() => {
 		if (!mobileChrome || typeof window === "undefined") {
@@ -182,6 +229,53 @@ export function AppShell({
 		mediaQuery.addEventListener("change", updateViewport);
 		return () => {
 			mediaQuery.removeEventListener("change", updateViewport);
+		};
+	}, [mobileChrome]);
+
+	useEffect(() => {
+		if (!mobileChrome || typeof window === "undefined") {
+			setViewportHeight(null);
+			setViewportHeightSource("css-fallback");
+			return;
+		}
+
+		const visualViewport = window.visualViewport;
+		const resolveViewportHeight = () => {
+			const nextHeight =
+				visualViewport && visualViewport.height > 0
+					? Math.round(visualViewport.height)
+					: Math.round(window.innerHeight);
+			const keyboardLikelyVisible =
+				visualViewport &&
+				visualViewport.height > 0 &&
+				isTextEditableElement(document.activeElement) &&
+				window.innerHeight - visualViewport.height >=
+					MOBILE_SOFTWARE_KEYBOARD_HEIGHT_THRESHOLD_PX;
+			const keyboardModalTarget = isKeyboardModalTarget(document.activeElement);
+			const appliedViewportHeight =
+				keyboardLikelyVisible && keyboardModalTarget
+					? Math.round(window.innerHeight)
+					: nextHeight;
+			setViewportHeight((current) =>
+				current === appliedViewportHeight ? current : appliedViewportHeight,
+			);
+			setViewportHeightSource(
+				!(keyboardLikelyVisible && keyboardModalTarget) &&
+					visualViewport &&
+					visualViewport.height > 0
+					? "visual-viewport"
+					: "window-inner-height",
+			);
+		};
+
+		resolveViewportHeight();
+		window.addEventListener("resize", resolveViewportHeight);
+		visualViewport?.addEventListener("resize", resolveViewportHeight);
+		visualViewport?.addEventListener("scroll", resolveViewportHeight);
+		return () => {
+			window.removeEventListener("resize", resolveViewportHeight);
+			visualViewport?.removeEventListener("resize", resolveViewportHeight);
+			visualViewport?.removeEventListener("scroll", resolveViewportHeight);
 		};
 	}, [mobileChrome]);
 
@@ -1008,9 +1102,15 @@ export function AppShell({
 				data-app-shell-header-progress={chromeState.headerProgress.toFixed(3)}
 				data-app-shell-header-interacting={headerInteracting ? "true" : "false"}
 				data-app-shell-footer-hidden={footerHidden ? "true" : "false"}
+				data-app-shell-viewport-height={
+					viewportHeight !== null ? String(viewportHeight) : "fallback"
+				}
+				data-app-shell-viewport-height-source={viewportHeightSource}
 				style={
 					{
 						"--app-shell-header-height": `${headerHeight}px`,
+						minHeight:
+							viewportHeight !== null ? `${viewportHeight}px` : undefined,
 					} as React.CSSProperties
 				}
 			>
@@ -1018,6 +1118,7 @@ export function AppShell({
 					<header
 						ref={headerRef}
 						className="supports-[backdrop-filter]:bg-background/70 bg-background/90 sticky top-0 z-20 border-b backdrop-blur motion-safe:transition-[background-color,border-color,box-shadow] motion-safe:duration-200 motion-safe:ease-out"
+						data-app-shell-header="true"
 					>
 						<div
 							className={cn(
