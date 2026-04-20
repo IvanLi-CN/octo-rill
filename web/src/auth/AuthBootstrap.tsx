@@ -34,17 +34,18 @@ export type AuthBootstrapValue = AuthSnapshot & {
 const AuthBootstrapContext = createContext<AuthBootstrapValue | null>(null);
 
 const startupSeed = readStartupPresentationSeed();
-const canReuseStartupSeedOnTransientError =
-	startupSeed?.presentation === "warm-cache";
+const warmStartupSeed =
+	startupSeed?.presentation === "warm-cache" ? startupSeed : null;
+const canReuseStartupSeedOnTransientError = warmStartupSeed !== null;
 
-let cachedSnapshot: AuthSnapshot | null = startupSeed
+let cachedSnapshot: AuthSnapshot | null = warmStartupSeed
 	? {
 			status: "authenticated",
-			me: startupSeed.me,
+			me: warmStartupSeed.me,
 			bootError: null,
 		}
 	: null;
-let cachedSnapshotOrigin: "seed" | "network" | "none" = startupSeed
+let cachedSnapshotOrigin: "seed" | "network" | "none" = warmStartupSeed
 	? "seed"
 	: "none";
 let inflightSnapshotPromise: Promise<AuthSnapshot> | null = null;
@@ -117,10 +118,10 @@ async function loadAuthSnapshot(force = false) {
 export function AuthBootstrapProvider(props: { children: ReactNode }) {
 	const { children } = props;
 	const [snapshot, setSnapshot] = useState<AuthSnapshot>(() => {
-		if (startupSeed) {
+		if (warmStartupSeed) {
 			return {
 				status: "authenticated",
-				me: startupSeed.me,
+				me: warmStartupSeed.me,
 				bootError: null,
 			};
 		}

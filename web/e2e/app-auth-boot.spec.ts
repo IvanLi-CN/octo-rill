@@ -436,6 +436,26 @@ test("30-day startup seed does not survive transient /api/me failures as logged-
 	await expect(page.getByText("Cached Release 10001")).toHaveCount(0);
 });
 
+test("route-skeleton seed keeps settings on app boot until live auth resolves", async ({
+	page,
+}) => {
+	await seedPersistentAuthCache(page);
+	await installAppAuthMocks(page, {
+		meStatus: 401,
+		meDelayMs: 900,
+	});
+
+	await page.goto("/settings", { waitUntil: "domcontentloaded" });
+
+	await expect(page.locator("[data-app-boot]")).toBeVisible();
+	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
+		0,
+	);
+
+	await expect(page.locator("[data-landing-login-card]")).toBeVisible();
+	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+});
+
 test("admin routes do not trust 30-day startup cache for privileged first paint", async ({
 	page,
 }) => {
