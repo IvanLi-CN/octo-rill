@@ -1853,6 +1853,102 @@ test("dashboard retries the initial sidebar bootstrap after a transient briefs f
 	).toBeVisible();
 });
 
+test("dashboard retries the initial sidebar bootstrap after a transient inbox failure", async ({
+	page,
+}) => {
+	let notificationCalls = 0;
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "inbox-retry-user",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			notificationCalls += 1;
+			if (notificationCalls === 1) {
+				return json(
+					route,
+					{
+						error: {
+							code: "notifications_temporarily_unavailable",
+							message: "notifications bootstrap failed once",
+						},
+					},
+					503,
+				);
+			}
+
+			return json(route, [
+				{
+					thread_id: "93001",
+					repo_full_name: "owner/repo",
+					subject_title: "Recovered inbox thread",
+					subject_type: "PullRequest",
+					reason: "review_requested",
+					updated_at: "2026-04-09T08:02:00Z",
+					unread: 1,
+					html_url: "https://github.com/owner/repo/pull/93001",
+				},
+			]);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/?tab=inbox");
+
+	await expect.poll(() => notificationCalls).toBeGreaterThanOrEqual(2);
+	await expect(page.getByText("Recovered inbox thread").first()).toBeVisible();
+});
+
 test("dashboard reaction dialog keeps PAT status unknown when the PAT status fetch fails", async ({
 	page,
 }) => {
