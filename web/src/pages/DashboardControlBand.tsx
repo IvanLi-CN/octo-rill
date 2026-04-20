@@ -84,6 +84,7 @@ function DashboardMobileTabStrip(props: {
 						type="button"
 						role="tab"
 						aria-selected={active}
+						data-app-shell-gesture-guard
 						data-state={active ? "active" : "inactive"}
 						className={cn(
 							distributed
@@ -163,6 +164,7 @@ function DashboardMobileLaneMenu(props: {
 				aria-expanded={open}
 				aria-haspopup="menu"
 				disabled={disabled}
+				data-app-shell-gesture-guard
 				data-disabled={disabled ? "true" : "false"}
 				data-dashboard-mobile-lane-menu-trigger
 				onClick={() => {
@@ -186,6 +188,7 @@ function DashboardMobileLaneMenu(props: {
 					id={menuId}
 					role="menu"
 					aria-label="选择阅读模式"
+					data-app-shell-gesture-guard
 					data-dashboard-mobile-lane-menu-popover
 					className="absolute top-full right-0 z-30 mt-2 min-w-32 rounded-2xl border border-border/70 bg-card/98 p-1.5 shadow-lg backdrop-blur"
 				>

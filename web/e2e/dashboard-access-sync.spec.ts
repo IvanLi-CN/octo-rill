@@ -1,4 +1,10 @@
-import { type Route, expect, test } from "@playwright/test";
+import {
+	type Locator,
+	type Page,
+	type Route,
+	expect,
+	test,
+} from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
 
@@ -20,12 +26,16 @@ function svgAvatarDataUrl(
 	)}`;
 }
 
-function buildReleaseFeedItem(id: string) {
+function buildReleaseFeedItem(
+	id: string,
+	overrides: Record<string, unknown> = {},
+) {
 	return {
 		kind: "release",
 		ts: "2026-04-09T08:00:00Z",
 		id,
 		repo_full_name: "owner/repo",
+		repo_visual: null,
 		title: `Release ${id}`,
 		body: "- mobile shell proof\n- tighten spacing\n- keep sticky rail visible",
 		body_truncated: false,
@@ -37,6 +47,7 @@ function buildReleaseFeedItem(id: string) {
 		translated: null,
 		smart: null,
 		reactions: null,
+		...overrides,
 	};
 }
 
@@ -49,6 +60,7 @@ function buildSocialFeedItem(
 		ts: "2026-04-09T08:00:00Z",
 		id,
 		repo_full_name: kind === "repo_star_received" ? "owner/repo" : null,
+		repo_visual: null,
 		title: null,
 		body: null,
 		body_truncated: false,
@@ -72,6 +84,26 @@ function buildSocialFeedItem(
 		smart: null,
 		reactions: null,
 	};
+}
+
+async function getLocatorCenter(locator: Locator) {
+	const box = await locator.evaluate((element) => {
+		const rect = element.getBoundingClientRect();
+		return {
+			x: rect.left + rect.width / 2,
+			y: rect.top + rect.height / 2,
+			width: rect.width,
+			height: rect.height,
+		};
+	});
+	expect(box.width).toBeGreaterThan(0);
+	expect(box.height).toBeGreaterThan(0);
+	return box;
+}
+
+async function tapLocator(page: Page, locator: Locator) {
+	const box = await getLocatorCenter(locator);
+	await page.touchscreen.tap(box.x, box.y);
 }
 
 function buildReactionFooterReady() {
@@ -246,7 +278,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 });
 
 test.describe("mobile dashboard shell", () => {
-	test.use({ viewport: { width: 390, height: 844 } });
+	test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
 	test("dashboard switches to compact mobile chrome and moves admin entry into the user menu", async ({
 		page,
@@ -273,9 +305,29 @@ test.describe("mobile dashboard shell", () => {
 
 			if (req.method() === "GET" && pathname === "/api/feed") {
 				return json(route, {
-					items: Array.from({ length: 10 }, (_, index) =>
-						buildReleaseFeedItem(String(20001 + index)),
-					),
+					items: [
+						buildReleaseFeedItem("2630", {
+							title: "v2.63.0",
+							body: "- tighten release rollout path\n- reduce regression risk",
+							html_url: "https://github.com/owner/repo/releases/tag/v2.63.0",
+							translated: {
+								lang: "zh-CN",
+								status: "ready",
+								title: "v2.63.0（稳定版）",
+								summary: "- 收紧发布链路\n- 降低回归风险",
+							},
+							smart: {
+								lang: "zh-CN",
+								status: "ready",
+								title: "v2.63.0 · 版本变化",
+								summary: "- 自动整理版本变化摘要",
+							},
+							reactions: buildReactionFooterReady(),
+						}),
+						...Array.from({ length: 9 }, (_, index) =>
+							buildReleaseFeedItem(String(20001 + index)),
+						),
+					],
 					next_cursor: null,
 				});
 			}
@@ -327,23 +379,182 @@ test.describe("mobile dashboard shell", () => {
 			expandedWorkband.getByRole("tab", { name: "发布" }),
 		).toBeVisible();
 		const mobileHeader = page.locator("[data-dashboard-header-progress]");
+		const appShellHeader = page.locator("[data-app-shell-header-interacting]");
 		const laneMenuTrigger = expandedWorkband.locator(
 			"[data-dashboard-mobile-lane-menu-trigger]",
 		);
 		await expect(laneMenuTrigger).toBeVisible();
-		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
 		await expect(
-			page.locator("[data-dashboard-secondary-controls]").getByRole("link", {
-				name: "管理员面板",
-			}),
-		).toHaveCount(0);
+			page.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		expect(await page.locator("[data-dashboard-mobile-rail]").count()).toBe(0);
+		expect(
+			await page
+				.locator("[data-dashboard-secondary-controls]")
+				.getByRole("link", {
+					name: "管理员面板",
+				})
+				.count(),
+		).toBe(0);
 
-		await expect(
-			expandedWorkband.locator(
-				"[data-dashboard-mobile-control-band-row='lane']",
-			),
-		).toHaveCount(0);
-		await laneMenuTrigger.click();
+		expect(
+			await page
+				.locator("[data-dashboard-mobile-control-band-row='lane']")
+				.count(),
+		).toBe(0);
+		await page.evaluate(() => {
+			const trigger = document.querySelector(
+				"[data-dashboard-mobile-lane-menu-trigger]",
+			);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(trigger instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected mobile lane trigger and app shell header");
+			}
+			const touchStates: string[] = [];
+			trigger.addEventListener(
+				"touchstart",
+				() => {
+					touchStates.push(
+						shell.getAttribute("data-app-shell-header-interacting") ??
+							"missing",
+					);
+				},
+				{ once: true, passive: true },
+			);
+			(
+				window as Window & { __laneMenuTouchHeaderStates?: string[] }
+			).__laneMenuTouchHeaderStates = touchStates;
+		});
+
+		await page.evaluate(() => {
+			const trigger = document.querySelector(
+				"[data-dashboard-mobile-lane-menu-trigger]",
+			);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(trigger instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected mobile lane trigger and app shell header");
+			}
+			const rect = trigger.getBoundingClientRect();
+			const createTouchEvent = (
+				type: "touchstart" | "touchmove",
+				offsetX = 0,
+				offsetY = 0,
+			) => {
+				const touchPoint = {
+					clientX: rect.left + rect.width / 2 + offsetX,
+					clientY: rect.top + rect.height / 2 + offsetY,
+				};
+				const event = new Event(type, {
+					bubbles: true,
+					cancelable: true,
+				}) as Event & {
+					touches: Array<typeof touchPoint>;
+					targetTouches: Array<typeof touchPoint>;
+					changedTouches: Array<typeof touchPoint>;
+				};
+				Object.defineProperty(event, "touches", { value: [touchPoint] });
+				Object.defineProperty(event, "targetTouches", {
+					value: [touchPoint],
+				});
+				Object.defineProperty(event, "changedTouches", {
+					value: [touchPoint],
+				});
+				return event;
+			};
+			trigger.dispatchEvent(createTouchEvent("touchstart"));
+			trigger.dispatchEvent(createTouchEvent("touchmove", 10, 0));
+			(
+				window as Window & { __laneMenuSyntheticHorizontalHeaderState?: string }
+			).__laneMenuSyntheticHorizontalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+			trigger.dispatchEvent(createTouchEvent("touchmove", 0, -10));
+			(
+				window as Window & { __laneMenuSyntheticVerticalHeaderState?: string }
+			).__laneMenuSyntheticVerticalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+		});
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuSyntheticHorizontalHeaderState?: string;
+							}
+						).__laneMenuSyntheticHorizontalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuSyntheticVerticalHeaderState?: string;
+							}
+						).__laneMenuSyntheticVerticalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		await page.evaluate(() => {
+			const trigger = document.querySelector(
+				"[data-dashboard-mobile-lane-menu-trigger]",
+			);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(trigger instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected mobile lane trigger and app shell header");
+			}
+			const touchStates: string[] = [];
+			trigger.addEventListener(
+				"touchstart",
+				() => {
+					touchStates.push(
+						shell.getAttribute("data-app-shell-header-interacting") ??
+							"missing",
+					);
+				},
+				{ once: true, passive: true },
+			);
+			(
+				window as Window & { __laneMenuTouchHeaderStates?: string[] }
+			).__laneMenuTouchHeaderStates = touchStates;
+		});
+
+		await tapLocator(page, laneMenuTrigger);
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(window as Window & { __laneMenuTouchHeaderStates?: string[] })
+							.__laneMenuTouchHeaderStates ?? [],
+				),
+			)
+			.toEqual(["false"]);
 		await expect(
 			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
 		).toBeVisible();
@@ -352,26 +563,112 @@ test.describe("mobile dashboard shell", () => {
 				.locator("[data-dashboard-mobile-lane-menu-popover]")
 				.getByRole("menuitemradio", { name: "原文" }),
 		).toBeVisible();
+		await page.evaluate(() => {
+			const translatedOption = document
+				.querySelector("[data-dashboard-mobile-lane-menu-popover]")
+				?.querySelector(
+					'[role="menuitemradio"][data-feed-page-lane="translated"]',
+				);
+			const shell = document.querySelector(
+				"[data-app-shell-header-interacting]",
+			);
+			if (
+				!(translatedOption instanceof HTMLElement) ||
+				!(shell instanceof HTMLElement)
+			) {
+				throw new Error("Expected translated lane option and app shell header");
+			}
+			const rect = translatedOption.getBoundingClientRect();
+			const createTouchEvent = (
+				type: "touchstart" | "touchmove",
+				offsetX = 0,
+				offsetY = 0,
+			) => {
+				const touchPoint = {
+					clientX: rect.left + rect.width / 2 + offsetX,
+					clientY: rect.top + rect.height / 2 + offsetY,
+				};
+				const event = new Event(type, {
+					bubbles: true,
+					cancelable: true,
+				}) as Event & {
+					touches: Array<typeof touchPoint>;
+					targetTouches: Array<typeof touchPoint>;
+					changedTouches: Array<typeof touchPoint>;
+				};
+				Object.defineProperty(event, "touches", { value: [touchPoint] });
+				Object.defineProperty(event, "targetTouches", {
+					value: [touchPoint],
+				});
+				Object.defineProperty(event, "changedTouches", {
+					value: [touchPoint],
+				});
+				return event;
+			};
+			translatedOption.dispatchEvent(createTouchEvent("touchstart"));
+			translatedOption.dispatchEvent(createTouchEvent("touchmove", 10, 0));
+			(
+				window as Window & {
+					__laneMenuOptionSyntheticHorizontalHeaderState?: string;
+				}
+			).__laneMenuOptionSyntheticHorizontalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+			translatedOption.dispatchEvent(createTouchEvent("touchmove", 0, -10));
+			(
+				window as Window & {
+					__laneMenuOptionSyntheticVerticalHeaderState?: string;
+				}
+			).__laneMenuOptionSyntheticVerticalHeaderState =
+				shell.getAttribute("data-app-shell-header-interacting") ?? "missing";
+		});
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuOptionSyntheticHorizontalHeaderState?: string;
+							}
+						).__laneMenuOptionSyntheticHorizontalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() =>
+						(
+							window as Window & {
+								__laneMenuOptionSyntheticVerticalHeaderState?: string;
+							}
+						).__laneMenuOptionSyntheticVerticalHeaderState ?? "missing",
+				),
+			)
+			.toBe("false");
 		await page
 			.locator("[data-dashboard-mobile-lane-menu-popover]")
-			.getByRole("menuitemradio", { name: "智能" })
+			.getByRole("menuitemradio", { name: "翻译" })
 			.click();
+		expect(
+			await page.locator("[data-dashboard-mobile-lane-menu-popover]").count(),
+		).toBe(0);
 		await expect(
-			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
-		).toHaveCount(0);
+			page.getByRole("heading", { name: "v2.63.0（稳定版）" }),
+		).toBeVisible();
 		await expandedWorkband.getByRole("tab", { name: "关注" }).click();
 		await expect(laneMenuTrigger).toBeVisible();
 		await expect(laneMenuTrigger).toBeDisabled();
 		await laneMenuTrigger.click({ force: true });
-		await expect(
-			page.locator("[data-dashboard-mobile-lane-menu-popover]"),
-		).toHaveCount(0);
+		expect(
+			await page.locator("[data-dashboard-mobile-lane-menu-popover]").count(),
+		).toBe(0);
 		await expandedWorkband.getByRole("tab", { name: "全部" }).click();
 		await expect(laneMenuTrigger).toBeEnabled();
 
 		const client = await page.context().newCDPSession(page);
 		const dispatchTouch = async (
 			type: "touchStart" | "touchMove" | "touchEnd",
+			x?: number,
 			y?: number,
 		) => {
 			await client.send("Input.dispatchTouchEvent", {
@@ -379,12 +676,21 @@ test.describe("mobile dashboard shell", () => {
 				touchPoints:
 					type === "touchEnd"
 						? []
-						: [{ x: 200, y: y ?? 0, radiusX: 5, radiusY: 5, force: 1, id: 1 }],
+						: [
+								{
+									x: x ?? 200,
+									y: y ?? 0,
+									radiusX: 5,
+									radiusY: 5,
+									force: 1,
+									id: 1,
+								},
+							],
 			});
 		};
 
-		await dispatchTouch("touchStart", 500);
-		await dispatchTouch("touchMove", 430);
+		await dispatchTouch("touchStart", 200, 500);
+		await dispatchTouch("touchMove", 200, 430);
 		await page.waitForTimeout(48);
 		await expect(mobileHeader).toHaveAttribute(
 			"data-dashboard-header-interacting",
@@ -401,7 +707,7 @@ test.describe("mobile dashboard shell", () => {
 			"data-dashboard-header-compact",
 			"false",
 		);
-		await dispatchTouch("touchMove", 360);
+		await dispatchTouch("touchMove", 200, 360);
 		await page.waitForTimeout(48);
 		await dispatchTouch("touchEnd");
 		await page.waitForTimeout(320);
@@ -429,10 +735,10 @@ test.describe("mobile dashboard shell", () => {
 			"false",
 		);
 
-		await dispatchTouch("touchStart", 520);
-		await dispatchTouch("touchMove", 430);
+		await dispatchTouch("touchStart", 200, 520);
+		await dispatchTouch("touchMove", 200, 430);
 		await page.waitForTimeout(48);
-		await dispatchTouch("touchMove", 360);
+		await dispatchTouch("touchMove", 200, 360);
 		await page.waitForTimeout(48);
 		await dispatchTouch("touchEnd");
 		await page.waitForTimeout(320);
@@ -442,34 +748,34 @@ test.describe("mobile dashboard shell", () => {
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
 		).toBeVisible();
-		await expect(expandedWorkband).toHaveCount(0);
-		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		expect(await expandedWorkband.count()).toBe(0);
+		expect(await page.locator("[data-dashboard-mobile-rail]").count()).toBe(0);
 
-		await dispatchTouch("touchStart", 360);
-		await dispatchTouch("touchMove", 404);
+		await dispatchTouch("touchStart", 200, 360);
+		await dispatchTouch("touchMove", 200, 404);
 		await page.waitForTimeout(48);
-		await dispatchTouch("touchMove", 452);
+		await dispatchTouch("touchMove", 200, 452);
 		await page.waitForTimeout(48);
 		await dispatchTouch("touchEnd");
 		await page.waitForTimeout(240);
-		await expect(
-			page.locator("[data-dashboard-header-compact='true']"),
-		).toHaveCount(0);
-		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
+		expect(
+			await page.locator("[data-dashboard-header-compact='true']").count(),
+		).toBe(0);
+		expect(await page.locator("[data-dashboard-mobile-rail]").count()).toBe(0);
 		await expect(expandedWorkband).toBeVisible();
 
-		await dispatchTouch("touchStart", 520);
-		await dispatchTouch("touchMove", 430);
+		await dispatchTouch("touchStart", 200, 520);
+		await dispatchTouch("touchMove", 200, 430);
 		await page.waitForTimeout(48);
-		await dispatchTouch("touchMove", 340);
+		await dispatchTouch("touchMove", 200, 340);
 		await page.waitForTimeout(48);
 		await dispatchTouch("touchEnd");
 		await page.waitForTimeout(320);
 		await expect(
 			page.locator("[data-dashboard-header-compact='true']"),
 		).toBeVisible();
-		await expect(page.locator("[data-dashboard-mobile-rail]")).toHaveCount(0);
-		await expect(expandedWorkband).toHaveCount(0);
+		expect(await page.locator("[data-dashboard-mobile-rail]").count()).toBe(0);
+		expect(await expandedWorkband.count()).toBe(0);
 
 		await page.getByRole("button", { name: "查看账号信息" }).click();
 		await expect(

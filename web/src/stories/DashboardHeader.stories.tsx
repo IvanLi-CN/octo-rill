@@ -1,6 +1,7 @@
 import type * as React from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
 import { DEFAULT_PAGE_LANE } from "@/feed/laneOptions";
@@ -20,6 +21,43 @@ function svgDataUrl(label: string, background: string, foreground = "#ffffff") {
 }
 
 const STORYBOOK_AVATAR = svgDataUrl("SA", "#4f6a98");
+const DASHBOARD_HEADER_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	dashboardHeaderMobile390: {
+		name: "Dashboard header mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+} as const;
+
+function dispatchSyntheticTouchEvent(
+	target: HTMLElement,
+	type: "touchstart" | "touchmove",
+	offsetX = 0,
+	offsetY = 0,
+) {
+	const rect = target.getBoundingClientRect();
+	const touchPoint = {
+		clientX: rect.left + rect.width / 2 + offsetX,
+		clientY: rect.top + rect.height / 2 + offsetY,
+	};
+	const event = new Event(type, {
+		bubbles: true,
+		cancelable: true,
+	}) as Event & {
+		touches: Array<typeof touchPoint>;
+		targetTouches: Array<typeof touchPoint>;
+		changedTouches: Array<typeof touchPoint>;
+	};
+
+	Object.defineProperty(event, "touches", { value: [touchPoint] });
+	Object.defineProperty(event, "targetTouches", { value: [touchPoint] });
+	Object.defineProperty(event, "changedTouches", { value: [touchPoint] });
+	target.dispatchEvent(event);
+}
 
 function DashboardHeaderGallery() {
 	return (
@@ -148,6 +186,9 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: DASHBOARD_HEADER_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -247,6 +288,95 @@ export const StateGallery: Story = {
 export const EvidenceMobileShell: Story = {
 	name: "Evidence / Mobile Shell",
 	render: (args) => <DashboardHeaderMobileShellPreview {...args} />,
+	globals: {
+		viewport: {
+			value: "dashboardHeaderMobile390",
+			isRotated: false,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const appShellHeader = canvasElement.querySelector<HTMLElement>(
+			"[data-app-shell-header-interacting]",
+		);
+		expect(appShellHeader).not.toBeNull();
+		if (!appShellHeader) {
+			throw new Error("Expected app shell interaction state to exist");
+		}
+
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		const laneMenuTrigger = canvas.getByRole("button", {
+			name: "当前阅读模式：智能",
+		}) as HTMLButtonElement;
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchstart");
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 0, -10);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		await userEvent.click(laneMenuTrigger);
+		await expect(
+			canvas.getByRole("menu", { name: "选择阅读模式" }),
+		).toBeVisible();
+		const laneMenu = canvas.getByRole("menu", { name: "选择阅读模式" });
+		const translatedOption = within(laneMenu).getByRole("menuitemradio", {
+			name: "翻译",
+		}) as HTMLButtonElement;
+		dispatchSyntheticTouchEvent(translatedOption, "touchstart");
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 10, 0);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		dispatchSyntheticTouchEvent(translatedOption, "touchmove", 0, -10);
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+		await userEvent.click(translatedOption);
+		await expect(
+			canvas.queryByRole("menu", { name: "选择阅读模式" }),
+		).not.toBeInTheDocument();
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+
+		await userEvent.click(canvas.getByRole("button", { name: "查看账号信息" }));
+		await expect(
+			canvas.getByRole("dialog", { name: "账号信息" }),
+		).toBeVisible();
+		await expect(appShellHeader).toHaveAttribute(
+			"data-app-shell-header-interacting",
+			"false",
+		);
+	},
+	parameters: {
+		docs: {
+			disable: true,
+		},
+	},
+};
+
+export const VerificationMobileShellDrag: Story = {
+	name: "Verification / Mobile shell drag",
+	render: (args) => <DashboardHeaderMobileShellPreview {...args} />,
+	globals: {
+		viewport: {
+			value: "dashboardHeaderMobile390",
+			isRotated: false,
+		},
+	},
 	parameters: {
 		docs: {
 			disable: true,

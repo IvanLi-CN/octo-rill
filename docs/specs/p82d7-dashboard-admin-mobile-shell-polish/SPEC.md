@@ -2,9 +2,9 @@
 
 ## 状态
 
-- Status: 部分完成（4/4）
+- Status: 已完成
 - Created: 2026-04-12
-- Last: 2026-04-14
+- Last: 2026-04-20
 
 ## 背景 / 问题陈述
 
@@ -235,6 +235,14 @@
   evidence_note: 验证移动端进入 `收件箱` tab 时只保留主内容里的 Inbox 列表，同时 `Sync inbox` / `GitHub` 次级操作都已收敛为 icon-only 按钮，不再占用额外横向空间。
   image:
   ![Dashboard 移动端仅在收件箱 tab 展示 Inbox 列表](./assets/dashboard-mobile-inbox-tab-only-light.png)
+
+- source_type: storybook_canvas
+  story_id_or_title: `pages-dashboard--page-default-lane-switching-mobile`
+  state: mobile lane menu switches to translated lane
+  evidence_note: 验证移动端右上阅读模式按钮在触摸后不会再被 header gesture 抢占，菜单可正常展开并切到翻译态。
+  PR: include
+  image:
+  ![Dashboard 移动端阅读模式切到翻译态](./assets/dashboard-mobile-lane-switch-translated-light.png)
 
 ## 资产晋升（Asset promotion）
 

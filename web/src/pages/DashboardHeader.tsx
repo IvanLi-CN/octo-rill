@@ -258,6 +258,7 @@ function DashboardUserMenu(props: {
 		<fieldset
 			ref={wrapperRef}
 			className="relative inline-flex min-w-0 items-center leading-none"
+			data-app-shell-gesture-guard
 			data-dashboard-user-menu
 			aria-label="账号菜单"
 			onMouseEnter={() => setHoverOpen(true)}
@@ -493,6 +494,7 @@ export function DashboardHeader({
 					data-dashboard-primary-actions
 				>
 					<div
+						data-app-shell-gesture-guard
 						style={
 							hideSubtitle
 								? {
@@ -516,6 +518,7 @@ export function DashboardHeader({
 						disabled={busy}
 						onClick={onSyncAll}
 						size={hideSubtitle ? "sm" : "default"}
+						data-app-shell-gesture-guard
 						className={cn(
 							!disableHeaderMotion &&
 								"motion-safe:transition-[height,padding,border-radius,transform] motion-safe:duration-200 motion-safe:ease-out",
@@ -554,13 +557,13 @@ export function DashboardHeader({
 			{shouldRenderMobileControlBand ? (
 				<div
 					className={cn(
-						"sm:hidden overflow-hidden",
+						"sm:hidden",
 						!disableHeaderMotion &&
 							"motion-safe:transition-[max-height,opacity,transform,margin] motion-safe:duration-200 motion-safe:ease-out",
 						disableHeaderMotion && "transition-none",
 						useMobileCompact
-							? "pointer-events-none max-h-0 -translate-y-1 opacity-0"
-							: "max-h-32 translate-y-0 opacity-100",
+							? "pointer-events-none overflow-hidden max-h-0 -translate-y-1 opacity-0"
+							: "overflow-visible max-h-32 translate-y-0 opacity-100",
 					)}
 					style={{
 						maxHeight: `${mix(116, 0, mobileHeaderProgress)}px`,
