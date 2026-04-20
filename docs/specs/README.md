@@ -121,4 +121,4 @@
 | 25pe9 | SPA document fallback 与全局 404 页面收口 | 部分完成（3/4） | `25pe9-spa-document-fallback/SPEC.md` | 2026-04-20 | local implementation + regression coverage complete; PR path proceeds without persisted screenshot assets |
 | bydfx | Web 前端懒路由与按需拆包 | 待实现 | `bydfx-web-lazy-route-code-splitting/SPEC.md` | 2026-04-20 | fast-track / lazy routes + branch-level split |
 | wt8rb | 前台错误呈现分层改造 | 已完成 | `wt8rb-frontend-error-presentation/SPEC.md` | 2026-04-20 | fast-track / frontend error surfaces / visual evidence landed |
-| kgepw | Dashboard「全部」tab 移动端页头意外上滑修复 | 部分完成（3/4） | `kgepw-dashboard-all-tab-mobile-header-scroll/SPEC.md` | 2026-04-20 | local implementation + validation + owner-facing evidence landed; push/PR pending screenshot approval |
+| kgepw | Dashboard「全部」tab 移动端页头意外上滑修复 | 已完成 | `kgepw-dashboard-all-tab-mobile-header-scroll/SPEC.md` | 2026-04-20 | viewport-height shell fix, Storybook evidence, mobile regression coverage, and owner approval all landed |

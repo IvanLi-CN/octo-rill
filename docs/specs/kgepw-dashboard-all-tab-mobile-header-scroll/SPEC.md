@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-20
 - Last: 2026-04-20
 
@@ -136,10 +136,10 @@
 - [x] M1: 冻结 follow-up spec 与 `全部` tab 壳层回归 contract。
 - [x] M2: 修复 `AppShell` / 根节点移动端 viewport 高度链，并补 Storybook 入口。
 - [x] M3: 跑通 lint / build / Storybook verify / Playwright，并生成 owner-facing 视觉证据。
-- [ ] M4: 在主人确认截图可提交后，推进 push / PR-ready 收口。
+- [x] M4: 在主人确认截图可提交后，推进 push / PR-ready 收口。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：真实移动浏览器对 `visualViewport` 的事件节奏存在差异，因此回归主要锁定“高度绑定 + sticky 顶部不漂移”的 contract，而不是绑定某一款浏览器的动画细节。
-- 开放问题：截图文件推送仍需主人确认；在确认前保持本地 PR-ready。
+- 开放问题：无。
 - 假设：当前问题根因在壳层高度链，而不是 `全部` tab 自身的 feed 布局语义。
