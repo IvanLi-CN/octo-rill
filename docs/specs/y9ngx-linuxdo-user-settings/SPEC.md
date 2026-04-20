@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-04-18
-- Last: 2026-04-19
+- Last: 2026-04-20
 
 ## 背景 / 问题陈述
 
@@ -50,6 +50,7 @@
 - `/settings` 必须至少包含 `linuxdo`、`github-pat`、`daily-brief` 三个稳定 section，并支持 `?section=<id>` 深链定位。
 - LinuxDO section 必须能展示“未绑定 / 已绑定 / 服务端未配置”三种状态，并支持发起 OAuth 绑定与解绑。
 - GitHub PAT section 必须保留现有 800ms 防抖校验、masked token 展示与仅 `valid` 可保存的门禁。
+- Dashboard 弹层与 `/settings` 内的 GitHub PAT 输入框都必须显式声明“非登录凭证”自动填充语义，避免浏览器把它当成当前站点登录密码框自动填充。
 - reaction 在 PAT 缺失或失效时，必须提供可直接输入、校验并保存 GitHub PAT 的快捷弹层；同时保留进入 `/settings?section=github-pat` 的完整设置入口。
 - Dashboard 顶部独立“日报设置”按钮必须移除，日报设置迁入 `/settings`。
 
@@ -116,7 +117,7 @@
 
 - Given 用户访问 `/settings?section=github-pat`
   When 页面渲染完成
-  Then 页面滚动/定位到 GitHub PAT section，且展示当前 masked token 与 PAT 校验状态。
+  Then 页面滚动/定位到 GitHub PAT section，展示当前 masked token 与 PAT 校验状态，且输入框使用非登录密码自动填充语义。
 
 - Given LinuxDO OAuth 已配置且用户尚未绑定
   When 用户在设置页点击“连接 LinuxDO”并完成授权
@@ -128,7 +129,7 @@
 
 - Given 用户点击 Release reaction 且 GitHub PAT 缺失或失效
   When 前端处理 fallback
-  Then 会出现可直接保存 GitHub PAT 的快捷弹层，并保留跳转 `/settings?section=github-pat` 的入口。
+  Then 会出现可直接保存 GitHub PAT 的快捷弹层，并保留跳转 `/settings?section=github-pat` 的入口，且弹层输入框不会声明为当前站点登录密码自动填充目标。
 
 - Given 用户在设置页修改日报时间或时区
   When 提交保存
@@ -181,6 +182,10 @@ PR: include
 ![Settings page overview](./assets/settings-page-overview.png)
 
 PR: include
+GitHub PAT section 深链态（保留 masked token / 校验状态，输入框声明为非登录凭证）
+![Settings GitHub PAT section](./assets/settings-github-pat-section.png)
+
+PR: include
 设置页移动端总览
 ![Settings page mobile overview](./assets/settings-page-mobile-overview.png)
 
@@ -217,6 +222,8 @@ None
 - 假设（需主人确认）：LinuxDO 绑定只服务于未来的账号关联展示/权限扩展，本轮不需要在产品其它位置消费绑定态。
 
 ## 变更记录（Change log）
+
+- 2026-04-20：补充 GitHub PAT 输入框的非登录自动填充语义要求，覆盖 Dashboard 快捷弹层与 `/settings` 页面。
 
 - 2026-04-18: 新建规格，冻结为 LinuxDO OAuth 绑定 + 统一用户设置页方案。
 - 2026-04-19: 设置页文案与布局收敛，补齐桌面端 / 移动端视觉证据并完成实现验证。
