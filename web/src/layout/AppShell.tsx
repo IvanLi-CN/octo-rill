@@ -142,6 +142,14 @@ function isTextEditableElement(target: Element | null): boolean {
 	return false;
 }
 
+function isKeyboardModalTarget(target: Element | null): boolean {
+	if (!(target instanceof Element)) {
+		return false;
+	}
+
+	return target.closest("[role='dialog'], [role='alertdialog']") !== null;
+}
+
 export function AppShell({
 	header,
 	notice,
@@ -243,14 +251,18 @@ export function AppShell({
 				isTextEditableElement(document.activeElement) &&
 				window.innerHeight - visualViewport.height >=
 					MOBILE_SOFTWARE_KEYBOARD_HEIGHT_THRESHOLD_PX;
-			const appliedViewportHeight = keyboardLikelyVisible
-				? Math.round(window.innerHeight)
-				: nextHeight;
+			const keyboardModalTarget = isKeyboardModalTarget(document.activeElement);
+			const appliedViewportHeight =
+				keyboardLikelyVisible && keyboardModalTarget
+					? Math.round(window.innerHeight)
+					: nextHeight;
 			setViewportHeight((current) =>
 				current === appliedViewportHeight ? current : appliedViewportHeight,
 			);
 			setViewportHeightSource(
-				!keyboardLikelyVisible && visualViewport && visualViewport.height > 0
+				!(keyboardLikelyVisible && keyboardModalTarget) &&
+					visualViewport &&
+					visualViewport.height > 0
 					? "visual-viewport"
 					: "window-inner-height",
 			);
