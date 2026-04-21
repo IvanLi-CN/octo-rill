@@ -276,7 +276,6 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 	await expect(myReleasesSection).toContainText("已纳入我的发布");
 });
 
-
 test("unknown app route shows not-found page after app shell boot", async ({
 	page,
 }) => {

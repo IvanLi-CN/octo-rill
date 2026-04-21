@@ -1,33 +1,32 @@
-# GitHub PAT 内嵌高仿配置 Mock（#6xaku）
+# GitHub PAT 1:1 参考界面（#6xaku）
 
 ## 状态
 
 - Status: 已完成
 - Created: 2026-04-20
-- Last: 2026-04-20
+- Last: 2026-04-21
 
 ## 背景 / 问题陈述
 
-- 当前 `/settings?section=github-pat` 仅在底部给出一行 `Settings → Developer settings → Personal access tokens → Tokens (classic)` 文本，不足以让用户 1:1 跟着 GitHub 界面照抄。
-- OctoRill 的 PAT 校验与保存逻辑已经完整可用，但“去 GitHub 哪一页点、哪几个字段怎么填、scope 应该勾哪个”仍需要用户自行脑补，学习成本偏高。
-- 产品目标不是跳转远程 GitHub DOM 做真嵌入，而是在当前设置页中提供一个稳定、静态、可控的 GitHub 风格 mock 教程卡，让用户不用离开页面也能照着完成 classic PAT 创建。
+- `/settings?section=github-pat` 需要一个用户能直接照抄的 GitHub classic PAT 参考界面。
+- 用户拒绝教程卡式自创结构、额外解释块、伪权限说明和任何不属于 GitHub 真页的辅助元素。
+- 参考界面不仅要单独验收，还要真实嵌回 OctoRill 设置页，并在移动端保持稳定、不变形、低噪声。
 
 ## 目标 / 非目标
 
 ### Goals
 
-- 在 `GitHub PAT` section 中保留真实 PAT 输入、校验、保存能力。
-- 把底部简短提示升级为内嵌式 GitHub 风格教程卡，固定为 3 步：进入路径、填写 classic token 表单、复制 token 回填 OctoRill。
-- 让教程卡显式展示 GitHub 官方文案与关键标签：`Developer settings`、`Personal access tokens`、`Tokens (classic)`、`Generate new token (classic)`、`Note`、`Expiration`。
-- 将 scope 指引与现有后端校验对齐：公开仓库至少 `public_repo`，私有仓库改选 `repo`。
-- 补齐 Storybook 与定向 E2E，确保教程卡成为稳定视觉证据来源。
+- 保留现有 GitHub PAT 输入、800ms 防抖校验、状态提示、masked token 与保存能力。
+- 提供 GitHub classic PAT 创建页的 1:1 DOM 参考界面，覆盖 desktop/mobile × light/dark 四个变体。
+- 在设置页里把参考界面作为可照抄区域嵌入，并让移动端 section 导航可切换四个设置分区。
+- 把移动端设置页外层 section 统一收成非卡片壳，减少噪声并节约空间。
+- 提供 Storybook 入口、交互切换 story、E2E 断言与视觉证据。
 
 ### Non-goals
 
-- 不修改 `/api/reaction-token/*` 的接口与后端校验语义。
-- 不嵌入真实 GitHub 页面，不依赖远程 iframe / DOM 抓取。
-- 不改 LinuxDO / 我的发布 / 日报设置 section。
-- 不追求移动端对 GitHub 设置页逐像素复刻；本轮只要求桌面端高仿、移动端信息完整可读。
+- 不修改 `/api/reaction-token/*` 接口与后端校验逻辑。
+- 不自动创建、提交或修改 GitHub PAT。
+- 不在参考界面中加入 GitHub 真页不存在的说明块、箭头、权限摘要或额外中文提示。
 
 ## 范围（Scope）
 
@@ -36,134 +35,104 @@
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/pages/Settings.tsx`
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/settings/GitHubPatGuideCard.tsx`
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/stories/Settings.stories.tsx`
+- `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/stories/GitHubPatGuideCard.stories.tsx`
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/e2e/settings.spec.ts`
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/6xaku-github-pat-inline-guide-mock/SPEC.md`
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/README.md`
+- `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/6xaku-github-pat-inline-guide-mock/assets/*`
 
 ### Out of scope
 
 - `/Users/ivan/.codex/worktrees/49f3/octo-rill/src/**`
-- 任意 GitHub OAuth / PAT 权限扩展、数据库、migration 或环境变量变更
-- 真实 GitHub 页面截图、远程抓图或浏览器自动登录 GitHub 的产品方案
+- GitHub PAT 权限策略、数据库、migration、环境变量变更
+- 任何会在 GitHub 上创建或修改 PAT 的自动化操作
 
 ## 需求（Requirements）
 
 ### MUST
 
-- `GitHub PAT` section 继续保留真实输入框、800ms 防抖校验、masked token、最近检查与“仅 valid 才允许保存”的现有语义。
-- 教程卡必须内嵌在当前 settings 页面，用户无需跳离 OctoRill 即可照着完成 classic PAT 创建流程。
-- 教程卡固定呈现 3 个顺序步骤，并用 GitHub 风格静态 mock 展示：
-  1. `Settings → Developer settings → Personal access tokens → Tokens (classic)`
-  2. `Generate new token (classic)` 表单中的 `Note`、`Expiration`、scope 区块
-  3. 复制 `ghp_` token 并回填当前页面上方输入框
-- scope 指引必须与当前后端门禁一致：公开仓库提示 `public_repo`；需要私有仓库能力时提示改选 `repo`。
-- Storybook 的 `Settings` 场景必须新增或更新为可稳定验证该教程卡的入口。
-- 定向 E2E 必须覆盖 `/settings?section=github-pat` 深链下教程卡存在且关键标签可见。
+- `GitHub PAT` section 继续保留真实输入框、自动校验、状态 badge、masked token、最近检查与“仅 valid 才允许保存”的语义。
+- `GitHubPatGuideCard` 必须使用真实 DOM 复刻 GitHub classic PAT 创建页，而不是静态截图回放。
+- 参考界面默认预填主人要求的建议值：
+  - `Note = OctoRill release feedback`
+  - `Expiration = No expiration`
+  - `repo` 已勾选
+- Storybook 必须提供四个独立 PAT 参考 story：desktop light、desktop dark、mobile light、mobile dark。
+- Storybook 必须额外提供一个可在设置页里切换四个 section 的交互式 story。
+- 移动端设置页的四个 section 导航必须稳定呈现 2×2 布局，并能在 story 内直接切换内容。
+- 移动端设置页的 section 内容区不得继续使用外层大卡片壳。
+- 参考界面在移动端必须保持最小宽度，空间不足时横向滚动，而不是继续挤压变形。
 
 ### SHOULD
 
-- 教程卡整体视觉应明显接近 GitHub 设置页的信息架构与灰阶语义，但保持 OctoRill 当前视觉系统的可读性。
-- 说明文案以中文解释为主，关键 GitHub 标签保留英文，方便用户真实对照 GitHub 页面。
-- 教程卡的布局应优先优化桌面端阅读，移动端退化为纵向单列仍能顺序完成步骤。
-
-### COULD
-
-- 无。
+- 移动端嵌入版在保持 GitHub 页面骨架的同时降低噪声，例如将长介绍替换成中性单行色块。
+- 设置页与独立参考 story 的视觉行为应一致：主题切换切换主题，窄视口切换移动版骨架。
 
 ## 功能与行为规格（Functional / Behavior Spec）
 
 ### Core flows
 
-- 用户打开 `/settings?section=github-pat` 后，页面先展示现有 PAT 输入与状态区，再在下方看到 GitHub 风格教程卡。
-- 用户按教程卡 Step 1 在 GitHub 中依次点击 `Settings`、`Developer settings`、`Personal access tokens`、`Tokens (classic)`。
-- 用户按 Step 2 参考 mock 表单填写 `Note`、选择 `Expiration`，并根据仓库类型勾选 `public_repo` 或 `repo`。
-- 用户生成 token 后，按 Step 3 把 `ghp_...` token 复制回当前页面上方的 `GitHub PAT` 输入框，等待 OctoRill 自动校验并保存。
+- 用户打开 `/settings?section=github-pat` 后，先看到真实 PAT 输入区，再看到 GitHub classic PAT 参考界面。
+- 用户在设置页中可直接照着参考界面抄写 `Note`、`Expiration` 和 `repo` 勾选状态，然后把 PAT 粘贴回真实输入框。
+- 用户在移动端查看设置页时，顶部四个 section 导航以 2×2 布局出现，并在同一 story 内切换 `日报设置 / 我的发布 / GitHub PAT / LinuxDO 绑定`。
+- 用户在移动端查看时，`GitHub PAT`、`我的发布`、`日报设置`、`LinuxDO 绑定` 的 section 内容区都不再有外层卡片壳，只保留必要分隔。
 
 ### Edge cases / errors
 
-- 若当前保存的 token 无效或已过期，原有错误态与 badge 行为保持不变；教程卡只负责引导，不替代校验结果。
-- 若用户只需要公开仓库权限，不应被教程卡误导去勾选更宽的 `repo`；但需要私有仓库时必须明确提示改选 `repo`。
-- 教程卡不得与真实输入框共享状态，不得因为用户输入变化而闪烁或重排。
+- 参考界面只负责展示 GitHub 真页结构，不承担任何 PAT 校验或保存逻辑。
+- 容器宽度小于移动参考界面最小宽度时，只允许横向滚动，不允许继续压缩 DOM。
+- 交互式 story 切换 section 时不得真的离开 Storybook 页面，只更新 story 内部状态。
 
 ## 验收标准（Acceptance Criteria）
 
 - Given 用户访问 `/settings?section=github-pat`
   When 页面渲染完成
-  Then 同一屏内能同时看到真实 PAT 输入区与 GitHub 风格教程卡。
+  Then 同一屏内能同时看到真实 PAT 输入区与 GitHub classic PAT 参考界面。
 
-- Given 用户阅读教程卡 Step 1
-  When 按图索骥进入 GitHub 设置页
-  Then 能看到 `Developer settings`、`Personal access tokens` 与 `Tokens (classic)` 的路径提示。
+- Given 用户打开 GitHub PAT 独立 story
+  When 切换 light/dark 与 desktop/mobile
+  Then 四个变体都能显示正确主题和正确骨架。
 
-- Given 用户阅读教程卡 Step 2
-  When 对照填写 classic PAT 表单
-  Then 能看到 `Generate new token (classic)`、`Note`、`Expiration` 以及 `public_repo` / `repo` 的 scope 指引。
+- Given 用户打开 `Switchable Sections` story
+  When 点击四个顶部导航项
+  Then 不离开 story，即可切换到对应 section 内容。
 
-- Given 用户生成了 `ghp_` token
-  When 阅读教程卡 Step 3
-  Then 能明确知道要把 token 复制回当前页面上方输入框，而不是继续停留在 GitHub 页面。
+- Given 用户在移动端查看 `Switchable Sections` story
+  When 切到 `日报设置`、`GitHub PAT`、`LinuxDO 绑定` 或 `我的发布`
+  Then section 内容不应继续包裹在外层卡片壳中。
 
-- Given Storybook 与 Playwright 回归均运行
-  When 检查 `github-pat` 场景
-  Then 两者都能稳定断言教程卡关键标签存在，且原有 PAT 输入/状态信息仍可见。
+- Given 用户在移动端查看 `GitHub PAT` section
+  When 可用宽度小于参考界面最小宽度
+  Then 参考界面横向滚动，而不是被压坏。
 
-## 实现前置条件（Definition of Ready / Preconditions）
+## 质量门槛（Quality Gates）
 
-- 仓库已具备 `SettingsPage`、`Settings.stories.tsx` 与 `/settings?section=github-pat` 深链。
-- Storybook 已启用 docs/autodocs 能力，并可作为 Web UI 的稳定视觉证据源。
-- 后端已固定 classic PAT scope 校验规则：`public_repo (public)` 或 `repo (private)`。
-
-## 非功能性验收 / 质量门槛（Quality Gates）
-
-### Testing
-
-- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && npm run lint`
-- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && npm run build`
-- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && npm run storybook:build`
-- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && npm run e2e -- settings.spec.ts`
-- `codex -m gpt-5.4 -c model_reasoning_effort="low" --sandbox read-only -a never review --base origin/main`
-
-### UI / Storybook (if applicable)
-
-- `Settings` Storybook 场景必须显式展示 GitHub PAT guide mock。
-- `play` 断言必须覆盖教程卡关键标签与原有输入区并存。
-- 视觉证据优先来自 Storybook docs/canvas，而不是临时浏览器截图。
-
-## 文档更新（Docs to Update）
-
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/6xaku-github-pat-inline-guide-mock/SPEC.md`
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/README.md`
+- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && bun run lint`
+- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && bun run build`
+- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && bun run storybook:build`
+- `cd /Users/ivan/.codex/worktrees/49f3/octo-rill/web && bunx playwright test e2e/settings.spec.ts --project=chromium`
 
 ## Visual Evidence
 
 PR: include
-设置页 GitHub PAT section 内嵌高仿 GitHub classic PAT 教程卡
-![GitHub PAT inline guide mock](./assets/github-pat-inline-guide-mock.png)
+GitHub 实际界面 vs OctoRill 参考界面对比（desktop/mobile × light/dark）
+![GitHub PAT 1:1 compare](./assets/github-pat-1to1-compare.png)
 
-## 实现里程碑（Milestones / Delivery checklist）
+设置页内嵌版的移动端最终形态（可切换 section story）
+![Settings switchable mobile](./assets/settings-switchable-mobile.png)
 
-- [x] M1: 新建独立 spec，冻结教程卡的信息架构、scope 真相源与视觉证据要求。
-- [x] M2: Settings 页改为“真实 PAT 表单 + GitHub 风格静态教程卡”双区块布局。
-- [x] M3: 更新 Storybook 与定向 E2E，固定 `github-pat` 深链的可见性断言。
-- [x] M4: 产出视觉证据并将其落盘到 spec assets。
+## 实现概述
 
-## 方案概述（Approach, high-level）
-
-- 新增独立 `GitHubPatGuideCard` 展示组件，以 GitHub 设置页的信息架构为骨架，用静态 mock 还原导航、表单与 token 回填步骤。
-- `SettingsPage` 保持现有 PAT 输入与保存逻辑不动，只把原 `details` 简短提示替换为新的教程卡组件。
-- Storybook 继续复用现有 `SettingsPage` mock fetch 方案，在 `github-pat` 深链故事里直接断言教程卡关键标签。
-- Playwright 复用现有 `/settings` mock API，扩展 `github-pat` 深链用例以覆盖教程卡存在性与关键 scope 指引。
-
-## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
-
-- 风险：GitHub 官方设置页未来若调整文案或导航层级，教程卡文案需要跟着更新。
-- 风险：若后端未来进一步细分 scope 要求，前端教程卡必须同步更新以避免指引漂移。
-- 开放问题：无。
-- 假设：当前 classic PAT 校验语义继续保持 `public_repo` 或 `repo` 二选一即可通过。
+- `GitHubPatGuideCard` 使用 DOM 复刻 GitHub classic PAT 页面骨架，并按主题与断点切换 desktop/mobile × light/dark 四个变体。
+- 设置页保留真实 PAT 编辑能力，只把参考界面作为嵌入式抄写区域；移动端嵌入版允许横向滚动并降低说明噪声。
+- `Settings.stories.tsx` 新增可切换 section 的 story，并在 story 内拦截导航跳转、改为本地状态切换。
+- 移动端设置页导航拆成独立 2×2 网格渲染，避免桌面按钮变体导致选中态与布局失真。
+- 移动端 `GitHub PAT`、`日报设置`、`我的发布`、`LinuxDO 绑定` 的外层 section 卡片壳统一抹平，保留导航和内容之间的明确分隔。
 
 ## 参考（References）
 
-- https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/docs/specs/y9ngx-linuxdo-user-settings/SPEC.md`
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/src/api.rs`
-- `/Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/pages/Settings.tsx`
+- https://github.com/settings/tokens/new
+- https://github.com/settings/tokens
+- /Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/pages/Settings.tsx
+- /Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/settings/GitHubPatGuideCard.tsx
+- /Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/stories/Settings.stories.tsx
+- /Users/ivan/.codex/worktrees/49f3/octo-rill/web/src/stories/GitHubPatGuideCard.stories.tsx

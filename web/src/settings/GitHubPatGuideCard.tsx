@@ -1,301 +1,642 @@
 import {
-	ArrowRight,
+	CalendarDays,
 	Check,
-	ChevronRight,
-	Copy,
+	ChevronDown,
+	ChevronUp,
+	Github,
+	Grid2x2,
 	KeyRound,
-	ShieldCheck,
+	Menu,
+	Search,
+	UserRound,
 } from "lucide-react";
-import type { ReactNode } from "react";
 
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { PAT_CREATE_PATH } from "@/settings/reactionTokenEditor";
+import { useOptionalTheme } from "@/theme/ThemeProvider";
 
-function GuideChrome(props: {
-	step: string;
-	title: string;
-	description: string;
-	children: ReactNode;
-	className?: string;
-}) {
-	const { step, title, description, children, className } = props;
-	return (
-		<section
-			className={cn(
-				"rounded-2xl border border-slate-300/90 bg-slate-50/95 p-4 text-slate-900 shadow-[0_1px_0_rgba(15,23,42,0.04)] dark:border-slate-700 dark:bg-slate-950/60 dark:text-slate-100",
-				className,
-			)}
-		>
-			<div className="flex flex-wrap items-start justify-between gap-3">
-				<div className="space-y-1">
-					<p className="text-[11px] font-semibold tracking-[0.18em] text-slate-500 uppercase dark:text-slate-400">
-						{step}
-					</p>
-					<h3 className="text-sm font-semibold text-slate-950 dark:text-slate-50">
-						{title}
-					</h3>
-				</div>
-				<Badge
-					variant="outline"
-					className="rounded-full border-slate-300 bg-white/90 px-2.5 py-0.5 text-[11px] text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
-				>
-					GitHub mock
-				</Badge>
-			</div>
-			<p className="mt-2 text-xs leading-5 text-slate-600 dark:text-slate-300">
-				{description}
-			</p>
-			<div className="mt-4">{children}</div>
-		</section>
-	);
-}
+type ReplicaTheme = {
+	page: string;
+	surface: string;
+	subtleSurface: string;
+	border: string;
+	text: string;
+	muted: string;
+	link: string;
+	accent: string;
+	accentSoft: string;
+	input: string;
+	search: string;
+	button: string;
+	buttonText: string;
+	topMask: string;
+	topMaskAlt: string;
+	avatar: string;
+	shadow: string;
+};
 
-function SidebarRow(props: {
+type ScopeItem = {
 	label: string;
-	active?: boolean;
-	nested?: boolean;
-}) {
-	const { label, active = false, nested = false } = props;
-	return (
-		<div
-			className={cn(
-				"flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300",
-				nested && "ml-4 text-[11px]",
-				active &&
-					"bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950",
-			)}
-		>
-			<div
-				className={cn(
-					"size-1.5 rounded-full bg-slate-300 dark:bg-slate-600",
-					active && "bg-current",
-				)}
-			/>
-			<span>{label}</span>
-		</div>
-	);
-}
-
-function ScopeRow(props: {
-	scope: string;
-	tone: "primary" | "muted";
-	title: string;
 	description: string;
-}) {
-	const { scope, tone, title, description } = props;
+	checked?: boolean;
+	disabled?: boolean;
+	child?: boolean;
+};
+
+type GitHubPatGuideCardProps = {
+	compact?: boolean;
+};
+
+const desktopRows: ScopeItem[] = [
+	{
+		label: "repo",
+		description: "Full control of private repositories",
+		checked: true,
+	},
+	{
+		label: "repo:status",
+		description: "Access commit status",
+		checked: true,
+		disabled: true,
+		child: true,
+	},
+	{
+		label: "repo_deployment",
+		description: "Access deployment status",
+		checked: true,
+		disabled: true,
+		child: true,
+	},
+	{
+		label: "public_repo",
+		description: "Access public repositories",
+		checked: true,
+		disabled: true,
+		child: true,
+	},
+	{
+		label: "repo:invite",
+		description: "Access repository invitations",
+		checked: true,
+		disabled: true,
+		child: true,
+	},
+	{
+		label: "security_events",
+		description: "Read and write security events",
+		checked: true,
+		disabled: true,
+		child: true,
+	},
+	{ label: "workflow", description: "Update GitHub Action workflows" },
+	{
+		label: "write:packages",
+		description: "Upload packages to GitHub Package Registry",
+	},
+	{
+		label: "read:packages",
+		description: "Download packages from GitHub Package Registry",
+	},
+	{
+		label: "delete:packages",
+		description: "Delete packages from GitHub Package Registry",
+	},
+	{
+		label: "admin:org",
+		description: "Full control of orgs and teams, read and write org projects",
+	},
+	{
+		label: "write:org",
+		description:
+			"Read and write org and team membership, read and write org projects",
+		child: true,
+	},
+	{
+		label: "read:org",
+		description: "Read org and team membership, read org projects",
+		child: true,
+	},
+	{
+		label: "manage_runners:org",
+		description: "Manage org runners and runner groups",
+		child: true,
+	},
+	{
+		label: "admin:public_key",
+		description: "Full control of user public keys",
+	},
+];
+
+const mobileRows = desktopRows.slice(0, 7);
+
+const lightTheme: ReplicaTheme = {
+	page: "#ffffff",
+	surface: "#ffffff",
+	subtleSurface: "#f6f8fa",
+	border: "#d0d7de",
+	text: "#1f2328",
+	muted: "#59636e",
+	link: "#0969da",
+	accent: "#0969da",
+	accentSoft: "#ddf4ff",
+	input: "#ffffff",
+	search: "#f6f8fa",
+	button: "#1f883d",
+	buttonText: "#ffffff",
+	topMask: "#e7edf7",
+	topMaskAlt: "#dde6f2",
+	avatar: "#d6af72",
+	shadow: "0 1px 0 rgba(31,35,40,0.04)",
+};
+
+const darkTheme: ReplicaTheme = {
+	page: "#0d1117",
+	surface: "#0d1117",
+	subtleSurface: "#161b22",
+	border: "#30363d",
+	text: "#e6edf3",
+	muted: "#8b949e",
+	link: "#2f81f7",
+	accent: "#2f81f7",
+	accentSoft: "#1f6feb26",
+	input: "#0d1117",
+	search: "#0d1117",
+	button: "#238636",
+	buttonText: "#ffffff",
+	topMask: "#2b3240",
+	topMaskAlt: "#232937",
+	avatar: "#c59a62",
+	shadow: "0 0 0 1px rgba(240,246,252,0.02)",
+};
+
+function topChrome(ui: ReplicaTheme) {
 	return (
-		<div
-			className={cn(
-				"rounded-xl border px-3 py-3",
-				tone === "primary"
-					? "border-emerald-200 bg-emerald-50/90 dark:border-emerald-800/70 dark:bg-emerald-950/30"
-					: "border-slate-200 bg-white/85 dark:border-slate-700 dark:bg-slate-900/80",
-			)}
-		>
+		<div className="flex items-center gap-3">
+			<div
+				className="hidden lg:flex h-10 items-center gap-2 rounded-md border px-3 text-[15px]"
+				style={{
+					backgroundColor: ui.search,
+					borderColor: ui.border,
+					color: ui.muted,
+				}}
+			>
+				<Search className="size-4" />
+				<span>Type / to search</span>
+			</div>
 			<div className="flex items-center gap-2">
 				<div
-					className={cn(
-						"flex size-4 items-center justify-center rounded-sm border",
-						tone === "primary"
-							? "border-emerald-500 bg-emerald-500 text-white"
-							: "border-slate-300 bg-transparent text-transparent dark:border-slate-600",
-					)}
-				>
-					<Check className="size-3" />
-				</div>
-				<code className="rounded bg-slate-900 px-1.5 py-0.5 text-[11px] font-semibold text-white dark:bg-slate-100 dark:text-slate-950">
-					{scope}
-				</code>
-				<p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-					{title}
-				</p>
+					className="h-7 w-7 rounded-md"
+					style={{ backgroundColor: ui.topMask }}
+				/>
+				<div
+					className="h-7 w-7 rounded-md"
+					style={{ backgroundColor: ui.topMaskAlt }}
+				/>
+				<div
+					className="h-7 w-7 rounded-full"
+					style={{ backgroundColor: ui.avatar }}
+				/>
 			</div>
-			<p className="mt-2 text-[11px] leading-5 text-slate-600 dark:text-slate-300">
-				{description}
-			</p>
 		</div>
 	);
 }
 
-export function GitHubPatGuideCard() {
+function ReplicaCheckbox({
+	checked,
+	disabled,
+	ui,
+}: {
+	checked?: boolean;
+	disabled?: boolean;
+	ui: ReplicaTheme;
+}) {
+	return (
+		<span
+			aria-hidden="true"
+			className="mt-[2px] inline-flex size-4 items-center justify-center rounded-[4px] border"
+			style={{
+				backgroundColor: checked ? ui.accent : ui.input,
+				borderColor: checked ? ui.accent : ui.border,
+				opacity: disabled ? 0.72 : 1,
+			}}
+		>
+			{checked ? <Check className="size-3 text-white" strokeWidth={3} /> : null}
+		</span>
+	);
+}
+
+function ScopeRow({ item, ui }: { item: ScopeItem; ui: ReplicaTheme }) {
+	return (
+		<div
+			className="grid grid-cols-[minmax(0,44%)_minmax(0,56%)] gap-3 border-t px-4 py-3 text-[15px] leading-6 md:grid-cols-[minmax(0,320px)_minmax(0,1fr)] md:px-5"
+			style={{ borderColor: ui.border }}
+		>
+			<div
+				className={cn("flex items-start gap-3", item.child ? "pl-7" : "pl-0")}
+			>
+				<ReplicaCheckbox
+					checked={item.checked}
+					disabled={item.disabled}
+					ui={ui}
+				/>
+				<span
+					className={cn(
+						"min-w-0 break-all",
+						item.child ? "font-normal" : "font-semibold",
+					)}
+				>
+					{item.label}
+				</span>
+			</div>
+			<div className="min-w-0" style={{ color: ui.muted }}>
+				{item.description}
+			</div>
+		</div>
+	);
+}
+
+function PatForm({
+	mobile,
+	ui,
+	compact,
+}: {
+	mobile?: boolean;
+	ui: ReplicaTheme;
+	compact?: boolean;
+}) {
+	const rows = mobile ? mobileRows : desktopRows;
+	const showCompactIntro = compact && mobile;
+	return (
+		<div
+			className={cn(
+				"min-w-0",
+				mobile ? "px-4 pb-6" : "px-8 pb-10 pt-8 lg:px-10",
+			)}
+		>
+			<div className={cn("min-w-0", mobile ? "max-w-none" : "max-w-[820px]")}>
+				<h2
+					className={cn(
+						"font-semibold tracking-[-0.02em]",
+						mobile ? "text-[32px]" : "text-[48px]",
+					)}
+				>
+					New personal access token (classic)
+				</h2>
+				<div className="mt-4 border-b" style={{ borderColor: ui.border }} />
+				{showCompactIntro ? (
+					<div
+						aria-hidden="true"
+						className="mt-6 h-4 w-full rounded-md"
+						style={{ backgroundColor: ui.subtleSurface }}
+					/>
+				) : (
+					<p
+						className="mt-6 text-[16px] leading-7 md:text-[17px]"
+						style={{ color: ui.text }}
+					>
+						Personal access tokens (classic) function like ordinary OAuth access
+						tokens. They can be used instead of a password for Git over HTTPS,
+						or can be used to{" "}
+						<a
+							href="https://docs.github.com/v3/auth/#basic-authentication"
+							style={{ color: ui.link }}
+						>
+							authenticate to the API over Basic Authentication
+						</a>
+						.
+					</p>
+				)}
+
+				<div className="mt-8">
+					<label
+						htmlFor="github-pat-note"
+						className="block text-[16px] font-semibold"
+					>
+						Note
+					</label>
+					<input
+						readOnly
+						id="github-pat-note"
+						aria-label="Note"
+						value="OctoRill release feedback"
+						className="mt-3 block h-11 w-full rounded-md border bg-transparent px-3 text-[16px] outline-none"
+						style={{
+							backgroundColor: ui.input,
+							borderColor: ui.accent,
+							boxShadow: `inset 0 0 0 1px ${ui.accent}`,
+						}}
+					/>
+					<p className="mt-2 text-[14px]" style={{ color: ui.muted }}>
+						What’s this token for?
+					</p>
+				</div>
+
+				<div className="mt-8">
+					<div className="text-[16px] font-semibold">Expiration</div>
+					<button
+						type="button"
+						aria-haspopup="menu"
+						className="mt-3 inline-flex h-11 items-center gap-3 rounded-md border px-3 text-[16px]"
+						style={{
+							backgroundColor: ui.subtleSurface,
+							borderColor: ui.border,
+						}}
+					>
+						<CalendarDays className="size-4" />
+						<span>No expiration</span>
+						<ChevronDown className="size-4" />
+					</button>
+					<p className="mt-3 text-[14px] leading-6" style={{ color: ui.muted }}>
+						GitHub strongly recommends that you set an expiration date for your
+						token to help keep your information secure.{" "}
+						<a
+							href="https://github.blog/changelog/2021-07-26-expiration-options-for-personal-access-tokens/"
+							style={{ color: ui.link }}
+						>
+							Learn more
+						</a>
+					</p>
+				</div>
+
+				<div className="mt-8">
+					<div className="text-[16px] font-semibold">Select scopes</div>
+					<p className="mt-3 text-[16px] leading-7">
+						Scopes define the access for personal tokens.{" "}
+						<a
+							href="https://docs.github.com/apps/building-oauth-apps/scopes-for-oauth-apps/"
+							style={{ color: ui.link }}
+						>
+							Read more about OAuth scopes.
+						</a>
+					</p>
+					<div
+						className="mt-4 overflow-hidden rounded-md border"
+						style={{ borderColor: ui.border }}
+					>
+						{rows.map((item) => (
+							<div key={item.label}>
+								<ScopeRow item={item} ui={ui} />
+							</div>
+						))}
+					</div>
+				</div>
+
+				<div className="mt-8 flex items-center gap-4">
+					<button
+						type="button"
+						className="rounded-md px-4 py-2 text-[15px] font-semibold"
+						style={{ backgroundColor: ui.button, color: ui.buttonText }}
+					>
+						Generate token
+					</button>
+					<a
+						href="https://github.com/settings/tokens"
+						style={{ color: ui.link }}
+					>
+						Cancel
+					</a>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function DesktopSidebar({ ui }: { ui: ReplicaTheme }) {
+	const navItemClass =
+		"flex items-center gap-3 rounded-md px-3 py-2 text-[15px] font-medium";
+	return (
+		<aside className="border-r px-4 py-6" style={{ borderColor: ui.border }}>
+			<nav className="space-y-2">
+				<a className={navItemClass} href="https://github.com/settings/apps">
+					<Grid2x2 className="size-4" />
+					<span>GitHub Apps</span>
+				</a>
+				<a
+					className={navItemClass}
+					href="https://github.com/settings/developers"
+				>
+					<UserRound className="size-4" />
+					<span>OAuth Apps</span>
+				</a>
+				<div className="space-y-1">
+					<div className={cn(navItemClass, "justify-between")}>
+						<div className="flex items-center gap-3">
+							<KeyRound className="size-4" />
+							<span>Personal access tokens</span>
+						</div>
+						<ChevronUp className="size-4" />
+					</div>
+					<div
+						className="ml-7 space-y-1 border-l pl-4"
+						style={{ borderColor: ui.border }}
+					>
+						<a
+							className={cn(
+								navItemClass,
+								"px-2 py-1.5 text-[14px] font-normal",
+							)}
+							href="https://github.com/settings/personal-access-tokens"
+						>
+							Fine-grained tokens
+						</a>
+						<div
+							className="relative rounded-md px-2 py-2 text-[14px] font-medium"
+							style={{ backgroundColor: ui.subtleSurface }}
+						>
+							<span
+								className="absolute bottom-2 left-0 top-2 w-1 rounded-full"
+								style={{ backgroundColor: ui.accent }}
+							/>
+							<span className="pl-3">Tokens (classic)</span>
+						</div>
+					</div>
+				</div>
+			</nav>
+		</aside>
+	);
+}
+
+function DesktopReplica({
+	ui,
+	compact,
+}: {
+	ui: ReplicaTheme;
+	compact?: boolean;
+}) {
+	return (
+		<div
+			className="overflow-hidden rounded-[6px] border"
+			style={{
+				backgroundColor: ui.page,
+				borderColor: ui.border,
+				color: ui.text,
+				boxShadow: ui.shadow,
+				fontFamily:
+					'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+			}}
+		>
+			<header
+				className="flex h-[72px] items-center justify-between border-b px-7"
+				style={{ borderColor: ui.border, backgroundColor: ui.surface }}
+			>
+				<div className="flex items-center gap-4 text-[15px] font-semibold">
+					<button
+						type="button"
+						className="inline-flex size-10 items-center justify-center rounded-md border"
+						style={{
+							borderColor: ui.border,
+							backgroundColor: ui.subtleSurface,
+						}}
+					>
+						<Menu className="size-5" />
+					</button>
+					<Github className="size-8" />
+					<div className="flex items-center gap-3 text-[16px]">
+						<span>Settings</span>
+						<span style={{ color: ui.muted }}>/</span>
+						<span>Developer Settings</span>
+					</div>
+				</div>
+				{topChrome(ui)}
+			</header>
+			<div className="grid min-h-[860px] grid-cols-[280px_minmax(0,1fr)]">
+				<DesktopSidebar ui={ui} />
+				<PatForm ui={ui} compact={compact} />
+			</div>
+		</div>
+	);
+}
+
+function MobileReplica({
+	ui,
+	compact,
+}: {
+	ui: ReplicaTheme;
+	compact?: boolean;
+}) {
+	return (
+		<div
+			className="overflow-hidden rounded-[6px] border"
+			style={{
+				backgroundColor: ui.page,
+				borderColor: ui.border,
+				color: ui.text,
+				boxShadow: ui.shadow,
+				fontFamily:
+					'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+			}}
+		>
+			<header
+				className="flex h-14 items-center justify-between border-b px-4"
+				style={{ borderColor: ui.border, backgroundColor: ui.surface }}
+			>
+				<div className="flex items-center gap-3">
+					<button
+						type="button"
+						className="inline-flex size-8 items-center justify-center rounded-md border"
+						style={{
+							borderColor: ui.border,
+							backgroundColor: ui.subtleSurface,
+						}}
+					>
+						<Menu className="size-4" />
+					</button>
+					<Github className="size-7" />
+					<div className="flex items-center gap-2 text-[14px] font-semibold">
+						<span>…</span>
+						<span style={{ color: ui.muted }}>/</span>
+						<span>Developer S...</span>
+					</div>
+				</div>
+				<div className="flex items-center gap-2">
+					<button
+						type="button"
+						className="inline-flex size-8 items-center justify-center rounded-md border"
+						style={{
+							borderColor: ui.border,
+							backgroundColor: ui.subtleSurface,
+						}}
+					>
+						<Search className="size-4" />
+					</button>
+					<div
+						className="h-7 w-7 rounded-md"
+						style={{ backgroundColor: ui.topMask }}
+					/>
+					<div
+						className="h-7 w-7 rounded-full"
+						style={{ backgroundColor: ui.avatar }}
+					/>
+				</div>
+			</header>
+			<div className="border-b px-4 py-5" style={{ borderColor: ui.border }}>
+				<nav className="space-y-4 text-[14px]">
+					<div className="flex items-center gap-2">
+						<Grid2x2 className="size-4" />
+						<span>GitHub Apps</span>
+					</div>
+					<div className="flex items-center gap-2">
+						<UserRound className="size-4" />
+						<span>OAuth Apps</span>
+					</div>
+					<div>
+						<div className="flex items-center justify-between font-medium">
+							<div className="flex items-center gap-2">
+								<KeyRound className="size-4" />
+								<span>Personal access tokens</span>
+							</div>
+							<ChevronUp className="size-4" />
+						</div>
+						<div
+							className="ml-2 mt-3 space-y-2 border-l pl-4"
+							style={{ borderColor: ui.border }}
+						>
+							<div className="text-[13px]" style={{ color: ui.muted }}>
+								Fine-grained tokens
+							</div>
+							<div
+								className="relative rounded-md px-3 py-2 text-[13px] font-medium"
+								style={{ backgroundColor: ui.subtleSurface }}
+							>
+								<span
+									className="absolute bottom-2 left-0 top-2 w-1 rounded-full"
+									style={{ backgroundColor: ui.accent }}
+								/>
+								<span>Tokens (classic)</span>
+							</div>
+						</div>
+					</div>
+				</nav>
+			</div>
+			<PatForm mobile ui={ui} compact={compact} />
+		</div>
+	);
+}
+
+export function GitHubPatGuideCard(props: GitHubPatGuideCardProps) {
+	const { compact = false } = props;
+	const theme = useOptionalTheme();
+	const resolvedTheme = theme?.resolvedTheme ?? "light";
+	const ui = resolvedTheme === "dark" ? darkTheme : lightTheme;
+
 	return (
 		<section
 			data-testid="github-pat-guide-card"
-			className="rounded-2xl border border-border/70 bg-card/98 p-4 shadow-sm"
+			aria-label="GitHub classic PAT reference"
+			className="overflow-hidden"
 		>
-			<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-				<div className="space-y-1">
-					<div className="flex flex-wrap items-center gap-2">
-						<h2 className="text-base font-semibold text-foreground">
-							照着 GitHub 页面创建 classic PAT
-						</h2>
-						<Badge variant="secondary">1:1 抄作业</Badge>
-					</div>
-					<p className="text-muted-foreground text-sm leading-6">
-						这是一个静态高仿 mock，用来告诉你去 GitHub
-						哪一页点、哪些字段照着填、生成后再回到上方输入框保存。
-					</p>
-				</div>
-				<Badge
-					variant="outline"
-					className="w-fit rounded-full px-3 py-1 font-mono text-[11px]"
-				>
-					{PAT_CREATE_PATH}
-				</Badge>
+			<p className="sr-only">
+				GitHub Settings. Developer Settings. Personal access tokens. Tokens
+				(classic). New personal access token (classic). Note equals OctoRill
+				release feedback. Expiration equals No expiration. Scope repo is
+				checked.
+			</p>
+			<div className="hidden md:block">
+				<DesktopReplica ui={ui} compact={compact} />
 			</div>
-
-			<div className="mt-4 space-y-4">
-				<div className="grid gap-4 xl:grid-cols-[0.96fr_1.04fr]">
-					<GuideChrome
-						step="Step 1"
-						title="进入 Tokens (classic)"
-						description="先按 GitHub 官方路径进入 classic token 页面，左边栏的层级要对上。"
-					>
-						<div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-950">
-							<div className="flex items-center justify-between border-b border-slate-200 bg-slate-100/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-900">
-								<div className="flex items-center gap-2">
-									<div className="size-6 rounded-full bg-slate-950 dark:bg-slate-100" />
-									<p className="text-xs font-semibold">GitHub</p>
-								</div>
-								<p className="text-[11px] text-slate-500 dark:text-slate-400">
-									Settings
-								</p>
-							</div>
-							<div className="grid gap-4 px-3 py-3 md:grid-cols-[160px_1fr]">
-								<div className="space-y-1.5">
-									<SidebarRow label="Access" />
-									<SidebarRow label="Code, planning, and automation" />
-									<SidebarRow label="Security" />
-									<SidebarRow label="Developer settings" active />
-									<SidebarRow label="GitHub Apps" nested />
-									<SidebarRow label="OAuth apps" nested />
-									<SidebarRow label="Personal access tokens" nested />
-									<SidebarRow label="Fine-grained tokens" nested />
-									<SidebarRow label="Tokens (classic)" active nested />
-								</div>
-								<div className="space-y-3 rounded-xl border border-slate-200 bg-slate-50/70 p-3 dark:border-slate-700 dark:bg-slate-900/70">
-									<div className="flex flex-wrap items-center gap-1 text-[11px] font-medium text-slate-500 dark:text-slate-400">
-										<span>Settings</span>
-										<ChevronRight className="size-3" />
-										<span>Developer settings</span>
-										<ChevronRight className="size-3" />
-										<span>Personal access tokens</span>
-										<ChevronRight className="size-3" />
-										<span className="font-semibold text-slate-900 dark:text-slate-100">
-											Tokens (classic)
-										</span>
-									</div>
-									<div className="rounded-xl border border-dashed border-slate-300 bg-white px-3 py-3 dark:border-slate-600 dark:bg-slate-950">
-										<p className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-											Personal access tokens (classic)
-										</p>
-										<p className="mt-1 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
-											点击右上角 <strong>Generate new token</strong>，再选择{" "}
-											<strong>Generate new token (classic)</strong>。
-										</p>
-									</div>
-								</div>
-							</div>
-						</div>
-					</GuideChrome>
-
-					<GuideChrome
-						step="Step 2"
-						title="填写 Generate new token (classic)"
-						description="把关键字段和 scope 先在脑子里对齐，再去 GitHub 填，避免生成后又因为 scope 不对重新来一遍。"
-					>
-						<div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-950">
-							<div className="border-b border-slate-200 px-4 py-3 dark:border-slate-700">
-								<p className="text-sm font-semibold text-slate-950 dark:text-slate-50">
-									Generate new token (classic)
-								</p>
-								<p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
-									创建后只会显示一次 token，请立刻复制保存。
-								</p>
-							</div>
-							<div className="space-y-3 px-4 py-4">
-								<div className="space-y-1.5">
-									<p className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-										Note
-									</p>
-									<div className="rounded-md border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-700 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200">
-										OctoRill release feedback
-									</div>
-								</div>
-								<div className="space-y-1.5">
-									<p className="text-[11px] font-semibold text-slate-700 dark:text-slate-300">
-										Expiration
-									</p>
-									<div className="flex items-center justify-between rounded-md border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-700 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200">
-										<span>30 days</span>
-										<ChevronRight className="size-3 rotate-90" />
-									</div>
-								</div>
-								<div className="space-y-2">
-									<div className="flex items-center gap-2">
-										<ShieldCheck className="size-4 text-emerald-600 dark:text-emerald-400" />
-										<p className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-											Repository scopes（按仓库类型二选一）
-										</p>
-									</div>
-									<ScopeRow
-										scope="public_repo"
-										tone="primary"
-										title="公开仓库最低要求"
-										description="只需要给公开仓库做 release feedback 时，勾这个就够了，对应当前后端校验的 minimum scope。"
-									/>
-									<ScopeRow
-										scope="repo"
-										tone="muted"
-										title="私有仓库改选这个"
-										description="如果 OctoRill 需要访问私有仓库，请改勾 repo；它比 public_repo 更宽，也能满足当前校验。"
-									/>
-								</div>
-							</div>
-						</div>
-					</GuideChrome>
+			<div className="md:hidden overflow-x-auto pb-1">
+				<div className="min-w-[390px]">
+					<MobileReplica ui={ui} compact={compact} />
 				</div>
-
-				<GuideChrome
-					step="Step 3"
-					title="复制 token，回填到当前页面上方"
-					description="生成后别停留在 GitHub；把新 token 复制回来，上方输入框会自动做 800ms 防抖校验。"
-				>
-					<div className="grid gap-4 lg:grid-cols-[1fr_auto_1fr]">
-						<div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-950">
-							<div className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
-								<KeyRound className="size-4" />
-								New personal access token
-							</div>
-							<div className="mt-3 flex items-center justify-between rounded-xl border border-slate-300 bg-slate-50 px-3 py-3 font-mono text-xs text-slate-800 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-100">
-								<span>ghp_xxxx_xxxx_classic_token</span>
-								<Copy className="size-4 text-slate-500 dark:text-slate-400" />
-							</div>
-							<p className="mt-2 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
-								GitHub 只会显示一次，复制后就回到 OctoRill。
-							</p>
-						</div>
-
-						<div className="flex items-center justify-center text-slate-400">
-							<ArrowRight className="size-5" />
-						</div>
-
-						<div className="rounded-2xl border border-emerald-200 bg-emerald-50/90 p-4 dark:border-emerald-800/70 dark:bg-emerald-950/30">
-							<div className="flex items-center gap-2 text-xs font-semibold text-emerald-800 dark:text-emerald-200">
-								<Check className="size-4" />
-								回到当前页面上方输入框
-							</div>
-							<div className="mt-3 rounded-xl border border-emerald-300/80 bg-white/90 px-3 py-3 font-mono text-xs text-slate-800 dark:border-emerald-700 dark:bg-slate-950 dark:text-slate-100">
-								粘贴新的 classic PAT
-							</div>
-							<p className="mt-2 text-[11px] leading-5 text-emerald-900/80 dark:text-emerald-100/90">
-								校验通过后再点 <strong>保存 GitHub PAT</strong>，这样当前站点的
-								release feedback 才能恢复可用。
-							</p>
-						</div>
-					</div>
-				</GuideChrome>
 			</div>
 		</section>
 	);

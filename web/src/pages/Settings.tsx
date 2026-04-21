@@ -733,16 +733,15 @@ export function SettingsPage(props: {
 								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
 									<div className="space-y-2">
 										<Label htmlFor="settings-reaction-pat">GitHub PAT</Label>
-										<Input
+										<GitHubPatInput
 											id="settings-reaction-pat"
-											type="password"
 											value={patInput}
 											onChange={(event) => setPatInput(event.target.value)}
 											placeholder="粘贴新的 classic PAT"
 											autoCapitalize="none"
 											autoCorrect="off"
 											spellCheck={false}
-											className="h-10 font-mono text-sm"
+											inputClassName="h-10 font-mono text-sm"
 										/>
 									</div>
 
