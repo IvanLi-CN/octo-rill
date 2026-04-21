@@ -15,7 +15,6 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
@@ -61,6 +60,7 @@ import {
 	isReactionTokenUsable,
 	useReactionTokenEditor,
 } from "@/settings/reactionTokenEditor";
+import { GitHubPatInput } from "@/settings/GitHubPatInput";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
 	InboxQuickList,
@@ -1743,10 +1743,8 @@ export function Dashboard(props: {
 										</span>
 									) : null}
 								</div>
-								<Input
+								<GitHubPatInput
 									id="dashboard-reaction-pat"
-									type="password"
-									autoComplete="new-password"
 									value={patInput}
 									onChange={(event) => setPatInput(event.target.value)}
 									placeholder="粘贴 classic PAT"
@@ -1754,7 +1752,7 @@ export function Dashboard(props: {
 									autoCorrect="off"
 									spellCheck={false}
 									autoFocus
-									className="h-10 font-mono text-sm"
+									inputClassName="h-10 font-mono text-sm"
 								/>
 							</div>
 

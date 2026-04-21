@@ -13,7 +13,6 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent } from "@/components/ui/tabs";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
@@ -45,6 +44,7 @@ import {
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
 import { DashboardHeader } from "@/pages/DashboardHeader";
+import { GitHubPatInput } from "@/settings/GitHubPatInput";
 import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
 import { BriefListCard } from "@/sidebar/BriefListCard";
 import {
@@ -1945,13 +1945,11 @@ function DashboardPreview(props: {
 										已保存：ghp_****wxyz
 									</span>
 								</div>
-								<Input
+								<GitHubPatInput
 									id="story-pat-input"
-									type="password"
-									autoComplete="new-password"
 									value="ghp_example_valid_token"
 									readOnly
-									className="h-10 font-mono text-sm"
+									inputClassName="h-10 font-mono text-sm"
 								/>
 							</div>
 							<div className="rounded-xl border border-border/70 bg-muted/20 px-3 py-2.5">
@@ -2937,10 +2935,17 @@ export const PatDialogOpen: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByLabelText("GitHub PAT")).toHaveAttribute(
-			"autocomplete",
-			"new-password",
+		const input = canvas.getByLabelText("GitHub PAT", { selector: "input" });
+		await expect(input).toHaveAttribute("type", "password");
+		await expect(input).toHaveAttribute("autocomplete", "new-password");
+		await expect(input).toHaveAttribute("data-1p-ignore", "true");
+		await expect(input).toHaveAttribute("data-form-type", "other");
+		await expect(input).toHaveAttribute("data-secret-visible", "false");
+		await userEvent.click(
+			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
+		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("data-secret-visible", "true");
 	},
 };
 
