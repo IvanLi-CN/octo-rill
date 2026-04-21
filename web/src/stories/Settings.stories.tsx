@@ -289,7 +289,6 @@ export const Default: Story = {
 };
 
 export const SwitchableSections: Story = {
-	...Default,
 	name: "Switchable Sections",
 	parameters: {
 		docs: {

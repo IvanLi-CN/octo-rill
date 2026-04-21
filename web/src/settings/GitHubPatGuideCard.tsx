@@ -130,7 +130,7 @@ const desktopRows: ScopeItem[] = [
 	},
 ];
 
-const mobileRows = desktopRows.slice(0, 7);
+const mobileRows = desktopRows;
 
 const lightTheme: ReplicaTheme = {
 	page: "#ffffff",
