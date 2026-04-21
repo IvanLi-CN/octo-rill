@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-21
 - Last: 2026-04-21
 
@@ -203,7 +203,7 @@
 - [x] M1: 冻结平板页头 spec 与 README 索引。
 - [x] M2: 完成 Dashboard / Admin 页头 tablet-inline 布局与内部测试锚点。
 - [x] M3: 补齐 Storybook 平板入口、Playwright 回归与视觉证据。
-- [ ] M4: 在主人确认截图可用于后续 push / PR 后，推进快车道 PR-ready 收口。
+- [x] M4: 在主人确认截图可用于后续 push / PR 后，推进快车道 PR-ready 收口。
 
 ## 方案概述（Approach, high-level）
 
@@ -223,6 +223,7 @@
 - 2026-04-21: 已完成 Dashboard / Admin 平板页头两列主行实现，补齐 Storybook `853x1280` 审阅入口、Playwright tablet smoke 与本地视觉证据；后续仅等待主人确认截图是否可进入 push / PR。
 - 2026-04-21: 根据主人反馈补充 Dashboard 平板 feed 单主列合同：`768–1023px` 不再显示右侧 Inbox 快捷侧栏，相关 Storybook / Playwright / 视觉证据需一起刷新。
 - 2026-04-21: 主人已确认可继续远端流程，平板证据改为 `approved`，其中 Dashboard 页面与 AdminHeader 证据允许复用到 PR 正文。
+- 2026-04-21: 已创建 PR #113，spec/README 同步为完成态，等待后续 review / merge。
 
 ## 参考（References）
 
