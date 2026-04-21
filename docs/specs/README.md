@@ -127,4 +127,4 @@
 | cuz3w | Dashboard / Admin 平板页头对齐修复 | 已完成 | `cuz3w-dashboard-admin-tablet-header-alignment/SPEC.md` | 2026-04-21 | PR #113; fast-track / tablet header alignment + dashboard tablet single-column feed without inbox sidebar |
 | 6xaku | GitHub PAT 1:1 参考界面 | 已完成 | `6xaku-github-pat-inline-guide-mock/SPEC.md` | 2026-04-20 | fast-track / DOM-based GitHub PAT reference + switchable settings story + evidence |
 | 2v2aw | 多 GitHub 绑定与 LinuxDO 首登补绑改造 | 已完成 | `2v2aw-multi-github-linuxdo-onboarding/SPEC.md` | 2026-04-21 | PR #117; fast-track / multi-github + linuxdo onboarding / 去主账号语义并收口运行时迁移；legacy schema cleanup deferred |
-| etd3f | Release「润色」术语统一 | 部分完成（3/4） | `etd3f-polish-terminology-unification/SPEC.md` | 2026-04-22 | local implementation + validation + visual evidence landed; push/PR pending owner screenshot approval |
+| etd3f | Release「润色」术语统一 | 已完成 | `etd3f-polish-terminology-unification/SPEC.md` | 2026-04-22 | PR #118; release-smart owner-facing terminology unified to `润色`, visual evidence landed, review-loop clear |
