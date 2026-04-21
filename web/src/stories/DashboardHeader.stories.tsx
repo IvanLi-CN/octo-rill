@@ -31,11 +31,35 @@ const DASHBOARD_HEADER_VIEWPORTS = {
 		},
 		type: "mobile",
 	},
+	dashboardHeaderNarrowTablet640: {
+		name: "Dashboard header narrow tablet 640x960",
+		styles: {
+			height: "960px",
+			width: "640px",
+		},
+		type: "tablet",
+	},
+	dashboardHeaderNarrowTablet757: {
+		name: "Dashboard header narrow tablet 757x827",
+		styles: {
+			height: "827px",
+			width: "757px",
+		},
+		type: "tablet",
+	},
 	dashboardHeaderTablet853: {
 		name: "Dashboard header tablet 853x1280",
 		styles: {
 			height: "1280px",
 			width: "853px",
+		},
+		type: "tablet",
+	},
+	dashboardHeaderTablet1023: {
+		name: "Dashboard header tablet 1023x1280",
+		styles: {
+			height: "1280px",
+			width: "1023px",
 		},
 		type: "tablet",
 	},
@@ -347,6 +371,63 @@ export const EvidenceTabletInline: Story = {
 			description: {
 				story:
 					"平板 853x1280 证据入口：品牌块与 utility actions 必须回到同一主行，且右侧按钮组不再掉到品牌块下方。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet640: Story = {
+	name: "Regression / Narrow Tablet 640",
+	globals: {
+		viewport: {
+			value: "dashboardHeaderNarrowTablet640",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"640x960 回归入口：窄平板起点必须已经切入同排行为，utility actions 不得掉回品牌块下方。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet757: Story = {
+	name: "Regression / Narrow Tablet 757",
+	globals: {
+		viewport: {
+			value: "dashboardHeaderNarrowTablet757",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"757x827 主回归入口：对应主人复现宽度，品牌块与 `ThemeToggle / 同步 / avatar` 必须保持同排。",
+			},
+		},
+	},
+};
+
+export const RegressionTablet1023: Story = {
+	name: "Regression / Tablet 1023",
+	globals: {
+		viewport: {
+			value: "dashboardHeaderTablet1023",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"1023x1280 上边界入口：在进入桌面语义前，平板同排行为仍需保持稳定。",
 			},
 		},
 	},
