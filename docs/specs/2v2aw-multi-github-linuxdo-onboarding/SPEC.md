@@ -2,7 +2,7 @@
 
 ## 状态
 
-- Status: 部分完成（3/4）
+- Status: 已完成
 - Created: 2026-04-21
 - Last: 2026-04-21
 
@@ -252,7 +252,7 @@ None
 - [x] M1: 新增 `github_connections`、PAT owner 字段与 migration/backfill，完成多 GitHub 与 LinuxDO 补绑主链路。
 - [x] M2: GitHub / LinuxDO OAuth 流程改造成“多 GitHub 连接 + LinuxDO 首登补绑”，并开放连接管理 API。
 - [x] M3: Landing、`/bind/github`、Settings、Storybook、Playwright 与 owner-facing 视觉证据完成首轮落地。
-- [ ] M4: 去除“主账号”语义、完成运行时迁移收口并推进到交付路径。
+- [x] M4: 去除“主账号”语义、完成运行时迁移收口并推进到交付路径。
 
 ## 方案概述（Approach, high-level）
 
