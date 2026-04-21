@@ -35,7 +35,6 @@ import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -52,6 +51,7 @@ import {
 	PAT_CREATE_PATH,
 	useReactionTokenEditor,
 } from "@/settings/reactionTokenEditor";
+import { GitHubPatInput } from "@/settings/GitHubPatInput";
 
 const SECTION_META: Record<
 	SettingsSection,
@@ -708,17 +708,15 @@ export function SettingsPage(props: {
 								<CardContent className="space-y-4 p-5">
 									<div className="space-y-2">
 										<Label htmlFor="settings-reaction-pat">GitHub PAT</Label>
-										<Input
+										<GitHubPatInput
 											id="settings-reaction-pat"
-											type="password"
-											autoComplete="new-password"
 											value={patInput}
 											onChange={(event) => setPatInput(event.target.value)}
 											placeholder="粘贴新的 classic PAT"
 											autoCapitalize="none"
 											autoCorrect="off"
 											spellCheck={false}
-											className="h-10 font-mono text-sm"
+											inputClassName="h-10 font-mono text-sm"
 										/>
 									</div>
 
