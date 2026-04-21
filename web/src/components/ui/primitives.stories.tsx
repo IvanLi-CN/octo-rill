@@ -58,6 +58,7 @@ import {
 } from "./table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip";
+import { GitHubPatInput } from "@/settings/GitHubPatInput";
 
 type Story = StoryObj<typeof meta>;
 
@@ -424,12 +425,11 @@ export const DialogOpen: Story = {
 				<div className="space-y-3">
 					<div className="space-y-2">
 						<Label htmlFor="storybook-pat">GitHub PAT</Label>
-						<Input
+						<GitHubPatInput
 							id="storybook-pat"
-							type="password"
-							autoComplete="new-password"
 							value="ghp_****************"
 							readOnly
+							inputClassName="font-mono text-sm"
 						/>
 					</div>
 					<p className="text-xs text-emerald-600">
@@ -462,13 +462,12 @@ export const DialogInvalidState: Story = {
 				<div className="space-y-3">
 					<div className="space-y-2">
 						<Label htmlFor="storybook-invalid-pat">GitHub PAT</Label>
-						<Input
+						<GitHubPatInput
 							id="storybook-invalid-pat"
-							type="password"
-							autoComplete="new-password"
 							value="ghp_invalid_demo_token"
 							readOnly
 							aria-invalid="true"
+							inputClassName="font-mono text-sm"
 						/>
 					</div>
 					<p className="text-destructive text-xs">

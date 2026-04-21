@@ -1059,24 +1059,34 @@ test("reaction fallback lets users configure PAT inline from the dialog", async 
 	await expect(
 		page.locator('[data-repo-visual-kind="social_preview"]'),
 	).toHaveCount(0);
-	await page.getByTitle("赞").click();
+	const reactionFooter = page.locator('[data-reaction-footer="true"]').first();
+	const plusOneButton = reactionFooter.locator(
+		'[data-reaction-trigger="plus1"]',
+	);
+	await expect(plusOneButton).toBeVisible();
+	await plusOneButton.click();
 
 	const patDialog = page.getByRole("dialog", {
 		name: "配置 GitHub PAT",
 	});
-	await expect(patDialog).toBeVisible();
+	await expect(patDialog).toBeVisible({ timeout: 10_000 });
 	await expect(
 		patDialog.getByText(/先补齐 GitHub PAT，才能继续使用站内反馈/),
 	).toBeVisible();
-	await expect(patDialog.getByLabel("GitHub PAT")).toHaveAttribute(
-		"autocomplete",
-		"new-password",
-	);
+	const patInput = patDialog.locator("#dashboard-reaction-pat");
+	await expect(patInput).toHaveAttribute("type", "password");
+	await expect(patInput).toHaveAttribute("autocomplete", "new-password");
+	await expect(patInput).toHaveAttribute("data-1p-ignore", "true");
+	await expect(patInput).toHaveAttribute("data-form-type", "other");
+	await expect(patInput).toHaveAttribute("data-secret-visible", "false");
+	await patDialog.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(patInput).toHaveAttribute("type", "text");
+	await expect(patInput).toHaveAttribute("data-secret-visible", "true");
 	await expect(page.getByRole("link", { name: "去完整设置" })).toHaveAttribute(
 		"href",
 		"/settings?section=github-pat",
 	);
-	await patDialog.getByLabel("GitHub PAT").fill("ghp_valid_token_1234");
+	await patInput.fill("ghp_valid_token_1234");
 	await expect(
 		patDialog.getByText("GitHub PAT 可用", { exact: true }),
 	).toBeVisible();
