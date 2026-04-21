@@ -1,7 +1,7 @@
 import {
 	ArrowLeft,
 	CalendarClock,
-	ExternalLink,
+	Github,
 	KeyRound,
 	LoaderCircle,
 	Link2,
@@ -19,10 +19,13 @@ import {
 
 import {
 	type DailyBriefProfilePatchRequest,
+	type GitHubConnectionResponse,
 	type LinuxDoConnectionResponse,
 	type MeResponse,
 	type MeProfileResponse,
+	apiDeleteMeGitHubConnection,
 	apiDeleteMeLinuxDo,
+	apiGetMeGitHubConnections,
 	apiGetMeLinuxDo,
 	apiGetMeProfile,
 	apiPatchMeProfile,
@@ -31,6 +34,7 @@ import {
 	DailyBriefProfileForm,
 	readHourAlignedBrowserTimeZone,
 } from "@/briefs/DailyBriefProfileForm";
+import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,6 +67,11 @@ const SECTION_META: Record<
 		description:
 			"绑定 LinuxDO Connect 账号，只保存本地快照，不存 LinuxDO PAT。",
 	},
+	"github-accounts": {
+		label: "GitHub 账号",
+		description:
+			"一个 OctoRill 账号可绑定多个 GitHub 账号；全部绑定都会参与登录、同步与 PAT 校验。",
+	},
 	"my-releases": {
 		label: "我的发布",
 		description:
@@ -76,6 +85,26 @@ const SECTION_META: Record<
 	"daily-brief": {
 		label: "日报设置",
 		description: "调整日报生成边界，继续沿用现有 /api/me/profile 契约。",
+	},
+};
+
+const GITHUB_STATUS_META: Record<
+	string,
+	{
+		tone: "success" | "error";
+		title: string;
+		description: string;
+	}
+> = {
+	connected: {
+		tone: "success",
+		title: "GitHub 账号已绑定",
+		description: "新的 GitHub 账号已加入当前 OctoRill 账号，可以参与聚合同步。",
+	},
+	already_bound: {
+		tone: "error",
+		title: "GitHub 账号已被占用",
+		description: "这个 GitHub 账号已经绑定到其他 OctoRill 账号，不能重复绑定。",
 	},
 };
 
@@ -131,6 +160,17 @@ function formatDateTime(value: string | null | undefined) {
 	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }
 
+function avatarFallbackText(name: string | null | undefined, login: string) {
+	const source = (name ?? login).trim();
+	const normalized = source
+		.split(/[\s_-]+/)
+		.filter(Boolean)
+		.slice(0, 2)
+		.map((part) => part[0]?.toUpperCase() ?? "")
+		.join("");
+	return normalized || login.slice(0, 2).toUpperCase();
+}
+
 function statusToneClassName(tone: "success" | "error" | "idle" | "muted") {
 	switch (tone) {
 		case "success":
@@ -174,6 +214,7 @@ function DetailItem(props: {
 export function SettingsPage(props: {
 	me: MeResponse;
 	section: SettingsSection;
+	githubStatus?: string | null;
 	linuxdoStatus?: string | null;
 	onSectionChange: (section: SettingsSection) => void;
 	onProfileSaved?: () => Promise<void> | void;
@@ -181,10 +222,22 @@ export function SettingsPage(props: {
 	const {
 		me,
 		section,
+		githubStatus = null,
 		linuxdoStatus = null,
 		onSectionChange,
 		onProfileSaved,
 	} = props;
+	const [githubConnectionsLoading, setGitHubConnectionsLoading] =
+		useState(true);
+	const [githubConnectionsBusyId, setGitHubConnectionsBusyId] = useState<
+		string | null
+	>(null);
+	const [githubConnectionsError, setGitHubConnectionsError] = useState<
+		string | null
+	>(null);
+	const [githubConnections, setGitHubConnections] = useState<
+		GitHubConnectionResponse[]
+	>([]);
 	const [linuxdoLoading, setLinuxdoLoading] = useState(true);
 	const [linuxdoBusy, setLinuxdoBusy] = useState(false);
 	const [linuxdoError, setLinuxdoError] = useState<string | null>(null);
@@ -195,6 +248,7 @@ export function SettingsPage(props: {
 		reactionTokenLoading,
 		reactionTokenConfigured,
 		reactionTokenMasked,
+		reactionTokenOwner,
 		patInput,
 		setPatInput,
 		patCheckState,
@@ -224,9 +278,27 @@ export function SettingsPage(props: {
 		});
 	const [includeOwnReleases, setIncludeOwnReleases] = useState(false);
 
+	const activeGitHubStatusMeta = githubStatus
+		? (GITHUB_STATUS_META[githubStatus] ?? null)
+		: null;
 	const activeStatusMeta = linuxdoStatus
 		? (LINUXDO_STATUS_META[linuxdoStatus] ?? null)
 		: null;
+
+	const loadGitHubConnections = useCallback(async () => {
+		setGitHubConnectionsLoading(true);
+		setGitHubConnectionsError(null);
+		try {
+			const res = await apiGetMeGitHubConnections();
+			setGitHubConnections(res.items);
+		} catch (err) {
+			setGitHubConnectionsError(
+				err instanceof Error ? err.message : String(err),
+			);
+		} finally {
+			setGitHubConnectionsLoading(false);
+		}
+	}, []);
 
 	const loadLinuxDo = useCallback(async () => {
 		setLinuxdoLoading(true);
@@ -261,8 +333,37 @@ export function SettingsPage(props: {
 	}, []);
 
 	useEffect(() => {
-		void Promise.all([loadLinuxDo(), loadBriefProfile()]);
-	}, [loadBriefProfile, loadLinuxDo]);
+		void Promise.all([
+			loadGitHubConnections(),
+			loadLinuxDo(),
+			loadBriefProfile(),
+		]);
+	}, [loadBriefProfile, loadGitHubConnections, loadLinuxDo]);
+
+	const onConnectGitHub = useCallback(() => {
+		window.location.assign("/auth/github/connect");
+	}, []);
+
+	const onDeleteGitHub = useCallback(
+		(connectionId: string) => {
+			setGitHubConnectionsBusyId(connectionId);
+			setGitHubConnectionsError(null);
+			void apiDeleteMeGitHubConnection(connectionId)
+				.then(async (res) => {
+					setGitHubConnections(res.items);
+					await onProfileSaved?.();
+				})
+				.catch((err) => {
+					setGitHubConnectionsError(
+						err instanceof Error ? err.message : String(err),
+					);
+				})
+				.finally(() => {
+					setGitHubConnectionsBusyId(null);
+				});
+		},
+		[onProfileSaved],
+	);
 
 	const onConnectLinuxDo = useCallback(() => {
 		window.location.assign("/auth/linuxdo/login");
@@ -377,7 +478,23 @@ export function SettingsPage(props: {
 							? { label: "已配置", variant: "secondary" as const }
 							: { label: "未配置", variant: "outline" as const };
 
+	const githubStatusBadge = githubConnectionsLoading
+		? { label: "读取中", variant: "outline" as const }
+		: githubConnections.length > 0
+			? {
+					label:
+						githubConnections.length === 1
+							? "1 个 GitHub 账号"
+							: `${githubConnections.length} 个 GitHub 账号`,
+					variant: "secondary" as const,
+				}
+			: { label: "未绑定", variant: "outline" as const };
+
 	const sectionNavItems = [
+		{
+			id: "github-accounts" as const,
+			icon: <Github className="size-4" />,
+		},
 		{
 			id: "daily-brief" as const,
 			icon: <CalendarClock className="size-4" />,
@@ -432,16 +549,43 @@ export function SettingsPage(props: {
 			footer={<AppMetaFooter />}
 			mobileChrome
 		>
-			<div className="mx-auto max-w-6xl space-y-4">
-				{activeStatusMeta?.tone === "error" ? (
+			<div className="mx-auto max-w-3xl space-y-4">
+				{activeGitHubStatusMeta ? (
 					<section
 						className={cn(
 							"rounded-xl border px-3 py-2.5 text-sm shadow-sm",
-							statusToneClassName("error"),
+							statusToneClassName(activeGitHubStatusMeta.tone),
 						)}
 					>
 						<div className="flex items-start gap-2.5">
-							<ShieldAlert className="mt-0.5 size-4 shrink-0" />
+							{activeGitHubStatusMeta.tone === "error" ? (
+								<ShieldAlert className="mt-0.5 size-4 shrink-0" />
+							) : (
+								<Github className="mt-0.5 size-4 shrink-0" />
+							)}
+							<div className="space-y-0.5">
+								<p className="font-medium">{activeGitHubStatusMeta.title}</p>
+								<p className="text-xs leading-5">
+									{activeGitHubStatusMeta.description}
+								</p>
+							</div>
+						</div>
+					</section>
+				) : null}
+
+				{activeStatusMeta ? (
+					<section
+						className={cn(
+							"rounded-xl border px-3 py-2.5 text-sm shadow-sm",
+							statusToneClassName(activeStatusMeta.tone),
+						)}
+					>
+						<div className="flex items-start gap-2.5">
+							{activeStatusMeta.tone === "error" ? (
+								<ShieldAlert className="mt-0.5 size-4 shrink-0" />
+							) : (
+								<Link2 className="mt-0.5 size-4 shrink-0" />
+							)}
 							<div className="space-y-0.5">
 								<p className="font-medium">{activeStatusMeta.title}</p>
 								<p className="text-xs leading-5">
@@ -502,6 +646,180 @@ export function SettingsPage(props: {
 				</nav>
 
 				<div className="min-w-0 max-md:border-t max-md:border-border/60 max-md:pt-4">
+					{section === "github-accounts" ? (
+						<section
+							id="settings-github-accounts"
+							data-settings-section="github-accounts"
+						>
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
+									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+										<div className="flex flex-wrap items-center gap-2">
+											<CardTitle className="text-lg">
+												{SECTION_META["github-accounts"].label}
+											</CardTitle>
+											<Badge variant={githubStatusBadge.variant}>
+												{githubStatusBadge.label}
+											</Badge>
+										</div>
+										<Button
+											size="sm"
+											disabled={githubConnectionsLoading}
+											onClick={onConnectGitHub}
+										>
+											<AuthProviderIcon provider="github" />
+											绑定 GitHub
+										</Button>
+									</div>
+								</CardHeader>
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
+									{githubConnectionsError ? (
+										<div
+											className={cn(
+												"rounded-xl border px-3 py-2.5 text-sm",
+												statusToneClassName("error"),
+											)}
+										>
+											{githubConnectionsError}
+										</div>
+									) : null}
+
+									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+										全部已绑定 GitHub 账号都可以直接登录当前 OctoRill
+										账号，也都会参与同步与 PAT 校验。
+									</div>
+
+									{githubConnectionsLoading ? (
+										<div className="text-muted-foreground flex items-center gap-2 text-sm">
+											<LoaderCircle className="size-4 animate-spin" />
+											正在读取 GitHub 绑定列表…
+										</div>
+									) : (
+										<div className="space-y-3">
+											{githubConnections.map((connection) => {
+												const isBusy =
+													githubConnectionsBusyId === connection.id;
+												return (
+													<div
+														key={connection.id}
+														className="space-y-4 rounded-2xl border border-border/70 bg-background/80 p-4 sm:p-5"
+													>
+														<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+															<div className="flex min-w-0 items-center gap-3">
+																{connection.avatar_url ? (
+																	<img
+																		src={connection.avatar_url}
+																		alt={`${connection.login} avatar`}
+																		className="size-12 shrink-0 rounded-full border border-border/70 object-cover"
+																		referrerPolicy="no-referrer"
+																		data-github-connection-avatar={
+																			connection.login
+																		}
+																	/>
+																) : (
+																	<div
+																		className="bg-muted text-muted-foreground flex size-12 shrink-0 items-center justify-center rounded-full border border-border/70 text-xs font-semibold"
+																		data-github-connection-avatar-fallback={
+																			connection.login
+																		}
+																	>
+																		{avatarFallbackText(
+																			connection.name,
+																			connection.login,
+																		)}
+																	</div>
+																)}
+																<div className="min-w-0 space-y-1.5">
+																	<div className="flex flex-wrap items-center gap-2">
+																		<p className="truncate text-base font-semibold text-foreground">
+																			{connection.name ?? connection.login}
+																		</p>
+																		<Badge
+																			variant="outline"
+																			className="rounded-full px-2.5 py-0.5 text-[11px] font-medium"
+																		>
+																			ID {connection.github_user_id}
+																		</Badge>
+																	</div>
+																	<div className="text-muted-foreground flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+																		<span className="truncate">
+																			@{connection.login}
+																		</span>
+																		{connection.email ? (
+																			<>
+																				<span className="hidden sm:inline">
+																					·
+																				</span>
+																				<span className="truncate">
+																					{connection.email}
+																				</span>
+																			</>
+																		) : null}
+																	</div>
+																</div>
+															</div>
+															<div className="flex flex-wrap gap-2">
+																{githubConnections.length <= 1 ? null : (
+																	<Button
+																		variant="outline"
+																		size="sm"
+																		disabled={isBusy}
+																		onClick={() =>
+																			onDeleteGitHub(connection.id)
+																		}
+																	>
+																		{isBusy ? (
+																			<LoaderCircle className="size-4 animate-spin" />
+																		) : (
+																			<Unlink2 className="size-4" />
+																		)}
+																		解绑
+																	</Button>
+																)}
+															</div>
+														</div>
+
+														<div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_18rem]">
+															<div className="space-y-2 rounded-xl border border-border/70 bg-muted/20 px-4 py-3">
+																<p className="text-muted-foreground text-[11px] font-medium tracking-[0.16em] uppercase">
+																	Scope
+																</p>
+																<p className="break-words text-sm leading-6 text-foreground">
+																	{connection.scopes || "—"}
+																</p>
+																<p className="text-muted-foreground text-xs leading-5">
+																	OAuth scope 快照，供排查当前连接能力。
+																</p>
+															</div>
+															<div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
+																<div className="space-y-1.5 rounded-xl border border-border/70 bg-background/80 px-4 py-3">
+																	<p className="text-muted-foreground text-[11px] font-medium tracking-[0.16em] uppercase">
+																		绑定时间
+																	</p>
+																	<p className="text-sm font-medium leading-6 text-foreground">
+																		{formatDateTime(connection.linked_at)}
+																	</p>
+																</div>
+																<div className="space-y-1.5 rounded-xl border border-border/70 bg-background/80 px-4 py-3">
+																	<p className="text-muted-foreground text-[11px] font-medium tracking-[0.16em] uppercase">
+																		最近刷新
+																	</p>
+																	<p className="text-sm font-medium leading-6 text-foreground">
+																		{formatDateTime(connection.updated_at)}
+																	</p>
+																</div>
+															</div>
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									)}
+								</CardContent>
+							</Card>
+						</section>
+					) : null}
+
 					{section === "linuxdo" ? (
 						<section id="settings-linuxdo" data-settings-section="linuxdo">
 							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
@@ -535,8 +853,8 @@ export function SettingsPage(props: {
 												disabled={!linuxdoAvailable}
 												onClick={onConnectLinuxDo}
 											>
-												<ExternalLink className="size-4" />
-												Connect LinuxDO
+												<AuthProviderIcon provider="linuxdo" />
+												绑定 LinuxDO
 											</Button>
 										)}
 									</div>
@@ -782,6 +1100,15 @@ export function SettingsPage(props: {
 										<DetailItem
 											label="最近检查"
 											value={patCheckedAt ? formatDateTime(patCheckedAt) : "—"}
+										/>
+										<DetailItem
+											label="PAT 归属"
+											value={
+												reactionTokenOwner
+													? `@${reactionTokenOwner.login}`
+													: "未配置"
+											}
+											hint="PAT 只能属于当前账号下某个已绑定 GitHub 账号。"
 										/>
 									</div>
 

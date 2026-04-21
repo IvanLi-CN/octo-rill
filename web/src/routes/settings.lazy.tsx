@@ -29,10 +29,12 @@ function SettingsRouteComponent() {
 	useEffect(() => {
 		const expectedSearch = buildSettingsSearch(section, {
 			linuxdo: search.linuxdo,
+			github: search.github,
 		});
 		if (
 			(search.section ?? undefined) === expectedSearch.section &&
-			(search.linuxdo ?? undefined) === expectedSearch.linuxdo
+			(search.linuxdo ?? undefined) === expectedSearch.linuxdo &&
+			(search.github ?? undefined) === expectedSearch.github
 		) {
 			return;
 		}
@@ -41,7 +43,7 @@ function SettingsRouteComponent() {
 			search: expectedSearch as never,
 			replace: true,
 		});
-	}, [router, search.linuxdo, search.section, section]);
+	}, [router, search.github, search.linuxdo, search.section, section]);
 
 	if (auth.status === "pending") {
 		return <AppBoot />;
@@ -59,6 +61,7 @@ function SettingsRouteComponent() {
 		<SettingsPage
 			me={auth.me}
 			section={section}
+			githubStatus={search.github}
 			linuxdoStatus={search.linuxdo}
 			onSectionChange={(nextSection) => {
 				void router.navigate({

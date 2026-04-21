@@ -1,5 +1,6 @@
 export const SETTINGS_SECTIONS = [
 	"linuxdo",
+	"github-accounts",
 	"my-releases",
 	"github-pat",
 	"daily-brief",
@@ -17,11 +18,13 @@ export function buildSettingsSearch(
 	section: SettingsSection,
 	options?: {
 		linuxdo?: string | null;
+		github?: string | null;
 	},
 ) {
 	return {
 		section: section === "linuxdo" ? undefined : section,
 		linuxdo: options?.linuxdo ?? undefined,
+		github: options?.github ?? undefined,
 	};
 }
 
@@ -29,6 +32,7 @@ export function buildSettingsHref(
 	section: SettingsSection,
 	options?: {
 		linuxdo?: string | null;
+		github?: string | null;
 	},
 ) {
 	const params = new URLSearchParams();
@@ -38,6 +42,9 @@ export function buildSettingsHref(
 	}
 	if (search.linuxdo) {
 		params.set("linuxdo", search.linuxdo);
+	}
+	if (search.github) {
+		params.set("github", search.github);
 	}
 	const query = params.toString();
 	return query ? `/settings?${query}` : "/settings";

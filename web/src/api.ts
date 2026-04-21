@@ -249,6 +249,37 @@ export type MeLinuxDoResponse = {
 	available: boolean;
 	connection: LinuxDoConnectionResponse | null;
 };
+export type GitHubConnectionResponse = {
+	id: string;
+	github_user_id: number;
+	login: string;
+	name: string | null;
+	avatar_url: string | null;
+	email: string | null;
+	scopes: string;
+	linked_at: string;
+	updated_at: string;
+};
+export type MeGitHubConnectionsResponse = {
+	items: GitHubConnectionResponse[];
+};
+export type AuthBindContextResponse = {
+	linuxdo_available: boolean;
+	pending_linuxdo: {
+		linuxdo_user_id: number;
+		username: string;
+		name: string | null;
+		avatar_url: string;
+		trust_level: number;
+		active: boolean;
+		silenced: boolean;
+	} | null;
+};
+export type ReactionTokenOwnerSummary = {
+	github_connection_id: string;
+	github_user_id: number;
+	login: string;
+};
 export type ReactionTokenStatusResponse = {
 	configured: boolean;
 	masked_token: string | null;
@@ -257,10 +288,12 @@ export type ReactionTokenStatusResponse = {
 		message: string | null;
 		checked_at: string | null;
 	};
+	owner: ReactionTokenOwnerSummary | null;
 };
 export type ReactionTokenCheckResponse = {
 	state: "valid" | "invalid";
 	message: string;
+	owner: ReactionTokenOwnerSummary | null;
 };
 export type AdminJobsOverviewResponse = {
 	queued: number;
@@ -651,6 +684,19 @@ export async function apiGetMeLinuxDo(): Promise<MeLinuxDoResponse> {
 }
 export async function apiDeleteMeLinuxDo(): Promise<MeLinuxDoResponse> {
 	return apiDeleteJson<MeLinuxDoResponse>("/api/me/linuxdo");
+}
+export async function apiGetAuthBindContext(): Promise<AuthBindContextResponse> {
+	return apiGet<AuthBindContextResponse>("/api/auth/bind-context");
+}
+export async function apiGetMeGitHubConnections(): Promise<MeGitHubConnectionsResponse> {
+	return apiGet<MeGitHubConnectionsResponse>("/api/me/github-connections");
+}
+export async function apiDeleteMeGitHubConnection(
+	connectionId: string,
+): Promise<MeGitHubConnectionsResponse> {
+	return apiDeleteJson<MeGitHubConnectionsResponse>(
+		`/api/me/github-connections/${encodeURIComponent(connectionId)}`,
+	);
 }
 export async function apiGetReactionTokenStatus(): Promise<ReactionTokenStatusResponse> {
 	return apiGet<ReactionTokenStatusResponse>("/api/reaction-token/status");

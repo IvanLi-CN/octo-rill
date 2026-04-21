@@ -190,14 +190,23 @@ pub struct UserSummary {
 #[derive(Debug, sqlx::FromRow)]
 struct MeUserRow {
     id: String,
+    is_admin: i64,
+    is_disabled: i64,
+    last_active_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MeFirstGitHubRow {
     github_user_id: i64,
     login: String,
     name: Option<String>,
     avatar_url: Option<String>,
     email: Option<String>,
-    is_admin: i64,
-    is_disabled: i64,
-    last_active_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MeLinuxDoAvatarRow {
+    avatar_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -243,7 +252,7 @@ pub async fn me(
     let user_id = require_user_id(&session).await?;
     let row = sqlx::query_as::<_, MeUserRow>(
         r#"
-        SELECT id, github_user_id, login, name, avatar_url, email, is_admin, is_disabled, last_active_at
+        SELECT id, is_admin, is_disabled, last_active_at
         FROM users
         WHERE id = ?
         "#,
@@ -267,6 +276,42 @@ pub async fn me(
         return Err(err);
     }
 
+    let first_github = sqlx::query_as::<_, MeFirstGitHubRow>(
+        r#"
+        SELECT github_user_id, login, name, avatar_url, email
+        FROM github_connections
+        WHERE user_id = ?
+        ORDER BY linked_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(&row.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(first_github) = first_github else {
+        session.clear().await;
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "session user has no github connection",
+        ));
+    };
+
+    let linuxdo_avatar = sqlx::query_as::<_, MeLinuxDoAvatarRow>(
+        r#"
+        SELECT avatar_url
+        FROM linuxdo_connections
+        WHERE user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&row.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .and_then(|record| record.avatar_url);
+
     let access_sync = maybe_bootstrap_access_sync(state.as_ref(), &session, &row).await?;
     touch_user_last_active_at(state.as_ref(), &row.id).await?;
     let preferences = briefs::load_daily_brief_preferences(state.as_ref(), &row.id)
@@ -281,11 +326,11 @@ pub async fn me(
     Ok(Json(MeResponse {
         user: UserSummary {
             id: row.id,
-            github_user_id: row.github_user_id,
-            login: row.login,
-            name: row.name,
-            avatar_url: row.avatar_url,
-            email: row.email,
+            github_user_id: first_github.github_user_id,
+            login: first_github.login,
+            name: first_github.name,
+            avatar_url: linuxdo_avatar.or(first_github.avatar_url),
+            email: first_github.email,
             is_admin: row.is_admin != 0,
         },
         access_sync,
@@ -895,6 +940,41 @@ pub struct MeLinuxDoResponse {
     connection: Option<LinuxDoConnectionResponse>,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct GitHubConnectionResponse {
+    id: String,
+    github_user_id: i64,
+    login: String,
+    name: Option<String>,
+    avatar_url: Option<String>,
+    email: Option<String>,
+    scopes: String,
+    linked_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MeGitHubConnectionsResponse {
+    items: Vec<GitHubConnectionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthBindContextLinuxDoResponse {
+    linuxdo_user_id: i64,
+    username: String,
+    name: Option<String>,
+    avatar_url: String,
+    trust_level: i64,
+    active: bool,
+    silenced: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthBindContextResponse {
+    linuxdo_available: bool,
+    pending_linuxdo: Option<AuthBindContextLinuxDoResponse>,
+}
+
 pub async fn me_get_linuxdo(
     State(state): State<Arc<AppState>>,
     session: Session,
@@ -948,6 +1028,151 @@ pub async fn me_delete_linuxdo(
         available: state.config.linuxdo.is_some(),
         connection: None,
     }))
+}
+
+pub async fn auth_get_bind_context(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<AuthBindContextResponse>, ApiError> {
+    #[derive(Debug, Deserialize)]
+    struct PendingLinuxDoSession {
+        linuxdo_user_id: i64,
+        username: String,
+        name: Option<String>,
+        avatar_url: String,
+        trust_level: i64,
+        active: bool,
+        silenced: bool,
+    }
+
+    let pending_linuxdo = session
+        .get::<PendingLinuxDoSession>("pending_linuxdo")
+        .await
+        .map_err(ApiError::internal)?
+        .map(|pending| AuthBindContextLinuxDoResponse {
+            linuxdo_user_id: pending.linuxdo_user_id,
+            username: pending.username,
+            name: pending.name,
+            avatar_url: pending.avatar_url,
+            trust_level: pending.trust_level,
+            active: pending.active,
+            silenced: pending.silenced,
+        });
+
+    Ok(Json(AuthBindContextResponse {
+        linuxdo_available: state.config.linuxdo.is_some(),
+        pending_linuxdo,
+    }))
+}
+
+pub async fn me_get_github_connections(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MeGitHubConnectionsResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let items = sqlx::query_as::<_, GitHubConnectionResponse>(
+        r#"
+        SELECT
+          id,
+          github_user_id,
+          login,
+          name,
+          avatar_url,
+          email,
+          scopes,
+          linked_at,
+          updated_at
+        FROM github_connections
+        WHERE user_id = ?
+        ORDER BY linked_at ASC, id ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(MeGitHubConnectionsResponse { items }))
+}
+
+pub async fn me_delete_github_connection(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(connection_id): Path<String>,
+) -> Result<Json<MeGitHubConnectionsResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let connection_id = parse_local_id_param(connection_id, "connection_id")?;
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM github_connections
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(connection_id.as_str())
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "github_connection_not_found",
+            "github connection not found",
+        ));
+    }
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM github_connections
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if total <= 1 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_github_connection_guard",
+            "at least one github connection is required",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query(
+        r#"
+        DELETE FROM github_connections
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(connection_id.as_str())
+    .bind(user_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM reaction_pat_tokens
+        WHERE user_id = ?
+          AND owner_github_connection_id = ?
+        "#,
+    )
+    .bind(user_id.as_str())
+    .bind(connection_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    me_get_github_connections(State(state), session).await
 }
 
 pub async fn admin_get_user_profile(
@@ -5023,11 +5248,19 @@ pub struct ReactionTokenCheckSummary {
     checked_at: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct ReactionTokenOwnerSummary {
+    github_connection_id: String,
+    github_user_id: i64,
+    login: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReactionTokenStatusResponse {
     configured: bool,
     masked_token: Option<String>,
     check: ReactionTokenCheckSummary,
+    owner: Option<ReactionTokenOwnerSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5039,6 +5272,7 @@ pub struct ReactionTokenRequest {
 pub struct ReactionTokenCheckResponse {
     state: String, // valid | invalid
     message: String,
+    owner: Option<ReactionTokenOwnerSummary>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -5047,6 +5281,9 @@ struct ReactionTokenStatusRow {
     last_check_state: String,
     last_check_message: Option<String>,
     last_checked_at: Option<String>,
+    owner_github_connection_id: Option<String>,
+    owner_github_user_id: Option<i64>,
+    owner_login: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -5078,6 +5315,7 @@ fn has_public_repo_scope(scopes: &str) -> bool {
 async fn check_reaction_pat_with_github(
     state: &AppState,
     token: &str,
+    user_id: Option<&str>,
 ) -> Result<ReactionTokenCheckResponse, ApiError> {
     let token = token.trim();
     if token.is_empty() {
@@ -5100,6 +5338,17 @@ async fn check_reaction_pat_with_github(
     let body = resp.text().await.map_err(ApiError::internal)?;
 
     if status == reqwest::StatusCode::OK {
+        let github_user =
+            serde_json::from_str::<serde_json::Value>(&body).map_err(ApiError::internal)?;
+        let github_user_id = github_user
+            .get("id")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| ApiError::internal("github user id missing from PAT check"))?;
+        let github_login = github_user
+            .get("login")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ApiError::internal("github login missing from PAT check"))?
+            .to_owned();
         let scopes = headers
             .get("x-oauth-scopes")
             .and_then(|v| v.to_str().ok())
@@ -5108,11 +5357,52 @@ async fn check_reaction_pat_with_github(
             return Ok(ReactionTokenCheckResponse {
                 state: "invalid".to_owned(),
                 message: "classic PAT needs public_repo (public) or repo (private)".to_owned(),
+                owner: None,
             });
         }
+
+        let owner = if let Some(user_id) = user_id {
+            let owner = sqlx::query_as::<_, (String, i64, String)>(
+                r#"
+                SELECT id, github_user_id, login
+                FROM github_connections
+                WHERE user_id = ?
+                  AND github_user_id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(user_id)
+            .bind(github_user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
+
+            let Some((github_connection_id, github_user_id, login)) = owner else {
+                return Ok(ReactionTokenCheckResponse {
+                    state: "invalid".to_owned(),
+                    message:
+                        "PAT owner is not bound to the current OctoRill account; bind that GitHub account first"
+                            .to_owned(),
+                    owner: None,
+                });
+            };
+            Some(ReactionTokenOwnerSummary {
+                github_connection_id,
+                github_user_id,
+                login,
+            })
+        } else {
+            Some(ReactionTokenOwnerSummary {
+                github_connection_id: String::new(),
+                github_user_id,
+                login: github_login,
+            })
+        };
+
         return Ok(ReactionTokenCheckResponse {
             state: "valid".to_owned(),
             message: "token is valid".to_owned(),
+            owner,
         });
     }
 
@@ -5120,6 +5410,7 @@ async fn check_reaction_pat_with_github(
         return Ok(ReactionTokenCheckResponse {
             state: "invalid".to_owned(),
             message: "token is invalid or expired".to_owned(),
+            owner: None,
         });
     }
 
@@ -5134,6 +5425,7 @@ async fn check_reaction_pat_with_github(
         return Ok(ReactionTokenCheckResponse {
             state: "invalid".to_owned(),
             message: "token cannot access GitHub user API; check PAT permissions".to_owned(),
+            owner: None,
         });
     }
 
@@ -5150,7 +5442,14 @@ async fn load_reaction_pat_status_row(
 ) -> Result<Option<ReactionTokenStatusRow>, ApiError> {
     sqlx::query_as::<_, ReactionTokenStatusRow>(
         r#"
-        SELECT masked_token, last_check_state, last_check_message, last_checked_at
+        SELECT
+          masked_token,
+          last_check_state,
+          last_check_message,
+          last_checked_at,
+          owner_github_connection_id,
+          owner_github_user_id,
+          owner_login
         FROM reaction_pat_tokens
         WHERE user_id = ?
         "#,
@@ -5234,6 +5533,7 @@ pub async fn reaction_token_status(
                 message: None,
                 checked_at: None,
             },
+            owner: None,
         }));
     };
 
@@ -5250,6 +5550,20 @@ pub async fn reaction_token_status(
             message: row.last_check_message,
             checked_at: row.last_checked_at,
         },
+        owner: match (
+            row.owner_github_connection_id,
+            row.owner_github_user_id,
+            row.owner_login,
+        ) {
+            (Some(github_connection_id), Some(github_user_id), Some(login)) => {
+                Some(ReactionTokenOwnerSummary {
+                    github_connection_id,
+                    github_user_id,
+                    login,
+                })
+            }
+            _ => None,
+        },
     }))
 }
 
@@ -5258,8 +5572,10 @@ pub async fn check_reaction_token(
     session: Session,
     Json(req): Json<ReactionTokenRequest>,
 ) -> Result<Json<ReactionTokenCheckResponse>, ApiError> {
-    let _ = require_active_user_id(state.as_ref(), &session).await?;
-    let checked = check_reaction_pat_with_github(state.as_ref(), req.token.as_str()).await?;
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let checked =
+        check_reaction_pat_with_github(state.as_ref(), req.token.as_str(), Some(user_id.as_str()))
+            .await?;
     Ok(Json(checked))
 }
 
@@ -5274,7 +5590,8 @@ pub async fn upsert_reaction_token(
         return Err(ApiError::bad_request("token is required"));
     }
 
-    let checked = check_reaction_pat_with_github(state.as_ref(), token).await?;
+    let checked =
+        check_reaction_pat_with_github(state.as_ref(), token, Some(user_id.as_str())).await?;
     if checked.state != "valid" {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -5282,6 +5599,13 @@ pub async fn upsert_reaction_token(
             checked.message,
         ));
     }
+    let owner = checked.owner.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "pat_invalid",
+            "PAT owner is not bound to the current OctoRill account",
+        )
+    })?;
 
     let now = chrono::Utc::now().to_rfc3339();
     let encrypted = state
@@ -5294,9 +5618,10 @@ pub async fn upsert_reaction_token(
         r#"
         INSERT INTO reaction_pat_tokens (
           user_id, token_ciphertext, token_nonce, masked_token,
-          last_check_state, last_check_message, last_checked_at, updated_at
+          last_check_state, last_check_message, last_checked_at, updated_at,
+          owner_github_connection_id, owner_github_user_id, owner_login
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
           token_ciphertext = excluded.token_ciphertext,
           token_nonce = excluded.token_nonce,
@@ -5304,10 +5629,13 @@ pub async fn upsert_reaction_token(
           last_check_state = excluded.last_check_state,
           last_check_message = excluded.last_check_message,
           last_checked_at = excluded.last_checked_at,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          owner_github_connection_id = excluded.owner_github_connection_id,
+          owner_github_user_id = excluded.owner_github_user_id,
+          owner_login = excluded.owner_login
         "#,
     )
-    .bind(user_id)
+    .bind(user_id.as_str())
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(&masked)
@@ -5315,6 +5643,9 @@ pub async fn upsert_reaction_token(
     .bind("token is valid")
     .bind(&now)
     .bind(&now)
+    .bind(owner.github_connection_id.as_str())
+    .bind(owner.github_user_id)
+    .bind(owner.login.as_str())
     .execute(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -5327,6 +5658,7 @@ pub async fn upsert_reaction_token(
             message: Some("token is valid".to_owned()),
             checked_at: Some(now),
         },
+        owner: Some(owner),
     }))
 }
 
@@ -9166,35 +9498,39 @@ async fn fetch_release_compare_digest(
     base_tag: &str,
     head_tag: &str,
 ) -> Result<Option<String>, ApiError> {
-    let token = state
-        .load_access_token(user_id)
+    let connections = state
+        .load_github_connections(user_id)
         .await
-        .map_err(|err| ApiError::internal(format!("load access token failed: {err}")))?;
-    match fetch_release_compare_digest_request(
-        state,
-        repo_full_name,
-        base_tag,
-        head_tag,
-        Some(token.as_str()),
-    )
-    .await
-    {
-        Ok(digest) => Ok(digest),
-        Err(auth_err) if should_retry_public_compare_without_auth(&auth_err) => {
-            match fetch_release_compare_digest_request(
-                state,
-                repo_full_name,
-                base_tag,
-                head_tag,
-                None,
-            )
-            .await
-            {
-                Ok(digest) => Ok(digest),
-                Err(public_err) => Err(map_public_compare_fallback_error(auth_err, public_err)),
+        .map_err(|err| ApiError::internal(format!("load github connections failed: {err}")))?;
+
+    let mut last_auth_err: Option<ApiError> = None;
+    for connection in connections {
+        match fetch_release_compare_digest_request(
+            state,
+            repo_full_name,
+            base_tag,
+            head_tag,
+            Some(connection.access_token.as_str()),
+        )
+        .await
+        {
+            Ok(digest) => return Ok(digest),
+            Err(err) if should_retry_public_compare_without_auth(&err) => {
+                last_auth_err = Some(err);
             }
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
+    }
+
+    if let Some(auth_err) = last_auth_err {
+        match fetch_release_compare_digest_request(state, repo_full_name, base_tag, head_tag, None)
+            .await
+        {
+            Ok(digest) => Ok(digest),
+            Err(public_err) => Err(map_public_compare_fallback_error(auth_err, public_err)),
+        }
+    } else {
+        fetch_release_compare_digest_request(state, repo_full_name, base_tag, head_tag, None).await
     }
 }
 
@@ -11531,6 +11867,8 @@ mod tests {
         .await
         .expect("seed user");
 
+        seed_github_connection(&pool, test_user_id(1).as_str(), 30215105, "IvanLi-CN", now).await;
+
         pool
     }
 
@@ -11654,6 +11992,43 @@ mod tests {
         session
     }
 
+    async fn seed_github_connection(
+        pool: &SqlitePool,
+        user_id: &str,
+        github_user_id: i64,
+        login: &str,
+        linked_at: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id,
+              user_id,
+              github_user_id,
+              login,
+              access_token_ciphertext,
+              access_token_nonce,
+              scopes,
+              linked_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id)
+        .bind(github_user_id)
+        .bind(login)
+        .bind(vec![0_u8])
+        .bind(vec![0_u8])
+        .bind("read:user")
+        .bind(linked_at)
+        .bind(linked_at)
+        .execute(pool)
+        .await
+        .expect("seed github connection");
+    }
+
     async fn seed_user(pool: &SqlitePool, id: i64, login: &str, is_admin: i64, is_disabled: i64) {
         let created_at = format!("2026-02-23T00:00:{id:02}Z");
         let local_id = test_user_id(id);
@@ -11663,7 +12038,7 @@ mod tests {
             VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(local_id)
+        .bind(&local_id)
         .bind(30000000_i64 + id)
         .bind(login)
         .bind(is_admin)
@@ -11673,6 +12048,15 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed test user");
+
+        seed_github_connection(
+            pool,
+            local_id.as_str(),
+            30000000_i64 + id,
+            login,
+            &created_at,
+        )
+        .await;
     }
 
     async fn set_last_active_at(pool: &SqlitePool, user_id: &str, last_active_at: Option<&str>) {

@@ -11,6 +11,7 @@ import {
 	apiCheckReactionToken,
 	apiGetReactionTokenStatus,
 	apiPutReactionToken,
+	type ReactionTokenOwnerSummary,
 	type ReactionTokenStatusResponse,
 } from "@/api";
 
@@ -70,6 +71,8 @@ export function useReactionTokenEditor(
 	const [reactionTokenMasked, setReactionTokenMasked] = useState<string | null>(
 		null,
 	);
+	const [reactionTokenOwner, setReactionTokenOwner] =
+		useState<ReactionTokenOwnerSummary | null>(null);
 	const [patInput, setPatInput] = useState("");
 	const [patCheckState, setPatCheckState] = useState<PatCheckState>("idle");
 	const [patCheckMessage, setPatCheckMessage] = useState<string | null>(null);
@@ -105,6 +108,7 @@ export function useReactionTokenEditor(
 			const hasDraft = patInputRef.current.trim().length > 0;
 			setReactionTokenConfigured(res.configured);
 			setReactionTokenMasked(res.masked_token);
+			setReactionTokenOwner(res.owner);
 			if (!hasDraft) {
 				setPatCheckState(normalized.status);
 				setPatCheckMessage(normalized.message);
@@ -188,6 +192,7 @@ export function useReactionTokenEditor(
 			const normalized = normalizePatStatus(res.check.state, res.check.message);
 			setReactionTokenConfigured(res.configured);
 			setReactionTokenMasked(res.masked_token);
+			setReactionTokenOwner(res.owner);
 			setPatCheckState(normalized.status);
 			setPatCheckMessage(normalized.message);
 			setPatCheckedAt(res.check.checked_at);
@@ -212,6 +217,7 @@ export function useReactionTokenEditor(
 		reactionTokenLoading,
 		reactionTokenConfigured,
 		reactionTokenMasked,
+		reactionTokenOwner,
 		patInput,
 		setPatInput,
 		patCheckState,

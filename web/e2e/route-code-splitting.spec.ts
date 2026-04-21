@@ -213,7 +213,9 @@ test("anonymous root only loads landing route code path on demand", async ({
 
 	await page.goto("/");
 
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 	expect(tracked.includes("/src/routes/index.lazy.tsx")).toBeTruthy();
 	expect(
 		tracked.includes("/src/routes/-index.landing-surface.tsx"),
