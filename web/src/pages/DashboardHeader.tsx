@@ -383,7 +383,7 @@ export function DashboardHeader({
 		>
 			<div
 				className={cn(
-					"flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between",
+					"flex flex-col gap-3 md:grid md:grid-cols-[minmax(0,1fr)_auto] md:items-start md:gap-x-4 md:gap-y-3 lg:flex lg:flex-row lg:items-start lg:justify-between",
 					interactiveMotionClass,
 					useSingleLineHeader && "flex-row items-center justify-between gap-3",
 				)}
@@ -394,6 +394,7 @@ export function DashboardHeader({
 							}
 						: undefined
 				}
+				data-dashboard-header-main-row
 			>
 				<div
 					className={cn(
@@ -490,6 +491,7 @@ export function DashboardHeader({
 						disableHeaderMotion
 							? "transition-none"
 							: "motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
+						!useSingleLineHeader && "md:justify-self-end md:self-start",
 						useSingleLineHeader &&
 							"w-auto shrink-0 justify-end gap-1.5 self-auto",
 					)}
