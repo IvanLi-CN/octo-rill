@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useRef, useState } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
 import type {
@@ -9,7 +10,29 @@ import type {
 } from "@/api";
 import { SettingsPage } from "@/pages/Settings";
 import type { SettingsSection } from "@/settings/routeState";
+import { ThemeProvider } from "@/theme/ThemeProvider";
+import type { ThemePreference } from "@/theme/theme";
 import { VersionMonitorStateProvider } from "@/version/versionMonitor";
+
+const SETTINGS_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	settingsGithubPatMobile390: {
+		name: "Settings PAT mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+	settingsGithubPatDesktop1280: {
+		name: "Settings PAT desktop 1280x1000",
+		styles: {
+			height: "1000px",
+			width: "1280px",
+		},
+		type: "desktop",
+	},
+} as const;
 
 function svgAvatarDataUrl(
 	label: string,
@@ -64,16 +87,22 @@ type SettingsStoryArgs = {
 	linuxdoConnection: LinuxDoConnectionResponse | null;
 	reactionTokenStatus: ReactionTokenStatusResponse;
 	profile: MeProfileResponse;
+	themePreference: ThemePreference;
 };
 
 function SettingsStoryScene(args: SettingsStoryArgs) {
 	const me = buildMockMeResponse();
 	const originalFetchRef = useRef(globalThis.fetch);
 	const [profile, setProfile] = useState(args.profile);
+	const [section, setSection] = useState(args.section);
 
 	useEffect(() => {
 		setProfile(args.profile);
 	}, [args.profile]);
+
+	useEffect(() => {
+		setSection(args.section);
+	}, [args.section]);
 
 	globalThis.fetch = async (input, init) => {
 		const requestUrl =
@@ -150,22 +179,36 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	}, []);
 
 	return (
-		<VersionMonitorStateProvider
-			value={{
-				loadedVersion: "v2.4.6",
-				availableVersion: null,
-				hasUpdate: false,
-				refreshPage: () => {},
+		<div
+			onClickCapture={(event) => {
+				const target = event.target;
+				if (!(target instanceof Element)) return;
+				const anchor = target.closest<HTMLAnchorElement>(
+					"[data-settings-nav] a[href*='/settings']",
+				);
+				if (!anchor) return;
+				event.preventDefault();
 			}}
 		>
-			<SettingsPage
-				me={me}
-				section={args.section}
-				linuxdoStatus={args.linuxdoStatus}
-				onSectionChange={() => {}}
-				onProfileSaved={() => {}}
-			/>
-		</VersionMonitorStateProvider>
+			<VersionMonitorStateProvider
+				value={{
+					loadedVersion: "v2.4.6",
+					availableVersion: null,
+					hasUpdate: false,
+					refreshPage: () => {},
+				}}
+			>
+				<ThemeProvider defaultPreference={args.themePreference} persist={false}>
+					<SettingsPage
+						me={me}
+						section={section}
+						linuxdoStatus={args.linuxdoStatus}
+						onSectionChange={setSection}
+						onProfileSaved={() => {}}
+					/>
+				</ThemeProvider>
+			</VersionMonitorStateProvider>
+		</div>
 	);
 }
 
@@ -187,6 +230,9 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: SETTINGS_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -208,6 +254,7 @@ const meta = {
 			},
 		},
 		profile: buildMockProfile(),
+		themePreference: "light",
 	},
 } satisfies Meta<typeof SettingsStoryScene>;
 
@@ -227,6 +274,29 @@ export const Default: Story = {
 		await expect(
 			canvas.getByRole("button", { name: "Connect LinuxDO" }),
 		).toBeVisible();
+
+		await userEvent.click(canvas.getByRole("link", { name: "GitHub PAT" }));
+		await expect(canvas.getByTestId("github-pat-guide-card")).toBeVisible();
+
+		await userEvent.click(canvas.getByRole("link", { name: "我的发布" }));
+		await expect(
+			canvas.getByRole("switch", { name: "我的发布" }),
+		).toBeVisible();
+
+		await userEvent.click(canvas.getByRole("link", { name: "日报设置" }));
+		await expect(canvas.getByText("日报时间")).toBeVisible();
+	},
+};
+
+export const SwitchableSections: Story = {
+	name: "Switchable Sections",
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"用于手动点击四个设置分区的交互式 Story。点击顶部导航即可在 LinuxDO、我的发布、GitHub PAT、日报设置之间切换。",
+			},
+		},
 	},
 };
 
@@ -272,7 +342,7 @@ export const DeepLinkedGitHubPat: Story = {
 		docs: {
 			description: {
 				story:
-					"深链到 `section=github-pat` 时，GitHub PAT 区域会被高亮；这里同时覆盖 LinuxDO 未配置与 PAT 失效提示态。",
+					"深链到 `section=github-pat` 时，页面展示 GitHub classic PAT 的高仿 DOM mock，并直接预填建议值供用户照抄。",
 			},
 		},
 	},
@@ -282,13 +352,88 @@ export const DeepLinkedGitHubPat: Story = {
 			canvas.queryByRole("heading", { name: "GitHub PAT 可用" }),
 		).not.toBeInTheDocument();
 		await expect(canvas.getByText("GitHub PAT 无效")).toBeVisible();
-		await expect(canvas.getByLabelText("GitHub PAT")).toHaveAttribute(
-			"autocomplete",
-			"new-password",
+		const input = canvas.getByLabelText("GitHub PAT", { selector: "input" });
+		await expect(input).toHaveAttribute("type", "password");
+		await expect(input).toHaveAttribute("autocomplete", "new-password");
+		await expect(input).toHaveAttribute("data-1p-ignore", "true");
+		await expect(input).toHaveAttribute("data-form-type", "other");
+		await expect(input).toHaveAttribute("data-secret-visible", "false");
+		await userEvent.click(
+			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
+		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("data-secret-visible", "true");
+		const guide = canvas.getByTestId("github-pat-guide-card");
+		await expect(guide).toBeVisible();
+		await expect(
+			within(guide).getByRole("textbox", { name: "Note" }),
+		).toHaveValue("OctoRill release feedback");
+		await expect(
+			within(guide).getByRole("button", { name: "No expiration" }),
+		).toBeVisible();
 		await expect(
 			canvas.getByText("当前环境未配置 LinuxDO Connect，按钮已禁用。"),
 		).toBeVisible();
+	},
+};
+
+export const GitHubPatDesktopLight: Story = {
+	...DeepLinkedGitHubPat,
+	name: "GitHub PAT / Desktop / Light",
+	globals: {
+		viewport: {
+			value: "settingsGithubPatDesktop1280",
+			isRotated: false,
+		},
+	},
+	args: {
+		...DeepLinkedGitHubPat.args,
+		themePreference: "light",
+	},
+};
+
+export const GitHubPatDesktopDark: Story = {
+	...DeepLinkedGitHubPat,
+	name: "GitHub PAT / Desktop / Dark",
+	globals: {
+		viewport: {
+			value: "settingsGithubPatDesktop1280",
+			isRotated: false,
+		},
+	},
+	args: {
+		...DeepLinkedGitHubPat.args,
+		themePreference: "dark",
+	},
+};
+
+export const GitHubPatMobileLight: Story = {
+	...DeepLinkedGitHubPat,
+	name: "GitHub PAT / Mobile / Light",
+	globals: {
+		viewport: {
+			value: "settingsGithubPatMobile390",
+			isRotated: false,
+		},
+	},
+	args: {
+		...DeepLinkedGitHubPat.args,
+		themePreference: "light",
+	},
+};
+
+export const GitHubPatMobileDark: Story = {
+	...DeepLinkedGitHubPat,
+	name: "GitHub PAT / Mobile / Dark",
+	globals: {
+		viewport: {
+			value: "settingsGithubPatMobile390",
+			isRotated: false,
+		},
+	},
+	args: {
+		...DeepLinkedGitHubPat.args,
+		themePreference: "dark",
 	},
 };
 

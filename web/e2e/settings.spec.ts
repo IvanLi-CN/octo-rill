@@ -200,13 +200,28 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await page.goto("/settings?section=github-pat");
 
 	await expect(page).toHaveURL(/section=github-pat/);
-	await expect(
-		page.locator('[data-settings-section="github-pat"]'),
-	).toContainText("ghp_****_saved");
-	await expect(page.getByLabel("GitHub PAT")).toHaveAttribute(
-		"autocomplete",
-		"new-password",
+	const githubPatSection = page.locator('[data-settings-section="github-pat"]');
+	await expect(githubPatSection).toBeVisible({ timeout: 10_000 });
+	await expect(githubPatSection).toContainText("ghp_****_saved", {
+		timeout: 10_000,
+	});
+	const input = page.locator("#settings-reaction-pat");
+	await expect(input).toHaveAttribute("type", "password");
+	await expect(input).toHaveAttribute("autocomplete", "new-password");
+	await expect(input).toHaveAttribute("data-1p-ignore", "true");
+	await expect(input).toHaveAttribute("data-form-type", "other");
+	await expect(input).toHaveAttribute("data-secret-visible", "false");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveAttribute("type", "text");
+	await expect(input).toHaveAttribute("data-secret-visible", "true");
+	const guide = page.getByTestId("github-pat-guide-card");
+	await expect(guide).toBeVisible();
+	await expect(guide.getByRole("textbox", { name: "Note" })).toHaveValue(
+		"OctoRill release feedback",
 	);
+	await expect(
+		guide.getByRole("button", { name: "No expiration" }),
+	).toBeVisible();
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {
