@@ -273,9 +273,9 @@ fn ai_error_is_missing_content(err: &anyhow::Error) -> bool {
     err.to_string().trim() == AI_RESPONSE_MISSING_CONTENT_ERROR
 }
 
-fn max_llm_attempts_for_error(source: &str, err: &anyhow::Error) -> usize {
+fn max_llm_attempts_for_call(source: &str, translation_empty_content_budget_active: bool) -> usize {
     if llm_source_uses_translation_empty_content_retry_budget(source)
-        && ai_error_is_missing_content(err)
+        && translation_empty_content_budget_active
     {
         LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
     } else {
@@ -1942,6 +1942,9 @@ pub async fn chat_completion(
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
     let mut started_at_timestamp: Option<String> = None;
+    let translation_source_uses_empty_content_budget =
+        llm_source_uses_translation_empty_content_retry_budget(log_record.source.as_str());
+    let mut translation_empty_content_budget_active = false;
     let mut attempt = 0_usize;
     loop {
         attempt = attempt.saturating_add(1);
@@ -2068,7 +2071,14 @@ pub async fn chat_completion(
                     err,
                     first_token_wait_ms,
                 } = attempt_err;
-                let max_attempts = max_llm_attempts_for_error(log_record.source.as_str(), &err);
+                if translation_source_uses_empty_content_budget && ai_error_is_missing_content(&err)
+                {
+                    translation_empty_content_budget_active = true;
+                }
+                let max_attempts = max_llm_attempts_for_call(
+                    log_record.source.as_str(),
+                    translation_empty_content_budget_active,
+                );
                 if !retryable || attempt >= max_attempts {
                     let duration_ms = started_at.map(|started| {
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
@@ -5890,6 +5900,93 @@ mod tests {
             );
             assert_eq!(row.get::<Option<String>, _>("error_text"), None);
         }
+    }
+
+    #[tokio::test]
+    async fn chat_completion_preserves_extended_budget_after_empty_content_for_translation_sources()
+    {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    let attempt = route_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    match attempt {
+                        1..=4 => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "choices": [{
+                                    "message": { "content": "" }
+                                }]
+                            })),
+                        ),
+                        5 => (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "temporary upstream failure",
+                                    "code": "upstream_error"
+                                }
+                            })),
+                        ),
+                        _ => (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "choices": [{
+                                    "message": { "content": "ok" }
+                                }]
+                            })),
+                        ),
+                    }
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let context = LlmCallContext {
+            source: "translation.scheduler.deadline".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: Some("batch-test".to_owned()),
+        };
+
+        let result = with_llm_call_context(context, async {
+            chat_completion(state.as_ref(), "system", "user", 128).await
+        })
+        .await
+        .expect(
+            "translation-scoped calls should keep the 8-attempt budget once empty content appears",
+        );
+
+        assert_eq!(result, "ok");
+        assert_eq!(seen_attempts.load(Ordering::SeqCst), 6);
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, response_text, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(
+            row.get::<String, _>("source"),
+            "translation.scheduler.deadline"
+        );
+        assert_eq!(row.get::<String, _>("status"), "succeeded");
+        assert_eq!(row.get::<i64, _>("attempt_count"), 6);
+        assert_eq!(
+            row.get::<Option<String>, _>("response_text"),
+            Some("ok".to_owned())
+        );
+        assert_eq!(row.get::<Option<String>, _>("error_text"), None);
     }
 
     #[tokio::test]
