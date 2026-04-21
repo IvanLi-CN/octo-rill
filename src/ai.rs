@@ -19,7 +19,7 @@ use crate::{
     admin_runtime,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    local_id, runtime,
+    jobs, local_id, runtime,
     state::AppState,
 };
 
@@ -265,20 +265,37 @@ fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
 }
 
-fn llm_source_uses_translation_empty_content_retry_budget(source: &str) -> bool {
+fn llm_parent_task_type_uses_translation_empty_content_retry_budget(
+    parent_task_type: Option<&str>,
+) -> bool {
+    matches!(
+        parent_task_type,
+        Some(
+            jobs::TASK_TRANSLATE_RELEASE
+                | jobs::TASK_TRANSLATE_RELEASE_BATCH
+                | jobs::TASK_TRANSLATE_RELEASE_DETAIL
+                | jobs::TASK_TRANSLATE_NOTIFICATION
+                | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH
+        )
+    )
+}
+
+fn llm_call_uses_translation_empty_content_retry_budget(
+    source: &str,
+    parent_task_type: Option<&str>,
+) -> bool {
     let normalized_source = source.strip_prefix("job.").unwrap_or(source);
     normalized_source.starts_with("translation.scheduler.")
         || normalized_source.starts_with("api.translate_")
+        || llm_parent_task_type_uses_translation_empty_content_retry_budget(parent_task_type)
 }
 
 fn ai_error_is_missing_content(err: &anyhow::Error) -> bool {
     err.to_string().trim() == AI_RESPONSE_MISSING_CONTENT_ERROR
 }
 
-fn max_llm_attempts_for_call(source: &str, translation_empty_content_budget_active: bool) -> usize {
-    if llm_source_uses_translation_empty_content_retry_budget(source)
-        && translation_empty_content_budget_active
-    {
+fn max_llm_attempts_for_call(translation_empty_content_budget_active: bool) -> usize {
+    if translation_empty_content_budget_active {
         LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
     } else {
         LLM_REQUEST_MAX_ATTEMPTS
@@ -1945,7 +1962,10 @@ pub async fn chat_completion(
     let mut started_at: Option<Instant> = None;
     let mut started_at_timestamp: Option<String> = None;
     let translation_source_uses_empty_content_budget =
-        llm_source_uses_translation_empty_content_retry_budget(log_record.source.as_str());
+        llm_call_uses_translation_empty_content_retry_budget(
+            log_record.source.as_str(),
+            log_record.parent_task_type.as_deref(),
+        );
     let mut translation_empty_content_budget_active = false;
     let mut attempt = 0_usize;
     loop {
@@ -2077,10 +2097,8 @@ pub async fn chat_completion(
                 {
                     translation_empty_content_budget_active = true;
                 }
-                let max_attempts = max_llm_attempts_for_call(
-                    log_record.source.as_str(),
-                    translation_empty_content_budget_active,
-                );
+                let max_attempts =
+                    max_llm_attempts_for_call(translation_empty_content_budget_active);
                 if !retryable || attempt >= max_attempts {
                     let duration_ms = started_at.map(|started| {
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
@@ -6115,6 +6133,76 @@ mod tests {
         .expect("load llm call");
 
         assert_eq!(row.get::<String, _>("source"), "job.api.translate_release");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<i64, _>("attempt_count"),
+            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text"),
+            Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_extends_empty_content_budget_for_release_smart_job_sources() {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    route_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "" }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let context = LlmCallContext {
+            source: "job.sync.releases.auto_smart".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: Some(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH.to_owned()),
+            parent_translation_batch_id: None,
+        };
+
+        let err = with_llm_call_context(context, async {
+            chat_completion(state.as_ref(), "system", "user", 128).await
+        })
+        .await
+        .expect_err("release smart job source should inherit the 8-attempt budget");
+
+        assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+        assert_eq!(
+            seen_attempts.load(Ordering::SeqCst),
+            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(
+            row.get::<String, _>("source"),
+            "job.sync.releases.auto_smart"
+        );
         assert_eq!(row.get::<String, _>("status"), "failed");
         assert_eq!(
             row.get::<i64, _>("attempt_count"),
