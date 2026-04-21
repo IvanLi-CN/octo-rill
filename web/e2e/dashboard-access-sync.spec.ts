@@ -452,6 +452,9 @@ test("dashboard keeps header utilities inline on tablet widths", async ({
 	await expect(
 		page.locator("[data-dashboard-secondary-controls]"),
 	).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-sidebar-inbox='true']"),
+	).toHaveCount(0);
 
 	const layout = await page.evaluate(() => {
 		const mainRowElement = document.querySelector(

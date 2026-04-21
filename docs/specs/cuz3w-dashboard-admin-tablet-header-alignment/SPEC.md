@@ -11,6 +11,7 @@
 - 主人反馈在 `853x1280` 一类平板视口下，Dashboard 与 Admin 页头会退回移动前的纵向堆叠：utility actions 从品牌 / 导航块下方起排，导致顶部结构错位。
 - 当前 `DashboardHeader` 与 `AdminHeader` 都把“同排对齐”的布局切换点压在 `lg (>=1024px)`，`768–1023px` 区间缺少独立的 tablet contract。
 - 现有 Storybook 与 Playwright 覆盖主要集中在桌面与手机壳层，缺少平板视口下“主行对齐 + 无横向溢出”的稳定回归。
+- Dashboard feed 页在平板口径仍沿用桌面侧栏，把 `Inbox Quick List` 继续塞在右列，会压缩主内容阅读宽度，也和“平板只保留核心主列”的体验目标冲突。
 
 ## 目标 / 非目标
 
@@ -18,6 +19,7 @@
 
 - 为 Dashboard / Admin 页头补齐 `768–1023px` 的 tablet-inline 两列合同。
 - 保持 Dashboard 品牌区 / tabs 控制带、Admin 导航区的现有信息层级，只修正 utility actions 的对齐与挤压问题。
+- 在 Dashboard feed 的平板口径下移除右侧 `Inbox Quick List` 列，把收件箱入口统一收敛到顶部 `收件箱` tab。
 - 为 DashboardHeader、Dashboard 页面与 AdminHeader 增加平板 Storybook 审阅入口和回归断言。
 - 为 dashboard/admin Playwright 增加 `853x1280` 平板 smoke，锁住“同排对齐 + 无横向溢出”。
 
@@ -25,7 +27,7 @@
 
 - 不改动 `<=639px` 的 mobile compact shell、手势、sticky rail 或 footer auto-hide 语义。
 - 不改动 `>=1024px` 的 desktop 品牌 / 导航布局语义。
-- 不调整 Feed / Inbox / Release 卡片结构，不修改 API、路由、schema、数据库或权限逻辑。
+- 不移除 Dashboard 顶部 `收件箱` tab，不修改 Inbox 主列表自身结构，不修改 API、路由、schema、数据库或权限逻辑。
 
 ## 范围（Scope）
 
@@ -55,6 +57,7 @@
 - DashboardHeader 在 `768–1023px` 必须采用两列主行：左列品牌 / 副标题，右列 `ThemeToggle + 同步 + avatar`。
 - AdminHeader 在 `768–1023px` 必须采用两列主行：左列品牌 + 管理员导航块，右列 `ThemeToggle + 返回前台 + login/logout`。
 - Dashboard / Admin 页头在 `853x1280` 下不得出现 utility actions 从品牌 / 导航块下方起排的错位。
+- Dashboard feed 在 `768–1023px` 下不得继续显示右侧 `Inbox Quick List` 侧栏；收件箱内容只通过 `收件箱` tab 进入。
 - 平板合同下页头容器不得产生水平滚动；长 login 文本需要安全收口，不得把返回前台按钮挤出可视区。
 - Storybook 必须提供稳定的平板 viewport 审阅入口，并通过 `play` 断言验证“主行同排 + 无横向溢出”。
 - Playwright 必须补齐 Dashboard / Admin 的平板 smoke，覆盖 `853x1280`。
@@ -77,6 +80,7 @@
    - 品牌块继续显示 `OctoRill` 与副标题。
    - `ThemeToggle`、`同步`、头像入口固定在右列，不再被挤到品牌块下方。
    - 下方 tabs / secondary controls 继续保留为后续控制带。
+   - feed tabs 在平板口径回到单主列，不再额外渲染 `Inbox Quick List` 侧栏；查看收件箱时改走 `收件箱` tab 主列表。
 
 2. **Admin tablet shell**
    - `AdminHeader` 在平板区间进入两列主行。
@@ -109,7 +113,7 @@
 
 - Given `853x1280` 打开 Dashboard
   When 页头完成渲染
-  Then 品牌块与 `ThemeToggle / 同步 / avatar` 处于同一顶层主行，且页头容器无水平滚动。
+  Then 品牌块与 `ThemeToggle / 同步 / avatar` 处于同一顶层主行，页头容器无水平滚动，且 feed 页不再显示右侧 Inbox 侧栏。
 
 - Given `853x1280` 打开 Admin Users 或 Admin Jobs
   When 页头完成渲染
@@ -188,7 +192,7 @@
   submission_gate: `pending-owner-approval`
   story_id_or_title: `Pages/Dashboard / Evidence / Tablet Header Inline`
   state: `tablet-inline-dashboard-page`
-  evidence_note: 验证 Dashboard 页面级壳层在平板口径下维持页头主行同排、tabs / secondary controls 仍位于后续控制带，且容器没有水平滚动回归。
+  evidence_note: 验证 Dashboard 页面级壳层在平板口径下维持页头主行同排、tabs / secondary controls 仍位于后续控制带，同时 feed 页已移除右侧 Inbox 侧栏列。
   image:
   ![Dashboard 页面平板页头同排对齐证据](./assets/dashboard-tablet-header-inline.png)
 
@@ -202,7 +206,7 @@
 ## 方案概述（Approach, high-level）
 
 - 让两个页头在 `md` 区间切到 grid 两列主行，把 utility actions 固定到右列。
-- 保持 Dashboard tabs / Admin 导航块的现有层级，不扩大到信息架构改造。
+- 保持 Dashboard tabs / Admin 导航块的现有层级，并把 Dashboard 平板 feed 恢复为单主列，不扩大到更多信息架构改造。
 - 用 Storybook 与 Playwright 同时锁住 `853x1280` 的布局合同，避免再次回归到“平板看起来像手机堆叠”。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
@@ -215,6 +219,7 @@
 
 - 2026-04-21: 创建 follow-up spec，冻结 Dashboard / Admin 平板页头对齐修复合同。
 - 2026-04-21: 已完成 Dashboard / Admin 平板页头两列主行实现，补齐 Storybook `853x1280` 审阅入口、Playwright tablet smoke 与本地视觉证据；后续仅等待主人确认截图是否可进入 push / PR。
+- 2026-04-21: 根据主人反馈补充 Dashboard 平板 feed 单主列合同：`768–1023px` 不再显示右侧 Inbox 快捷侧栏，相关 Storybook / Playwright / 视觉证据需一起刷新。
 
 ## 参考（References）
 
