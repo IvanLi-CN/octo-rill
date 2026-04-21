@@ -125,3 +125,4 @@
 | yhyaj | 共享 Markdown GitHub 链接短标签与自动换行防裁剪 | 已完成 | `yhyaj-shared-markdown-github-link-wrap/SPEC.md` | 2026-04-21 | PR #109; shared Markdown GitHub autolink compaction + wrap guards + Storybook/Playwright coverage |
 | gr8kr | GitHub 登录态持久化与稳定 session cookie | 已完成 | `gr8kr-persistent-session-auth/SPEC.md` | 2026-04-21 | fast-track / 30d sliding session + stable cookie-name config / PR #110 |
 | cuz3w | Dashboard / Admin 平板页头对齐修复 | 已完成 | `cuz3w-dashboard-admin-tablet-header-alignment/SPEC.md` | 2026-04-21 | PR #113; fast-track / tablet header alignment + dashboard tablet single-column feed without inbox sidebar |
+| 6xaku | GitHub PAT 1:1 参考界面 | 已完成 | `6xaku-github-pat-inline-guide-mock/SPEC.md` | 2026-04-20 | fast-track / DOM-based GitHub PAT reference + switchable settings story + evidence |
