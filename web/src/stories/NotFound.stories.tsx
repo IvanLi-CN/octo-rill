@@ -67,8 +67,10 @@ export const Guest: Story = {
 		).toBeVisible();
 		await expect(canvas.getByText("/missing-public-page")).toBeVisible();
 		await expect(canvas.getByRole("link", { name: "回到首页" })).toBeVisible();
-		await expect(
-			canvas.getByRole("link", { name: "连接到 GitHub" }),
-		).toBeVisible();
+		const githubLink = canvas.getByRole("link", { name: "使用 GitHub 登录" });
+		await expect(githubLink).toBeVisible();
+		expect(
+			githubLink.querySelector('[data-auth-provider-icon="github"]'),
+		).not.toBeNull();
 	},
 };

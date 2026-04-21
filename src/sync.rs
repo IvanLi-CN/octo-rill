@@ -532,6 +532,19 @@ struct AggregatedRepo {
     related_users: Vec<RelatedUserRef>,
 }
 
+#[derive(Debug, Clone)]
+struct SyncGitHubConnection {
+    id: String,
+    login: String,
+    access_token: String,
+}
+
+#[derive(Debug, Clone)]
+struct OwnedRepoSource {
+    repo: OwnedRepoSnapshot,
+    access_token: String,
+}
+
 #[derive(Debug)]
 struct StarPhaseSuccess {
     user_id: String,
@@ -772,6 +785,53 @@ impl SyncRequestError {
     }
 }
 
+async fn load_sync_github_connections(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<SyncGitHubConnection>, SyncRequestError> {
+    let connections = state
+        .load_github_connections(user_id)
+        .await
+        .map_err(|err| {
+            SyncRequestError::non_retryable(
+                "credentials_invalid",
+                format!("load github connections for user #{user_id}: {err}"),
+                None,
+            )
+        })?;
+    if !connections.is_empty() {
+        return Ok(connections
+            .into_iter()
+            .map(|connection| SyncGitHubConnection {
+                id: connection.id,
+                login: connection.login,
+                access_token: connection.access_token,
+            })
+            .collect());
+    }
+
+    Err(SyncRequestError::non_retryable(
+        "credentials_invalid",
+        format!("user #{user_id} has no github connections"),
+        None,
+    ))
+}
+
+fn merge_sync_since(target: &mut Option<String>, candidate: Option<String>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    match target {
+        Some(current) if candidate >= *current => {}
+        Some(current) => *current = candidate,
+        None => *target = Some(candidate),
+    }
+}
+
+fn notification_sync_key(base_key: &str, connection_id: &str) -> String {
+    format!("{base_key}:{connection_id}")
+}
+
 pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarredResult> {
     let repos = fetch_starred_snapshot(state, user_id)
         .await
@@ -855,42 +915,80 @@ pub async fn sync_social_activity(
     state: &AppState,
     user_id: &str,
 ) -> Result<SyncSocialActivityResult> {
-    let token = load_access_token_or_classified(state, user_id)
+    let connections = load_sync_github_connections(state, user_id)
         .await
         .map_err(SyncRequestError::into_anyhow)?;
-
     let mut source_errors = Vec::new();
-    let owned_repos = match fetch_owned_repo_snapshot(state, &token).await {
-        Ok(repos) => Some(repos),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                user_id,
-                "sync social activity: skip owned repo snapshot"
-            );
-            source_errors.push(format!("owned_repos({}): {}", err.reason_code, err.message));
-            None
+    let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
+    let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
+
+    for connection in connections {
+        match fetch_owned_repo_snapshot(state, &connection.access_token).await {
+            Ok(repos) => {
+                for repo in repos {
+                    owned_repo_sources
+                        .entry(repo.repo_id)
+                        .or_insert(OwnedRepoSource {
+                            repo,
+                            access_token: connection.access_token.clone(),
+                        });
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync social activity: skip owned repo snapshot"
+                );
+                source_errors.push(format!(
+                    "owned_repos(@{}, {}): {}",
+                    connection.login, err.reason_code, err.message
+                ));
+            }
         }
-    };
-    let followers = match fetch_followers_snapshot(state, &token).await {
-        Ok(followers) => Some(followers),
-        Err(err) => {
-            tracing::warn!(
-                ?err,
-                user_id,
-                "sync social activity: skip followers snapshot"
-            );
-            source_errors.push(format!("followers({}): {}", err.reason_code, err.message));
-            None
+
+        match fetch_followers_snapshot(state, &connection.access_token).await {
+            Ok(followers) => {
+                for follower in followers {
+                    followers_by_id.entry(follower.actor.id).or_insert(follower);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync social activity: skip followers snapshot"
+                );
+                source_errors.push(format!(
+                    "followers(@{}, {}): {}",
+                    connection.login, err.reason_code, err.message
+                ));
+            }
         }
-    };
-    let repo_collection = if let Some(owned_repos) = owned_repos.as_deref() {
-        collect_repo_stargazer_snapshots(state, &token, owned_repos).await
+    }
+
+    let mut owned_repos = owned_repo_sources
+        .values()
+        .map(|source| source.repo.clone())
+        .collect::<Vec<_>>();
+    owned_repos.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+
+    let mut followers = followers_by_id.into_values().collect::<Vec<_>>();
+    followers.sort_by(|left, right| left.actor.id.cmp(&right.actor.id));
+
+    let repo_collection = if !owned_repo_sources.is_empty() {
+        let repo_sources = owned_repo_sources.into_values().collect::<Vec<_>>();
+        collect_repo_stargazer_snapshots_for_sources(state, &repo_sources).await
     } else {
         RepoStargazerCollectionResult::default()
     };
 
-    let events = match (owned_repos.as_deref(), followers.as_deref()) {
+    let events = match (
+        (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
+        (!followers.is_empty()).then_some(followers.as_slice()),
+    ) {
         (Some(owned_repos), Some(followers)) => {
             apply_social_activity_snapshot(
                 state,
@@ -905,11 +1003,9 @@ pub async fn sync_social_activity(
             apply_social_activity_snapshot_partial(
                 state,
                 user_id,
-                owned_repos.as_deref(),
-                owned_repos
-                    .as_ref()
-                    .map(|_| repo_collection.repo_members.as_slice()),
-                followers.as_deref(),
+                (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
+                (!owned_repos.is_empty()).then_some(repo_collection.repo_members.as_slice()),
+                (!followers.is_empty()).then_some(followers.as_slice()),
             )
             .await?
         }
@@ -917,7 +1013,7 @@ pub async fn sync_social_activity(
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
-        followers: followers.as_ref().map_or(0, Vec::len),
+        followers: followers.len(),
         events,
         failed_repos: repo_collection.failed_repos,
         source_errors,
@@ -943,6 +1039,8 @@ pub async fn sync_social_activity_best_effort(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn collect_repo_stargazer_snapshots(
     state: &AppState,
     access_token: &str,
@@ -961,6 +1059,74 @@ async fn collect_repo_stargazer_snapshots(
     .await
 }
 
+async fn collect_repo_stargazer_snapshots_for_sources(
+    state: &AppState,
+    repos: &[OwnedRepoSource],
+) -> RepoStargazerCollectionResult {
+    let mut repo_stars = 0usize;
+    let mut repo_members = Vec::with_capacity(repos.len());
+    let mut failed_repos = Vec::new();
+    let mut join_set = JoinSet::new();
+    let mut pending = repos.iter().cloned().enumerate();
+    let concurrency = SOCIAL_STARGAZER_FETCH_CONCURRENCY.max(1);
+
+    loop {
+        while join_set.len() < concurrency {
+            let Some((index, repo_source)) = pending.next() else {
+                break;
+            };
+            let state = state.clone();
+            let repo_for_task = repo_source.repo.clone();
+            let access_token = repo_source.access_token.clone();
+            join_set.spawn(async move {
+                (
+                    index,
+                    repo_for_task.clone(),
+                    fetch_repo_stargazers_snapshot(&state, access_token.as_str(), &repo_for_task)
+                        .await,
+                )
+            });
+        }
+
+        let Some(joined) = join_set.join_next().await else {
+            break;
+        };
+
+        match joined {
+            Ok((index, repo, Ok(members))) => {
+                repo_stars += members.len();
+                repo_members.push((index, repo, members));
+            }
+            Ok((_, repo, Err(err))) => {
+                tracing::warn!(
+                    ?err,
+                    repo = repo.full_name.as_str(),
+                    "sync social activity: skip repo stargazers snapshot"
+                );
+                failed_repos.push(repo.full_name);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "sync social activity: repo stargazers task join failed"
+                );
+            }
+        }
+    }
+
+    repo_members.sort_by_key(|(index, _, _)| *index);
+
+    RepoStargazerCollectionResult {
+        repo_stars,
+        repo_members: repo_members
+            .into_iter()
+            .map(|(_, repo, members)| (repo, members))
+            .collect(),
+        failed_repos,
+    }
+}
+
+#[cfg(test)]
 type RepoStargazerFetchFuture =
     Pin<Box<dyn Future<Output = Result<Vec<RepoStargazerSnapshot>, anyhow::Error>> + Send>>;
 
@@ -971,6 +1137,7 @@ struct RepoStargazerCollectionResult {
     failed_repos: Vec<String>,
 }
 
+#[cfg(test)]
 async fn collect_repo_stargazer_snapshots_with<F>(
     state: &AppState,
     access_token: &str,
@@ -1234,12 +1401,36 @@ async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) 
         return Ok(false);
     }
 
-    let token = load_access_token_or_classified(state, user_id)
+    let connections = load_sync_github_connections(state, user_id)
         .await
         .map_err(SyncRequestError::into_anyhow)?;
-    let owned_repos = fetch_owned_repo_snapshot(state, &token)
-        .await
-        .map_err(SyncRequestError::into_anyhow)?;
+    let mut repos_by_id = HashMap::<i64, OwnedRepoSnapshot>::new();
+    let mut any_success = false;
+    let mut last_error: Option<SyncRequestError> = None;
+    for connection in connections {
+        match fetch_owned_repo_snapshot(state, &connection.access_token).await {
+            Ok(repos) => {
+                any_success = true;
+                for repo in repos {
+                    repos_by_id.entry(repo.repo_id).or_insert(repo);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync releases: skip owned repo visibility refresh for github connection"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    if !any_success && let Some(err) = last_error {
+        return Err(err.into_anyhow());
+    }
+    let mut owned_repos = repos_by_id.into_values().collect::<Vec<_>>();
+    owned_repos.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
     let empty_repo_members: &[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)] = &[];
     apply_social_activity_snapshot_partial(
         state,
@@ -4475,28 +4666,6 @@ fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequ
     SyncRequestError::non_retryable("graphql_error", format!("{operation}: {message}"), None)
 }
 
-async fn load_access_token_or_classified(
-    state: &AppState,
-    user_id: &str,
-) -> Result<String, SyncRequestError> {
-    state.load_access_token(user_id).await.map_err(|err| {
-        let message = err.to_string();
-        if message.contains("access token not found") {
-            SyncRequestError::non_retryable(
-                "credentials_missing",
-                format!("load access token for user #{user_id}: {message}"),
-                None,
-            )
-        } else {
-            SyncRequestError::non_retryable(
-                "credentials_invalid",
-                format!("load access token for user #{user_id}: {message}"),
-                None,
-            )
-        }
-    })
-}
-
 async fn fetch_json_response<T: DeserializeOwned>(
     response: Response,
     operation: &str,
@@ -4732,7 +4901,59 @@ async fn fetch_starred_snapshot(
     state: &AppState,
     user_id: &str,
 ) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
-    let token = load_access_token_or_classified(state, user_id).await?;
+    let connections = load_sync_github_connections(state, user_id).await?;
+    let mut repos_by_id = HashMap::<i64, StarredRepoSnapshot>::new();
+    let mut any_success = false;
+    let mut last_error: Option<SyncRequestError> = None;
+    for connection in connections {
+        match fetch_starred_snapshot_with_token(state, &connection.access_token).await {
+            Ok(repos) => {
+                any_success = true;
+                for repo in repos {
+                    match repos_by_id.get(&repo.repo_id) {
+                        Some(existing) if existing.stargazed_at >= repo.stargazed_at => {}
+                        _ => {
+                            repos_by_id.insert(repo.repo_id, repo);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync starred: skip github connection"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if !any_success {
+        return Err(last_error.unwrap_or_else(|| {
+            SyncRequestError::non_retryable(
+                "credentials_missing",
+                format!("load github connections for user #{user_id}: no usable github connection"),
+                None,
+            )
+        }));
+    }
+
+    let mut all = repos_by_id.into_values().collect::<Vec<_>>();
+    all.sort_by(|left, right| {
+        right
+            .stargazed_at
+            .cmp(&left.stargazed_at)
+            .then_with(|| left.full_name.cmp(&right.full_name))
+    });
+    Ok(all)
+}
+
+async fn fetch_starred_snapshot_with_token(
+    state: &AppState,
+    token: &str,
+) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
     let query = r#"
       query($after: String) {
         viewer {
@@ -4768,7 +4989,7 @@ async fn fetch_starred_snapshot(
             let response = state
                 .http
                 .post(GRAPHQL_URL)
-                .bearer_auth(&token)
+                .bearer_auth(token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", API_VERSION)
@@ -4826,6 +5047,12 @@ async fn fetch_starred_snapshot(
         }
     }
 
+    all.sort_by(|left, right| {
+        right
+            .stargazed_at
+            .cmp(&left.stargazed_at)
+            .then_with(|| left.full_name.cmp(&right.full_name))
+    });
     Ok(all)
 }
 
@@ -4886,8 +5113,31 @@ async fn fetch_repo_releases_for_user(
     user_id: &str,
     repo_full_name: &str,
 ) -> Result<Vec<GitHubRelease>, SyncRequestError> {
-    let token = load_access_token_or_classified(state, user_id).await?;
-    fetch_repo_releases_with_token(state, &token, repo_full_name).await
+    let connections = load_sync_github_connections(state, user_id).await?;
+    let mut last_error: Option<SyncRequestError> = None;
+    for connection in connections {
+        match fetch_repo_releases_with_token(state, &connection.access_token, repo_full_name).await
+        {
+            Ok(releases) => return Ok(releases),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    repo = repo_full_name,
+                    "sync releases: github connection could not read repo releases"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        SyncRequestError::non_retryable(
+            "credentials_missing",
+            format!("load github connections for user #{user_id}: no usable github connection"),
+            None,
+        )
+    }))
 }
 
 async fn fetch_repo_releases_with_token(
@@ -4931,86 +5181,158 @@ pub async fn sync_notifications(
     state: &AppState,
     user_id: &str,
 ) -> Result<SyncNotificationsResult> {
-    let token = state.load_access_token(user_id).await?;
-    sync_notifications_with_fetch(
+    let connections = load_sync_github_connections(state, user_id)
+        .await
+        .map_err(SyncRequestError::into_anyhow)?;
+    let mut total_notifications = 0usize;
+    let mut aggregated_since = None;
+    let mut any_success = false;
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for connection in connections {
+        let token = connection.access_token.clone();
+        let since_key = notification_sync_key(NOTIFICATIONS_SINCE_KEY, &connection.id);
+        let repair_key = notification_sync_key(NOTIFICATION_OPEN_URL_REPAIR_KEY, &connection.id);
+        match sync_notifications_with_fetch_keys(
+            state,
+            user_id,
+            since_key.as_str(),
+            repair_key.as_str(),
+            |since, before, page| {
+                let client = state.http.clone();
+                let token = token.clone();
+                Box::pin(async move {
+                    let mut url = format!(
+                        "{REST_API_BASE}/notifications?all=true&per_page={GITHUB_NOTIFICATIONS_PAGE_SIZE}"
+                    );
+                    if let Some(ref since) = since {
+                        url.push_str("&since=");
+                        url.push_str(&urlencoding::encode(since));
+                    }
+                    if let Some(ref before) = before {
+                        url.push_str("&before=");
+                        url.push_str(&urlencoding::encode(before));
+                    }
+                    url.push_str("&page=");
+                    url.push_str(&page.to_string());
+
+                    client
+                        .get(url)
+                        .bearer_auth(&token)
+                        .header(USER_AGENT, "OctoRill")
+                        .header(ACCEPT, "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", API_VERSION)
+                        .send()
+                        .await
+                        .context("github notifications request failed")?
+                        .error_for_status()
+                        .context("github notifications returned error")?
+                        .json::<Vec<GitHubNotification>>()
+                        .await
+                        .context("github notifications json decode failed")
+                }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
+            },
+            |thread_id| {
+                let client = state.http.clone();
+                let token = token.clone();
+                Box::pin(async move {
+                    let url = format!("{REST_API_BASE}/notifications/threads/{thread_id}");
+                    let response = client
+                        .get(url)
+                        .bearer_auth(&token)
+                        .header(USER_AGENT, "OctoRill")
+                        .header(ACCEPT, "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", API_VERSION)
+                        .send()
+                        .await
+                        .context("github notification thread request failed")?;
+                    let status = response.status();
+                    if status.is_success() {
+                        return response
+                            .json::<GitHubNotification>()
+                            .await
+                            .map(Some)
+                            .context("github notification thread json decode failed");
+                    }
+                    let headers = response.headers().clone();
+                    let body = response
+                        .text()
+                        .await
+                        .context("github notification thread error body decode failed")?;
+                    let error = classify_github_http_error(
+                        "github notification thread",
+                        status,
+                        &headers,
+                        &body,
+                    );
+                    if is_terminal_notification_thread_error(&error) {
+                        return Ok(None);
+                    }
+                    Err(error.into_anyhow())
+                }) as Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>
+            },
+        )
+        .await
+        {
+            Ok(result) => {
+                any_success = true;
+                total_notifications += result.notifications;
+                merge_sync_since(&mut aggregated_since, result.since);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    "sync notifications: skip github connection"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if !any_success {
+        return Err(last_error.unwrap_or_else(|| anyhow!("notifications sync failed")));
+    }
+
+    Ok(SyncNotificationsResult {
+        notifications: total_notifications,
+        since: aggregated_since,
+    })
+}
+
+#[cfg(test)]
+async fn sync_notifications_with_fetch<F, G>(
+    state: &AppState,
+    user_id: &str,
+    fetch_page: F,
+    fetch_thread: G,
+) -> Result<SyncNotificationsResult>
+where
+    F: FnMut(
+        Option<String>,
+        Option<String>,
+        usize,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>,
+    G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
+{
+    sync_notifications_with_fetch_keys(
         state,
         user_id,
-        |since, before, page| {
-            let client = state.http.clone();
-            let token = token.clone();
-            Box::pin(async move {
-                let mut url = format!(
-                    "{REST_API_BASE}/notifications?all=true&per_page={GITHUB_NOTIFICATIONS_PAGE_SIZE}"
-                );
-                if let Some(ref since) = since {
-                    url.push_str("&since=");
-                    url.push_str(&urlencoding::encode(since));
-                }
-                if let Some(ref before) = before {
-                    url.push_str("&before=");
-                    url.push_str(&urlencoding::encode(before));
-                }
-                url.push_str("&page=");
-                url.push_str(&page.to_string());
-
-                client
-                    .get(url)
-                    .bearer_auth(&token)
-                    .header(USER_AGENT, "OctoRill")
-                    .header(ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", API_VERSION)
-                    .send()
-                    .await
-                    .context("github notifications request failed")?
-                    .error_for_status()
-                    .context("github notifications returned error")?
-                    .json::<Vec<GitHubNotification>>()
-                    .await
-                    .context("github notifications json decode failed")
-            }) as Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>
-        },
-        |thread_id| {
-            let client = state.http.clone();
-            let token = token.clone();
-            Box::pin(async move {
-                let url = format!("{REST_API_BASE}/notifications/threads/{thread_id}");
-                let response = client
-                    .get(url)
-                    .bearer_auth(&token)
-                    .header(USER_AGENT, "OctoRill")
-                    .header(ACCEPT, "application/vnd.github+json")
-                    .header("X-GitHub-Api-Version", API_VERSION)
-                    .send()
-                    .await
-                    .context("github notification thread request failed")?;
-                let status = response.status();
-                if status.is_success() {
-                    return response
-                        .json::<GitHubNotification>()
-                        .await
-                        .map(Some)
-                        .context("github notification thread json decode failed");
-                }
-                let headers = response.headers().clone();
-                let body = response
-                    .text()
-                    .await
-                    .context("github notification thread error body decode failed")?;
-                let error =
-                    classify_github_http_error("github notification thread", status, &headers, &body);
-                if is_terminal_notification_thread_error(&error) {
-                    return Ok(None);
-                }
-                Err(error.into_anyhow())
-            }) as Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>
-        },
+        NOTIFICATIONS_SINCE_KEY,
+        NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        fetch_page,
+        fetch_thread,
     )
     .await
 }
 
-async fn sync_notifications_with_fetch<F, G>(
+async fn sync_notifications_with_fetch_keys<F, G>(
     state: &AppState,
     user_id: &str,
+    since_key: &str,
+    repair_key: &str,
     mut fetch_page: F,
     mut fetch_thread: G,
 ) -> Result<SyncNotificationsResult>
@@ -5022,10 +5344,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GitHubNotification>>> + Send>>,
     G: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Option<GitHubNotification>>> + Send>>,
 {
-    let repair_state = load_sync_state_value(state, user_id, NOTIFICATION_OPEN_URL_REPAIR_KEY)
+    let repair_state = load_sync_state_value(state, user_id, repair_key)
         .await
         .context("failed to query notification open-url repair state")?;
-    let since = load_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY)
+    let since = load_sync_state_value(state, user_id, since_key)
         .await
         .context("failed to query notifications since")?;
     let fetch_since = if repair_state.is_none() {
@@ -5062,16 +5384,11 @@ where
     } else {
         NOTIFICATION_OPEN_URL_REPAIR_PENDING
     };
-    store_sync_state_value(
-        state,
-        user_id,
-        NOTIFICATION_OPEN_URL_REPAIR_KEY,
-        repair_state_value,
-    )
-    .await
-    .context("failed to update notification open-url repair state")?;
+    store_sync_state_value(state, user_id, repair_key, repair_state_value)
+        .await
+        .context("failed to update notification open-url repair state")?;
 
-    store_sync_state_value(state, user_id, NOTIFICATIONS_SINCE_KEY, &sync_started_at)
+    store_sync_state_value(state, user_id, since_key, &sync_started_at)
         .await
         .context("failed to update notifications since")?;
 

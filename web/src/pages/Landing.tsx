@@ -1,3 +1,4 @@
+import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
@@ -21,7 +22,7 @@ const heroTitle = "集中查看与你相关的 GitHub 动态";
 const heroDescription =
 	"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。";
 const loginCardDescription =
-	"连接后即可同步你的 GitHub 动态，并在站内查看译文、日报与通知。";
+	"可直接使用 GitHub 登录；也可以先用 LinuxDO 登录，再绑定 GitHub。";
 
 const heroHighlights = [
 	{
@@ -100,7 +101,7 @@ export function Landing({ bootError }: LandingProps) {
 							<CardHeader className="gap-3 px-5 pt-5 pb-0 sm:px-6 sm:pt-6">
 								<div className="space-y-2">
 									<CardTitle className="text-2xl sm:text-[2rem]">
-										连接到 GitHub
+										登录
 									</CardTitle>
 									<CardDescription className="text-sm leading-6 sm:text-base">
 										{loginCardDescription}
@@ -113,7 +114,21 @@ export function Landing({ bootError }: LandingProps) {
 									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
 									data-landing-login-cta
 								>
-									<a href="/auth/github/login">连接到 GitHub</a>
+									<a href="/auth/github/login">
+										<AuthProviderIcon provider="github" />
+										使用 GitHub 登录
+									</a>
+								</Button>
+								<Button
+									asChild
+									variant="outline"
+									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
+									data-landing-linuxdo-cta
+								>
+									<a href="/auth/linuxdo/login">
+										<AuthProviderIcon provider="linuxdo" />
+										使用 LinuxDO 登录
+									</a>
 								</Button>
 
 								{bootError ? (

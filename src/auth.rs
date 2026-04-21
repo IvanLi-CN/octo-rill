@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Redirect},
 };
 use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
@@ -18,8 +18,68 @@ use crate::{
 };
 
 const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
+const SESSION_KEY_GITHUB_OAUTH_MODE: &str = "github_oauth_mode";
 const SESSION_KEY_LINUXDO_OAUTH_STATE: &str = "linuxdo_oauth_state";
+const SESSION_KEY_PENDING_LINUXDO: &str = "pending_linuxdo";
 const SESSION_KEY_USER_ID: &str = "user_id";
+
+const GITHUB_OAUTH_MODE_LOGIN: &str = "login";
+const GITHUB_OAUTH_MODE_CONNECT: &str = "connect";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingLinuxDoSession {
+    linuxdo_user_id: i64,
+    username: String,
+    name: Option<String>,
+    avatar_url: String,
+    trust_level: i64,
+    active: bool,
+    silenced: bool,
+}
+
+impl PendingLinuxDoSession {
+    fn from_linuxdo_user(user: &linuxdo::LinuxDoUser) -> Self {
+        Self {
+            linuxdo_user_id: user.id,
+            username: user.username.clone(),
+            name: linuxdo::normalize_display_name(user.name.as_deref()),
+            avatar_url: linuxdo::resolve_avatar_url(&user.avatar_template, 96),
+            trust_level: user.trust_level,
+            active: user.active,
+            silenced: user.silenced,
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct GitHubConnectionOwnerRow {
+    id: String,
+    user_id: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AuthUserRow {
+    id: String,
+    is_admin: i64,
+    is_disabled: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ExistingBriefPreferenceRow {
+    daily_brief_local_time: Option<String>,
+    daily_brief_time_zone: Option<String>,
+    daily_brief_utc_time: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LinuxDoOwnerRow {
+    user_id: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct UserLinuxDoBindingRow {
+    linuxdo_user_id: i64,
+}
 
 async fn promote_first_admin(
     tx: &mut Transaction<'_, Sqlite>,
@@ -43,33 +103,50 @@ async fn promote_first_admin(
     Ok(updated.rows_affected() > 0)
 }
 
-async fn upsert_github_user(
+async fn load_existing_brief_preferences(
     tx: &mut Transaction<'_, Sqlite>,
-    user: &github::GitHubUser,
-    email: Option<&str>,
-    now: &str,
-    default_daily_brief_local_time: chrono::NaiveTime,
-    default_daily_brief_time_zone: &str,
-) -> Result<(), ApiError> {
-    #[derive(Debug, sqlx::FromRow)]
-    struct ExistingBriefPreferenceRow {
-        daily_brief_local_time: Option<String>,
-        daily_brief_time_zone: Option<String>,
-        daily_brief_utc_time: String,
-    }
-
-    let existing = sqlx::query_as::<_, ExistingBriefPreferenceRow>(
+    existing_user_id: Option<&str>,
+    github_user_id: i64,
+) -> Result<Option<ExistingBriefPreferenceRow>, ApiError> {
+    let query = if existing_user_id.is_some() {
+        r#"
+        SELECT daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#
+    } else {
         r#"
         SELECT daily_brief_local_time, daily_brief_time_zone, daily_brief_utc_time
         FROM users
         WHERE github_user_id = ?
         LIMIT 1
-        "#,
-    )
-    .bind(user.id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
+        "#
+    };
+
+    let mut db_query = sqlx::query_as::<_, ExistingBriefPreferenceRow>(query);
+    if let Some(user_id) = existing_user_id {
+        db_query = db_query.bind(user_id);
+    } else {
+        db_query = db_query.bind(github_user_id);
+    }
+
+    db_query
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(ApiError::internal)
+}
+
+async fn upsert_github_user_for_account(
+    tx: &mut Transaction<'_, Sqlite>,
+    existing_user_id: Option<&str>,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    now: &str,
+    default_daily_brief_local_time: chrono::NaiveTime,
+    default_daily_brief_time_zone: &str,
+) -> Result<String, ApiError> {
+    let existing = load_existing_brief_preferences(tx, existing_user_id, user.id).await?;
 
     let existing_local_time = existing
         .as_ref()
@@ -150,6 +227,46 @@ async fn upsert_github_user(
         }
     };
 
+    if let Some(user_id) = existing_user_id {
+        sqlx::query(
+            r#"
+            INSERT INTO users (
+              id, github_user_id, login, name, avatar_url, email,
+              created_at, updated_at, last_active_at,
+              daily_brief_utc_time, daily_brief_local_time, daily_brief_time_zone
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              github_user_id = excluded.github_user_id,
+              login = excluded.login,
+              name = excluded.name,
+              avatar_url = excluded.avatar_url,
+              email = excluded.email,
+              updated_at = excluded.updated_at,
+              last_active_at = excluded.last_active_at,
+              daily_brief_utc_time = excluded.daily_brief_utc_time,
+              daily_brief_local_time = excluded.daily_brief_local_time,
+              daily_brief_time_zone = excluded.daily_brief_time_zone
+            "#,
+        )
+        .bind(user_id)
+        .bind(user.id)
+        .bind(&user.login)
+        .bind(user.name.as_deref())
+        .bind(user.avatar_url.as_deref())
+        .bind(email)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(excluded_daily_brief_utc_time)
+        .bind(excluded_daily_brief_local_time)
+        .bind(excluded_daily_brief_time_zone)
+        .execute(&mut **tx)
+        .await
+        .map_err(ApiError::internal)?;
+        return Ok(user_id.to_owned());
+    }
+
     sqlx::query(
         r#"
         INSERT INTO users (
@@ -186,7 +303,479 @@ async fn upsert_github_user(
     .await
     .map_err(ApiError::internal)?;
 
+    let user_id = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM users
+        WHERE github_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user.id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(user_id)
+}
+
+#[cfg(test)]
+async fn upsert_github_user(
+    tx: &mut Transaction<'_, Sqlite>,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    now: &str,
+    default_daily_brief_local_time: chrono::NaiveTime,
+    default_daily_brief_time_zone: &str,
+) -> Result<(), ApiError> {
+    let _ = upsert_github_user_for_account(
+        tx,
+        None,
+        user,
+        email,
+        now,
+        default_daily_brief_local_time,
+        default_daily_brief_time_zone,
+    )
+    .await?;
     Ok(())
+}
+
+async fn load_github_connection_owner(
+    tx: &mut Transaction<'_, Sqlite>,
+    github_user_id: i64,
+) -> Result<Option<GitHubConnectionOwnerRow>, ApiError> {
+    sqlx::query_as::<_, GitHubConnectionOwnerRow>(
+        r#"
+        SELECT id, user_id
+        FROM github_connections
+        WHERE github_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(github_user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upsert_github_connection(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    access_token: &str,
+    scopes: &str,
+    now: &str,
+    encryption_key: &crate::crypto::EncryptionKey,
+) -> Result<(), ApiError> {
+    let owner = load_github_connection_owner(tx, user.id).await?;
+    if let Some(owner) = owner.as_ref()
+        && owner.user_id != user_id
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "github_already_bound",
+            "github account already bound to another user",
+        ));
+    }
+
+    let existing_id = owner.as_ref().map(|row| row.id.clone());
+
+    let EncryptedSecret { ciphertext, nonce } = encryption_key
+        .encrypt_str(access_token)
+        .map_err(ApiError::internal)?;
+    let connection_id = existing_id.unwrap_or_else(local_id::generate_local_id);
+
+    sqlx::query(
+        r#"
+        INSERT INTO github_connections (
+          id,
+          user_id,
+          github_user_id,
+          login,
+          name,
+          avatar_url,
+          email,
+          access_token_ciphertext,
+          access_token_nonce,
+          scopes,
+          linked_at,
+          updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          github_user_id = excluded.github_user_id,
+          login = excluded.login,
+          name = excluded.name,
+          avatar_url = excluded.avatar_url,
+          email = excluded.email,
+          access_token_ciphertext = excluded.access_token_ciphertext,
+          access_token_nonce = excluded.access_token_nonce,
+          scopes = excluded.scopes,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&connection_id)
+    .bind(user_id)
+    .bind(user.id)
+    .bind(&user.login)
+    .bind(user.name.as_deref())
+    .bind(user.avatar_url.as_deref())
+    .bind(email)
+    .bind(ciphertext)
+    .bind(nonce)
+    .bind(scopes)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(())
+}
+
+async fn load_auth_user_row(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+) -> Result<AuthUserRow, ApiError> {
+    sqlx::query_as::<_, AuthUserRow>(
+        r#"
+        SELECT id, is_admin, is_disabled
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)
+}
+
+fn settings_redirect(
+    config: &AppConfig,
+    section: &str,
+    github_status: Option<&str>,
+    linuxdo_status: Option<&str>,
+) -> String {
+    let mut url = config
+        .public_base_url
+        .join("settings")
+        .expect("settings route should join public base url");
+    {
+        let mut pairs = url.query_pairs_mut();
+        if section != "linuxdo" {
+            pairs.append_pair("section", section);
+        }
+        if let Some(status) = github_status {
+            pairs.append_pair("github", status);
+        }
+        if let Some(status) = linuxdo_status {
+            pairs.append_pair("linuxdo", status);
+        }
+    }
+    url.into()
+}
+
+fn bind_github_redirect(config: &AppConfig, linuxdo_status: Option<&str>) -> String {
+    let mut url = config
+        .public_base_url
+        .join("bind/github")
+        .expect("bind route should join public base url");
+    if let Some(status) = linuxdo_status {
+        url.query_pairs_mut().append_pair("linuxdo", status);
+    }
+    url.into()
+}
+
+async fn upsert_linuxdo_connection_record(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    pending: &PendingLinuxDoSession,
+    now: &str,
+) -> Result<(), ApiError> {
+    if let Some(owner) = sqlx::query_as::<_, LinuxDoOwnerRow>(
+        r#"
+        SELECT user_id
+        FROM linuxdo_connections
+        WHERE linuxdo_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(pending.linuxdo_user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?
+        && owner.user_id != user_id
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "linuxdo_already_bound",
+            "linuxdo account already bound to another user",
+        ));
+    }
+
+    if let Some(existing) = sqlx::query_as::<_, UserLinuxDoBindingRow>(
+        r#"
+        SELECT linuxdo_user_id
+        FROM linuxdo_connections
+        WHERE user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?
+        && existing.linuxdo_user_id != pending.linuxdo_user_id
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "linuxdo_account_conflict",
+            "account already bound to another linuxdo user",
+        ));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO linuxdo_connections (
+          user_id, linuxdo_user_id, username, name, avatar_url, trust_level,
+          active, silenced, linked_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          linuxdo_user_id = excluded.linuxdo_user_id,
+          username = excluded.username,
+          name = excluded.name,
+          avatar_url = excluded.avatar_url,
+          trust_level = excluded.trust_level,
+          active = excluded.active,
+          silenced = excluded.silenced,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(pending.linuxdo_user_id)
+    .bind(pending.username.as_str())
+    .bind(pending.name.as_deref())
+    .bind(pending.avatar_url.as_str())
+    .bind(pending.trust_level)
+    .bind(pending.active)
+    .bind(pending.silenced)
+    .bind(now)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(())
+}
+
+async fn finalize_github_auth(
+    state: &Arc<AppState>,
+    session: &Session,
+    user: &github::GitHubUser,
+    email: Option<&str>,
+    access_token: &str,
+    scopes: &str,
+    requested_mode: Option<String>,
+) -> Result<Redirect, ApiError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let default_daily_brief_local_time =
+        crate::briefs::default_daily_brief_local_time(&state.config);
+    let default_daily_brief_time_zone =
+        crate::briefs::default_daily_brief_time_zone(&state.config).to_owned();
+
+    let pending_linuxdo = session
+        .get::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
+        .await
+        .map_err(ApiError::internal)?;
+    let session_user_id = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .map_err(ApiError::internal)?;
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut login_user_after_commit: Option<String> = None;
+
+    let effective_mode = if requested_mode.as_deref() == Some(GITHUB_OAUTH_MODE_CONNECT)
+        || (session_user_id.is_some() && pending_linuxdo.is_none())
+    {
+        GITHUB_OAUTH_MODE_CONNECT
+    } else {
+        GITHUB_OAUTH_MODE_LOGIN
+    };
+
+    let redirect = match effective_mode {
+        GITHUB_OAUTH_MODE_CONNECT => {
+            let current_user_id = if let Some(user_id) = session_user_id.as_deref() {
+                user_id.to_owned()
+            } else {
+                let _ = tx.rollback().await;
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "github connect requires an authenticated user",
+                ));
+            };
+
+            let auth_user_row = load_auth_user_row(&mut tx, current_user_id.as_str()).await?;
+            if auth_user_row.is_disabled != 0 {
+                let _ = tx.rollback().await;
+                session.clear().await;
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "account_disabled",
+                    "account is disabled",
+                ));
+            }
+
+            let connection = upsert_github_connection(
+                &mut tx,
+                current_user_id.as_str(),
+                user,
+                email,
+                access_token,
+                scopes,
+                now.as_str(),
+                &state.encryption_key,
+            )
+            .await;
+
+            match connection {
+                Ok(()) => {
+                    settings_redirect(&state.config, "github-accounts", Some("connected"), None)
+                }
+                Err(err) if err.code() == "github_already_bound" => {
+                    let _ = tx.rollback().await;
+                    return Ok(Redirect::to(
+                        settings_redirect(
+                            &state.config,
+                            "github-accounts",
+                            Some("already_bound"),
+                            None,
+                        )
+                        .as_str(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            }
+        }
+        _ => {
+            let owner = load_github_connection_owner(&mut tx, user.id).await?;
+            let target_user_id = if let Some(owner) = owner.as_ref() {
+                owner.user_id.clone()
+            } else if let Some(existing_user_id) = session_user_id.as_deref() {
+                existing_user_id.to_owned()
+            } else {
+                upsert_github_user_for_account(
+                    &mut tx,
+                    None,
+                    user,
+                    email,
+                    now.as_str(),
+                    default_daily_brief_local_time,
+                    default_daily_brief_time_zone.as_str(),
+                )
+                .await?
+            };
+
+            let mut auth_user_row = load_auth_user_row(&mut tx, target_user_id.as_str()).await?;
+            if auth_user_row.is_admin == 0
+                && promote_first_admin(&mut tx, &auth_user_row.id, now.as_str()).await?
+            {
+                auth_user_row.is_admin = 1;
+            }
+            if auth_user_row.is_disabled != 0 {
+                let _ = tx.rollback().await;
+                session.clear().await;
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "account_disabled",
+                    "account is disabled",
+                ));
+            }
+
+            let connection = upsert_github_connection(
+                &mut tx,
+                target_user_id.as_str(),
+                user,
+                email,
+                access_token,
+                scopes,
+                now.as_str(),
+                &state.encryption_key,
+            )
+            .await;
+
+            match connection {
+                Ok(()) => {}
+                Err(err) if err.code() == "github_already_bound" => {
+                    let _ = tx.rollback().await;
+                    let redirect = if pending_linuxdo.is_some() {
+                        bind_github_redirect(&state.config, Some("github_already_bound"))
+                    } else {
+                        settings_redirect(
+                            &state.config,
+                            "github-accounts",
+                            Some("already_bound"),
+                            None,
+                        )
+                    };
+                    return Ok(Redirect::to(redirect.as_str()));
+                }
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            }
+
+            if let Some(pending_linuxdo) = pending_linuxdo.as_ref()
+                && let Err(err) = upsert_linuxdo_connection_record(
+                    &mut tx,
+                    target_user_id.as_str(),
+                    pending_linuxdo,
+                    now.as_str(),
+                )
+                .await
+            {
+                let _ = tx.rollback().await;
+                return Ok(Redirect::to(
+                    bind_github_redirect(&state.config, Some(err.code())).as_str(),
+                ));
+            }
+
+            login_user_after_commit = Some(target_user_id.clone());
+            if pending_linuxdo.is_some() {
+                settings_redirect(
+                    &state.config,
+                    "github-accounts",
+                    Some("connected"),
+                    Some("connected"),
+                )
+            } else {
+                state.config.public_base_url.to_string()
+            }
+        }
+    };
+
+    tx.commit().await.map_err(ApiError::internal)?;
+    if let Some(user_id) = login_user_after_commit {
+        session
+            .insert(SESSION_KEY_USER_ID, user_id)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    let _ = session
+        .remove::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
+        .await;
+
+    info!(login = %user.login, github_user_id = user.id, "github auth ok");
+    Ok(Redirect::to(redirect.as_str()))
 }
 
 pub async fn github_login(
@@ -204,6 +793,37 @@ pub async fn github_login(
 
     session
         .insert(SESSION_KEY_OAUTH_STATE, csrf_token.secret())
+        .await
+        .map_err(ApiError::internal)?;
+    session
+        .insert(SESSION_KEY_GITHUB_OAUTH_MODE, GITHUB_OAUTH_MODE_LOGIN)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Redirect::to(auth_url.as_str()))
+}
+
+pub async fn github_connect(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<impl IntoResponse, ApiError> {
+    let _ = require_active_user_id(state.as_ref(), &session).await?;
+
+    let (auth_url, csrf_token) = state
+        .github_oauth
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("read:user".to_owned()))
+        .add_scope(Scope::new("user:email".to_owned()))
+        .add_scope(Scope::new("notifications".to_owned()))
+        .add_scope(Scope::new("public_repo".to_owned()))
+        .url();
+
+    session
+        .insert(SESSION_KEY_OAUTH_STATE, csrf_token.secret())
+        .await
+        .map_err(ApiError::internal)?;
+    session
+        .insert(SESSION_KEY_GITHUB_OAUTH_MODE, GITHUB_OAUTH_MODE_CONNECT)
         .await
         .map_err(ApiError::internal)?;
 
@@ -230,10 +850,17 @@ pub async fn github_callback(
         return Err(ApiError::bad_request("invalid oauth state"));
     }
 
+    let requested_mode = session
+        .get::<String>(SESSION_KEY_GITHUB_OAUTH_MODE)
+        .await
+        .map_err(ApiError::internal)?;
     session
         .remove::<String>(SESSION_KEY_OAUTH_STATE)
         .await
         .map_err(ApiError::internal)?;
+    let _ = session
+        .remove::<String>(SESSION_KEY_GITHUB_OAUTH_MODE)
+        .await;
 
     let token = state
         .github_oauth
@@ -268,95 +895,16 @@ pub async fn github_callback(
             .flatten()
     };
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let default_daily_brief_local_time =
-        crate::briefs::default_daily_brief_local_time(&state.config);
-    let default_daily_brief_time_zone =
-        crate::briefs::default_daily_brief_time_zone(&state.config).to_owned();
-    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
-
-    upsert_github_user(
-        &mut tx,
+    finalize_github_auth(
+        &state,
+        &session,
         &user,
         email.as_deref(),
-        now.as_str(),
-        default_daily_brief_local_time,
-        default_daily_brief_time_zone.as_str(),
+        access_token.as_str(),
+        scopes.as_str(),
+        requested_mode,
     )
-    .await?;
-
-    #[derive(Debug, sqlx::FromRow)]
-    struct AuthUserRow {
-        id: String,
-        is_admin: i64,
-        is_disabled: i64,
-    }
-
-    let mut auth_user_row = sqlx::query_as::<_, AuthUserRow>(
-        r#"
-        SELECT id, is_admin, is_disabled
-        FROM users
-        WHERE github_user_id = ?
-        "#,
-    )
-    .bind(user.id)
-    .fetch_one(&mut *tx)
     .await
-    .map_err(ApiError::internal)?;
-
-    if auth_user_row.is_admin == 0
-        && promote_first_admin(&mut tx, &auth_user_row.id, now.as_str()).await?
-    {
-        auth_user_row.is_admin = 1;
-    }
-
-    if auth_user_row.is_disabled != 0 {
-        let _ = tx.rollback().await;
-        session.clear().await;
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "account_disabled",
-            "account is disabled",
-        ));
-    }
-
-    let internal_user_id = auth_user_row.id.clone();
-
-    let EncryptedSecret { ciphertext, nonce } = state
-        .encryption_key
-        .encrypt_str(&access_token)
-        .map_err(ApiError::internal)?;
-
-    sqlx::query(
-        r#"
-        INSERT INTO user_tokens (user_id, access_token_ciphertext, access_token_nonce, scopes, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          access_token_ciphertext = excluded.access_token_ciphertext,
-          access_token_nonce = excluded.access_token_nonce,
-          scopes = excluded.scopes,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(internal_user_id.as_str())
-    .bind(ciphertext)
-    .bind(nonce)
-    .bind(&scopes)
-    .bind(&now)
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::internal)?;
-
-    tx.commit().await.map_err(ApiError::internal)?;
-
-    session
-        .insert(SESSION_KEY_USER_ID, internal_user_id.clone())
-        .await
-        .map_err(ApiError::internal)?;
-
-    info!(user_id = internal_user_id, github_user_id = user.id, login = %user.login, "login ok");
-
-    Ok(Redirect::to(state.config.public_base_url.as_str()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,93 +913,10 @@ pub struct LinuxDoCallbackQuery {
     pub state: String,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct LinuxDoOwnerRow {
-    user_id: String,
-}
-
-fn settings_redirect(config: &AppConfig, status: Option<&str>) -> String {
-    let mut url = config
-        .public_base_url
-        .join("settings")
-        .expect("settings route should join public base url");
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("section", "linuxdo");
-        if let Some(status) = status {
-            pairs.append_pair("linuxdo", status);
-        }
-    }
-    url.into()
-}
-
-async fn upsert_linuxdo_connection(
-    state: &AppState,
-    user_id: &str,
-    user: &linuxdo::LinuxDoUser,
-) -> Result<(), ApiError> {
-    if let Some(owner) = sqlx::query_as::<_, LinuxDoOwnerRow>(
-        r#"
-        SELECT user_id
-        FROM linuxdo_connections
-        WHERE linuxdo_user_id = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::internal)?
-        && owner.user_id != user_id
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "linuxdo_already_bound",
-            "linuxdo account already bound to another user",
-        ));
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO linuxdo_connections (
-          user_id, linuxdo_user_id, username, name, avatar_url, trust_level,
-          active, silenced, linked_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-          linuxdo_user_id = excluded.linuxdo_user_id,
-          username = excluded.username,
-          name = excluded.name,
-          avatar_url = excluded.avatar_url,
-          trust_level = excluded.trust_level,
-          active = excluded.active,
-          silenced = excluded.silenced,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(user_id)
-    .bind(user.id)
-    .bind(user.username.as_str())
-    .bind(linuxdo::normalize_display_name(user.name.as_deref()))
-    .bind(linuxdo::resolve_avatar_url(&user.avatar_template, 96))
-    .bind(user.trust_level)
-    .bind(user.active)
-    .bind(user.silenced)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
-
-    Ok(())
-}
-
 pub async fn linuxdo_login(
     State(state): State<Arc<AppState>>,
     session: Session,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = require_active_user_id(state.as_ref(), &session).await?;
     let Some(client) = state.linuxdo_oauth.as_ref() else {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -478,11 +943,17 @@ pub async fn linuxdo_callback(
     session: Session,
     Query(query): Query<LinuxDoCallbackQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let session_user_id = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .map_err(ApiError::internal)?;
     let Some(client) = state.linuxdo_oauth.as_ref() else {
-        return Ok(Redirect::to(
-            settings_redirect(&state.config, Some("not_configured")).as_str(),
-        ));
+        let redirect = if session_user_id.is_some() {
+            settings_redirect(&state.config, "linuxdo", None, Some("not_configured"))
+        } else {
+            bind_github_redirect(&state.config, Some("not_configured"))
+        };
+        return Ok(Redirect::to(redirect.as_str()));
     };
 
     let expected_state = session
@@ -493,9 +964,12 @@ pub async fn linuxdo_callback(
         .remove::<String>(SESSION_KEY_LINUXDO_OAUTH_STATE)
         .await;
     if expected_state.as_deref() != Some(query.state.as_str()) {
-        return Ok(Redirect::to(
-            settings_redirect(&state.config, Some("state_mismatch")).as_str(),
-        ));
+        let redirect = if session_user_id.is_some() {
+            settings_redirect(&state.config, "linuxdo", None, Some("state_mismatch"))
+        } else {
+            bind_github_redirect(&state.config, Some("state_mismatch"))
+        };
+        return Ok(Redirect::to(redirect.as_str()));
     }
 
     let token = match client
@@ -506,9 +980,12 @@ pub async fn linuxdo_callback(
         Ok(token) => token,
         Err(err) => {
             tracing::warn!(error = %err, "linuxdo oauth token exchange failed");
-            return Ok(Redirect::to(
-                settings_redirect(&state.config, Some("exchange_failed")).as_str(),
-            ));
+            let redirect = if session_user_id.is_some() {
+                settings_redirect(&state.config, "linuxdo", None, Some("exchange_failed"))
+            } else {
+                bind_github_redirect(&state.config, Some("exchange_failed"))
+            };
+            return Ok(Redirect::to(redirect.as_str()));
         }
     };
 
@@ -517,26 +994,82 @@ pub async fn linuxdo_callback(
         Ok(user) => user,
         Err(err) => {
             tracing::warn!(error = %err, "failed to fetch linuxdo user");
-            return Ok(Redirect::to(
-                settings_redirect(&state.config, Some("fetch_user_failed")).as_str(),
-            ));
+            let redirect = if session_user_id.is_some() {
+                settings_redirect(&state.config, "linuxdo", None, Some("fetch_user_failed"))
+            } else {
+                bind_github_redirect(&state.config, Some("fetch_user_failed"))
+            };
+            return Ok(Redirect::to(redirect.as_str()));
         }
     };
 
-    match upsert_linuxdo_connection(state.as_ref(), &user_id, &linuxdo_user).await {
-        Ok(()) => Ok(Redirect::to(
-            settings_redirect(&state.config, Some("connected")).as_str(),
-        )),
-        Err(err) if err.code() == "linuxdo_already_bound" => Ok(Redirect::to(
-            settings_redirect(&state.config, Some("already_bound")).as_str(),
-        )),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to persist linuxdo binding");
-            Ok(Redirect::to(
-                settings_redirect(&state.config, Some("save_failed")).as_str(),
-            ))
+    let pending = PendingLinuxDoSession::from_linuxdo_user(&linuxdo_user);
+
+    if let Some(owner) = sqlx::query_as::<_, LinuxDoOwnerRow>(
+        r#"
+        SELECT user_id
+        FROM linuxdo_connections
+        WHERE linuxdo_user_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(pending.linuxdo_user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    {
+        session
+            .insert(SESSION_KEY_USER_ID, owner.user_id)
+            .await
+            .map_err(ApiError::internal)?;
+        let _ = session
+            .remove::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
+            .await;
+        return Ok(Redirect::to(state.config.public_base_url.as_str()));
+    }
+
+    if let Some(user_id) = session_user_id {
+        let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+        let auth_user_row = load_auth_user_row(&mut tx, user_id.as_str()).await?;
+        if auth_user_row.is_disabled != 0 {
+            let _ = tx.rollback().await;
+            session.clear().await;
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "account_disabled",
+                "account is disabled",
+            ));
+        }
+        match upsert_linuxdo_connection_record(
+            &mut tx,
+            user_id.as_str(),
+            &pending,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        {
+            Ok(()) => {
+                tx.commit().await.map_err(ApiError::internal)?;
+                return Ok(Redirect::to(
+                    settings_redirect(&state.config, "linuxdo", None, Some("connected")).as_str(),
+                ));
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Ok(Redirect::to(
+                    settings_redirect(&state.config, "linuxdo", None, Some(err.code())).as_str(),
+                ));
+            }
         }
     }
+
+    session
+        .insert(SESSION_KEY_PENDING_LINUXDO, pending)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Redirect::to(
+        bind_github_redirect(&state.config, None).as_str(),
+    ))
 }
 
 pub async fn logout(
@@ -585,7 +1118,7 @@ mod tests {
             INSERT INTO users (id, github_user_id, login, is_admin, is_disabled, created_at, updated_at)
             VALUES
               ('user-first-id', 101, 'first', 0, 0, '2026-02-25T10:00:00Z', '2026-02-25T10:00:00Z'),
-              (2, 102, 'second', 0, 0, '2026-02-25T11:00:00Z', '2026-02-25T11:00:00Z')
+              ('user-second-id', 102, 'second', 0, 0, '2026-02-25T11:00:00Z', '2026-02-25T11:00:00Z')
             "#,
         )
         .execute(&pool)

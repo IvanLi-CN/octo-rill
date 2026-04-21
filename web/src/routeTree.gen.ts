@@ -13,6 +13,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as AdminRouteRouteImport } from './routes/admin/route'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
+import { Route as BindGithubRouteImport } from './routes/bind/github'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as AdminJobsIndexRouteImport } from './routes/admin/jobs/index'
@@ -43,6 +44,11 @@ const AdminIndexRoute = AdminIndexRouteImport.update({
   path: '/',
   getParentRoute: () => AdminRouteRoute,
 } as any).lazy(() => import('./routes/admin/index.lazy').then((d) => d.Route))
+const BindGithubRoute = BindGithubRouteImport.update({
+  id: '/bind/github',
+  path: '/bind/github',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/bind/github.lazy').then((d) => d.Route))
 const AdminUsersRoute = AdminUsersRouteImport.update({
   id: '/users',
   path: '/users',
@@ -112,6 +118,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/users': typeof AdminUsersRoute
+  '/bind/github': typeof BindGithubRoute
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -125,6 +132,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/settings': typeof SettingsRoute
   '/admin/users': typeof AdminUsersRoute
+  '/bind/github': typeof BindGithubRoute
   '/admin': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -140,6 +148,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/users': typeof AdminUsersRoute
+  '/bind/github': typeof BindGithubRoute
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
@@ -157,6 +166,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/admin/jobs'
     | '/admin/users'
+    | '/bind/github'
     | '/admin/'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -170,6 +180,7 @@ export interface FileRouteTypes {
     | '/'
     | '/settings'
     | '/admin/users'
+    | '/bind/github'
     | '/admin'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -184,6 +195,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/admin/jobs'
     | '/admin/users'
+    | '/bind/github'
     | '/admin/'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
@@ -198,6 +210,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRouteRoute: typeof AdminRouteRouteWithChildren
   SettingsRoute: typeof SettingsRoute
+  BindGithubRoute: typeof BindGithubRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -229,6 +242,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/admin/'
       preLoaderRoute: typeof AdminIndexRouteImport
       parentRoute: typeof AdminRouteRoute
+    }
+    '/bind/github': {
+      id: '/bind/github'
+      path: '/bind/github'
+      fullPath: '/bind/github'
+      preLoaderRoute: typeof BindGithubRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/admin/users': {
       id: '/admin/users'
@@ -352,6 +372,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRouteRoute: AdminRouteRouteWithChildren,
   SettingsRoute: SettingsRoute,
+  BindGithubRoute: BindGithubRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
