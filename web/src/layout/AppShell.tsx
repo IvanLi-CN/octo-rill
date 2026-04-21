@@ -24,6 +24,8 @@ type AppShellChromeState = {
 	footerHidden: boolean;
 	atTop: boolean;
 	headerHeight: number;
+	viewportTopInset: number;
+	viewportBottomInset: number;
 	scrollDirection: AppShellScrollDirection;
 };
 
@@ -37,6 +39,8 @@ const DEFAULT_CHROME_STATE: AppShellChromeState = {
 	footerHidden: false,
 	atTop: true,
 	headerHeight: 0,
+	viewportTopInset: 0,
+	viewportBottomInset: 0,
 	scrollDirection: "idle",
 };
 
@@ -210,6 +214,8 @@ export function AppShell({
 		useState(false);
 	const [headerHeight, setHeaderHeight] = useState(0);
 	const [viewportHeight, setViewportHeight] = useState<number | null>(null);
+	const [viewportTopInset, setViewportTopInset] = useState(0);
+	const [viewportBottomInset, setViewportBottomInset] = useState(0);
 	const [viewportHeightSource, setViewportHeightSource] = useState<
 		"css-fallback" | "visual-viewport" | "window-inner-height"
 	>("css-fallback");
@@ -235,6 +241,8 @@ export function AppShell({
 	useEffect(() => {
 		if (!mobileChrome || typeof window === "undefined") {
 			setViewportHeight(null);
+			setViewportTopInset(0);
+			setViewportBottomInset(0);
 			setViewportHeightSource("css-fallback");
 			return;
 		}
@@ -245,6 +253,21 @@ export function AppShell({
 				visualViewport && visualViewport.height > 0
 					? Math.round(visualViewport.height)
 					: Math.round(window.innerHeight);
+			const nextTopInset =
+				visualViewport && visualViewport.offsetTop > 0
+					? Math.max(0, Math.round(visualViewport.offsetTop))
+					: 0;
+			const nextBottomInset =
+				visualViewport && visualViewport.height > 0
+					? Math.max(
+							0,
+							Math.round(
+								window.innerHeight -
+									visualViewport.height -
+									visualViewport.offsetTop,
+							),
+						)
+					: 0;
 			const keyboardLikelyVisible =
 				visualViewport &&
 				visualViewport.height > 0 &&
@@ -256,8 +279,20 @@ export function AppShell({
 				keyboardLikelyVisible && keyboardModalTarget
 					? Math.round(window.innerHeight)
 					: nextHeight;
+			const appliedViewportTopInset =
+				keyboardLikelyVisible && keyboardModalTarget ? 0 : nextTopInset;
+			const appliedViewportBottomInset =
+				keyboardLikelyVisible && keyboardModalTarget ? 0 : nextBottomInset;
 			setViewportHeight((current) =>
 				current === appliedViewportHeight ? current : appliedViewportHeight,
+			);
+			setViewportTopInset((current) =>
+				current === appliedViewportTopInset ? current : appliedViewportTopInset,
+			);
+			setViewportBottomInset((current) =>
+				current === appliedViewportBottomInset
+					? current
+					: appliedViewportBottomInset,
 			);
 			setViewportHeightSource(
 				!(keyboardLikelyVisible && keyboardModalTarget) &&
@@ -1077,6 +1112,8 @@ export function AppShell({
 			footerHidden,
 			atTop,
 			headerHeight,
+			viewportTopInset,
+			viewportBottomInset,
 			scrollDirection,
 		}),
 		[
@@ -1089,6 +1126,8 @@ export function AppShell({
 			isMobileViewport,
 			mobileCompactHeader,
 			mobileChrome,
+			viewportBottomInset,
+			viewportTopInset,
 			scrollDirection,
 		],
 	);
@@ -1105,10 +1144,14 @@ export function AppShell({
 				data-app-shell-viewport-height={
 					viewportHeight !== null ? String(viewportHeight) : "fallback"
 				}
+				data-app-shell-viewport-top-inset={String(viewportTopInset)}
+				data-app-shell-viewport-bottom-inset={String(viewportBottomInset)}
 				data-app-shell-viewport-height-source={viewportHeightSource}
 				style={
 					{
 						"--app-shell-header-height": `${headerHeight}px`,
+						"--app-shell-viewport-top-inset": `${viewportTopInset}px`,
+						"--app-shell-viewport-bottom-inset": `${viewportBottomInset}px`,
 						minHeight:
 							viewportHeight !== null ? `${viewportHeight}px` : undefined,
 					} as React.CSSProperties
@@ -1119,6 +1162,13 @@ export function AppShell({
 						ref={headerRef}
 						className="supports-[backdrop-filter]:bg-background/70 bg-background/90 sticky top-0 z-20 border-b backdrop-blur motion-safe:transition-[background-color,border-color,box-shadow] motion-safe:duration-200 motion-safe:ease-out"
 						data-app-shell-header="true"
+						style={
+							mobileChrome
+								? {
+										top: "var(--app-shell-viewport-top-inset, 0px)",
+									}
+								: undefined
+						}
 					>
 						<div
 							className={cn(
@@ -1139,7 +1189,7 @@ export function AppShell({
 						)}
 						style={{
 							top: mobileChrome
-								? "var(--app-shell-header-height, 0px)"
+								? "calc(var(--app-shell-viewport-top-inset, 0px) + var(--app-shell-header-height, 0px))"
 								: undefined,
 						}}
 					>
