@@ -141,7 +141,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("failed to bind TCP listener")?;
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
-    let session_cookie_name = build_session_cookie_name(&config);
+    let session_cookie_name = build_session_cookie_name();
     let session_layer = SessionManagerLayer::new(session_store)
         .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
@@ -664,26 +664,8 @@ fn accepts_html_document(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("text/html") || value.contains("application/xhtml+xml"))
 }
 
-fn build_session_cookie_name(config: &AppConfig) -> String {
-    if let Some(session_cookie_name) = config.session_cookie_name.as_ref() {
-        return session_cookie_name.clone();
-    }
-
-    let host = config.public_base_url.host_str().unwrap_or("localhost");
-    let port = config
-        .public_base_url
-        .port_or_known_default()
-        .unwrap_or(config.bind_addr.port());
-    let raw = format!("octo_rill_sid_{host}_{port}");
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
+fn build_session_cookie_name() -> String {
+    "octo_rill_sid".to_owned()
 }
 
 fn session_inactivity_expiry() -> Expiry {
@@ -693,11 +675,11 @@ fn session_inactivity_expiry() -> Expiry {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite,
-        accepts_html_document, api_health, api_version, apply_no_store_headers,
-        attach_static_site_routes, build_session_cookie_name, build_sqlite_connect_options,
-        build_sqlite_pool_options, looks_like_static_asset_path, read_sqlite_runtime_pragmas,
-        session_inactivity_expiry, should_serve_spa_shell,
+        SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite, accepts_html_document,
+        api_health, api_version, apply_no_store_headers, attach_static_site_routes,
+        build_session_cookie_name, build_sqlite_connect_options, build_sqlite_pool_options,
+        looks_like_static_asset_path, read_sqlite_runtime_pragmas, session_inactivity_expiry,
+        should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -797,34 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_name_can_be_overridden_by_config() {
-        let config = AppConfig {
-            bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
-            public_base_url: url::Url::parse("https://octo-rill.ivanli.cc")
-                .expect("parse public base url"),
-            session_cookie_name: Some("octo_rill_sid_prod".to_owned()),
-            database_url: "sqlite::memory:".to_owned(),
-            static_dir: None,
-            task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
-            job_worker_concurrency: 1,
-            encryption_key: crate::crypto::EncryptionKey::from_base64(
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            )
-            .expect("build encryption key"),
-            github: crate::config::GitHubOAuthConfig {
-                client_id: "test-client-id".to_owned(),
-                client_secret: "test-client-secret".to_owned(),
-                redirect_url: url::Url::parse("https://octo-rill.ivanli.cc/auth/github/callback")
-                    .expect("parse redirect url"),
-            },
-            linuxdo: None,
-            ai: None,
-            ai_max_concurrency: 1,
-            ai_daily_at_local: None,
-            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
-        };
-
-        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid_prod");
+    fn session_cookie_name_is_fixed() {
+        assert_eq!(build_session_cookie_name(), "octo_rill_sid");
     }
 
     #[tokio::test]
