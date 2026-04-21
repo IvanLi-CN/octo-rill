@@ -501,8 +501,8 @@ function DesktopReplica({
 				style={{ borderColor: ui.border, backgroundColor: ui.surface }}
 			>
 				<div className="flex items-center gap-4 text-[15px] font-semibold">
-					<button
-						type="button"
+					<span
+						aria-hidden="true"
 						className="inline-flex size-10 items-center justify-center rounded-md border"
 						style={{
 							borderColor: ui.border,
@@ -510,7 +510,7 @@ function DesktopReplica({
 						}}
 					>
 						<Menu className="size-5" />
-					</button>
+					</span>
 					<Github className="size-8" />
 					<div className="flex items-center gap-3 text-[16px]">
 						<span>Settings</span>
