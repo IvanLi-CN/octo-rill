@@ -205,7 +205,9 @@ function topChrome(ui: ReplicaTheme) {
 }
 
 function ReferenceLink(props: AnchorHTMLAttributes<HTMLAnchorElement>) {
-	return <a {...props} rel="noreferrer noopener" target="_blank" />;
+	return (
+		<a {...props} rel="noreferrer noopener" tabIndex={-1} target="_blank" />
+	);
 }
 
 function ReplicaCheckbox({
@@ -328,6 +330,7 @@ function PatForm({
 						readOnly
 						id={noteInputId}
 						aria-label="Note"
+						tabIndex={-1}
 						value="OctoRill release feedback"
 						className="mt-3 block h-11 w-full rounded-md border bg-transparent px-3 text-[16px] outline-none"
 						style={{
@@ -346,6 +349,7 @@ function PatForm({
 					<button
 						type="button"
 						aria-haspopup="menu"
+						tabIndex={-1}
 						className="mt-3 inline-flex h-11 items-center gap-3 rounded-md border px-3 text-[16px]"
 						style={{
 							backgroundColor: ui.subtleSurface,
@@ -394,6 +398,7 @@ function PatForm({
 				<div className="mt-8 flex items-center gap-4">
 					<button
 						type="button"
+						tabIndex={-1}
 						className="rounded-md px-4 py-2 text-[15px] font-semibold"
 						style={{ backgroundColor: ui.button, color: ui.buttonText }}
 					>
