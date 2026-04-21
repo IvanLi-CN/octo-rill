@@ -1,3 +1,5 @@
+import type { AnchorHTMLAttributes } from "react";
+
 import {
 	CalendarDays,
 	Check,
@@ -45,6 +47,8 @@ type ScopeItem = {
 type GitHubPatGuideCardProps = {
 	compact?: boolean;
 };
+
+type ReplicaKind = "desktop" | "mobile";
 
 const desktopRows: ScopeItem[] = [
 	{
@@ -200,6 +204,10 @@ function topChrome(ui: ReplicaTheme) {
 	);
 }
 
+function ReferenceLink(props: AnchorHTMLAttributes<HTMLAnchorElement>) {
+	return <a {...props} rel="noreferrer noopener" target="_blank" />;
+}
+
 function ReplicaCheckbox({
 	checked,
 	disabled,
@@ -258,13 +266,16 @@ function PatForm({
 	mobile,
 	ui,
 	compact,
+	replicaKind,
 }: {
 	mobile?: boolean;
 	ui: ReplicaTheme;
 	compact?: boolean;
+	replicaKind: ReplicaKind;
 }) {
 	const rows = mobile ? mobileRows : desktopRows;
 	const showCompactIntro = compact && mobile;
+	const noteInputId = `github-pat-note-${replicaKind}`;
 	return (
 		<div
 			className={cn(
@@ -296,26 +307,26 @@ function PatForm({
 						Personal access tokens (classic) function like ordinary OAuth access
 						tokens. They can be used instead of a password for Git over HTTPS,
 						or can be used to{" "}
-						<a
+						<ReferenceLink
 							href="https://docs.github.com/v3/auth/#basic-authentication"
 							style={{ color: ui.link }}
 						>
 							authenticate to the API over Basic Authentication
-						</a>
+						</ReferenceLink>
 						.
 					</p>
 				)}
 
 				<div className="mt-8">
 					<label
-						htmlFor="github-pat-note"
+						htmlFor={noteInputId}
 						className="block text-[16px] font-semibold"
 					>
 						Note
 					</label>
 					<input
 						readOnly
-						id="github-pat-note"
+						id={noteInputId}
 						aria-label="Note"
 						value="OctoRill release feedback"
 						className="mt-3 block h-11 w-full rounded-md border bg-transparent px-3 text-[16px] outline-none"
@@ -348,12 +359,12 @@ function PatForm({
 					<p className="mt-3 text-[14px] leading-6" style={{ color: ui.muted }}>
 						GitHub strongly recommends that you set an expiration date for your
 						token to help keep your information secure.{" "}
-						<a
+						<ReferenceLink
 							href="https://github.blog/changelog/2021-07-26-expiration-options-for-personal-access-tokens/"
 							style={{ color: ui.link }}
 						>
 							Learn more
-						</a>
+						</ReferenceLink>
 					</p>
 				</div>
 
@@ -361,12 +372,12 @@ function PatForm({
 					<div className="text-[16px] font-semibold">Select scopes</div>
 					<p className="mt-3 text-[16px] leading-7">
 						Scopes define the access for personal tokens.{" "}
-						<a
+						<ReferenceLink
 							href="https://docs.github.com/apps/building-oauth-apps/scopes-for-oauth-apps/"
 							style={{ color: ui.link }}
 						>
 							Read more about OAuth scopes.
-						</a>
+						</ReferenceLink>
 					</p>
 					<div
 						className="mt-4 overflow-hidden rounded-md border"
@@ -388,12 +399,12 @@ function PatForm({
 					>
 						Generate token
 					</button>
-					<a
+					<ReferenceLink
 						href="https://github.com/settings/tokens"
 						style={{ color: ui.link }}
 					>
 						Cancel
-					</a>
+					</ReferenceLink>
 				</div>
 			</div>
 		</div>
@@ -406,17 +417,20 @@ function DesktopSidebar({ ui }: { ui: ReplicaTheme }) {
 	return (
 		<aside className="border-r px-4 py-6" style={{ borderColor: ui.border }}>
 			<nav className="space-y-2">
-				<a className={navItemClass} href="https://github.com/settings/apps">
+				<ReferenceLink
+					className={navItemClass}
+					href="https://github.com/settings/apps"
+				>
 					<Grid2x2 className="size-4" />
 					<span>GitHub Apps</span>
-				</a>
-				<a
+				</ReferenceLink>
+				<ReferenceLink
 					className={navItemClass}
 					href="https://github.com/settings/developers"
 				>
 					<UserRound className="size-4" />
 					<span>OAuth Apps</span>
-				</a>
+				</ReferenceLink>
 				<div className="space-y-1">
 					<div className={cn(navItemClass, "justify-between")}>
 						<div className="flex items-center gap-3">
@@ -429,7 +443,7 @@ function DesktopSidebar({ ui }: { ui: ReplicaTheme }) {
 						className="ml-7 space-y-1 border-l pl-4"
 						style={{ borderColor: ui.border }}
 					>
-						<a
+						<ReferenceLink
 							className={cn(
 								navItemClass,
 								"px-2 py-1.5 text-[14px] font-normal",
@@ -437,7 +451,7 @@ function DesktopSidebar({ ui }: { ui: ReplicaTheme }) {
 							href="https://github.com/settings/personal-access-tokens"
 						>
 							Fine-grained tokens
-						</a>
+						</ReferenceLink>
 						<div
 							className="relative rounded-md px-2 py-2 text-[14px] font-medium"
 							style={{ backgroundColor: ui.subtleSurface }}
@@ -500,7 +514,7 @@ function DesktopReplica({
 			</header>
 			<div className="grid min-h-[860px] grid-cols-[280px_minmax(0,1fr)]">
 				<DesktopSidebar ui={ui} />
-				<PatForm ui={ui} compact={compact} />
+				<PatForm ui={ui} compact={compact} replicaKind="desktop" />
 			</div>
 		</div>
 	);
@@ -570,14 +584,20 @@ function MobileReplica({
 			</header>
 			<div className="border-b px-4 py-5" style={{ borderColor: ui.border }}>
 				<nav className="space-y-4 text-[14px]">
-					<div className="flex items-center gap-2">
+					<ReferenceLink
+						className="flex items-center gap-2"
+						href="https://github.com/settings/apps"
+					>
 						<Grid2x2 className="size-4" />
 						<span>GitHub Apps</span>
-					</div>
-					<div className="flex items-center gap-2">
+					</ReferenceLink>
+					<ReferenceLink
+						className="flex items-center gap-2"
+						href="https://github.com/settings/developers"
+					>
 						<UserRound className="size-4" />
 						<span>OAuth Apps</span>
-					</div>
+					</ReferenceLink>
 					<div>
 						<div className="flex items-center justify-between font-medium">
 							<div className="flex items-center gap-2">
@@ -607,7 +627,7 @@ function MobileReplica({
 					</div>
 				</nav>
 			</div>
-			<PatForm mobile ui={ui} compact={compact} />
+			<PatForm mobile ui={ui} compact={compact} replicaKind="mobile" />
 		</div>
 	);
 }
