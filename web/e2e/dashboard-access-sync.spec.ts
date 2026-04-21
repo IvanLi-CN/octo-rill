@@ -350,7 +350,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 		secondaryControls.getByRole("button", { name: "翻译" }),
 	).toBeVisible();
 	await expect(
-		secondaryControls.getByRole("button", { name: "智能" }),
+		secondaryControls.getByRole("button", { name: "润色" }),
 	).toBeVisible();
 	await expect(
 		secondaryControls.getByRole("link", { name: "管理员面板" }),
@@ -543,7 +543,7 @@ test.describe("mobile dashboard shell", () => {
 								lang: "zh-CN",
 								status: "ready",
 								title: "v2.63.0 · 版本变化",
-								summary: "- 自动整理版本变化摘要",
+								summary: "- 自动润色版本变化要点",
 							},
 							reactions: buildReactionFooterReady(),
 						}),

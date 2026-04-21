@@ -222,7 +222,7 @@ async function verifyMouseDrag(page) {
 async function verifyMouseDragFromInteractiveControl(page) {
 	await openStory(page);
 	const laneMenuTrigger = page.getByRole("button", {
-		name: "当前阅读模式：智能",
+		name: "当前阅读模式：润色",
 	});
 	const center = await getLocatorCenter(laneMenuTrigger);
 

@@ -65,7 +65,7 @@
 ### MUST
 
 - `全部` tab 必须混排 `release`、`repo_star_received`、`follower_received` 三类记录。
-- `发布` tab 必须继续只展示 release cards，保留原文 / 翻译 / 智能 lane 与 reactions。
+- `发布` tab 必须继续只展示 release cards，保留原文 / 翻译 / 润色 lane 与 reactions。
 - `加星` tab 必须只展示 `repo_star_received` 记录；`关注` tab 必须只展示 `follower_received` 记录。
 - 社交记录卡片必须展示对方头像、login 与单个 GitHub CTA。
 - `repo_star_received` 记录必须展示目标仓库名。
@@ -152,7 +152,7 @@
 
 - Given Dashboard `发布` tab
   When 页面渲染完成
-  Then 只显示 release cards，且仍支持原文 / 翻译 / 智能 lane 与 reactions。
+  Then 只显示 release cards，且仍支持原文 / 翻译 / 润色 lane 与 reactions。
 
 - Given Dashboard `全部` tab 某日既有 release 又有社交记录
   When 页面渲染完成

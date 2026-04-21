@@ -266,11 +266,11 @@ function makeFeedSmartPayload(
 		kind: "release_smart",
 		variant: "feed_card",
 		status,
-		title_zh: status === "ready" ? `智能摘要 ${releaseId}` : null,
+		title_zh: status === "ready" ? `润色 ${releaseId}` : null,
 		summary_md: null,
 		body_md:
 			status === "ready"
-				? `- 智能总结 release ${releaseId} 的主要版本变化。\n- 方便快速理解这次发布的重点。`
+				? `- 润色 release ${releaseId} 的主要版本变化。\n- 方便快速理解这次发布的重点。`
 				: null,
 		error:
 			status === "error"
@@ -437,7 +437,7 @@ async function installApiMocks(
 							smart: {
 								lang: "zh-CN",
 								status: "ready",
-								title: "智能摘要 123",
+								title: "润色 123",
 								summary:
 									"- 这一版主要聚焦 feed 卡片体验与版本阅读效率。\n- 同步补齐反馈按钮与浏览器端交互状态。",
 							},
@@ -685,10 +685,10 @@ async function installApiMocks(
 										status: isPendingReleaseDetail ? "running" : "ready",
 										title_zh: isPendingReleaseDetail
 											? null
-											: `智能摘要 ${cfg.releaseId}`,
+											: `润色 ${cfg.releaseId}`,
 										body_md: isPendingReleaseDetail
 											? null
-											: `- 智能总结 ${cfg.releaseId} 的版本变化。\n- 方便主人快速读懂 release。`,
+											: `- 润色 ${cfg.releaseId} 的版本变化。\n- 方便主人快速读懂 release。`,
 									}
 								: {
 										producer_ref:
@@ -1222,11 +1222,9 @@ test("feed smart lane auto generates for visible cards by default", async ({
 				request.entityIds.includes(makeAutoTranslateReleaseId(0)),
 		),
 	).toBe(true);
+	await expect(page.getByRole("heading", { name: "润色 20001" })).toBeVisible();
 	await expect(
-		page.getByRole("heading", { name: "智能摘要 20001" }),
-	).toBeVisible();
-	await expect(
-		page.getByText("智能总结 release 20001 的主要版本变化。", {
+		page.getByText("润色 release 20001 的主要版本变化。", {
 			exact: true,
 		}),
 	).toBeVisible();
@@ -1245,7 +1243,7 @@ test("feed page default selector switches current cards and persists after reloa
 
 	await page.goto("/?tab=releases");
 	await expect(
-		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+		page.getByRole("heading", { name: `润色 ${releaseId}` }),
 	).toBeVisible();
 
 	await page.getByRole("button", { name: "翻译" }).click();
@@ -1305,7 +1303,7 @@ test("feed page default selector triggers on-demand translation for manual lanes
 
 	await page.goto("/?tab=releases");
 	await expect(
-		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+		page.getByRole("heading", { name: `润色 ${releaseId}` }),
 	).toBeVisible();
 
 	await page.getByRole("button", { name: "翻译" }).click();
@@ -1342,7 +1340,7 @@ test("feed page default selector shows original when AI lanes are unavailable", 
 		"aria-pressed",
 		"true",
 	);
-	await expect(page.getByRole("button", { name: "智能" })).toHaveAttribute(
+	await expect(page.getByRole("button", { name: "润色" })).toHaveAttribute(
 		"aria-pressed",
 		"false",
 	);
@@ -1417,7 +1415,7 @@ test("feed smart loading keeps original body visible while the smart option puls
 	).toHaveAttribute("data-feed-lane-loading", "true");
 	releaseSmartResults?.();
 	await expect(
-		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+		page.getByRole("heading", { name: `润色 ${releaseId}` }),
 	).toBeVisible();
 });
 
@@ -1438,7 +1436,7 @@ test("feed translated tab triggers on-demand translation when data was not prehe
 		"true",
 	);
 	await expect(
-		page.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+		page.getByRole("heading", { name: `润色 ${releaseId}` }),
 	).toBeVisible();
 
 	await page.getByRole("tab", { name: "翻译" }).first().click();
@@ -1478,7 +1476,7 @@ test("mobile release cards hide per-card lane tabs and keep GitHub as a top-righ
 	const releaseCard = page.locator('[data-slot="card"]').first();
 	await expect(releaseCard).toBeVisible();
 	await expect(
-		releaseCard.getByRole("heading", { name: `智能摘要 ${releaseId}` }),
+		releaseCard.getByRole("heading", { name: `润色 ${releaseId}` }),
 	).toBeVisible();
 	await expect(releaseCard.getByRole("tab", { name: "翻译" })).toHaveCount(0);
 	await expect(releaseCard.getByRole("button", { name: "GitHub" })).toHaveCount(
@@ -1537,9 +1535,9 @@ test("feed smart insufficient result collapses the card to version-only mode", a
 			has: page.getByRole("heading", { name: `Release ${releaseId}` }),
 		})
 		.first();
-	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
+	await expect(page.getByRole("tab", { name: "润色" })).toHaveCount(0);
 	await expect(
-		page.getByText("智能总结 release 20001 的主要版本变化。"),
+		page.getByText("润色 release 20001 的主要版本变化。"),
 	).toHaveCount(0);
 	await expect(releaseCard.getByRole("link", { name: "GitHub" })).toBeVisible();
 	await expect(releaseCard.getByRole("button", { name: /赞/ })).toBeVisible();
@@ -1581,10 +1579,8 @@ test("feed smart localized retryable error falls back to the original card inste
 	await expect(
 		page.getByRole("heading", { name: `Release ${releaseId}` }),
 	).toBeVisible();
-	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
-	await expect(page.getByRole("button", { name: "重试智能整理" })).toHaveCount(
-		0,
-	);
+	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(0);
 });
 
 test("feed smart retry treats insufficient result as a successful collapse", async ({
@@ -1605,16 +1601,16 @@ test("feed smart retry treats insufficient result as a successful collapse", asy
 		"aria-selected",
 		"true",
 	);
-	await expect(page.getByText("智能整理失败", { exact: true })).toBeVisible();
+	await expect(page.getByText("润色失败", { exact: true })).toBeVisible();
 
-	await page.getByRole("button", { name: "重试智能整理" }).click();
+	await page.getByRole("button", { name: "重试润色" }).click();
 
 	await expect(page.getByText("no_valuable_version_info")).toHaveCount(0);
-	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
 	await expect(
 		page.getByRole("heading", { name: `Release ${releaseId}` }),
 	).toBeVisible();
-	await expect(page.getByRole("tab", { name: "智能" })).toHaveCount(0);
+	await expect(page.getByRole("tab", { name: "润色" })).toHaveCount(0);
 });
 
 test("feed smart retry button spins and disables while request is in flight", async ({
@@ -1632,7 +1628,7 @@ test("feed smart retry button spins and disables while request is in flight", as
 	});
 
 	await page.goto("/?tab=releases");
-	const retryButton = page.getByRole("button", { name: "重试智能整理" });
+	const retryButton = page.getByRole("button", { name: "重试润色" });
 	await expect(retryButton).toBeVisible();
 	await expect(retryButton).toBeEnabled();
 
@@ -1651,11 +1647,11 @@ test("feed smart retry button spins and disables while request is in flight", as
 	await expect(retryButton).toBeDisabled();
 	await expect(retryButton).toHaveAttribute("aria-busy", "true");
 	await expect(retryButton.locator("svg").first()).toHaveClass(/animate-spin/);
-	await expect(retryButton).toHaveText("重试智能整理");
+	await expect(retryButton).toHaveText("重试润色");
 
-	await expect(page.getByText("智能整理失败", { exact: true })).toHaveCount(0);
+	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
 	await expect(
-		page.getByText(`智能总结 release ${releaseId} 的主要版本变化。`),
+		page.getByText(`润色 release ${releaseId} 的主要版本变化。`),
 	).toBeVisible();
 });
 
