@@ -2136,6 +2136,52 @@ test("admin refreshes translation scheduler via shared sse stream", async ({
 	await expect(page.getByRole("cell", { name: "W4" }).last()).toBeVisible();
 });
 
+test("admin jobs keeps header utilities inline on tablet widths", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 853, height: 1280 });
+	await installAdminJobsMocks(page);
+
+	await page.goto("/admin/jobs");
+	await expect(
+		page.getByRole("navigation", { name: "管理员导航" }),
+	).toBeVisible();
+	await expect(page.getByRole("link", { name: "返回前台首页" })).toBeVisible();
+
+	const layout = await page.evaluate(() => {
+		const mainRowElement = document.querySelector(
+			"[data-admin-header-main-row]",
+		);
+		const navBlockElement = document.querySelector("[data-admin-nav-block]");
+		const actionClusterElement = document.querySelector(
+			"[data-admin-primary-actions]",
+		);
+		if (
+			!(mainRowElement instanceof HTMLElement) ||
+			!(navBlockElement instanceof HTMLElement) ||
+			!(actionClusterElement instanceof HTMLElement)
+		) {
+			throw new Error("Expected admin header layout anchors");
+		}
+
+		const mainRect = mainRowElement.getBoundingClientRect();
+		const navRect = navBlockElement.getBoundingClientRect();
+		const actionRect = actionClusterElement.getBoundingClientRect();
+		return {
+			rowOverflow: mainRowElement.scrollWidth - mainRowElement.clientWidth,
+			actionTopDelta: actionRect.top - mainRect.top,
+			actionVsNavTopDelta: actionRect.top - navRect.top,
+			actionLeft: actionRect.left,
+			rowMidpoint: mainRect.left + mainRect.width * 0.5,
+		};
+	});
+
+	expect(layout.rowOverflow).toBeLessThanOrEqual(1);
+	expect(layout.actionTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionVsNavTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionLeft).toBeGreaterThanOrEqual(layout.rowMidpoint);
+});
+
 test("admin translation scheduler falls back to single-line mobile lists", async ({
 	page,
 }) => {

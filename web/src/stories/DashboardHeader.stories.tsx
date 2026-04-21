@@ -31,6 +31,14 @@ const DASHBOARD_HEADER_VIEWPORTS = {
 		},
 		type: "mobile",
 	},
+	dashboardHeaderTablet853: {
+		name: "Dashboard header tablet 853x1280",
+		styles: {
+			height: "1280px",
+			width: "853px",
+		},
+		type: "tablet",
+	},
 } as const;
 
 function dispatchSyntheticTouchEvent(
@@ -57,6 +65,30 @@ function dispatchSyntheticTouchEvent(
 	Object.defineProperty(event, "targetTouches", { value: [touchPoint] });
 	Object.defineProperty(event, "changedTouches", { value: [touchPoint] });
 	target.dispatchEvent(event);
+}
+
+function expectTabletInlineLayout(options: {
+	mainRow: HTMLElement | null;
+	leadingBlock: HTMLElement | null;
+	trailingBlock: HTMLElement | null;
+}) {
+	const { mainRow, leadingBlock, trailingBlock } = options;
+	expect(mainRow).not.toBeNull();
+	expect(leadingBlock).not.toBeNull();
+	expect(trailingBlock).not.toBeNull();
+	if (!mainRow || !leadingBlock || !trailingBlock) {
+		throw new Error("Expected main row, leading block, and trailing block");
+	}
+
+	const mainRect = mainRow.getBoundingClientRect();
+	const leadingRect = leadingBlock.getBoundingClientRect();
+	const trailingRect = trailingBlock.getBoundingClientRect();
+	expect(mainRow.scrollWidth - mainRow.clientWidth).toBeLessThanOrEqual(1);
+	expect(trailingRect.top - mainRect.top).toBeLessThanOrEqual(12);
+	expect(trailingRect.left).toBeGreaterThanOrEqual(
+		mainRect.left + mainRect.width * 0.5,
+	);
+	expect(trailingRect.top - leadingRect.top).toBeLessThanOrEqual(12);
 }
 
 function DashboardHeaderGallery() {
@@ -280,6 +312,41 @@ export const StateGallery: Story = {
 			description: {
 				story:
 					"把默认、AI 未配置与紧凑宽度三种状态放进同一审阅面，便于确认品牌位独立、右侧账号入口收敛，以及窄宽度下同步/头像的排列。",
+			},
+		},
+	},
+};
+
+export const EvidenceTabletInline: Story = {
+	name: "Evidence / Tablet Inline Header",
+	globals: {
+		viewport: {
+			value: "dashboardHeaderTablet853",
+			isRotated: false,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText("GitHub 动态 · 中文翻译 · 日报与 Inbox"),
+		).toBeVisible();
+		expectTabletInlineLayout({
+			mainRow: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-header-main-row]",
+			),
+			leadingBlock: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-brand-block]",
+			),
+			trailingBlock: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-primary-actions]",
+			),
+		});
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"平板 853x1280 证据入口：品牌块与 utility actions 必须回到同一主行，且右侧按钮组不再掉到品牌块下方。",
 			},
 		},
 	},
