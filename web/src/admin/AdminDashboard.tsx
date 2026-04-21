@@ -51,7 +51,7 @@ const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 
 const TASK_COLORS = {
 	翻译: "#3b82f6",
-	智能摘要: "#6366f1",
+	润色: "#6366f1",
 	日报: "#10b981",
 } as const;
 
@@ -419,7 +419,7 @@ export function AdminDashboard() {
 			(data?.trend_points ?? []).map((item) => ({
 				label: item.label,
 				翻译: item.translations_total,
-				智能摘要: item.summaries_total,
+				润色: item.summaries_total,
 				日报: item.briefs_total,
 				active_users: item.active_users,
 				total_users: item.total_users,
@@ -496,8 +496,7 @@ export function AdminDashboard() {
 						<div>
 							<CardTitle>运营总览</CardTitle>
 							<CardDescription>
-								展示用户规模、今日活跃与翻译 / 智能摘要 /
-								日报三条链路的关键指标。
+								展示用户规模、今日活跃与翻译 / 润色 / 日报三条链路的关键指标。
 							</CardDescription>
 						</div>
 						<div className="flex flex-wrap items-center gap-2">
@@ -912,9 +911,9 @@ export function AdminDashboard() {
 									dotClass="bg-sky-500"
 								/>
 								<TaskLaneCard
-									label="智能摘要"
+									label="润色"
 									value={data?.summary.ongoing_by_task.summaries ?? 0}
-									description="发布摘要批任务"
+									description="发布润色批任务"
 									borderClass="border-l-indigo-500"
 									dotClass="bg-indigo-500"
 								/>
@@ -985,9 +984,9 @@ export function AdminDashboard() {
 										dotClass: "bg-sky-500",
 									},
 									{
-										label: "智能摘要",
-										value: formatCount(latestTrendPoint?.智能摘要),
-										description: "最新日摘要任务量",
+										label: "润色",
+										value: formatCount(latestTrendPoint?.润色),
+										description: "最新日润色任务量",
 										dotClass: "bg-indigo-500",
 									},
 									{
@@ -1032,12 +1031,12 @@ export function AdminDashboard() {
 											>
 												<stop
 													offset="5%"
-													stopColor={TASK_COLORS.智能摘要}
+													stopColor={TASK_COLORS.润色}
 													stopOpacity={0.22}
 												/>
 												<stop
 													offset="95%"
-													stopColor={TASK_COLORS.智能摘要}
+													stopColor={TASK_COLORS.润色}
 													stopOpacity={0}
 												/>
 											</linearGradient>
@@ -1089,8 +1088,8 @@ export function AdminDashboard() {
 										/>
 										<Area
 											type="monotone"
-											dataKey="智能摘要"
-											stroke={TASK_COLORS.智能摘要}
+											dataKey="润色"
+											stroke={TASK_COLORS.润色}
 											fill="url(#admin-dashboard-summary)"
 											strokeWidth={2}
 											isAnimationActive={false}

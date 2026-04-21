@@ -377,7 +377,7 @@ export const EvidenceMobileShell: Story = {
 		);
 
 		const laneMenuTrigger = canvas.getByRole("button", {
-			name: "当前阅读模式：智能",
+			name: "当前阅读模式：润色",
 		}) as HTMLButtonElement;
 		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchstart");
 		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 10, 0);
