@@ -163,7 +163,7 @@
   requested_viewport: `853x1280`
   viewport_strategy: `devtools-emulate`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard Header / Evidence / Tablet Inline Header`
   state: `tablet-inline-dashboard-header`
   evidence_note: 验证 DashboardHeader 在 `853x1280` 下已切到平板两列主行，品牌区与 `ThemeToggle / 同步 / avatar` 保持同排对齐，没有回退到品牌块下方堆叠。
@@ -176,10 +176,11 @@
   requested_viewport: `853x1280`
   viewport_strategy: `devtools-emulate`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Layout/Admin Header / Evidence / Tablet Inline Header`
   state: `tablet-inline-admin-header`
   evidence_note: 验证 AdminHeader 在 `853x1280` 下把 utility cluster 固定在品牌 / 管理导航右侧，`返回前台` 保持可见，长 login 仅截断自身。
+  PR: include
   image:
   ![AdminHeader 平板页头同排对齐证据](./assets/admin-header-tablet-inline.png)
 
@@ -189,10 +190,11 @@
   requested_viewport: `853x1280`
   viewport_strategy: `devtools-emulate`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard / Evidence / Tablet Header Inline`
   state: `tablet-inline-dashboard-page`
   evidence_note: 验证 Dashboard 页面级壳层在平板口径下维持页头主行同排、tabs / secondary controls 仍位于后续控制带，同时 feed 页已移除右侧 Inbox 侧栏列。
+  PR: include
   image:
   ![Dashboard 页面平板页头同排对齐证据](./assets/dashboard-tablet-header-inline.png)
 
@@ -220,6 +222,7 @@
 - 2026-04-21: 创建 follow-up spec，冻结 Dashboard / Admin 平板页头对齐修复合同。
 - 2026-04-21: 已完成 Dashboard / Admin 平板页头两列主行实现，补齐 Storybook `853x1280` 审阅入口、Playwright tablet smoke 与本地视觉证据；后续仅等待主人确认截图是否可进入 push / PR。
 - 2026-04-21: 根据主人反馈补充 Dashboard 平板 feed 单主列合同：`768–1023px` 不再显示右侧 Inbox 快捷侧栏，相关 Storybook / Playwright / 视觉证据需一起刷新。
+- 2026-04-21: 主人已确认可继续远端流程，平板证据改为 `approved`，其中 Dashboard 页面与 AdminHeader 证据允许复用到 PR 正文。
 
 ## 参考（References）
 
