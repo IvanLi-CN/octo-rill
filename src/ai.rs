@@ -37,11 +37,14 @@ const MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG: &str = "synced_catalog";
 const MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG: &str = "builtin_catalog";
 const MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK: &str = "unknown_fallback";
 const LLM_REQUEST_MAX_RETRIES: usize = 3;
+const LLM_REQUEST_MAX_ATTEMPTS: usize = LLM_REQUEST_MAX_RETRIES + 1;
+const LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS: usize = 8;
 const LLM_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(500);
 const LLM_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 const LLM_RETRY_BACKOFF_JITTER_MAX_MS: u64 = 250;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const AI_RESPONSE_MISSING_CONTENT_ERROR: &str = "AI response missing content";
 
 #[derive(Debug, Default)]
 struct ModelLimitCatalog {
@@ -260,6 +263,24 @@ where
 
 fn current_llm_call_context() -> Option<LlmCallContext> {
     LLM_CALL_CONTEXT.try_with(Clone::clone).ok()
+}
+
+fn llm_source_uses_translation_empty_content_retry_budget(source: &str) -> bool {
+    source.starts_with("translation.scheduler.") || source.starts_with("api.translate_")
+}
+
+fn ai_error_is_missing_content(err: &anyhow::Error) -> bool {
+    err.to_string().trim() == AI_RESPONSE_MISSING_CONTENT_ERROR
+}
+
+fn max_llm_attempts_for_error(source: &str, err: &anyhow::Error) -> usize {
+    if llm_source_uses_translation_empty_content_retry_budget(source)
+        && ai_error_is_missing_content(err)
+    {
+        LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
+    } else {
+        LLM_REQUEST_MAX_ATTEMPTS
+    }
 }
 
 fn normalize_model_name(raw: &str) -> String {
@@ -1857,7 +1878,7 @@ async fn chat_completion_once(
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ChatCompletionAttemptError {
-            err: anyhow!("AI response missing content"),
+            err: anyhow!(AI_RESPONSE_MISSING_CONTENT_ERROR),
             retryable: true,
             retry_after: None,
             first_token_wait_ms,
@@ -1918,12 +1939,12 @@ pub async fn chat_completion(
         }
     };
 
-    let mut last_err: Option<anyhow::Error> = None;
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
     let mut started_at_timestamp: Option<String> = None;
-    let max_attempts = LLM_REQUEST_MAX_RETRIES + 1;
-    for attempt in 1..=max_attempts {
+    let mut attempt = 0_usize;
+    loop {
+        attempt = attempt.saturating_add(1);
         let (wait_ms, mut in_flight_guard) = state.llm_scheduler.acquire_slot().await;
         total_wait_ms = total_wait_ms.saturating_add(wait_ms.max(0));
         let attempt_count = i64::try_from(attempt).unwrap_or(i64::MAX);
@@ -2047,6 +2068,7 @@ pub async fn chat_completion(
                     err,
                     first_token_wait_ms,
                 } = attempt_err;
+                let max_attempts = max_llm_attempts_for_error(log_record.source.as_str(), &err);
                 if !retryable || attempt >= max_attempts {
                     let duration_ms = started_at.map(|started| {
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
@@ -2162,12 +2184,10 @@ pub async fn chat_completion(
                     ?err,
                     "ai request failed; sleeping before retry"
                 );
-                last_err = Some(err);
                 tokio::time::sleep(retry_delay).await;
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow!("AI request failed after retries")))
 }
 
 fn ai_error_is_non_retryable(err: &anyhow::Error) -> bool {
@@ -5799,6 +5819,277 @@ mod tests {
                 .to_string()
                 .contains("AppChatReverse: Chat failed, 401")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_extends_empty_content_retries_for_translation_sources() {
+        for success_attempt in [5_usize, 6, 8] {
+            let seen_attempts = Arc::new(AtomicUsize::new(0));
+            let route_attempts = Arc::clone(&seen_attempts);
+            let base_url = spawn_test_ai_server(Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let route_attempts = Arc::clone(&route_attempts);
+                    async move {
+                        let attempt = route_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        let content = if attempt >= success_attempt { "ok" } else { "" };
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "choices": [{
+                                    "message": { "content": content }
+                                }]
+                            })),
+                        )
+                    }
+                }),
+            ))
+            .await;
+            let state = setup_llm_state_with_ai(Some(base_url)).await;
+            let context = LlmCallContext {
+                source: "translation.scheduler.deadline".to_owned(),
+                requested_by: None,
+                parent_task_id: None,
+                parent_task_type: None,
+                parent_translation_batch_id: Some("batch-test".to_owned()),
+            };
+
+            let result = with_llm_call_context(context, async {
+                chat_completion(state.as_ref(), "system", "user", 128).await
+            })
+            .await
+            .expect("translation-scoped empty content retries should eventually succeed");
+
+            assert_eq!(result, "ok");
+            assert_eq!(seen_attempts.load(Ordering::SeqCst), success_attempt);
+
+            let row = sqlx::query(
+                r#"
+                SELECT source, status, attempt_count, response_text, error_text
+                FROM llm_calls
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                "#,
+            )
+            .fetch_one(&state.pool)
+            .await
+            .expect("load llm call");
+
+            assert_eq!(
+                row.get::<String, _>("source"),
+                "translation.scheduler.deadline"
+            );
+            assert_eq!(row.get::<String, _>("status"), "succeeded");
+            assert_eq!(
+                row.get::<i64, _>("attempt_count"),
+                i64::try_from(success_attempt).unwrap_or(i64::MAX)
+            );
+            assert_eq!(
+                row.get::<Option<String>, _>("response_text"),
+                Some("ok".to_owned())
+            );
+            assert_eq!(row.get::<Option<String>, _>("error_text"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_completion_fails_after_eight_empty_content_attempts_for_api_translate_source() {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    route_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "" }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let context = LlmCallContext {
+            source: "api.translate_release".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        let err = with_llm_call_context(context, async {
+            chat_completion(state.as_ref(), "system", "user", 128).await
+        })
+        .await
+        .expect_err("api translate source should fail after eight empty attempts");
+
+        assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+        assert_eq!(
+            seen_attempts.load(Ordering::SeqCst),
+            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, response_text, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(row.get::<String, _>("source"), "api.translate_release");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<i64, _>("attempt_count"),
+            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+        );
+        assert_eq!(row.get::<Option<String>, _>("response_text"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text"),
+            Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_keeps_default_empty_content_budget_for_non_translation_sources() {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    route_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "" }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+
+        let err = chat_completion(state.as_ref(), "system", "user", 128)
+            .await
+            .expect_err("non-translation sources should keep the default budget");
+
+        assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+        assert_eq!(
+            seen_attempts.load(Ordering::SeqCst),
+            LLM_REQUEST_MAX_ATTEMPTS
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(row.get::<String, _>("source"), "ai.chat_completion");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<i64, _>("attempt_count"),
+            i64::try_from(LLM_REQUEST_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text"),
+            Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_keeps_default_budget_for_non_empty_retryable_errors() {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    route_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "temporary upstream failure",
+                                "code": "upstream_error"
+                            }
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let context = LlmCallContext {
+            source: "translation.scheduler.deadline".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: Some("batch-test".to_owned()),
+        };
+
+        let err = with_llm_call_context(context, async {
+            chat_completion(state.as_ref(), "system", "user", 128).await
+        })
+        .await
+        .expect_err("retryable non-empty errors should keep the default budget");
+
+        let error_text = err.to_string();
+        assert!(error_text.contains("AI returned 502"));
+        assert!(error_text.contains("temporary upstream failure"));
+        assert_eq!(
+            seen_attempts.load(Ordering::SeqCst),
+            LLM_REQUEST_MAX_ATTEMPTS
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(
+            row.get::<String, _>("source"),
+            "translation.scheduler.deadline"
+        );
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<i64, _>("attempt_count"),
+            i64::try_from(LLM_REQUEST_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+        );
+        let stored_error = row
+            .get::<Option<String>, _>("error_text")
+            .expect("failed llm call should persist error text");
+        assert!(stored_error.contains("AI returned 502"));
+        assert!(stored_error.contains("temporary upstream failure"));
     }
 
     #[tokio::test]
