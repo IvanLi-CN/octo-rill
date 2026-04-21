@@ -19,7 +19,7 @@
 ### Goals
 
 - 后端 session 改成 **30 天不活跃滑动过期**，并在活跃请求期间通过节流 touch 续期。
-- 新增可选 `OCTORILL_SESSION_COOKIE_NAME`，允许生产固定 cookie 名。
+- session cookie 名不再开放运行时配置：根路径公网部署固定为 `octo_rill_sid`，本地多实例或非根路径部署自动派生隔离后缀。
 - 保持现有 REST 响应结构、OAuth 流程和 SQLite session store 不变。
 - 同步文档与部署口径，明确一次性重新登录预期。
 
@@ -34,7 +34,6 @@
 ### In scope
 
 - `src/server.rs` session layer 与 cookie 命名策略
-- `src/config.rs` 新环境变量解析
 - `web/src/auth/startupCache.ts` 的口径与注释
 - `.env.example`、`README.md`、`docs-site/docs/config.md`
 - Rust / Playwright 回归验证
@@ -49,7 +48,7 @@
 
 - 登录成功后返回的 `Set-Cookie` 必须带 `Max-Age=2592000`，不再是 session-only cookie。
 - 有效已登录请求会通过节流 touch 刷新 cookie 与服务端 session 的不活跃过期时间，避免对 SQLite 造成每请求写放大。
-- 若设置 `OCTORILL_SESSION_COOKIE_NAME`，服务必须优先使用该固定名称；未设置时继续回退到现有“按公开入口推导”行为。
+- 服务对根路径公网部署统一使用 `octo_rill_sid`；本地多实例、非默认端口或非根路径部署自动派生隔离 cookie 名，避免跨实例互踢。
 - 前端 startup cache 的 30 天窗口只是启动优化提示，不得被当成比 `/api/me` 更高优先级的登录真相。
 
 ## 验收标准（Acceptance Criteria）
@@ -62,9 +61,13 @@
   When 用户刷新页面或浏览器重开后再次访问  
   Then `/api/me` 仍返回 `200`，登录态保持。
 
-- Given 用户已经设置固定 `OCTORILL_SESSION_COOKIE_NAME`  
-  When 服务升级但 `OCTORILL_PUBLIC_BASE_URL` 的推导逻辑发生变化  
-  Then cookie 名仍保持固定，不因为版本更新批量失效。
+- Given 服务运行在根路径公网部署  
+  When 浏览器继续携带既有 session cookie  
+  Then cookie 名保持 `octo_rill_sid`，不因为版本更新批量失效。
+
+- Given 同一 host 上运行多个本地实例，或部署在非根路径/非默认端口  
+  When 浏览器同时访问这些实例  
+  Then 每个实例会得到不同的派生 cookie 名，互不覆盖登录态。
 
 - Given 本地存在过期或失效的启动缓存  
   When `/api/me` 返回 `401`  
@@ -75,7 +78,8 @@
 ### Testing
 
 - Rust tests 覆盖：
-  - 固定 cookie 名配置优先级
+  - 根路径公网部署保持固定 cookie 名
+  - 本地多实例 / 非根路径部署使用隔离 cookie 名
   - `Set-Cookie` 持久化 `Max-Age`
   - 有效请求的滑动续期
   - 无效 sid 的清 cookie 行为
@@ -106,4 +110,4 @@
 
 - 风险：固定 cookie 名上线后，旧 cookie 名不会自动平滑迁移；允许一次性重新登录。
 - 风险：如果部署仍把 SQLite 放在非持久层，即使 cookie 持久化也无法保住服务端 session。
-- 假设：生产会同步固定 `OCTORILL_SESSION_COOKIE_NAME`，并继续保持稳定的数据库与加密密钥。
+- 假设：部署继续保持稳定的数据库与加密密钥。
