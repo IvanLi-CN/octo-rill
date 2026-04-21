@@ -106,6 +106,86 @@ async function tapLocator(page: Page, locator: Locator) {
 	await page.touchscreen.tap(box.x, box.y);
 }
 
+async function installVisualViewportMock(page: Page) {
+	await page.addInitScript(() => {
+		type VisualViewportListener = (event: Event) => void;
+		type VisualViewportState = {
+			width: number;
+			height: number;
+			offsetTop: number;
+			offsetLeft: number;
+			pageTop: number;
+			pageLeft: number;
+			scale: number;
+		};
+
+		const listeners = new Map<string, Set<VisualViewportListener>>([
+			["resize", new Set<VisualViewportListener>()],
+			["scroll", new Set<VisualViewportListener>()],
+		]);
+
+		const state: VisualViewportState = {
+			width: window.innerWidth,
+			height: window.innerHeight,
+			offsetTop: 0,
+			offsetLeft: 0,
+			pageTop: 0,
+			pageLeft: 0,
+			scale: 1,
+		};
+
+		const visualViewport = {
+			get width() {
+				return state.width;
+			},
+			get height() {
+				return state.height;
+			},
+			get offsetTop() {
+				return state.offsetTop;
+			},
+			get offsetLeft() {
+				return state.offsetLeft;
+			},
+			get pageTop() {
+				return state.pageTop;
+			},
+			get pageLeft() {
+				return state.pageLeft;
+			},
+			get scale() {
+				return state.scale;
+			},
+			addEventListener(type: string, listener: VisualViewportListener) {
+				listeners.get(type)?.add(listener);
+			},
+			removeEventListener(type: string, listener: VisualViewportListener) {
+				listeners.get(type)?.delete(listener);
+			},
+			dispatch(type: "resize" | "scroll") {
+				for (const listener of listeners.get(type) ?? []) {
+					listener(new Event(type));
+				}
+			},
+		};
+
+		Object.defineProperty(window, "visualViewport", {
+			configurable: true,
+			get: () => visualViewport,
+		});
+
+		(
+			window as typeof window & {
+				__setTestVisualViewport?: (patch: Partial<VisualViewportState>) => void;
+			}
+		).__setTestVisualViewport = (patch) => {
+			Object.assign(state, patch);
+			visualViewport.dispatch("resize");
+			visualViewport.dispatch("scroll");
+		};
+	});
+}
+
 function buildReactionFooterReady() {
 	return {
 		counts: {
@@ -974,6 +1054,7 @@ test.describe("mobile dashboard shell", () => {
 		});
 
 		await page.goto("/?tab=all");
+		await page.waitForSelector("[data-app-shell-header='true']");
 
 		const shell = page.locator("[data-app-shell-mobile-chrome='true']");
 		const headerState = page.locator("[data-dashboard-header-progress]");
@@ -1067,6 +1148,148 @@ test.describe("mobile dashboard shell", () => {
 		await expect(headerState).toHaveAttribute(
 			"data-dashboard-header-compact",
 			"false",
+		);
+		await expect(stickyHeader).toBeVisible();
+	});
+
+	test("dashboard keeps mobile feed headers pinned to the visual viewport top inset", async ({
+		page,
+	}) => {
+		await installVisualViewportMock(page);
+
+		await page.route("**/api/**", async (route) => {
+			const req = route.request();
+			const url = new URL(req.url());
+			const { pathname } = url;
+
+			if (req.method() === "GET" && pathname === "/api/me") {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "2f4k7m9p3x6c8v2a",
+						github_user_id: 10,
+						login: "octo-admin",
+						name: "Octo Admin",
+						avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+						email: "admin@example.com",
+						is_admin: true,
+					}),
+				);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/feed") {
+				return json(route, {
+					items: Array.from({ length: 12 }, (_, index) =>
+						buildReleaseFeedItem(String(42001 + index), {
+							ts: `2026-04-0${Math.min(8, index + 1)}T12:00:00+08:00`,
+							title: `Release ${42001 + index}`,
+						}),
+					),
+					next_cursor: null,
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/notifications") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/briefs") {
+				return json(route, []);
+			}
+
+			if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+				return json(route, {
+					configured: false,
+					masked_token: null,
+					check: {
+						state: "idle",
+						message: null,
+						checked_at: null,
+					},
+				});
+			}
+
+			if (req.method() === "GET" && pathname === "/api/health") {
+				return json(route, { ok: true, version: "1.2.3" });
+			}
+
+			return json(
+				route,
+				{
+					error: {
+						code: "not_found",
+						message: `unhandled ${req.method()} ${pathname}`,
+					},
+				},
+				404,
+			);
+		});
+
+		await page.goto("/?tab=all");
+		await page.waitForSelector("[data-app-shell-header='true']");
+
+		const shell = page.locator("[data-app-shell-mobile-chrome='true']");
+		const headerState = page.locator("[data-dashboard-header-progress]");
+		const stickyHeader = page.locator("[data-app-shell-header='true']");
+		const readHeaderInsetState = async () =>
+			(async () => ({
+				headerTop: Math.round(
+					await stickyHeader.evaluate(
+						(element) => element.getBoundingClientRect().top,
+					),
+				),
+				topInset: Number.parseInt(
+					(await shell.getAttribute("data-app-shell-viewport-top-inset")) ??
+						"0",
+					10,
+				),
+				compact:
+					(await headerState.getAttribute("data-dashboard-header-compact")) ===
+					"true",
+			}))();
+
+		await expect(shell).toBeVisible();
+		await expect(headerState).toBeVisible();
+		await expect(shell).toHaveAttribute(
+			"data-app-shell-viewport-top-inset",
+			"0",
+		);
+		const initialState = await readHeaderInsetState();
+		expect(initialState.headerTop).toBe(0);
+		expect(initialState.topInset).toBe(0);
+
+		await page.evaluate(() => {
+			(
+				window as typeof window & {
+					__setTestVisualViewport?: (patch: {
+						height?: number;
+						offsetTop?: number;
+					}) => void;
+				}
+			).__setTestVisualViewport?.({
+				height: window.innerHeight - 48,
+				offsetTop: 48,
+			});
+		});
+		await page.waitForTimeout(220);
+
+		await expect(shell).toHaveAttribute(
+			"data-app-shell-viewport-top-inset",
+			"48",
+		);
+		const insetState = await readHeaderInsetState();
+		expect(insetState.headerTop).toBe(48);
+
+		await page.mouse.wheel(0, 420);
+		await page.waitForTimeout(320);
+
+		const compactInsetState = await readHeaderInsetState();
+		expect(compactInsetState.compact).toBe(true);
+		expect(compactInsetState.topInset).toBe(48);
+		expect(compactInsetState.headerTop).toBe(48);
+		await expect(headerState).toHaveAttribute(
+			"data-dashboard-header-compact",
+			"true",
 		);
 		await expect(stickyHeader).toBeVisible();
 	});
