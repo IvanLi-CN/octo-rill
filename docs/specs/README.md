@@ -89,7 +89,7 @@
 | qvewp | Release 成功后回写 PR 版本评论 | 已完成 | `qvewp-release-pr-version-comment/SPEC.md` | 2026-04-04 | PR #46, PR #47; release run #43 comments PRs and rerun updates in place |
 | xaycu | Dashboard 按日报边界分组与历史日报折叠 | 已完成 | `xaycu-dashboard-day-grouping/SPEC.md` | 2026-04-16 | top-level tab copy aligned to `发布`; spec wording refreshed for current dashboard labels |
 | tvujt | 品牌刷新：生成图接管 favicon / Web / Docs | 已完成 | `tvujt-brand-generated-icon-refresh/SPEC.md` | 2026-04-06 | local implementation completed; PR pending screenshot push approval |
-| 7f2b9 | Release Feed 三 Tabs 与智能版本变化卡片 | 已完成 | `7f2b9-release-feed-smart-tabs/SPEC.md` | 2026-04-21 | PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, and translation empty-content retries capped at 8 attempts in-call |
+| 7f2b9 | Release Feed 三 Tabs 与润色版本变化卡片 | 已完成 | `7f2b9-release-feed-smart-tabs/SPEC.md` | 2026-04-21 | PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, and translation empty-content retries capped at 8 attempts in-call |
 | h4yvc | 服务端版本更新轮询轻提示 | 已完成 | `h4yvc-version-update-polling-notice/SPEC.md` | 2026-04-10 | PR #57; version polling notice + visual evidence + regression coverage |
 | crzva | Release 视图仓库图标补齐 | 已完成 | `crzva-release-repo-visuals/SPEC.md` | 2026-04-10 | local implementation completed; review-loop clear; release repo visuals shipped with aligned repo identity polish |
 | vgqp9 | Dashboard 社交活动记录扩展（含头像） | 已完成 | `vgqp9-dashboard-social-activity/SPEC.md` | 2026-04-16 | dashboard social activity labels aligned to `发布 / 加星 / 关注 / 收件箱`; spec wording refreshed for current top-level tabs |
@@ -127,3 +127,4 @@
 | cuz3w | Dashboard / Admin 平板页头对齐修复 | 已完成 | `cuz3w-dashboard-admin-tablet-header-alignment/SPEC.md` | 2026-04-21 | PR #113; fast-track / tablet header alignment + dashboard tablet single-column feed without inbox sidebar |
 | 6xaku | GitHub PAT 1:1 参考界面 | 已完成 | `6xaku-github-pat-inline-guide-mock/SPEC.md` | 2026-04-20 | fast-track / DOM-based GitHub PAT reference + switchable settings story + evidence |
 | 2v2aw | 多 GitHub 绑定与 LinuxDO 首登补绑改造 | 已完成 | `2v2aw-multi-github-linuxdo-onboarding/SPEC.md` | 2026-04-21 | PR #117; fast-track / multi-github + linuxdo onboarding / 去主账号语义并收口运行时迁移；legacy schema cleanup deferred |
+| etd3f | Release「润色」术语统一 | 部分完成（3/4） | `etd3f-polish-terminology-unification/SPEC.md` | 2026-04-22 | local implementation + validation + visual evidence landed; push/PR pending owner screenshot approval |

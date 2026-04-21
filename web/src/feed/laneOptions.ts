@@ -14,7 +14,7 @@ export const FEED_LANE_OPTIONS: Array<{
 }> = [
 	{ lane: "original", label: "原文", icon: FileText },
 	{ lane: "translated", label: "翻译", icon: Languages },
-	{ lane: "smart", label: "智能", icon: Sparkles },
+	{ lane: "smart", label: "润色", icon: Sparkles },
 ];
 
 export function isFeedLane(value: unknown): value is FeedLane {

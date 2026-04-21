@@ -8,11 +8,11 @@
 
 ## 背景 / 问题陈述
 
-当前 release feed 已经有页面级默认显示模式控制器，但移动端卡片内部仍重复显示单卡 `原文 / 翻译 / 智能` 切换器，同时 `GitHub` 打开方式还是带 label 的按钮。
+当前 release feed 已经有页面级默认显示模式控制器，但移动端卡片内部仍重复显示单卡 `原文 / 翻译 / 润色` 切换器，同时 `GitHub` 打开方式还是带 label 的按钮。
 
 这会让窄屏卡片头部过度拥挤：同一层级同时出现“页面级控制 + 单卡控制 + GitHub 按钮”，阅读节奏被打断，也与移动端壳层已经收敛出的“顶部统一控制、卡片只保留必要动作”的方向冲突。
 
-本 follow-up 只处理移动端 release 卡片头部与操作区收敛，不回改桌面端交互语义，也不改变翻译 / 智能数据流。
+本 follow-up 只处理移动端 release 卡片头部与操作区收敛，不回改桌面端交互语义，也不改变翻译 / 润色数据流。
 
 ## 目标 / 非目标
 
@@ -27,7 +27,7 @@
 
 - 不改桌面端 release 卡片的 lane tabs 与 GitHub 按钮样式。
 - 不改社交卡片、Inbox 卡片、Release detail 弹窗、Dashboard 顶栏以外的视觉结构。
-- 不改 Rust 后端、`/api/feed`、翻译/智能调度、数据库或公开接口。
+- 不改 Rust 后端、`/api/feed`、翻译/润色调度、数据库或公开接口。
 
 ## 范围（Scope）
 
@@ -82,13 +82,13 @@
 
 - Given `390px` / `375px` 移动端 release feed
   When 卡片渲染完成
-  Then 卡片内部不显示 `原文 / 翻译 / 智能` tabs，顶部页面级 lane menu 仍可见。
+  Then 卡片内部不显示 `原文 / 翻译 / 润色` tabs，顶部页面级 lane menu 仍可见。
 
 - Given 移动端 release 卡片头部
   When 用户查看 GitHub 打开入口
   Then 入口位于卡片右上角，表现为 icon-only 链接，而不是带 `GitHub` label 的按钮。
 
-- Given 移动端顶部页面级 lane menu 从 `智能` 切到 `翻译`
+- Given 移动端顶部页面级 lane menu 从 `润色` 切到 `翻译`
   When 切换完成
   Then 当前 release 卡片标题与正文同步切到翻译 lane。
 

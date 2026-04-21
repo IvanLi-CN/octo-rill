@@ -161,7 +161,7 @@ function OriginalLane(props: { item: ReleaseFeedItem }) {
 	return (
 		<EmptyPanel
 			title="原文暂无可读正文"
-			description="这个 release 没有可直接展示的正文，主人可以切到翻译或智能看看。"
+			description="这个 release 没有可直接展示的正文，主人可以切到翻译或润色看看。"
 		/>
 	);
 }
@@ -218,8 +218,8 @@ function SmartLane(props: {
 	if (item.smart?.status === "disabled") {
 		return (
 			<EmptyPanel
-				title="智能整理不可用"
-				description="当前环境没有可用的 AI 智能总结能力。"
+				title="润色不可用"
+				description="当前环境没有可用的 AI 润色能力。"
 			/>
 		);
 	}
@@ -227,13 +227,13 @@ function SmartLane(props: {
 	if (item.smart?.status === "error") {
 		return (
 			<ErrorStatePanel
-				title="智能整理失败"
+				title="润色失败"
 				summary={resolveErrorSummary(
 					item.smart,
-					"这次智能整理没有成功完成，可以立即再试一次。",
+					"这次润色没有成功完成，可以立即再试一次。",
 				)}
 				detail={resolveErrorDetail(item.smart)}
-				actionLabel="重试智能整理"
+				actionLabel="重试润色"
 				onAction={onSmartNow}
 				disabled={isSmartGenerating}
 				loading={isSmartGenerating}
