@@ -3620,7 +3620,6 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
-            session_cookie_name: None,
             database_url: "sqlite::memory:".to_owned(),
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-jobs-tests"),

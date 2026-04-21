@@ -665,25 +665,42 @@ fn accepts_html_document(headers: &HeaderMap) -> bool {
 }
 
 fn build_session_cookie_name(config: &AppConfig) -> String {
-    if let Some(session_cookie_name) = config.session_cookie_name.as_ref() {
-        return session_cookie_name.clone();
-    }
+    let Some(host) = config.public_base_url.host_str() else {
+        return "octo_rill_sid".to_owned();
+    };
 
-    let host = config.public_base_url.host_str().unwrap_or("localhost");
-    let port = config
+    let scheme = config.public_base_url.scheme();
+    let normalized_path = normalize_cookie_name_path(config.public_base_url.path());
+    let effective_port = config
         .public_base_url
         .port_or_known_default()
         .unwrap_or(config.bind_addr.port());
-    let raw = format!("octo_rill_sid_{host}_{port}");
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
+    let is_loopback_host = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let has_non_root_path = normalized_path != "/";
+    let uses_non_default_port = config
+        .public_base_url
+        .port()
+        .is_some_and(|port| !matches!((scheme, port), ("http", 80) | ("https", 443)));
+    let is_fixed_https_root =
+        scheme == "https" && !is_loopback_host && !has_non_root_path && !uses_non_default_port;
+
+    if is_fixed_https_root {
+        return "octo_rill_sid".to_owned();
+    }
+
+    let discriminator = crate::ai::sha256_hex(&format!(
+        "{scheme}\n{host}\n{effective_port}\n{}",
+        normalized_path
+    ));
+    format!("octo_rill_sid_{}", &discriminator[..16])
+}
+
+fn normalize_cookie_name_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
 }
 
 fn session_inactivity_expiry() -> Expiry {
@@ -797,12 +814,75 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_name_can_be_overridden_by_config() {
-        let config = AppConfig {
+    fn session_cookie_name_is_fixed_for_root_public_origin() {
+        let config = test_config("https://octo-rill.ivanli.cc");
+
+        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid");
+    }
+
+    #[test]
+    fn session_cookie_name_keeps_fixed_name_for_explicit_default_https_port() {
+        let config = test_config("https://example.com:443/");
+
+        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid");
+    }
+
+    #[test]
+    fn session_cookie_name_derives_for_loopback_multi_instance_isolation() {
+        let first = test_config("http://127.0.0.1:58090");
+        let second = test_config("http://127.0.0.1:58091");
+        let first_cookie_name = build_session_cookie_name(&first);
+        let second_cookie_name = build_session_cookie_name(&second);
+
+        assert_ne!(first_cookie_name, "octo_rill_sid");
+        assert_ne!(first_cookie_name, second_cookie_name);
+    }
+
+    #[test]
+    fn session_cookie_name_derives_for_non_root_public_path() {
+        let config = test_config("https://example.com/octo-rill");
+
+        assert_ne!(build_session_cookie_name(&config), "octo_rill_sid");
+    }
+
+    #[test]
+    fn session_cookie_name_derives_for_root_http_origin() {
+        let http_config = test_config("http://example.com");
+        let https_config = test_config("https://example.com");
+
+        assert_ne!(build_session_cookie_name(&http_config), "octo_rill_sid");
+        assert_ne!(
+            build_session_cookie_name(&http_config),
+            build_session_cookie_name(&https_config)
+        );
+    }
+
+    #[test]
+    fn session_cookie_name_keeps_distinct_paths_isolated_without_lossy_collisions() {
+        let dotted_path = test_config("https://example.com/foo.bar");
+        let nested_path = test_config("https://example.com/foo/bar");
+
+        assert_ne!(
+            build_session_cookie_name(&dotted_path),
+            build_session_cookie_name(&nested_path)
+        );
+    }
+
+    #[test]
+    fn session_cookie_name_treats_trailing_slash_variants_as_same_path() {
+        let without_trailing_slash = test_config("https://example.com/octo-rill");
+        let with_trailing_slash = test_config("https://example.com/octo-rill/");
+
+        assert_eq!(
+            build_session_cookie_name(&without_trailing_slash),
+            build_session_cookie_name(&with_trailing_slash)
+        );
+    }
+
+    fn test_config(public_base_url: &str) -> AppConfig {
+        AppConfig {
             bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
-            public_base_url: url::Url::parse("https://octo-rill.ivanli.cc")
-                .expect("parse public base url"),
-            session_cookie_name: Some("octo_rill_sid_prod".to_owned()),
+            public_base_url: url::Url::parse(public_base_url).expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
@@ -822,9 +902,7 @@ mod tests {
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
-        };
-
-        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid_prod");
+        }
     }
 
     #[tokio::test]

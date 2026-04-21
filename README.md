@@ -39,7 +39,7 @@ OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅
    cp .env.example .env.local
    ```
 
-   至少补齐：`OCTORILL_ENCRYPTION_KEY_BASE64`、`GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URL`。如果这次不测试 LinuxDO，记得把 `LINUXDO_CLIENT_ID`、`LINUXDO_CLIENT_SECRET`、`LINUXDO_OAUTH_REDIRECT_URL` 三项都清空；如果要测试 LinuxDO 绑定，则三项必须同时出现。生产若希望未来更换入口/端口时仍保持同一登录 cookie，可额外固定 `OCTORILL_SESSION_COOKIE_NAME`。
+   至少补齐：`OCTORILL_ENCRYPTION_KEY_BASE64`、`GITHUB_CLIENT_ID`、`GITHUB_CLIENT_SECRET`、`GITHUB_OAUTH_REDIRECT_URL`。如果这次不测试 LinuxDO，记得把 `LINUXDO_CLIENT_ID`、`LINUXDO_CLIENT_SECRET`、`LINUXDO_OAUTH_REDIRECT_URL` 三项都清空；如果要测试 LinuxDO 绑定，则三项必须同时出现。根路径公网部署默认固定使用 `octo_rill_sid`；本地多实例或非根路径部署会自动派生隔离 cookie 名，避免互踢登录。
 
 3. 启动后端：
 
