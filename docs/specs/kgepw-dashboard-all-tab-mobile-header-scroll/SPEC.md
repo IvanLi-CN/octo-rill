@@ -59,6 +59,7 @@
 
 - 只新增内部 `data-*` 调试/验证钩子，不扩展公开 props 或 API。
 - 桌面端和其他 Dashboard tabs 保持现有视觉与交互语义。
+- 若排查必须借助线上真实数据，真实响应只允许作为临时本地回放基线；最终进入仓库的 Storybook 场景必须改写为脱敏后的稳定 mock。
 
 ## 功能与行为规格（Functional/Behavior Spec）
 
@@ -78,7 +79,7 @@
 ### Edge cases / errors
 
 - 只有 `全部` tab 长内容、带历史分组和 reaction footer 的场景也必须稳定。
-- 回归验证不能依赖真实后端数据，必须使用稳定 mock / Storybook 场景。
+- 允许先用线上真实响应做临时复现，但正式回归验证不能依赖真实后端数据，必须收敛到稳定 mock / Storybook 场景。
 
 ## 验收标准（Acceptance Criteria）
 
@@ -108,7 +109,8 @@
 
 - Storybook 覆盖：`通过`
 - 视觉证据目标源：`storybook_canvas`
-- 新增 Storybook 入口：`Evidence / Mobile all tab sticky shell`
+- 新增 Storybook 入口：`Mobile Runtime Parity All`
+- 新增 Storybook 入口：`Mobile Runtime Parity Releases`
 - 新增 Verification 入口：`Verification / Mobile all tab sticky shell`
 
 ## 文档更新（Docs to Update）
@@ -124,10 +126,10 @@
   requested_viewport: dashboardMobile390
   viewport_strategy: storybook-viewport
   sensitive_exclusion: N/A
-  submission_gate: pending-owner-approval
-  story_id_or_title: `Pages/Dashboard / Evidence / Mobile all tab sticky shell`
-  state: mobile all-tab shell viewport binding
-  evidence_note: 证明移动端 `全部` tab 长内容场景下，顶部壳层仍贴顶，且修复后的壳层高度链已绑定实时 viewport，不再出现页头意外滑出视口的问题。
+  submission_gate: owner-approved
+  story_id_or_title: `Pages/Dashboard / Mobile Runtime Parity All`
+  state: sanitized runtime-parity all-tab shell
+  evidence_note: 主人已在 IAB 中确认脱敏后的 `Mobile Runtime Parity All` 审阅面“看起来没问题了”。该正式 Story 保留线上 `全部` tab 的长滚动密度与 `release + repo_star_received` 混合结构，但不再携带原始线上响应；原始线上响应只作为临时复现基线保留在本地 scratch，不进入正式仓库资产。
   image:
   ![Dashboard 全部 tab 移动端壳层高度修复证据图](./assets/mobile-all-tab-sticky-shell.png)
 
