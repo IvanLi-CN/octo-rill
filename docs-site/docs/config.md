@@ -13,7 +13,7 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 
 - `OCTORILL_BIND_ADDR`：后端监听地址。默认 `127.0.0.1:58090`。
 - `OCTORILL_PUBLIC_BASE_URL`：前端和 OAuth 等对外使用的基础 URL。默认根据 `OCTORILL_BIND_ADDR` 推导；本地默认是 `http://127.0.0.1:58090`，模板里通常改成前端地址 `http://127.0.0.1:55174` 便于本地联调。
-- Session cookie 名固定为 `octo_rill_sid`，不再提供运行时配置入口。
+- Session cookie 名不再提供运行时配置入口：根路径公网部署固定为 `octo_rill_sid`；本地多实例、非默认端口或非根路径部署会自动派生隔离后缀，避免不同实例互相覆盖登录态。
 - `DATABASE_URL`：数据库连接串。默认 `sqlite:./.data/octo-rill.db`。
 - `OCTORILL_TASK_LOG_DIR`：后台任务日志目录。默认 `.data/task-logs`。
 - `OCTORILL_TASK_WORKERS`：后台任务 worker 数量。默认 `4`，必须是正整数。

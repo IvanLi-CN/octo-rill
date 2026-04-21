@@ -141,7 +141,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .context("failed to bind TCP listener")?;
 
     let is_secure_cookie = config.public_base_url.scheme() == "https";
-    let session_cookie_name = build_session_cookie_name();
+    let session_cookie_name = build_session_cookie_name(&config);
     let session_layer = SessionManagerLayer::new(session_store)
         .with_name(session_cookie_name)
         .with_secure(is_secure_cookie)
@@ -664,8 +664,41 @@ fn accepts_html_document(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.contains("text/html") || value.contains("application/xhtml+xml"))
 }
 
-fn build_session_cookie_name() -> String {
-    "octo_rill_sid".to_owned()
+fn build_session_cookie_name(config: &AppConfig) -> String {
+    let Some(host) = config.public_base_url.host_str() else {
+        return "octo_rill_sid".to_owned();
+    };
+
+    let is_loopback_host = host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    let has_non_root_path = config.public_base_url.path() != "/";
+    let uses_non_default_port = config.public_base_url.port().is_some();
+
+    if !(is_loopback_host || has_non_root_path || uses_non_default_port) {
+        return "octo_rill_sid".to_owned();
+    }
+
+    let raw = format!(
+        "octo_rill_sid_{}_{}_{}",
+        host,
+        config
+            .public_base_url
+            .port_or_known_default()
+            .unwrap_or(config.bind_addr.port()),
+        config.public_base_url.path().trim_matches('/')
+    );
+
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn session_inactivity_expiry() -> Expiry {
@@ -675,11 +708,11 @@ fn session_inactivity_expiry() -> Expiry {
 #[cfg(test)]
 mod tests {
     use super::{
-        SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite, accepts_html_document,
-        api_health, api_version, apply_no_store_headers, attach_static_site_routes,
-        build_session_cookie_name, build_sqlite_connect_options, build_sqlite_pool_options,
-        looks_like_static_asset_path, read_sqlite_runtime_pragmas, session_inactivity_expiry,
-        should_serve_spa_shell,
+        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite,
+        accepts_html_document, api_health, api_version, apply_no_store_headers,
+        attach_static_site_routes, build_session_cookie_name, build_sqlite_connect_options,
+        build_sqlite_pool_options, looks_like_static_asset_path, read_sqlite_runtime_pragmas,
+        session_inactivity_expiry, should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -779,8 +812,56 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_name_is_fixed() {
-        assert_eq!(build_session_cookie_name(), "octo_rill_sid");
+    fn session_cookie_name_is_fixed_for_root_public_origin() {
+        let config = test_config("https://octo-rill.ivanli.cc");
+
+        assert_eq!(build_session_cookie_name(&config), "octo_rill_sid");
+    }
+
+    #[test]
+    fn session_cookie_name_derives_for_loopback_multi_instance_isolation() {
+        let config = test_config("http://127.0.0.1:58090");
+
+        assert_eq!(
+            build_session_cookie_name(&config),
+            "octo_rill_sid_127_0_0_1_58090_"
+        );
+    }
+
+    #[test]
+    fn session_cookie_name_derives_for_non_root_public_path() {
+        let config = test_config("https://example.com/octo-rill");
+
+        assert_eq!(
+            build_session_cookie_name(&config),
+            "octo_rill_sid_example_com_443_octo-rill"
+        );
+    }
+
+    fn test_config(public_base_url: &str) -> AppConfig {
+        AppConfig {
+            bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
+            public_base_url: url::Url::parse(public_base_url).expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: crate::crypto::EncryptionKey::from_base64(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )
+            .expect("build encryption key"),
+            github: crate::config::GitHubOAuthConfig {
+                client_id: "test-client-id".to_owned(),
+                client_secret: "test-client-secret".to_owned(),
+                redirect_url: url::Url::parse("https://octo-rill.ivanli.cc/auth/github/callback")
+                    .expect("parse redirect url"),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+        }
     }
 
     #[tokio::test]
