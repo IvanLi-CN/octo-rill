@@ -93,7 +93,7 @@ function buildPayload(
 					},
 					{
 						task_type: "summarize.release.smart.batch",
-						label: "智能摘要",
+						label: "润色",
 						queued: 3,
 						running: 2,
 						succeeded: 24,
@@ -125,7 +125,7 @@ function buildPayload(
 				},
 				{
 					task_type: "summarize.release.smart.batch",
-					label: "智能摘要",
+					label: "润色",
 					total: 31,
 					share_ratio: 31 / 87,
 					success_rate: 0.923,
@@ -199,7 +199,7 @@ function buildPayload(
 					},
 					{
 						task_type: "summarize.release.smart.batch",
-						label: "智能摘要",
+						label: "润色",
 						queued: 1,
 						running: 1,
 						succeeded: 5,
@@ -231,7 +231,7 @@ function buildPayload(
 				},
 				{
 					task_type: "summarize.release.smart.batch",
-					label: "智能摘要",
+					label: "润色",
 					total: 7,
 					share_ratio: 0.35,
 					success_rate: 1,
@@ -305,7 +305,7 @@ function buildPayload(
 					},
 					{
 						task_type: "summarize.release.smart.batch",
-						label: "智能摘要",
+						label: "润色",
 						queued: 0,
 						running: 0,
 						succeeded: 0,
@@ -388,7 +388,7 @@ function buildPayload(
 				},
 				{
 					task_type: "summarize.release.smart.batch",
-					label: "智能摘要",
+					label: "润色",
 					queued: 1,
 					running: 1,
 					succeeded: 13,
@@ -420,7 +420,7 @@ function buildPayload(
 			},
 			{
 				task_type: "summarize.release.smart.batch",
-				label: "智能摘要",
+				label: "润色",
 				total: 16,
 				share_ratio: 16 / 52,
 				success_rate: 0.929,
@@ -542,7 +542,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"管理后台仪表盘，集中展示用户规模、今日活跃、翻译 / 智能摘要 / 日报任务的实时态势，并支持近 7 天 / 近 30 天预聚合趋势切换。",
+					"管理后台仪表盘，集中展示用户规模、今日活跃、翻译 / 润色 / 日报任务的实时态势，并支持近 7 天 / 近 30 天预聚合趋势切换。",
 			},
 		},
 	},
