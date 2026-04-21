@@ -205,8 +205,11 @@ function topChrome(ui: ReplicaTheme) {
 }
 
 function ReferenceLink(props: AnchorHTMLAttributes<HTMLAnchorElement>) {
+	const { children, href: _href, target: _target, rel: _rel, ...rest } = props;
 	return (
-		<a {...props} rel="noreferrer noopener" tabIndex={-1} target="_blank" />
+		<span {...rest} aria-hidden="true">
+			{children}
+		</span>
 	);
 }
 

@@ -182,7 +182,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 		<div
 			onClickCapture={(event) => {
 				const target = event.target;
-				if (!(target instanceof HTMLElement)) return;
+				if (!(target instanceof Element)) return;
 				const anchor = target.closest<HTMLAnchorElement>(
 					"[data-settings-nav] a[href*='/settings']",
 				);
