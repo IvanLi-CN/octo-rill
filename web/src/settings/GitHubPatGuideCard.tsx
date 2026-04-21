@@ -552,8 +552,8 @@ function MobileReplica({
 				style={{ borderColor: ui.border, backgroundColor: ui.surface }}
 			>
 				<div className="flex items-center gap-3">
-					<button
-						type="button"
+					<span
+						aria-hidden="true"
 						className="inline-flex size-8 items-center justify-center rounded-md border"
 						style={{
 							borderColor: ui.border,
@@ -561,7 +561,7 @@ function MobileReplica({
 						}}
 					>
 						<Menu className="size-4" />
-					</button>
+					</span>
 					<Github className="size-7" />
 					<div className="flex items-center gap-2 text-[14px] font-semibold">
 						<span>…</span>
@@ -570,8 +570,8 @@ function MobileReplica({
 					</div>
 				</div>
 				<div className="flex items-center gap-2">
-					<button
-						type="button"
+					<span
+						aria-hidden="true"
 						className="inline-flex size-8 items-center justify-center rounded-md border"
 						style={{
 							borderColor: ui.border,
@@ -579,7 +579,7 @@ function MobileReplica({
 						}}
 					>
 						<Search className="size-4" />
-					</button>
+					</span>
 					<div
 						className="h-7 w-7 rounded-md"
 						style={{ backgroundColor: ui.topMask }}
@@ -658,10 +658,10 @@ export function GitHubPatGuideCard(props: GitHubPatGuideCardProps) {
 				release feedback. Expiration equals No expiration. Scope repo is
 				checked.
 			</p>
-			<div className="hidden md:block">
+			<div className="hidden lg:block">
 				<DesktopReplica ui={ui} compact={compact} />
 			</div>
-			<div className="md:hidden overflow-x-auto pb-1">
+			<div className="overflow-x-auto pb-1 lg:hidden">
 				<div className="min-w-[390px]">
 					<MobileReplica ui={ui} compact={compact} />
 				</div>
