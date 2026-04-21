@@ -104,6 +104,14 @@ const DASHBOARD_VIEWPORTS = {
 		},
 		type: "mobile",
 	},
+	dashboardTablet853: {
+		name: "Dashboard tablet 853x1280",
+		styles: {
+			height: "1280px",
+			width: "853px",
+		},
+		type: "tablet",
+	},
 	dashboardMobile375: {
 		name: "Dashboard mobile 375x667",
 		styles: {
@@ -158,6 +166,36 @@ function expectNoHorizontalOverflow(element: Element | null, tolerance = 1) {
 function expectLinkWraps(link: HTMLElement) {
 	const styles = window.getComputedStyle(link);
 	expect(styles.overflowWrap).toBe("anywhere");
+}
+
+function expectTabletInlineHeaderLayout(options: {
+	mainRow: HTMLElement | null;
+	leadingBlock: HTMLElement | null;
+	trailingBlock: HTMLElement | null;
+	controlBand: HTMLElement | null;
+}) {
+	const { mainRow, leadingBlock, trailingBlock, controlBand } = options;
+	expect(mainRow).not.toBeNull();
+	expect(leadingBlock).not.toBeNull();
+	expect(trailingBlock).not.toBeNull();
+	expect(controlBand).not.toBeNull();
+	if (!mainRow || !leadingBlock || !trailingBlock || !controlBand) {
+		throw new Error(
+			"Expected header main row, brand block, action cluster, and control band",
+		);
+	}
+
+	const mainRect = mainRow.getBoundingClientRect();
+	const leadingRect = leadingBlock.getBoundingClientRect();
+	const trailingRect = trailingBlock.getBoundingClientRect();
+	const controlBandRect = controlBand.getBoundingClientRect();
+	expect(mainRow.scrollWidth - mainRow.clientWidth).toBeLessThanOrEqual(1);
+	expect(trailingRect.top - mainRect.top).toBeLessThanOrEqual(12);
+	expect(trailingRect.top - leadingRect.top).toBeLessThanOrEqual(12);
+	expect(trailingRect.left).toBeGreaterThanOrEqual(
+		mainRect.left + mainRect.width * 0.5,
+	);
+	expect(controlBandRect.top).toBeGreaterThanOrEqual(mainRect.bottom - 1);
 }
 
 function makeBrief(
@@ -1612,15 +1650,20 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
-	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
 	);
 	const [resolvedDeferredFeedTabs, setResolvedDeferredFeedTabs] = useState<
 		Set<Tab>
 	>(() => new Set<Tab>());
-	const renderSidebarInbox = hasDesktopSidebar;
-	const renderSidebar = tab === "briefs" || renderSidebarInbox;
+	const renderSidebarInbox = hasDesktopSidebarInbox;
+	const renderSidebar =
+		(tab === "briefs" && hasTabletSidebar) || renderSidebarInbox;
+	const dashboardContentLayoutClassName = renderSidebar
+		? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
+		: "grid gap-4 md:gap-6";
 
 	const visibleItems = (mode: "all" | "releases" | "stars" | "followers") => {
 		switch (mode) {
@@ -1869,7 +1912,7 @@ function DashboardPreview(props: {
 						</div>
 					</div>
 
-					<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
+					<div className={dashboardContentLayoutClassName}>
 						<section className="min-w-0">
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
@@ -2066,6 +2109,54 @@ export const Default: Story = {
 		await expect(
 			canvas.queryByRole("button", { name: "日报设置" }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const EvidenceTabletHeaderInline: Story = {
+	name: "Evidence / Tablet Header Inline",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardTablet853",
+			isRotated: false,
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { level: 1, name: "OctoRill" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
+		).toBeVisible();
+		expectTabletInlineHeaderLayout({
+			mainRow: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-header-main-row]",
+			),
+			leadingBlock: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-brand-block]",
+			),
+			trailingBlock: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-primary-actions]",
+			),
+			controlBand: canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-secondary-controls]",
+			),
+		});
+		expect(
+			canvasElement.querySelector("[data-dashboard-sidebar-inbox='true']"),
+		).toBeNull();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"平板 853x1280 证据入口：Dashboard 页头主行保持品牌 / utility actions 同排，tabs 与次级控制区继续作为后续控制带落在下一行，同时 feed 页不再额外显示 Inbox 快捷侧栏列。",
+			},
+		},
 	},
 };
 

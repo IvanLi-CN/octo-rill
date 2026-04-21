@@ -357,6 +357,149 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	).toBeVisible();
 });
 
+test("dashboard keeps header utilities inline on tablet widths", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 853, height: 1280 });
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo-admin",
+					name: "Octo Admin",
+					avatar_url: svgAvatarDataUrl("OA", "#4f6a98"),
+					email: "admin@example.com",
+					is_admin: true,
+				}),
+			);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			return json(route, {
+				items: [
+					{
+						kind: "release",
+						ts: "2026-04-09T08:00:00Z",
+						id: "20001",
+						repo_full_name: "owner/repo",
+						title: "Release 20001",
+						body: "hello",
+						body_truncated: false,
+						subtitle: null,
+						reason: null,
+						subject_type: null,
+						html_url: "https://github.com/owner/repo/releases/tag/v20001",
+						unread: null,
+						translated: null,
+						smart: null,
+						reactions: null,
+					},
+				],
+				next_cursor: null,
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+
+	const actionCluster = page.locator("[data-dashboard-primary-actions]");
+	await expect(
+		actionCluster.getByRole("button", { name: "同步" }),
+	).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-secondary-controls]"),
+	).toBeVisible();
+	await expect(
+		page.locator("[data-dashboard-sidebar-inbox='true']"),
+	).toHaveCount(0);
+
+	const layout = await page.evaluate(() => {
+		const mainRowElement = document.querySelector(
+			"[data-dashboard-header-main-row]",
+		);
+		const brandBlockElement = document.querySelector(
+			"[data-dashboard-brand-block]",
+		);
+		const actionClusterElement = document.querySelector(
+			"[data-dashboard-primary-actions]",
+		);
+		const secondaryControlsElement = document.querySelector(
+			"[data-dashboard-secondary-controls]",
+		);
+		if (
+			!(mainRowElement instanceof HTMLElement) ||
+			!(brandBlockElement instanceof HTMLElement) ||
+			!(actionClusterElement instanceof HTMLElement) ||
+			!(secondaryControlsElement instanceof HTMLElement)
+		) {
+			throw new Error("Expected dashboard header layout anchors");
+		}
+
+		const mainRect = mainRowElement.getBoundingClientRect();
+		const brandRect = brandBlockElement.getBoundingClientRect();
+		const actionRect = actionClusterElement.getBoundingClientRect();
+		const controlsRect = secondaryControlsElement.getBoundingClientRect();
+		return {
+			rowOverflow: mainRowElement.scrollWidth - mainRowElement.clientWidth,
+			actionTopDelta: actionRect.top - mainRect.top,
+			actionVsBrandTopDelta: actionRect.top - brandRect.top,
+			actionLeft: actionRect.left,
+			rowMidpoint: mainRect.left + mainRect.width * 0.5,
+			controlsTop: controlsRect.top,
+			rowBottom: mainRect.bottom,
+		};
+	});
+
+	expect(layout.rowOverflow).toBeLessThanOrEqual(1);
+	expect(layout.actionTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionVsBrandTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionLeft).toBeGreaterThanOrEqual(layout.rowMidpoint);
+	expect(layout.controlsTop).toBeGreaterThanOrEqual(layout.rowBottom - 1);
+});
+
 test.describe("mobile dashboard shell", () => {
 	test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
