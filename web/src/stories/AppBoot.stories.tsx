@@ -76,7 +76,7 @@ export const ColdInit: Story = {
 			canvas.getByText("应用正在完成初始化，请稍候片刻。"),
 		).toBeVisible();
 		await expect(
-			canvas.queryByRole("link", { name: "连接到 GitHub" }),
+			canvas.queryByRole("link", { name: "使用 GitHub 登录" }),
 		).not.toBeInTheDocument();
 		expect(canvasElement.querySelector("[data-app-boot]")).not.toBeNull();
 	},
@@ -111,7 +111,7 @@ export const DashboardWarmSkeleton: Story = {
 			canvas.getByRole("heading", { level: 1, name: "OctoRill" }),
 		).toBeVisible();
 		await expect(
-			canvas.queryByRole("link", { name: "连接到 GitHub" }),
+			canvas.queryByRole("link", { name: "使用 GitHub 登录" }),
 		).not.toBeInTheDocument();
 		await expect(canvas.queryByText("octo-admin")).not.toBeInTheDocument();
 		await expect(

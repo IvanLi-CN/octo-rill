@@ -1,5 +1,6 @@
-import { Compass, Home, LogIn, Settings2 } from "lucide-react";
+import { Compass, Home, Settings2 } from "lucide-react";
 
+import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -86,8 +87,8 @@ export function NotFoundPage(props: {
 									className="rounded-2xl"
 								>
 									<a href="/auth/github/login">
-										<LogIn className="size-4" />
-										连接到 GitHub
+										<AuthProviderIcon provider="github" />
+										使用 GitHub 登录
 									</a>
 								</Button>
 							)}

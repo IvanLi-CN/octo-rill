@@ -20,6 +20,31 @@ function svgAvatarDataUrl(
 	)}`;
 }
 
+const defaultGitHubConnections = [
+	{
+		id: "ghconn_primary",
+		github_user_id: 42,
+		login: "storybook-user",
+		name: "Storybook User",
+		avatar_url: svgAvatarDataUrl("GH", "#111827"),
+		email: "storybook-user@example.com",
+		scopes: "read:user, user:email, notifications, public_repo",
+		linked_at: "2026-04-16T10:00:00+08:00",
+		updated_at: "2026-04-18T09:00:00+08:00",
+	},
+	{
+		id: "ghconn_secondary",
+		github_user_id: 84,
+		login: "storybook-ops",
+		name: "Storybook Ops",
+		avatar_url: svgAvatarDataUrl("OP", "#0f766e"),
+		email: "ops@example.com",
+		scopes: "read:user, user:email, notifications, public_repo",
+		linked_at: "2026-04-17T10:00:00+08:00",
+		updated_at: "2026-04-18T09:05:00+08:00",
+	},
+];
+
 function buildReactionReadyFeedItem(id: string) {
 	return {
 		kind: "release",
@@ -63,15 +88,19 @@ async function installSettingsMocks(
 	options?: {
 		linuxdoAvailable?: boolean;
 		linuxdoConnection?: Record<string, unknown> | null;
+		githubConnections?: typeof defaultGitHubConnections;
 		reactionTokenConfigured?: boolean;
 		reactionTokenMasked?: string | null;
 		reactionTokenState?: "idle" | "valid" | "invalid" | "error";
 		reactionTokenMessage?: string | null;
+		reactionTokenOwnerLogin?: string | null;
 		includeOwnReleases?: boolean;
 		withReactionFeed?: boolean;
 	},
 ) {
 	let includeOwnReleases = options?.includeOwnReleases ?? false;
+	let githubConnections =
+		options?.githubConnections ?? defaultGitHubConnections;
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -109,7 +138,28 @@ async function installSettingsMocks(
 			return json(route, []);
 		}
 
+		if (req.method() === "GET" && pathname === "/api/me/github-connections") {
+			return json(route, { items: githubConnections });
+		}
+
+		if (
+			req.method() === "DELETE" &&
+			pathname.startsWith("/api/me/github-connections/")
+		) {
+			const connectionId = pathname.split("/").at(-1);
+			githubConnections = githubConnections.filter(
+				(connection) => connection.id !== connectionId,
+			);
+			return json(route, { items: githubConnections });
+		}
+
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			const owner = options?.reactionTokenOwnerLogin
+				? githubConnections.find(
+						(connection) =>
+							connection.login === options.reactionTokenOwnerLogin,
+					)
+				: githubConnections[0];
 			return json(route, {
 				configured: options?.reactionTokenConfigured ?? false,
 				masked_token: options?.reactionTokenMasked ?? null,
@@ -117,6 +167,44 @@ async function installSettingsMocks(
 					state: options?.reactionTokenState ?? "idle",
 					message: options?.reactionTokenMessage ?? null,
 					checked_at: "2026-04-18T08:00:00+08:00",
+				},
+				owner: owner
+					? {
+							github_connection_id: owner.id,
+							github_user_id: owner.github_user_id,
+							login: owner.login,
+						}
+					: null,
+			});
+		}
+
+		if (req.method() === "POST" && pathname === "/api/reaction-token/check") {
+			const owner = githubConnections[0];
+			return json(route, {
+				state: "valid",
+				message: `token is valid for @${owner.login}`,
+				owner: {
+					github_connection_id: owner.id,
+					github_user_id: owner.github_user_id,
+					login: owner.login,
+				},
+			});
+		}
+
+		if (req.method() === "PUT" && pathname === "/api/reaction-token") {
+			const owner = githubConnections[0];
+			return json(route, {
+				configured: true,
+				masked_token: options?.reactionTokenMasked ?? "ghp_****_saved",
+				check: {
+					state: "valid",
+					message: `token is valid for @${owner.login}`,
+					checked_at: "2026-04-18T08:00:00+08:00",
+				},
+				owner: {
+					github_connection_id: owner.id,
+					github_user_id: owner.github_user_id,
+					login: owner.login,
 				},
 			});
 		}
@@ -189,12 +277,28 @@ test("dashboard account menu exposes settings entry and opens settings page", as
 	);
 });
 
+test("settings deep link focuses github accounts section", async ({ page }) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-accounts&github=connected");
+
+	await expect(page).toHaveURL(/section=github-accounts/);
+	const section = page.locator('[data-settings-section="github-accounts"]');
+	await expect(section).toContainText("GitHub 账号");
+	await expect(section).toContainText("@storybook-user");
+	await expect(section).toContainText("@storybook-ops");
+	await expect(page.getByAltText("storybook-user avatar")).toBeVisible();
+	await expect(page.getByAltText("storybook-ops avatar")).toBeVisible();
+	await expect(page.getByText("GitHub 账号已绑定")).toBeVisible();
+});
+
 test("settings deep link focuses github pat section", async ({ page }) => {
 	await installSettingsMocks(page, {
 		reactionTokenConfigured: true,
 		reactionTokenMasked: "ghp_****_saved",
 		reactionTokenState: "valid",
-		reactionTokenMessage: "token is valid",
+		reactionTokenMessage: "token is valid for @storybook-ops",
+		reactionTokenOwnerLogin: "storybook-ops",
 	});
 
 	await page.goto("/settings?section=github-pat");
@@ -222,6 +326,7 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(
 		guide.getByRole("button", { name: "No expiration" }),
 	).toBeVisible();
+	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {

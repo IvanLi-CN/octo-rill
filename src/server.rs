@@ -85,6 +85,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .await
         .context("failed to apply database migrations")?;
 
+    state::backfill_github_connections(&pool)
+        .await
+        .context("failed to backfill github connections")?;
+
     let runtime_settings = admin_runtime::load_or_seed_runtime_settings(&pool, &config)
         .await
         .context("failed to load admin runtime settings")?;
@@ -247,6 +251,15 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/me/linuxdo",
             get(api::me_get_linuxdo).delete(api::me_delete_linuxdo),
         )
+        .route(
+            "/me/github-connections",
+            get(api::me_get_github_connections),
+        )
+        .route(
+            "/me/github-connections/{connection_id}",
+            axum::routing::delete(api::me_delete_github_connection),
+        )
+        .route("/auth/bind-context", get(api::auth_get_bind_context))
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
         .route(
@@ -301,6 +314,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     let mut app = Router::new()
         .nest("/api", api_router)
         .route("/auth/github/login", get(auth::github_login))
+        .route("/auth/github/connect", get(auth::github_connect))
         .route("/auth/github/callback", get(auth::github_callback))
         .route("/auth/linuxdo/login", get(auth::linuxdo_login))
         .route("/auth/linuxdo/callback", get(auth::linuxdo_callback))
