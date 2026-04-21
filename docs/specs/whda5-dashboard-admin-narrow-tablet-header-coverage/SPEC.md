@@ -170,10 +170,11 @@
   requested_viewport: `757x827`
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard Header / Regression / Narrow Tablet 757`
   state: `dashboard-header-narrow-tablet-757`
   evidence_note: 验证 `757x827` 主复现宽度下，DashboardHeader 已在 `640–1023px` 合同内切到两列主行，品牌块与 `ThemeToggle / 同步 / avatar` 保持同排。
+  PR: include
   image:
   ![DashboardHeader 窄平板 757 同排证据](./assets/dashboard-header-narrow-tablet-757.png)
 
@@ -183,10 +184,11 @@
   requested_viewport: `757x827`
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Layout/Admin Header / Regression / Narrow Tablet 757`
   state: `admin-header-narrow-tablet-757`
   evidence_note: 验证 AdminHeader 在 `757x827` 下把 utility cluster 固定到右列，`返回前台` 保持可见，长 login 只截断自身。
+  PR: include
   image:
   ![AdminHeader 窄平板 757 同排证据](./assets/admin-header-narrow-tablet-757.png)
 
@@ -196,10 +198,11 @@
   requested_viewport: `757x827`
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard / Regression / Narrow Tablet 757`
   state: `dashboard-page-narrow-tablet-757`
   evidence_note: 验证 Dashboard 页面在 `757x827` 下维持单主列与页头同排合同，且 `Inbox Quick List` 侧栏仍保持隐藏。
+  PR: include
   image:
   ![Dashboard 页面窄平板 757 单主列证据](./assets/dashboard-page-narrow-tablet-757.png)
 
@@ -209,7 +212,7 @@
   requested_viewport: `853x1280`
   viewport_strategy: `storybook-viewport`
   sensitive_exclusion: `N/A`
-  submission_gate: `pending-owner-approval`
+  submission_gate: `approved`
   story_id_or_title: `Pages/Dashboard / Evidence / Tablet Header Inline`
   state: `dashboard-page-tablet-853`
   evidence_note: 保留 `853x1280` canonical tablet 证据，证明原平板口径仍保持页头同排与单主列内容区，不因窄平板 follow-up 回退。
