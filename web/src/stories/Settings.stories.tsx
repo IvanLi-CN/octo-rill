@@ -4,6 +4,7 @@ import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
 import type {
+	GitHubConnectionResponse,
 	LinuxDoConnectionResponse,
 	MeProfileResponse,
 	ReactionTokenStatusResponse,
@@ -80,11 +81,38 @@ function buildMockProfile(): MeProfileResponse {
 	};
 }
 
+const baseGitHubConnections: GitHubConnectionResponse[] = [
+	{
+		id: "ghconn_primary",
+		github_user_id: 42,
+		login: "storybook-user",
+		name: "Storybook User",
+		avatar_url: svgAvatarDataUrl("GH", "#111827"),
+		email: "storybook-user@example.com",
+		scopes: "read:user, user:email, notifications, public_repo",
+		linked_at: "2026-04-16T10:00:00+08:00",
+		updated_at: "2026-04-18T09:00:00+08:00",
+	},
+	{
+		id: "ghconn_secondary",
+		github_user_id: 84,
+		login: "storybook-ops",
+		name: "Storybook Ops",
+		avatar_url: svgAvatarDataUrl("OP", "#0f766e"),
+		email: "ops@example.com",
+		scopes: "read:user, user:email, notifications, public_repo",
+		linked_at: "2026-04-17T10:00:00+08:00",
+		updated_at: "2026-04-18T09:05:00+08:00",
+	},
+];
+
 type SettingsStoryArgs = {
 	section: SettingsSection;
+	githubStatus?: string;
 	linuxdoStatus?: string;
 	linuxdoAvailable: boolean;
 	linuxdoConnection: LinuxDoConnectionResponse | null;
+	githubConnections: GitHubConnectionResponse[];
 	reactionTokenStatus: ReactionTokenStatusResponse;
 	profile: MeProfileResponse;
 	themePreference: ThemePreference;
@@ -95,6 +123,12 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	const originalFetchRef = useRef(globalThis.fetch);
 	const [profile, setProfile] = useState(args.profile);
 	const [section, setSection] = useState(args.section);
+	const [githubConnections, setGitHubConnections] = useState(
+		args.githubConnections,
+	);
+	const [reactionTokenStatus, setReactionTokenStatus] = useState(
+		args.reactionTokenStatus,
+	);
 
 	useEffect(() => {
 		setProfile(args.profile);
@@ -103,6 +137,14 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	useEffect(() => {
 		setSection(args.section);
 	}, [args.section]);
+
+	useEffect(() => {
+		setGitHubConnections(args.githubConnections);
+	}, [args.githubConnections]);
+
+	useEffect(() => {
+		setReactionTokenStatus(args.reactionTokenStatus);
+	}, [args.reactionTokenStatus]);
 
 	globalThis.fetch = async (input, init) => {
 		const requestUrl =
@@ -116,6 +158,20 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 			init?.method ??
 			(typeof input === "object" && "method" in input ? input.method : "GET");
 
+		if (request.pathname === "/api/me/github-connections" && method === "GET") {
+			return jsonResponse({ items: githubConnections });
+		}
+		if (
+			request.pathname.startsWith("/api/me/github-connections/") &&
+			method === "DELETE"
+		) {
+			const connectionId = request.pathname.split("/").at(-1);
+			const nextConnections = githubConnections.filter(
+				(connection) => connection.id !== connectionId,
+			);
+			setGitHubConnections(nextConnections);
+			return jsonResponse({ items: nextConnections });
+		}
 		if (request.pathname === "/api/me/linuxdo" && method === "GET") {
 			return jsonResponse({
 				available: args.linuxdoAvailable,
@@ -141,24 +197,46 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 			return jsonResponse(nextProfile);
 		}
 		if (request.pathname === "/api/reaction-token/status" && method === "GET") {
-			return jsonResponse(args.reactionTokenStatus);
+			return jsonResponse(reactionTokenStatus);
 		}
 		if (request.pathname === "/api/reaction-token/check" && method === "POST") {
+			const owner = githubConnections.at(0)
+				? {
+						github_connection_id: githubConnections[0].id,
+						github_user_id: githubConnections[0].github_user_id,
+						login: githubConnections[0].login,
+					}
+				: null;
 			return jsonResponse({
 				state: "valid",
-				message: "token is valid",
+				message: owner
+					? `token is valid for @${owner.login}`
+					: "token is valid",
+				owner,
 			});
 		}
 		if (request.pathname === "/api/reaction-token" && method === "PUT") {
-			return jsonResponse({
+			const owner = githubConnections.at(0)
+				? {
+						github_connection_id: githubConnections[0].id,
+						github_user_id: githubConnections[0].github_user_id,
+						login: githubConnections[0].login,
+					}
+				: null;
+			const nextStatus: ReactionTokenStatusResponse = {
 				configured: true,
 				masked_token: "ghp_****_storybook_saved",
 				check: {
 					state: "valid",
-					message: "token is valid",
+					message: owner
+						? `token is valid for @${owner.login}`
+						: "token is valid",
 					checked_at: "2026-04-18T08:01:00+08:00",
 				},
-			});
+				owner,
+			};
+			setReactionTokenStatus(nextStatus);
+			return jsonResponse(nextStatus);
 		}
 
 		return jsonResponse(
@@ -202,6 +280,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 					<SettingsPage
 						me={me}
 						section={section}
+						githubStatus={args.githubStatus}
 						linuxdoStatus={args.linuxdoStatus}
 						onSectionChange={setSection}
 						onProfileSaved={() => {}}
@@ -236,14 +315,16 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Settings 页面统一承载 LinuxDO Connect 绑定、我的发布开关、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
+					"Settings 页面统一承载 GitHub 多账号绑定、LinuxDO Connect 绑定、我的发布开关、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
 			},
 		},
 	},
 	args: {
-		section: "linuxdo",
+		section: "github-accounts",
+		githubStatus: "connected",
 		linuxdoAvailable: true,
 		linuxdoConnection: null,
+		githubConnections: baseGitHubConnections,
 		reactionTokenStatus: {
 			configured: false,
 			masked_token: null,
@@ -252,6 +333,7 @@ const meta = {
 				message: null,
 				checked_at: null,
 			},
+			owner: null,
 		},
 		profile: buildMockProfile(),
 		themePreference: "light",
@@ -267,13 +349,13 @@ export const Default: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "账号与偏好" }),
 		).toBeVisible();
-		await expect(canvas.getByText("LinuxDO 绑定")).toBeVisible();
+		await expect(canvas.getByText("GitHub 账号")).toBeVisible();
+		await expect(canvas.getByText("日报设置")).toBeVisible();
 		await expect(canvas.getByText("我的发布")).toBeVisible();
 		await expect(canvas.getByText("GitHub PAT")).toBeVisible();
-		await expect(canvas.getByText("日报设置")).toBeVisible();
-		await expect(
-			canvas.getByRole("button", { name: "Connect LinuxDO" }),
-		).toBeVisible();
+		await expect(canvas.getByText("LinuxDO 绑定")).toBeVisible();
+		await expect(canvas.getByAltText("storybook-user avatar")).toBeVisible();
+		await expect(canvas.getByAltText("storybook-ops avatar")).toBeVisible();
 
 		await userEvent.click(canvas.getByRole("link", { name: "GitHub PAT" }));
 		await expect(canvas.getByTestId("github-pat-guide-card")).toBeVisible();
@@ -288,13 +370,33 @@ export const Default: Story = {
 	},
 };
 
+export const GitHubAccounts: Story = {
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("GitHub 账号已绑定")).toBeVisible();
+		await expect(canvas.getByText("@storybook-user")).toBeVisible();
+		await expect(canvas.getByText("@storybook-ops")).toBeVisible();
+		await expect(canvas.getByAltText("storybook-user avatar")).toBeVisible();
+		await expect(canvas.getByAltText("storybook-ops avatar")).toBeVisible();
+		await expect(canvas.getByRole("button", { name: "解绑" })).toBeVisible();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"深链到 `section=github-accounts` 时，应展示多 GitHub 绑定列表，以及追加绑定 / 解绑入口；所有绑定账号都参与登录、同步与 PAT 校验。",
+			},
+		},
+	},
+};
+
 export const SwitchableSections: Story = {
 	name: "Switchable Sections",
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"用于手动点击四个设置分区的交互式 Story。点击顶部导航即可在 LinuxDO、我的发布、GitHub PAT、日报设置之间切换。",
+					"用于手动点击设置分区的交互式 Story。点击顶部导航即可在 GitHub 账号、LinuxDO、我的发布、GitHub PAT 与日报设置之间切换。",
 			},
 		},
 	},
@@ -310,8 +412,13 @@ export const ConnectedAndConfigured: Story = {
 			masked_token: "ghp_****_storybook",
 			check: {
 				state: "valid",
-				message: "token is valid",
+				message: "token is valid for @storybook-user",
 				checked_at: "2026-04-18T08:00:00+08:00",
+			},
+			owner: {
+				github_connection_id: "ghconn_primary",
+				github_user_id: 42,
+				login: "storybook-user",
 			},
 		},
 	},
@@ -336,13 +443,18 @@ export const DeepLinkedGitHubPat: Story = {
 				message: "PAT 无效或已过期，请重新填写并校验。",
 				checked_at: "2026-04-18T08:02:00+08:00",
 			},
+			owner: {
+				github_connection_id: "ghconn_secondary",
+				github_user_id: 84,
+				login: "storybook-ops",
+			},
 		},
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"深链到 `section=github-pat` 时，页面展示 GitHub classic PAT 的高仿 DOM mock，并直接预填建议值供用户照抄。",
+					"深链到 `section=github-pat` 时，GitHub PAT 区域会被高亮；这里同时覆盖 LinuxDO 未配置、PAT 失效与 PAT owner 展示。",
 			},
 		},
 	},
@@ -370,6 +482,9 @@ export const DeepLinkedGitHubPat: Story = {
 		).toHaveValue("OctoRill release feedback");
 		await expect(
 			within(guide).getByRole("button", { name: "No expiration" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("@storybook-ops", { exact: true }),
 		).toBeVisible();
 		await expect(
 			canvas.getByText("当前环境未配置 LinuxDO Connect，按钮已禁用。"),

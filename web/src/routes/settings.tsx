@@ -10,6 +10,7 @@ export const Route = createFileRoute("/settings")({
 				? normalizeSettingsSection(search.section)
 				: undefined,
 		linuxdo: typeof search.linuxdo === "string" ? search.linuxdo : undefined,
+		github: typeof search.github === "string" ? search.github : undefined,
 	}),
 	pendingMs: 0,
 	pendingMinMs: 200,

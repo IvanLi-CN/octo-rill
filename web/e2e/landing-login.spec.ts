@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 const TECH_HINT_PATTERN =
 	/(?:dev 环境|Vite|\/api 和 \/auth proxy|proxy 到 Rust 后端)/i;
 const LEGACY_COPY_PATTERN =
-	/(?:Start here|为 GitHub Release 阅读而生|使用 GitHub 登录)/i;
+	/(?:Start here|为 GitHub Release 阅读而生|连接你的账号|连接到 GitHub)/i;
 
 async function installLandingApiMocks(
 	page: Page,
@@ -55,9 +55,18 @@ test("landing page shows concise login copy for unauthenticated users", async ({
 
 	await page.goto("/");
 
-	const loginButton = page.getByRole("link", { name: "连接到 GitHub" });
+	const loginButton = page.getByRole("link", { name: "使用 GitHub 登录" });
+	const linuxDoButton = page.getByRole("link", { name: "使用 LinuxDO 登录" });
 	await expect(loginButton).toBeVisible();
+	await expect(linuxDoButton).toBeVisible();
+	await expect(
+		loginButton.locator('[data-auth-provider-icon="github"]'),
+	).toBeVisible();
+	await expect(
+		linuxDoButton.locator('[data-auth-provider-icon="linuxdo"]'),
+	).toBeVisible();
 	await expect(loginButton).toHaveAttribute("href", "/auth/github/login");
+	await expect(linuxDoButton).toHaveAttribute("href", "/auth/linuxdo/login");
 	await expect(
 		page.getByRole("heading", {
 			name: "集中查看与你相关的 GitHub 动态",
@@ -84,8 +93,16 @@ test("landing page keeps boot error visible while dev proxy tip stays hidden", a
 
 	await page.goto("/");
 
-	const loginButton = page.getByRole("link", { name: "连接到 GitHub" });
+	const loginButton = page.getByRole("link", { name: "使用 GitHub 登录" });
+	const linuxDoButton = page.getByRole("link", { name: "使用 LinuxDO 登录" });
 	await expect(loginButton).toBeVisible();
+	await expect(linuxDoButton).toBeVisible();
+	await expect(
+		loginButton.locator('[data-auth-provider-icon="github"]'),
+	).toBeVisible();
+	await expect(
+		linuxDoButton.locator('[data-auth-provider-icon="linuxdo"]'),
+	).toBeVisible();
 	await expect(page.getByText("boot exploded")).toBeVisible();
 	await expect(page.getByText(TECH_HINT_PATTERN)).toHaveCount(0);
 	await expect(page.getByText(LEGACY_COPY_PATTERN)).toHaveCount(0);
@@ -99,8 +116,16 @@ test("landing page keeps the GitHub CTA above the fold on mobile", async ({
 
 	await page.goto("/");
 
-	const loginButton = page.getByRole("link", { name: "连接到 GitHub" });
+	const loginButton = page.getByRole("link", { name: "使用 GitHub 登录" });
+	const linuxDoButton = page.getByRole("link", { name: "使用 LinuxDO 登录" });
 	await expect(loginButton).toBeVisible();
+	await expect(linuxDoButton).toBeVisible();
+	await expect(
+		loginButton.locator('[data-auth-provider-icon="github"]'),
+	).toBeVisible();
+	await expect(
+		linuxDoButton.locator('[data-auth-provider-icon="linuxdo"]'),
+	).toBeVisible();
 
 	const viewport = await page.evaluate(() => ({
 		scrollY: window.scrollY,
@@ -108,7 +133,15 @@ test("landing page keeps the GitHub CTA above the fold on mobile", async ({
 	}));
 	expect(viewport.scrollY).toBe(0);
 
-	const buttonRect = await loginButton.evaluate((element) => {
+	const githubRect = await loginButton.evaluate((element) => {
+		const rect = element.getBoundingClientRect();
+		return {
+			top: rect.top,
+			bottom: rect.bottom,
+			height: rect.height,
+		};
+	});
+	const linuxDoRect = await linuxDoButton.evaluate((element) => {
 		const rect = element.getBoundingClientRect();
 		return {
 			top: rect.top,
@@ -117,7 +150,10 @@ test("landing page keeps the GitHub CTA above the fold on mobile", async ({
 		};
 	});
 
-	expect(buttonRect.top).toBeGreaterThanOrEqual(0);
-	expect(buttonRect.height).toBeGreaterThan(0);
-	expect(buttonRect.bottom).toBeLessThanOrEqual(viewport.height);
+	expect(githubRect.top).toBeGreaterThanOrEqual(0);
+	expect(githubRect.height).toBeGreaterThan(0);
+	expect(githubRect.bottom).toBeLessThanOrEqual(viewport.height);
+	expect(linuxDoRect.top).toBeGreaterThanOrEqual(0);
+	expect(linuxDoRect.height).toBeGreaterThan(0);
+	expect(linuxDoRect.bottom).toBeLessThanOrEqual(viewport.height);
 });

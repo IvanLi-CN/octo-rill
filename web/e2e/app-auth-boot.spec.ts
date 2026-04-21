@@ -351,9 +351,9 @@ test("authenticated bootstrap keeps landing CTA hidden until /api/me resolves", 
 	await page.goto("/", { waitUntil: "domcontentloaded" });
 
 	await expect(page.locator("[data-app-boot]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 	await expect(page.locator("[data-landing-login-card]")).toHaveCount(0);
 	await expect(
 		page.getByText("应用正在完成初始化，请稍候片刻。"),
@@ -363,9 +363,9 @@ test("authenticated bootstrap keeps landing CTA hidden until /api/me resolves", 
 		page.getByRole("heading", { level: 1, name: "OctoRill" }),
 	).toBeVisible();
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 });
 
 test("anonymous bootstrap shows boot surface first and only reveals landing after 401", async ({
@@ -376,17 +376,19 @@ test("anonymous bootstrap shows boot surface first and only reveals landing afte
 		meDelayMs: 900,
 	});
 
-	await page.goto("/");
+	await page.goto("/", { waitUntil: "domcontentloaded" });
 
 	await expect(page.locator("[data-app-boot]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 	await expect(page.locator("[data-landing-login-card]")).toHaveCount(0);
 
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
 	await expect(page.locator("[data-landing-login-card]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 });
 
 test("stale authenticated startup cache is cleared after /api/me returns 401", async ({
@@ -401,7 +403,9 @@ test("stale authenticated startup cache is cleared after /api/me returns 401", a
 	await page.goto("/");
 
 	await expect(page.locator("[data-landing-login-card]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 	await expect
 		.poll(async () =>
 			page.evaluate(() =>
@@ -431,7 +435,9 @@ test("30-day startup seed does not survive transient /api/me failures as logged-
 	await page.goto("/");
 
 	await expect(page.locator("[data-landing-login-card]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 	await expect(page.getByText("boot exploded")).toBeVisible();
 	await expect(page.getByText("Cached Release 10001")).toHaveCount(0);
 });
@@ -442,18 +448,22 @@ test("route-skeleton seed keeps settings on app boot until live auth resolves", 
 	await seedPersistentAuthCache(page);
 	await installAppAuthMocks(page, {
 		meStatus: 401,
-		meDelayMs: 900,
+		meDelayMs: 2000,
 	});
 
 	await page.goto("/settings", { waitUntil: "domcontentloaded" });
 
-	await expect(page.locator("[data-app-boot]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.locator("[data-app-boot], [data-settings-startup-skeleton]"),
+	).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 
 	await expect(page.locator("[data-landing-login-card]")).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 });
 
 test("admin routes do not trust 30-day startup cache for privileged first paint", async ({
@@ -519,7 +529,9 @@ test("logout clears startup cache before redirecting to anonymous landing", asyn
 	await page.getByRole("button", { name: "查看账号信息" }).click();
 	await page.getByRole("link", { name: "退出登录" }).click();
 
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toBeVisible();
 	await expect
 		.poll(async () =>
 			page.evaluate(() =>
@@ -541,9 +553,9 @@ test("dashboard to admin to dashboard stays in SPA mode and does not re-bootstra
 	await expect(
 		page.getByRole("heading", { level: 1, name: "OctoRill" }),
 	).toBeVisible();
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 
 	const navigationEntryCount = await page.evaluate(
 		() => performance.getEntriesByType("navigation").length,
@@ -559,9 +571,9 @@ test("dashboard to admin to dashboard stays in SPA mode and does not re-bootstra
 		page.getByRole("navigation", { name: "管理员导航" }),
 	).toBeVisible();
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 
 	await page.getByRole("link", { name: "返回前台首页" }).click();
 	await expect(page).toHaveURL(/\/$/);
@@ -569,9 +581,9 @@ test("dashboard to admin to dashboard stays in SPA mode and does not re-bootstra
 		page.getByRole("heading", { level: 1, name: "OctoRill" }),
 	).toBeVisible();
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 
 	expect(tracker.getMeCalls()).toBe(1);
 	await expect
@@ -697,9 +709,9 @@ test("warm cache resumes the dashboard shell immediately before the network refr
 	await page.goto("/", { waitUntil: "domcontentloaded" });
 
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
-	await expect(page.getByRole("link", { name: "连接到 GitHub" })).toHaveCount(
-		0,
-	);
+	await expect(
+		page.getByRole("link", { name: "使用 GitHub 登录" }),
+	).toHaveCount(0);
 	await expect(
 		page.locator('[data-dashboard-hydration-source="warm-cache"]'),
 	).toHaveCount(1);
