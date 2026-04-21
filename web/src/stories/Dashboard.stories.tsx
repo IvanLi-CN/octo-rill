@@ -623,6 +623,124 @@ function buildFollowerItem(
 	};
 }
 
+const RUNTIME_PARITY_REPOS = [
+	"acme/rocket",
+	"acme/satellite",
+	"acme/telemetry",
+	"acme/hangar",
+	"acme/fleet",
+	"acme/meridian",
+	"acme/relay",
+	"acme/atlas",
+] as const;
+
+function buildRuntimeParityReleaseItem(index: number): ReleaseFeedItem {
+	const seq = String(index + 1).padStart(2, "0");
+	const repo = RUNTIME_PARITY_REPOS[index % RUNTIME_PARITY_REPOS.length];
+	const repoVisual =
+		index % 3 === 0
+			? repoVisualFixtures.social
+			: index % 3 === 1
+				? repoVisualFixtures.avatar
+				: repoVisualFixtures.text;
+
+	return buildFeedItem(`runtime-parity-release-${seq}`, {
+		ts: `2026-04-${String(20 - Math.floor(index / 6)).padStart(2, "0")}T${String(
+			23 - (index % 6),
+		).padStart(2, "0")}:15:00Z`,
+		repo_full_name: repo,
+		repo_visual: repoVisual,
+		title: `Runtime parity release ${seq}`,
+		body: [
+			`- Release lane ${seq} keeps the mobile shell busy with realistic card heights`,
+			"- Includes translated summary and smart summary blocks",
+			"- Mirrors the long-scroll release density seen on production",
+		].join("\n"),
+		html_url: `https://github.com/${repo}/releases/tag/runtime-parity-${seq}`,
+		translated:
+			index % 5 === 0
+				? {
+						lang: "zh-CN",
+						status: "missing",
+						title: null,
+						summary: null,
+					}
+				: {
+						lang: "zh-CN",
+						status: "ready",
+						title: `运行时对齐发布 ${seq}`,
+						summary: `- 第 ${seq} 条发布保持卡片密度\n- 覆盖移动端长滚动场景`,
+					},
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: `Runtime parity release ${seq} · 版本变化`,
+			summary: `- 模拟生产环境下的长列表滚动\n- 保持 header compact 切换压力`,
+		},
+		reactions: {
+			counts: {
+				plus1: index % 4,
+				laugh: index % 2,
+				heart: (index + 1) % 3,
+				hooray: index % 3,
+				rocket: (index + 2) % 5,
+				eyes: index % 2,
+			},
+			viewer: {
+				plus1: index % 7 === 0,
+				laugh: false,
+				heart: index % 6 === 0,
+				hooray: false,
+				rocket: index % 8 === 0,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	});
+}
+
+function makeRuntimeParityReleasesFeed(): FeedItem[] {
+	return Array.from({ length: 30 }, (_, index) =>
+		buildRuntimeParityReleaseItem(index),
+	);
+}
+
+function makeRuntimeParityAllFeed(): FeedItem[] {
+	const releases = makeRuntimeParityReleasesFeed();
+	const stars = [
+		buildRepoStarItem("runtime-parity-star-01", {
+			ts: "2026-04-20T02:30:44Z",
+			repo_full_name: "acme/runtime-observer",
+			repo_visual: repoVisualFixtures.avatar,
+			html_url: "https://github.com/runtime-observer",
+			actor: {
+				login: "observer-alpha",
+				avatar_url: avatarDataUrl("OA", "#2563eb"),
+				html_url: "https://github.com/observer-alpha",
+			},
+		}),
+		buildRepoStarItem("runtime-parity-star-02", {
+			ts: "2026-04-19T15:36:46Z",
+			repo_full_name: "acme/shell-watch",
+			repo_visual: repoVisualFixtures.text,
+			html_url: "https://github.com/shell-watch",
+			actor: {
+				login: "observer-beta",
+				avatar_url: avatarDataUrl("OB", "#7c3aed"),
+				html_url: "https://github.com/observer-beta",
+			},
+		}),
+	];
+
+	return [
+		...releases.slice(0, 14),
+		stars[0],
+		...releases.slice(14, 27),
+		stars[1],
+		...releases.slice(27),
+	];
+}
+
 function makeMixedSocialFeed(): FeedItem[] {
 	return [
 		...makeMockFeed(),
@@ -2393,6 +2511,56 @@ export const MobileAllTabStickyShell: Story = {
 					compactViewportHeight,
 			),
 		).toBeLessThanOrEqual(1);
+	},
+};
+
+export const MobileRuntimeParityAll: Story = {
+	name: "Mobile Runtime Parity All",
+	render: () => (
+		<DashboardPreview
+			initialTab="all"
+			feedItems={makeRuntimeParityAllFeed()}
+			showFooter={true}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"脱敏后的正式 mock：保留线上 `全部` tab 的长滚动密度与 `release + repo_star_received` 混合结构，用来稳定验证移动端 header shell。",
+			},
+		},
+	},
+};
+
+export const MobileRuntimeParityReleases: Story = {
+	name: "Mobile Runtime Parity Releases",
+	render: () => (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={makeRuntimeParityReleasesFeed()}
+			showFooter={true}
+		/>
+	),
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"脱敏后的正式 mock：对齐线上 `发布` tab 的纯 release 长列表结构，用来和 `全部` tab 做壳层滚动对照。",
+			},
+		},
 	},
 };
 
