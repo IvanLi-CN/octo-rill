@@ -431,9 +431,10 @@ export function Dashboard(props: {
 	);
 	const [notificationsError, setNotificationsError] =
 		useState<DashboardSectionError | null>(null);
-	const hasDesktopSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const initialNotificationBootstrapRef = useRef(
-		hasDesktopSidebar || tab === "inbox",
+		hasDesktopSidebarInbox || tab === "inbox",
 	);
 	const startupBootstrapRequestedRef = useRef(false);
 	const startupSidebarRetriedRef = useRef(false);
@@ -572,10 +573,10 @@ export function Dashboard(props: {
 		await Promise.all([
 			refreshFeed(),
 			refreshSidebar({
-				includeNotifications: hasDesktopSidebar || tab === "inbox",
+				includeNotifications: hasDesktopSidebarInbox || tab === "inbox",
 			}),
 		]);
-	}, [hasDesktopSidebar, refreshFeed, refreshSidebar, tab]);
+	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, tab]);
 
 	const ensureTaskWaiter = useCallback((taskId: string) => {
 		const existing = taskWaitersRef.current.get(taskId);
@@ -707,7 +708,7 @@ export function Dashboard(props: {
 	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
 
 	useEffect(() => {
-		const shouldLoadNotifications = hasDesktopSidebar || tab === "inbox";
+		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
 		if (
 			!shouldLoadNotifications ||
 			notificationsBootstrapRequestedRef.current
@@ -718,7 +719,7 @@ export function Dashboard(props: {
 		void refreshNotifications({ background: tab !== "inbox" }).catch(() => {
 			notificationsBootstrapRequestedRef.current = false;
 		});
-	}, [hasDesktopSidebar, refreshNotifications, tab]);
+	}, [hasDesktopSidebarInbox, refreshNotifications, tab]);
 
 	useEffect(() => {
 		window.localStorage.setItem(PAGE_DEFAULT_LANE_STORAGE_KEY, pageDefaultLane);
@@ -1366,8 +1367,12 @@ export function Dashboard(props: {
 		);
 	}, [setRouteState, tab]);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
-	const renderSidebarInbox = hasDesktopSidebar;
-	const renderSidebar = tab === "briefs" || renderSidebarInbox;
+	const renderSidebarInbox = hasDesktopSidebarInbox;
+	const renderSidebar =
+		(tab === "briefs" && hasTabletSidebar) || renderSidebarInbox;
+	const dashboardContentLayoutClassName = renderSidebar
+		? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
+		: "grid gap-4 md:gap-6";
 
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
@@ -1634,7 +1639,7 @@ export function Dashboard(props: {
 						</div>
 					</div>
 
-					<div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6">
+					<div className={dashboardContentLayoutClassName}>
 						<section className="min-w-0">
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
@@ -1662,7 +1667,7 @@ export function Dashboard(props: {
 									onRetry={() =>
 										void refreshSidebar({
 											includeNotifications:
-												hasDesktopSidebar || tab === "inbox",
+												hasDesktopSidebarInbox || tab === "inbox",
 										})
 									}
 									onOpenRelease={onOpenReleaseDetail}

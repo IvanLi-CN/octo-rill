@@ -78,7 +78,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			<h1 className="sr-only">管理后台</h1>
 			<div
 				className={cn(
-					"flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between",
+					"flex flex-col gap-2 md:grid md:grid-cols-[minmax(0,1fr)_auto] md:items-start md:gap-x-4 md:gap-y-2 lg:flex lg:flex-row lg:items-center lg:justify-between",
 					!disableHeaderMotion &&
 						"motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out",
 				)}
@@ -89,6 +89,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							}
 						: undefined
 				}
+				data-admin-header-main-row
 			>
 				<div
 					className={cn(
@@ -103,6 +104,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 								}
 							: undefined
 					}
+					data-admin-nav-block
 				>
 					<div
 						className={cn(
@@ -214,6 +216,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 						disableHeaderMotion && "transition-none",
+						"md:justify-self-end md:self-start",
 					)}
 					style={
 						isMobileViewport
@@ -222,6 +225,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 								}
 							: undefined
 					}
+					data-admin-primary-actions
 				>
 					<div
 						style={
@@ -247,7 +251,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						variant="outline"
 						size="sm"
 						className={cn(
-							"mr-2 h-8 px-2",
+							"mr-0 h-8 px-2 lg:mr-2",
 							!disableHeaderMotion &&
 								"motion-safe:transition-[height,padding,margin,transform] motion-safe:duration-200 motion-safe:ease-out",
 							disableHeaderMotion && "transition-none",
@@ -273,7 +277,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					</Button>
 					<div
 						className={cn(
-							"flex items-center gap-1",
+							"flex min-w-0 items-center gap-1",
 							useMobileCompact && "gap-0.5",
 						)}
 						style={
@@ -286,7 +290,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 					>
 						<span
 							className={cn(
-								"text-muted-foreground text-sm",
+								"text-muted-foreground min-w-0 max-w-[8.5rem] truncate text-sm md:max-w-[10rem] lg:max-w-none",
 								!disableHeaderMotion &&
 									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
 								disableHeaderMotion && "transition-none",
