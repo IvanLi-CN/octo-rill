@@ -266,7 +266,9 @@ fn current_llm_call_context() -> Option<LlmCallContext> {
 }
 
 fn llm_source_uses_translation_empty_content_retry_budget(source: &str) -> bool {
-    source.starts_with("translation.scheduler.") || source.starts_with("api.translate_")
+    let normalized_source = source.strip_prefix("job.").unwrap_or(source);
+    normalized_source.starts_with("translation.scheduler.")
+        || normalized_source.starts_with("api.translate_")
 }
 
 fn ai_error_is_missing_content(err: &anyhow::Error) -> bool {
@@ -6051,6 +6053,73 @@ mod tests {
             i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
         );
         assert_eq!(row.get::<Option<String>, _>("response_text"), None);
+        assert_eq!(
+            row.get::<Option<String>, _>("error_text"),
+            Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_extends_empty_content_budget_for_queued_api_translation_sources() {
+        let seen_attempts = Arc::new(AtomicUsize::new(0));
+        let route_attempts = Arc::clone(&seen_attempts);
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let route_attempts = Arc::clone(&route_attempts);
+                async move {
+                    route_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "choices": [{
+                                "message": { "content": "" }
+                            }]
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let context = LlmCallContext {
+            source: "job.api.translate_release".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+            parent_task_type: None,
+            parent_translation_batch_id: None,
+        };
+
+        let err = with_llm_call_context(context, async {
+            chat_completion(state.as_ref(), "system", "user", 128).await
+        })
+        .await
+        .expect_err("queued api translate source should inherit the 8-attempt budget");
+
+        assert_eq!(err.to_string(), AI_RESPONSE_MISSING_CONTENT_ERROR);
+        assert_eq!(
+            seen_attempts.load(Ordering::SeqCst),
+            LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS
+        );
+
+        let row = sqlx::query(
+            r#"
+            SELECT source, status, attempt_count, error_text
+            FROM llm_calls
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_one(&state.pool)
+        .await
+        .expect("load llm call");
+
+        assert_eq!(row.get::<String, _>("source"), "job.api.translate_release");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(
+            row.get::<i64, _>("attempt_count"),
+            i64::try_from(LLM_TRANSLATION_EMPTY_CONTENT_MAX_ATTEMPTS).unwrap_or(i64::MAX)
+        );
         assert_eq!(
             row.get::<Option<String>, _>("error_text"),
             Some(AI_RESPONSE_MISSING_CONTENT_ERROR.to_owned())
