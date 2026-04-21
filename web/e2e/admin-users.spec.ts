@@ -18,6 +18,7 @@ type MockUser = {
 
 const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
 const STANDARD_USER_ID = "3g5n8q2r4y7d9w3b";
+const LONG_ADMIN_LOGIN = "storybook-admin-with-a-very-long-login-name";
 
 test.describe.configure({ mode: "serial" });
 
@@ -58,14 +59,16 @@ async function installBaseMocks(
 		adminApiForbidden?: boolean;
 		patchMode?: "ok" | "conflict_last_admin";
 		extraUsers?: number;
+		currentUserLogin?: string;
 	},
 ) {
 	let currentUserIsAdmin = options.isAdmin;
+	const currentUserLogin = options.currentUserLogin ?? "octo-admin";
 	const users: MockUser[] = [
 		{
 			id: CURRENT_USER_ID,
 			github_user_id: 10,
-			login: "octo-admin",
+			login: currentUserLogin,
 			name: "Octo Admin",
 			avatar_url: null,
 			email: "admin@example.com",
@@ -116,7 +119,7 @@ async function installBaseMocks(
 				buildMockMeResponse({
 					id: CURRENT_USER_ID,
 					github_user_id: 10,
-					login: "octo-admin",
+					login: currentUserLogin,
 					name: "Octo Admin",
 					avatar_url: null,
 					email: "admin@example.com",
@@ -297,6 +300,9 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 
 	await page.getByRole("link", { name: "管理员面板" }).click();
 	await expect(page).toHaveURL(/\/admin$/);
+	await expect(page.locator("[data-admin-header-main-row]")).toBeVisible({
+		timeout: 10_000,
+	});
 	await expect(
 		page.getByRole("navigation", { name: "管理员导航" }),
 	).toBeVisible();
@@ -421,47 +427,74 @@ test("non-admin user cannot stay on admin route", async ({ page }) => {
 test("admin panel keeps header utilities inline on tablet widths", async ({
 	page,
 }) => {
-	await page.setViewportSize({ width: 853, height: 1280 });
-	await installBaseMocks(page, { isAdmin: true, extraUsers: 10 });
-	await page.goto("/admin");
-
-	await expect(
-		page.getByRole("navigation", { name: "管理员导航" }),
-	).toBeVisible();
-	await expect(page.getByRole("link", { name: "返回前台首页" })).toBeVisible();
-
-	const layout = await page.evaluate(() => {
-		const mainRowElement = document.querySelector(
-			"[data-admin-header-main-row]",
-		);
-		const navBlockElement = document.querySelector("[data-admin-nav-block]");
-		const actionClusterElement = document.querySelector(
-			"[data-admin-primary-actions]",
-		);
-		if (
-			!(mainRowElement instanceof HTMLElement) ||
-			!(navBlockElement instanceof HTMLElement) ||
-			!(actionClusterElement instanceof HTMLElement)
-		) {
-			throw new Error("Expected admin header layout anchors");
-		}
-
-		const mainRect = mainRowElement.getBoundingClientRect();
-		const navRect = navBlockElement.getBoundingClientRect();
-		const actionRect = actionClusterElement.getBoundingClientRect();
-		return {
-			rowOverflow: mainRowElement.scrollWidth - mainRowElement.clientWidth,
-			actionTopDelta: actionRect.top - mainRect.top,
-			actionVsNavTopDelta: actionRect.top - navRect.top,
-			actionLeft: actionRect.left,
-			rowMidpoint: mainRect.left + mainRect.width * 0.5,
-		};
+	await installBaseMocks(page, {
+		isAdmin: true,
+		extraUsers: 10,
+		currentUserLogin: LONG_ADMIN_LOGIN,
 	});
 
-	expect(layout.rowOverflow).toBeLessThanOrEqual(1);
-	expect(layout.actionTopDelta).toBeLessThanOrEqual(12);
-	expect(layout.actionVsNavTopDelta).toBeLessThanOrEqual(12);
-	expect(layout.actionLeft).toBeGreaterThanOrEqual(layout.rowMidpoint);
+	for (const viewport of [
+		{ width: 640, height: 960 },
+		{ width: 757, height: 827 },
+		{ width: 853, height: 1280 },
+		{ width: 1023, height: 1280 },
+	]) {
+		await test.step(`${viewport.width}x${viewport.height}`, async () => {
+			await page.setViewportSize(viewport);
+			await page.goto("/admin");
+
+			await expect(
+				page.getByRole("navigation", { name: "管理员导航" }),
+			).toBeVisible();
+			await expect(
+				page.getByRole("link", { name: "返回前台首页" }),
+			).toBeVisible();
+
+			const layout = await page.evaluate(() => {
+				const mainRowElement = document.querySelector(
+					"[data-admin-header-main-row]",
+				);
+				const navBlockElement = document.querySelector(
+					"[data-admin-nav-block]",
+				);
+				const actionClusterElement = document.querySelector(
+					"[data-admin-primary-actions]",
+				);
+				const loginLabelElement = document.querySelector(
+					"[data-admin-login-label]",
+				);
+				if (
+					!(mainRowElement instanceof HTMLElement) ||
+					!(navBlockElement instanceof HTMLElement) ||
+					!(actionClusterElement instanceof HTMLElement) ||
+					!(loginLabelElement instanceof HTMLElement)
+				) {
+					throw new Error("Expected admin header layout anchors");
+				}
+
+				const mainRect = mainRowElement.getBoundingClientRect();
+				const navRect = navBlockElement.getBoundingClientRect();
+				const actionRect = actionClusterElement.getBoundingClientRect();
+				const loginRect = loginLabelElement.getBoundingClientRect();
+				return {
+					rowOverflow: mainRowElement.scrollWidth - mainRowElement.clientWidth,
+					actionTopDelta: actionRect.top - mainRect.top,
+					actionVsNavTopDelta: actionRect.top - navRect.top,
+					actionRight: actionRect.right,
+					rowRightGap: mainRect.right - actionRect.right,
+					loginRight: loginRect.right,
+					rowRight: mainRect.right,
+				};
+			});
+
+			expect(layout.rowOverflow).toBeLessThanOrEqual(1);
+			expect(layout.actionTopDelta).toBeLessThanOrEqual(12);
+			expect(layout.actionVsNavTopDelta).toBeLessThanOrEqual(12);
+			expect(layout.actionRight).toBeLessThanOrEqual(layout.rowRight + 1);
+			expect(layout.rowRightGap).toBeLessThanOrEqual(12);
+			expect(layout.loginRight).toBeLessThanOrEqual(layout.rowRight + 1);
+		});
+	}
 });
 
 test.describe("mobile admin shell", () => {

@@ -6,11 +6,35 @@ import { AdminHeader } from "@/layout/AdminHeader";
 
 const ADMIN_HEADER_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
+	adminHeaderNarrowTablet640: {
+		name: "Admin header narrow tablet 640x960",
+		styles: {
+			height: "960px",
+			width: "640px",
+		},
+		type: "tablet",
+	},
+	adminHeaderNarrowTablet757: {
+		name: "Admin header narrow tablet 757x827",
+		styles: {
+			height: "827px",
+			width: "757px",
+		},
+		type: "tablet",
+	},
 	adminHeaderTablet853: {
 		name: "Admin header tablet 853x1280",
 		styles: {
 			height: "1280px",
 			width: "853px",
+		},
+		type: "tablet",
+	},
+	adminHeaderTablet1023: {
+		name: "Admin header tablet 1023x1280",
+		styles: {
+			height: "1280px",
+			width: "1023px",
 		},
 		type: "tablet",
 	},
@@ -38,9 +62,8 @@ function expectTabletInlineLayout(options: {
 	expect(mainRow.scrollWidth - mainRow.clientWidth).toBeLessThanOrEqual(1);
 	expect(trailingRect.top - mainRect.top).toBeLessThanOrEqual(12);
 	expect(trailingRect.top - leadingRect.top).toBeLessThanOrEqual(12);
-	expect(trailingRect.left).toBeGreaterThanOrEqual(
-		mainRect.left + mainRect.width * 0.5,
-	);
+	expect(trailingRect.right).toBeLessThanOrEqual(mainRect.right + 1);
+	expect(mainRect.right - trailingRect.right).toBeLessThanOrEqual(12);
 	if (loginLabel) {
 		const loginRect = loginLabel.getBoundingClientRect();
 		expect(loginRect.right).toBeLessThanOrEqual(mainRect.right + 1);
@@ -123,7 +146,6 @@ export const EvidenceTabletInline: Story = {
 		await expect(
 			canvas.getByRole("link", { name: "返回前台首页" }),
 		).toBeVisible();
-		const loginLabel = canvas.getByText(LONG_LOGIN);
 		expectTabletInlineLayout({
 			mainRow: canvasElement.querySelector<HTMLElement>(
 				"[data-admin-header-main-row]",
@@ -134,7 +156,9 @@ export const EvidenceTabletInline: Story = {
 			trailingBlock: canvasElement.querySelector<HTMLElement>(
 				"[data-admin-primary-actions]",
 			),
-			loginLabel,
+			loginLabel: canvasElement.querySelector<HTMLElement>(
+				"[data-admin-login-label]",
+			),
 		});
 	},
 	parameters: {
@@ -142,6 +166,78 @@ export const EvidenceTabletInline: Story = {
 			description: {
 				story:
 					"平板 853x1280 证据入口：utility actions 必须固定在品牌 / 导航块右侧，长 login 只能截断自身，不能把 `返回前台` 挤出视口。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet640: Story = {
+	name: "Regression / Narrow Tablet 640",
+	args: {
+		user: {
+			login: LONG_LOGIN,
+		},
+	},
+	globals: {
+		viewport: {
+			value: "adminHeaderNarrowTablet640",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"640x960 回归入口：窄平板起点必须保持 utility actions 与品牌 / 导航块同排，长 login 只允许自身截断。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet757: Story = {
+	name: "Regression / Narrow Tablet 757",
+	args: {
+		user: {
+			login: LONG_LOGIN,
+		},
+	},
+	globals: {
+		viewport: {
+			value: "adminHeaderNarrowTablet757",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"757x827 主回归入口：对应窄平板主复现宽度，`返回前台` 与退出动作不能被长 login 挤出可视区。",
+			},
+		},
+	},
+};
+
+export const RegressionTablet1023: Story = {
+	name: "Regression / Tablet 1023",
+	args: {
+		user: {
+			login: LONG_LOGIN,
+		},
+	},
+	globals: {
+		viewport: {
+			value: "adminHeaderTablet1023",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"1023x1280 上边界入口：在进入桌面语义前，Admin utility cluster 仍需稳定贴在右列。",
 			},
 		},
 	},

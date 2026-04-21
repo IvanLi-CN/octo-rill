@@ -78,7 +78,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 			<h1 className="sr-only">管理后台</h1>
 			<div
 				className={cn(
-					"flex flex-col gap-2 md:grid md:grid-cols-[minmax(0,1fr)_auto] md:items-start md:gap-x-4 md:gap-y-2 lg:flex lg:flex-row lg:items-center lg:justify-between",
+					"flex flex-col gap-2 sm:grid sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start sm:gap-x-4 sm:gap-y-2 lg:flex lg:flex-row lg:items-center lg:justify-between",
 					!disableHeaderMotion &&
 						"motion-safe:transition-[gap,transform] motion-safe:duration-200 motion-safe:ease-out",
 				)}
@@ -216,7 +216,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						!disableHeaderMotion &&
 							"motion-safe:transition-[gap] motion-safe:duration-200 motion-safe:ease-out",
 						disableHeaderMotion && "transition-none",
-						"md:justify-self-end md:self-start",
+						"sm:justify-self-end sm:self-start",
 					)}
 					style={
 						isMobileViewport
@@ -289,8 +289,9 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 						}
 					>
 						<span
+							data-admin-login-label
 							className={cn(
-								"text-muted-foreground min-w-0 max-w-[8.5rem] truncate text-sm md:max-w-[10rem] lg:max-w-none",
+								"text-muted-foreground min-w-0 max-w-[8.5rem] truncate text-sm sm:max-w-[10rem] lg:max-w-none",
 								!disableHeaderMotion &&
 									"motion-safe:transition-[font-size,transform] motion-safe:duration-200 motion-safe:ease-out",
 								disableHeaderMotion && "transition-none",
