@@ -418,6 +418,52 @@ test("non-admin user cannot stay on admin route", async ({ page }) => {
 	await expect(page.getByRole("heading", { name: "用户管理" })).toHaveCount(0);
 });
 
+test("admin panel keeps header utilities inline on tablet widths", async ({
+	page,
+}) => {
+	await page.setViewportSize({ width: 853, height: 1280 });
+	await installBaseMocks(page, { isAdmin: true, extraUsers: 10 });
+	await page.goto("/admin");
+
+	await expect(
+		page.getByRole("navigation", { name: "管理员导航" }),
+	).toBeVisible();
+	await expect(page.getByRole("link", { name: "返回前台首页" })).toBeVisible();
+
+	const layout = await page.evaluate(() => {
+		const mainRowElement = document.querySelector(
+			"[data-admin-header-main-row]",
+		);
+		const navBlockElement = document.querySelector("[data-admin-nav-block]");
+		const actionClusterElement = document.querySelector(
+			"[data-admin-primary-actions]",
+		);
+		if (
+			!(mainRowElement instanceof HTMLElement) ||
+			!(navBlockElement instanceof HTMLElement) ||
+			!(actionClusterElement instanceof HTMLElement)
+		) {
+			throw new Error("Expected admin header layout anchors");
+		}
+
+		const mainRect = mainRowElement.getBoundingClientRect();
+		const navRect = navBlockElement.getBoundingClientRect();
+		const actionRect = actionClusterElement.getBoundingClientRect();
+		return {
+			rowOverflow: mainRowElement.scrollWidth - mainRowElement.clientWidth,
+			actionTopDelta: actionRect.top - mainRect.top,
+			actionVsNavTopDelta: actionRect.top - navRect.top,
+			actionLeft: actionRect.left,
+			rowMidpoint: mainRect.left + mainRect.width * 0.5,
+		};
+	});
+
+	expect(layout.rowOverflow).toBeLessThanOrEqual(1);
+	expect(layout.actionTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionVsNavTopDelta).toBeLessThanOrEqual(12);
+	expect(layout.actionLeft).toBeGreaterThanOrEqual(layout.rowMidpoint);
+});
+
 test.describe("mobile admin shell", () => {
 	test.use({ viewport: { width: 390, height: 844 } });
 
