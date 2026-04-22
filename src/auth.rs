@@ -11,10 +11,30 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, Transaction};
 use tower_sessions::Session;
 use tracing::info;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, DiscoverableKey, PublicKeyCredential, RegisterPublicKeyCredential,
+    RequestChallengeResponse,
+};
 
 use crate::{
-    api::require_active_user_id, briefs, config::AppConfig, crypto::EncryptedSecret,
-    error::ApiError, github, linuxdo, local_id, state::AppState,
+    api::require_active_user_id,
+    briefs,
+    config::AppConfig,
+    crypto::EncryptedSecret,
+    error::ApiError,
+    github, linuxdo, local_id,
+    passkeys::{
+        AttachPendingPasskeyOutcome, PendingPasskeyAuthenticationSession,
+        PendingPasskeyCredentialSession, PendingPasskeyRegistrationMode,
+        PendingPasskeyRegistrationSession, SESSION_KEY_PENDING_PASSKEY_AUTHENTICATION,
+        SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, SESSION_KEY_PENDING_PASSKEY_REGISTRATION,
+        attach_pending_passkey_to_user, build_passkey_label, encode_credential_id,
+        generate_user_handle_uuid, load_passkeys, load_user_id_by_user_handle,
+        mark_passkey_authentication_used, parse_user_handle_uuid,
+        pending_passkey_authentication_is_expired, pending_passkey_bind_is_expired,
+        pending_passkey_registration_is_expired, user_has_github_connection,
+    },
+    state::AppState,
 };
 
 const SESSION_KEY_OAUTH_STATE: &str = "oauth_state";
@@ -459,6 +479,7 @@ fn settings_redirect(
     section: &str,
     github_status: Option<&str>,
     linuxdo_status: Option<&str>,
+    passkey_status: Option<&str>,
 ) -> String {
     let mut url = config
         .public_base_url
@@ -475,19 +496,49 @@ fn settings_redirect(
         if let Some(status) = linuxdo_status {
             pairs.append_pair("linuxdo", status);
         }
+        if let Some(status) = passkey_status {
+            pairs.append_pair("passkey", status);
+        }
     }
     url.into()
 }
 
-fn bind_github_redirect(config: &AppConfig, linuxdo_status: Option<&str>) -> String {
+fn bind_github_redirect(
+    config: &AppConfig,
+    linuxdo_status: Option<&str>,
+    passkey_status: Option<&str>,
+) -> String {
     let mut url = config
         .public_base_url
         .join("bind/github")
         .expect("bind route should join public base url");
-    if let Some(status) = linuxdo_status {
-        url.query_pairs_mut().append_pair("linuxdo", status);
+    {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(status) = linuxdo_status {
+            pairs.append_pair("linuxdo", status);
+        }
+        if let Some(status) = passkey_status {
+            pairs.append_pair("passkey", status);
+        }
     }
     url.into()
+}
+
+fn provisional_passkey_user_name(user_handle_uuid: &str) -> String {
+    let suffix = user_handle_uuid.chars().take(8).collect::<String>();
+    format!("passkey-{suffix}")
+}
+
+async fn clear_pending_passkey_registration(session: &Session) {
+    let _ = session
+        .remove::<PendingPasskeyRegistrationSession>(SESSION_KEY_PENDING_PASSKEY_REGISTRATION)
+        .await;
+}
+
+async fn clear_pending_passkey_authentication(session: &Session) {
+    let _ = session
+        .remove::<PendingPasskeyAuthenticationSession>(SESSION_KEY_PENDING_PASSKEY_AUTHENTICATION)
+        .await;
 }
 
 async fn upsert_linuxdo_connection_record(
@@ -592,12 +643,31 @@ async fn finalize_github_auth(
         .get::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
         .await
         .map_err(ApiError::internal)?;
+    let mut passkey_status_after_login: Option<&'static str> = None;
+    let pending_passkey = session
+        .get::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+        .await
+        .map_err(ApiError::internal)?;
+    let pending_passkey = if let Some(pending_passkey) = pending_passkey {
+        if pending_passkey_bind_is_expired(&pending_passkey) {
+            let _ = session
+                .remove::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+                .await;
+            passkey_status_after_login = Some("expired");
+            None
+        } else {
+            Some(pending_passkey)
+        }
+    } else {
+        None
+    };
     let session_user_id = session
         .get::<String>(SESSION_KEY_USER_ID)
         .await
         .map_err(ApiError::internal)?;
     let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     let mut login_user_after_commit: Option<String> = None;
+    let mut consume_pending_passkey = false;
 
     let effective_mode = if requested_mode.as_deref() == Some(GITHUB_OAUTH_MODE_CONNECT)
         || (session_user_id.is_some() && pending_linuxdo.is_none())
@@ -644,9 +714,13 @@ async fn finalize_github_auth(
             .await;
 
             match connection {
-                Ok(()) => {
-                    settings_redirect(&state.config, "github-accounts", Some("connected"), None)
-                }
+                Ok(()) => settings_redirect(
+                    &state.config,
+                    "github-accounts",
+                    Some("connected"),
+                    None,
+                    None,
+                ),
                 Err(err) if err.code() == "github_already_bound" => {
                     let _ = tx.rollback().await;
                     return Ok(Redirect::to(
@@ -654,6 +728,7 @@ async fn finalize_github_auth(
                             &state.config,
                             "github-accounts",
                             Some("already_bound"),
+                            None,
                             None,
                         )
                         .as_str(),
@@ -717,13 +792,18 @@ async fn finalize_github_auth(
                 Err(err) if err.code() == "github_already_bound" => {
                     let _ = tx.rollback().await;
                     let redirect = if pending_linuxdo.is_some() {
-                        bind_github_redirect(&state.config, Some("github_already_bound"))
+                        bind_github_redirect(
+                            &state.config,
+                            Some("github_already_bound"),
+                            passkey_status_after_login,
+                        )
                     } else {
                         settings_redirect(
                             &state.config,
                             "github-accounts",
                             Some("already_bound"),
                             None,
+                            passkey_status_after_login,
                         )
                     };
                     return Ok(Redirect::to(redirect.as_str()));
@@ -731,6 +811,29 @@ async fn finalize_github_auth(
                 Err(err) => {
                     let _ = tx.rollback().await;
                     return Err(err);
+                }
+            }
+
+            if let Some(pending_passkey) = pending_passkey.as_ref() {
+                match attach_pending_passkey_to_user(
+                    &mut tx,
+                    target_user_id.as_str(),
+                    pending_passkey,
+                )
+                .await?
+                {
+                    AttachPendingPasskeyOutcome::Attached
+                    | AttachPendingPasskeyOutcome::AlreadyExists => {
+                        consume_pending_passkey = true;
+                    }
+                    AttachPendingPasskeyOutcome::AlreadyBound => {
+                        consume_pending_passkey = true;
+                        passkey_status_after_login = Some("passkey_already_bound");
+                    }
+                    AttachPendingPasskeyOutcome::RetryRequired => {
+                        consume_pending_passkey = true;
+                        passkey_status_after_login = Some("passkey_retry_required");
+                    }
                 }
             }
 
@@ -745,7 +848,12 @@ async fn finalize_github_auth(
             {
                 let _ = tx.rollback().await;
                 return Ok(Redirect::to(
-                    bind_github_redirect(&state.config, Some(err.code())).as_str(),
+                    bind_github_redirect(
+                        &state.config,
+                        Some(err.code()),
+                        passkey_status_after_login,
+                    )
+                    .as_str(),
                 ));
             }
 
@@ -756,7 +864,10 @@ async fn finalize_github_auth(
                     "github-accounts",
                     Some("connected"),
                     Some("connected"),
+                    passkey_status_after_login,
                 )
+            } else if let Some(passkey_status) = passkey_status_after_login {
+                settings_redirect(&state.config, "passkeys", None, None, Some(passkey_status))
             } else {
                 state.config.public_base_url.to_string()
             }
@@ -773,6 +884,11 @@ async fn finalize_github_auth(
     let _ = session
         .remove::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
         .await;
+    if consume_pending_passkey {
+        let _ = session
+            .remove::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+            .await;
+    }
 
     info!(login = %user.login, github_user_id = user.id, "github auth ok");
     Ok(Redirect::to(redirect.as_str()))
@@ -949,9 +1065,9 @@ pub async fn linuxdo_callback(
         .map_err(ApiError::internal)?;
     let Some(client) = state.linuxdo_oauth.as_ref() else {
         let redirect = if session_user_id.is_some() {
-            settings_redirect(&state.config, "linuxdo", None, Some("not_configured"))
+            settings_redirect(&state.config, "linuxdo", None, Some("not_configured"), None)
         } else {
-            bind_github_redirect(&state.config, Some("not_configured"))
+            bind_github_redirect(&state.config, Some("not_configured"), None)
         };
         return Ok(Redirect::to(redirect.as_str()));
     };
@@ -965,9 +1081,9 @@ pub async fn linuxdo_callback(
         .await;
     if expected_state.as_deref() != Some(query.state.as_str()) {
         let redirect = if session_user_id.is_some() {
-            settings_redirect(&state.config, "linuxdo", None, Some("state_mismatch"))
+            settings_redirect(&state.config, "linuxdo", None, Some("state_mismatch"), None)
         } else {
-            bind_github_redirect(&state.config, Some("state_mismatch"))
+            bind_github_redirect(&state.config, Some("state_mismatch"), None)
         };
         return Ok(Redirect::to(redirect.as_str()));
     }
@@ -981,9 +1097,15 @@ pub async fn linuxdo_callback(
         Err(err) => {
             tracing::warn!(error = %err, "linuxdo oauth token exchange failed");
             let redirect = if session_user_id.is_some() {
-                settings_redirect(&state.config, "linuxdo", None, Some("exchange_failed"))
+                settings_redirect(
+                    &state.config,
+                    "linuxdo",
+                    None,
+                    Some("exchange_failed"),
+                    None,
+                )
             } else {
-                bind_github_redirect(&state.config, Some("exchange_failed"))
+                bind_github_redirect(&state.config, Some("exchange_failed"), None)
             };
             return Ok(Redirect::to(redirect.as_str()));
         }
@@ -995,9 +1117,15 @@ pub async fn linuxdo_callback(
         Err(err) => {
             tracing::warn!(error = %err, "failed to fetch linuxdo user");
             let redirect = if session_user_id.is_some() {
-                settings_redirect(&state.config, "linuxdo", None, Some("fetch_user_failed"))
+                settings_redirect(
+                    &state.config,
+                    "linuxdo",
+                    None,
+                    Some("fetch_user_failed"),
+                    None,
+                )
             } else {
-                bind_github_redirect(&state.config, Some("fetch_user_failed"))
+                bind_github_redirect(&state.config, Some("fetch_user_failed"), None)
             };
             return Ok(Redirect::to(redirect.as_str()));
         }
@@ -1051,13 +1179,15 @@ pub async fn linuxdo_callback(
             Ok(()) => {
                 tx.commit().await.map_err(ApiError::internal)?;
                 return Ok(Redirect::to(
-                    settings_redirect(&state.config, "linuxdo", None, Some("connected")).as_str(),
+                    settings_redirect(&state.config, "linuxdo", None, Some("connected"), None)
+                        .as_str(),
                 ));
             }
             Err(err) => {
                 let _ = tx.rollback().await;
                 return Ok(Redirect::to(
-                    settings_redirect(&state.config, "linuxdo", None, Some(err.code())).as_str(),
+                    settings_redirect(&state.config, "linuxdo", None, Some(err.code()), None)
+                        .as_str(),
                 ));
             }
         }
@@ -1068,8 +1198,397 @@ pub async fn linuxdo_callback(
         .await
         .map_err(ApiError::internal)?;
     Ok(Redirect::to(
-        bind_github_redirect(&state.config, None).as_str(),
+        bind_github_redirect(&state.config, None, None).as_str(),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyRegisterVerifyRequest {
+    pub credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasskeyAuthenticateVerifyRequest {
+    pub credential: PublicKeyCredential,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PasskeyRegisterVerifyResponse {
+    pub status: String,
+    pub next_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PasskeyAuthenticateVerifyResponse {
+    pub status: String,
+    pub next_path: String,
+}
+
+pub async fn passkey_register_options(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<axum::Json<CreationChallengeResponse>, ApiError> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let session_user_id = session
+        .get::<String>(SESSION_KEY_USER_ID)
+        .await
+        .map_err(ApiError::internal)?;
+
+    let (mode, user_handle_uuid, user_name, user_display_name, exclude_credentials) =
+        if session_user_id.is_some() {
+            let user_id = require_active_user_id(state.as_ref(), &session).await?;
+            let user_handle_uuid = sqlx::query_scalar::<_, Option<String>>(
+                r#"
+                SELECT passkey_user_handle_uuid
+                FROM users
+                WHERE id = ?
+                LIMIT 1
+                "#,
+            )
+            .bind(user_id.as_str())
+            .fetch_one(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .unwrap_or_else(generate_user_handle_uuid);
+
+            let user_name = sqlx::query_scalar::<_, String>(
+                r#"
+                SELECT login
+                FROM github_connections
+                WHERE user_id = ?
+                ORDER BY linked_at ASC, id ASC
+                LIMIT 1
+                "#,
+            )
+            .bind(user_id.as_str())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "passkey_github_required",
+                    "at least one github connection is required before adding a passkey",
+                )
+            })?;
+
+            let existing_passkeys = load_passkeys(state.as_ref(), user_id.as_str()).await?;
+            let exclude_credentials = existing_passkeys
+                .iter()
+                .map(|stored| stored.passkey.cred_id().clone())
+                .collect::<Vec<_>>();
+
+            (
+                PendingPasskeyRegistrationMode::Authenticated { user_id },
+                user_handle_uuid.clone(),
+                user_name.clone(),
+                user_name,
+                (!exclude_credentials.is_empty()).then_some(exclude_credentials),
+            )
+        } else {
+            let user_handle_uuid = generate_user_handle_uuid();
+            (
+                PendingPasskeyRegistrationMode::Onboarding,
+                user_handle_uuid.clone(),
+                provisional_passkey_user_name(&user_handle_uuid),
+                "OctoRill Passkey".to_owned(),
+                None,
+            )
+        };
+
+    let (challenge, registration) = state
+        .webauthn
+        .start_passkey_registration(
+            parse_user_handle_uuid(&user_handle_uuid)?,
+            user_name.as_str(),
+            user_display_name.as_str(),
+            exclude_credentials,
+        )
+        .map_err(ApiError::internal)?;
+
+    session
+        .insert(
+            SESSION_KEY_PENDING_PASSKEY_REGISTRATION,
+            PendingPasskeyRegistrationSession {
+                mode,
+                user_handle_uuid,
+                label: build_passkey_label(&now),
+                started_at: now,
+                registration,
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+    let _ = session
+        .remove::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+        .await;
+
+    Ok(axum::Json(challenge))
+}
+
+pub async fn passkey_register_verify(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    axum::Json(req): axum::Json<PasskeyRegisterVerifyRequest>,
+) -> Result<axum::Json<PasskeyRegisterVerifyResponse>, ApiError> {
+    let pending = session
+        .get::<PendingPasskeyRegistrationSession>(SESSION_KEY_PENDING_PASSKEY_REGISTRATION)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passkey_registration_missing",
+                "passkey registration was not started or has already been consumed",
+            )
+        })?;
+
+    if pending_passkey_registration_is_expired(&pending) {
+        clear_pending_passkey_registration(&session).await;
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "passkey_registration_expired",
+            "passkey registration has expired, please try again",
+        ));
+    }
+
+    clear_pending_passkey_registration(&session).await;
+    let passkey = state
+        .webauthn
+        .finish_passkey_registration(&req.credential, &pending.registration)
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passkey_registration_failed",
+                err.to_string(),
+            )
+        })?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let pending_credential = PendingPasskeyCredentialSession {
+        user_handle_uuid: pending.user_handle_uuid.clone(),
+        label: pending.label.clone(),
+        created_at: now,
+        passkey,
+    };
+
+    match pending.mode {
+        PendingPasskeyRegistrationMode::Authenticated { user_id } => {
+            let current_user_id = require_active_user_id(state.as_ref(), &session).await?;
+            if current_user_id != user_id {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "session user changed during passkey registration",
+                ));
+            }
+
+            let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+            match attach_pending_passkey_to_user(&mut tx, user_id.as_str(), &pending_credential)
+                .await?
+            {
+                AttachPendingPasskeyOutcome::Attached
+                | AttachPendingPasskeyOutcome::AlreadyExists => {
+                    tx.commit().await.map_err(ApiError::internal)?;
+                    let _ = session
+                        .remove::<PendingPasskeyCredentialSession>(
+                            SESSION_KEY_PENDING_PASSKEY_CREDENTIAL,
+                        )
+                        .await;
+                    Ok(axum::Json(PasskeyRegisterVerifyResponse {
+                        status: "registered".to_owned(),
+                        next_path: Some(settings_redirect(
+                            &state.config,
+                            "passkeys",
+                            None,
+                            None,
+                            Some("registered"),
+                        )),
+                    }))
+                }
+                AttachPendingPasskeyOutcome::AlreadyBound => {
+                    let _ = tx.rollback().await;
+                    Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        "passkey_already_bound",
+                        "this passkey is already bound to another account",
+                    ))
+                }
+                AttachPendingPasskeyOutcome::RetryRequired => {
+                    let _ = tx.rollback().await;
+                    Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        "passkey_retry_required",
+                        "this account already uses a different passkey handle; please retry from settings",
+                    ))
+                }
+            }
+        }
+        PendingPasskeyRegistrationMode::Onboarding => {
+            session
+                .insert(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, pending_credential)
+                .await
+                .map_err(ApiError::internal)?;
+
+            Ok(axum::Json(PasskeyRegisterVerifyResponse {
+                status: "pending_github_bind".to_owned(),
+                next_path: Some(bind_github_redirect(&state.config, None, Some("created"))),
+            }))
+        }
+    }
+}
+
+pub async fn passkey_authenticate_options(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<axum::Json<RequestChallengeResponse>, ApiError> {
+    let (challenge, authentication) = state
+        .webauthn
+        .start_discoverable_authentication()
+        .map_err(ApiError::internal)?;
+
+    session
+        .insert(
+            SESSION_KEY_PENDING_PASSKEY_AUTHENTICATION,
+            PendingPasskeyAuthenticationSession {
+                started_at: chrono::Utc::now().to_rfc3339(),
+                authentication,
+            },
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(axum::Json(challenge))
+}
+
+pub async fn passkey_authenticate_verify(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    axum::Json(req): axum::Json<PasskeyAuthenticateVerifyRequest>,
+) -> Result<axum::Json<PasskeyAuthenticateVerifyResponse>, ApiError> {
+    let pending = session
+        .get::<PendingPasskeyAuthenticationSession>(SESSION_KEY_PENDING_PASSKEY_AUTHENTICATION)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "passkey_authentication_missing",
+                "passkey authentication was not started or has already been consumed",
+            )
+        })?;
+
+    if pending_passkey_authentication_is_expired(&pending) {
+        clear_pending_passkey_authentication(&session).await;
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "passkey_authentication_expired",
+            "passkey authentication has expired, please try again",
+        ));
+    }
+
+    clear_pending_passkey_authentication(&session).await;
+    let (user_handle_uuid, credential_id_bytes) = state
+        .webauthn
+        .identify_discoverable_authentication(&req.credential)
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "passkey_authentication_failed",
+                err.to_string(),
+            )
+        })?;
+    let user_handle_uuid = user_handle_uuid.to_string();
+    let user_id = load_user_id_by_user_handle(state.as_ref(), user_handle_uuid.as_str())
+        .await?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "passkey_user_not_found",
+                "passkey does not map to an existing account",
+            )
+        })?;
+
+    if !user_has_github_connection(state.as_ref(), user_id.as_str()).await? {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "passkey_github_required",
+            "a github connection is required before passkey login can complete",
+        ));
+    }
+
+    let mut stored_passkeys = load_passkeys(state.as_ref(), user_id.as_str()).await?;
+    if stored_passkeys.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "passkey_not_found",
+            "no passkeys are registered for this account",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let auth_user_row = load_auth_user_row(&mut tx, user_id.as_str()).await?;
+    if auth_user_row.is_disabled != 0 {
+        session.clear().await;
+        let _ = tx.rollback().await;
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "account is disabled",
+        ));
+    }
+
+    let discoverable_keys = stored_passkeys
+        .iter()
+        .map(|stored| DiscoverableKey::from(&stored.passkey))
+        .collect::<Vec<_>>();
+    let authentication_result = state
+        .webauthn
+        .finish_discoverable_authentication(
+            &req.credential,
+            pending.authentication,
+            discoverable_keys.as_slice(),
+        )
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "passkey_authentication_failed",
+                err.to_string(),
+            )
+        })?;
+
+    let credential_id = encode_credential_id(credential_id_bytes);
+    let matched_passkey = stored_passkeys
+        .iter_mut()
+        .find(|stored| stored.credential_id == credential_id)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "passkey_not_found",
+                "the selected passkey is not registered for this account",
+            )
+        })?;
+    let used_at = chrono::Utc::now().to_rfc3339();
+
+    mark_passkey_authentication_used(
+        &mut tx,
+        matched_passkey,
+        &authentication_result,
+        used_at.as_str(),
+    )
+    .await?;
+
+    tx.commit().await.map_err(ApiError::internal)?;
+    session
+        .insert(SESSION_KEY_USER_ID, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(axum::Json(PasskeyAuthenticateVerifyResponse {
+        status: "authenticated".to_owned(),
+        next_path: state.config.public_base_url.to_string(),
+    }))
 }
 
 pub async fn logout(

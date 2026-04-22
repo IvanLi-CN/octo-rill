@@ -69,7 +69,7 @@ cargo run
 - OAuth callback 由后端处理
 - SQLite 默认写到 `./.data/octo-rill.db`
 
-如果这里启动失败，先检查 `.env.local` 是否缺少加密密钥或 OAuth 配置。
+如果这里启动失败，先检查 `.env.local` 是否缺少加密密钥或 OAuth 配置。若你要联调 Passkey，请再确认 `OCTORILL_PUBLIC_BASE_URL` 指向浏览器实际打开的 origin，并使用 HTTPS 或 loopback (`localhost` / `127.0.0.1`)。
 
 ## 4. 启动前端
 
@@ -83,7 +83,7 @@ bun run dev
 
 你应该看到：
 
-- 未登录：Landing 登录页，包含 GitHub 登录入口
+- 未登录：Landing 登录页，包含 GitHub、LinuxDO 与 Passkey 入口
 - 已登录：Dashboard
 
 ## 5. 完成一次最小验证

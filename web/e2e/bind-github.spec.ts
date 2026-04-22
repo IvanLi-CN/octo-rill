@@ -18,7 +18,25 @@ function svgAvatarDataUrl(
 	)}`;
 }
 
-async function installBindMocks(page: Parameters<typeof test>[0]["page"]) {
+async function installBindMocks(
+	page: Parameters<typeof test>[0]["page"],
+	options?: {
+		linuxdoAvailable?: boolean;
+		pendingLinuxDo?: {
+			linuxdo_user_id: number;
+			username: string;
+			name: string | null;
+			avatar_url: string;
+			trust_level: number;
+			active: boolean;
+			silenced: boolean;
+		} | null;
+		pendingPasskey?: {
+			label: string;
+			created_at: string;
+		} | null;
+	},
+) {
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -38,8 +56,8 @@ async function installBindMocks(page: Parameters<typeof test>[0]["page"]) {
 
 		if (req.method() === "GET" && url.pathname === "/api/auth/bind-context") {
 			return json(route, {
-				linuxdo_available: true,
-				pending_linuxdo: {
+				linuxdo_available: options?.linuxdoAvailable ?? true,
+				pending_linuxdo: options?.pendingLinuxDo ?? {
 					linuxdo_user_id: 9527,
 					username: "linuxdo-first-login",
 					name: "LinuxDO First Login",
@@ -48,6 +66,7 @@ async function installBindMocks(page: Parameters<typeof test>[0]["page"]) {
 					active: true,
 					silenced: false,
 				},
+				pending_passkey: options?.pendingPasskey ?? null,
 			});
 		}
 
@@ -82,4 +101,25 @@ test("bind github page shows pending linuxdo snapshot and github CTA", async ({
 	await expect(
 		githubLink.locator('[data-auth-provider-icon="github"]'),
 	).toBeVisible();
+});
+
+test("bind github page shows pending passkey state and github CTA", async ({
+	page,
+}) => {
+	await installBindMocks(page, {
+		pendingLinuxDo: null,
+		pendingPasskey: {
+			label: "Passkey · 2026-04-22 10:12 UTC",
+			created_at: "2026-04-22T10:12:00Z",
+		},
+	});
+
+	await page.goto("/bind/github?passkey=created");
+
+	await expect(page.getByText("Passkey 已暂存")).toBeVisible();
+	await expect(page.getByText("待挂接的 Passkey")).toBeVisible();
+	await expect(page.getByText("Passkey · 2026-04-22 10:12 UTC")).toBeVisible();
+	await expect(
+		page.getByRole("link", { name: "绑定 GitHub 并继续" }),
+	).toHaveAttribute("href", "/auth/github/login");
 });

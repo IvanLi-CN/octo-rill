@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link2, LoaderCircle, ShieldAlert } from "lucide-react";
+import { Fingerprint, Link2, LoaderCircle, ShieldAlert } from "lucide-react";
 
 import { apiGetAuthBindContext, type AuthBindContextResponse } from "@/api";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
@@ -71,14 +71,53 @@ const LINUXDO_BIND_STATUS_META: Record<
 	},
 };
 
+const PASSKEY_BIND_STATUS_META: Record<
+	string,
+	{
+		tone: "success" | "error";
+		title: string;
+		description: string;
+	}
+> = {
+	created: {
+		tone: "success",
+		title: "Passkey 已暂存",
+		description: "完成 GitHub 绑定后，这把 Passkey 就会挂接到你的账号上。",
+	},
+	passkey_retry_required: {
+		tone: "error",
+		title: "需要重新添加 Passkey",
+		description:
+			"这次 GitHub 绑定没有自动挂接之前创建的 Passkey，请登录后到设置页重新添加。",
+	},
+	passkey_already_bound: {
+		tone: "error",
+		title: "Passkey 已被占用",
+		description: "这把 Passkey 已经绑定到其他 OctoRill 账号，不能重复挂接。",
+	},
+	expired: {
+		tone: "error",
+		title: "Passkey 已过期",
+		description: "之前创建的 Passkey 暂存状态已经过期，请重新创建一次。",
+	},
+};
+
 function statusToneClassName(tone: "success" | "error") {
 	return tone === "success"
 		? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
 		: "border-destructive/30 bg-destructive/8 text-destructive";
 }
 
-export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
-	const { linuxdoStatus = null } = props;
+function formatDateTime(value: string) {
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+export function BindGitHubPage(props: {
+	linuxdoStatus?: string | null;
+	passkeyStatus?: string | null;
+}) {
+	const { linuxdoStatus = null, passkeyStatus = null } = props;
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 	const [context, setContext] = useState<AuthBindContextResponse | null>(null);
@@ -98,11 +137,18 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 			});
 	}, []);
 
-	const activeStatus = useMemo(
+	const activeLinuxDoStatus = useMemo(
 		() =>
 			linuxdoStatus ? (LINUXDO_BIND_STATUS_META[linuxdoStatus] ?? null) : null,
 		[linuxdoStatus],
 	);
+	const activePasskeyStatus = useMemo(
+		() =>
+			passkeyStatus ? (PASSKEY_BIND_STATUS_META[passkeyStatus] ?? null) : null,
+		[passkeyStatus],
+	);
+	const hasPendingContext =
+		context?.pending_linuxdo !== null || context?.pending_passkey !== null;
 
 	return (
 		<AppShell
@@ -126,22 +172,47 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 			mobileChrome
 		>
 			<div className="mx-auto max-w-2xl space-y-4 py-4">
-				{activeStatus ? (
+				{activePasskeyStatus ? (
 					<section
 						className={cn(
 							"rounded-xl border px-3 py-2.5 text-sm shadow-sm",
-							statusToneClassName(activeStatus.tone),
+							statusToneClassName(activePasskeyStatus.tone),
 						)}
 					>
 						<div className="flex items-start gap-2.5">
-							{activeStatus.tone === "error" ? (
+							{activePasskeyStatus.tone === "error" ? (
+								<ShieldAlert className="mt-0.5 size-4 shrink-0" />
+							) : (
+								<Fingerprint className="mt-0.5 size-4 shrink-0" />
+							)}
+							<div className="space-y-0.5">
+								<p className="font-medium">{activePasskeyStatus.title}</p>
+								<p className="text-xs leading-5">
+									{activePasskeyStatus.description}
+								</p>
+							</div>
+						</div>
+					</section>
+				) : null}
+
+				{activeLinuxDoStatus ? (
+					<section
+						className={cn(
+							"rounded-xl border px-3 py-2.5 text-sm shadow-sm",
+							statusToneClassName(activeLinuxDoStatus.tone),
+						)}
+					>
+						<div className="flex items-start gap-2.5">
+							{activeLinuxDoStatus.tone === "error" ? (
 								<ShieldAlert className="mt-0.5 size-4 shrink-0" />
 							) : (
 								<Link2 className="mt-0.5 size-4 shrink-0" />
 							)}
 							<div className="space-y-0.5">
-								<p className="font-medium">{activeStatus.title}</p>
-								<p className="text-xs leading-5">{activeStatus.description}</p>
+								<p className="font-medium">{activeLinuxDoStatus.title}</p>
+								<p className="text-xs leading-5">
+									{activeLinuxDoStatus.description}
+								</p>
 							</div>
 						</div>
 					</section>
@@ -149,9 +220,11 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 
 				<Card className="border-border/70 shadow-sm">
 					<CardHeader>
-						<CardTitle>将 LinuxDO 账号绑定到 GitHub</CardTitle>
+						<CardTitle>继续绑定 GitHub</CardTitle>
 						<CardDescription>
-							LinuxDO 账号需要先关联一个 GitHub 账号，完成后才能继续登录。
+							{context?.pending_passkey
+								? "完成 GitHub 绑定后，暂存的 Passkey 会和账号一起落地。"
+								: "补上 GitHub 绑定后，才能把待处理的登录上下文正式挂到账号上。"}
 						</CardDescription>
 					</CardHeader>
 					<CardContent className="space-y-4">
@@ -164,26 +237,44 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 							<div className="rounded-xl border border-destructive/30 bg-destructive/8 px-3 py-2.5 text-sm text-destructive">
 								{error}
 							</div>
-						) : context?.pending_linuxdo ? (
+						) : hasPendingContext ? (
 							<>
-								<div className="flex items-center gap-3 rounded-2xl border border-border/70 bg-muted/20 p-4">
-									<img
-										src={context.pending_linuxdo.avatar_url}
-										alt={`${context.pending_linuxdo.username} avatar`}
-										className="size-12 rounded-full border border-border/70 object-cover"
-										referrerPolicy="no-referrer"
-									/>
-									<div className="min-w-0">
-										<p className="truncate text-sm font-semibold text-foreground">
-											{context.pending_linuxdo.name ??
-												context.pending_linuxdo.username}
+								{context?.pending_passkey ? (
+									<div className="space-y-2 rounded-2xl border border-border/70 bg-muted/20 p-4">
+										<div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+											<Fingerprint className="size-4" />
+											待挂接的 Passkey
+										</div>
+										<p className="text-sm text-foreground">
+											{context.pending_passkey.label}
 										</p>
-										<p className="text-muted-foreground truncate text-xs">
-											@{context.pending_linuxdo.username} · Trust level{" "}
-											{context.pending_linuxdo.trust_level}
+										<p className="text-muted-foreground text-xs leading-5">
+											创建于{" "}
+											{formatDateTime(context.pending_passkey.created_at)}
 										</p>
 									</div>
-								</div>
+								) : null}
+
+								{context?.pending_linuxdo ? (
+									<div className="flex items-center gap-3 rounded-2xl border border-border/70 bg-muted/20 p-4">
+										<img
+											src={context.pending_linuxdo.avatar_url}
+											alt={`${context.pending_linuxdo.username} avatar`}
+											className="size-12 rounded-full border border-border/70 object-cover"
+											referrerPolicy="no-referrer"
+										/>
+										<div className="min-w-0">
+											<p className="truncate text-sm font-semibold text-foreground">
+												{context.pending_linuxdo.name ??
+													context.pending_linuxdo.username}
+											</p>
+											<p className="text-muted-foreground truncate text-xs">
+												@{context.pending_linuxdo.username} · Trust level{" "}
+												{context.pending_linuxdo.trust_level}
+											</p>
+										</div>
+									</div>
+								) : null}
 
 								<div className="grid gap-3 sm:grid-cols-2">
 									<Button asChild size="lg" className="h-11 rounded-2xl">
@@ -207,11 +298,11 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 						) : (
 							<div className="space-y-3 rounded-2xl border border-border/70 bg-muted/20 p-4 text-sm">
 								<p className="font-medium text-foreground">
-									当前没有待完成的 LinuxDO 绑定。
+									当前没有待完成的绑定上下文。
 								</p>
 								<p className="text-muted-foreground leading-6">
-									如果你想通过 LinuxDO 登录，请先从首页进入 LinuxDO
-									登录入口；如果只是想给当前账号增加 GitHub
+									如果你想通过 Passkey 或 LinuxDO
+									首次进入，请先从首页重新开始；如果只是想给当前账号增加 GitHub
 									绑定，请登录后前往设置页操作。
 								</p>
 								<div className="flex flex-wrap gap-2">
@@ -221,9 +312,9 @@ export function BindGitHubPage(props: { linuxdoStatus?: string | null }) {
 										</InternalLink>
 									</Button>
 									<Button asChild size="sm">
-										<a href="/auth/linuxdo/login">
-											<AuthProviderIcon provider="linuxdo" />
-											重新使用 LinuxDO 登录
+										<a href="/auth/github/login">
+											<AuthProviderIcon provider="github" />
+											继续使用 GitHub 登录
 										</a>
 									</Button>
 								</div>

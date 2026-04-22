@@ -7,6 +7,7 @@ import type {
 	GitHubConnectionResponse,
 	LinuxDoConnectionResponse,
 	MeProfileResponse,
+	PasskeySummary,
 	ReactionTokenStatusResponse,
 } from "@/api";
 import { SettingsPage } from "@/pages/Settings";
@@ -110,9 +111,12 @@ type SettingsStoryArgs = {
 	section: SettingsSection;
 	githubStatus?: string;
 	linuxdoStatus?: string;
+	passkeyStatus?: string;
 	linuxdoAvailable: boolean;
 	linuxdoConnection: LinuxDoConnectionResponse | null;
 	githubConnections: GitHubConnectionResponse[];
+	passkeys: PasskeySummary[];
+	passkeySupportOverride: boolean;
 	reactionTokenStatus: ReactionTokenStatusResponse;
 	profile: MeProfileResponse;
 	themePreference: ThemePreference;
@@ -126,6 +130,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	const [githubConnections, setGitHubConnections] = useState(
 		args.githubConnections,
 	);
+	const [passkeys, setPasskeys] = useState(args.passkeys);
 	const [reactionTokenStatus, setReactionTokenStatus] = useState(
 		args.reactionTokenStatus,
 	);
@@ -141,6 +146,10 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 	useEffect(() => {
 		setGitHubConnections(args.githubConnections);
 	}, [args.githubConnections]);
+
+	useEffect(() => {
+		setPasskeys(args.passkeys);
+	}, [args.passkeys]);
 
 	useEffect(() => {
 		setReactionTokenStatus(args.reactionTokenStatus);
@@ -177,6 +186,20 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 				available: args.linuxdoAvailable,
 				connection: args.linuxdoConnection,
 			});
+		}
+		if (request.pathname === "/api/me/passkeys" && method === "GET") {
+			return jsonResponse({ items: passkeys });
+		}
+		if (
+			request.pathname.startsWith("/api/me/passkeys/") &&
+			method === "DELETE"
+		) {
+			const passkeyId = request.pathname.split("/").at(-1);
+			const nextPasskeys = passkeys.filter(
+				(passkey) => passkey.id !== passkeyId,
+			);
+			setPasskeys(nextPasskeys);
+			return jsonResponse({ items: nextPasskeys });
 		}
 		if (request.pathname === "/api/me/linuxdo" && method === "DELETE") {
 			return jsonResponse({
@@ -282,6 +305,8 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 						section={section}
 						githubStatus={args.githubStatus}
 						linuxdoStatus={args.linuxdoStatus}
+						passkeyStatus={args.passkeyStatus}
+						passkeySupportOverride={args.passkeySupportOverride}
 						onSectionChange={setSection}
 						onProfileSaved={() => {}}
 					/>
@@ -315,16 +340,19 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"Settings 页面统一承载 GitHub 多账号绑定、LinuxDO Connect 绑定、我的发布开关、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
+					"Settings 页面统一承载 Passkey、GitHub 多账号绑定、LinuxDO Connect 绑定、我的发布开关、GitHub PAT 配置与日报设置。它是普通用户设置的唯一主入口，并支持 `section` 深链定位。",
 			},
 		},
 	},
 	args: {
 		section: "github-accounts",
 		githubStatus: "connected",
+		passkeyStatus: undefined,
 		linuxdoAvailable: true,
 		linuxdoConnection: null,
 		githubConnections: baseGitHubConnections,
+		passkeys: [],
+		passkeySupportOverride: true,
 		reactionTokenStatus: {
 			configured: false,
 			masked_token: null,
@@ -390,13 +418,82 @@ export const GitHubAccounts: Story = {
 	},
 };
 
+export const PasskeysEmpty: Story = {
+	args: {
+		section: "passkeys",
+		passkeySupportOverride: true,
+		passkeys: [],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"深链到 `section=passkeys` 的空态：用于展示首次添加 Passkey 的说明、CTA 和 GitHub 仍然是恢复路径的约束。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Passkeys")).toBeVisible();
+		await expect(
+			canvas.getByText("还没有可直接登录的 Passkey。"),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "添加 Passkey" }),
+		).toBeVisible();
+	},
+};
+
+export const PasskeysMultipleDevices: Story = {
+	args: {
+		section: "passkeys",
+		passkeySupportOverride: true,
+		passkeyStatus: "registered",
+		passkeys: [
+			{
+				id: "passkey_phone",
+				label: "Passkey · 2026-04-20 09:00 UTC",
+				created_at: "2026-04-20T09:00:00Z",
+				last_used_at: "2026-04-22T08:30:00Z",
+			},
+			{
+				id: "passkey_laptop",
+				label: "Passkey · 2026-04-21 11:15 UTC",
+				created_at: "2026-04-21T11:15:00Z",
+				last_used_at: null,
+			},
+		],
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"多设备态：同时展示 flash 状态、两把 Passkey 列表与最近使用时间，作为设置页视觉证据的稳定入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Passkey 已添加")).toBeVisible();
+		await expect(
+			canvas.getByText("Passkey · 2026-04-20 09:00 UTC"),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("Passkey · 2026-04-21 11:15 UTC"),
+		).toBeVisible();
+		await expect(canvas.getAllByRole("button", { name: "移除" })).toHaveLength(
+			2,
+		);
+	},
+};
+
 export const SwitchableSections: Story = {
 	name: "Switchable Sections",
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"用于手动点击设置分区的交互式 Story。点击顶部导航即可在 GitHub 账号、LinuxDO、我的发布、GitHub PAT 与日报设置之间切换。",
+					"用于手动点击设置分区的交互式 Story。点击顶部导航即可在 Passkeys、GitHub 账号、LinuxDO、我的发布、GitHub PAT 与日报设置之间切换。",
 			},
 		},
 	},
