@@ -128,3 +128,4 @@
 | 6xaku | GitHub PAT 1:1 参考界面 | 已完成 | `6xaku-github-pat-inline-guide-mock/SPEC.md` | 2026-04-20 | fast-track / DOM-based GitHub PAT reference + switchable settings story + evidence |
 | 2v2aw | 多 GitHub 绑定与 LinuxDO 首登补绑改造 | 已完成 | `2v2aw-multi-github-linuxdo-onboarding/SPEC.md` | 2026-04-21 | PR #117; fast-track / multi-github + linuxdo onboarding / 去主账号语义并收口运行时迁移；legacy schema cleanup deferred |
 | etd3f | Release「润色」术语统一 | 已完成 | `etd3f-polish-terminology-unification/SPEC.md` | 2026-04-22 | PR #118; release-smart owner-facing terminology unified to `润色`, visual evidence landed, review-loop clear |
+| whda5 | Dashboard / Admin 窄平板断点补齐与自动化验证收口 | 已完成 | `whda5-dashboard-admin-narrow-tablet-header-coverage/SPEC.md` | 2026-04-22 | fast-track / PR-ready / 640-1023 narrow tablet contract + storybook/e2e green |

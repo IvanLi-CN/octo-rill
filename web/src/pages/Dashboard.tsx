@@ -431,7 +431,7 @@ export function Dashboard(props: {
 	);
 	const [notificationsError, setNotificationsError] =
 		useState<DashboardSectionError | null>(null);
-	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
