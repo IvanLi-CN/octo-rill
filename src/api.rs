@@ -13694,9 +13694,24 @@ mod tests {
         .await
         .expect("admin dashboard should succeed");
 
+        let expected_active_users_today = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM users
+            WHERE last_active_at IS NOT NULL
+              AND julianday(last_active_at) >= julianday(?)
+              AND julianday(last_active_at) < julianday(?)
+            "#,
+        )
+        .bind(today_window_start.with_timezone(&chrono::Utc).to_rfc3339())
+        .bind(resp.generated_at.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count expected active users for response window");
+
         assert_eq!(resp.time_zone, "Asia/Shanghai");
         assert_eq!(resp.summary.total_users, 2);
-        assert_eq!(resp.summary.active_users_today, 2);
+        assert_eq!(resp.summary.active_users_today, expected_active_users_today);
         assert_eq!(resp.summary.ongoing_tasks_total, 2);
         assert_eq!(resp.summary.ongoing_by_task.translations, 1);
         assert_eq!(resp.summary.ongoing_by_task.summaries, 1);

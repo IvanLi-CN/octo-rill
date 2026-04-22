@@ -21,6 +21,30 @@ function svgAvatarDataUrl(
 	)}`;
 }
 
+async function getPartialAccessibilityTreeSnapshot(
+	page: Parameters<typeof test>[0]["page"],
+	selector: string,
+) {
+	const client = await page.context().newCDPSession(page);
+	const { root } = await client.send("DOM.getDocument", {
+		depth: -1,
+		pierce: true,
+	});
+	const { nodeId } = await client.send("DOM.querySelector", {
+		nodeId: root.nodeId,
+		selector,
+	});
+	if (!nodeId) {
+		throw new Error(`selector not found for AX snapshot: ${selector}`);
+	}
+	const { node } = await client.send("DOM.describeNode", { nodeId });
+	const { nodes } = await client.send("Accessibility.getPartialAXTree", {
+		backendNodeId: node.backendNodeId,
+		fetchRelatives: true,
+	});
+	return JSON.stringify(nodes);
+}
+
 const defaultGitHubConnections = [
 	{
 		id: "ghconn_primary",
@@ -336,9 +360,14 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	await expect(input).toHaveAttribute("data-1p-ignore", "true");
 	await expect(input).toHaveAttribute("data-form-type", "other");
 	await expect(input).toHaveAttribute("data-secret-visible", "false");
+	await expect(input).toHaveAttribute(
+		"data-secret-mask-mode",
+		"native-password",
+	);
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveAttribute("type", "text");
 	await expect(input).toHaveAttribute("data-secret-visible", "true");
+	await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
 	const guide = page.getByTestId("github-pat-guide-card");
 	await expect(guide).toBeVisible();
 	await expect(guide.getByRole("textbox", { name: "Note" })).toHaveValue(
@@ -348,6 +377,345 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 		guide.getByRole("button", { name: "No expiration" }),
 	).toBeVisible();
 	await expect(page.getByText("@storybook-ops", { exact: true })).toBeVisible();
+});
+
+test("settings github pat hidden mode preserves undo history after visible edits", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_fix");
+	await toggleButton.click();
+	await expect(toggleButton).toBeFocused();
+	await expect(toggleButton).toHaveAttribute("aria-label", "显示 GitHub PAT");
+	await input.focus();
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
+});
+
+test("settings github pat hidden mode stays editable in accessibility tree", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_secret_demo");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+
+	const inputAccessibilityTree = await getPartialAccessibilityTreeSnapshot(
+		page,
+		"#settings-reaction-pat",
+	);
+
+	expect(inputAccessibilityTree).toContain("GitHub PAT");
+	expect(inputAccessibilityTree).toContain("当前内容已隐藏");
+	expect(inputAccessibilityTree).not.toContain("ghp_secret_demo");
+	expect(inputAccessibilityTree).toContain("•••••••••••••••");
+	expect(inputAccessibilityTree).not.toContain("ariaHiddenElement");
+});
+
+test("settings github pat hidden mode keeps word deletion shortcuts", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await expect(toggleButton).toBeFocused();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+	});
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Alt+Backspace" : "Control+Backspace",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_");
+});
+
+test("settings github pat hidden mode keeps word deletion on the native undo stack", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await expect(toggleButton).toBeFocused();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+	});
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Alt+Backspace" : "Control+Backspace",
+	);
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_chunk");
+});
+
+test("settings github pat hidden mode handles beforeinput word deletion", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+		node.dispatchEvent(
+			new InputEvent("beforeinput", {
+				bubbles: true,
+				cancelable: true,
+				inputType: "deleteWordBackward",
+			}),
+		);
+	});
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_");
+});
+
+test("settings github pat hidden mode accepts drop edits", async ({ page }) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await input.evaluate((node, droppedValue) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		const dataTransfer = new DataTransfer();
+		dataTransfer.setData("text", droppedValue);
+		node.dispatchEvent(
+			new DragEvent("drop", {
+				bubbles: true,
+				cancelable: true,
+				dataTransfer,
+			}),
+		);
+	}, "ghp_drop_token");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_drop_token");
+});
+
+test("settings github pat hidden mode keeps drop edits on the native undo stack", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await input.evaluate((node, droppedValue) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		const dataTransfer = new DataTransfer();
+		dataTransfer.setData("text/plain", droppedValue);
+		node.dispatchEvent(
+			new DragEvent("drop", {
+				bubbles: true,
+				cancelable: true,
+				dataTransfer,
+			}),
+		);
+	}, "ghp_drop_token");
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
+});
+
+test("settings github pat hidden mode supports menu-style undo and redo", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+	});
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Alt+Backspace" : "Control+Backspace",
+	);
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.dispatchEvent(
+			new InputEvent("beforeinput", {
+				bubbles: true,
+				cancelable: true,
+				inputType: "historyUndo",
+			}),
+		);
+	});
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.dispatchEvent(
+			new InputEvent("beforeinput", {
+				bubbles: true,
+				cancelable: true,
+				inputType: "historyRedo",
+			}),
+		);
+	});
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_");
+});
+
+test("settings github pat hidden mode drops at the hovered caret", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+	});
+	await input.evaluate(
+		(node, payload) => {
+			if (!(node instanceof HTMLInputElement)) {
+				throw new Error("expected HTMLInputElement");
+			}
+			const { prefix, droppedValue } = payload;
+			const rect = node.getBoundingClientRect();
+			const style = getComputedStyle(node);
+			const leftInset =
+				parseFloat(style.borderLeftWidth || "0") +
+				parseFloat(style.paddingLeft || "0");
+			const context = document.createElement("canvas").getContext("2d");
+			if (!context) {
+				throw new Error("expected 2d canvas context");
+			}
+			context.font =
+				style.font ||
+				`${style.fontStyle} ${style.fontVariant} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+			const clientX =
+				rect.left + leftInset + context.measureText(prefix).width + 1;
+			const clientY = rect.top + rect.height / 2;
+			node.dispatchEvent(
+				new DragEvent("dragover", {
+					bubbles: true,
+					cancelable: true,
+					clientX,
+					clientY,
+					dataTransfer: new DataTransfer(),
+				}),
+			);
+			const dataTransfer = new DataTransfer();
+			dataTransfer.setData("text/plain", droppedValue);
+			node.dispatchEvent(
+				new DragEvent("drop", {
+					bubbles: true,
+					cancelable: true,
+					clientX,
+					clientY,
+					dataTransfer,
+				}),
+			);
+		},
+		{
+			prefix: "ghp_",
+			droppedValue: "drop_",
+		},
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_drop_chunk");
+});
+
+test("settings github pat save clears hidden undo history", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_valid_token_1234");
+	await expect(
+		page.getByText("GitHub PAT 可用", { exact: true }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "保存 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
+	await expect(
+		page.getByText("token is valid for @storybook-user", { exact: true }),
+	).toBeVisible();
+	await input.focus();
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {
