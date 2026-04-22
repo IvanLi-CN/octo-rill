@@ -1864,7 +1864,7 @@ async fn load_admin_dashboard_today_live_snapshot(
     let today = now_local.date_naive();
     let (start_utc, _) = local_day_bounds_utc(time_zone, today)?;
     let start_at = start_utc.to_rfc3339();
-    let end_at = now_utc.to_rfc3339();
+    let end_at = (now_utc + chrono::Duration::seconds(1)).to_rfc3339();
 
     let total_users = count_admin_dashboard_total_users_now(&state.pool).await?;
     let active_users =

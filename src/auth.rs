@@ -563,10 +563,20 @@ async fn clear_pending_passkey_registration(session: &Session) {
         .await;
 }
 
+async fn clear_pending_passkey_credential(session: &Session) {
+    let _ = session
+        .remove_value(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+        .await;
+}
+
 async fn clear_pending_passkey_authentication(session: &Session) {
     let _ = session
         .remove::<PendingPasskeyAuthenticationSession>(SESSION_KEY_PENDING_PASSKEY_AUTHENTICATION)
         .await;
+}
+
+async fn clear_pending_linuxdo(session: &Session) {
+    let _ = session.remove_value(SESSION_KEY_PENDING_LINUXDO).await;
 }
 
 async fn upsert_linuxdo_connection_record(
@@ -678,9 +688,7 @@ async fn finalize_github_auth(
         .map_err(ApiError::internal)?;
     let pending_passkey = if let Some(pending_passkey) = pending_passkey {
         if pending_passkey_bind_is_expired(&pending_passkey) {
-            let _ = session
-                .remove::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
-                .await;
+            clear_pending_passkey_credential(session).await;
             passkey_status_after_login = Some("expired");
             None
         } else {
@@ -875,6 +883,9 @@ async fn finalize_github_auth(
                 .await
             {
                 let _ = tx.rollback().await;
+                if consume_pending_passkey {
+                    clear_pending_passkey_credential(session).await;
+                }
                 return Ok(Redirect::to(
                     bind_github_redirect(
                         &state.config,
@@ -901,13 +912,9 @@ async fn finalize_github_auth(
             .await
             .map_err(ApiError::internal)?;
     }
-    let _ = session
-        .remove::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
-        .await;
+    clear_pending_linuxdo(session).await;
     if consume_pending_passkey {
-        let _ = session
-            .remove::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
-            .await;
+        clear_pending_passkey_credential(session).await;
     }
 
     info!(login = %user.login, github_user_id = user.id, "github auth ok");
@@ -1170,9 +1177,8 @@ pub async fn linuxdo_callback(
             .insert(SESSION_KEY_USER_ID, owner.user_id)
             .await
             .map_err(ApiError::internal)?;
-        let _ = session
-            .remove::<PendingLinuxDoSession>(SESSION_KEY_PENDING_LINUXDO)
-            .await;
+        clear_pending_linuxdo(&session).await;
+        clear_pending_passkey_credential(&session).await;
         return Ok(Redirect::to(state.config.public_base_url.as_str()));
     }
 
@@ -1621,16 +1627,22 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::{post_github_login_redirect, promote_first_admin, upsert_github_user};
+    use super::{
+        SESSION_KEY_PENDING_LINUXDO, SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, clear_pending_linuxdo,
+        clear_pending_passkey_credential, post_github_login_redirect, promote_first_admin,
+        upsert_github_user,
+    };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
     };
+    use serde_json::json;
     use sqlx::{
         SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
-    use std::{net::SocketAddr, path::PathBuf};
+    use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+    use tower_sessions::{MemoryStore, Session};
     use url::Url;
 
     async fn setup_pool() -> SqlitePool {
@@ -1651,6 +1663,11 @@ mod tests {
             .await
             .expect("run migrations");
         pool
+    }
+
+    fn setup_session() -> Session {
+        let store = Arc::new(MemoryStore::default());
+        Session::new(None, store, None)
     }
 
     fn test_config() -> AppConfig {
@@ -1700,6 +1717,50 @@ mod tests {
         assert_eq!(
             redirect,
             "http://127.0.0.1:58090/settings?section=github-accounts&github=connected&linuxdo=connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_passkey_credential_removes_stale_session_value() {
+        let session = setup_session();
+        session
+            .insert_value(
+                SESSION_KEY_PENDING_PASSKEY_CREDENTIAL,
+                json!({"stale": true}),
+            )
+            .await
+            .expect("insert pending passkey");
+
+        clear_pending_passkey_credential(&session).await;
+
+        assert!(
+            session
+                .get_value(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+                .await
+                .expect("read pending passkey")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_pending_linuxdo_removes_bind_context_key() {
+        let session = setup_session();
+        session
+            .insert_value(
+                SESSION_KEY_PENDING_LINUXDO,
+                json!({"username": "linuxdo-user"}),
+            )
+            .await
+            .expect("insert pending linuxdo");
+
+        clear_pending_linuxdo(&session).await;
+
+        assert!(
+            session
+                .get_value(SESSION_KEY_PENDING_LINUXDO)
+                .await
+                .expect("read pending linuxdo")
+                .is_none()
         );
     }
 
