@@ -11,6 +11,7 @@ export const Route = createFileRoute("/settings")({
 				: undefined,
 		linuxdo: typeof search.linuxdo === "string" ? search.linuxdo : undefined,
 		github: typeof search.github === "string" ? search.github : undefined,
+		passkey: typeof search.passkey === "string" ? search.passkey : undefined,
 	}),
 	pendingMs: 0,
 	pendingMinMs: 200,

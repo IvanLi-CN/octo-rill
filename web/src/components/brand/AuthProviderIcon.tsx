@@ -1,8 +1,9 @@
+import { Fingerprint } from "lucide-react";
 import { useId } from "react";
 
 import { cn } from "@/lib/utils";
 
-type AuthProvider = "github" | "linuxdo";
+type AuthProvider = "github" | "linuxdo" | "passkey";
 
 type AuthProviderIconProps = {
 	provider: AuthProvider;
@@ -66,12 +67,26 @@ function LinuxDoLogoIcon({ className }: { className?: string }) {
 	);
 }
 
+function PasskeyIcon({ className }: { className?: string }) {
+	return (
+		<Fingerprint
+			aria-hidden="true"
+			data-auth-provider-icon="passkey"
+			className={cn("size-4 shrink-0", className)}
+		/>
+	);
+}
+
 export function AuthProviderIcon({
 	provider,
 	className,
 }: AuthProviderIconProps) {
 	if (provider === "github") {
 		return <GitHubMarkIcon className={className} />;
+	}
+
+	if (provider === "passkey") {
+		return <PasskeyIcon className={className} />;
 	}
 
 	return <LinuxDoLogoIcon className={className} />;

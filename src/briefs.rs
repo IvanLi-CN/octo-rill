@@ -575,6 +575,7 @@ mod tests {
             app_default_time_zone: DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -587,6 +588,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key,
             runtime_owner_id: "briefs-test-runtime-owner".to_owned(),
         })

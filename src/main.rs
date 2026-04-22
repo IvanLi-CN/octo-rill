@@ -10,6 +10,7 @@ mod github;
 mod jobs;
 mod linuxdo;
 mod local_id;
+mod passkeys;
 mod runtime;
 mod server;
 mod state;
