@@ -431,7 +431,7 @@ export function Dashboard(props: {
 	);
 	const [notificationsError, setNotificationsError] =
 		useState<DashboardSectionError | null>(null);
-	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
@@ -743,11 +743,7 @@ export function Dashboard(props: {
 			return;
 		}
 		void primeSmart(feed.items).catch((error) => {
-			notifyGlobalError(
-				"智能整理预取失败",
-				error,
-				"智能整理预取失败，请稍后重试。",
-			);
+			notifyGlobalError("润色预取失败", error, "润色预取失败，请稍后重试。");
 		});
 	}, [feed.items, feed.loadingInitial, notifyGlobalError, primeSmart, tab]);
 
@@ -981,11 +977,7 @@ export function Dashboard(props: {
 	const onSmartNow = useCallback(
 		(item: FeedItem) => {
 			void smartNow(item).catch((error) => {
-				notifyGlobalError(
-					"智能整理触发失败",
-					error,
-					"智能整理触发失败，请稍后重试。",
-				);
+				notifyGlobalError("润色触发失败", error, "润色触发失败，请稍后重试。");
 			});
 		},
 		[notifyGlobalError, smartNow],
@@ -1017,9 +1009,9 @@ export function Dashboard(props: {
 			) {
 				void smartNow(item).catch((error) => {
 					notifyGlobalError(
-						"智能整理触发失败",
+						"润色触发失败",
 						error,
-						"智能整理触发失败，请稍后重试。",
+						"润色触发失败，请稍后重试。",
 					);
 				});
 			}

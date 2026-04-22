@@ -976,7 +976,7 @@ export function SettingsPage(props: {
 											<p className="text-muted-foreground text-sm leading-6">
 												开启后，当前 GitHub 账号本人 owner 的仓库 release
 												会像已加星仓库一样进入 “全部 /
-												发布”、详情、翻译、智能总结与日报链路；真实“加星”列表和社交动态不会被污染。
+												发布”、详情、翻译、润色与日报链路；真实“加星”列表和社交动态不会被污染。
 											</p>
 										</div>
 										<Switch
@@ -1009,7 +1009,7 @@ export function SettingsPage(props: {
 										/>
 										<DetailItem
 											label="影响范围"
-											value="发布列表 / Release 详情 / 翻译与智能总结 / 日报"
+											value="发布列表 / Release 详情 / 翻译与润色 / 日报"
 											hint="不影响真实加星列表，也不会新增社交事件。"
 										/>
 									</div>

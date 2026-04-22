@@ -26,7 +26,7 @@ const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
-    (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "智能摘要"),
+    (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
     (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
 ];
 

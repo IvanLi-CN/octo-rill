@@ -8,7 +8,7 @@
 
 ## 背景 / 问题陈述
 
-- 当前 Release 相关能力只认真实 `starred_repos`，因此用户自己的个人仓库如果没有手动加星，就不会进入 `发布 / 全部`、Release 详情、翻译、智能总结与日报链路。
+- 当前 Release 相关能力只认真实 `starred_repos`，因此用户自己的个人仓库如果没有手动加星，就不会进入 `发布 / 全部`、Release 详情、翻译、润色与日报链路。
 - 产品需要一个前台可控的“我的发布”开关，让用户可以把“本人 owner 的个人仓库 Release”纳入阅读面，但不能污染真实加星列表与社交动态语义。
 - 现有后端已经维护 `owned_repo_star_baselines`，但还没有把这份 owner 仓库基线统一接入 Release 可见性判定。
 
@@ -18,7 +18,7 @@
 
 - 在 `/settings?section=my-releases` 新增“我的发布”开关，并通过现有 `/api/me/profile` / `/api/admin/users/{user_id}/profile` 契约持久化 `include_own_releases`。
 - 将 Release 可见性统一改为：`starred_repos` +（开关开启时）`owned_repo_star_baselines` 的去重并集。
-- 让 `发布 / 全部`、Release 详情、翻译、智能总结、reaction、日报、手动同步与定时同步都使用同一套 Release 可见性来源。
+- 让 `发布 / 全部`、Release 详情、翻译、润色、reaction、日报、手动同步与定时同步都使用同一套 Release 可见性来源。
 - 保持 `/api/starred`、社交 `加星` tab、真实 starred snapshot 语义不变。
 
 ### Non-goals
@@ -67,7 +67,7 @@
   - 基础来源：`starred_repos`
   - 增量来源：`owned_repo_star_baselines`（仅当 `users.include_own_releases = 1`）
   - 去重规则：若某 repo 已在 `starred_repos` 中存在，则忽略同 repo 的 owned baseline 行。
-- Release 列表、详情、翻译、智能总结、reaction、日报与智能预热都从该 view 获取 repo membership。
+- Release 列表、详情、翻译、润色、reaction、日报与润色预热都从该 view 获取 repo membership。
 
 ### 前台“我的发布”开关
 
@@ -85,7 +85,7 @@
 ## 验收标准（Acceptance Criteria）
 
 - Given 用户未开启“我的发布”
-  When 访问 `发布 / 全部`、Release 详情、翻译、智能总结或日报
+  When 访问 `发布 / 全部`、Release 详情、翻译、润色或日报
   Then owned-but-unstarred 仓库 Release 不可见。
 
 - Given 用户开启“我的发布”
@@ -155,7 +155,7 @@
 ## 实现里程碑（Milestones / Delivery checklist）
 
 - [x] M1: 新增 spec、README 索引、`include_own_releases` migration 与 profile 契约扩展。
-- [x] M2: Release 可见性统一改到 `user_release_visible_repos`，并接通同步 / 详情 / 翻译 / 智能总结 / 日报。
+- [x] M2: Release 可见性统一改到 `user_release_visible_repos`，并接通同步 / 详情 / 翻译 / 润色 / 日报。
 - [x] M3: Settings / Dashboard Storybook、Playwright 与 owner-facing 视觉证据完成。
 - [ ] M4: 提交、推送、PR、review-loop 收敛到 merge-ready。
 

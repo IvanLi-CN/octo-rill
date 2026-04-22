@@ -1,4 +1,4 @@
-# Release Feed 三 Tabs 与智能版本变化卡片（#7f2b9）
+# Release Feed 三 Tabs 与润色版本变化卡片（#7f2b9）
 
 ## 状态
 
@@ -10,21 +10,21 @@
 
 当前 Dashboard release feed 只有“原文 / 翻译”二选一，且中文内容本质上仍是直译，无法帮助用户快速理解“这个版本到底改了什么”。
 
-对于大量 GitHub Release，正文可能为空、只有一句模板话术、或者只有链接；这类内容即使翻译出来，也不足以承担版本变化导读。我们需要把 feed 卡片升级为一个更适合快速浏览版本变化的阅读面：优先展示智能整理后的中文要点，必要时再按需分析 compare diff；若仍无法提炼出有效版本信息，则卡片收敛为仅保留版本号与元信息的折叠样式。
+对于大量 GitHub Release，正文可能为空、只有一句模板话术、或者只有链接；这类内容即使翻译出来，也不足以承担版本变化导读。我们需要把 feed 卡片升级为一个更适合快速浏览版本变化的阅读面：优先展示润色后的中文要点，必要时再按需分析 compare diff；若仍无法提炼出有效版本信息，则卡片收敛为仅保留版本号与元信息的折叠样式。
 
 ## 目标 / 非目标
 
 ### Goals
 
-- Release feed 卡片改为 `原文 / 翻译 / 智能` 三 tabs。
-- 顶部新增页面级默认显示模式控制器（原文 / 翻译 / 智能），用于决定当前 release feed 的全局默认阅读 lane，并持久化到浏览器。
-- AI 可用时页面级默认显示模式优先为 `智能`；缺数据时进入可见区即自动生成。
-- 新 release 在 sync 流程完成后，`智能` 需像 `翻译` 一样走后台预生成，优先命中缓存而不是等首次可见时才补算。
-- `智能` 内容专门服务于“帮助快速理解版本变化”，输出纯要点列表，不做长段落直译。
-- 智能工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 按需拉 compare diff`，`仍无价值 -> 折叠为仅版本号卡片`。
+- Release feed 卡片改为 `原文 / 翻译 / 润色` 三 tabs。
+- 顶部新增页面级默认显示模式控制器（原文 / 翻译 / 润色），用于决定当前 release feed 的全局默认阅读 lane，并持久化到浏览器。
+- AI 可用时页面级默认显示模式优先为 `润色`；缺数据时进入可见区即自动生成。
+- 新 release 在 sync 流程完成后，`润色` 需像 `翻译` 一样走后台预生成，优先命中缓存而不是等首次可见时才补算。
+- `润色` 内容专门服务于“帮助快速理解版本变化”，输出纯要点列表，不做长段落直译。
+- 润色工作流遵循：`正文有价值 -> 直接生成`，`正文无价值 -> 按需拉 compare diff`，`仍无价值 -> 折叠为仅版本号卡片`。
 - 新增独立的 `release_smart` 调度/缓存语义，与现有 release 翻译缓存隔离。
 - 卡片内 lane selector 改为 icon-only，但保留 tooltip 与可访问标签。
-- 当 `翻译` / `智能` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
+- 当 `翻译` / `润色` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
 - 为 UI 改动补齐 Storybook 场景、视觉证据和回归测试，并推进到 PR merge-ready。
 
 ### Non-goals
@@ -43,7 +43,7 @@
 - `release_smart` 的请求校验、缓存映射、批处理解析与 `/api/feed` smart lane。
 - release body -> diff fallback -> insufficient collapse 的 LLM 工作流。
 - compare diff 的按需精简 payload builder。
-- 翻译 / 智能 lane 的原文回退展示与 option 呼吸态。
+- 翻译 / 润色 lane 的原文回退展示与 option 呼吸态。
 - 仅版本号折叠卡片样式。
 - 本地 SQLite 运行时稳定性修复，避免 smart/translation 后台任务把桌面预览拖进 `database is locked` 自锁状态。
 - Storybook 状态覆盖、Playwright 回归、spec visual evidence。
@@ -79,7 +79,7 @@
 - `error_text` 使用稳定 reason code：`no_valuable_version_info`。
 - `/api/feed` 把 `missing + no_valuable_version_info` 暴露为 `smart.status = insufficient`。
 
-## 智能工作流
+## 润色工作流
 
 ### 1. Body-first
 
@@ -122,48 +122,48 @@
 ## 前端行为规格
 
 - 顶部新增页面级默认显示模式控制器，仅作用于 `全部` / `Releases` 两个含 release feed 的顶层 tab。
-- 页面级默认显示模式持久化到 `localStorage`：`octo-rill.dashboard.releaseDefaultLane`；默认值为 `智能`，AI disabled 或 lane 不可用时按既有保护回退到 `原文`。
+- 页面级默认显示模式持久化到 `localStorage`：`octo-rill.dashboard.releaseDefaultLane`；默认值为 `润色`，AI disabled 或 lane 不可用时按既有保护回退到 `原文`。
 - 页面级控制器切换时，当前已渲染的 release 卡片立即切到新 lane；切换后用户仍可通过单卡 selector 临时覆盖。
-- 页面级控制器切换到 `翻译` / `智能` 时，需要沿用单卡 selector 的按需生成语义：对当前 feed 中仍为 `missing` 的卡片立即触发对应请求，避免整页切换后长期停留在原文回退态。
-- 卡片内 selector 改为 icon-only；hover / focus 通过 tooltip 与 `aria-label` 暴露 `原文 / 翻译 / 智能`。
-- 智能 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
-- sync 新写入的 release：后台同时预热 `翻译` 与 `智能` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
+- 页面级控制器切换到 `翻译` / `润色` 时，需要沿用单卡 selector 的按需生成语义：对当前 feed 中仍为 `missing` 的卡片立即触发对应请求，避免整页切换后长期停留在原文回退态。
+- 卡片内 selector 改为 icon-only；hover / focus 通过 tooltip 与 `aria-label` 暴露 `原文 / 翻译 / 润色`。
+- 润色 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
+- sync 新写入的 release：后台同时预热 `翻译` 与 `润色` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
 - 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
 - 当 `translation.scheduler.*` 或 `api.translate_*` 路径中的 LLM 调用返回 `AI response missing content` 时，共享 AI 客户端必须在**同一次请求内**把总尝试上限从 4 提升到 8；其他 source 与其他错误类型继续维持 4 次总尝试，不引入后台重排队。
-- 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `智能整理中`。
+- 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `润色中`。
 - queued batch recovery 只能接手**已经陈旧的遗留 batch**；刚创建、尚未进入执行阶段的 fresh batch 不能被第二个 scheduler tick 抢占重放。
-- 本地 SQLite 运行时必须允许 feed 首屏查询、心跳与可见区智能预加载并存；不能因为连接池过小而让智能预加载长时间饥饿，看起来像“没有自动生成”。
-- 翻译 / 智能 tab 缺数据：用户首次切入该 tab 时，`missing` lane 仍允许按需补算；但若 lane 已明确是 `error + auto_translate=false`，tab 切换只能展示当前终态，不能偷偷再发一次无效重试请求。
-- 若 smart lane 处于 `error` 且用户点击 `重试智能整理`，错误态 action 按钮必须立刻进入 spinning/loading，并在请求完成前保持 disabled，避免重复点击。
+- 本地 SQLite 运行时必须允许 feed 首屏查询、心跳与可见区润色预加载并存；不能因为连接池过小而让润色预加载长时间饥饿，看起来像“没有自动生成”。
+- 翻译 / 润色 tab 缺数据：用户首次切入该 tab 时，`missing` lane 仍允许按需补算；但若 lane 已明确是 `error + auto_translate=false`，tab 切换只能展示当前终态，不能偷偷再发一次无效重试请求。
+- 若 smart lane 处于 `error` 且用户点击 `重试润色`，错误态 action 按钮必须立刻进入 spinning/loading，并在请求完成前保持 disabled，避免重复点击。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
-- 智能 ready 内容必须是纯要点列表，不得退化为原文直译。
+- 润色 ready 内容必须是纯要点列表，不得退化为原文直译。
 
 ## 验收标准（Acceptance Criteria）
 
 - Given AI 可用且 release smart 结果缺失
   When 用户打开 release feed 且卡片进入可见区
-  Then 页面级默认显示模式为 `智能`，卡片正文继续显示原文，`智能` option 显示呼吸态，并自动发起 `release_smart` 请求。
+  Then 页面级默认显示模式为 `润色`，卡片正文继续显示原文，`润色` option 显示呼吸态，并自动发起 `release_smart` 请求。
 
 - Given 用户在 `全部` 或 `Releases` 顶部切换页面级默认显示模式
-  When 用户选择 `原文` / `翻译` / `智能`
+  When 用户选择 `原文` / `翻译` / `润色`
   Then 当前已渲染的 release 卡片会立即切换到对应 lane；若目标 lane 仍缺数据，则沿用单卡 selector 的按需生成逻辑，刷新页面后仍沿用同一默认值。
 
 - Given sync 刚写入新的 release 且 AI 可用
   When 后台预热任务入队
-  Then `翻译` 与 `智能` 两条 lane 都会按同一批 release ID 预生成；用户再次打开 feed 时优先命中 ready/terminal 缓存，而不是只预热翻译。
+  Then `翻译` 与 `润色` 两条 lane 都会按同一批 release ID 预生成；用户再次打开 feed 时优先命中 ready/terminal 缓存，而不是只预热翻译。
 
 - Given smart lane 之前落过可重试的瞬时错误
   When 用户重新打开 feed 或再次触发 sync
-  Then 系统会把该卡片重新纳入智能预热/预加载，而不是继续展示陈旧错误态。
+  Then 系统会把该卡片重新纳入润色预热/预加载，而不是继续展示陈旧错误态。
 
 - Given feed 首次加载完成且当前页里仍有 missing 的 smart 卡片
   When 页面进入空闲态
   Then 前端会主动 prime 最近一批 smart 请求，而不是必须等主人滚动到每张卡片才开始生成。
 
 - Given 首屏同时出现多张待整理的 release 卡片
-  When 页面完成 feed 请求并自动触发智能预加载
-  Then 卡片会先进入呼吸态 / `智能整理中`，随后持续回填结果；运行时不能长期卡在“还没有智能版本变化摘要”但实际上没有继续生成。
+  When 页面完成 feed 请求并自动触发润色预加载
+  Then 卡片会先进入呼吸态 / `润色中`，随后持续回填结果；运行时不能长期卡在“还没有润色版本变化摘要”但实际上没有继续生成。
 
 - Given 用户点击 `翻译` tab 且当前没有翻译结果
   When tab 切换完成
@@ -187,13 +187,13 @@
 
 - Given 调度器曾在 batch 已入库、但实际执行前中断
   When 服务重启后下一个 translation scheduler tick 到来
-  Then 旧的 queued batch 会被重新接手并继续执行，卡片不会永久停在 `智能整理中`。
+  Then 旧的 queued batch 会被重新接手并继续执行，卡片不会永久停在 `润色中`。
 
 - Given 一个 queued batch 刚被当前 worker 创建、但尚未进入执行阶段
   When 另一个 scheduler tick 紧接着运行
   Then 该 fresh queued batch 不会被当作遗留任务重复接手，避免同一批 work items 被并发重放。
 
-- Given 某个翻译或智能 lane 已明确返回 `error + auto_translate=false`
+- Given 某个翻译或润色 lane 已明确返回 `error + auto_translate=false`
   When 用户只是切换到对应 tab
   Then 前端不会把 tab 切换当成新的自动重试信号，也不会静默发出明知无效的请求。
 
@@ -209,11 +209,11 @@
   When 本次单请求内重试预算耗尽
   Then lane 仍按现有错误态收口，且 public error 语义不变。
 
-- Given 用户在 `智能整理失败` 卡片上点击 `重试智能整理`
+- Given 用户在 `润色失败` 卡片上点击 `重试润色`
   When 本次 smart 终态实际返回 `insufficient`
   Then 卡片直接收敛为仅版本号折叠样式，不额外冒出全局 boot error。
 
-- Given 用户在 `智能整理失败` 卡片上点击 `重试智能整理`
+- Given 用户在 `润色失败` 卡片上点击 `重试润色`
   When 请求仍在进行中
   Then 按钮会立即显示 spinning/loading 并保持 disabled，直到本次 smart 请求结束，期间不会出现第二次有效触发。
 
@@ -238,7 +238,7 @@
 
 ## Change log
 
-- 2026-04-08：补齐页面级默认 lane selector、单卡 icon-only selector，以及翻译 / 智能加载时继续显示原文的交互口径与视觉证据。
+- 2026-04-08：补齐页面级默认 lane selector、单卡 icon-only selector，以及翻译 / 润色加载时继续显示原文的交互口径与视觉证据。
 - 2026-04-08：补齐页面级切换复用单卡按需生成逻辑，并收紧 segmented selector 的选中 / 加载态层级。
 
 ## Visual Evidence
@@ -253,30 +253,30 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartReadyBody`
   state: `smart-ready-body`
-  evidence_note: 验证默认落在“智能” tab，且正文可直接生成版本变化要点而非直译。
+  evidence_note: 验证默认落在“润色” tab，且正文可直接生成版本变化要点而非直译。
 
-  ![智能总结（正文直出）](./assets/release-smart-ready-body-focused.png)
+  ![润色（正文直出）](./assets/release-smart-ready-body-focused.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartReadyDiff`
   state: `smart-ready-diff`
-  evidence_note: 验证 release body 无价值时，智能总结回退到 diff digest，并输出适合快速理解版本变化的中文要点。
+  evidence_note: 验证 release body 无价值时，润色回退到 diff digest，并输出适合快速理解版本变化的中文要点。
 
-  ![智能总结（diff 回退）](./assets/release-smart-ready-diff-focused.png)
+  ![润色（diff 回退）](./assets/release-smart-ready-diff-focused.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartLoading`
   state: `smart-loading`
-  evidence_note: 验证智能 lane 缺数据时正文继续显示原文，同时仅通过 selector option 的呼吸态表达加载状态，不再把正文区替换成空白加载面板。
+  evidence_note: 验证润色 lane 缺数据时正文继续显示原文，同时仅通过 selector option 的呼吸态表达加载状态，不再把正文区替换成空白加载面板。
 
-  ![智能总结加载时保留原文](./assets/release-smart-loading-original-fallback.png)
+  ![润色加载时保留原文](./assets/release-smart-loading-original-fallback.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartRetryActionLoading`
   state: `smart-retry-action-loading`
-  evidence_note: 验证错误态卡片点击“重试智能整理”后，按钮立即进入旋转 loading，并在 smart 请求进行期间保持禁用，避免重复点击。
+  evidence_note: 验证错误态卡片点击“重试润色”后，按钮立即进入旋转 loading，并在 smart 请求进行期间保持禁用，避免重复点击。
 
-  ![重试智能整理按钮加载中](./assets/release-smart-retry-action-loading-focused.png)
+  ![重试润色按钮加载中](./assets/release-smart-retry-action-loading-focused.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartInsufficient`

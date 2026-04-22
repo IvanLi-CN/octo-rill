@@ -575,11 +575,11 @@ function buildTaskDetailPageModel(
 			return {
 				pageTitle:
 					task.task_type === "summarize.release.smart.batch"
-						? "批量智能整理 Release 详情页"
+						? "批量润色 Release 详情页"
 						: "批量翻译 Release 详情页",
 				pageSummary:
 					task.task_type === "summarize.release.smart.batch"
-						? "展示批量智能整理任务的目标 Release 数量、进度与 ready/missing/error 结果分布。"
+						? "展示批量润色任务的目标 Release 数量、进度与 ready/missing/error 结果分布。"
 						: "展示批量翻译任务的目标 Release 数量、进度与 ready/missing/error 结果分布。",
 				fields: buildFields(
 					field("目标用户", targetUser),
