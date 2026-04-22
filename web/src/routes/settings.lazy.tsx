@@ -76,9 +76,7 @@ function SettingsRouteComponent() {
 			onSectionChange={(nextSection) => {
 				void router.navigate({
 					to: "/settings",
-					search: buildSettingsSearch(nextSection, {
-						passkey: search.passkey,
-					}) as never,
+					search: buildSettingsSearch(nextSection) as never,
 				});
 			}}
 			onProfileSaved={async () => {

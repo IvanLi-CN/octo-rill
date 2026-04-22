@@ -457,3 +457,31 @@ test("settings deep link shows passkey list and allows revoke", async ({
 	).toHaveCount(0);
 	await expect(page.getByText("Passkey 已移除")).toBeVisible();
 });
+
+test("switching away from passkeys clears the passkey flash state", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installSettingsMocks(page, {
+		passkeys: [
+			{
+				id: "pk_phone",
+				label: "Passkey · 2026-04-20 09:00 UTC",
+				created_at: "2026-04-20T09:00:00Z",
+				last_used_at: "2026-04-22T08:30:00Z",
+			},
+		],
+	});
+
+	await page.goto("/settings?section=passkeys&passkey=registered");
+
+	await expect(page.getByText("Passkey 已添加")).toBeVisible();
+	await page
+		.getByRole("link", { name: /GitHub 账号/ })
+		.first()
+		.click();
+
+	await expect(page).toHaveURL(/section=github-accounts/);
+	await expect(page).not.toHaveURL(/passkey=/);
+	await expect(page.getByText("Passkey 已添加")).toHaveCount(0);
+});

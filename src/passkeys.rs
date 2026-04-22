@@ -212,37 +212,8 @@ pub async fn attach_pending_passkey_to_user(
     user_id: &str,
     pending: &PendingPasskeyCredentialSession,
 ) -> Result<AttachPendingPasskeyOutcome, ApiError> {
-    let existing_handle = sqlx::query_scalar::<_, Option<String>>(
-        r#"
-        SELECT passkey_user_handle_uuid
-        FROM users
-        WHERE id = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(ApiError::internal)?;
-
-    if let Some(existing_handle) = existing_handle.as_deref() {
-        if existing_handle != pending.user_handle_uuid {
-            return Ok(AttachPendingPasskeyOutcome::RetryRequired);
-        }
-    } else {
-        sqlx::query(
-            r#"
-            UPDATE users
-            SET passkey_user_handle_uuid = ?
-            WHERE id = ?
-              AND passkey_user_handle_uuid IS NULL
-            "#,
-        )
-        .bind(pending.user_handle_uuid.as_str())
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(ApiError::internal)?;
+    if !ensure_passkey_user_handle(tx, user_id, pending.user_handle_uuid.as_str()).await? {
+        return Ok(AttachPendingPasskeyOutcome::RetryRequired);
     }
 
     let credential_id = passkey_credential_id(&pending.passkey);
@@ -292,6 +263,65 @@ pub async fn attach_pending_passkey_to_user(
     .map_err(ApiError::internal)?;
 
     Ok(AttachPendingPasskeyOutcome::Attached)
+}
+
+async fn ensure_passkey_user_handle(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    pending_user_handle_uuid: &str,
+) -> Result<bool, ApiError> {
+    let existing_handle = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT passkey_user_handle_uuid
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if let Some(existing_handle) = existing_handle.as_deref() {
+        return Ok(existing_handle == pending_user_handle_uuid);
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE users
+        SET passkey_user_handle_uuid = ?
+        WHERE id = ?
+          AND passkey_user_handle_uuid IS NULL
+        "#,
+    )
+    .bind(pending_user_handle_uuid)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if result.rows_affected() > 0 {
+        return Ok(true);
+    }
+
+    let refreshed_handle = sqlx::query_scalar::<_, Option<String>>(
+        r#"
+        SELECT passkey_user_handle_uuid
+        FROM users
+        WHERE id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    match refreshed_handle.as_deref() {
+        Some(existing_handle) => Ok(existing_handle == pending_user_handle_uuid),
+        None => Err(ApiError::internal("failed to persist passkey user handle")),
+    }
 }
 
 pub async fn mark_passkey_authentication_used(
@@ -346,8 +376,26 @@ fn stored_passkey_from_row(row: StoredPasskeyRow) -> Result<StoredPasskey, ApiEr
 mod tests {
     use super::{
         PASSKEY_AUTHENTICATION_TTL_SECS, PASSKEY_BIND_TTL_SECS, PASSKEY_REGISTRATION_TTL_SECS,
-        build_passkey_label, session_timestamp_is_expired,
+        build_passkey_label, ensure_passkey_user_handle, session_timestamp_is_expired,
     };
+    use sqlx::{Connection, Executor, SqliteConnection};
+
+    async fn build_handle_test_connection() -> SqliteConnection {
+        let mut conn = SqliteConnection::connect(":memory:")
+            .await
+            .expect("connect sqlite memory");
+        conn.execute(
+            r#"
+            CREATE TABLE users (
+              id TEXT PRIMARY KEY,
+              passkey_user_handle_uuid TEXT
+            );
+            "#,
+        )
+        .await
+        .expect("create users table");
+        conn
+    }
 
     #[test]
     fn build_passkey_label_keeps_stable_utc_shape() {
@@ -380,5 +428,62 @@ mod tests {
             &stale,
             PASSKEY_REGISTRATION_TTL_SECS
         ));
+    }
+
+    #[tokio::test]
+    async fn ensure_passkey_user_handle_accepts_matching_existing_value() {
+        let mut conn = build_handle_test_connection().await;
+        conn.execute(
+            "INSERT INTO users (id, passkey_user_handle_uuid) VALUES ('user_1', 'handle_1')",
+        )
+        .await
+        .expect("insert user");
+        let mut tx = conn.begin().await.expect("begin tx");
+
+        let matched = ensure_passkey_user_handle(&mut tx, "user_1", "handle_1")
+            .await
+            .expect("ensure matching handle");
+
+        assert!(matched);
+    }
+
+    #[tokio::test]
+    async fn ensure_passkey_user_handle_rejects_mismatched_existing_value() {
+        let mut conn = build_handle_test_connection().await;
+        conn.execute(
+            "INSERT INTO users (id, passkey_user_handle_uuid) VALUES ('user_1', 'handle_old')",
+        )
+        .await
+        .expect("insert user");
+        let mut tx = conn.begin().await.expect("begin tx");
+
+        let matched = ensure_passkey_user_handle(&mut tx, "user_1", "handle_new")
+            .await
+            .expect("ensure mismatched handle");
+
+        assert!(!matched);
+    }
+
+    #[tokio::test]
+    async fn ensure_passkey_user_handle_sets_missing_value() {
+        let mut conn = build_handle_test_connection().await;
+        conn.execute("INSERT INTO users (id, passkey_user_handle_uuid) VALUES ('user_1', NULL)")
+            .await
+            .expect("insert user");
+        let mut tx = conn.begin().await.expect("begin tx");
+
+        let matched = ensure_passkey_user_handle(&mut tx, "user_1", "handle_1")
+            .await
+            .expect("ensure missing handle");
+        tx.commit().await.expect("commit tx");
+
+        assert!(matched);
+        let persisted = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT passkey_user_handle_uuid FROM users WHERE id = 'user_1'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("load persisted handle");
+        assert_eq!(persisted.as_deref(), Some("handle_1"));
     }
 }
