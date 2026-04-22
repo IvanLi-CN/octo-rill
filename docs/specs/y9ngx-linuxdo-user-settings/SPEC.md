@@ -4,7 +4,7 @@
 
 - Status: 已完成
 - Created: 2026-04-18
-- Last: 2026-04-21
+- Last: 2026-04-22
 
 ## 背景 / 问题陈述
 
@@ -50,7 +50,9 @@
 - `/settings` 必须至少包含 `linuxdo`、`github-pat`、`daily-brief` 三个稳定 section，并支持 `?section=<id>` 深链定位。
 - LinuxDO section 必须能展示“未绑定 / 已绑定 / 服务端未配置”三种状态，并支持发起 OAuth 绑定与解绑。
 - GitHub PAT section 必须保留现有 800ms 防抖校验、masked token 展示与仅 `valid` 可保存的门禁。
-- Dashboard 弹层与 `/settings` 内的 GitHub PAT 输入框都必须在默认隐藏态保留原生 `password` 语义，保留 `autocomplete="new-password"` 提示，且仅在用户显式点亮后切到明文；同时补充密码管理器忽略提示，尽量避免被当成当前站点登录密码框自动填充。
+- Dashboard 弹层与 `/settings` 内的 GitHub PAT 输入框都必须在默认隐藏态使用原生 `password` / secure-text 语义，设置 `autocomplete="new-password"`，并补充密码管理器忽略提示，避免被当成当前站点登录密码框自动填充或触发生成密码建议；仅在用户显式点亮后切到明文。隐藏态还必须继续保留在辅助功能树中的可聚焦、可编辑语义，辅助技术读取到的值必须保持为掩码而不是明文 token，并提供额外提示说明当前处于隐藏编辑态。
+- GitHub PAT 输入框在隐藏态下保留原生文本编辑体验：词级删除、拖放插入与撤销/重做不能因为防自动填充处理而回退；其中词级删除既要覆盖键盘快捷键，也要覆盖浏览器原生 `beforeinput` 的 `deleteWordBackward` / `deleteWordForward` 路径；撤销/重做既要覆盖键盘快捷键，也要覆盖浏览器 Edit / context-menu 触发的 `historyUndo` / `historyRedo` 路径；拖放插入必须落在用户实际悬停的插入点，而不是沿用旧光标位置。
+- GitHub PAT 输入框从明文切回隐藏态时，焦点必须回到显隐切换按钮，避免键盘用户与辅助技术继续停留在刚刚暴露过明文的编辑控件上。
 - reaction 在 PAT 缺失或失效时，必须提供可直接输入、校验并保存 GitHub PAT 的快捷弹层；同时保留进入 `/settings?section=github-pat` 的完整设置入口。
 - Dashboard 顶部独立“日报设置”按钮必须移除，日报设置迁入 `/settings`。
 
@@ -117,7 +119,11 @@
 
 - Given 用户访问 `/settings?section=github-pat`
   When 页面渲染完成
-  Then 页面滚动/定位到 GitHub PAT section，展示当前 masked token 与 PAT 校验状态，且输入框默认以 `password` + `new-password` 语义渲染、支持显隐切换并附带密码管理器忽略提示。
+  Then 页面滚动/定位到 GitHub PAT section，展示当前 masked token 与 PAT 校验状态，且输入框默认以原生 `password` / secure-text 语义渲染、默认关闭自动填充提示、支持显隐切换并附带密码管理器忽略提示，同时保持屏幕阅读器可感知/可编辑并能读到隐藏编辑提示，且辅助功能树不会暴露明文 token。
+
+- Given 用户先显示 GitHub PAT 再点击“隐藏 GitHub PAT”
+  When 输入框回到掩码态
+  Then 焦点返回显隐切换按钮，避免继续停留在刚刚显示过明文的编辑控件上。
 
 - Given LinuxDO OAuth 已配置且用户尚未绑定
   When 用户在设置页点击“连接 LinuxDO”并完成授权
@@ -129,7 +135,7 @@
 
 - Given 用户点击 Release reaction 且 GitHub PAT 缺失或失效
   When 前端处理 fallback
-  Then 会出现可直接保存 GitHub PAT 的快捷弹层，并保留跳转 `/settings?section=github-pat` 的入口，且弹层输入框默认保持 `password` + `new-password` 保护，仅在用户显式点亮后显示明文，并附带密码管理器忽略提示。
+  Then 会出现可直接保存 GitHub PAT 的快捷弹层，并保留跳转 `/settings?section=github-pat` 的入口，且弹层输入框默认保持原生 `password` / secure-text 语义、默认关闭自动填充提示，仅在用户显式点亮后显示明文，并附带密码管理器忽略提示，同时继续支持隐藏态下的词级删除、拖放插入与撤销/重做。
 
 - Given 用户在设置页修改日报时间或时区
   When 提交保存
@@ -182,7 +188,7 @@ PR: include
 ![Settings page overview](./assets/settings-page-overview.png)
 
 PR: include
-GitHub PAT section 深链态（保留 masked token / 校验状态，输入框默认保持 password 保护并支持显隐切换）
+GitHub PAT section 深链态（保留 masked token / 校验状态，输入框默认使用原生 secure-text 隐藏并支持显隐切换）
 ![Settings GitHub PAT section](./assets/settings-github-pat-section.png)
 
 PR: include
@@ -194,7 +200,7 @@ PR: include
 ![Dashboard account menu settings entry](./assets/dashboard-account-menu-settings.png)
 
 PR: include
-PAT fallback 快速补录弹层（默认保持 password 保护、支持显隐切换，并保留完整设置入口）
+PAT fallback 快速补录弹层（默认使用原生 secure-text 隐藏、支持显隐切换，并保留完整设置入口）
 ![PAT fallback quick setup dialog](./assets/dashboard-pat-fallback-guide.png)
 
 ## 资产晋升（Asset promotion）
@@ -223,7 +229,7 @@ None
 
 ## 变更记录（Change log）
 
-- 2026-04-21：将 GitHub PAT 输入契约调整为默认保持 `password` + `new-password` 保护、显式点亮后再切到明文，并补充密码管理器忽略提示。
+- 2026-04-22：将 GitHub PAT 输入契约调整为默认保持原生 `password` / secure-text + `autocomplete="new-password"`、显式点亮后再切到明文，并补充密码管理器忽略提示，同时补齐隐藏态对辅助功能树的掩码保护、切回隐藏态后的焦点回收、菜单驱动的撤销/重做路径以及按实际悬停插入点落位的拖放编辑覆盖。
 - 2026-04-20：补充 GitHub PAT 输入框的非登录自动填充语义要求，覆盖 Dashboard 快捷弹层与 `/settings` 页面。
 
 - 2026-04-18: 新建规格，冻结为 LinuxDO OAuth 绑定 + 统一用户设置页方案。
