@@ -464,17 +464,26 @@ export const DeepLinkedGitHubPat: Story = {
 			canvas.queryByRole("heading", { name: "GitHub PAT 可用" }),
 		).not.toBeInTheDocument();
 		await expect(canvas.getByText("GitHub PAT 无效")).toBeVisible();
-		const input = canvas.getByLabelText("GitHub PAT", { selector: "input" });
-		await expect(input).toHaveAttribute("type", "password");
-		await expect(input).toHaveAttribute("autocomplete", "new-password");
+		const input = canvasElement.querySelector(
+			"#settings-reaction-pat",
+		) as HTMLInputElement | null;
+		if (!input) {
+			throw new Error("expected settings GitHub PAT input");
+		}
+		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("autocomplete", "off");
+		await expect(input).toHaveAttribute("aria-hidden", "true");
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
+		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
 		await userEvent.click(
 			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "true");
+		await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
+		await expect(input).not.toHaveAttribute("aria-hidden");
 		const guide = canvas.getByTestId("github-pat-guide-card");
 		await expect(guide).toBeVisible();
 		await expect(
