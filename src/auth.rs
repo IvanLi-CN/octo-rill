@@ -552,6 +552,44 @@ fn post_github_login_redirect(
     config.public_base_url.to_string()
 }
 
+fn post_linuxdo_login_redirect(config: &AppConfig, passkey_status: Option<&str>) -> String {
+    if let Some(passkey_status) = passkey_status {
+        return settings_redirect(
+            config,
+            "passkeys",
+            None,
+            Some("connected"),
+            Some(passkey_status),
+        );
+    }
+
+    config.public_base_url.to_string()
+}
+
+fn post_linuxdo_bind_redirect(config: &AppConfig, passkey_status: Option<&str>) -> String {
+    if let Some(passkey_status) = passkey_status {
+        return settings_redirect(
+            config,
+            "passkeys",
+            None,
+            Some("connected"),
+            Some(passkey_status),
+        );
+    }
+
+    settings_redirect(config, "linuxdo", None, Some("connected"), None)
+}
+
+fn should_use_github_connect_mode(
+    requested_mode: Option<&str>,
+    has_session_user: bool,
+    has_pending_linuxdo: bool,
+    has_pending_passkey: bool,
+) -> bool {
+    requested_mode == Some(GITHUB_OAUTH_MODE_CONNECT)
+        || (has_session_user && !has_pending_linuxdo && !has_pending_passkey)
+}
+
 fn provisional_passkey_user_name(user_handle_uuid: &str) -> String {
     let suffix = user_handle_uuid.chars().take(8).collect::<String>();
     format!("passkey-{suffix}")
@@ -598,6 +636,42 @@ async fn finalize_passkey_authentication_session(
         .map_err(ApiError::internal)?;
     clear_pending_passkey_credential(session).await;
     Ok(())
+}
+
+async fn consume_pending_passkey_after_login(
+    state: &AppState,
+    session: &Session,
+    user_id: &str,
+) -> Result<Option<&'static str>, ApiError> {
+    let pending_passkey = session
+        .get::<PendingPasskeyCredentialSession>(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(pending_passkey) = pending_passkey else {
+        return Ok(None);
+    };
+    if pending_passkey_bind_is_expired(&pending_passkey) {
+        clear_pending_passkey_credential(session).await;
+        return Ok(Some("expired"));
+    }
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let status = match attach_pending_passkey_to_user(&mut tx, user_id, &pending_passkey).await? {
+        AttachPendingPasskeyOutcome::Attached | AttachPendingPasskeyOutcome::AlreadyExists => {
+            tx.commit().await.map_err(ApiError::internal)?;
+            None
+        }
+        AttachPendingPasskeyOutcome::AlreadyBound => {
+            let _ = tx.rollback().await;
+            Some("passkey_already_bound")
+        }
+        AttachPendingPasskeyOutcome::RetryRequired => {
+            let _ = tx.rollback().await;
+            Some("passkey_retry_required")
+        }
+    };
+    clear_pending_passkey_credential(session).await;
+    Ok(status)
 }
 
 async fn upsert_linuxdo_connection_record(
@@ -726,9 +800,12 @@ async fn finalize_github_auth(
     let mut login_user_after_commit: Option<String> = None;
     let mut consume_pending_passkey = false;
 
-    let effective_mode = if requested_mode.as_deref() == Some(GITHUB_OAUTH_MODE_CONNECT)
-        || (session_user_id.is_some() && pending_linuxdo.is_none())
-    {
+    let effective_mode = if should_use_github_connect_mode(
+        requested_mode.as_deref(),
+        session_user_id.is_some(),
+        pending_linuxdo.is_some(),
+        pending_passkey.is_some(),
+    ) {
         GITHUB_OAUTH_MODE_CONNECT
     } else {
         GITHUB_OAUTH_MODE_LOGIN
@@ -1194,13 +1271,17 @@ pub async fn linuxdo_callback(
     .await
     .map_err(ApiError::internal)?
     {
+        let passkey_status_after_login =
+            consume_pending_passkey_after_login(state.as_ref(), &session, owner.user_id.as_str())
+                .await?;
         session
             .insert(SESSION_KEY_USER_ID, owner.user_id)
             .await
             .map_err(ApiError::internal)?;
         clear_pending_linuxdo(&session).await;
-        clear_pending_passkey_credential(&session).await;
-        return Ok(Redirect::to(state.config.public_base_url.as_str()));
+        return Ok(Redirect::to(
+            post_linuxdo_login_redirect(&state.config, passkey_status_after_login).as_str(),
+        ));
     }
 
     if let Some(user_id) = session_user_id {
@@ -1225,9 +1306,11 @@ pub async fn linuxdo_callback(
         {
             Ok(()) => {
                 tx.commit().await.map_err(ApiError::internal)?;
+                let passkey_status_after_login =
+                    consume_pending_passkey_after_login(state.as_ref(), &session, user_id.as_str())
+                        .await?;
                 return Ok(Redirect::to(
-                    settings_redirect(&state.config, "linuxdo", None, Some("connected"), None)
-                        .as_str(),
+                    post_linuxdo_bind_redirect(&state.config, passkey_status_after_login).as_str(),
                 ));
             }
             Err(err) => {
@@ -1648,8 +1731,10 @@ mod tests {
     use super::{
         SESSION_KEY_PENDING_LINUXDO, SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, SESSION_KEY_USER_ID,
         clear_pending_linuxdo, clear_pending_passkey_credential,
-        finalize_passkey_authentication_session, post_github_login_redirect, promote_first_admin,
-        should_clear_pending_passkey_after_linuxdo_rollback, upsert_github_user,
+        finalize_passkey_authentication_session, post_github_login_redirect,
+        post_linuxdo_bind_redirect, post_linuxdo_login_redirect, promote_first_admin,
+        should_clear_pending_passkey_after_linuxdo_rollback, should_use_github_connect_mode,
+        upsert_github_user,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -1737,6 +1822,41 @@ mod tests {
             redirect,
             "http://127.0.0.1:58090/settings?section=github-accounts&github=connected&linuxdo=connected"
         );
+    }
+
+    #[test]
+    fn post_linuxdo_login_redirect_prefers_passkeys_section_for_passkey_recovery() {
+        let config = test_config();
+        let redirect = post_linuxdo_login_redirect(&config, Some("passkey_retry_required"));
+
+        assert_eq!(
+            redirect,
+            "http://127.0.0.1:58090/settings?section=passkeys&linuxdo=connected&passkey=passkey_retry_required"
+        );
+    }
+
+    #[test]
+    fn post_linuxdo_bind_redirect_falls_back_to_linuxdo_section_without_passkey_recovery() {
+        let config = test_config();
+        let redirect = post_linuxdo_bind_redirect(&config, None);
+
+        assert_eq!(
+            redirect,
+            "http://127.0.0.1:58090/settings?linuxdo=connected"
+        );
+    }
+
+    #[test]
+    fn github_auto_connect_mode_waits_for_pending_passkey_onboarding() {
+        assert!(should_use_github_connect_mode(
+            Some("connect"),
+            true,
+            false,
+            true,
+        ));
+        assert!(!should_use_github_connect_mode(None, true, false, true));
+        assert!(should_use_github_connect_mode(None, true, false, false));
+        assert!(!should_use_github_connect_mode(None, true, true, false));
     }
 
     #[tokio::test]
