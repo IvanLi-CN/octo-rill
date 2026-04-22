@@ -634,6 +634,7 @@ async fn finalize_passkey_authentication_session(
         .insert(SESSION_KEY_USER_ID, user_id)
         .await
         .map_err(ApiError::internal)?;
+    clear_pending_linuxdo(session).await;
     clear_pending_passkey_credential(session).await;
     Ok(())
 }
@@ -1918,7 +1919,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_passkey_authentication_session_logs_in_and_clears_pending_passkey() {
+    async fn finalize_passkey_authentication_session_logs_in_and_clears_pending_bind_context() {
         let session = setup_session();
         session
             .insert_value(
@@ -1927,6 +1928,10 @@ mod tests {
             )
             .await
             .expect("insert pending passkey");
+        session
+            .insert_value(SESSION_KEY_PENDING_LINUXDO, json!({"stale": true}))
+            .await
+            .expect("insert pending linuxdo");
 
         finalize_passkey_authentication_session(&session, "user_123")
             .await
@@ -1945,6 +1950,13 @@ mod tests {
                 .get_value(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
                 .await
                 .expect("read pending passkey")
+                .is_none()
+        );
+        assert!(
+            session
+                .get_value(SESSION_KEY_PENDING_LINUXDO)
+                .await
+                .expect("read pending linuxdo")
                 .is_none()
         );
     }
