@@ -1,8 +1,18 @@
+import {
+	apiPostPasskeyAuthenticateOptions,
+	apiPostPasskeyAuthenticateVerify,
+	apiPostPasskeyRegisterOptions,
+	apiPostPasskeyRegisterVerify,
+} from "@/api";
+import {
+	browserSupportsPasskeys,
+	createPasskeyCredential,
+	getPasskeyCredential,
+	normalizePasskeyErrorMessage,
+} from "@/auth/passkeys";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
-import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/brand/BrandLogo";
-import { ThemeToggle } from "@/components/theme/ThemeToggle";
-import { Inbox, Package2, Users } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
 	Card,
 	CardContent,
@@ -10,19 +20,23 @@ import {
 	CardHeader,
 	CardTitle,
 } from "@/components/ui/card";
+import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import { Inbox, Package2, Users } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 
 type LandingProps = {
 	bootError?: string | null;
+	passkeySupportOverride?: boolean | null;
 };
 
 const heroTitle = "集中查看与你相关的 GitHub 动态";
 const heroDescription =
 	"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。";
 const loginCardDescription =
-	"可直接使用 GitHub 登录；也可以先用 LinuxDO 登录，再绑定 GitHub。";
+	"可直接使用 GitHub 或 Passkey 登录；也可以先创建 Passkey，再继续绑定 GitHub。";
 
 const heroHighlights = [
 	{
@@ -42,7 +56,70 @@ const heroHighlights = [
 	},
 ] as const;
 
-export function Landing({ bootError }: LandingProps) {
+export function Landing({
+	bootError,
+	passkeySupportOverride = null,
+}: LandingProps) {
+	const [passkeySupported, setPasskeySupported] = useState(
+		passkeySupportOverride ?? false,
+	);
+	const [passkeyBusyMode, setPasskeyBusyMode] = useState<
+		"authenticate" | "register" | null
+	>(null);
+	const [passkeyError, setPasskeyError] = useState<string | null>(null);
+
+	useEffect(() => {
+		setPasskeySupported(passkeySupportOverride ?? browserSupportsPasskeys());
+	}, [passkeySupportOverride]);
+
+	const onAuthenticatePasskey = useCallback(() => {
+		if (!passkeySupported) {
+			setPasskeyError(
+				"当前浏览器不支持 Passkey，请改用 GitHub / LinuxDO 登录。",
+			);
+			return;
+		}
+		setPasskeyBusyMode("authenticate");
+		setPasskeyError(null);
+		void apiPostPasskeyAuthenticateOptions()
+			.then((options) => getPasskeyCredential(options, "required"))
+			.then((credential) => apiPostPasskeyAuthenticateVerify(credential))
+			.then((res) => {
+				window.location.assign(res.next_path);
+			})
+			.catch((err) => {
+				setPasskeyError(normalizePasskeyErrorMessage(err));
+			})
+			.finally(() => {
+				setPasskeyBusyMode(null);
+			});
+	}, [passkeySupported]);
+
+	const onRegisterPasskey = useCallback(() => {
+		if (!passkeySupported) {
+			setPasskeyError(
+				"当前浏览器不支持 Passkey，请改用 GitHub / LinuxDO 登录。",
+			);
+			return;
+		}
+		setPasskeyBusyMode("register");
+		setPasskeyError(null);
+		void apiPostPasskeyRegisterOptions()
+			.then((options) => createPasskeyCredential(options))
+			.then((credential) => apiPostPasskeyRegisterVerify(credential))
+			.then((res) => {
+				if (res.next_path) {
+					window.location.assign(res.next_path);
+				}
+			})
+			.catch((err) => {
+				setPasskeyError(normalizePasskeyErrorMessage(err));
+			})
+			.finally(() => {
+				setPasskeyBusyMode(null);
+			});
+	}, [passkeySupported]);
+
 	return (
 		<AppShell notice={<VersionUpdateNotice />} footer={<AppMetaFooter />}>
 			<div className="mx-auto max-w-6xl py-2 sm:py-4">
@@ -130,6 +207,43 @@ export function Landing({ bootError }: LandingProps) {
 										使用 LinuxDO 登录
 									</a>
 								</Button>
+								<Button
+									type="button"
+									variant="secondary"
+									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
+									onClick={onAuthenticatePasskey}
+									disabled={!passkeySupported || passkeyBusyMode !== null}
+									data-landing-passkey-login-cta
+								>
+									{passkeyBusyMode === "authenticate"
+										? "正在验证 Passkey…"
+										: "使用 Passkey 登录"}
+								</Button>
+								<Button
+									type="button"
+									variant="ghost"
+									className="h-11 w-full rounded-2xl text-sm font-medium"
+									onClick={onRegisterPasskey}
+									disabled={!passkeySupported || passkeyBusyMode !== null}
+									data-landing-passkey-register-cta
+								>
+									{passkeyBusyMode === "register"
+										? "正在创建 Passkey…"
+										: "首次使用？创建 Passkey 并继续绑定 GitHub"}
+								</Button>
+
+								{!passkeySupported ? (
+									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm leading-6 text-muted-foreground">
+										当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub /
+										LinuxDO 登录。
+									</div>
+								) : null}
+
+								{passkeyError ? (
+									<div className="rounded-2xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm leading-6 text-destructive">
+										{passkeyError}
+									</div>
+								) : null}
 
 								{bootError ? (
 									<div className="rounded-2xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm leading-6 text-destructive">

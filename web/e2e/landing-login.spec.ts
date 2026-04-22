@@ -1,5 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 
+import {
+	installPasskeyBrowserMock,
+	installPasskeyUnsupportedBrowser,
+} from "./passkeyHelpers";
+
 const TECH_HINT_PATTERN =
 	/(?:dev 环境|Vite|\/api 和 \/auth proxy|proxy 到 Rust 后端)/i;
 const LEGACY_COPY_PATTERN =
@@ -51,14 +56,25 @@ async function installLandingApiMocks(
 test("landing page shows concise login copy for unauthenticated users", async ({
 	page,
 }) => {
+	await installPasskeyBrowserMock(page);
 	await installLandingApiMocks(page, 401, "unauthorized");
 
 	await page.goto("/");
 
 	const loginButton = page.getByRole("link", { name: "使用 GitHub 登录" });
 	const linuxDoButton = page.getByRole("link", { name: "使用 LinuxDO 登录" });
+	const passkeyLoginButton = page.getByRole("button", {
+		name: "使用 Passkey 登录",
+	});
+	const passkeyRegisterButton = page.getByRole("button", {
+		name: "首次使用？创建 Passkey 并继续绑定 GitHub",
+	});
 	await expect(loginButton).toBeVisible();
 	await expect(linuxDoButton).toBeVisible();
+	await expect(passkeyLoginButton).toBeVisible();
+	await expect(passkeyRegisterButton).toBeVisible();
+	await expect(passkeyLoginButton).toBeEnabled();
+	await expect(passkeyRegisterButton).toBeEnabled();
 	await expect(
 		loginButton.locator('[data-auth-provider-icon="github"]'),
 	).toBeVisible();
@@ -89,6 +105,7 @@ test("landing page shows concise login copy for unauthenticated users", async ({
 test("landing page keeps boot error visible while dev proxy tip stays hidden", async ({
 	page,
 }) => {
+	await installPasskeyBrowserMock(page);
 	await installLandingApiMocks(page, 500, "boot exploded");
 
 	await page.goto("/");
@@ -111,6 +128,7 @@ test("landing page keeps boot error visible while dev proxy tip stays hidden", a
 test("landing page keeps the GitHub CTA above the fold on mobile", async ({
 	page,
 }) => {
+	await installPasskeyBrowserMock(page);
 	await page.setViewportSize({ width: 375, height: 667 });
 	await installLandingApiMocks(page, 401, "unauthorized");
 
@@ -156,4 +174,28 @@ test("landing page keeps the GitHub CTA above the fold on mobile", async ({
 	expect(linuxDoRect.top).toBeGreaterThanOrEqual(0);
 	expect(linuxDoRect.height).toBeGreaterThan(0);
 	expect(linuxDoRect.bottom).toBeLessThanOrEqual(viewport.height);
+});
+
+test("landing page disables passkey actions when browser support is unavailable", async ({
+	page,
+}) => {
+	await installPasskeyUnsupportedBrowser(page);
+	await installLandingApiMocks(page, 401, "unauthorized");
+
+	await page.goto("/");
+
+	const passkeyLoginButton = page.getByRole("button", {
+		name: "使用 Passkey 登录",
+	});
+	const passkeyRegisterButton = page.getByRole("button", {
+		name: "首次使用？创建 Passkey 并继续绑定 GitHub",
+	});
+
+	await expect(passkeyLoginButton).toBeDisabled();
+	await expect(passkeyRegisterButton).toBeDisabled();
+	await expect(
+		page.getByText(
+			"当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub / LinuxDO 登录。",
+		),
+	).toBeVisible();
 });

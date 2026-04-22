@@ -1,6 +1,7 @@
 import {
 	ArrowLeft,
 	CalendarClock,
+	Fingerprint,
 	Github,
 	KeyRound,
 	LoaderCircle,
@@ -22,14 +23,24 @@ import {
 	type GitHubConnectionResponse,
 	type LinuxDoConnectionResponse,
 	type MeResponse,
+	type PasskeySummary,
 	type MeProfileResponse,
+	apiDeleteMePasskey,
 	apiDeleteMeGitHubConnection,
 	apiDeleteMeLinuxDo,
 	apiGetMeGitHubConnections,
 	apiGetMeLinuxDo,
+	apiGetMePasskeys,
 	apiGetMeProfile,
+	apiPostPasskeyRegisterOptions,
+	apiPostPasskeyRegisterVerify,
 	apiPatchMeProfile,
 } from "@/api";
+import {
+	browserSupportsPasskeys,
+	createPasskeyCredential,
+	normalizePasskeyErrorMessage,
+} from "@/auth/passkeys";
 import {
 	DailyBriefProfileForm,
 	readHourAlignedBrowserTimeZone,
@@ -67,6 +78,11 @@ const SECTION_META: Record<
 		description:
 			"绑定 LinuxDO Connect 账号，只保存本地快照，不存 LinuxDO PAT。",
 	},
+	passkeys: {
+		label: "Passkeys",
+		description:
+			"给当前账号添加可直接登录的 Passkey；GitHub / LinuxDO 仍保留为恢复与补绑路径。",
+	},
 	"github-accounts": {
 		label: "GitHub 账号",
 		description:
@@ -85,6 +101,42 @@ const SECTION_META: Record<
 	"daily-brief": {
 		label: "日报设置",
 		description: "调整日报生成边界，继续沿用现有 /api/me/profile 契约。",
+	},
+};
+
+const PASSKEY_STATUS_META: Record<
+	string,
+	{
+		tone: "success" | "error";
+		title: string;
+		description: string;
+	}
+> = {
+	registered: {
+		tone: "success",
+		title: "Passkey 已添加",
+		description: "这把 Passkey 现在可以直接用于登录当前 OctoRill 账号。",
+	},
+	deleted: {
+		tone: "success",
+		title: "Passkey 已移除",
+		description: "已删除对应设备的 Passkey；GitHub / LinuxDO 登录不会受影响。",
+	},
+	passkey_retry_required: {
+		tone: "error",
+		title: "需要重新添加 Passkey",
+		description:
+			"这次 GitHub 绑定没有自动挂接之前创建的 Passkey，请在当前账号的设置页重新添加。",
+	},
+	passkey_already_bound: {
+		tone: "error",
+		title: "Passkey 已被占用",
+		description: "这把 Passkey 已经绑定到其他 OctoRill 账号，不能重复添加。",
+	},
+	expired: {
+		tone: "error",
+		title: "Passkey 状态已过期",
+		description: "之前暂存的 Passkey 已经过期，请重新添加一次。",
 	},
 };
 
@@ -216,6 +268,8 @@ export function SettingsPage(props: {
 	section: SettingsSection;
 	githubStatus?: string | null;
 	linuxdoStatus?: string | null;
+	passkeyStatus?: string | null;
+	passkeySupportOverride?: boolean | null;
 	onSectionChange: (section: SettingsSection) => void;
 	onProfileSaved?: () => Promise<void> | void;
 }) {
@@ -224,6 +278,8 @@ export function SettingsPage(props: {
 		section,
 		githubStatus = null,
 		linuxdoStatus = null,
+		passkeyStatus = null,
+		passkeySupportOverride = null,
 		onSectionChange,
 		onProfileSaved,
 	} = props;
@@ -238,6 +294,15 @@ export function SettingsPage(props: {
 	const [githubConnections, setGitHubConnections] = useState<
 		GitHubConnectionResponse[]
 	>([]);
+	const [passkeysLoading, setPasskeysLoading] = useState(true);
+	const [passkeysRegistering, setPasskeysRegistering] = useState(false);
+	const [passkeysBusyId, setPasskeysBusyId] = useState<string | null>(null);
+	const [passkeysError, setPasskeysError] = useState<string | null>(null);
+	const [passkeysSupported, setPasskeysSupported] = useState(false);
+	const [passkeys, setPasskeys] = useState<PasskeySummary[]>([]);
+	const [passkeyFlashStatus, setPasskeyFlashStatus] = useState<string | null>(
+		passkeyStatus,
+	);
 	const [linuxdoLoading, setLinuxdoLoading] = useState(true);
 	const [linuxdoBusy, setLinuxdoBusy] = useState(false);
 	const [linuxdoError, setLinuxdoError] = useState<string | null>(null);
@@ -281,6 +346,9 @@ export function SettingsPage(props: {
 	const activeGitHubStatusMeta = githubStatus
 		? (GITHUB_STATUS_META[githubStatus] ?? null)
 		: null;
+	const activePasskeyStatusMeta = passkeyFlashStatus
+		? (PASSKEY_STATUS_META[passkeyFlashStatus] ?? null)
+		: null;
 	const activeStatusMeta = linuxdoStatus
 		? (LINUXDO_STATUS_META[linuxdoStatus] ?? null)
 		: null;
@@ -314,6 +382,19 @@ export function SettingsPage(props: {
 		}
 	}, []);
 
+	const loadPasskeys = useCallback(async () => {
+		setPasskeysLoading(true);
+		setPasskeysError(null);
+		try {
+			const res = await apiGetMePasskeys();
+			setPasskeys(res.items);
+		} catch (err) {
+			setPasskeysError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setPasskeysLoading(false);
+		}
+	}, []);
+
 	const loadBriefProfile = useCallback(async () => {
 		setBriefProfileLoading(true);
 		setBriefProfileError(null);
@@ -333,12 +414,21 @@ export function SettingsPage(props: {
 	}, []);
 
 	useEffect(() => {
+		setPasskeyFlashStatus(passkeyStatus);
+	}, [passkeyStatus]);
+
+	useEffect(() => {
+		setPasskeysSupported(passkeySupportOverride ?? browserSupportsPasskeys());
+	}, [passkeySupportOverride]);
+
+	useEffect(() => {
 		void Promise.all([
 			loadGitHubConnections(),
+			loadPasskeys(),
 			loadLinuxDo(),
 			loadBriefProfile(),
 		]);
-	}, [loadBriefProfile, loadGitHubConnections, loadLinuxDo]);
+	}, [loadBriefProfile, loadGitHubConnections, loadLinuxDo, loadPasskeys]);
 
 	const onConnectGitHub = useCallback(() => {
 		window.location.assign("/auth/github/connect");
@@ -367,6 +457,49 @@ export function SettingsPage(props: {
 
 	const onConnectLinuxDo = useCallback(() => {
 		window.location.assign("/auth/linuxdo/login");
+	}, []);
+
+	const onRegisterPasskey = useCallback(() => {
+		if (!passkeysSupported) {
+			setPasskeysError(
+				"当前浏览器不支持 Passkey，请改用 GitHub / LinuxDO 登录。",
+			);
+			return;
+		}
+
+		setPasskeysRegistering(true);
+		setPasskeysError(null);
+		void apiPostPasskeyRegisterOptions()
+			.then((options) => createPasskeyCredential(options))
+			.then((credential) => apiPostPasskeyRegisterVerify(credential))
+			.then(async (res) => {
+				setPasskeyFlashStatus(
+					res.status === "registered" ? "registered" : null,
+				);
+				await loadPasskeys();
+			})
+			.catch((err) => {
+				setPasskeysError(normalizePasskeyErrorMessage(err));
+			})
+			.finally(() => {
+				setPasskeysRegistering(false);
+			});
+	}, [loadPasskeys, passkeysSupported]);
+
+	const onDeletePasskey = useCallback((passkeyId: string) => {
+		setPasskeysBusyId(passkeyId);
+		setPasskeysError(null);
+		void apiDeleteMePasskey(passkeyId)
+			.then((res) => {
+				setPasskeys(res.items);
+				setPasskeyFlashStatus("deleted");
+			})
+			.catch((err) => {
+				setPasskeysError(err instanceof Error ? err.message : String(err));
+			})
+			.finally(() => {
+				setPasskeysBusyId(null);
+			});
 	}, []);
 
 	const onDisconnectLinuxDo = useCallback(() => {
@@ -490,7 +623,23 @@ export function SettingsPage(props: {
 				}
 			: { label: "未绑定", variant: "outline" as const };
 
+	const passkeyStatusBadge = passkeysLoading
+		? { label: "读取中", variant: "outline" as const }
+		: passkeys.length > 0
+			? {
+					label:
+						passkeys.length === 1
+							? "1 把 Passkey"
+							: `${passkeys.length} 把 Passkey`,
+					variant: "secondary" as const,
+				}
+			: { label: "未添加", variant: "outline" as const };
+
 	const sectionNavItems = [
+		{
+			id: "passkeys" as const,
+			icon: <Fingerprint className="size-4" />,
+		},
 		{
 			id: "github-accounts" as const,
 			icon: <Github className="size-4" />,
@@ -573,6 +722,29 @@ export function SettingsPage(props: {
 					</section>
 				) : null}
 
+				{activePasskeyStatusMeta ? (
+					<section
+						className={cn(
+							"rounded-xl border px-3 py-2.5 text-sm shadow-sm",
+							statusToneClassName(activePasskeyStatusMeta.tone),
+						)}
+					>
+						<div className="flex items-start gap-2.5">
+							{activePasskeyStatusMeta.tone === "error" ? (
+								<ShieldAlert className="mt-0.5 size-4 shrink-0" />
+							) : (
+								<Fingerprint className="mt-0.5 size-4 shrink-0" />
+							)}
+							<div className="space-y-0.5">
+								<p className="font-medium">{activePasskeyStatusMeta.title}</p>
+								<p className="text-xs leading-5">
+									{activePasskeyStatusMeta.description}
+								</p>
+							</div>
+						</div>
+					</section>
+				) : null}
+
 				{activeStatusMeta ? (
 					<section
 						className={cn(
@@ -646,6 +818,129 @@ export function SettingsPage(props: {
 				</nav>
 
 				<div className="min-w-0 max-md:border-t max-md:border-border/60 max-md:pt-4">
+					{section === "passkeys" ? (
+						<section id="settings-passkeys" data-settings-section="passkeys">
+							<Card className="border-border/70 shadow-sm max-md:rounded-none max-md:border-0 max-md:bg-transparent max-md:shadow-none">
+								<CardHeader className="border-b border-border/60 p-5 max-md:border-b-0 max-md:px-0 max-md:pb-4 max-md:pt-0">
+									<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+										<div className="flex flex-wrap items-center gap-2">
+											<CardTitle className="text-lg">
+												{SECTION_META.passkeys.label}
+											</CardTitle>
+											<Badge variant={passkeyStatusBadge.variant}>
+												{passkeyStatusBadge.label}
+											</Badge>
+										</div>
+										<Button
+											size="sm"
+											disabled={!passkeysSupported || passkeysRegistering}
+											onClick={onRegisterPasskey}
+											data-settings-passkey-register
+										>
+											{passkeysRegistering ? (
+												<LoaderCircle className="size-4 animate-spin" />
+											) : (
+												<Fingerprint className="size-4" />
+											)}
+											添加 Passkey
+										</Button>
+									</div>
+								</CardHeader>
+								<CardContent className="space-y-4 p-5 max-md:px-0 max-md:pb-0">
+									{passkeysError ? (
+										<div
+											className={cn(
+												"rounded-xl border px-3 py-2.5 text-sm",
+												statusToneClassName("error"),
+											)}
+										>
+											{passkeysError}
+										</div>
+									) : null}
+
+									<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+										Passkey 只负责直接登录当前账号；GitHub / LinuxDO
+										仍保留为恢复路径。若当前浏览器不支持 Passkey，请继续用
+										GitHub 或 LinuxDO 登录。
+									</div>
+
+									{!passkeysSupported ? (
+										<div className="rounded-2xl border border-border/70 bg-muted/20 px-4 py-3 text-sm text-foreground">
+											当前浏览器不支持 Passkey 注册；你仍然可以继续使用 GitHub /
+											LinuxDO 登录。
+										</div>
+									) : null}
+
+									{passkeysLoading ? (
+										<div className="text-muted-foreground flex items-center gap-2 text-sm">
+											<LoaderCircle className="size-4 animate-spin" />
+											正在读取 Passkey 列表…
+										</div>
+									) : passkeys.length === 0 ? (
+										<div className="rounded-2xl border border-border/70 bg-background/80 px-4 py-4 text-sm leading-6 text-foreground">
+											<p className="font-medium">
+												还没有可直接登录的 Passkey。
+											</p>
+											<p className="text-muted-foreground mt-1">
+												添加后，你可以跳过 GitHub OAuth
+												重定向，直接用浏览器或系统设备登录。
+											</p>
+										</div>
+									) : (
+										<div className="space-y-3">
+											{passkeys.map((passkey) => {
+												const isBusy = passkeysBusyId === passkey.id;
+												return (
+													<div
+														key={passkey.id}
+														className="space-y-3 rounded-2xl border border-border/70 bg-background/80 p-4 sm:p-5"
+														data-passkey-item={passkey.id}
+													>
+														<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+															<div className="space-y-1.5">
+																<p className="text-base font-semibold text-foreground">
+																	{passkey.label}
+																</p>
+																<p className="text-muted-foreground text-sm leading-6">
+																	注册后可直接登录当前 OctoRill 账号。
+																</p>
+															</div>
+															<Button
+																variant="outline"
+																size="sm"
+																disabled={isBusy}
+																onClick={() => onDeletePasskey(passkey.id)}
+															>
+																{isBusy ? (
+																	<LoaderCircle className="size-4 animate-spin" />
+																) : (
+																	<Unlink2 className="size-4" />
+																)}
+																移除
+															</Button>
+														</div>
+
+														<div className="grid gap-3 sm:grid-cols-2">
+															<DetailItem
+																label="添加时间"
+																value={formatDateTime(passkey.created_at)}
+															/>
+															<DetailItem
+																label="最近使用"
+																value={formatDateTime(passkey.last_used_at)}
+																hint="如果是新添加但还没用来登录，这里会保持为空。"
+															/>
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									)}
+								</CardContent>
+							</Card>
+						</section>
+					) : null}
+
 					{section === "github-accounts" ? (
 						<section
 							id="settings-github-accounts"

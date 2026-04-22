@@ -27,7 +27,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"OctoRill 的公开入口页，用来说明产品定位并承接 GitHub / LinuxDO 双登录入口。适合在这里确认未登录态的首屏文案、登录按钮与错误反馈。\n\n相关公开文档：[快速开始](../quick-start.html) · [产品说明](../product.html)",
+					"OctoRill 的公开入口页，用来说明产品定位并承接 GitHub / LinuxDO / Passkey 三条登录入口。适合在这里确认未登录态的首屏文案、Passkey fallback 与错误反馈。\n\n相关公开文档：[快速开始](../quick-start.html) · [产品说明](../product.html)",
 			},
 		},
 	},
@@ -39,6 +39,7 @@ type Story = StoryObj<typeof meta>;
 export const Default: Story = {
 	args: {
 		bootError: null,
+		passkeySupportOverride: true,
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
@@ -58,6 +59,14 @@ export const Default: Story = {
 			linuxDoLink.querySelector('[data-auth-provider-icon="linuxdo"]'),
 		).not.toBeNull();
 		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", {
+				name: "首次使用？创建 Passkey 并继续绑定 GitHub",
+			}),
+		).toBeVisible();
+		await expect(
 			canvas.getByText(
 				"登录后可在同一页面查看发布更新、获星与关注动态，并使用日报与通知入口；发布内容支持中文翻译与要点整理。",
 			),
@@ -72,7 +81,7 @@ export const Default: Story = {
 		docs: {
 			description: {
 				story:
-					"默认的未登录首屏状态：桌面保留品牌说明区 + 独立登录卡，首屏明确说明 OctoRill 面向前台用户提供发布更新阅读、社交动态、日报与通知入口，并同时暴露 GitHub / LinuxDO 两个入口。",
+					"默认未登录首屏：桌面保留品牌说明区 + 独立登录卡，同时暴露 GitHub / LinuxDO / Passkey 入口，其中 Passkey 支持返回用户直登与首登先建后绑。",
 			},
 		},
 	},
@@ -81,20 +90,14 @@ export const Default: Story = {
 export const WithError: Story = {
 	args: {
 		bootError: "Example error: unauthorized",
+		passkeySupportOverride: true,
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		const githubLink = canvas.getByRole("link", { name: "使用 GitHub 登录" });
-		const linuxDoLink = canvas.getByRole("link", { name: "使用 LinuxDO 登录" });
 		await expect(canvas.getByText("Example error: unauthorized")).toBeVisible();
-		await expect(githubLink).toBeVisible();
-		await expect(linuxDoLink).toBeVisible();
-		expect(
-			githubLink.querySelector('[data-auth-provider-icon="github"]'),
-		).not.toBeNull();
-		expect(
-			linuxDoLink.querySelector('[data-auth-provider-icon="linuxdo"]'),
-		).not.toBeNull();
+		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeVisible();
 	},
 	parameters: {
 		docs: {
@@ -105,10 +108,36 @@ export const WithError: Story = {
 	},
 };
 
+export const PasskeyUnsupported: Story = {
+	args: {
+		bootError: null,
+		passkeySupportOverride: false,
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByText(
+				"当前浏览器不支持 Passkey；你仍然可以继续使用 GitHub / LinuxDO 登录。",
+			),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeDisabled();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "浏览器不支持 Passkey 时，CTA 会被禁用并显示明确 fallback。",
+			},
+		},
+	},
+};
+
 export const MobilePriority: Story = {
 	name: "Mobile priority CTA",
 	args: {
 		bootError: null,
+		passkeySupportOverride: true,
 	},
 	globals: {
 		viewport: {
@@ -118,16 +147,15 @@ export const MobilePriority: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		const githubLink = canvas.getByRole("link", { name: "使用 GitHub 登录" });
-		const linuxDoLink = canvas.getByRole("link", { name: "使用 LinuxDO 登录" });
-		await expect(githubLink).toBeVisible();
-		await expect(linuxDoLink).toBeVisible();
-		expect(
-			githubLink.querySelector('[data-auth-provider-icon="github"]'),
-		).not.toBeNull();
-		expect(
-			linuxDoLink.querySelector('[data-auth-provider-icon="linuxdo"]'),
-		).not.toBeNull();
+		await expect(
+			canvas.getByRole("link", { name: "使用 GitHub 登录" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "使用 LinuxDO 登录" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeVisible();
 		await expect(canvas.getByText("发布更新", { exact: true })).toBeVisible();
 		await expect(canvas.getByText("查看日报与通知入口")).toBeVisible();
 	},
@@ -135,7 +163,7 @@ export const MobilePriority: Story = {
 		docs: {
 			description: {
 				story:
-					"移动端审阅入口：把登录卡提到品牌说明前，优先保证首屏即可看到 GitHub / LinuxDO 双 CTA。",
+					"移动端审阅入口：登录卡仍然排在品牌说明前，优先保证首屏能看到 GitHub / LinuxDO / Passkey 三个主要入口。",
 			},
 		},
 	},

@@ -19,7 +19,14 @@ use tower_sessions::Session;
 use url::Url;
 
 use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::ApiError,
+    passkeys::{
+        PasskeySummary, PendingPasskeyCredentialSession, load_passkey_summaries,
+        pending_passkey_bind_is_expired,
+    },
+    state::AppState,
+};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
 const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
@@ -973,6 +980,18 @@ pub struct AuthBindContextLinuxDoResponse {
 pub struct AuthBindContextResponse {
     linuxdo_available: bool,
     pending_linuxdo: Option<AuthBindContextLinuxDoResponse>,
+    pending_passkey: Option<AuthBindContextPasskeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthBindContextPasskeyResponse {
+    label: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MePasskeysResponse {
+    items: Vec<PasskeySummary>,
 }
 
 pub async fn me_get_linuxdo(
@@ -1058,10 +1077,30 @@ pub async fn auth_get_bind_context(
             active: pending.active,
             silenced: pending.silenced,
         });
+    let pending_passkey = session
+        .get::<PendingPasskeyCredentialSession>("pending_passkey_credential")
+        .await
+        .map_err(ApiError::internal)?;
+    let pending_passkey = if let Some(pending_passkey) = pending_passkey {
+        if pending_passkey_bind_is_expired(&pending_passkey) {
+            let _ = session
+                .remove::<PendingPasskeyCredentialSession>("pending_passkey_credential")
+                .await;
+            None
+        } else {
+            Some(AuthBindContextPasskeyResponse {
+                label: pending_passkey.label,
+                created_at: pending_passkey.created_at,
+            })
+        }
+    } else {
+        None
+    };
 
     Ok(Json(AuthBindContextResponse {
         linuxdo_available: state.config.linuxdo.is_some(),
         pending_linuxdo,
+        pending_passkey,
     }))
 }
 
@@ -1093,6 +1132,15 @@ pub async fn me_get_github_connections(
     .map_err(ApiError::internal)?;
 
     Ok(Json(MeGitHubConnectionsResponse { items }))
+}
+
+pub async fn me_get_passkeys(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MePasskeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let items = load_passkey_summaries(state.as_ref(), user_id.as_str()).await?;
+    Ok(Json(MePasskeysResponse { items }))
 }
 
 pub async fn me_delete_github_connection(
@@ -1173,6 +1221,51 @@ pub async fn me_delete_github_connection(
     tx.commit().await.map_err(ApiError::internal)?;
 
     me_get_github_connections(State(state), session).await
+}
+
+pub async fn me_delete_passkey(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(passkey_id): Path<String>,
+) -> Result<Json<MePasskeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let passkey_id = parse_local_id_param(passkey_id, "passkey_id")?;
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM user_passkeys
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(passkey_id.as_str())
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "passkey_not_found",
+            "passkey not found",
+        ));
+    }
+
+    sqlx::query(
+        r#"
+        DELETE FROM user_passkeys
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(passkey_id.as_str())
+    .bind(user_id.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    me_get_passkeys(State(state), session).await
 }
 
 pub async fn admin_get_user_profile(
@@ -11899,6 +11992,7 @@ mod tests {
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11911,6 +12005,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })
@@ -11947,6 +12042,7 @@ mod tests {
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11959,6 +12055,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })

@@ -1,6 +1,7 @@
 import { type Route, expect, test } from "@playwright/test";
 
 import { buildMockMeResponse } from "./mockApi";
+import { installPasskeyBrowserMock } from "./passkeyHelpers";
 
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
@@ -89,6 +90,12 @@ async function installSettingsMocks(
 		linuxdoAvailable?: boolean;
 		linuxdoConnection?: Record<string, unknown> | null;
 		githubConnections?: typeof defaultGitHubConnections;
+		passkeys?: Array<{
+			id: string;
+			label: string;
+			created_at: string;
+			last_used_at: string | null;
+		}>;
 		reactionTokenConfigured?: boolean;
 		reactionTokenMasked?: string | null;
 		reactionTokenState?: "idle" | "valid" | "invalid" | "error";
@@ -101,6 +108,7 @@ async function installSettingsMocks(
 	let includeOwnReleases = options?.includeOwnReleases ?? false;
 	let githubConnections =
 		options?.githubConnections ?? defaultGitHubConnections;
+	let passkeys = options?.passkeys ?? [];
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
 		const url = new URL(req.url());
@@ -142,6 +150,10 @@ async function installSettingsMocks(
 			return json(route, { items: githubConnections });
 		}
 
+		if (req.method() === "GET" && pathname === "/api/me/passkeys") {
+			return json(route, { items: passkeys });
+		}
+
 		if (
 			req.method() === "DELETE" &&
 			pathname.startsWith("/api/me/github-connections/")
@@ -151,6 +163,12 @@ async function installSettingsMocks(
 				(connection) => connection.id !== connectionId,
 			);
 			return json(route, { items: githubConnections });
+		}
+
+		if (req.method() === "DELETE" && pathname.startsWith("/api/me/passkeys/")) {
+			const passkeyId = pathname.split("/").at(-1);
+			passkeys = passkeys.filter((passkey) => passkey.id !== passkeyId);
+			return json(route, { items: passkeys });
 		}
 
 		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
@@ -264,6 +282,7 @@ async function installSettingsMocks(
 test("dashboard account menu exposes settings entry and opens settings page", async ({
 	page,
 }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page);
 
 	await page.goto("/");
@@ -278,6 +297,7 @@ test("dashboard account menu exposes settings entry and opens settings page", as
 });
 
 test("settings deep link focuses github accounts section", async ({ page }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page);
 
 	await page.goto("/settings?section=github-accounts&github=connected");
@@ -293,6 +313,7 @@ test("settings deep link focuses github accounts section", async ({ page }) => {
 });
 
 test("settings deep link focuses github pat section", async ({ page }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page, {
 		reactionTokenConfigured: true,
 		reactionTokenMasked: "ghp_****_saved",
@@ -330,6 +351,7 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 });
 
 test("settings shows bound linuxdo snapshot", async ({ page }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page, {
 		linuxdoAvailable: true,
 		linuxdoConnection: {
@@ -356,6 +378,7 @@ test("settings shows bound linuxdo snapshot", async ({ page }) => {
 });
 
 test("settings deep link saves my releases opt-in", async ({ page }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page, {
 		includeOwnReleases: false,
 	});
@@ -384,6 +407,7 @@ test("settings deep link saves my releases opt-in", async ({ page }) => {
 test("unknown app route shows not-found page after app shell boot", async ({
 	page,
 }) => {
+	await installPasskeyBrowserMock(page);
 	await installSettingsMocks(page);
 
 	await page.goto("/does-not-exist");
@@ -394,4 +418,42 @@ test("unknown app route shows not-found page after app shell boot", async ({
 	);
 	await expect(page.getByRole("link", { name: "返回工作台" })).toBeVisible();
 	await expect(page.getByRole("link", { name: "打开设置" })).toBeVisible();
+});
+
+test("settings deep link shows passkey list and allows revoke", async ({
+	page,
+}) => {
+	await installPasskeyBrowserMock(page);
+	await installSettingsMocks(page, {
+		passkeys: [
+			{
+				id: "pk_phone",
+				label: "Passkey · 2026-04-20 09:00 UTC",
+				created_at: "2026-04-20T09:00:00Z",
+				last_used_at: "2026-04-22T08:30:00Z",
+			},
+			{
+				id: "pk_laptop",
+				label: "Passkey · 2026-04-21 11:15 UTC",
+				created_at: "2026-04-21T11:15:00Z",
+				last_used_at: null,
+			},
+		],
+	});
+
+	await page.goto("/settings?section=passkeys&passkey=registered");
+
+	await expect(page).toHaveURL(/section=passkeys/);
+	const passkeysSection = page.locator('[data-settings-section="passkeys"]');
+	await expect(page.getByText("Passkey 已添加")).toBeVisible();
+	await expect(passkeysSection).toContainText("Passkey · 2026-04-20 09:00 UTC");
+	await expect(passkeysSection).toContainText("Passkey · 2026-04-21 11:15 UTC");
+	await passkeysSection
+		.locator('[data-passkey-item="pk_phone"]')
+		.getByRole("button", { name: "移除" })
+		.click();
+	await expect(
+		passkeysSection.locator('[data-passkey-item="pk_phone"]'),
+	).toHaveCount(0);
+	await expect(page.getByText("Passkey 已移除")).toBeVisible();
 });

@@ -439,6 +439,7 @@ mod tests {
 
     fn setup_state(pool: SqlitePool, config: AppConfig) -> Arc<AppState> {
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(TranslationSchedulerController::new(
@@ -447,6 +448,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key: config.encryption_key.clone(),
             runtime_owner_id: generate_local_id(),
             pool,
