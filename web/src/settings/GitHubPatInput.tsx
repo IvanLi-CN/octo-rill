@@ -236,7 +236,7 @@ export function GitHubPatInput({
 				id={inputId}
 				type={isVisible ? "text" : "password"}
 				value={secretValue}
-				autoComplete={autoComplete ?? "off"}
+				autoComplete={autoComplete ?? "new-password"}
 				aria-describedby={isVisible ? undefined : hiddenHintId}
 				aria-label={assistiveLabel}
 				data-secret-visible={secretState}

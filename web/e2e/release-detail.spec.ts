@@ -1075,7 +1075,7 @@ test("reaction fallback lets users configure PAT inline from the dialog", async 
 	).toBeVisible();
 	const patInput = patDialog.locator("#dashboard-reaction-pat");
 	await expect(patInput).toHaveAttribute("type", "password");
-	await expect(patInput).toHaveAttribute("autocomplete", "off");
+	await expect(patInput).toHaveAttribute("autocomplete", "new-password");
 	await expect(patInput).toHaveAttribute("data-1p-ignore", "true");
 	await expect(patInput).toHaveAttribute("data-form-type", "other");
 	await expect(patInput).toHaveAttribute("data-secret-visible", "false");

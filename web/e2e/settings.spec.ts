@@ -335,7 +335,7 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 	});
 	const input = page.locator("#settings-reaction-pat");
 	await expect(input).toHaveAttribute("type", "password");
-	await expect(input).toHaveAttribute("autocomplete", "off");
+	await expect(input).toHaveAttribute("autocomplete", "new-password");
 	await expect(input).toHaveAttribute("data-1p-ignore", "true");
 	await expect(input).toHaveAttribute("data-form-type", "other");
 	await expect(input).toHaveAttribute("data-secret-visible", "false");
