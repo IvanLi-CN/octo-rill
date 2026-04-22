@@ -579,6 +579,27 @@ async fn clear_pending_linuxdo(session: &Session) {
     let _ = session.remove_value(SESSION_KEY_PENDING_LINUXDO).await;
 }
 
+fn should_clear_pending_passkey_after_linuxdo_rollback(
+    passkey_status_after_login: Option<&str>,
+) -> bool {
+    matches!(
+        passkey_status_after_login,
+        Some("passkey_already_bound" | "passkey_retry_required")
+    )
+}
+
+async fn finalize_passkey_authentication_session(
+    session: &Session,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    session
+        .insert(SESSION_KEY_USER_ID, user_id)
+        .await
+        .map_err(ApiError::internal)?;
+    clear_pending_passkey_credential(session).await;
+    Ok(())
+}
+
 async fn upsert_linuxdo_connection_record(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
@@ -883,7 +904,7 @@ async fn finalize_github_auth(
                 .await
             {
                 let _ = tx.rollback().await;
-                if consume_pending_passkey {
+                if should_clear_pending_passkey_after_linuxdo_rollback(passkey_status_after_login) {
                     clear_pending_passkey_credential(session).await;
                 }
                 return Ok(Redirect::to(
@@ -1606,10 +1627,7 @@ pub async fn passkey_authenticate_verify(
     .await?;
 
     tx.commit().await.map_err(ApiError::internal)?;
-    session
-        .insert(SESSION_KEY_USER_ID, user_id)
-        .await
-        .map_err(ApiError::internal)?;
+    finalize_passkey_authentication_session(&session, user_id.as_str()).await?;
 
     Ok(axum::Json(PasskeyAuthenticateVerifyResponse {
         status: "authenticated".to_owned(),
@@ -1628,9 +1646,10 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use super::{
-        SESSION_KEY_PENDING_LINUXDO, SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, clear_pending_linuxdo,
-        clear_pending_passkey_credential, post_github_login_redirect, promote_first_admin,
-        upsert_github_user,
+        SESSION_KEY_PENDING_LINUXDO, SESSION_KEY_PENDING_PASSKEY_CREDENTIAL, SESSION_KEY_USER_ID,
+        clear_pending_linuxdo, clear_pending_passkey_credential,
+        finalize_passkey_authentication_session, post_github_login_redirect, promote_first_admin,
+        should_clear_pending_passkey_after_linuxdo_rollback, upsert_github_user,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -1760,6 +1779,52 @@ mod tests {
                 .get_value(SESSION_KEY_PENDING_LINUXDO)
                 .await
                 .expect("read pending linuxdo")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn linuxdo_rollback_only_clears_terminal_pending_passkeys() {
+        assert!(should_clear_pending_passkey_after_linuxdo_rollback(Some(
+            "passkey_retry_required"
+        )));
+        assert!(should_clear_pending_passkey_after_linuxdo_rollback(Some(
+            "passkey_already_bound"
+        )));
+        assert!(!should_clear_pending_passkey_after_linuxdo_rollback(None));
+        assert!(!should_clear_pending_passkey_after_linuxdo_rollback(Some(
+            "created"
+        )));
+    }
+
+    #[tokio::test]
+    async fn finalize_passkey_authentication_session_logs_in_and_clears_pending_passkey() {
+        let session = setup_session();
+        session
+            .insert_value(
+                SESSION_KEY_PENDING_PASSKEY_CREDENTIAL,
+                json!({"stale": true}),
+            )
+            .await
+            .expect("insert pending passkey");
+
+        finalize_passkey_authentication_session(&session, "user_123")
+            .await
+            .expect("finalize passkey auth session");
+
+        assert_eq!(
+            session
+                .get::<String>(SESSION_KEY_USER_ID)
+                .await
+                .expect("read user id")
+                .as_deref(),
+            Some("user_123")
+        );
+        assert!(
+            session
+                .get_value(SESSION_KEY_PENDING_PASSKEY_CREDENTIAL)
+                .await
+                .expect("read pending passkey")
                 .is_none()
         );
     }
