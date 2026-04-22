@@ -328,13 +328,14 @@ export function GitHubPatInput({
 				}}
 				onClick={(event) => {
 					const nextVisible = !isVisible;
+					const toggleButton = event.currentTarget;
 					setIsVisible(nextVisible);
 					requestAnimationFrame(() => {
 						if (nextVisible) {
 							inputRef.current?.focus();
 							return;
 						}
-						event.currentTarget.focus();
+						toggleButton.focus();
 					});
 				}}
 			>

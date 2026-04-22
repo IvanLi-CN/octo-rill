@@ -363,9 +363,14 @@ test("settings github pat hidden mode preserves undo history after visible edits
 	await page.goto("/settings?section=github-pat");
 
 	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await input.fill("ghp_visible_fix");
-	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await toggleButton.click();
+	await expect(toggleButton).toBeFocused();
+	await expect(toggleButton).toHaveAttribute("aria-label", "显示 GitHub PAT");
 	await input.focus();
 	await page.keyboard.press(
 		process.platform === "darwin" ? "Meta+Z" : "Control+Z",

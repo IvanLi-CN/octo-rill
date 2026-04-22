@@ -3127,7 +3127,10 @@ export const PatDialogOpen: Story = {
 		}
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("autocomplete", "off");
-		await expect(input).toHaveAttribute("aria-hidden", "true");
+		await expect(input).toHaveAttribute(
+			"aria-describedby",
+			"dashboard-reaction-pat-hidden-hint",
+		);
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
@@ -3138,7 +3141,7 @@ export const PatDialogOpen: Story = {
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "true");
 		await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
-		await expect(input).not.toHaveAttribute("aria-hidden");
+		await expect(input).not.toHaveAttribute("aria-describedby");
 	},
 };
 

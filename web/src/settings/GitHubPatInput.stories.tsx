@@ -84,17 +84,17 @@ export const MaskedByDefault: Story = {
 		await userEvent.click(
 			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
+		const hideButton = canvas.getByRole("button", { name: "隐藏 GitHub PAT" });
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "true");
 		await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
 		await expect(input).not.toHaveAttribute("aria-describedby");
 
-		await userEvent.click(
-			canvas.getByRole("button", { name: "隐藏 GitHub PAT" }),
-		);
+		await userEvent.click(hideButton);
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
 		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
+		await expect(hideButton).toHaveFocus();
 	},
 };
 
