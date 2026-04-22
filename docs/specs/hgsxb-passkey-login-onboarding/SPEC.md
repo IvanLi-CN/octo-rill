@@ -64,6 +64,7 @@
 - `pending_passkey_credential`
   - 保存匿名用户刚创建完成、尚未挂接账号的 Passkey 与展示 label
   - 由 GitHub callback 消费并决定 attach / retry-required
+  - 在 `/bind/github` 等待期间，如果用户已经在别的标签页通过 GitHub / LinuxDO 登录到现有账号，后续继续完成 GitHub 或 LinuxDO 流程时仍必须优先消费这份 pending Passkey，不能因为 session 已存在就静默退化成普通 connect 流程
   - attach 正式账号时，若首次写入 `users.passkey_user_handle_uuid` 的条件更新没有成功落库，必须重新读取最新 handle，再决定 attach 还是 `passkey_retry_required`，避免并发首绑留下不可登录的孤儿凭据
   - 成功的 Passkey 登录也必须清掉这份 session，避免旧的 onboarding Passkey 在后续 GitHub OAuth 中被误挂到当前会话登录到的其他账号
   - 若 GitHub callback 后续的 LinuxDO 合并在同一事务里回滚，而 Passkey 侧并未进入 `passkey_already_bound` / `passkey_retry_required` 这类终态 remediation，则必须保留这份 session，允许用户直接重试 GitHub 绑定而不是被迫重建 Passkey
@@ -112,6 +113,7 @@
 - GitHub callback 成功后：
   - 若命中新账号或可安全认领的账号，则一次性完成 GitHub connection + Passkey attach；
   - 若命中不同 `passkey_user_handle_uuid` 的已有账号，则返回 `passkey_retry_required`，不做静默合并。
+- 若用户在 `/bind/github` 期间先通过 LinuxDO 登录到一个已存在账号，或在已有登录态下补绑 LinuxDO，成功路径也必须消费同一份 pending Passkey；只有进入 `passkey_already_bound` / `passkey_retry_required` / `expired` 这类明确 remediation 时，才允许落到设置页提示用户手动处理。
 
 ### 已登录用户：在设置页管理 Passkeys
 
