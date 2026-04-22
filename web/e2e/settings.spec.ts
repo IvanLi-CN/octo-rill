@@ -520,6 +520,32 @@ test("settings github pat hidden mode keeps drop edits on the native undo stack"
 	await expect(input).toHaveValue("");
 });
 
+test("settings github pat save clears hidden undo history", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_valid_token_1234");
+	await expect(
+		page.getByText("GitHub PAT 可用", { exact: true }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "保存 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
+	await expect(
+		page.getByText("token is valid for @storybook-user", { exact: true }),
+	).toBeVisible();
+	await input.focus();
+	await page.keyboard.press(
+		process.platform === "darwin" ? "Meta+Z" : "Control+Z",
+	);
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("");
+});
+
 test("settings shows bound linuxdo snapshot", async ({ page }) => {
 	await installSettingsMocks(page, {
 		linuxdoAvailable: true,

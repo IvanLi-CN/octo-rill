@@ -53,11 +53,8 @@ export function GitHubPatInput({
 		if (currentHistoryValue === secretValue) {
 			return;
 		}
-		historyRef.current = [
-			...historyRef.current.slice(0, historyIndexRef.current + 1),
-			secretValue,
-		];
-		historyIndexRef.current = historyRef.current.length - 1;
+		historyRef.current = [secretValue];
+		historyIndexRef.current = 0;
 	}, [secretValue]);
 
 	const queueSelection = (
