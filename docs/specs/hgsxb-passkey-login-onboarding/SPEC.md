@@ -67,6 +67,7 @@
   - attach 正式账号时，若首次写入 `users.passkey_user_handle_uuid` 的条件更新没有成功落库，必须重新读取最新 handle，再决定 attach 还是 `passkey_retry_required`，避免并发首绑留下不可登录的孤儿凭据
 - `pending_passkey_authentication`
   - 保存 discoverable authentication challenge state
+  - 本地 loopback (`localhost` / `127.0.0.1`) 运行时的注册 challenge 也必须要求 discoverable / resident credential，确保后续 username-less discoverable authentication 能稳定取回 user handle
 
 ## HTTP / Route 契约
 
@@ -87,6 +88,7 @@
   - `首次使用？创建 Passkey 并继续绑定 GitHub`
 - `/settings` 支持 `section=passkeys` 与 `passkey=<status>`
   - 仅 `section=passkeys` 保留 `passkey=<status>` flash；切到其他设置分区时必须清掉该 query，避免成功/错误 banner 泄漏到无关页面
+  - 若 GitHub callback 同时带回 LinuxDO `connected` 与 Passkey 恢复类状态（如 `passkey_retry_required` / `passkey_already_bound` / `expired`），落点仍必须优先打开 `section=passkeys`，避免把 Passkey remediation 引导到其他分区
 - `/bind/github` 支持 `passkey=<status>` 并展示 pending Passkey 卡片
 
 ## 功能与行为规格

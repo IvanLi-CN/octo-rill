@@ -216,7 +216,7 @@ impl LoopbackWebauthn {
             .context("failed to build loopback passkey registration challenge")?
             .attestation(AttestationConveyancePreference::None)
             .credential_algorithms(self.algorithms.clone())
-            .require_resident_key(false)
+            .require_resident_key(true)
             .authenticator_attachment(None)
             .user_verification_policy(UserVerificationPolicy::Required)
             .reject_synchronised_authenticators(false)
@@ -595,6 +595,8 @@ mod tests {
     };
     use std::{net::SocketAddr, path::PathBuf};
     use url::Url;
+    use uuid::Uuid;
+    use webauthn_rs_core::proto::ResidentKeyRequirement;
 
     fn test_config(public_base_url: &str) -> AppConfig {
         AppConfig {
@@ -643,5 +645,29 @@ mod tests {
         let config = test_config("https://app.example.com");
         let webauthn = build_webauthn(&config).expect("build webauthn");
         assert!(matches!(webauthn, ConfiguredWebauthn::Standard(_)));
+    }
+
+    #[test]
+    fn loopback_passkey_registration_requires_discoverable_credentials() {
+        let config = test_config("http://127.0.0.1:58090");
+        let webauthn = build_webauthn(&config).expect("build webauthn");
+        let ConfiguredWebauthn::Loopback(webauthn) = webauthn else {
+            panic!("expected loopback webauthn runtime");
+        };
+
+        let (challenge, _) = webauthn
+            .start_passkey_registration(Uuid::nil(), "passkey-user", "Passkey User", None)
+            .expect("start loopback passkey registration");
+
+        let selection = challenge
+            .public_key
+            .authenticator_selection
+            .expect("loopback challenge should include authenticator selection");
+
+        assert_eq!(
+            selection.resident_key,
+            Some(ResidentKeyRequirement::Required)
+        );
+        assert!(selection.require_resident_key);
     }
 }
