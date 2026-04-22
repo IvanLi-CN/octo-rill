@@ -1578,7 +1578,7 @@ async fn count_admin_dashboard_active_users_between(
         FROM users
         WHERE last_active_at IS NOT NULL
           AND julianday(last_active_at) >= julianday(?)
-          AND julianday(last_active_at) < julianday(?)
+          AND julianday(last_active_at) <= julianday(?)
         "#,
     )
     .bind(start_at)
@@ -1605,7 +1605,7 @@ async fn load_admin_dashboard_task_status_counts(
         FROM job_tasks
         WHERE task_type = ?
           AND julianday(created_at) >= julianday(?)
-          AND julianday(created_at) < julianday(?)
+          AND julianday(created_at) <= julianday(?)
         "#,
     )
     .bind(task_type)
@@ -1864,7 +1864,7 @@ async fn load_admin_dashboard_today_live_snapshot(
     let today = now_local.date_naive();
     let (start_utc, _) = local_day_bounds_utc(time_zone, today)?;
     let start_at = start_utc.to_rfc3339();
-    let end_at = (now_utc + chrono::Duration::seconds(1)).to_rfc3339();
+    let end_at = now_utc.to_rfc3339();
 
     let total_users = count_admin_dashboard_total_users_now(&state.pool).await?;
     let active_users =
@@ -11766,8 +11766,9 @@ mod tests {
         github_access_restricted_error, github_graphql_errors_to_api_error,
         github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
-        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -13572,6 +13573,76 @@ mod tests {
         assert_eq!(today_point.translations_total, 1);
         assert_eq!(today_point.summaries_total, 1);
         assert_eq!(today_point.briefs_total, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_today_live_snapshot_excludes_future_activity() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "operator", 0, 0).await;
+
+        let time_zone = chrono_tz::Asia::Shanghai;
+        let now_utc = time_zone
+            .with_ymd_and_hms(2026, 4, 22, 10, 0, 0)
+            .single()
+            .expect("build live snapshot time")
+            .with_timezone(&chrono::Utc);
+        let in_window_time = (now_utc - chrono::Duration::minutes(5)).to_rfc3339();
+        let future_time = (now_utc + chrono::Duration::seconds(1)).to_rfc3339();
+
+        set_last_active_at(
+            &pool,
+            test_user_id(1).as_str(),
+            Some(in_window_time.as_str()),
+        )
+        .await;
+        set_last_active_at(&pool, test_user_id(2).as_str(), Some(future_time.as_str())).await;
+
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-live-queued",
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_QUEUED,
+            test_user_id(1).as_str(),
+            in_window_time.as_str(),
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-future-succeeded",
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+            jobs::STATUS_SUCCEEDED,
+            test_user_id(2).as_str(),
+            future_time.as_str(),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let (today_live, status_breakdown) =
+            load_admin_dashboard_today_live_snapshot(state.as_ref(), time_zone, now_utc)
+                .await
+                .expect("load live snapshot");
+
+        assert_eq!(today_live.total_users, 2);
+        assert_eq!(today_live.active_users, 1);
+        assert_eq!(today_live.queued_tasks, 1);
+        assert_eq!(today_live.running_tasks, 0);
+        assert_eq!(today_live.ongoing_tasks_total, 1);
+        assert_eq!(status_breakdown.queued_total, 1);
+        assert_eq!(status_breakdown.running_total, 0);
+        assert_eq!(status_breakdown.total, 1);
+        assert_eq!(status_breakdown.items.len(), 3);
+        let translation_item = status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_TRANSLATE_RELEASE_BATCH)
+            .expect("translation item should exist");
+        assert_eq!(translation_item.total, 1);
+        let summary_item = status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+            .expect("summary item should exist");
+        assert_eq!(summary_item.total, 0);
     }
 
     #[tokio::test]

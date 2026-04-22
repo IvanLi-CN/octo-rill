@@ -61,7 +61,7 @@ export function Landing({
 	passkeySupportOverride = null,
 }: LandingProps) {
 	const [passkeySupported, setPasskeySupported] = useState(
-		passkeySupportOverride ?? false,
+		() => passkeySupportOverride ?? browserSupportsPasskeys(),
 	);
 	const [passkeyBusyMode, setPasskeyBusyMode] = useState<
 		"authenticate" | "register" | null
