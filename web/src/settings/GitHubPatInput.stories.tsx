@@ -24,7 +24,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					'GitHub PAT 专用输入组件：隐藏态保持原生 secure text field 语义，确保辅助技术只能读取掩码值；同时用 `autocomplete="off"` 与密码管理器忽略提示抑制站点登录密码自动填充。只有显式点亮后才切到明文。',
+					'GitHub PAT 专用输入组件：隐藏态保持原生 secure text field 语义，确保辅助技术只能读取掩码值；同时用 `autocomplete="new-password"` 与密码管理器忽略提示抑制站点登录密码自动填充。只有显式点亮后才切到明文。',
 			},
 		},
 	},
@@ -67,7 +67,7 @@ export const MaskedByDefault: Story = {
 			"当前内容已隐藏，仍可直接编辑。使用“显示 GitHub PAT”按钮可临时查看明文。",
 		);
 		await expect(input).toHaveAttribute("type", "password");
-		await expect(input).toHaveAttribute("autocomplete", "off");
+		await expect(input).toHaveAttribute("autocomplete", "new-password");
 		await expect(input).toHaveAttribute(
 			"aria-describedby",
 			"storybook-github-pat-hidden-hint",

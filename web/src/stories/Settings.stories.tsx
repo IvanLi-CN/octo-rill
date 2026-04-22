@@ -471,7 +471,7 @@ export const DeepLinkedGitHubPat: Story = {
 			throw new Error("expected settings GitHub PAT input");
 		}
 		await expect(input).toHaveAttribute("type", "password");
-		await expect(input).toHaveAttribute("autocomplete", "off");
+		await expect(input).toHaveAttribute("autocomplete", "new-password");
 		await expect(input).toHaveAttribute(
 			"aria-describedby",
 			"settings-reaction-pat-hidden-hint",

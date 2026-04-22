@@ -3126,7 +3126,7 @@ export const PatDialogOpen: Story = {
 			throw new Error("expected dashboard GitHub PAT input");
 		}
 		await expect(input).toHaveAttribute("type", "password");
-		await expect(input).toHaveAttribute("autocomplete", "off");
+		await expect(input).toHaveAttribute("autocomplete", "new-password");
 		await expect(input).toHaveAttribute(
 			"aria-describedby",
 			"dashboard-reaction-pat-hidden-hint",
