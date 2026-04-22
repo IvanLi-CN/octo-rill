@@ -64,6 +64,7 @@
 - `pending_passkey_credential`
   - 保存匿名用户刚创建完成、尚未挂接账号的 Passkey 与展示 label
   - 由 GitHub callback 消费并决定 attach / retry-required
+  - attach 正式账号时，若首次写入 `users.passkey_user_handle_uuid` 的条件更新没有成功落库，必须重新读取最新 handle，再决定 attach 还是 `passkey_retry_required`，避免并发首绑留下不可登录的孤儿凭据
 - `pending_passkey_authentication`
   - 保存 discoverable authentication challenge state
 
@@ -85,6 +86,7 @@
   - `使用 Passkey 登录`（左侧带 Passkey 图标，和其他登录入口保持一致）
   - `首次使用？创建 Passkey 并继续绑定 GitHub`
 - `/settings` 支持 `section=passkeys` 与 `passkey=<status>`
+  - 仅 `section=passkeys` 保留 `passkey=<status>` flash；切到其他设置分区时必须清掉该 query，避免成功/错误 banner 泄漏到无关页面
 - `/bind/github` 支持 `passkey=<status>` 并展示 pending Passkey 卡片
 
 ## 功能与行为规格
