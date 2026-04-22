@@ -263,6 +263,59 @@ export type GitHubConnectionResponse = {
 export type MeGitHubConnectionsResponse = {
 	items: GitHubConnectionResponse[];
 };
+export type PasskeySummary = {
+	id: string;
+	label: string;
+	created_at: string;
+	last_used_at: string | null;
+};
+export type MePasskeysResponse = {
+	items: PasskeySummary[];
+};
+export type PasskeyCredentialDescriptorJSON = {
+	id: string;
+	type: PublicKeyCredentialType;
+	transports?: AuthenticatorTransport[];
+};
+export type PasskeyCreationOptionsJSON = {
+	publicKey: {
+		rp: PublicKeyCredentialRpEntity;
+		user: {
+			id: string;
+			name: string;
+			displayName: string;
+		};
+		challenge: string;
+		pubKeyCredParams: PublicKeyCredentialParameters[];
+		timeout?: number;
+		excludeCredentials?: PasskeyCredentialDescriptorJSON[];
+		authenticatorSelection?: AuthenticatorSelectionCriteria & {
+			residentKey?: ResidentKeyRequirement;
+		};
+		attestation?: AttestationConveyancePreference;
+		extensions?: Record<string, unknown>;
+	};
+};
+export type PasskeyRequestOptionsJSON = {
+	publicKey: {
+		challenge: string;
+		timeout?: number;
+		rpId: string;
+		allowCredentials: PasskeyCredentialDescriptorJSON[];
+		userVerification: UserVerificationRequirement;
+		hints?: string[];
+		extensions?: Record<string, unknown>;
+	};
+	mediation?: "conditional";
+};
+export type PasskeyRegisterVerifyResponse = {
+	status: "registered" | "pending_github_bind";
+	next_path: string | null;
+};
+export type PasskeyAuthenticateVerifyResponse = {
+	status: "authenticated";
+	next_path: string;
+};
 export type AuthBindContextResponse = {
 	linuxdo_available: boolean;
 	pending_linuxdo: {
@@ -273,6 +326,10 @@ export type AuthBindContextResponse = {
 		trust_level: number;
 		active: boolean;
 		silenced: boolean;
+	} | null;
+	pending_passkey: {
+		label: string;
+		created_at: string;
 	} | null;
 };
 export type ReactionTokenOwnerSummary = {
@@ -688,6 +745,16 @@ export async function apiDeleteMeLinuxDo(): Promise<MeLinuxDoResponse> {
 export async function apiGetAuthBindContext(): Promise<AuthBindContextResponse> {
 	return apiGet<AuthBindContextResponse>("/api/auth/bind-context");
 }
+export async function apiGetMePasskeys(): Promise<MePasskeysResponse> {
+	return apiGet<MePasskeysResponse>("/api/me/passkeys");
+}
+export async function apiDeleteMePasskey(
+	passkeyId: string,
+): Promise<MePasskeysResponse> {
+	return apiDeleteJson<MePasskeysResponse>(
+		`/api/me/passkeys/${encodeURIComponent(passkeyId)}`,
+	);
+}
 export async function apiGetMeGitHubConnections(): Promise<MeGitHubConnectionsResponse> {
 	return apiGet<MeGitHubConnectionsResponse>("/api/me/github-connections");
 }
@@ -696,6 +763,34 @@ export async function apiDeleteMeGitHubConnection(
 ): Promise<MeGitHubConnectionsResponse> {
 	return apiDeleteJson<MeGitHubConnectionsResponse>(
 		`/api/me/github-connections/${encodeURIComponent(connectionId)}`,
+	);
+}
+export async function apiPostPasskeyRegisterOptions(): Promise<PasskeyCreationOptionsJSON> {
+	return apiPostJson<PasskeyCreationOptionsJSON>(
+		"/api/auth/passkeys/register/options",
+		{},
+	);
+}
+export async function apiPostPasskeyRegisterVerify(
+	credential: unknown,
+): Promise<PasskeyRegisterVerifyResponse> {
+	return apiPostJson<PasskeyRegisterVerifyResponse>(
+		"/api/auth/passkeys/register/verify",
+		{ credential },
+	);
+}
+export async function apiPostPasskeyAuthenticateOptions(): Promise<PasskeyRequestOptionsJSON> {
+	return apiPostJson<PasskeyRequestOptionsJSON>(
+		"/api/auth/passkeys/authenticate/options",
+		{},
+	);
+}
+export async function apiPostPasskeyAuthenticateVerify(
+	credential: unknown,
+): Promise<PasskeyAuthenticateVerifyResponse> {
+	return apiPostJson<PasskeyAuthenticateVerifyResponse>(
+		"/api/auth/passkeys/authenticate/verify",
+		{ credential },
 	);
 }
 export async function apiGetReactionTokenStatus(): Promise<ReactionTokenStatusResponse> {

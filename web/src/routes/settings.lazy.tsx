@@ -30,11 +30,13 @@ function SettingsRouteComponent() {
 		const expectedSearch = buildSettingsSearch(section, {
 			linuxdo: search.linuxdo,
 			github: search.github,
+			passkey: search.passkey,
 		});
 		if (
 			(search.section ?? undefined) === expectedSearch.section &&
 			(search.linuxdo ?? undefined) === expectedSearch.linuxdo &&
-			(search.github ?? undefined) === expectedSearch.github
+			(search.github ?? undefined) === expectedSearch.github &&
+			(search.passkey ?? undefined) === expectedSearch.passkey
 		) {
 			return;
 		}
@@ -43,7 +45,14 @@ function SettingsRouteComponent() {
 			search: expectedSearch as never,
 			replace: true,
 		});
-	}, [router, search.github, search.linuxdo, search.section, section]);
+	}, [
+		router,
+		search.github,
+		search.linuxdo,
+		search.passkey,
+		search.section,
+		section,
+	]);
 
 	if (auth.status === "pending") {
 		return <AppBoot />;
@@ -63,6 +72,7 @@ function SettingsRouteComponent() {
 			section={section}
 			githubStatus={search.github}
 			linuxdoStatus={search.linuxdo}
+			passkeyStatus={search.passkey}
 			onSectionChange={(nextSection) => {
 				void router.navigate({
 					to: "/settings",

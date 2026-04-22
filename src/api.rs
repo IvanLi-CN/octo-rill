@@ -19,7 +19,14 @@ use tower_sessions::Session;
 use url::Url;
 
 use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
-use crate::{error::ApiError, state::AppState};
+use crate::{
+    error::ApiError,
+    passkeys::{
+        PasskeySummary, PendingPasskeyCredentialSession, load_passkey_summaries,
+        pending_passkey_bind_is_expired,
+    },
+    state::AppState,
+};
 
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
 const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
@@ -973,6 +980,18 @@ pub struct AuthBindContextLinuxDoResponse {
 pub struct AuthBindContextResponse {
     linuxdo_available: bool,
     pending_linuxdo: Option<AuthBindContextLinuxDoResponse>,
+    pending_passkey: Option<AuthBindContextPasskeyResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthBindContextPasskeyResponse {
+    label: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MePasskeysResponse {
+    items: Vec<PasskeySummary>,
 }
 
 pub async fn me_get_linuxdo(
@@ -1058,10 +1077,30 @@ pub async fn auth_get_bind_context(
             active: pending.active,
             silenced: pending.silenced,
         });
+    let pending_passkey = session
+        .get::<PendingPasskeyCredentialSession>("pending_passkey_credential")
+        .await
+        .map_err(ApiError::internal)?;
+    let pending_passkey = if let Some(pending_passkey) = pending_passkey {
+        if pending_passkey_bind_is_expired(&pending_passkey) {
+            let _ = session
+                .remove::<PendingPasskeyCredentialSession>("pending_passkey_credential")
+                .await;
+            None
+        } else {
+            Some(AuthBindContextPasskeyResponse {
+                label: pending_passkey.label,
+                created_at: pending_passkey.created_at,
+            })
+        }
+    } else {
+        None
+    };
 
     Ok(Json(AuthBindContextResponse {
         linuxdo_available: state.config.linuxdo.is_some(),
         pending_linuxdo,
+        pending_passkey,
     }))
 }
 
@@ -1093,6 +1132,15 @@ pub async fn me_get_github_connections(
     .map_err(ApiError::internal)?;
 
     Ok(Json(MeGitHubConnectionsResponse { items }))
+}
+
+pub async fn me_get_passkeys(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<MePasskeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let items = load_passkey_summaries(state.as_ref(), user_id.as_str()).await?;
+    Ok(Json(MePasskeysResponse { items }))
 }
 
 pub async fn me_delete_github_connection(
@@ -1173,6 +1221,81 @@ pub async fn me_delete_github_connection(
     tx.commit().await.map_err(ApiError::internal)?;
 
     me_get_github_connections(State(state), session).await
+}
+
+pub async fn me_delete_passkey(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(passkey_id): Path<String>,
+) -> Result<Json<MePasskeysResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let passkey_id = parse_local_id_param(passkey_id, "passkey_id")?;
+
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM user_passkeys
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(passkey_id.as_str())
+    .bind(user_id.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if exists == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "passkey_not_found",
+            "passkey not found",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query(
+        r#"
+        DELETE FROM user_passkeys
+        WHERE id = ?
+          AND user_id = ?
+        "#,
+    )
+    .bind(passkey_id.as_str())
+    .bind(user_id.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let remaining = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM user_passkeys
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if remaining == 0 {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET passkey_user_handle_uuid = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(user_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    me_get_passkeys(State(state), session).await
 }
 
 pub async fn admin_get_user_profile(
@@ -1485,7 +1608,7 @@ async fn count_admin_dashboard_active_users_between(
         FROM users
         WHERE last_active_at IS NOT NULL
           AND julianday(last_active_at) >= julianday(?)
-          AND julianday(last_active_at) < julianday(?)
+          AND julianday(last_active_at) <= julianday(?)
         "#,
     )
     .bind(start_at)
@@ -1512,7 +1635,7 @@ async fn load_admin_dashboard_task_status_counts(
         FROM job_tasks
         WHERE task_type = ?
           AND julianday(created_at) >= julianday(?)
-          AND julianday(created_at) < julianday(?)
+          AND julianday(created_at) <= julianday(?)
         "#,
     )
     .bind(task_type)
@@ -11673,9 +11796,10 @@ mod tests {
         github_access_restricted_error, github_graphql_errors_to_api_error,
         github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
         guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
-        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, normalize_markdown_translation_output,
+        llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
+        markdown_structure_preserved, me, me_delete_passkey, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
@@ -11899,6 +12023,7 @@ mod tests {
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11911,6 +12036,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })
@@ -11947,6 +12073,7 @@ mod tests {
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
+        let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -11959,6 +12086,7 @@ mod tests {
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
+            webauthn,
             encryption_key,
             runtime_owner_id: "api-test-runtime-owner".to_owned(),
         })
@@ -12027,6 +12155,52 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed github connection");
+    }
+
+    async fn seed_passkey(
+        pool: &SqlitePool,
+        user_id: &str,
+        user_handle_uuid: &str,
+        credential_id: &str,
+    ) -> String {
+        let passkey_id = crate::local_id::generate_local_id();
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET passkey_user_handle_uuid = ?, updated_at = '2026-02-23T00:00:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_handle_uuid)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed passkey user handle");
+        sqlx::query(
+            r#"
+            INSERT INTO user_passkeys (
+              id,
+              user_id,
+              credential_id,
+              label,
+              passkey_json,
+              created_at,
+              last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(passkey_id.as_str())
+        .bind(user_id)
+        .bind(credential_id)
+        .bind("通行密钥 · 2026-02-23 00:00 UTC")
+        .bind("{}")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("seed passkey");
+        passkey_id
     }
 
     async fn seed_user(pool: &SqlitePool, id: i64, login: &str, is_admin: i64, is_disabled: i64) {
@@ -12463,6 +12637,80 @@ mod tests {
         .await
         .expect("count inflight access refresh tasks");
         assert_eq!(inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn me_delete_passkey_clears_stale_handle_after_removing_last_passkey() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "0c4ad957-f3cd-4dd3-a31b-56658fd149ea",
+            "cred-last",
+        )
+        .await;
+
+        let Json(resp) = me_delete_passkey(State(state), setup_session(1).await, Path(passkey_id))
+            .await
+            .expect("delete last passkey");
+
+        assert!(resp.items.is_empty());
+        let persisted_handle = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT passkey_user_handle_uuid
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load user handle");
+        assert!(persisted_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn me_delete_passkey_keeps_handle_when_other_passkeys_remain() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "83a58fc5-4c34-499e-9ca0-9eaeecfcc173",
+            "cred-keep-1",
+        )
+        .await;
+        let _second_passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "83a58fc5-4c34-499e-9ca0-9eaeecfcc173",
+            "cred-keep-2",
+        )
+        .await;
+
+        let Json(resp) = me_delete_passkey(State(state), setup_session(1).await, Path(passkey_id))
+            .await
+            .expect("delete one passkey");
+
+        assert_eq!(resp.items.len(), 1);
+        let persisted_handle = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT passkey_user_handle_uuid
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load user handle");
+        assert_eq!(
+            persisted_handle.as_deref(),
+            Some("83a58fc5-4c34-499e-9ca0-9eaeecfcc173")
+        );
     }
 
     async fn seed_repo_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
@@ -13490,6 +13738,76 @@ mod tests {
         assert_eq!(today_point.translations_total, 1);
         assert_eq!(today_point.summaries_total, 1);
         assert_eq!(today_point.briefs_total, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_today_live_snapshot_excludes_future_activity() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "operator", 0, 0).await;
+
+        let time_zone = chrono_tz::Asia::Shanghai;
+        let now_utc = time_zone
+            .with_ymd_and_hms(2026, 4, 22, 10, 0, 0)
+            .single()
+            .expect("build live snapshot time")
+            .with_timezone(&chrono::Utc);
+        let in_window_time = (now_utc - chrono::Duration::minutes(5)).to_rfc3339();
+        let future_time = (now_utc + chrono::Duration::seconds(1)).to_rfc3339();
+
+        set_last_active_at(
+            &pool,
+            test_user_id(1).as_str(),
+            Some(in_window_time.as_str()),
+        )
+        .await;
+        set_last_active_at(&pool, test_user_id(2).as_str(), Some(future_time.as_str())).await;
+
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-live-queued",
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_QUEUED,
+            test_user_id(1).as_str(),
+            in_window_time.as_str(),
+        )
+        .await;
+        seed_admin_dashboard_task(
+            &pool,
+            "dashboard-future-succeeded",
+            jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+            jobs::STATUS_SUCCEEDED,
+            test_user_id(2).as_str(),
+            future_time.as_str(),
+        )
+        .await;
+
+        let state = setup_state(pool);
+        let (today_live, status_breakdown) =
+            load_admin_dashboard_today_live_snapshot(state.as_ref(), time_zone, now_utc)
+                .await
+                .expect("load live snapshot");
+
+        assert_eq!(today_live.total_users, 2);
+        assert_eq!(today_live.active_users, 1);
+        assert_eq!(today_live.queued_tasks, 1);
+        assert_eq!(today_live.running_tasks, 0);
+        assert_eq!(today_live.ongoing_tasks_total, 1);
+        assert_eq!(status_breakdown.queued_total, 1);
+        assert_eq!(status_breakdown.running_total, 0);
+        assert_eq!(status_breakdown.total, 1);
+        assert_eq!(status_breakdown.items.len(), 3);
+        let translation_item = status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_TRANSLATE_RELEASE_BATCH)
+            .expect("translation item should exist");
+        assert_eq!(translation_item.total, 1);
+        let summary_item = status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+            .expect("summary item should exist");
+        assert_eq!(summary_item.total, 0);
     }
 
     #[tokio::test]
