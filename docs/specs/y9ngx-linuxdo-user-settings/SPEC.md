@@ -51,7 +51,7 @@
 - LinuxDO section 必须能展示“未绑定 / 已绑定 / 服务端未配置”三种状态，并支持发起 OAuth 绑定与解绑。
 - GitHub PAT section 必须保留现有 800ms 防抖校验、masked token 展示与仅 `valid` 可保存的门禁。
 - Dashboard 弹层与 `/settings` 内的 GitHub PAT 输入框都必须在默认隐藏态使用原生 `password` / secure-text 语义，设置 `autocomplete="new-password"`，并补充密码管理器忽略提示，避免被当成当前站点登录密码框自动填充或触发生成密码建议；仅在用户显式点亮后切到明文。隐藏态还必须继续保留在辅助功能树中的可聚焦、可编辑语义，辅助技术读取到的值必须保持为掩码而不是明文 token，并提供额外提示说明当前处于隐藏编辑态。
-- GitHub PAT 输入框在隐藏态下保留原生文本编辑体验：词级删除、拖放插入与撤销/重做不能因为防自动填充处理而回退。
+- GitHub PAT 输入框在隐藏态下保留原生文本编辑体验：词级删除、拖放插入与撤销/重做不能因为防自动填充处理而回退；其中撤销/重做既要覆盖键盘快捷键，也要覆盖浏览器 Edit / context-menu 触发的 `historyUndo` / `historyRedo` 路径；拖放插入必须落在用户实际悬停的插入点，而不是沿用旧光标位置。
 - GitHub PAT 输入框从明文切回隐藏态时，焦点必须回到显隐切换按钮，避免键盘用户与辅助技术继续停留在刚刚暴露过明文的编辑控件上。
 - reaction 在 PAT 缺失或失效时，必须提供可直接输入、校验并保存 GitHub PAT 的快捷弹层；同时保留进入 `/settings?section=github-pat` 的完整设置入口。
 - Dashboard 顶部独立“日报设置”按钮必须移除，日报设置迁入 `/settings`。
@@ -229,7 +229,7 @@ None
 
 ## 变更记录（Change log）
 
-- 2026-04-22：将 GitHub PAT 输入契约调整为默认保持原生 `password` / secure-text + `autocomplete="new-password"`、显式点亮后再切到明文，并补充密码管理器忽略提示，同时补齐隐藏态对辅助功能树的掩码保护、切回隐藏态后的焦点回收以及自动填充回归覆盖。
+- 2026-04-22：将 GitHub PAT 输入契约调整为默认保持原生 `password` / secure-text + `autocomplete="new-password"`、显式点亮后再切到明文，并补充密码管理器忽略提示，同时补齐隐藏态对辅助功能树的掩码保护、切回隐藏态后的焦点回收、菜单驱动的撤销/重做路径以及按实际悬停插入点落位的拖放编辑覆盖。
 - 2026-04-20：补充 GitHub PAT 输入框的非登录自动填充语义要求，覆盖 Dashboard 快捷弹层与 `/settings` 页面。
 
 - 2026-04-18: 新建规格，冻结为 LinuxDO OAuth 绑定 + 统一用户设置页方案。

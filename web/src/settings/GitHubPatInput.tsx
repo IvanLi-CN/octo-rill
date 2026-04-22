@@ -1,6 +1,13 @@
 import { Eye, EyeOff } from "lucide-react";
 import type * as React from "react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+	useCallback,
+	useEffect,
+	useId,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -31,6 +38,9 @@ export function GitHubPatInput({
 	const inputId = id ?? `github-pat-${generatedId}`;
 	const hiddenHintId = `${inputId}-hidden-hint`;
 	const inputRef = useRef<HTMLInputElement | null>(null);
+	const historyInputTypeRef = useRef<"historyUndo" | "historyRedo" | null>(
+		null,
+	);
 	const toggleLabel = isVisible ? "隐藏 GitHub PAT" : "显示 GitHub PAT";
 	const isControlled = value !== undefined;
 	const secretValue = isControlled ? String(value ?? "") : localValue;
@@ -57,18 +67,18 @@ export function GitHubPatInput({
 		historyIndexRef.current = 0;
 	}, [secretValue]);
 
-	const queueSelection = (
-		nextSelectionStart: number,
-		nextSelectionEnd = nextSelectionStart,
-	) => {
-		requestAnimationFrame(() => {
-			const input = inputRef.current;
-			if (!input || document.activeElement !== input) {
-				return;
-			}
-			input.setSelectionRange(nextSelectionStart, nextSelectionEnd);
-		});
-	};
+	const queueSelection = useCallback(
+		(nextSelectionStart: number, nextSelectionEnd = nextSelectionStart) => {
+			requestAnimationFrame(() => {
+				const input = inputRef.current;
+				if (!input || document.activeElement !== input) {
+					return;
+				}
+				input.setSelectionRange(nextSelectionStart, nextSelectionEnd);
+			});
+		},
+		[],
+	);
 
 	const recordHistory = (nextValue: string) => {
 		const currentHistoryValue =
@@ -120,6 +130,57 @@ export function GitHubPatInput({
 			secretValue.slice(selectionEnd);
 		const nextCaret = selectionStart + insertedText.length;
 		applyHiddenMutation(nextValue, nextCaret);
+	};
+
+	const resolveDropCaret = (input: HTMLInputElement, clientX: number) => {
+		if (!Number.isFinite(clientX)) {
+			const selectionStart = input.selectionStart ?? secretValue.length;
+			return selectionStart;
+		}
+		const rect = input.getBoundingClientRect();
+		const styles = getComputedStyle(input);
+		const leftInset =
+			parseFloat(styles.borderLeftWidth || "0") +
+			parseFloat(styles.paddingLeft || "0");
+		const rightInset =
+			parseFloat(styles.borderRightWidth || "0") +
+			parseFloat(styles.paddingRight || "0");
+		const contentWidth = Math.max(0, rect.width - leftInset - rightInset);
+		const relativeX = Math.min(
+			Math.max(clientX - rect.left - leftInset + input.scrollLeft, 0),
+			contentWidth + input.scrollLeft,
+		);
+		const context = document.createElement("canvas").getContext("2d");
+		if (!context) {
+			return input.selectionStart ?? secretValue.length;
+		}
+		context.font =
+			styles.font ||
+			`${styles.fontStyle} ${styles.fontVariant} ${styles.fontWeight} ${styles.fontSize} ${styles.fontFamily}`;
+
+		let previousWidth = 0;
+		for (let index = 0; index <= secretValue.length; index += 1) {
+			const currentWidth = context.measureText(
+				secretValue.slice(0, index),
+			).width;
+			if (relativeX <= currentWidth) {
+				return relativeX - previousWidth <= currentWidth - relativeX
+					? index - 1
+					: index;
+			}
+			previousWidth = currentWidth;
+		}
+		return secretValue.length;
+	};
+
+	const updateDropSelection = (clientX: number) => {
+		const input = inputRef.current;
+		if (!input) {
+			return;
+		}
+		input.focus();
+		const nextCaret = Math.max(0, resolveDropCaret(input, clientX));
+		input.setSelectionRange(nextCaret, nextCaret);
 	};
 
 	const deleteRange = (selectionStart: number, selectionEnd: number) => {
@@ -207,6 +268,91 @@ export function GitHubPatInput({
 		queueSelection(nextValue.length);
 	};
 
+	useEffect(() => {
+		const input = inputRef.current;
+		if (!input) {
+			return;
+		}
+
+		const replayNativeHistory = (direction: "undo" | "redo") => {
+			const currentIndex = historyIndexRef.current;
+			const nextIndex =
+				direction === "undo"
+					? Math.max(0, currentIndex - 1)
+					: Math.min(historyRef.current.length - 1, currentIndex + 1);
+			if (nextIndex === currentIndex) {
+				return false;
+			}
+			historyIndexRef.current = nextIndex;
+			const nextValue = historyRef.current[nextIndex] ?? "";
+			if (!isControlled) {
+				setLocalValue(nextValue);
+			}
+			onChange?.({
+				target: { value: nextValue },
+				currentTarget: { value: nextValue },
+			} as React.ChangeEvent<HTMLInputElement>);
+			queueSelection(nextValue.length);
+			return true;
+		};
+
+		const handleBeforeInput = (event: InputEvent) => {
+			if (isVisible || props.readOnly || props.disabled) {
+				return;
+			}
+			const shouldHandle =
+				event.inputType === "historyUndo"
+					? replayNativeHistory("undo")
+					: event.inputType === "historyRedo"
+						? replayNativeHistory("redo")
+						: false;
+			if (shouldHandle) {
+				if (
+					event.inputType === "historyUndo" ||
+					event.inputType === "historyRedo"
+				) {
+					historyInputTypeRef.current = event.inputType;
+				}
+				event.preventDefault();
+			}
+		};
+
+		const handleInput = (event: Event) => {
+			if (isVisible || props.readOnly || props.disabled) {
+				return;
+			}
+			const nativeEvent = event as InputEvent;
+			if (
+				historyInputTypeRef.current &&
+				historyInputTypeRef.current === nativeEvent.inputType
+			) {
+				historyInputTypeRef.current = null;
+				return;
+			}
+			if (nativeEvent.inputType === "historyUndo") {
+				replayNativeHistory("undo");
+				return;
+			}
+			if (nativeEvent.inputType === "historyRedo") {
+				replayNativeHistory("redo");
+			}
+		};
+
+		input.addEventListener("beforeinput", handleBeforeInput);
+		input.addEventListener("input", handleInput);
+		return () => {
+			input.removeEventListener("beforeinput", handleBeforeInput);
+			input.removeEventListener("input", handleInput);
+		};
+	}, [
+		isVisible,
+		isControlled,
+		onChange,
+		props.disabled,
+		props.readOnly,
+		queueSelection,
+	]);
+
 	const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
 		recordHistory(event.target.value);
 		if (!isControlled) {
@@ -261,6 +407,17 @@ export function GitHubPatInput({
 					if (!isVisible) {
 						event.preventDefault();
 					}
+					props.onDragStart?.(event);
+				}}
+				onDragOver={(event) => {
+					if (!isVisible && !props.readOnly && !props.disabled) {
+						event.preventDefault();
+						updateDropSelection(event.clientX);
+						if (event.dataTransfer) {
+							event.dataTransfer.dropEffect = "copy";
+						}
+					}
+					props.onDragOver?.(event);
 				}}
 				onDrop={(event) => {
 					if (!isVisible && !props.readOnly && !props.disabled) {
@@ -269,9 +426,11 @@ export function GitHubPatInput({
 							event.dataTransfer.getData("text");
 						if (droppedText) {
 							event.preventDefault();
+							updateDropSelection(event.clientX);
 							replaceSelection(droppedText);
 						}
 					}
+					props.onDrop?.(event);
 				}}
 				onKeyDown={(event) => {
 					if (!isVisible && !props.readOnly && !props.disabled) {
@@ -317,6 +476,7 @@ export function GitHubPatInput({
 							return;
 						}
 					}
+					props.onKeyDown?.(event);
 				}}
 				className={cn("pr-11", inputClassName)}
 			/>
