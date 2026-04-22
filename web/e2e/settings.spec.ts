@@ -409,9 +409,13 @@ test("settings github pat hidden mode keeps word deletion shortcuts", async ({
 	await page.goto("/settings?section=github-pat");
 
 	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await input.fill("ghp_visible_chunk");
 	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await expect(toggleButton).toBeFocused();
 	await input.focus();
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
@@ -434,9 +438,13 @@ test("settings github pat hidden mode keeps word deletion on the native undo sta
 	await page.goto("/settings?section=github-pat");
 
 	const input = page.locator("#settings-reaction-pat");
+	const toggleButton = page.locator(
+		'button[aria-controls="settings-reaction-pat"]',
+	);
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await input.fill("ghp_visible_chunk");
 	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await expect(toggleButton).toBeFocused();
 	await input.focus();
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
