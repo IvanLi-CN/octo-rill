@@ -334,12 +334,15 @@ test("settings deep link focuses github pat section", async ({ page }) => {
 		timeout: 10_000,
 	});
 	const input = page.locator("#settings-reaction-pat");
-	await expect(input).toHaveAttribute("type", "text");
+	await expect(input).toHaveAttribute("type", "password");
 	await expect(input).toHaveAttribute("autocomplete", "off");
 	await expect(input).toHaveAttribute("data-1p-ignore", "true");
 	await expect(input).toHaveAttribute("data-form-type", "other");
 	await expect(input).toHaveAttribute("data-secret-visible", "false");
-	await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
+	await expect(input).toHaveAttribute(
+		"data-secret-mask-mode",
+		"native-password",
+	);
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveAttribute("type", "text");
 	await expect(input).toHaveAttribute("data-secret-visible", "true");
@@ -398,6 +401,8 @@ test("settings github pat hidden mode stays editable in accessibility tree", asy
 
 	expect(inputAccessibilityTree).toContain("GitHub PAT");
 	expect(inputAccessibilityTree).toContain("当前内容已隐藏");
+	expect(inputAccessibilityTree).not.toContain("ghp_secret_demo");
+	expect(inputAccessibilityTree).toContain("•••••••••••••••");
 	expect(inputAccessibilityTree).not.toContain("ariaHiddenElement");
 });
 

@@ -20,14 +20,7 @@ export function GitHubPatInput({
 	defaultValue,
 	"aria-label": ariaLabel,
 	autoComplete,
-	style,
 	onChange,
-	onBeforeInput,
-	onCopy,
-	onCut,
-	onDrop,
-	onDragStart,
-	onKeyDown,
 	...props
 }: GitHubPatInputProps) {
 	const [isVisible, setIsVisible] = useState(false);
@@ -41,26 +34,30 @@ export function GitHubPatInput({
 	const toggleLabel = isVisible ? "隐藏 GitHub PAT" : "显示 GitHub PAT";
 	const isControlled = value !== undefined;
 	const secretValue = isControlled ? String(value ?? "") : localValue;
+	const historyRef = useRef<string[]>([secretValue]);
+	const historyIndexRef = useRef(0);
 	const secretState = useMemo(
 		() => (isVisible ? "true" : "false"),
 		[isVisible],
-	);
-	const inputStyle = useMemo<React.CSSProperties>(
-		() => ({
-			...style,
-			...(isVisible
-				? {}
-				: ({
-						WebkitTextSecurity: "disc",
-					} as React.CSSProperties)),
-		}),
-		[isVisible, style],
 	);
 
 	useEffect(() => {
 		if (!secretValue) {
 			setIsVisible(false);
 		}
+	}, [secretValue]);
+
+	useEffect(() => {
+		const currentHistoryValue =
+			historyRef.current[historyIndexRef.current] ?? "";
+		if (currentHistoryValue === secretValue) {
+			return;
+		}
+		historyRef.current = [
+			...historyRef.current.slice(0, historyIndexRef.current + 1),
+			secretValue,
+		];
+		historyIndexRef.current = historyRef.current.length - 1;
 	}, [secretValue]);
 
 	const queueSelection = (
@@ -76,7 +73,21 @@ export function GitHubPatInput({
 		});
 	};
 
-	const emitFallbackChange = (nextValue: string) => {
+	const recordHistory = (nextValue: string) => {
+		const currentHistoryValue =
+			historyRef.current[historyIndexRef.current] ?? "";
+		if (currentHistoryValue === nextValue) {
+			return;
+		}
+		historyRef.current = [
+			...historyRef.current.slice(0, historyIndexRef.current + 1),
+			nextValue,
+		];
+		historyIndexRef.current = historyRef.current.length - 1;
+	};
+
+	const emitSyntheticChange = (nextValue: string) => {
+		recordHistory(nextValue);
 		if (!isControlled) {
 			setLocalValue(nextValue);
 		}
@@ -86,7 +97,7 @@ export function GitHubPatInput({
 		} as React.ChangeEvent<HTMLInputElement>);
 	};
 
-	const applyFallbackMutation = (
+	const applyHiddenMutation = (
 		nextValue: string,
 		nextSelectionStart: number,
 		nextSelectionEnd = nextSelectionStart,
@@ -94,27 +105,8 @@ export function GitHubPatInput({
 		if (nextValue === secretValue) {
 			return;
 		}
-		emitFallbackChange(nextValue);
+		emitSyntheticChange(nextValue);
 		queueSelection(nextSelectionStart, nextSelectionEnd);
-	};
-
-	const performEditCommand = (
-		commandName: "delete" | "insertText",
-		selectionStart: number,
-		selectionEnd: number,
-		valueArgument?: string,
-	) => {
-		const input = inputRef.current;
-		if (!input) {
-			return false;
-		}
-		input.focus();
-		input.setSelectionRange(selectionStart, selectionEnd);
-		try {
-			return document.execCommand(commandName, false, valueArgument);
-		} catch {
-			return false;
-		}
 	};
 
 	const replaceSelection = (insertedText: string) => {
@@ -122,6 +114,7 @@ export function GitHubPatInput({
 		if (!input) {
 			return;
 		}
+		input.focus();
 		const selectionStart = input.selectionStart ?? secretValue.length;
 		const selectionEnd = input.selectionEnd ?? selectionStart;
 		const nextValue =
@@ -129,29 +122,16 @@ export function GitHubPatInput({
 			insertedText +
 			secretValue.slice(selectionEnd);
 		const nextCaret = selectionStart + insertedText.length;
-		if (
-			performEditCommand(
-				"insertText",
-				selectionStart,
-				selectionEnd,
-				insertedText,
-			)
-		) {
-			return;
-		}
-		applyFallbackMutation(nextValue, nextCaret);
+		applyHiddenMutation(nextValue, nextCaret);
 	};
 
 	const deleteRange = (selectionStart: number, selectionEnd: number) => {
 		if (selectionStart === selectionEnd) {
 			return;
 		}
-		if (performEditCommand("delete", selectionStart, selectionEnd)) {
-			return;
-		}
 		const nextValue =
 			secretValue.slice(0, selectionStart) + secretValue.slice(selectionEnd);
-		applyFallbackMutation(nextValue, selectionStart);
+		applyHiddenMutation(nextValue, selectionStart);
 	};
 
 	const isTokenBoundary = (character: string) => !/[A-Za-z0-9]/.test(character);
@@ -209,7 +189,29 @@ export function GitHubPatInput({
 		deleteRange(rangeStart, rangeEnd);
 	};
 
+	const replayHistory = (direction: "undo" | "redo") => {
+		const currentIndex = historyIndexRef.current;
+		const nextIndex =
+			direction === "undo"
+				? Math.max(0, currentIndex - 1)
+				: Math.min(historyRef.current.length - 1, currentIndex + 1);
+		if (nextIndex === currentIndex) {
+			return;
+		}
+		historyIndexRef.current = nextIndex;
+		const nextValue = historyRef.current[nextIndex] ?? "";
+		if (!isControlled) {
+			setLocalValue(nextValue);
+		}
+		onChange?.({
+			target: { value: nextValue },
+			currentTarget: { value: nextValue },
+		} as React.ChangeEvent<HTMLInputElement>);
+		queueSelection(nextValue.length);
+	};
+
 	const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+		recordHistory(event.target.value);
 		if (!isControlled) {
 			setLocalValue(event.target.value);
 		}
@@ -223,7 +225,7 @@ export function GitHubPatInput({
 			className={cn("relative", className)}
 			data-secret-visible={secretState}
 			data-secret-input="github-pat"
-			data-secret-mask-mode={isVisible ? "plain-text" : "visual-mask"}
+			data-secret-mask-mode={isVisible ? "plain-text" : "native-password"}
 		>
 			{!isVisible ? (
 				<span className="sr-only" id={hiddenHintId}>
@@ -233,43 +235,35 @@ export function GitHubPatInput({
 			) : null}
 			<Input
 				{...props}
-				onBeforeInput={onBeforeInput}
 				ref={inputRef}
 				id={inputId}
-				type="text"
+				type={isVisible ? "text" : "password"}
 				value={secretValue}
 				autoComplete={autoComplete ?? "off"}
 				aria-describedby={isVisible ? undefined : hiddenHintId}
 				aria-label={assistiveLabel}
 				data-secret-visible={secretState}
 				data-secret-input="github-pat"
-				data-secret-mask-mode={isVisible ? "plain-text" : "visual-mask"}
+				data-secret-mask-mode={isVisible ? "plain-text" : "native-password"}
 				data-1p-ignore="true"
 				data-op-ignore="true"
 				data-form-type="other"
 				inputMode="text"
-				style={inputStyle}
 				onChange={handleChange}
 				onCopy={(event) => {
 					if (!isVisible) {
 						event.preventDefault();
-						return;
 					}
-					onCopy?.(event);
 				}}
 				onCut={(event) => {
 					if (!isVisible) {
 						event.preventDefault();
-						return;
 					}
-					onCut?.(event);
 				}}
 				onDragStart={(event) => {
 					if (!isVisible) {
 						event.preventDefault();
-						return;
 					}
-					onDragStart?.(event);
 				}}
 				onDrop={(event) => {
 					if (!isVisible && !props.readOnly && !props.disabled) {
@@ -279,11 +273,8 @@ export function GitHubPatInput({
 						if (droppedText) {
 							event.preventDefault();
 							replaceSelection(droppedText);
-							return;
 						}
-						return;
 					}
-					onDrop?.(event);
 				}}
 				onKeyDown={(event) => {
 					if (!isVisible && !props.readOnly && !props.disabled) {
@@ -305,8 +296,30 @@ export function GitHubPatInput({
 							deleteWord("forward");
 							return;
 						}
+						const wantsUndo =
+							event.key.toLowerCase() === "z" &&
+							((event.metaKey && !event.ctrlKey) ||
+								(event.ctrlKey && !event.metaKey)) &&
+							!event.shiftKey;
+						if (wantsUndo) {
+							event.preventDefault();
+							replayHistory("undo");
+							return;
+						}
+						const wantsRedo =
+							(event.key.toLowerCase() === "z" &&
+								((event.metaKey && !event.ctrlKey) ||
+									(event.ctrlKey && !event.metaKey)) &&
+								event.shiftKey) ||
+							(event.key.toLowerCase() === "y" &&
+								event.ctrlKey &&
+								!event.metaKey);
+						if (wantsRedo) {
+							event.preventDefault();
+							replayHistory("redo");
+							return;
+						}
 					}
-					onKeyDown?.(event);
 				}}
 				className={cn("pr-11", inputClassName)}
 			/>

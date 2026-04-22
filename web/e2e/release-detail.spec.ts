@@ -1074,14 +1074,14 @@ test("reaction fallback lets users configure PAT inline from the dialog", async 
 		patDialog.getByText(/先补齐 GitHub PAT，才能继续使用站内反馈/),
 	).toBeVisible();
 	const patInput = patDialog.locator("#dashboard-reaction-pat");
-	await expect(patInput).toHaveAttribute("type", "text");
+	await expect(patInput).toHaveAttribute("type", "password");
 	await expect(patInput).toHaveAttribute("autocomplete", "off");
 	await expect(patInput).toHaveAttribute("data-1p-ignore", "true");
 	await expect(patInput).toHaveAttribute("data-form-type", "other");
 	await expect(patInput).toHaveAttribute("data-secret-visible", "false");
 	await expect(patInput).toHaveAttribute(
 		"data-secret-mask-mode",
-		"visual-mask",
+		"native-password",
 	);
 	await patDialog.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(patInput).toHaveAttribute("type", "text");
