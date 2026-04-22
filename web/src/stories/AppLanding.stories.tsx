@@ -61,6 +61,11 @@ export const Default: Story = {
 		await expect(
 			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
 		).toBeVisible();
+		expect(
+			canvas
+				.getByRole("button", { name: "使用 Passkey 登录" })
+				.querySelector('[data-auth-provider-icon="passkey"]'),
+		).not.toBeNull();
 		await expect(
 			canvas.getByRole("button", {
 				name: "首次使用？创建 Passkey 并继续绑定 GitHub",
