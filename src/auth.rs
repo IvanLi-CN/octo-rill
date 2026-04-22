@@ -524,6 +524,34 @@ fn bind_github_redirect(
     url.into()
 }
 
+fn post_github_login_redirect(
+    config: &AppConfig,
+    has_pending_linuxdo: bool,
+    passkey_status: Option<&str>,
+) -> String {
+    if let Some(passkey_status) = passkey_status {
+        return settings_redirect(
+            config,
+            "passkeys",
+            has_pending_linuxdo.then_some("connected"),
+            has_pending_linuxdo.then_some("connected"),
+            Some(passkey_status),
+        );
+    }
+
+    if has_pending_linuxdo {
+        return settings_redirect(
+            config,
+            "github-accounts",
+            Some("connected"),
+            Some("connected"),
+            None,
+        );
+    }
+
+    config.public_base_url.to_string()
+}
+
 fn provisional_passkey_user_name(user_handle_uuid: &str) -> String {
     let suffix = user_handle_uuid.chars().take(8).collect::<String>();
     format!("passkey-{suffix}")
@@ -858,19 +886,11 @@ async fn finalize_github_auth(
             }
 
             login_user_after_commit = Some(target_user_id.clone());
-            if pending_linuxdo.is_some() {
-                settings_redirect(
-                    &state.config,
-                    "github-accounts",
-                    Some("connected"),
-                    Some("connected"),
-                    passkey_status_after_login,
-                )
-            } else if let Some(passkey_status) = passkey_status_after_login {
-                settings_redirect(&state.config, "passkeys", None, None, Some(passkey_status))
-            } else {
-                state.config.public_base_url.to_string()
-            }
+            post_github_login_redirect(
+                &state.config,
+                pending_linuxdo.is_some(),
+                passkey_status_after_login,
+            )
         }
     };
 
@@ -1601,11 +1621,17 @@ pub async fn logout(
 
 #[cfg(test)]
 mod tests {
-    use super::{promote_first_admin, upsert_github_user};
+    use super::{post_github_login_redirect, promote_first_admin, upsert_github_user};
+    use crate::{
+        config::{AppConfig, GitHubOAuthConfig},
+        crypto::EncryptionKey,
+    };
     use sqlx::{
         SqlitePool,
         sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     };
+    use std::{net::SocketAddr, path::PathBuf};
+    use url::Url;
 
     async fn setup_pool() -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
@@ -1625,6 +1651,56 @@ mod tests {
             .await
             .expect("run migrations");
         pool
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            bind_addr: "127.0.0.1:58090"
+                .parse::<SocketAddr>()
+                .expect("parse bind addr"),
+            public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
+            database_url: "sqlite::memory:".to_owned(),
+            static_dir: None,
+            task_log_dir: PathBuf::from("/tmp/octo-rill-auth-tests"),
+            job_worker_concurrency: 1,
+            encryption_key: EncryptionKey::from_base64(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )
+            .expect("build encryption key"),
+            github: GitHubOAuthConfig {
+                client_id: "github-client-id".to_owned(),
+                client_secret: "github-client-secret".to_owned(),
+                redirect_url: Url::parse("http://127.0.0.1:58090/auth/github/callback")
+                    .expect("parse github redirect url"),
+            },
+            linuxdo: None,
+            ai: None,
+            ai_max_concurrency: 1,
+            ai_daily_at_local: None,
+            app_default_time_zone: "Asia/Shanghai".to_owned(),
+        }
+    }
+
+    #[test]
+    fn post_github_login_redirect_prefers_passkeys_section_for_passkey_recovery() {
+        let config = test_config();
+        let redirect = post_github_login_redirect(&config, true, Some("passkey_retry_required"));
+
+        assert_eq!(
+            redirect,
+            "http://127.0.0.1:58090/settings?section=passkeys&github=connected&linuxdo=connected&passkey=passkey_retry_required"
+        );
+    }
+
+    #[test]
+    fn post_github_login_redirect_uses_github_accounts_when_only_linuxdo_connected() {
+        let config = test_config();
+        let redirect = post_github_login_redirect(&config, true, None);
+
+        assert_eq!(
+            redirect,
+            "http://127.0.0.1:58090/settings?section=github-accounts&github=connected&linuxdo=connected"
+        );
     }
 
     #[tokio::test]
