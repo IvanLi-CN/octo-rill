@@ -467,6 +467,35 @@ test("settings github pat hidden mode keeps word deletion on the native undo sta
 	await expect(input).toHaveValue("ghp_visible_chunk");
 });
 
+test("settings github pat hidden mode handles beforeinput word deletion", async ({
+	page,
+}) => {
+	await installSettingsMocks(page);
+
+	await page.goto("/settings?section=github-pat");
+
+	const input = page.locator("#settings-reaction-pat");
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await input.fill("ghp_visible_chunk");
+	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
+	await input.focus();
+	await input.evaluate((node) => {
+		if (!(node instanceof HTMLInputElement)) {
+			throw new Error("expected HTMLInputElement");
+		}
+		node.setSelectionRange(node.value.length, node.value.length);
+		node.dispatchEvent(
+			new InputEvent("beforeinput", {
+				bubbles: true,
+				cancelable: true,
+				inputType: "deleteWordBackward",
+			}),
+		);
+	});
+	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
+	await expect(input).toHaveValue("ghp_visible_");
+});
+
 test("settings github pat hidden mode accepts drop edits", async ({ page }) => {
 	await installSettingsMocks(page);
 
