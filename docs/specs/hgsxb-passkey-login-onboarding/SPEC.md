@@ -123,13 +123,22 @@
 ### 浏览器不支持与过期态
 
 - 若浏览器不支持 WebAuthn，Landing 和 Settings 均展示明确 fallback，不进入坏状态。
+- Landing 首屏必须在第一次 render 就完成 Passkey capability 判定；支持 Passkey 的浏览器不得先闪出“不支持”提示或先把 Passkey CTA 渲染成禁用态。
 - registration/authentication/pending-bind 任一 session 状态过期时，后端返回显式错误码，前端映射为可理解文案。
+
+### 同 PR 回归约束
+
+- 与本次 onboarding 同 PR 触及到的 admin dashboard `today_live` 快照，统计窗口上界必须以 `generated_at` 为准；`active_users` 与 `status_breakdown` 可以包含恰好发生在生成时刻的事件，但不得再向未来额外扩 1 秒。
 
 ## 验收标准
 
 - Given 匿名用户访问 `/`
   When 页面加载完成
   Then GitHub / LinuxDO / Passkey 入口同时可见，且不支持 WebAuthn 的浏览器会显示 fallback 提示。
+
+- Given 支持 Passkey 的浏览器访问 `/`
+  When Landing 首次渲染
+  Then Passkey CTA 从第一帧开始就是可用态，不会先闪出“不支持” fallback。
 
 - Given 已绑定 Passkey 的返回用户访问 `/`
   When 完成 Passkey 验证
