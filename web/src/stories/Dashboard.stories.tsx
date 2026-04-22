@@ -104,11 +104,35 @@ const DASHBOARD_VIEWPORTS = {
 		},
 		type: "mobile",
 	},
+	dashboardNarrowTablet640: {
+		name: "Dashboard narrow tablet 640x960",
+		styles: {
+			height: "960px",
+			width: "640px",
+		},
+		type: "tablet",
+	},
+	dashboardNarrowTablet757: {
+		name: "Dashboard narrow tablet 757x827",
+		styles: {
+			height: "827px",
+			width: "757px",
+		},
+		type: "tablet",
+	},
 	dashboardTablet853: {
 		name: "Dashboard tablet 853x1280",
 		styles: {
 			height: "1280px",
 			width: "853px",
+		},
+		type: "tablet",
+	},
+	dashboardTablet1023: {
+		name: "Dashboard tablet 1023x1280",
+		styles: {
+			height: "1280px",
+			width: "1023px",
 		},
 		type: "tablet",
 	},
@@ -1148,9 +1172,9 @@ function makeSyncPreheatedFeed(): FeedItem[] {
 			smart: {
 				lang: "zh-CN",
 				status: "ready",
-				title: "v4.1.0 · 后台智能预热",
+				title: "v4.1.0 · 后台润色预热",
 				summary: [
-					"- 后台同步已经预热智能版本摘要",
+					"- 后台同步已经预热润色版本摘要",
 					"- 首次打开 release feed 直接看到版本变化要点",
 				].join("\n"),
 			},
@@ -1194,7 +1218,7 @@ function makeSmartReadyDiffFeed(): FeedItem[] {
 			smart: {
 				lang: "zh-CN",
 				status: "ready",
-				title: "v5.1.0 · 智能整理",
+				title: "v5.1.0 · 润色",
 				summary: [
 					"- 主要变更集中在认证中间件与上传流程，强化失败回退",
 					"- 补齐批处理调度与监控字段，方便排查运行中的任务状态",
@@ -1650,7 +1674,7 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
-	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
@@ -2153,6 +2177,75 @@ export const EvidenceTabletHeaderInline: Story = {
 			description: {
 				story:
 					"平板 853x1280 证据入口：Dashboard 页头主行保持品牌 / utility actions 同排，tabs 与次级控制区继续作为后续控制带落在下一行，同时 feed 页不再额外显示 Inbox 快捷侧栏列。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet640: Story = {
+	name: "Regression / Narrow Tablet 640",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardNarrowTablet640",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"640x960 回归入口：窄平板起点必须保持页头主行同排，且页面仍为单主列，不渲染 Inbox 侧栏。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet757: Story = {
+	name: "Regression / Narrow Tablet 757",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardNarrowTablet757",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"757x827 主回归入口：对应主人实图宽度，Dashboard 页头与 control band 不得错位，Inbox 侧栏必须保持隐藏。",
+			},
+		},
+	},
+};
+
+export const RegressionTablet1023: Story = {
+	name: "Regression / Tablet 1023",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardTablet1023",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"1023x1280 上边界入口：进入桌面语义前，Dashboard 仍需保持单主列与平板页头合同。",
 			},
 		},
 	},
@@ -2893,9 +2986,9 @@ export const VisibleWindowQueue: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "v2.0.01" }),
 		).toBeVisible();
-		await expect(canvas.getAllByRole("tab", { name: "智能" })).toHaveLength(12);
+		await expect(canvas.getAllByRole("tab", { name: "润色" })).toHaveLength(12);
 		await expect(
-			canvas.getAllByRole("button", { name: "生成智能版" }),
+			canvas.getAllByRole("button", { name: "生成润色版" }),
 		).toHaveLength(12);
 	},
 };
@@ -2919,7 +3012,7 @@ export const VisibleWindowSettling: Story = {
 			canvas.getByRole("heading", { name: "v2.0.01" }),
 		).toBeVisible();
 		await expect(
-			canvas.getAllByRole("button", { name: "生成智能版" }),
+			canvas.getAllByRole("button", { name: "生成润色版" }),
 		).toHaveLength(12);
 		canvas.getAllByRole("tab", { name: "翻译" })[0]?.click();
 		await expect(
@@ -3184,10 +3277,10 @@ export const SyncPreheated: Story = {
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			canvas.getByRole("heading", { name: "v4.1.0 · 后台智能预热" }),
+			canvas.getByRole("heading", { name: "v4.1.0 · 后台润色预热" }),
 		).toBeVisible();
 		await expect(
-			canvas.getByText(/后台同步已经预热智能版本摘要/),
+			canvas.getByText(/后台同步已经预热润色版本摘要/),
 		).toBeVisible();
 		await canvas.getByRole("tab", { name: "翻译" }).click();
 		await expect(
@@ -3206,7 +3299,7 @@ export const SmartReadyBody: Story = {
 		docs: {
 			description: {
 				story:
-					"智能总结可直接从 release body 提炼版本变化时，默认 tab 应展示中文要点，而不是直译正文。",
+					"润色可直接从 release body 提炼版本变化时，默认 tab 应展示中文要点，而不是直译正文。",
 			},
 		},
 	},
@@ -3218,7 +3311,7 @@ export const SmartReadyBody: Story = {
 		await expect(
 			canvas.getByText(/新增 macOS \/ Windows 已签名桌面包/),
 		).toBeVisible();
-		await expect(canvas.getByRole("tab", { name: "智能" })).toHaveAttribute(
+		await expect(canvas.getByRole("tab", { name: "润色" })).toHaveAttribute(
 			"data-state",
 			"active",
 		);
@@ -3234,14 +3327,14 @@ export const SmartReadyDiff: Story = {
 		docs: {
 			description: {
 				story:
-					"当 release body 没有价值时，智能总结回退到 compare diff，并输出适合人类阅读的版本变化要点。",
+					"当 release body 没有价值时，润色回退到 compare diff，并输出适合人类阅读的版本变化要点。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			canvas.getByRole("heading", { name: "v5.1.0 · 智能整理" }),
+			canvas.getByRole("heading", { name: "v5.1.0 · 润色" }),
 		).toBeVisible();
 		await expect(canvas.getByText(/认证中间件与上传流程/)).toBeVisible();
 	},
@@ -3256,7 +3349,7 @@ export const SmartLoading: Story = {
 		docs: {
 			description: {
 				story:
-					"智能 tab 缺数据时，正文继续回退显示原文，加载状态仅通过卡片内智能选项的呼吸效果表达。",
+					"润色 tab 缺数据时，正文继续回退显示原文，加载状态仅通过卡片内润色选项的呼吸效果表达。",
 			},
 		},
 	},
@@ -3282,13 +3375,13 @@ export const SmartRetryActionLoading: Story = {
 		docs: {
 			description: {
 				story:
-					"智能整理失败时点击重试，错误态按钮会立即进入旋转 loading，并在动作完成前保持禁用，避免重复点击。",
+					"润色失败时点击重试，错误态按钮会立即进入旋转 loading，并在动作完成前保持禁用，避免重复点击。",
 			},
 		},
 	},
 	play: async ({ canvasElement, userEvent }) => {
 		const canvas = within(canvasElement);
-		const retryButton = canvas.getByRole("button", { name: "重试智能整理" });
+		const retryButton = canvas.getByRole("button", { name: "重试润色" });
 		await expect(retryButton).toBeEnabled();
 		await userEvent.click(retryButton);
 		await expect(retryButton).toBeDisabled();
@@ -3296,9 +3389,7 @@ export const SmartRetryActionLoading: Story = {
 		const icon = retryButton.querySelector("svg");
 		expect(icon).not.toBeNull();
 		expect(icon?.classList.contains("animate-spin")).toBe(true);
-		await expect(
-			canvas.getByText("智能整理失败", { exact: true }),
-		).toBeVisible();
+		await expect(canvas.getByText("润色失败", { exact: true })).toBeVisible();
 	},
 };
 
@@ -3434,7 +3525,7 @@ export const PageDefaultLaneSwitchingMobile: Story = {
 		);
 
 		const laneMenuTrigger = canvas.getByRole("button", {
-			name: "当前阅读模式：智能",
+			name: "当前阅读模式：润色",
 		}) as HTMLButtonElement;
 		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchstart");
 		dispatchSyntheticTouchEvent(laneMenuTrigger, "touchmove", 10, 0);
@@ -3517,10 +3608,10 @@ export const SmartInsufficient: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByRole("heading", { name: "v5.3.0" })).toBeVisible();
 		await expect(
-			canvas.queryByRole("tab", { name: "智能" }),
+			canvas.queryByRole("tab", { name: "润色" }),
 		).not.toBeInTheDocument();
 		await expect(
-			canvas.queryByText(/还没有智能版本变化摘要/),
+			canvas.queryByText(/还没有润色版本变化摘要/),
 		).not.toBeInTheDocument();
 	},
 };
