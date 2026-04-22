@@ -1252,6 +1252,7 @@ pub async fn me_delete_passkey(
         ));
     }
 
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
     sqlx::query(
         r#"
         DELETE FROM user_passkeys
@@ -1261,9 +1262,38 @@ pub async fn me_delete_passkey(
     )
     .bind(passkey_id.as_str())
     .bind(user_id.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(ApiError::internal)?;
+
+    let remaining = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM user_passkeys
+        WHERE user_id = ?
+        "#,
+    )
+    .bind(user_id.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if remaining == 0 {
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET passkey_user_handle_uuid = NULL, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(user_id.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    tx.commit().await.map_err(ApiError::internal)?;
 
     me_get_passkeys(State(state), session).await
 }
@@ -11769,7 +11799,7 @@ mod tests {
         llm_call_order_by_clause, load_admin_dashboard_today_live_snapshot,
         load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
         map_public_compare_fallback_error, mark_translation_requested,
-        markdown_structure_preserved, me, normalize_markdown_translation_output,
+        markdown_structure_preserved, me, me_delete_passkey, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
         parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
@@ -12125,6 +12155,52 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed github connection");
+    }
+
+    async fn seed_passkey(
+        pool: &SqlitePool,
+        user_id: &str,
+        user_handle_uuid: &str,
+        credential_id: &str,
+    ) -> String {
+        let passkey_id = crate::local_id::generate_local_id();
+        sqlx::query(
+            r#"
+            UPDATE users
+            SET passkey_user_handle_uuid = ?, updated_at = '2026-02-23T00:00:00Z'
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_handle_uuid)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed passkey user handle");
+        sqlx::query(
+            r#"
+            INSERT INTO user_passkeys (
+              id,
+              user_id,
+              credential_id,
+              label,
+              passkey_json,
+              created_at,
+              last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(passkey_id.as_str())
+        .bind(user_id)
+        .bind(credential_id)
+        .bind("通行密钥 · 2026-02-23 00:00 UTC")
+        .bind("{}")
+        .bind("2026-02-23T00:00:00Z")
+        .bind(Option::<String>::None)
+        .execute(pool)
+        .await
+        .expect("seed passkey");
+        passkey_id
     }
 
     async fn seed_user(pool: &SqlitePool, id: i64, login: &str, is_admin: i64, is_disabled: i64) {
@@ -12561,6 +12637,80 @@ mod tests {
         .await
         .expect("count inflight access refresh tasks");
         assert_eq!(inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn me_delete_passkey_clears_stale_handle_after_removing_last_passkey() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "0c4ad957-f3cd-4dd3-a31b-56658fd149ea",
+            "cred-last",
+        )
+        .await;
+
+        let Json(resp) = me_delete_passkey(State(state), setup_session(1).await, Path(passkey_id))
+            .await
+            .expect("delete last passkey");
+
+        assert!(resp.items.is_empty());
+        let persisted_handle = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT passkey_user_handle_uuid
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load user handle");
+        assert!(persisted_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn me_delete_passkey_keeps_handle_when_other_passkeys_remain() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id(1);
+        let passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "83a58fc5-4c34-499e-9ca0-9eaeecfcc173",
+            "cred-keep-1",
+        )
+        .await;
+        let _second_passkey_id = seed_passkey(
+            &pool,
+            user_id.as_str(),
+            "83a58fc5-4c34-499e-9ca0-9eaeecfcc173",
+            "cred-keep-2",
+        )
+        .await;
+
+        let Json(resp) = me_delete_passkey(State(state), setup_session(1).await, Path(passkey_id))
+            .await
+            .expect("delete one passkey");
+
+        assert_eq!(resp.items.len(), 1);
+        let persisted_handle = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            SELECT passkey_user_handle_uuid
+            FROM users
+            WHERE id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load user handle");
+        assert_eq!(
+            persisted_handle.as_deref(),
+            Some("83a58fc5-4c34-499e-9ca0-9eaeecfcc173")
+        );
     }
 
     async fn seed_repo_release(pool: &SqlitePool, repo_id: i64, release_id: i64) {
