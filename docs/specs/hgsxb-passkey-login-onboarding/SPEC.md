@@ -65,6 +65,7 @@
   - 保存匿名用户刚创建完成、尚未挂接账号的 Passkey 与展示 label
   - 由 GitHub callback 消费并决定 attach / retry-required
   - attach 正式账号时，若首次写入 `users.passkey_user_handle_uuid` 的条件更新没有成功落库，必须重新读取最新 handle，再决定 attach 还是 `passkey_retry_required`，避免并发首绑留下不可登录的孤儿凭据
+  - 任一终态 auth path（包括 attach 失败后已明确给出 remediation、或被既有账号快捷登录路径直接短路）都必须清掉这份 session，避免 `/bind/github` 继续展示已失效的待挂接 Passkey
 - `pending_passkey_authentication`
   - 保存 discoverable authentication challenge state
   - 本地 loopback (`localhost` / `127.0.0.1`) 运行时的注册 challenge 也必须要求 discoverable / resident credential，确保后续 username-less discoverable authentication 能稳定取回 user handle
