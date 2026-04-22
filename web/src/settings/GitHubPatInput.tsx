@@ -18,6 +18,36 @@ type GitHubPatInputProps = Omit<React.ComponentProps<typeof Input>, "type"> & {
 	toggleClassName?: string;
 };
 
+const isTokenBoundary = (character: string) => !/[A-Za-z0-9]/.test(character);
+
+const findBackwardWordBoundary = (input: string, cursor: number) => {
+	let nextCursor = cursor;
+	while (nextCursor > 0 && isTokenBoundary(input[nextCursor - 1] ?? "")) {
+		nextCursor -= 1;
+	}
+	while (nextCursor > 0 && !isTokenBoundary(input[nextCursor - 1] ?? "")) {
+		nextCursor -= 1;
+	}
+	return nextCursor;
+};
+
+const findForwardWordBoundary = (input: string, cursor: number) => {
+	let nextCursor = cursor;
+	while (
+		nextCursor < input.length &&
+		isTokenBoundary(input[nextCursor] ?? "")
+	) {
+		nextCursor += 1;
+	}
+	while (
+		nextCursor < input.length &&
+		!isTokenBoundary(input[nextCursor] ?? "")
+	) {
+		nextCursor += 1;
+	}
+	return nextCursor;
+};
+
 export function GitHubPatInput({
 	className,
 	inputClassName,
@@ -80,7 +110,7 @@ export function GitHubPatInput({
 		[],
 	);
 
-	const recordHistory = (nextValue: string) => {
+	const recordHistory = useCallback((nextValue: string) => {
 		const currentHistoryValue =
 			historyRef.current[historyIndexRef.current] ?? "";
 		if (currentHistoryValue === nextValue) {
@@ -91,30 +121,36 @@ export function GitHubPatInput({
 			nextValue,
 		];
 		historyIndexRef.current = historyRef.current.length - 1;
-	};
+	}, []);
 
-	const emitSyntheticChange = (nextValue: string) => {
-		recordHistory(nextValue);
-		if (!isControlled) {
-			setLocalValue(nextValue);
-		}
-		onChange?.({
-			target: { value: nextValue },
-			currentTarget: { value: nextValue },
-		} as React.ChangeEvent<HTMLInputElement>);
-	};
+	const emitSyntheticChange = useCallback(
+		(nextValue: string) => {
+			recordHistory(nextValue);
+			if (!isControlled) {
+				setLocalValue(nextValue);
+			}
+			onChange?.({
+				target: { value: nextValue },
+				currentTarget: { value: nextValue },
+			} as React.ChangeEvent<HTMLInputElement>);
+		},
+		[isControlled, onChange, recordHistory],
+	);
 
-	const applyHiddenMutation = (
-		nextValue: string,
-		nextSelectionStart: number,
-		nextSelectionEnd = nextSelectionStart,
-	) => {
-		if (nextValue === secretValue) {
-			return;
-		}
-		emitSyntheticChange(nextValue);
-		queueSelection(nextSelectionStart, nextSelectionEnd);
-	};
+	const applyHiddenMutation = useCallback(
+		(
+			nextValue: string,
+			nextSelectionStart: number,
+			nextSelectionEnd = nextSelectionStart,
+		) => {
+			if (nextValue === secretValue) {
+				return;
+			}
+			emitSyntheticChange(nextValue);
+			queueSelection(nextSelectionStart, nextSelectionEnd);
+		},
+		[emitSyntheticChange, queueSelection, secretValue],
+	);
 
 	const replaceSelection = (insertedText: string) => {
 		const input = inputRef.current;
@@ -183,90 +219,69 @@ export function GitHubPatInput({
 		input.setSelectionRange(nextCaret, nextCaret);
 	};
 
-	const deleteRange = (selectionStart: number, selectionEnd: number) => {
-		if (selectionStart === selectionEnd) {
-			return;
-		}
-		const nextValue =
-			secretValue.slice(0, selectionStart) + secretValue.slice(selectionEnd);
-		applyHiddenMutation(nextValue, selectionStart);
-	};
+	const deleteRange = useCallback(
+		(selectionStart: number, selectionEnd: number) => {
+			if (selectionStart === selectionEnd) {
+				return;
+			}
+			const nextValue =
+				secretValue.slice(0, selectionStart) + secretValue.slice(selectionEnd);
+			applyHiddenMutation(nextValue, selectionStart);
+		},
+		[applyHiddenMutation, secretValue],
+	);
 
-	const isTokenBoundary = (character: string) => !/[A-Za-z0-9]/.test(character);
+	const deleteWord = useCallback(
+		(direction: "backward" | "forward") => {
+			const input = inputRef.current;
+			if (!input) {
+				return;
+			}
+			const selectionStart = input.selectionStart ?? secretValue.length;
+			const selectionEnd = input.selectionEnd ?? selectionStart;
+			if (selectionStart !== selectionEnd) {
+				deleteRange(selectionStart, selectionEnd);
+				return;
+			}
+			const rangeStart =
+				direction === "backward"
+					? findBackwardWordBoundary(secretValue, selectionStart)
+					: selectionStart;
+			const rangeEnd =
+				direction === "forward"
+					? findForwardWordBoundary(secretValue, selectionStart)
+					: selectionStart;
+			if (rangeStart === rangeEnd) {
+				return;
+			}
+			deleteRange(rangeStart, rangeEnd);
+		},
+		[deleteRange, secretValue],
+	);
 
-	const findBackwardWordBoundary = (input: string, cursor: number) => {
-		let nextCursor = cursor;
-		while (nextCursor > 0 && isTokenBoundary(input[nextCursor - 1] ?? "")) {
-			nextCursor -= 1;
-		}
-		while (nextCursor > 0 && !isTokenBoundary(input[nextCursor - 1] ?? "")) {
-			nextCursor -= 1;
-		}
-		return nextCursor;
-	};
-
-	const findForwardWordBoundary = (input: string, cursor: number) => {
-		let nextCursor = cursor;
-		while (
-			nextCursor < input.length &&
-			isTokenBoundary(input[nextCursor] ?? "")
-		) {
-			nextCursor += 1;
-		}
-		while (
-			nextCursor < input.length &&
-			!isTokenBoundary(input[nextCursor] ?? "")
-		) {
-			nextCursor += 1;
-		}
-		return nextCursor;
-	};
-
-	const deleteWord = (direction: "backward" | "forward") => {
-		const input = inputRef.current;
-		if (!input) {
-			return;
-		}
-		const selectionStart = input.selectionStart ?? secretValue.length;
-		const selectionEnd = input.selectionEnd ?? selectionStart;
-		if (selectionStart !== selectionEnd) {
-			deleteRange(selectionStart, selectionEnd);
-			return;
-		}
-		const rangeStart =
-			direction === "backward"
-				? findBackwardWordBoundary(secretValue, selectionStart)
-				: selectionStart;
-		const rangeEnd =
-			direction === "forward"
-				? findForwardWordBoundary(secretValue, selectionStart)
-				: selectionStart;
-		if (rangeStart === rangeEnd) {
-			return;
-		}
-		deleteRange(rangeStart, rangeEnd);
-	};
-
-	const replayHistory = (direction: "undo" | "redo") => {
-		const currentIndex = historyIndexRef.current;
-		const nextIndex =
-			direction === "undo"
-				? Math.max(0, currentIndex - 1)
-				: Math.min(historyRef.current.length - 1, currentIndex + 1);
-		if (nextIndex === currentIndex) {
-			return;
-		}
-		historyIndexRef.current = nextIndex;
-		const nextValue = historyRef.current[nextIndex] ?? "";
-		if (!isControlled) {
-			setLocalValue(nextValue);
-		}
-		onChange?.({
-			target: { value: nextValue },
-			currentTarget: { value: nextValue },
-		} as React.ChangeEvent<HTMLInputElement>);
-		queueSelection(nextValue.length);
-	};
+	const replayHistory = useCallback(
+		(direction: "undo" | "redo") => {
+			const currentIndex = historyIndexRef.current;
+			const nextIndex =
+				direction === "undo"
+					? Math.max(0, currentIndex - 1)
+					: Math.min(historyRef.current.length - 1, currentIndex + 1);
+			if (nextIndex === currentIndex) {
+				return;
+			}
+			historyIndexRef.current = nextIndex;
+			const nextValue = historyRef.current[nextIndex] ?? "";
+			if (!isControlled) {
+				setLocalValue(nextValue);
+			}
+			onChange?.({
+				target: { value: nextValue },
+				currentTarget: { value: nextValue },
+			} as React.ChangeEvent<HTMLInputElement>);
+			queueSelection(nextValue.length);
+		},
+		[isControlled, onChange, queueSelection],
+	);
 
 	useEffect(() => {
 		const input = inputRef.current;
@@ -300,12 +315,18 @@ export function GitHubPatInput({
 			if (isVisible || props.readOnly || props.disabled) {
 				return;
 			}
-			const shouldHandle =
-				event.inputType === "historyUndo"
-					? replayNativeHistory("undo")
-					: event.inputType === "historyRedo"
-						? replayNativeHistory("redo")
-						: false;
+			let shouldHandle = false;
+			if (event.inputType === "historyUndo") {
+				shouldHandle = replayNativeHistory("undo");
+			} else if (event.inputType === "historyRedo") {
+				shouldHandle = replayNativeHistory("redo");
+			} else if (event.inputType === "deleteWordBackward") {
+				deleteWord("backward");
+				shouldHandle = true;
+			} else if (event.inputType === "deleteWordForward") {
+				deleteWord("forward");
+				shouldHandle = true;
+			}
 			if (shouldHandle) {
 				if (
 					event.inputType === "historyUndo" ||
@@ -338,9 +359,59 @@ export function GitHubPatInput({
 			}
 		};
 
+		const handleNativeKeyDown = (event: KeyboardEvent) => {
+			if (isVisible || props.readOnly || props.disabled) {
+				return;
+			}
+			const isWordBackwardShortcut =
+				event.key === "Backspace" &&
+				(event.altKey || event.ctrlKey) &&
+				!event.metaKey;
+			if (isWordBackwardShortcut) {
+				event.preventDefault();
+				event.stopPropagation();
+				deleteWord("backward");
+				return;
+			}
+			const isWordForwardShortcut =
+				event.key === "Delete" &&
+				(event.altKey || event.ctrlKey) &&
+				!event.metaKey;
+			if (isWordForwardShortcut) {
+				event.preventDefault();
+				event.stopPropagation();
+				deleteWord("forward");
+				return;
+			}
+			const wantsUndo =
+				event.key.toLowerCase() === "z" &&
+				((event.metaKey && !event.ctrlKey) ||
+					(event.ctrlKey && !event.metaKey)) &&
+				!event.shiftKey;
+			if (wantsUndo) {
+				event.preventDefault();
+				event.stopPropagation();
+				replayHistory("undo");
+				return;
+			}
+			const wantsRedo =
+				(event.key.toLowerCase() === "z" &&
+					((event.metaKey && !event.ctrlKey) ||
+						(event.ctrlKey && !event.metaKey)) &&
+					event.shiftKey) ||
+				(event.key.toLowerCase() === "y" && event.ctrlKey && !event.metaKey);
+			if (wantsRedo) {
+				event.preventDefault();
+				event.stopPropagation();
+				replayHistory("redo");
+			}
+		};
+
+		input.addEventListener("keydown", handleNativeKeyDown);
 		input.addEventListener("beforeinput", handleBeforeInput);
 		input.addEventListener("input", handleInput);
 		return () => {
+			input.removeEventListener("keydown", handleNativeKeyDown);
 			input.removeEventListener("beforeinput", handleBeforeInput);
 			input.removeEventListener("input", handleInput);
 		};
@@ -351,6 +422,8 @@ export function GitHubPatInput({
 		props.disabled,
 		props.readOnly,
 		queueSelection,
+		deleteWord,
+		replayHistory,
 	]);
 
 	const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
