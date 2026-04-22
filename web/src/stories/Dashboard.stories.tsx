@@ -3119,17 +3119,32 @@ export const PatDialogOpen: Story = {
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		const input = canvas.getByLabelText("GitHub PAT", { selector: "input" });
+		const input = canvasElement.querySelector(
+			"#dashboard-reaction-pat",
+		) as HTMLInputElement | null;
+		if (!input) {
+			throw new Error("expected dashboard GitHub PAT input");
+		}
 		await expect(input).toHaveAttribute("type", "password");
 		await expect(input).toHaveAttribute("autocomplete", "new-password");
+		await expect(input).toHaveAttribute(
+			"aria-describedby",
+			"dashboard-reaction-pat-hidden-hint",
+		);
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
+		await expect(input).toHaveAttribute(
+			"data-secret-mask-mode",
+			"native-password",
+		);
 		await userEvent.click(
 			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "true");
+		await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
+		await expect(input).not.toHaveAttribute("aria-describedby");
 	},
 };
 
