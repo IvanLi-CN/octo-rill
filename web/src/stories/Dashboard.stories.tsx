@@ -104,11 +104,35 @@ const DASHBOARD_VIEWPORTS = {
 		},
 		type: "mobile",
 	},
+	dashboardNarrowTablet640: {
+		name: "Dashboard narrow tablet 640x960",
+		styles: {
+			height: "960px",
+			width: "640px",
+		},
+		type: "tablet",
+	},
+	dashboardNarrowTablet757: {
+		name: "Dashboard narrow tablet 757x827",
+		styles: {
+			height: "827px",
+			width: "757px",
+		},
+		type: "tablet",
+	},
 	dashboardTablet853: {
 		name: "Dashboard tablet 853x1280",
 		styles: {
 			height: "1280px",
 			width: "853px",
+		},
+		type: "tablet",
+	},
+	dashboardTablet1023: {
+		name: "Dashboard tablet 1023x1280",
+		styles: {
+			height: "1280px",
+			width: "1023px",
 		},
 		type: "tablet",
 	},
@@ -1650,7 +1674,7 @@ function DashboardPreview(props: {
 		initialReleaseId,
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
-	const hasTabletSidebar = useMediaQuery("(min-width: 768px)");
+	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
@@ -2153,6 +2177,75 @@ export const EvidenceTabletHeaderInline: Story = {
 			description: {
 				story:
 					"平板 853x1280 证据入口：Dashboard 页头主行保持品牌 / utility actions 同排，tabs 与次级控制区继续作为后续控制带落在下一行，同时 feed 页不再额外显示 Inbox 快捷侧栏列。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet640: Story = {
+	name: "Regression / Narrow Tablet 640",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardNarrowTablet640",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"640x960 回归入口：窄平板起点必须保持页头主行同排，且页面仍为单主列，不渲染 Inbox 侧栏。",
+			},
+		},
+	},
+};
+
+export const RegressionNarrowTablet757: Story = {
+	name: "Regression / Narrow Tablet 757",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardNarrowTablet757",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"757x827 主回归入口：对应主人实图宽度，Dashboard 页头与 control band 不得错位，Inbox 侧栏必须保持隐藏。",
+			},
+		},
+	},
+};
+
+export const RegressionTablet1023: Story = {
+	name: "Regression / Tablet 1023",
+	args: {
+		initialTab: "all",
+		showFooter: false,
+	},
+	globals: {
+		viewport: {
+			value: "dashboardTablet1023",
+			isRotated: false,
+		},
+	},
+	play: EvidenceTabletHeaderInline.play,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"1023x1280 上边界入口：进入桌面语义前，Dashboard 仍需保持单主列与平板页头合同。",
 			},
 		},
 	},
