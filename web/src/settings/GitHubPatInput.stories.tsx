@@ -24,7 +24,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"GitHub PAT 专用输入组件：默认保持非 password 语义的文本输入，在隐藏态使用原生文本编辑配合视觉掩码，避免被当成站点登录密码框自动填充；隐藏态还会补一层受保护文本代理，避免辅助功能树直接读出真实 token。只有显式点亮后才切到明文。",
+					"GitHub PAT 专用输入组件：默认保持非 password 语义的文本输入，在隐藏态使用原生文本编辑配合视觉掩码，避免被当成站点登录密码框自动填充；隐藏态仍保持屏幕阅读器可操作，并通过额外提示说明当前是掩码编辑态。只有显式点亮后才切到明文。",
 			},
 		},
 	},
@@ -63,18 +63,23 @@ export const MaskedByDefault: Story = {
 		if (!input) {
 			throw new Error("expected storybook GitHub PAT input");
 		}
-		const hiddenProxy = canvas.getByLabelText("GitHub PAT", {
-			selector: 'input[data-secret-a11y-proxy="true"]',
-		});
+		const hiddenHint = canvas.getByText(
+			"当前内容已隐藏，仍可直接编辑。使用“显示 GitHub PAT”按钮可临时查看明文。",
+		);
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("autocomplete", "off");
-		await expect(input).toHaveAttribute("aria-hidden", "true");
+		await expect(input).toHaveAttribute(
+			"aria-describedby",
+			"storybook-github-pat-hidden-hint",
+		);
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
 		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
-		await expect(hiddenProxy).toHaveAttribute("type", "password");
-		await expect(hiddenProxy).toBeDisabled();
+		await expect(hiddenHint).toHaveAttribute(
+			"id",
+			"storybook-github-pat-hidden-hint",
+		);
 
 		await userEvent.click(
 			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
@@ -82,7 +87,7 @@ export const MaskedByDefault: Story = {
 		await expect(input).toHaveAttribute("type", "text");
 		await expect(input).toHaveAttribute("data-secret-visible", "true");
 		await expect(input).toHaveAttribute("data-secret-mask-mode", "plain-text");
-		await expect(input).not.toHaveAttribute("aria-hidden");
+		await expect(input).not.toHaveAttribute("aria-describedby");
 
 		await userEvent.click(
 			canvas.getByRole("button", { name: "隐藏 GitHub PAT" }),

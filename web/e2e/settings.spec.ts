@@ -374,7 +374,7 @@ test("settings github pat hidden mode preserves undo history after visible edits
 	await expect(input).toHaveValue("");
 });
 
-test("settings github pat hidden mode keeps protected text semantics in accessibility tree", async ({
+test("settings github pat hidden mode stays editable in accessibility tree", async ({
 	page,
 }) => {
 	await installSettingsMocks(page);
@@ -390,16 +390,10 @@ test("settings github pat hidden mode keeps protected text semantics in accessib
 		page,
 		"#settings-reaction-pat",
 	);
-	const proxyAccessibilityTree = await getPartialAccessibilityTreeSnapshot(
-		page,
-		'[data-secret-a11y-proxy="true"]',
-	);
 
-	expect(inputAccessibilityTree).not.toContain("ghp_secret_demo");
-	expect(inputAccessibilityTree).toContain("ariaHiddenElement");
-	expect(proxyAccessibilityTree).toContain("GitHub PAT");
-	expect(proxyAccessibilityTree).toContain("••••");
-	expect(proxyAccessibilityTree).not.toContain("ghp_secret_demo");
+	expect(inputAccessibilityTree).toContain("GitHub PAT");
+	expect(inputAccessibilityTree).toContain("当前内容已隐藏");
+	expect(inputAccessibilityTree).not.toContain("ariaHiddenElement");
 });
 
 test("settings github pat hidden mode keeps word deletion shortcuts", async ({

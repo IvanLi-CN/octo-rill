@@ -36,6 +36,7 @@ export function GitHubPatInput({
 	);
 	const generatedId = useId();
 	const inputId = id ?? `github-pat-${generatedId}`;
+	const hiddenHintId = `${inputId}-hidden-hint`;
 	const inputRef = useRef<HTMLInputElement | null>(null);
 	const toggleLabel = isVisible ? "隐藏 GitHub PAT" : "显示 GitHub PAT";
 	const isControlled = value !== undefined;
@@ -225,16 +226,10 @@ export function GitHubPatInput({
 			data-secret-mask-mode={isVisible ? "plain-text" : "visual-mask"}
 		>
 			{!isVisible ? (
-				<input
-					tabIndex={-1}
-					disabled
-					readOnly
-					aria-label={assistiveLabel}
-					className="sr-only"
-					data-secret-a11y-proxy="true"
-					type="password"
-					value={secretValue}
-				/>
+				<span className="sr-only" id={hiddenHintId}>
+					当前内容已隐藏，仍可直接编辑。使用“显示 GitHub
+					PAT”按钮可临时查看明文。
+				</span>
 			) : null}
 			<Input
 				{...props}
@@ -244,8 +239,8 @@ export function GitHubPatInput({
 				type="text"
 				value={secretValue}
 				autoComplete={autoComplete ?? "off"}
-				aria-hidden={isVisible ? undefined : "true"}
-				aria-label={isVisible ? ariaLabel : undefined}
+				aria-describedby={isVisible ? undefined : hiddenHintId}
+				aria-label={assistiveLabel}
 				data-secret-visible={secretState}
 				data-secret-input="github-pat"
 				data-secret-mask-mode={isVisible ? "plain-text" : "visual-mask"}
