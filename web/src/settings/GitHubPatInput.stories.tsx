@@ -24,7 +24,7 @@ const meta = {
 		docs: {
 			description: {
 				component:
-					"GitHub PAT 专用输入组件：默认保持非 password 语义的文本输入，在隐藏态使用原生文本编辑配合视觉掩码，避免被当成站点登录密码框自动填充；隐藏态仍保持屏幕阅读器可操作，并通过额外提示说明当前是掩码编辑态。只有显式点亮后才切到明文。",
+					'GitHub PAT 专用输入组件：隐藏态保持原生 secure text field 语义，确保辅助技术只能读取掩码值；同时用 `autocomplete="off"` 与密码管理器忽略提示抑制站点登录密码自动填充。只有显式点亮后才切到明文。',
 			},
 		},
 	},
@@ -66,7 +66,7 @@ export const MaskedByDefault: Story = {
 		const hiddenHint = canvas.getByText(
 			"当前内容已隐藏，仍可直接编辑。使用“显示 GitHub PAT”按钮可临时查看明文。",
 		);
-		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("type", "password");
 		await expect(input).toHaveAttribute("autocomplete", "off");
 		await expect(input).toHaveAttribute(
 			"aria-describedby",
@@ -75,7 +75,10 @@ export const MaskedByDefault: Story = {
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
-		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
+		await expect(input).toHaveAttribute(
+			"data-secret-mask-mode",
+			"native-password",
+		);
 		await expect(hiddenHint).toHaveAttribute(
 			"id",
 			"storybook-github-pat-hidden-hint",
@@ -91,9 +94,12 @@ export const MaskedByDefault: Story = {
 		await expect(input).not.toHaveAttribute("aria-describedby");
 
 		await userEvent.click(hideButton);
-		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("type", "password");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
-		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
+		await expect(input).toHaveAttribute(
+			"data-secret-mask-mode",
+			"native-password",
+		);
 		await expect(hideButton).toHaveFocus();
 	},
 };
@@ -106,7 +112,8 @@ export const Editable: Story = {
 	parameters: {
 		docs: {
 			description: {
-				story: "可编辑态默认使用掩码字符隐藏；用户显式点亮后才切到明文。",
+				story:
+					"可编辑态默认使用原生 password 掩码隐藏；用户显式点亮后才切到明文。",
 			},
 		},
 	},

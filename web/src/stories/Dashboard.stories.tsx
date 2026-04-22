@@ -3125,7 +3125,7 @@ export const PatDialogOpen: Story = {
 		if (!input) {
 			throw new Error("expected dashboard GitHub PAT input");
 		}
-		await expect(input).toHaveAttribute("type", "text");
+		await expect(input).toHaveAttribute("type", "password");
 		await expect(input).toHaveAttribute("autocomplete", "off");
 		await expect(input).toHaveAttribute(
 			"aria-describedby",
@@ -3134,7 +3134,10 @@ export const PatDialogOpen: Story = {
 		await expect(input).toHaveAttribute("data-1p-ignore", "true");
 		await expect(input).toHaveAttribute("data-form-type", "other");
 		await expect(input).toHaveAttribute("data-secret-visible", "false");
-		await expect(input).toHaveAttribute("data-secret-mask-mode", "visual-mask");
+		await expect(input).toHaveAttribute(
+			"data-secret-mask-mode",
+			"native-password",
+		);
 		await userEvent.click(
 			canvas.getByRole("button", { name: "显示 GitHub PAT" }),
 		);
