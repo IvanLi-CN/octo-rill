@@ -215,6 +215,7 @@ export function Landing({
 									disabled={!passkeySupported || passkeyBusyMode !== null}
 									data-landing-passkey-login-cta
 								>
+									<AuthProviderIcon provider="passkey" />
 									{passkeyBusyMode === "authenticate"
 										? "正在验证 Passkey…"
 										: "使用 Passkey 登录"}

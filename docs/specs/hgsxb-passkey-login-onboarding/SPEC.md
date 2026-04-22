@@ -82,7 +82,7 @@
 ### Route / search
 
 - Landing 增加两类 Passkey CTA：
-  - `使用 Passkey 登录`
+  - `使用 Passkey 登录`（左侧带 Passkey 图标，和其他登录入口保持一致）
   - `首次使用？创建 Passkey 并继续绑定 GitHub`
 - `/settings` 支持 `section=passkeys` 与 `passkey=<status>`
 - `/bind/github` 支持 `passkey=<status>` 并展示 pending Passkey 卡片

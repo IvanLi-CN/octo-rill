@@ -81,6 +81,9 @@ test("landing page shows concise login copy for unauthenticated users", async ({
 	await expect(
 		linuxDoButton.locator('[data-auth-provider-icon="linuxdo"]'),
 	).toBeVisible();
+	await expect(
+		passkeyLoginButton.locator('[data-auth-provider-icon="passkey"]'),
+	).toBeVisible();
 	await expect(loginButton).toHaveAttribute("href", "/auth/github/login");
 	await expect(linuxDoButton).toHaveAttribute("href", "/auth/linuxdo/login");
 	await expect(
