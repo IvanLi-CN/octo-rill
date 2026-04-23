@@ -1,6 +1,6 @@
 # 规格（Spec）总览
 
-本目录维护 OctoRill 的 topic-level spec catalog。
+本目录维护 OctoRill 的 topic-level spec catalog。若你要找的是项目入口、系统概览或内部维护文档，请先回到 [`../README.md`](../README.md)。
 
 - `SPEC.md`：长期有效的主题规范、契约、范围与验收口径。
 - `IMPLEMENTATION.md`：当前实现覆盖、验证结果、交付状态与剩余缺口。
