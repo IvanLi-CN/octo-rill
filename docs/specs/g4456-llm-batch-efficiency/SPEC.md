@@ -1,13 +1,5 @@
 # LLM 批处理效率改造（#g4456）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-02-25
-- Last: 2026-03-30
-
-> 注：本规格里关于运行时模型输入上限的环境变量口径已由 `#y2yf8` 接管；当前系统改为优先读取管理员后台持久化设置，`AI_MODEL_CONTEXT_LIMIT` 只保留为历史实现背景。
-
 ## 背景 / 问题陈述
 
 - 现状：Feed 自动翻译和部分后端流程主要按“单条输入 -> 单次 LLM 请求”执行，调用次数高。
@@ -174,28 +166,6 @@
 - `cd web && bun run storybook:build`
 - `cd web && bun run e2e -- release-detail.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `README.md`: 增加 `AI_MODEL_CONTEXT_LIMIT` 与模型目录行为说明。
-- `docs/product.md`: 补充 visible-window 自动翻译策略与结果聚合接口语义。
-- `.env.example`: 增加 `AI_MODEL_CONTEXT_LIMIT`。
-
-## 计划资产（Plan assets）
-
-- Directory: None
-- In-plan references: None
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 建立 specs-first 文档基线与接口契约。
-- [x] M2: 后端模型上限解析器 + 固定信源同步机制。
-- [x] M3: 后端 batch API 与单条委托改造（release/release detail/notification/brief）。
-- [x] M4: 前端自动翻译切换到 visible-window 结果聚合接口 + Storybook / E2E 回归验证。
-
 ## 方案概述（Approach, high-level）
 
 - 在 `ai.rs` 建立统一 token 预算与批量装箱能力，作为 LLM 路径共享底座。
@@ -212,12 +182,6 @@ None
 
 - 本任务不提交静态截图资产。
 - 可通过 Storybook `Pages/Dashboard/VisibleWindowQueue` 与 `Pages/Dashboard/VisibleWindowSettling` 复现可见窗口自动翻译状态。
-
-## 变更记录（Change log）
-
-- 2026-02-25: 创建规格并冻结“固定信源 + 固定同步 + 固定兜底 + 单环境变量”约束。
-- 2026-02-25: 完成后端批处理核心与前端自动翻译批调接入；前端构建受缺失依赖阻塞，待补依赖后复验。
-- 2026-03-30: 完成 release feed visible-window 结果聚合接口、request/work item 双层去重、Storybook 场景与 Playwright 回归验证。
 
 ## 参考（References）
 

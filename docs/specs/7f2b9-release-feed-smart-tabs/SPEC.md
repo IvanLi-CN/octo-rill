@@ -1,11 +1,5 @@
 # Release Feed 三 Tabs 与润色版本变化卡片（#7f2b9）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-07
-- Last: 2026-04-08
-
 ## 背景 / 问题陈述
 
 当前 Dashboard release feed 只有“原文 / 翻译”二选一，且中文内容本质上仍是直译，无法帮助用户快速理解“这个版本到底改了什么”。
@@ -228,18 +222,6 @@
 - E2E：扩展 `web/e2e/release-detail.spec.ts` 覆盖三 tabs 与 insufficient 卡片。
 - UI-affecting 变更必须补 Storybook 稳定场景，并提供视觉证据。
 - 本地开发运行时不得因为单进程内多个 SQLite pool 连接相互争抢写锁而频繁出现 `database is locked`；对桌面预览场景，SQLite 访问应串行化，保证 smart 生成与后台 worker 同时开启时页面仍可稳定打开。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: Spec 与 API/数据契约冻结。
-- [x] M2: 后端 `release_smart` 调度、prompt、diff fallback 与 `/api/feed` smart lane 完成。
-- [x] M3: 前端三 tabs、呼吸态、折叠卡片与 on-demand 生成完成。
-- [ ] M4: Storybook / Playwright / visual evidence / PR merge-ready 收敛完成。
-
-## Change log
-
-- 2026-04-08：补齐页面级默认 lane selector、单卡 icon-only selector，以及翻译 / 润色加载时继续显示原文的交互口径与视觉证据。
-- 2026-04-08：补齐页面级切换复用单卡按需生成逻辑，并收紧 segmented selector 的选中 / 加载态层级。
 
 ## Visual Evidence
 

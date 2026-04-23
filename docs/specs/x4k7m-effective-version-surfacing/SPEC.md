@@ -1,11 +1,5 @@
 # 发布有效版本显示修复（#x4k7m）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-03
-- Last: 2026-04-15
-
 ## 背景 / 问题陈述
 
 当前 UI footer 的版本号来自 `/api/health`，后端直接回传 `CARGO_PKG_VERSION`。发布流水线虽然计算了 `APP_EFFECTIVE_VERSION` 并传入 Docker build-arg，但 Rust 构建过程未消费该变量，导致线上部署新版本后仍显示 `v0.1.0`。
@@ -104,18 +98,3 @@
 - Given `/api/version` 与 `/api/health` 都失败
   When 前端 footer 拉取版本
   Then 显示 `Version unknown`。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 后端版本解析模块与 `/api/version` 完成。
-- [x] M2: 前端 footer 双端点回退逻辑完成。
-- [x] M3: Docker/release 注入链路校验与自动化测试完成。
-- [x] M4: 前端 `vite.config.ts` fallback 容错与 CI Docker smoke 完成。
-
-## 变更记录（Change log）
-
-- 2026-03-03: 建立规格并冻结修复范围与接口决策。
-- 2026-03-03: 完成后端 `APP_EFFECTIVE_VERSION` 优先解析、`/api/version` 接口、footer 回退逻辑与 Docker/Release 注入闭环校验。
-- 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
-- 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，Docker 全仓库构建仍保留 Cargo fallback，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
-- 2026-04-15: 补齐历史 release backfill：当补跑旧 `release_head_sha` 时，`docker-release` 叠加当前 workflow revision 的 Docker/web 构建基础设施修复，避免旧源码再次触发已修复的 `Cargo.toml` 构建断链。

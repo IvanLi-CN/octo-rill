@@ -1,11 +1,5 @@
 # Release 视图仓库图标补齐（#crzva）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-10
-
 ## 背景 / 问题陈述
 
 当前 Dashboard 的 Release Feed 卡片和 Release 详情侧栏只显示仓库全名文本，没有 GitHub 仓库在社交卡片或 owner 头像层面的视觉识别信息。对大量 release 连续阅读时，用户只能靠文本辨认来源仓库，缺少足够稳定的视觉锚点。
@@ -125,11 +119,6 @@ Feed release item 与 Release detail response 都新增：
 - Dashboard Storybook 必须提供可稳定截图的 release repo visual gallery/state。
 - 视觉证据必须绑定本轮实现的最新本地 `HEAD`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- 本 spec 的 `## Visual Evidence`
-
 ## Visual Evidence
 
 - Storybook canvas：`pages-dashboard--release-repo-visuals`
@@ -141,12 +130,6 @@ Feed release item 与 Release detail response 都新增：
   - 验证从 brief 打开的 Release 详情沿用同一 repo identity 样式，在有 metadata 时显示 owner avatar fallback，且标题区 repo 名保持垂直居中。
 
 ![Release detail owner avatar fallback](./assets/release-detail-avatar.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: starred repo sync 与 schema 完成 repo visual metadata 落库。
-- [x] M2: Feed / Release detail API 与前端统一 repo visual 渲染完成。
-- [x] M3: Storybook、测试与视觉证据刷新完成。
 
 ## 风险 / 假设
 

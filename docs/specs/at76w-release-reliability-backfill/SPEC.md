@@ -1,11 +1,5 @@
 # 修复 Release 自动发版断链并补齐漏发版本（#at76w）
 
-## 状态
-
-- Status: 待实现
-- Created: 2026-04-11
-- Last: 2026-04-11
-
 ## 背景
 
 - 当前 `/Users/ivan/.codex/worktrees/607d/octo-rill/.github/workflows/release.yml` 依赖 `workflow_run(CI Pipeline completed)`，只有 `push@main` 的 CI 结论为 `success` 才继续发版。
@@ -77,10 +71,3 @@
 - Given 当前漏发项仅为 PR #63 与 PR #62
   When 修复 PR 合并后触发 backfill
   Then 稳定版发布顺序保持为 `v2.11.0` 后 `v2.12.0`，且对应 tag / GitHub Release / PR release comment / Docker image 全部齐全。
-
-## 实现里程碑
-
-- [ ] M1: 新建 release reliability spec，并冻结补发顺序与修复 PR label 约束。
-- [ ] M2: Release workflow 改为 `push@main` + `workflow_dispatch`，并加入 audit/backfill 规划与串行补发。
-- [ ] M3: `release-intent.sh` / `compute-version.sh` / 新 audit helper 完成幂等与 backfill 支撑。
-- [ ] M4: CI 自测覆盖 release automation contract，并通过真实 merge + backfill 验证。

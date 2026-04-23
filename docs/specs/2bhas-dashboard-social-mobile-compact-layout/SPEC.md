@@ -1,11 +1,5 @@
 # Dashboard 社交卡片移动端横向紧凑重设计（#2bhas）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-16
-- Last: 2026-04-18
-
 ## 背景 / 问题陈述
 
 `#vgqp9` 已经把 Dashboard 的社交活动流（被加星 / 被关注）接进主时间线，但当前 `SocialActivityCard` 只在 `md` 以上启用 actor / action / target 三段布局，导致 `<md` 移动端退化成纵向三层堆叠：上方 actor、中间动作、下方 target。
@@ -134,11 +128,6 @@
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 - 在 push 或 PR 复用该图前，必须先在聊天中回图并取得主人确认。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/2bhas-dashboard-social-mobile-compact-layout/SPEC.md`
-
 ## 参考
 
 - `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
@@ -154,12 +143,6 @@
   evidence_note: 验证在 390px 移动端宽度下，右长、左长、双长与短 follower 连续列表都以真实实体组为贴边基准；右侧实体组的 trailing whitespace 已收敛。
 
 ![Mobile social compact storybook evidence](./assets/mobile-social-compact-storybook.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结移动端 follow-up spec、范围与不回归语义。
-- [x] M2: 落地 `SocialActivityCard` mobile-first 横向紧凑编排与内部验证钩子。
-- [x] M3: 补齐 Storybook、几何断言、build / e2e 验证与视觉证据。
 
 ## 风险 / 假设
 

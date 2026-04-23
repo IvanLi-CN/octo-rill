@@ -1,11 +1,5 @@
 # Release 成功后回写 PR 版本评论（#qvewp）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-04
-- Last: 2026-04-04
-
 ## 背景
 
 - 当前 release 流水线会解析 PR、计算 `APP_EFFECTIVE_VERSION` / `APP_RELEASE_TAG`、创建 Git tag、创建 GitHub Release、推送 Docker 镜像。
@@ -73,9 +67,3 @@
 - Given `should_release=false` 或 `pr_number` 为空
   When helper 执行
   Then 不发起评论写入请求，并返回 `skip`。
-
-## 实现里程碑
-
-- [x] M1: 新增 release PR 评论 helper，完成受控评论 upsert 行为。
-- [x] M2: release workflow 接线完成，并将新测试纳入 CI。
-- [x] M3: 真实 release run 回归确认 PR 评论幂等更新。

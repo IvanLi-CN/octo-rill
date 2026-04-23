@@ -1,11 +1,5 @@
 # 仓库级 Worktree Bootstrap（#gvxnw）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-06
-- Last: 2026-03-07
-
 ## 背景 / 问题陈述
 
 - Codex App 会频繁创建新的 linked worktree，但仓库当前不会自动补齐 `.env.local` 等本地开发资源。
@@ -153,17 +147,6 @@
 - Root tooling install: `bun install`
 - Existing repo checks remain green: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --locked --all-features`
 
-## 文档更新（Docs to Update）
-
-- `README.md`: 新增 repo-local hook 安装与 `.env.local` worktree bootstrap 说明。
-- `docs/specs/README.md`: 新增并同步该规格状态。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 增加 repo-local hook 安装入口与 `post-checkout` wiring。
-- [x] M2: 落地 worktree 同步脚本与资源清单。
-- [x] M3: 增加 smoke test 与 CI matrix 校验，并同步文档与规格状态。
-
 ## 方案概述（Approach, high-level）
 
 - 使用 Git `post-checkout` 作为唯一自动触发点，让 Codex 新工作树与手工 worktree 共享同一实现。
@@ -178,16 +161,3 @@
 - 风险：若开发者原本依赖 repo-local 自定义 `core.hooksPath` 承载其他 hook 管理逻辑，当前方案通过共享目录链式保留旧 hook；若旧 hook 本身依赖固定相对路径，仍需开发者自行确认。
 - 开放问题：无。
 - 假设：团队接受把 `.env.local` 作为推荐的 per-developer secrets 文件。
-
-## 变更记录（Change log）
-
-- 2026-03-06：创建规格，冻结仓库级 worktree bootstrap 方案与验收口径。
-- 2026-03-06：完成 repo-local hook 安装入口、worktree bootstrap 脚本、smoke test 与 CI matrix 校验。
-- 2026-03-06：补充共享 hooks 的 `LEFTHOOK_BIN` 固定逻辑，避免全局 Lefthook 抢占。
-- 2026-03-06：补充共享 Git 配置里的主工作区根目录记录，并增加 `--separate-git-dir` smoke 覆盖。
-- 2026-03-07：补充共享 `post-checkout` hook 的历史 revision 安全跳过逻辑，并收紧 README 对 linked worktree `bun install` 行为的表述。
-- 2026-03-07：补充共享 hook 对失效 `LEFTHOOK_BIN` 的自动回退，并在 README 中显式标注 `macOS/Linux` 支持边界。
-- 2026-03-07：补充对 repo-local `core.hooksPath` 的共享目录收敛，避免自定义 hooksPath 阻断安装或让 hooks 漏到单个 worktree。
-- 2026-03-07：补充 linked worktree 本地 `lefthook.yml` 新增 hook 类型时的共享 wrapper 更新，并优先固定到当前 worktree 的 `lefthook`、回退到主工作区二进制。
-- 2026-03-07：补充 `LEFTHOOK_BIN` 的 shell-safe 写入与带 `$` 路径 smoke 覆盖，避免 hook 运行时意外展开。
-- 2026-03-07：补充对既有 hook 链的链式保留（含默认 `.git/hooks` 的 `*.old` 备份），避免 `core.hooksPath` 收敛后静默停掉旧 hook。

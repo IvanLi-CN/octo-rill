@@ -167,14 +167,6 @@
 - `cd web && bun run storybook:build`
 - `cd web && bun run e2e -- landing-login.spec.ts bind-github.spec.ts settings.spec.ts passkey-login.spec.ts`
 
-## 文档更新
-
-- `docs/specs/README.md`
-- `docs/product.md`
-- `docs-site/docs/product.md`
-- `docs-site/docs/config.md`
-- `docs-site/docs/quick-start.md`
-
 ## Visual Evidence
 
 Landing Passkey 入口（storybook: `Pages/AppLanding / Default`）

@@ -1,11 +1,5 @@
 # Dashboard 启动骨架页头与 Tabs 占位收敛（#6x959）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-16
-- Last: 2026-04-16
-
 ## 背景 / 问题陈述
 
 - 当前 `DashboardStartupSkeleton` 的首屏头部仍停留在“wordmark + login pill + 三枚带文案 tabs”的旧轮廓，和真实 Dashboard 壳层差异过大。
@@ -122,17 +116,6 @@
 - Storybook: `cd web && bun run storybook:build`
 - E2E: `cd web && bun run e2e -- app-auth-boot.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本 spec，并在实现完成后同步状态与交付说明。
-- `docs/specs/6x959-dashboard-startup-skeleton-header-tabs-alignment/SPEC.md`: 回填最终实现结论与视觉证据。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/6x959-dashboard-startup-skeleton-header-tabs-alignment/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec
-
 ## Visual Evidence
 
 - 证据绑定：本地 `HEAD`（2026-04-16）
@@ -143,12 +126,6 @@
 ![Dashboard warm skeleton 移动端单行 shell 已对齐](./assets/dashboard-warm-skeleton-mobile-shell.png)
 
 - 证明点：桌面左侧品牌区已回到 mascot + `OctoRill` + 固定副标题文案层级，login pill 已移除；移动端已切回单行 shell，副标题隐藏，右侧改为 compact actions；顶部 tabs / controls 只保留中性占位块，不再显示具体 tabs 文案。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: `DashboardStartupSkeleton` 页头收敛到真实 Dashboard 壳层轮廓，并移除 login pill。
-- [x] M2: tabs / control band 改成中性占位，不再显示具体导航文案。
-- [x] M3: Storybook 桌面/移动端审阅断言、视觉证据与前端校验完成。
 
 ## 方案概述（Approach, high-level）
 
@@ -161,11 +138,6 @@
 - 风险：如果后续又往 warm skeleton 顶部塞入真实文案或身份信息，仍可能再次偏离真实 Dashboard 壳层。
 - 需要决策的问题：None。
 - 假设（需主人确认）：真实 Dashboard header 的桌面轮廓在本轮内保持稳定，不需要同步改动稳态组件。
-
-## 变更记录（Change log）
-
-- 2026-04-16: 新建 follow-up spec，冻结“warm skeleton 页头与 tabs 占位收敛”的验收口径。
-- 2026-04-16: 实现完成；Dashboard warm skeleton 已收敛到真实壳层轮廓，Storybook 断言与视觉证据同步刷新。
 
 ## 参考（References）
 

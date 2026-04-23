@@ -1,11 +1,5 @@
 # 管理员任务中心 Tab 路由化（#g8p8z）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-27
-- Last: 2026-03-27
-
 ## 背景 / 问题陈述
 
 当前 `/admin/jobs` 已经把任务详情抽屉路由化为 `/admin/jobs/tasks/:taskId` 与 `/admin/jobs/tasks/:taskId/llm/:callId`，但页面内两层核心切换仍停留在组件局部 state：
@@ -90,10 +84,3 @@
 
 - 验证来源：本地 Storybook route-state 与真实后台预览页。
 - 仓库内不保留截图资产；本次交付以构建、e2e 与人工走查结果为准。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 admin jobs route contract，并在前端引入统一解析/序列化 helper。
-- [x] M2: 一级 tabs 与翻译二级 tabs 切换改为 URL 驱动，支持深链与 popstate。
-- [x] M3: 任务详情抽屉补齐 `from` 上下文恢复。
-- [x] M4: Storybook、Playwright、视觉证据与本地验证收口。
