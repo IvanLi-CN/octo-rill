@@ -13700,7 +13700,7 @@ mod tests {
             FROM users
             WHERE last_active_at IS NOT NULL
               AND julianday(last_active_at) >= julianday(?)
-              AND julianday(last_active_at) < julianday(?)
+              AND julianday(last_active_at) <= julianday(?)
             "#,
         )
         .bind(today_window_start.with_timezone(&chrono::Utc).to_rfc3339())
