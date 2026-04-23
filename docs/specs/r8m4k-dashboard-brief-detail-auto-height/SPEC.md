@@ -1,11 +1,5 @@
 # Dashboard 日报阅读流与详情弹窗修正（#r8m4k）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-03
-- Last: 2026-04-03
-
 ## 背景 / 问题陈述
 
 - Dashboard `日报` tab 中，`Release 日报` 卡片原本把 Markdown 正文包在固定高度容器里，长内容会在卡片内部出现纵向滚动条。
@@ -113,26 +107,11 @@
 - 使用 Storybook 长内容场景生成至少一张视觉证据。
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/r8m4k-dashboard-brief-detail-auto-height/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/r8m4k-dashboard-brief-detail-auto-height/assets/`
-
 ## Visual Evidence
 
 ![Brief card grows with long content](./assets/briefs-long-content.png)
 
 ![Brief detail opens as modal](./assets/briefs-long-detail.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 spec 并登记到 `docs/specs/README.md`。
-- [x] M2: 去除日报卡片纵向内部滚动限制，并把详情改为模态弹窗。
-- [x] M3: 更新 Storybook 长内容场景、完成新的视觉证据与快车道收口。
 
 ## 方案概述（Approach, high-level）
 
@@ -146,15 +125,6 @@
 - 风险：若 Storybook 长详情 mock 未正确拦截详情接口，story 会退回加载失败态，影响弹窗验证。
 - 开放问题：无。
 - 假设：允许页面整体高度增长，浏览器主滚动条是预期承载方式。
-
-## 变更记录（Change log）
-
-- 2026-04-03: 创建规格，冻结“日报/详情卡片跟随内容高度展开，不再内部滚动”的实现口径。
-- 2026-04-03: 去除 `Release 日报` 与 `Release 详情` Markdown 容器的 `max-h-96` / `overflow-auto` 限制，并补齐长内容 Storybook 场景。
-- 2026-04-03: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并用 Storybook 稳定场景补入视觉证据，状态更新为 `部分完成（2/3）`。
-- 2026-04-03: 创建 PR #45，快车道收口到 PR-ready，规格状态更新为 `已完成`。
-- 2026-04-03: 根据评审反馈，将 `Release 详情` 从 Dashboard 文档流卡片改为模态弹窗，并重新生成 Storybook 场景与视觉证据。
-- 2026-04-03: 重新通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并以 Storybook 长日报/长详情弹窗场景更新视觉证据。
 
 ## 参考（References）
 

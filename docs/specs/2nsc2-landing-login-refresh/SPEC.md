@@ -1,11 +1,5 @@
 # Landing 登录页重做：降噪文案、重构布局、修复移动端 CTA（#2nsc2）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-12
-- Last: 2026-04-12
-
 ## 背景 / 问题陈述
 
 - 当前 Landing 登录页文案过长、口径混杂，既像产品介绍又像 AI 营销页，首屏信息密度过高。
@@ -136,17 +130,6 @@
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本 spec，并在交付完成后写入 PR 备注。
-- `docs/specs/2nsc2-landing-login-refresh/SPEC.md`: 同步最终状态、视觉证据与交付结果。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/2nsc2-landing-login-refresh/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec
-
 ## Visual Evidence
 
 - 桌面默认态：Landing 已收敛为更干净的双栏结构，左侧用 `发布更新 / 社交动态 / 日报通知` 三组统一卡片概括真实前台能力，右侧只保留简洁登录卡与唯一主 CTA。
@@ -156,16 +139,6 @@
 - 移动端首屏：登录卡已经前置到品牌说明之前，`连接到 GitHub` 在首屏内完整可见，不需要向下滚动寻找按钮；品牌说明则继续承接发布阅读、社交动态与日报通知口径。
 
 ![Landing 移动端首屏（暗色）](./assets/landing-mobile-dark.png)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: Landing 首屏文案与布局重做完成，移动端 CTA 优先单栏落地。
-- [x] M2: Storybook 默认态、错误态与移动端审阅入口更新完成，并将卖点卡统一为标题 + 说明结构。
-- [x] M3: Playwright 回归、视觉证据与快车道交付收口完成。
 
 ## 方案概述（Approach, high-level）
 
@@ -178,14 +151,6 @@ None
 - 风险：若后续继续往首屏加入新 badge 或补充说明，移动端 CTA 可能再次被挤出首屏。
 - 需要决策的问题：None。
 - 假设（需主人确认）：Landing 首屏优先强调“与我相关的 GitHub 动态工作区”，明确覆盖发布阅读、社交动态、日报与通知入口，不把 AI 单独当主卖点。
-
-## 变更记录（Change log）
-
-- 2026-04-12: 新建规格，冻结 Landing 登录页重做的文案、布局、移动端 CTA 与视觉证据口径。
-- 2026-04-12: 完成 Landing 页面、Storybook 和 Playwright 本地收口，并补入桌面/移动端视觉证据。
-- 2026-04-12: 根据 README 与 `docs/product.md`，把首屏文案改写为“与我相关的 GitHub 动态工作区”口径，明确覆盖发布更新、社交动态、日报与通知入口。
-- 2026-04-12: 根据新的视觉反馈，把首屏卖点重构为统一长度的标题 + 说明卡片，避免三列布局下的文案长短失衡。
-- 2026-04-12: 重新按代码与产品文档梳理前台真实功能范围，把首屏文案改为“发布更新 / 社交动态 / 日报通知”三组正式口径，并同步修正文档中的过时描述。
 
 ## 参考（References）
 

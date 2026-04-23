@@ -1,11 +1,5 @@
 # Dashboard / Admin 窄平板断点补齐与自动化验证收口（#whda5）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-22
-- Last: 2026-04-22
-
 ## 背景 / 问题陈述
 
 - 已完成的 `#cuz3w` 只冻结了 `768–1023px` 的平板页头合同，`640–767px` 仅被视为“顺带改善”，没有被真正纳入验收范围。
@@ -153,15 +147,6 @@
 - Visual evidence source: Storybook canvas
 - Visual evidence sink: `## Visual Evidence`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/whda5-dashboard-admin-narrow-tablet-header-coverage/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/whda5-dashboard-admin-narrow-tablet-header-coverage/assets/`
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -219,13 +204,6 @@
   image:
   ![Dashboard 页面平板 853 单主列证据](./assets/dashboard-page-tablet-853.png)
 
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 follow-up spec 与 README 索引，明确 `640–1023px` 合同与四档回归宽度。
-- [x] M2: 完成 Dashboard / Admin 页头窄平板断点改造，并让 Dashboard 内容区在 `640–1023px` 全段维持单主列。
-- [x] M3: 补齐 Storybook viewport / `play` 与 Playwright 四档宽度回归。
-- [x] M4: 完成 build、storybook:build、e2e 与视觉证据，收口到 PR-ready。
-
 ## 方案概述（Approach, high-level）
 
 - 把两个页头从 `sm (640px)` 起切入 grid 两列主行，同时保留 `<640px` 的 mobile compact 特判与 `>=1024px` 的 desktop 语义。
@@ -237,7 +215,3 @@
 - 风险：如果后续继续往 utility cluster 增加新按钮，窄平板区间可能再次被挤压，需要继续守住截断与几何断言。
 - 开放问题：无。
 - 假设：`640–1023px` 可以统一视为本轮要彻底补齐的窄平板 / 大横屏手机合同区间。
-
-## 变更记录（Change log）
-
-- 2026-04-22：完成 `640–1023px` 窄平板合同扩展，补齐 `640 / 757 / 853 / 1023` Storybook 与 Playwright 回归，并生成新的 Storybook canvas 视觉证据。

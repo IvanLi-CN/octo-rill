@@ -1,11 +1,5 @@
 # 共享 Markdown GitHub 链接短标签与自动换行防裁剪（#yhyaj）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-21
-- Last: 2026-04-21
-
 ## 背景 / 问题陈述
 
 - Dashboard `日报` 与历史摘要卡片会直接渲染 shared Markdown；当正文里出现裸 GitHub PR URL 时，当前前端会把整段 URL 原样显示出来，阅读密度很差。
@@ -120,13 +114,6 @@
   evidence_note: 验证 release detail 弹窗中的裸 GitHub commit autolink 已压缩为短 SHA，长外链仍保持原文并允许自动换行。
   image:
   ![Release 详情弹窗 GitHub autolink 短标签与自动换行](./assets/release-detail-github-autolink-wrap.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 shared Markdown GitHub 短标签与防裁剪 follow-up spec。
-- [x] M2: 落地 shared Markdown 链接文案压缩与自动换行样式守卫。
-- [x] M3: 补齐 Storybook 场景、共享 Markdown 回归与本地视觉证据。
-- [ ] M4: 在得到截图 push 授权后推进远端 PR 收敛到 merge-ready。
 
 ## 风险 / 假设
 

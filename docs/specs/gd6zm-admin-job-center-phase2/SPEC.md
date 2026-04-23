@@ -1,11 +1,5 @@
 # 管理员任务中心（二期）+ 用户管理字段补齐（#gd6zm）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-02-25
-- Last: 2026-03-27
-
 ## 背景 / 问题陈述
 
 管理员面板一期仅覆盖用户管理，缺少任务可观测与调度治理能力；同时用户表新增日报相关字段后，用户管理界面缺少对应可见性。
@@ -118,19 +112,3 @@
 - Given 管理员任务中心数据库中残留孤儿 `job_tasks.running`
   When 服务重启并完成启动前 recovery pass
   Then 这些任务会自动转为 `failed(runtime_lease_expired)` 并追加 recovery event，避免管理页长期显示假运行态。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: DB migration 与任务引擎基础设施（worker + scheduler + events）。
-- [x] M2: 管理员任务 API 与触发接口 `return_mode` 扩展。
-- [x] M3: 前端 `/admin/jobs` 页面与用户管理字段补齐。
-- [x] M4: Rust / Web 测试与验证通过。
-- [x] M5: 任务类型专属详情页与 Storybook 分类型示例补齐。
-
-## 变更记录（Change log）
-
-- 2026-02-25: 新建规格并落地实现，完成本地验证。
-- 2026-02-26: 新增“任务类型专属详情页”要求并完成实现；同步 Storybook 与契约文档。
-- 2026-02-27: 新增“管理端独立页头 + 管理员导航”要求，并在 `/admin` 与 `/admin/jobs` 落地统一页头组件。
-- 2026-03-07: 澄清用户详情抽屉中的日报时间语义为“浏览器当前时区”，并要求按浏览器当前日期换算 UTC 时钟值以避免 DST 偏差。
-- 2026-03-08: 对齐 Admin Jobs / Admin Users 相关 Playwright 断言与合并门禁证据，保持浏览器时区语义回归覆盖稳定。

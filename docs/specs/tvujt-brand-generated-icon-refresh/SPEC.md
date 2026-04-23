@@ -1,11 +1,5 @@
 # OctoRill 品牌刷新：生成图接管 favicon / Web / Docs（#tvujt）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-06
-- Last: 2026-04-06
-
 ## 背景 / 问题陈述
 
 - `origin/main` 当前仍缺少正式品牌资产链路：Web 继续使用 Vite 默认 favicon，README 只显示纯文本标题，docs-site 导航也未接入项目品牌图标。
@@ -94,12 +88,6 @@
 - `web/src/stories/BrandLogo.stories.tsx` 必须提供独立资产和品牌露出 gallery。
 - 视觉证据至少覆盖：品牌 gallery、Web Landing/Header 露出、docs-site navbar 露出。
 
-## 文档更新（Docs to Update）
-
-- `README.md`
-- `docs-site/rspress.config.ts`
-- `docs/specs/README.md`
-
 ## Visual Evidence
 
 Storybook brand gallery：展示 mark、wordmark、favicon icon 与主要品牌露出面。
@@ -113,21 +101,6 @@ Docs-site navbar：展示文档导航品牌图标与标签页 favicon。
 Web landing：展示 Landing 顶部 badge 与新 favicon 露出。
 
 ![Web landing brand](./assets/web-landing.png)
-
-## 资产晋升（Asset promotion）
-
-| Asset | Plan source (path) | Used by (runtime/test/docs) | Promote method (copy/derive/export) | Target (project path) | References to update | Notes |
-| --- | --- | --- | --- | --- | --- | --- |
-| 新品牌参考图 | `brand/source/reference/generated-brand-refresh-reference.png` | docs/render | copy | `brand/source/reference/generated-brand-refresh-reference.png` | 本 spec / render script | 主人确认的最新生成图，只作参考与派生源 |
-| 正式品牌导出物 | `brand/exports/*` | runtime/docs | export | `brand/exports/*` | README / public copies | Web、docs-site、README 使用的正式资产 |
-| Web public 品牌副本 | `brand/exports/*` | runtime | copy | `web/public/brand/*`, `web/public/favicon.*` | `web/index.html`, `BrandLogo` | 供 Vite / Storybook 消费 |
-| docs-site public 品牌副本 | `brand/exports/*` | docs | copy | `docs-site/docs/public/brand/*`, `docs-site/docs/public/favicon.*` | `docs-site/rspress.config.ts` | 供 Rspress 消费 |
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 归档新参考图并完成新的品牌导出链路。
-- [x] M2: Web、docs-site 与 README 全部接入新的品牌家族。
-- [x] M3: Storybook 与本地视觉证据刷新完成。
 
 ## 风险 / 假设
 

@@ -1,11 +1,5 @@
 # Dashboard「全部」tab 移动端页头意外上滑修复（#kgepw）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 - Dashboard 移动端壳层已经具备 compact header / footer auto-hide，但主人反馈在 `全部` tab 下，页头会意外继续上滑，表现像是页面高度链失真。
@@ -113,11 +107,6 @@
 - 新增 Storybook 入口：`Mobile Runtime Parity Releases`
 - 新增 Verification 入口：`Verification / Mobile all tab sticky shell`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/kgepw-dashboard-all-tab-mobile-header-scroll/SPEC.md`
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -132,13 +121,6 @@
   evidence_note: 主人已在 IAB 中确认脱敏后的 `Mobile Runtime Parity All` 审阅面“看起来没问题了”。该正式 Story 保留线上 `全部` tab 的长滚动密度与 `release + repo_star_received` 混合结构，但不再携带原始线上响应；原始线上响应只作为临时复现基线保留在本地 scratch，不进入正式仓库资产。
   image:
   ![Dashboard 全部 tab 移动端壳层高度修复证据图](./assets/mobile-all-tab-sticky-shell.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 follow-up spec 与 `全部` tab 壳层回归 contract。
-- [x] M2: 修复 `AppShell` / 根节点移动端 viewport 高度链，并补 Storybook 入口。
-- [x] M3: 跑通 lint / build / Storybook verify / Playwright，并生成 owner-facing 视觉证据。
-- [x] M4: 在主人确认截图可提交后，推进 push / PR-ready 收口。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

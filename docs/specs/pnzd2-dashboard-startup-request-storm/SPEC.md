@@ -1,11 +1,5 @@
 # Dashboard 启动期请求风暴热修复（#pnzd2）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 - 生产环境 Dashboard 在首屏进入后持续重放 `GET /api/briefs` 与 `GET /api/reaction-token/status`，Network 面板会快速堆积大量 pending fetch。
@@ -114,21 +108,9 @@
 
 - N/A：本轮属于行为 / 网络层热修复，无新增 owner-facing 视觉差异。
 
-## 文档更新（Docs to Update）
-
-- `/Users/ivan/.codex/worktrees/87aa/octo-rill/docs/specs/pnzd2-dashboard-startup-request-storm/SPEC.md`
-- `/Users/ivan/.codex/worktrees/87aa/octo-rill/docs/specs/README.md`
-
 ## Visual Evidence
 
 - 不要求新增截图资产；本轮以 Playwright 计数回归、生产 Network/Console smoke 与源码链路校验作为交付证据。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 follow-up spec，并明确“首屏 bootstrap 请求计数稳定”的验收口径。
-- [x] M2: 稳定 `useReactionTokenEditor()` 的回调消费，切断 `loadReactionToken` / `savePat` 的 render 漂移。
-- [x] M3: 将 Dashboard sidebar + PAT 启动 bootstrap 收紧为 mount-only 语义。
-- [x] M4: 补齐 Playwright 回归并完成 build / e2e / review / 生产 smoke。
 
 ## 方案概述（Approach, high-level）
 
@@ -141,11 +123,6 @@
 - 风险：若未来再把新的 mount-only 数据拉取直接耦合到 render 漂移依赖，仍可能出现新的请求风暴，需要继续按“稳定 callback + mount guard”模式治理。
 - 开放问题：生产 smoke 依赖部署生效与可用登录态；若部署未完成，需等待最新前端构建上线后再复核。
 - 假设：显式 refresh、task stream refresh 与 PAT 保存后的状态更新仍由既有显式触发链路负责，不依赖首次 mount effect 再次执行。
-
-## 变更记录（Change log）
-
-- 2026-04-20：新建 follow-up spec，冻结 Dashboard 首屏 bootstrap 请求风暴的根因、范围与验收口径。
-- 2026-04-20：完成 hook 回调稳定化、Dashboard mount-only bootstrap 修复与 Playwright 回归补强。
 
 ## 参考（References）
 

@@ -1,11 +1,5 @@
 # OctoRill 全局字标路径化与对齐修复（#gzyja）
 
-## 状态
-
-- Status: 部分完成（2/3）
-- Created: 2026-04-15
-- Last: 2026-04-15
-
 ## 背景 / 问题陈述
 
 - 当前 `wordmark-light.svg` / `wordmark-dark.svg` 仍用运行时 `<text>` 渲染 `OctoRill`，实际显示依赖本机字体回退。
@@ -109,33 +103,12 @@ None
 
 - Smoke check: `rg -n \"<text\" brand/exports/wordmark-*.svg web/public/brand/wordmark-*.svg`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本 spec 索引并在完成后同步状态
-- `docs/specs/gzyja-wordmark-path-geometry-fix/SPEC.md`: 回填实现结果与视觉证据
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/gzyja-wordmark-path-geometry-fix/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: `## Visual Evidence`
-
 ## Visual Evidence
 
 - Header-scale review：后台紧凑品牌位、常规页头与大尺寸露出共用同一套路径版字标，重点验证 `h-5` 的 AdminHeader 尺寸不再显小下沉。
   ![Header scale review](./assets/wordmark-header-scale.png)
 - Surface gallery：独立字标、Landing hero、Dashboard header 与 Admin header 复用同一导出资产，确认 light / dark 仅填充色不同、几何保持一致。
   ![Brand surface gallery](./assets/wordmark-surface-gallery.png)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 将 `wordmark` 导出链路改为 mascot + checked-in 路径轮廓字标，并刷新 light/dark 导出物
-- [x] M2: 更新 BrandLogo Storybook 品牌 gallery，补齐 header-scale 预览并完成视觉验收截图
-- [ ] M3: 完成本轮验证、spec 回填与 PR-ready 收口
 
 ## 方案概述（Approach, high-level）
 
@@ -148,11 +121,6 @@ None
 - 风险：若路径字标权重放大过头，README / AppBoot 等大尺寸露出可能显得过满，需要回调几何。
 - 风险：若导出脚本对 path source 的读取约束不够严格，后续维护时可能误改格式导致导出失败。
 - 假设：rounded system font 生成出的路径风格足够贴近当前品牌气质，可作为本轮静态字标源。
-
-## 变更记录（Change log）
-
-- 2026-04-15: 新建 follow-up spec，收口全局 wordmark 路径化与几何对齐修复。
-- 2026-04-15: 完成路径版 wordmark 导出链路、Storybook header-scale 预览与首轮视觉证据落盘；等待 review / PR-ready 收口。
 
 ## 参考（References）
 

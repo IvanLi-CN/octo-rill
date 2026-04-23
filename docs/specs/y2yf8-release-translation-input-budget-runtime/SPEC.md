@@ -1,11 +1,5 @@
 # Release 翻译输入预算与运行时设置收口（#y2yf8）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-13
-- Last: 2026-04-13
-
 ## 背景 / 问题陈述
 
 - 现有 release feed 曾把“正文过长”直接视为不可翻译，并把列表正文裁切上限错误地混同为翻译限制。
@@ -146,20 +140,6 @@
 - `bun run build`
 - `bun run storybook:build`
 
-## 文档更新（Docs to Update）
-
-- `README.md`: 删除 `AI_MODEL_CONTEXT_LIMIT` 环境变量说明，改为后台运行参数口径
-- `.env.example`: 删除 `AI_MODEL_CONTEXT_LIMIT`
-- `docs-site/docs/config.md`: 删除该环境变量，并说明输入预算来自后台运行参数/模型目录
-- `docs/specs/3k9fd-release-feed-body-translation/SPEC.md`: 标注已被当前 contract 取代
-- `docs/specs/epn56-admin-jobs-runtime-worker-settings/SPEC.md`: 标注已被当前 contract 取代
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/y2yf8-release-translation-input-budget-runtime/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: Storybook canvas
-
 ## Visual Evidence
 
 ![LLM 运行参数弹窗](./assets/admin-llm-settings-dialog.png)
@@ -167,16 +147,6 @@
 ![LLM 运行参数保存后状态](./assets/admin-llm-settings-saved.png)
 
 ![Dashboard 长正文分块翻译](./assets/dashboard-long-body-translation.png)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 后端 runtime setting、状态接口与输入预算解析改成 `ai_model_context_limit`
-- [x] M2: release feed / batch preheat 统一切到 `release_detail` 分块译文，不再按正文长度拒绝翻译
-- [x] M3: 文档、Storybook/E2E 与视觉证据收口
 
 ## 方案概述（Approach, high-level）
 
@@ -189,10 +159,6 @@ None
 - 风险：若模型目录缺失当前模型，需要回退到兜底输入预算；过小会增加分块数量，过大可能导致上游拒绝。
 - 需要决策的问题：PR/线上部署前是否允许把视觉证据图片随提交一起 push。
 - 假设（需主人确认）：feed 卡片原文继续保持固定展示裁切，不把 UI 呈现上限改成管理员配置项。
-
-## 变更记录（Change log）
-
-- 2026-04-13: 建立当前 contract，明确 release 翻译限制来自 LLM 输入预算而非正文长度上限；旧 `#3k9fd` / `#epn56` 转为历史参考。
 
 ## 参考（References）
 
