@@ -1,11 +1,5 @@
 # Release 日报内容格式 V2 与历史快照修复（#qvfxq）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-16
-- Last: 2026-04-19
-
 ## 背景 / 问题陈述
 
 - 当前 Release 日报正文仍以 `## 概览` 开头，并把时间窗口、项目数、预发布数等元数据直接堆进正文，导致内容主体被稀释。
@@ -167,28 +161,6 @@ None
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 
-### Verification results
-
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test` → `386 passed`
-- `cd web && bun run lint`
-- `cd web && bun run build`
-- `cd web && bun run storybook:build`
-- `cd web && bun run e2e -- e2e/release-detail.spec.ts` → `21 passed`
-
-## 文档更新（Docs to Update）
-
-- `docs/product.md`: 日报内容结构改为 `项目更新 + 获星与关注`
-- `docs/specs/README.md`: 登记本 spec，收口后写入 PR 号与状态
-- `docs/specs/qvfxq-release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据与验证结果
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/qvfxq-release-daily-brief-v2/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: Storybook docs / canvas
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -212,17 +184,6 @@ None
   image:
   ![Admin 日报内容修复详情](./assets/admin-brief-refresh-content.png)
 
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 spec 并冻结日报 V2 / 历史修复 contract。
-- [x] M2: 后端生成链路升级为 V2 正文，并补齐短链接 / fence 清洗 / 原位刷新。
-- [x] M3: 内容刷新任务、admin diagnostics 与相关回归测试落地。
-- [x] M4: Storybook、文档、视觉证据与快车道收口完成。
-
 ## 方案概述（Approach, high-level）
 
 - 保留现有 brief 卡头作为“窗口元数据”承载面，把正文彻底收敛到可读内容本体。
@@ -236,11 +197,6 @@ None
 - 风险：历史刷新任务若筛选条件过宽，可能对已经满意的标准化快照造成不必要覆写。
 - 需要决策的问题：无。
 - 假设（需主人确认）：社交摘要以“获星按仓库聚合、关注按 actor 聚合、默认不展示时间”作为稳定文风。
-
-## 变更记录（Change log）
-
-- 2026-04-16: 创建规格，冻结“移除概览/窗口、补社交摘要、支持历史内容刷新”的实现口径。
-- 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
 
 ## 参考（References）
 

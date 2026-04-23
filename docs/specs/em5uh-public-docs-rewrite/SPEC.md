@@ -1,11 +1,5 @@
 # 公开文档体系重写与职责收口（#em5uh）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-19
-- Last: 2026-04-19
-
 ## 背景 / 问题陈述
 
 - 现有公开文档在 README、docs-site、`docs/product.md`、`web/README.md` 之间重复描述同一批内容，阅读路径不清晰。
@@ -121,39 +115,14 @@ None
 - 不新增 docs 页面专用 stories。
 - 使用本地 docs-site 预览页进行 owner-facing 视觉验收。
 
-### Verification summary
-
-- docs-site build：通过
-- Storybook build：通过
-- assembled Pages smoke check：通过
-- 浏览器核验：首页、快速开始、配置、产品、Storybook 导览页均已检查
-
 ### Quality checks
 
 - 文案自审：标题、主动语态、链接文本、重复内容
 - 浏览器核验：首页、快速开始、配置、产品、Storybook 导览可达
 
-## 文档更新（Docs to Update）
-
-- `README.md`：收口为仓库入口与最短启动路径
-- `docs-site/docs/*`：按公开文档职责重写
-- `docs/product.md`：重写为内部产品参考
-- `web/README.md`：收口为前端与 Storybook 贡献说明
-- `docs-site/rspress.config.ts`：调整导航与侧边栏
-
 ## Visual Evidence
 
 本任务的 owner-facing docs 预览截图在对话中回传验收；未经额外允许，不把截图文件纳入仓库或 PR 正文。
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 重写 README 与 docs-site 公开文档，使每个入口只承担一种职责
-- [x] M2: 重写内部产品参考与前端 README，消除与公开文档的重复描述
-- [x] M3: 通过 docs build、Storybook build、assembled smoke check，并完成浏览器验收与 PR-ready 收口
 
 ## 方案概述（Approach, high-level）
 
@@ -167,12 +136,6 @@ None
 - 风险：配置页遗漏 `src/config.rs` 中的真实变量，会继续制造文档漂移。
 - 假设：本次继续保持中文单语公开文档，不引入英文版本。
 - 假设：Storybook stories 本身不需要随本次 docs 改动新增或重命名。
-
-## 交付结果（Delivery outcome）
-
-- PR：`#95`
-- 分支：`th/em5uh-public-docs-rewrite`
-- 收口状态：PR ready（未自动合并）
 
 ## 参考（References）
 

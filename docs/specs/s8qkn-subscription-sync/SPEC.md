@@ -1,9 +1,5 @@
 # 全局 Repo Release 复用与访问触发增量同步（#s8qkn）
 
-## 状态
-
-- Status: Implemented
-
 ## 背景 / 问题陈述
 
 旧实现把 Release 同步和存储都绑定在用户维度：

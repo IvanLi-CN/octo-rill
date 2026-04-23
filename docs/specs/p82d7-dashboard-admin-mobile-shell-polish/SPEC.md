@@ -1,11 +1,5 @@
 # Dashboard / Admin 移动端壳层与顶栏收敛优化（#p82d7）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-12
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 - Dashboard 当前移动端页头比预期更高，品牌、副标题、主题胶囊、同步按钮和头像入口叠加后，首屏可读内容被明显压缩。
@@ -185,16 +179,6 @@
 - Visual evidence source: Storybook + browser mobile viewport capture
 - Visual evidence sink: `## Visual Evidence`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/p82d7-dashboard-admin-mobile-shell-polish/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/p82d7-dashboard-admin-mobile-shell-polish/assets/`
-- Visual evidence source: maintain `## Visual Evidence` in this spec
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -244,17 +228,6 @@
   image:
   ![Dashboard 移动端阅读模式切到翻译态](./assets/dashboard-mobile-lane-switch-translated-light.png)
 
-## 资产晋升（Asset promotion）
-
-- None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: `AppShell` / footer / header 接通 opt-in mobile chrome 状态。
-- [x] M2: Dashboard 移动端页头、sticky rail、管理员入口迁移与小屏密度优化完成。
-- [x] M3: Admin 共享移动壳层接通，并补齐 Storybook / Playwright 移动回归。
-- [x] M4: 视觉证据落盘，快车道收敛到 latest PR merge-ready。
-
 ## 方案概述（Approach, high-level）
 
 - 把移动端滚动状态集中收敛到 `AppShell`，避免 Dashboard / Admin 分别维护 header / footer 行为。
@@ -267,11 +240,6 @@
 - 风险：移动端 sticky rail 与 header 高度联动若计算不稳，会出现吸顶跳动或遮挡。
 - 风险：Storybook 默认桌面视口下无法直接代表移动端，需要借助浏览器真实移动视口进行截图验证。
 - 假设（需主人确认）：桌面端仍保留 Dashboard 次级控制区里的“管理员面板”入口。
-
-## 变更记录（Change log）
-
-- 2026-04-12: 新建规格，冻结 Dashboard / Admin 移动端壳层、sticky rail 与视觉证据交付口径。
-- 2026-04-12: 完成移动端壳层实现、Storybook/Playwright 回归与视觉证据落盘，等待 push / PR 收口。
 
 ## 参考（References）
 

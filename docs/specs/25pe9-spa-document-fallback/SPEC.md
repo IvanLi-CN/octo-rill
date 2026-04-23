@@ -1,11 +1,5 @@
 # SPA document fallback 与全局 404 页面收口（#25pe9）
 
-## 状态
-
-- Status: 部分完成（3/4）
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 - `/settings` 已经是合法前端路由，但生产环境直接访问时 document request 仍返回 `404 Not Found`，只是响应体碰巧是 `index.html`，导致 DevTools、监控与代理层事实自相矛盾。
@@ -104,13 +98,6 @@
 
 - 本任务不在规格中持久化截图资产。
 - 视觉验收依赖稳定的 `Pages/Settings`、`Pages/Not Found` Storybook canvas，以及 `web/e2e/settings.spec.ts` 对直达 `/settings` 与未知前端路径 404 的回归覆盖。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结“仅 HTML 文档导航走 SPA fallback，静态资源 / API / auth miss 保持真实 404”的契约。
-- [x] M2: 源站静态 fallback 改为通用 SPA document fallback，不再让 `/settings` 文档请求带 `404`。
-- [x] M3: 根路由补齐全局 404 页面、Storybook 与测试覆盖。
-- [ ] M4: 完成视觉证据、PR 收敛与 merge+cleanup。
 
 ## 方案概述（Approach, high-level）
 

@@ -1,11 +1,5 @@
 # 管理员面板一期（首登管理员 + 用户管理）（#n6zd8）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-02-25
-- Last: 2026-02-25
-
 ## 背景 / 问题陈述
 
 当前系统只有“已登录用户”概念，没有管理员能力，也无法对站内账号做权限控制与状态控制。为支持后续运营与安全治理，需要先建立最小可用的管理员体系。
@@ -157,26 +151,6 @@
 - `cargo test --locked --all-features`
 - `cd web && bun run lint && bun run e2e`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增规格索引。
-- `docs/specs/n6zd8-admin-panel-user-management/SPEC.md`: 记录里程碑推进。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/n6zd8-admin-panel-user-management/assets/`
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 完成 DB 迁移与认证门禁改造（首登管理员 + 禁用拦截）。
-- [x] M2: 完成管理员 API（列表、筛选、更新）与保护规则。
-- [x] M3: 完成前端管理员模块与交互。
-- [x] M4: 补齐自动化测试并通过质量门禁。
-
 ## 方案概述（Approach, high-level）
 
 - 后端先落地身份状态模型，再提供管理接口，最后前端接入。
@@ -188,11 +162,6 @@ None
 - 风险：历史数据可能存在异常时间字段，回填逻辑需有 id 兜底排序。
 - 需要决策的问题：无（本期规则已冻结）。
 - 假设（需主人确认）：管理员不需要删除用户能力（本期不做）。
-
-## 变更记录（Change log）
-
-- 2026-02-25: 新建规格并冻结一期范围与验收标准。
-- 2026-02-25: 实现完成并通过 Rust + Web 质量门禁验证。
 
 ## 参考（References）
 

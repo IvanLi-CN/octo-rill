@@ -1,11 +1,5 @@
 # Dashboard 页头品牌优先重设计（#76bxs）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-10
-
 ## 背景 / 问题陈述
 
 - 当前 Dashboard 页头把 `Loaded / inbox / briefs` 统计信息和品牌字标挤在同一层，视觉重心分散，品牌露出不稳定。
@@ -142,17 +136,6 @@
 - Storybook: `cd web && bun run storybook:build`
 - E2E: `cd web && bun run e2e -- dashboard-access-sync.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本 spec，并在完成后补充 PR 备注。
-- `docs/specs/76bxs-dashboard-header-brand-layout/SPEC.md`: 同步最终状态、视觉证据与交付结论。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/76bxs-dashboard-header-brand-layout/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec
-
 ## Visual Evidence
 
 - Dashboard 页头默认态已改为品牌优先布局：完整 `OctoRill` wordmark 位于左侧，右侧只保留 `同步` 与头像入口，顶部统计信息不再出现。
@@ -167,16 +150,6 @@
 
 ![Dashboard 账号浮层近景](./assets/dashboard-header-profile-panel.png)
 
-## 资产晋升（Asset promotion）
-
-- None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: DashboardHeader 改为品牌优先双层布局，并移除顶部统计信息 props / 文案。
-- [x] M2: Storybook 审阅面、Dashboard smoke 与 Brand gallery 同步更新。
-- [x] M3: 视觉证据与本地验证完成，页头账号入口收敛到头像浮层。
-
 ## 方案概述（Approach, high-level）
 
 - 通过收窄 `DashboardHeaderProps`，让页头不再依赖 feed/inbox/brief 数量，彻底切断“统计数字占品牌位”的来源。
@@ -188,11 +161,6 @@
 - 风险：若后续再往页头主行塞入额外 badge/状态提示，仍可能重新挤压品牌位，需要继续守住 props 收敛边界。
 - 需要决策的问题：None。
 - 假设（需主人确认）：Dashboard 页头中的产品定位副标题继续沿用 Landing / Brand story 当前文案。
-
-## 变更记录（Change log）
-
-- 2026-04-10: 新建规格，冻结“品牌优先双层布局 + 移除统计信息 + Storybook 视觉证据”的交付口径。
-- 2026-04-10: 实现完成；已补齐 Dashboard Header Storybook 审阅面、视觉证据与前端校验，并将账号信息收敛到头像浮层。
 
 ## 参考（References）
 

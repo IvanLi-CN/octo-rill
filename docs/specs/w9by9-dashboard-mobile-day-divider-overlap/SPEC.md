@@ -1,11 +1,5 @@
 # Dashboard 移动端日分组标题防重叠修复（#w9by9）
 
-## 状态
-
-- Status: 部分完成（3/4）
-- Created: 2026-04-16
-- Last: 2026-04-16
-
 ## 背景 / 问题陈述
 
 - Dashboard 分组 feed 的日分隔标题在移动端窄宽度下，容易被上一张 Release 卡片底部的 reaction footer 压得过近。
@@ -101,15 +95,6 @@
 - 使用 Storybook 移动端稳定场景生成至少一张 owner-facing 视觉证据。
 - 最终视觉证据写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/w9by9-dashboard-mobile-day-divider-overlap/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/w9by9-dashboard-mobile-day-divider-overlap/assets/`
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -122,13 +107,6 @@
   evidence_note: 证明当前日 reaction footer 下方的历史 divider 已缩短为 `4 条动态`，并且右侧 `列表` action 与标题文本保持安全分离，桌面端对齐口径不回退。
   image:
   ![Dashboard 移动端混合动态日分组标题防重叠证据图](./assets/mobile-mixed-activity-day-divider-no-overlap.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 调整 grouped-feed divider header 的移动端布局与内部 hooks。
-- [x] M2: 补齐 Storybook 移动端场景与 Playwright 几何回归。
-- [x] M3: 生成视觉证据，并通过 lint / build / storybook:build / e2e 与 review-loop 收敛。
-- [ ] M4: 在主人确认截图可提交后，推进到 PR-ready。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

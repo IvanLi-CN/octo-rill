@@ -1,11 +1,5 @@
 # Release 视图固定 owner/org avatar（#g63t8）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-10
-
 ## 背景 / 问题陈述
 
 PR #58 把 Release Feed 与 Release 详情的仓库视觉识别做成了 `custom social preview -> owner/org avatar -> text-only`。实际阅读体验里，social preview 横图在小尺寸下噪音偏高，也会让仓库来源锚点不够稳定。
@@ -94,11 +88,6 @@ PR #58 把 Release Feed 与 Release 详情的仓库视觉识别做成了 `custom
 - `cd /Users/ivan/.codex/worktrees/460a/octo-rill/web && bun run storybook:build`
 - `cd /Users/ivan/.codex/worktrees/460a/octo-rill/web && bunx playwright test e2e/release-detail.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `/Users/ivan/.codex/worktrees/460a/octo-rill/docs/specs/README.md`
-- 本 spec 的 `## Visual Evidence`
-
 ## Visual Evidence
 
 - Storybook canvas：`pages-dashboard--release-repo-visuals`
@@ -110,12 +99,6 @@ PR #58 把 Release Feed 与 Release 详情的仓库视觉识别做成了 `custom
   - 验证 Release 详情弹窗沿用相同 avatar-only repo identity。
 
 ![Release detail owner avatar only](./assets/release-detail-owner-avatar.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 前端 repo visual 解析收敛为 avatar-only。
-- [x] M2: Storybook 与 Playwright 断言同步到 avatar-only 预期。
-- [x] M3: 新一轮视觉证据完成并落盘。
 
 ## 风险 / 假设
 

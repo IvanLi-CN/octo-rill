@@ -1,11 +1,5 @@
 # Dashboard 历史日报折叠补齐与社交空态裁剪（#n4x7e）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-19
-- Last: 2026-04-19
-
 ## 背景 / 问题陈述
 
 - `全部` tab 的历史日组已经支持用 brief 折叠同一窗口内的 Release，但获星 / 关注卡片仍会在 brief 前后残留，导致“日报视图”与“原始列表视图”混杂。
@@ -126,16 +120,6 @@
   - 独立 `日报` tab 的 project-only brief 不显示社交空态
 - 最终视觉证据写回本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/product.md`
-- `docs/specs/README.md`
-- `web/src/stories/Dashboard.stories.tsx`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/n4x7e-dashboard-brief-social-folding/assets/`
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -161,13 +145,6 @@
   PR: include
   image:
   ![日报 tab 仅 Release 时省略社交空态](./assets/dashboard-briefs-project-only.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 follow-up spec 并冻结历史 brief 折叠 / 社交空态 contract。
-- [x] M2: 后端 brief 生成、validator 与 refresh 判定支持可选社交章节。
-- [x] M3: Dashboard 历史组折叠 + Storybook mock / play 收敛。
-- [x] M4: 视觉证据、快车道交付与文档收口完成。
 
 ## 方案概述（Approach, high-level）
 

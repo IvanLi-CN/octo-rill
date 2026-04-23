@@ -1,11 +1,5 @@
 # Release Reaction 扁平化重绘与圆形按钮收敛（#zcp33）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-10
-
 ## 背景 / 问题陈述
 
 当前 Dashboard release card 底部的 reaction 直接使用系统原生 emoji 字形，不同平台/浏览器下视觉差异较大，也和当前卡片头部、tabs、按钮的扁平化 UI 语气不一致。
@@ -117,15 +111,6 @@
 - 使用 Storybook 稳定场景生成至少一张 reaction owner-facing 视觉证据。
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/zcp33-release-reaction-bubble-polish/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/zcp33-release-reaction-bubble-polish/assets/`
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -134,13 +119,6 @@
   evidence_note: 验证 6 个 reaction 已切换为本地扁平化 SVG，按钮保持真圆，计数 badge 独立浮在按钮外侧。
 
 ![Reaction bubble polish storybook evidence](./assets/reaction-bubble-polish-storybook.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新 spec、index 行与 reaction 资产来源说明落盘。
-- [x] M2: release card reaction SVG、圆形按钮与外侧 badge 完成。
-- [x] M3: Dashboard Storybook reaction-focused 场景与 Playwright 回归完成。
-- [x] M4: 视觉证据、PR 与 review-loop 收敛到 merge-ready。
 
 ## 方案概述（Approach, high-level）
 
@@ -153,13 +131,6 @@
 - 风险：如果按钮宽高只通过文本流样式控制，后续小改动可能再次退化成胶囊，需要用稳定的固定尺寸与回归断言锁住。
 - 开放问题：无。
 - 假设：reaction 资产允许以 MIT 许可子集形式随仓库存放。
-
-## Change log
-
-- 2026-04-10：创建规格，冻结“Fluent Flat 子集 + 真圆按钮 + 外侧 badge + Storybook 视觉证据”的执行口径。
-- 2026-04-10：完成 `FeedItemCard` reaction footer 的本地 SVG 替换、圆形按钮与外侧 badge 结构，并补入 Storybook reaction-focused 场景与 Playwright 回归。
-- 2026-04-10：通过 `bun run lint`、`bun run build`、`bun run storybook:build`、`bun run e2e -- release-detail.spec.ts`，并写入 Storybook 视觉证据，状态更新为 `部分完成（3/4）`。
-- 2026-04-10：创建 PR #59，快车道进入 PR 收敛阶段，规格状态更新为 `已完成`。
 
 ## 参考（References）
 

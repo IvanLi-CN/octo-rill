@@ -1,11 +1,5 @@
 # GitHub PAT 1:1 参考界面（#6xaku）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-20
-- Last: 2026-04-21
-
 ## 背景 / 问题陈述
 
 - `/settings?section=github-pat` 需要一个用户能直接照抄的 GitHub classic PAT 参考界面。
