@@ -1,11 +1,5 @@
 # 多 GitHub 绑定与 LinuxDO 首登补绑改造（#2v2aw）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-21
-- Last: 2026-04-21
-
 ## 背景 / 问题陈述
 
 - 当前 `users` 仍然保留“一个账号对应一个 GitHub 身份”的历史形态，导致多 GitHub 绑定只能通过兼容层勉强承接，容易把内部实现细节外露到产品语义。
@@ -217,18 +211,6 @@
 - `cd web && bun run storybook:build`
 - `cd web && bunx playwright test e2e/landing-login.spec.ts e2e/settings.spec.ts e2e/bind-github.spec.ts e2e/app-auth-boot.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增索引行，并在 PR 收口后更新状态 / 备注。
-- `docs/specs/2v2aw-multi-github-linuxdo-onboarding/SPEC.md`: 维护接口契约、视觉证据与 spec sync 结果。
-- `docs/specs/2v2aw-multi-github-linuxdo-onboarding/contracts/db.md`: 明确 runtime 真相源与 legacy 保留边界，并记录后续 cleanup 建议。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/2v2aw-multi-github-linuxdo-onboarding/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec when owner-facing or PR-facing screenshots are needed.
-
 ## Visual Evidence
 
 Landing 双登录入口（storybook_canvas: `Pages/Landing / Default`）
@@ -242,17 +224,6 @@ Settings GitHub 多账号管理（storybook_canvas: `Pages/Settings / Git Hub Ac
 
 Settings GitHub PAT owner 展示（storybook_canvas: `Pages/Settings / Deep Linked Git Hub Pat`）
 ![Settings GitHub PAT owner](./assets/settings-github-pat-owner.png)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新增 `github_connections`、PAT owner 字段与 migration/backfill，完成多 GitHub 与 LinuxDO 补绑主链路。
-- [x] M2: GitHub / LinuxDO OAuth 流程改造成“多 GitHub 连接 + LinuxDO 首登补绑”，并开放连接管理 API。
-- [x] M3: Landing、`/bind/github`、Settings、Storybook、Playwright 与 owner-facing 视觉证据完成首轮落地。
-- [x] M4: 去除“主账号”语义、完成运行时迁移收口并推进到交付路径。
 
 ## 方案概述（Approach, high-level）
 

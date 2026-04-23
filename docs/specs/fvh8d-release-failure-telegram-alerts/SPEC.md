@@ -1,12 +1,5 @@
 # Release 失败 Telegram 告警接入
 
-## 状态
-
-- Spec ID: `fvh8d`
-- State: `active`
-- Status: `已完成`
-- Scope: 为 `Release` workflow 接入失败告警与 repo-local smoke test
-
 ## 目标
 
 为 `octo-rill` 接入共享的 Telegram 失败告警工作流，使真实 `Release` 失败能够通过 `workflow_run` 自动告警，同时保留一个安全的 repo-local `workflow_dispatch` smoke test 入口。
@@ -50,7 +43,3 @@
 - Given `Release` 成功
   When notifier workflow 评估事件
   Then 不发送失败告警
-
-## 变更记录
-
-- 2026-04-11: 为 `octo-rill` 接入共享 Telegram 发布失败告警与 repo-local smoke test。

@@ -1,11 +1,5 @@
 # 服务器版本变更后的 Web 轻提示（#h4yvc）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-10
-
 ## 背景 / 问题陈述
 
 - 现有 Web 端只在 footer 显示当前版本；服务端部署新版本后，已打开页面的用户没有任何温和反馈。
@@ -148,32 +142,11 @@
 - E2E: `cd web && bun run e2e -- app-meta-footer-version.spec.ts`
 - Backend: `cargo test`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本 spec 索引并在实现结束后更新状态/备注。
-- `docs/specs/h4yvc-version-update-polling-notice/SPEC.md`: 同步最终里程碑、视觉证据与交付结论。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/h4yvc-version-update-polling-notice/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec when owner-facing or PR-facing screenshots are needed.
-
 ## Visual Evidence
 
 - 共享壳层在检测到服务端新版本后，会显示低打扰顶部轻提示；footer 仍保持当前页已加载版本。
 
 ![共享壳层版本更新轻提示](./assets/app-shell-update-notice.png)
-
-## 资产晋升（Asset promotion）
-
-- None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 前端共享版本监视、AppShell notice 槽位与顶部轻提示完成。
-- [x] M2: footer 共享版本语义、后端 no-store 保护与 Storybook 覆盖完成。
-- [x] M3: Playwright / build / visual evidence / review-loop 收敛完成。
 
 ## 方案概述（Approach, high-level）
 
@@ -187,11 +160,6 @@
 - 风险：若部署链路存在更强的 CDN 级缓存策略，单纯 no-store 仍可能需要额外平台配置兜底。
 - 需要决策的问题：None。
 - 假设（需主人确认）：共享壳层页面都应统一展示相同风格的更新提示。
-
-## 变更记录（Change log）
-
-- 2026-04-10: 新建规格，冻结“顶部轻提示 + 轮询 + no-store + 手动刷新”的交付口径。
-- 2026-04-10: 实现完成；已补齐 Storybook、视觉证据、Playwright 覆盖与 review-loop 收敛。
 
 ## 参考（References）
 

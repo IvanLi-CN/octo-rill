@@ -1,6 +1,6 @@
 # OctoRill 内部产品参考
 
-这份文档供 specs、实现讨论和协作者同步产品口径时使用。公开概览请看 `docs-site/docs/product.md`；这里保留更完整的行为语义和实现边界。
+这份文档供 specs、实现讨论和协作者同步产品口径时使用。公开概览请看 `docs-site/docs/product.md`；这里保留更完整的行为语义和实现边界。若你是第一次进入仓库，建议先看 [`../README.md`](../README.md)、[`docs/README.md`](./README.md) 与 [`architecture.md`](./architecture.md)。
 
 ## 产品定位
 

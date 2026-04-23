@@ -1,11 +1,5 @@
 # 全库主键 NanoID 化与公开标识收口（#67n8t）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-07
-- Last: 2026-03-08
-
 ## 背景 / 问题陈述
 
 - 当前仓库混用本地顺序整数主键与 UUID-like 文本主键，前端与非管理员接口仍可观察到部分本地顺序标识。
@@ -135,30 +129,7 @@
 
 - Lint / typecheck / formatting: `cargo test`、前端 `bun`/`npm` 既有检查、相关 e2e 或 build。
 
-## 文档更新（Docs to Update）
-
-- `README.md`: 说明本地 ID 已统一为 NanoID，以及旧 SQLite 文件需重建。
-- `docs/specs/README.md`: 新增并更新本规格状态。
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/67n8t-nanoid-primary-keys/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- PR visual evidence source: maintain `## Visual Evidence (PR)` in this spec when PR screenshots are needed.
-- If an asset must be used in impl (runtime/test/official docs), list it in `资产晋升（Asset promotion）` and promote it to a stable project path during implementation.
-
-## Visual Evidence (PR)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 统一后端 NanoID 生成/校验与所有本地主键类型定义
-- [x] M2: 追加破坏性迁移并完成 schema/查询/外键切换
-- [x] M3: 更新前端类型、管理员页面与关键测试/构建
-- [x] M4: 完成快车道交付（验证、PR、review-loop、spec 同步）
+## Visual Evidence
 
 ## 方案概述（Approach, high-level）
 
@@ -173,12 +144,6 @@ None
 - 风险：破坏性迁移会让旧 SQLite 数据文件失效，必须通过文档与验证明确该约束。
 - 需要决策的问题：None
 - 假设（需主人确认）：None
-
-## 变更记录（Change log）
-
-- 2026-03-08: PR #29 完成 checks 收口与 review-loop，补齐 NanoID 后的最新事件窗口与翻译请求项顺序修复，当前无未处理阻塞项。
-- 2026-03-07: 完成本地实现与验证，后端/前端本地主键已切换为 16 位 NanoID，README 补充重建库说明。
-- 2026-03-07: 创建规格并冻结 NanoID、天然键保留、公开路由保留外部键、允许重建库的实现口径。
 
 ## 参考（References）
 

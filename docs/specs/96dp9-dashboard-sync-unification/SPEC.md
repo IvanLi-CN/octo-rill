@@ -1,11 +1,5 @@
 # Dashboard 同步入口收敛与顺序固定（#96dp9）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-27
-- Last: 2026-04-09
-
 ## 背景 / 问题陈述
 
 - Dashboard 顶部同时暴露 `Sync all`、`Sync starred`、`Sync releases`、`Sync inbox` 多个入口，界面操作噪音过高。
@@ -121,24 +115,9 @@
 - 使用 Storybook 产出一张 Dashboard 默认态视觉证据。
 - 视觉证据需写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/96dp9-dashboard-sync-unification/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/96dp9-dashboard-sync-unification/assets/`
-
 ## Visual Evidence
 
 ![Dashboard default sync entry](./assets/dashboard-default.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 spec 并写入 `docs/specs/README.md`。
-- [x] M2: 完成 Dashboard 同步入口与文案收敛。
-- [x] M3: 完成 Storybook、视觉证据、快车道 PR 与 review-loop 收敛。
 
 ## 方案概述（Approach, high-level）
 
@@ -151,17 +130,6 @@
 - 风险：若 props 收敛不完整，Storybook 与页面实现可能出现类型漂移。
 - 开放问题：无。
 - 假设：顶部仍保留 `Logout`，但同步相关入口只剩一个 `同步`。
-
-## 变更记录（Change log）
-
-- 2026-03-27: 创建规格，冻结“单一同步入口 + 顺序固定 + Storybook 视觉证据”的执行口径。
-- 2026-03-27: 完成 Dashboard 同步入口、空态文案与 reaction 提示收敛，并更新 Dashboard Storybook stories。
-- 2026-03-27: 通过 `bun run lint`、`bun run build`、`bun run storybook:build`，并补入 Storybook 视觉证据，状态更新为 `部分完成（2/3）`。
-- 2026-03-27: 根据最新产品口径移除顶部 `Refresh`，保持头部只剩 `同步` 与 `Logout`，并完成视觉证据刷新。
-- 2026-03-27: 将最终保留的视觉证据收敛为一张默认态截图，移除多余截图资产。
-- 2026-03-27: 创建 PR #39 并完成快车道收敛，规格状态更新为 `已完成`。
-- 2026-03-27: 根据 PR review proof，将全量同步改为顺序等待 SSE 完成后再刷新页面，并在后续步骤失败时仍刷新已完成部分；若刷新也失败，则显式上报刷新错误，避免页面停留旧数据却被静默吞掉。
-- 2026-04-09: 为 Dashboard Header 与次级控制区补充显式分组语义，并新增“唯一同步入口”Storybook/E2E 回归，防止 `同步` 文案误落到中间控制区。
 
 ## 参考（References）
 

@@ -1,11 +1,5 @@
 # Dashboard 移动端 release 卡片操作收敛（#7yr2m）
 
-## 状态
-
-- Status: 部分完成（3/4）
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 当前 release feed 已经有页面级默认显示模式控制器，但移动端卡片内部仍重复显示单卡 `原文 / 翻译 / 润色` 切换器，同时 `GitHub` 打开方式还是带 label 的按钮。
@@ -111,11 +105,6 @@
 - 必须先在聊天中回传移动端证据图，再决定是否允许把带截图的改动推进到远端。
 - 证据需要绑定当前本地实现的最新 `HEAD`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/7yr2m-dashboard-mobile-release-card-action-polish/SPEC.md`
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -133,13 +122,6 @@
   PR: include
   image:
   ![移动端 release 卡片操作收敛（切到翻译）](./assets/mobile-release-card-translate.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结移动端 release 卡片操作收敛 follow-up spec 与范围。
-- [x] M2: 落地移动端头部布局与 lane 解析收敛，桌面端保持不变。
-- [x] M3: 补齐 Storybook、Playwright 与视觉证据。
-- [ ] M4: 快车道 push / PR 收敛到 merge-ready。
 
 ## 风险 / 假设
 

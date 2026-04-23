@@ -1,11 +1,5 @@
 # 移除公开文档中的 Storybook 导览页（#gms6p）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-19
-- Last: 2026-04-19
-
 ## 背景 / 问题陈述
 
 - `docs-site/docs/storybook-guide.mdx` 把“打开 Storybook”包装成单独文档页，增加了一层没有必要的跳转。
@@ -79,26 +73,9 @@
 - 本次只改 docs-site 内容与链接，不新增 stories。
 - owner-facing 视觉验收以 docs-site 首页与导航为准。
 
-## 文档更新（Docs to Update）
-
-- `docs-site/rspress.config.ts`
-- `docs-site/docs/index.md`
-- `docs-site/docs/quick-start.md`
-- `docs-site/docs/storybook.mdx`
-- `web/README.md`
-- `web/.storybook/preview.ts`
-- `.github/scripts/assemble-pages-site.sh`
-- `.github/workflows/docs-pages.yml`
-- `docs/specs/README.md`
-
 ## Visual Evidence
 
 ![公开文档首页已移除 Storybook 导览页](./assets/docs-homepage-no-storybook-guide.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 删除 Storybook 导览页并移除 docs-site 中的所有入口
-- [x] M2: 清理仓库文档中的相关死链并通过构建验证
 
 ## 风险 / 假设
 

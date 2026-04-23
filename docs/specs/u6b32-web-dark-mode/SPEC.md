@@ -1,11 +1,5 @@
 # Web 暗色模式接通（#u6b32）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-11
-- Last: 2026-04-11
-
 ## 背景 / 问题陈述
 
 - 当前 Web 应用已经铺设了不少 `dark:` 样式与 `.dark` token，但缺少真正的主题状态源、根节点切换与用户入口。
@@ -119,17 +113,6 @@
 - `cd web && npm run storybook:build`
 - `cd web && npx playwright test web/e2e/theme-mode.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/u6b32-web-dark-mode/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/u6b32-web-dark-mode/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec when owner-facing screenshots are needed.
-
 ## Visual Evidence
 
 Landing（浅色）：验证公开入口页的 hero、登录卡片与页头主题胶囊在 light 下的最终表现。
@@ -148,17 +131,6 @@ Admin Panel（深色）：验证管理后台页头中的主题胶囊、导航与
 
 ![Admin panel dark](./assets/admin-panel-dark.png)
 
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 接入主题初始化脚本、`ThemeProvider / useTheme` 与 `ThemeToggle`
-- [x] M2: 完成 BrandLogo、Landing、共享 notice/footer/header 的暗色适配
-- [x] M3: 补齐 Storybook 主题审阅面、play 覆盖与视觉证据
-- [x] M4: 完成本地验证、review-loop、提交与 PR 收敛
-
 ## 方案概述（Approach, high-level）
 
 - 以共享主题状态源收口页面主题判断，避免多入口与裸 `prefers-color-scheme` 分叉。
@@ -171,12 +143,6 @@ None
 - 风险：主题初始化若与 Storybook/本地存储处理不一致，容易导致 stories 与真实页面表现漂移。
 - 需要决策的问题：None
 - 假设（需主人确认）：None
-
-## 变更记录（Change log）
-
-- 2026-04-11: 新建规格，冻结三态主题、本地持久化、统一主题入口与 Storybook 视觉验收口径。
-- 2026-04-11: 接入启动前主题脚本、`ThemeProvider / useTheme / ThemeToggle`、BrandLogo 跟随应用已解析主题，并完成 Landing / Dashboard / Admin 共享表面的暗色适配。
-- 2026-04-11: 将主题入口调整为页头中的简约三态胶囊，刷新 Landing / Dashboard / Admin 审阅面与 Playwright 主题回归覆盖，沉淀最终视觉证据并完成 review-loop 清空。
 
 ## 参考（References）
 

@@ -13,6 +13,8 @@ OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅
 - 本地启动步骤：[`docs-site/docs/quick-start.md`](./docs-site/docs/quick-start.md)
 - 配置参考：[`docs-site/docs/config.md`](./docs-site/docs/config.md)
 - 公开产品说明：[`docs-site/docs/product.md`](./docs-site/docs/product.md)
+- 内部文档入口：[`docs/README.md`](./docs/README.md)
+- 系统概览：[`docs/architecture.md`](./docs/architecture.md)
 - 内部产品参考：[`docs/product.md`](./docs/product.md)
 - 前端与 Storybook 贡献说明：[`web/README.md`](./web/README.md)
 
@@ -21,7 +23,8 @@ OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅
 - `src/`：Rust 后端，负责 OAuth、同步、翻译、日报、通知与管理员任务接口。
 - `web/`：React + Vite 前端，以及 Storybook。
 - `docs-site/`：Rspress 文档站；发布时与 Storybook 组装到同一个 GitHub Pages 站点。
-- `docs/specs/`：工作项规格与追踪台账，不是公开文档入口。
+- `docs/`：内部项目文档入口，包含产品语义、系统概览与 topic-level specs。
+- `docs/specs/`：topic-level 规格、实现状态与历史追踪；用于长期工程记忆，不替代项目入口文档。
 - `migrations/`：SQLite schema 迁移。
 - `brand/`：品牌资源与导出文件。
 

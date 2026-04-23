@@ -1,11 +1,5 @@
 # Release「润色」术语统一（#etd3f）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-22
-- Last: 2026-04-22
-
 ## 背景 / 问题陈述
 
 - 当前 Release 相关能力在前台、管理端、Storybook、自动化测试与产品文档中同时混用 `智能`、`智能摘要`、`智能总结`、`智能整理` 等多套口径，用户感知不稳定。
@@ -107,24 +101,6 @@
 - `cd docs-site && bun run build`
 - targeted grep 不再命中 owner-facing `智能` 旧词
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/etd3f-polish-terminology-unification/SPEC.md`
-- `docs/specs/7f2b9-release-feed-smart-tabs/SPEC.md`
-- `docs/specs/m2k8d-admin-dashboard-rollups/SPEC.md`
-- `docs/specs/w5gaz-owned-release-opt-in/SPEC.md`
-- `docs/specs/7yr2m-dashboard-mobile-release-card-action-polish/SPEC.md`
-- `docs/specs/p82d7-dashboard-admin-mobile-shell-polish/SPEC.md`
-- `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
-- `docs/product.md`
-- `docs-site/docs/product.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/etd3f-polish-terminology-unification/assets/`
-- Visual evidence source: Storybook
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -142,16 +118,3 @@
   PR: include
   image:
   ![Admin Dashboard 润色任务标签](./assets/admin-dashboard-polish.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新 spec、README 索引与 copy contract 冻结。
-- [x] M2: Release / Admin / Settings owner-facing 文案完成统一。
-- [x] M3: Storybook / Playwright / docs / spec 文案与验证同步完成。
-- [x] M4: 视觉证据、提交、推送、PR、review-loop 与 spec sync 收敛到 merge-ready。
-
-## Change log
-
-- 2026-04-22：创建术语统一 spec，冻结 release-smart → `润色` 的 copy contract 与验收口径。
-- 2026-04-22：完成前台 / 管理端 / Storybook / 文档 / 回归断言中的 `润色` 文案统一，并通过 lint、build、e2e、移动端 header drag 与 docs-site build。
-- 2026-04-22：写入 Storybook 视觉证据，并在主人确认截图可提交后创建 PR #118；review-loop clear，当前规格状态更新为 `已完成`。

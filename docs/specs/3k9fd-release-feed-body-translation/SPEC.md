@@ -1,11 +1,5 @@
 # Release Feed 正文卡片与同步后后台翻译（#3k9fd）
 
-## 状态
-
-- Status: 重新设计（#y2yf8）
-- Created: 2026-04-03
-- Last: 2026-04-13
-
 ## 背景
 
 - 现有 release feed 只返回摘录式 `excerpt`，正文阅读被拆到独立 detail 链路。

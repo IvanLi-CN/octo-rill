@@ -1,11 +1,5 @@
 # 管理员任务中心：LLM 调度观测与调用排障（#erscd）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-02-27
-- Last: 2026-02-27
-
 ## 背景 / 问题陈述
 
 当前系统已存在进程内全局 LLM 调度器（串行发放 + 固定节流），但管理员页面缺少针对该调度器与调用链路的可观测能力，排查慢、定位成本高。
@@ -99,29 +93,8 @@
 - `cd web && bun run build`
 - `cd web && bun run e2e -- admin-jobs.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`：新增规格索引并在实现后更新状态。
-- 本规格 `contracts/*`：维护接口和数据结构。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 数据层（`llm_calls` + 索引）与保留清理任务。
-- [x] M2: 调度观测与调用日志埋点落地（含上下文透传）。
-- [x] M3: 管理员 LLM API（status/list/detail）。
-- [x] M4: 前端 LLM 调度标签页 + 筛选 + 详情 + 父任务跳转。
-- [x] M5: 自动化测试与文档同步完成。
-
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
 - 风险：明文保存完整 prompt/response 带来敏感信息泄漏风险（已接受）。
 - 风险：长期高并发下 SQLite 写入量增长，需依赖 TTL 维持体积可控。
 - 假设：当前运行拓扑为单后端实例。
-
-## 变更记录（Change log）
-
-- 2026-02-27: 创建规格并冻结实现边界。
-- 2026-02-27: 完成后端/前端实现，新增迁移与管理员 LLM 观测页面，并通过 `cargo test` + `web build` + `admin-jobs e2e` 验证。
-- 2026-02-27: 增补多轮消息 JSON 展示与 token 指标（含 cached tokens），扩展 llm_calls schema 与 admin API/UI。
-- 2026-02-27: 增补首字等待时间（first token wait）落库与详情/列表展示，用于排查模型首包延迟。
-- 2026-02-27: 新增 `llm_call_events` 与 `llm.call` SSE 事件，支持后台页面对 LLM 调用列表/状态/详情的实时刷新。

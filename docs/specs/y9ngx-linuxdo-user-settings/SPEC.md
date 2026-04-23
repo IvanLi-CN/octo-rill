@@ -1,11 +1,5 @@
 # LinuxDO 绑定与用户设置页改造（#y9ngx）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-18
-- Last: 2026-04-22
-
 ## 背景 / 问题陈述
 
 - 当前普通用户设置分散在 Dashboard 顶部按钮与 Release reaction 的临时 PAT 对话框里，入口零散，后续难以扩展更多账号能力。
@@ -170,17 +164,6 @@
 - `cd web && npm run storybook:build`
 - targeted Playwright
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`: 新增本规格索引行，并在进度推进时更新状态/备注
-- `docs/product.md`: 如设置入口或 LinuxDO 绑定成为用户可见能力，需要同步补充口径
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/y9ngx-linuxdo-user-settings/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: maintain `## Visual Evidence` in this spec when owner-facing or PR-facing screenshots are needed.
-
 ## Visual Evidence
 
 PR: include
@@ -203,17 +186,6 @@ PR: include
 PAT fallback 快速补录弹层（默认使用原生 secure-text 隐藏、支持显隐切换，并保留完整设置入口）
 ![PAT fallback quick setup dialog](./assets/dashboard-pat-fallback-guide.png)
 
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新增 LinuxDO 绑定 migration、配置解析、OAuth callback 与 `/api/me/linuxdo` 接口
-- [x] M2: 前台 `/settings` 页面落地，并迁移 GitHub PAT / 日报设置入口
-- [x] M3: Dashboard 账号菜单与 PAT fallback UX 完成切换
-- [x] M4: Storybook、Playwright、视觉证据与文档同步完成
-
 ## 方案概述（Approach, high-level）
 
 - 后端复用现有 GitHub OAuth / session 模式，只在 LinuxDO callback 阶段使用临时 access token 获取用户资料，然后落本地绑定快照，不持久化 LinuxDO token。
@@ -226,15 +198,6 @@ None
 - 风险：新增 settings route 后，route tree 生成与 Storybook mock 需要同步更新，否则容易出现构建漂移。
 - 需要决策的问题：None
 - 假设（需主人确认）：LinuxDO 绑定只服务于未来的账号关联展示/权限扩展，本轮不需要在产品其它位置消费绑定态。
-
-## 变更记录（Change log）
-
-- 2026-04-22：将 GitHub PAT 输入契约调整为默认保持原生 `password` / secure-text + `autocomplete="new-password"`、显式点亮后再切到明文，并补充密码管理器忽略提示，同时补齐隐藏态对辅助功能树的掩码保护、切回隐藏态后的焦点回收、菜单驱动的撤销/重做路径以及按实际悬停插入点落位的拖放编辑覆盖。
-- 2026-04-20：补充 GitHub PAT 输入框的非登录自动填充语义要求，覆盖 Dashboard 快捷弹层与 `/settings` 页面。
-
-- 2026-04-18: 新建规格，冻结为 LinuxDO OAuth 绑定 + 统一用户设置页方案。
-- 2026-04-19: 设置页文案与布局收敛，补齐桌面端 / 移动端视觉证据并完成实现验证。
-- 2026-04-19: 将 PAT fallback 从纯引导弹层调整为可就地保存 GitHub PAT 的快捷弹层，保留完整设置入口。
 
 ## 参考（References）
 
