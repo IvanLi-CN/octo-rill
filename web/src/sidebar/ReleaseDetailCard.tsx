@@ -6,6 +6,7 @@ import {
 	type TranslationRequestResponse,
 	ApiError,
 	apiGetReleaseDetail,
+	apiGetReleaseDetailByRepoTag,
 	apiGetTranslationRequest,
 	apiTranslateReleaseDetail,
 	isPendingTranslationResultStatus,
@@ -23,6 +24,7 @@ import {
 	DialogHeader,
 	DialogTitle,
 } from "@/components/ui/dialog";
+import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 import { formatIsoShortLocal } from "@/lib/datetime";
 import {
 	describeUnknownError,
@@ -89,15 +91,63 @@ function hasReadyTranslatedContent(
 	return Boolean(translated.title?.trim() || translated.summary?.trim());
 }
 
+function normalizeReleaseTarget(
+	target: DashboardReleaseTarget | null,
+): DashboardReleaseTarget | null {
+	if (!target) return null;
+	return {
+		releaseId: normalizeReleaseId(target.releaseId) ?? null,
+		locator: target.locator ?? null,
+		fromTab: target.fromTab,
+	};
+}
+
+function releaseTargetKey(target: DashboardReleaseTarget | null) {
+	if (!target) return null;
+	if (target.releaseId) {
+		return `release:${target.releaseId}`;
+	}
+	if (target.locator) {
+		return `locator:${target.locator.owner}/${target.locator.repo}#${target.locator.tag}`;
+	}
+	return null;
+}
+
+function releaseTargetDescription(target: DashboardReleaseTarget | null) {
+	if (!target) return null;
+	if (target.releaseId) {
+		return `#${target.releaseId}`;
+	}
+	if (target.locator) {
+		return `${target.locator.owner}/${target.locator.repo} · ${target.locator.tag}`;
+	}
+	return null;
+}
+
+async function fetchReleaseDetail(target: DashboardReleaseTarget) {
+	if (target.locator) {
+		return apiGetReleaseDetailByRepoTag(target.locator);
+	}
+	if (target.releaseId) {
+		return apiGetReleaseDetail(target.releaseId);
+	}
+	throw new Error("missing release detail target");
+}
+
 export function ReleaseDetailCard(props: {
-	releaseId: string | null;
+	target: DashboardReleaseTarget | null;
 	onClose: () => void;
+	onResolvedDetail?: (detail: ReleaseDetailResponse) => void;
 }) {
-	const { releaseId, onClose } = props;
+	const { target, onClose, onResolvedDetail } = props;
 	const { pushErrorToast } = useAppToast();
-	const normalizedReleaseId = useMemo(
-		() => normalizeReleaseId(releaseId),
-		[releaseId],
+	const normalizedTarget = useMemo(
+		() => normalizeReleaseTarget(target),
+		[target],
+	);
+	const activeTargetKey = useMemo(
+		() => releaseTargetKey(normalizedTarget),
+		[normalizedTarget],
 	);
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
@@ -106,6 +156,7 @@ export function ReleaseDetailCard(props: {
 		useState<ReleaseDetailUiError | null>(null);
 	const [showOriginal, setShowOriginal] = useState(false);
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
+	const [detailTargetKey, setDetailTargetKey] = useState<string | null>(null);
 	const translateRequestSeqRef = useRef(0);
 	const loadRequestSeqRef = useRef(0);
 	const pendingTranslationRequestRef = useRef<{
@@ -114,7 +165,10 @@ export function ReleaseDetailCard(props: {
 	} | null>(null);
 
 	const loadDetail = useCallback(
-		(targetReleaseId: string, options?: { resetDisplay?: boolean }) => {
+		(
+			targetRelease: DashboardReleaseTarget,
+			options?: { resetDisplay?: boolean },
+		) => {
 			const requestSeq = loadRequestSeqRef.current + 1;
 			loadRequestSeqRef.current = requestSeq;
 			pendingTranslationRequestRef.current = null;
@@ -124,15 +178,19 @@ export function ReleaseDetailCard(props: {
 			if (options?.resetDisplay !== false) {
 				setShowOriginal(false);
 				setDetail(null);
+				setDetailTargetKey(null);
 			}
-			void apiGetReleaseDetail(targetReleaseId)
+			void fetchReleaseDetail(targetRelease)
 				.then((response) => {
 					if (loadRequestSeqRef.current !== requestSeq) return;
 					setDetail(response);
+					setDetailTargetKey(releaseTargetKey(targetRelease));
+					onResolvedDetail?.(response);
 				})
 				.catch((error) => {
 					if (loadRequestSeqRef.current !== requestSeq) return;
 					setDetail(null);
+					setDetailTargetKey(null);
 					setLoadError(
 						toUnknownUiError(error, "Release 详情加载失败，请稍后重试。"),
 					);
@@ -142,26 +200,29 @@ export function ReleaseDetailCard(props: {
 					setLoading(false);
 				});
 		},
-		[],
+		[onResolvedDetail],
 	);
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
 		setTranslating(false);
-		if (!normalizedReleaseId) {
+		if (!normalizedTarget || !activeTargetKey) {
 			pendingTranslationRequestRef.current = null;
 			setDetail(null);
+			setDetailTargetKey(null);
 			setLoadError(null);
 			setTranslateError(null);
 			return;
 		}
-		loadDetail(normalizedReleaseId, { resetDisplay: true });
-	}, [loadDetail, normalizedReleaseId]);
+		loadDetail(normalizedTarget, { resetDisplay: true });
+	}, [activeTargetKey, loadDetail, normalizedTarget]);
 
 	const activeDetail = useMemo(() => {
-		if (!normalizedReleaseId || !detail) return null;
-		return detail.release_id === normalizedReleaseId ? detail : null;
-	}, [detail, normalizedReleaseId]);
+		if (!detail || !activeTargetKey || detailTargetKey !== activeTargetKey) {
+			return null;
+		}
+		return detail;
+	}, [activeTargetKey, detail, detailTargetKey]);
 
 	const detailTranslationError = useMemo(() => {
 		if (activeDetail?.translated?.status !== "error") {
@@ -305,7 +366,7 @@ export function ReleaseDetailCard(props: {
 		return hasReadyTranslatedContent(activeDetail?.translated);
 	}, [activeDetail]);
 
-	if (!normalizedReleaseId) {
+	if (!normalizedTarget || !activeTargetKey) {
 		return null;
 	}
 
@@ -325,7 +386,9 @@ export function ReleaseDetailCard(props: {
 						<div className="min-w-0">
 							<DialogTitle className="text-base">Release 详情</DialogTitle>
 							<DialogDescription className="font-mono text-xs">
-								{loading ? "加载中…" : `#${normalizedReleaseId}`}
+								{loading
+									? "加载中…"
+									: (releaseTargetDescription(normalizedTarget) ?? "Release")}
 								{activeDetail?.published_at
 									? ` · ${formatIsoShortLocal(activeDetail.published_at)}`
 									: ""}
@@ -407,7 +470,7 @@ export function ReleaseDetailCard(props: {
 										size="sm"
 										className="font-mono text-xs"
 										onClick={() =>
-											loadDetail(normalizedReleaseId, { resetDisplay: true })
+											loadDetail(normalizedTarget, { resetDisplay: true })
 										}
 									>
 										<RefreshCcw className="size-4" />

@@ -4405,7 +4405,10 @@ mod tests {
         assert!(!row.2.contains("### 获星"));
         assert!(!row.2.contains("## 概览"));
         assert!(!row.2.trim_start().starts_with("```"));
-        assert!(row.2.contains("[v1.0.0](/?tab=briefs&release=501)"));
+        assert!(
+            row.2
+                .contains("[v1.0.0](/acme/rocket/releases/tag/v1.0.0?from=briefs)")
+        );
         assert!(!row.2.contains("release=999"));
         assert!(row.2.contains("[@alice](https://github.com/alice)"));
 
@@ -4551,7 +4554,10 @@ mod tests {
         assert_eq!(row.1, "content_refresh");
         assert!(row.2.contains("  - fix: keep nested bullets stable"));
         assert!(!row.2.contains("stable  \n"));
-        assert!(row.2.contains("[v1.1.0](/?tab=briefs&release=601)"));
+        assert!(
+            row.2
+                .contains("[v1.1.0](/acme/rocket/releases/tag/v1.1.0?from=briefs)")
+        );
         assert!(!row.2.contains("## 获星与关注"));
     }
 

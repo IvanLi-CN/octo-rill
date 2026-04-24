@@ -45,12 +45,12 @@ Release 是主阅读对象，承担最多的衍生能力：
   - `## 项目更新`：始终存在，按项目分组逐条列出 release 与变更要点；若窗口内没有 Release，则显示 `- 本时间窗口内没有新的 Release。`
   - `## 获星与关注`：仅当同一窗口内实际存在 `repo_star_received` 或 `follower_received` 动态时出现；只渲染有数据的 `### 获星` / `### 关注` 小节，不再输出空社交占位
 - 链接策略：
-  - release 主链接：站内链接 `/?tab=briefs&release=<release_id>`，点击后在 briefs 页展示详情卡
+  - release 主链接：站内链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，点击后在 `日报` 上下文展示详情卡
   - 其他链接：跳转 GitHub（仓库页、release 原文页、相关 GitHub 链接）；相关链接显示文本应尽量短，优先使用 `#123`、短 SHA 等 GitHub-aware 标签，避免正文过长
 - 正文约束：
   - 卡头负责展示日期、时间窗口与边界信息；正文不再重复输出时间窗口/项目计数等概览元数据
   - 落库前会剥离整篇外层 Markdown code fence，避免整篇日报被当作代码块渲染
-- 链接完整性保障：日报润色后会按 `release` 查询参数做精确 `release_id` 校验，缺失时自动补链（避免 `12/123` 前缀误判）。
+- 链接完整性保障：日报润色后会同时校验 canonical `owner/repo/tag` 路径与 legacy `release_id` 查询参数，缺失时自动补链（避免 `12/123` 前缀误判）。
 - 用途：让用户快速了解这段时间发生了什么，并能一跳查看完整上下文。
 
 ## 前台界面结构
@@ -69,14 +69,14 @@ Landing 负责公开入口和登录承接：
 
 Dashboard 采用主列 + 侧栏结构，核心标签为：
 
-- `全部`
-- `发布`
-- `加星`
-- `关注`
-- `日报`
-- `收件箱`
+- `全部`（canonical path：`/`）
+- `发布`（canonical path：`/releases`）
+- `加星`（canonical path：`/stars`）
+- `关注`（canonical path：`/followers`）
+- `日报`（canonical path：`/briefs`）
+- `收件箱`（canonical path：`/inbox`）
 
-右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。
+右侧侧栏长期承担 Inbox 快捷入口；在 `日报` 标签下还同时承担日报列表。Release 详情的 canonical deep link 采用 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，其中 `from` 只表达返回上下文，默认 `briefs`。
 
 #### 全部
 

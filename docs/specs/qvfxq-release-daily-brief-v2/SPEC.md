@@ -58,8 +58,8 @@
 
 - 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
-- `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
-- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
+- `## 项目更新` 继续按仓库分组，保留 release 主链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs` 与 GitHub Release 外链。
+- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/<owner>/<repo>/releases/tag/<tag>?from=briefs)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
 - related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
 - 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
@@ -241,6 +241,7 @@ None
 
 - 2026-04-16: 创建规格，冻结“移除概览/窗口、补社交摘要、支持历史内容刷新”的实现口径。
 - 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
+- 2026-04-22: 同步 brief release 主链接 current truth；新生成内容默认输出 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，legacy query 链接继续兼容。
 
 ## 参考（References）
 

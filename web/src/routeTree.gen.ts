@@ -9,7 +9,12 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as StarsRouteImport } from './routes/stars'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as ReleasesRouteImport } from './routes/releases'
+import { Route as InboxRouteImport } from './routes/inbox'
+import { Route as FollowersRouteImport } from './routes/followers'
+import { Route as BriefsRouteImport } from './routes/briefs'
 import { Route as AdminRouteRouteImport } from './routes/admin/route'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
@@ -22,13 +27,39 @@ import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/sche
 import { Route as AdminJobsLlmRouteImport } from './routes/admin/jobs/llm'
 import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jobs/tasks/$taskId/route'
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
+import { Route as OwnerRepoReleasesTagTagRouteImport } from './routes/$owner/$repo/releases/tag/$tag'
 import { Route as AdminJobsTasksTaskIdLlmCallIdRouteImport } from './routes/admin/jobs/tasks/$taskId/llm/$callId'
 
+const StarsRoute = StarsRouteImport.update({
+  id: '/stars',
+  path: '/stars',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/stars.lazy').then((d) => d.Route))
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
   getParentRoute: () => rootRouteImport,
 } as any).lazy(() => import('./routes/settings.lazy').then((d) => d.Route))
+const ReleasesRoute = ReleasesRouteImport.update({
+  id: '/releases',
+  path: '/releases',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/releases.lazy').then((d) => d.Route))
+const InboxRoute = InboxRouteImport.update({
+  id: '/inbox',
+  path: '/inbox',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/inbox.lazy').then((d) => d.Route))
+const FollowersRoute = FollowersRouteImport.update({
+  id: '/followers',
+  path: '/followers',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/followers.lazy').then((d) => d.Route))
+const BriefsRoute = BriefsRouteImport.update({
+  id: '/briefs',
+  path: '/briefs',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/briefs.lazy').then((d) => d.Route))
 const AdminRouteRoute = AdminRouteRouteImport.update({
   id: '/admin',
   path: '/admin',
@@ -101,6 +132,13 @@ const AdminJobsTasksTaskIdIndexRoute =
   } as any).lazy(() =>
     import('./routes/admin/jobs/tasks/$taskId/index.lazy').then((d) => d.Route),
   )
+const OwnerRepoReleasesTagTagRoute = OwnerRepoReleasesTagTagRouteImport.update({
+  id: '/$owner/$repo/releases/tag/$tag',
+  path: '/$owner/$repo/releases/tag/$tag',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() =>
+  import('./routes/$owner/$repo/releases/tag/$tag.lazy').then((d) => d.Route),
+)
 const AdminJobsTasksTaskIdLlmCallIdRoute =
   AdminJobsTasksTaskIdLlmCallIdRouteImport.update({
     id: '/llm/$callId',
@@ -115,7 +153,12 @@ const AdminJobsTasksTaskIdLlmCallIdRoute =
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/admin': typeof AdminRouteRouteWithChildren
+  '/briefs': typeof BriefsRoute
+  '/followers': typeof FollowersRoute
+  '/inbox': typeof InboxRoute
+  '/releases': typeof ReleasesRoute
   '/settings': typeof SettingsRoute
+  '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
@@ -125,12 +168,18 @@ export interface FileRoutesByFullPath {
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/briefs': typeof BriefsRoute
+  '/followers': typeof FollowersRoute
+  '/inbox': typeof InboxRoute
+  '/releases': typeof ReleasesRoute
   '/settings': typeof SettingsRoute
+  '/stars': typeof StarsRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/admin': typeof AdminIndexRoute
@@ -138,6 +187,7 @@ export interface FileRoutesByTo {
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs': typeof AdminJobsIndexRoute
+  '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
 }
@@ -145,7 +195,12 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/admin': typeof AdminRouteRouteWithChildren
+  '/briefs': typeof BriefsRoute
+  '/followers': typeof FollowersRoute
+  '/inbox': typeof InboxRoute
+  '/releases': typeof ReleasesRoute
   '/settings': typeof SettingsRoute
+  '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
@@ -155,6 +210,7 @@ export interface FileRoutesById {
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
 }
@@ -163,7 +219,12 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/admin'
+    | '/briefs'
+    | '/followers'
+    | '/inbox'
+    | '/releases'
     | '/settings'
+    | '/stars'
     | '/admin/jobs'
     | '/admin/users'
     | '/bind/github'
@@ -173,12 +234,18 @@ export interface FileRouteTypes {
     | '/admin/jobs/translations'
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
+    | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/briefs'
+    | '/followers'
+    | '/inbox'
+    | '/releases'
     | '/settings'
+    | '/stars'
     | '/admin/users'
     | '/bind/github'
     | '/admin'
@@ -186,13 +253,19 @@ export interface FileRouteTypes {
     | '/admin/jobs/scheduled'
     | '/admin/jobs/translations'
     | '/admin/jobs'
+    | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
   id:
     | '__root__'
     | '/'
     | '/admin'
+    | '/briefs'
+    | '/followers'
+    | '/inbox'
+    | '/releases'
     | '/settings'
+    | '/stars'
     | '/admin/jobs'
     | '/admin/users'
     | '/bind/github'
@@ -202,6 +275,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/translations'
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
+    | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
   fileRoutesById: FileRoutesById
@@ -209,17 +283,58 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRouteRoute: typeof AdminRouteRouteWithChildren
+  BriefsRoute: typeof BriefsRoute
+  FollowersRoute: typeof FollowersRoute
+  InboxRoute: typeof InboxRoute
+  ReleasesRoute: typeof ReleasesRoute
   SettingsRoute: typeof SettingsRoute
+  StarsRoute: typeof StarsRoute
   BindGithubRoute: typeof BindGithubRoute
+  OwnerRepoReleasesTagTagRoute: typeof OwnerRepoReleasesTagTagRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/stars': {
+      id: '/stars'
+      path: '/stars'
+      fullPath: '/stars'
+      preLoaderRoute: typeof StarsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/settings': {
       id: '/settings'
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/releases': {
+      id: '/releases'
+      path: '/releases'
+      fullPath: '/releases'
+      preLoaderRoute: typeof ReleasesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/inbox': {
+      id: '/inbox'
+      path: '/inbox'
+      fullPath: '/inbox'
+      preLoaderRoute: typeof InboxRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/followers': {
+      id: '/followers'
+      path: '/followers'
+      fullPath: '/followers'
+      preLoaderRoute: typeof FollowersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/briefs': {
+      id: '/briefs'
+      path: '/briefs'
+      fullPath: '/briefs'
+      preLoaderRoute: typeof BriefsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/admin': {
@@ -306,6 +421,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminJobsTasksTaskIdIndexRouteImport
       parentRoute: typeof AdminJobsTasksTaskIdRouteRoute
     }
+    '/$owner/$repo/releases/tag/$tag': {
+      id: '/$owner/$repo/releases/tag/$tag'
+      path: '/$owner/$repo/releases/tag/$tag'
+      fullPath: '/$owner/$repo/releases/tag/$tag'
+      preLoaderRoute: typeof OwnerRepoReleasesTagTagRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin/jobs/tasks/$taskId/llm/$callId': {
       id: '/admin/jobs/tasks/$taskId/llm/$callId'
       path: '/llm/$callId'
@@ -371,8 +493,14 @@ const AdminRouteRouteWithChildren = AdminRouteRoute._addFileChildren(
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRouteRoute: AdminRouteRouteWithChildren,
+  BriefsRoute: BriefsRoute,
+  FollowersRoute: FollowersRoute,
+  InboxRoute: InboxRoute,
+  ReleasesRoute: ReleasesRoute,
   SettingsRoute: SettingsRoute,
+  StarsRoute: StarsRoute,
   BindGithubRoute: BindGithubRoute,
+  OwnerRepoReleasesTagTagRoute: OwnerRepoReleasesTagTagRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

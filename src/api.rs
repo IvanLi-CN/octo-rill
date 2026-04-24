@@ -16,8 +16,12 @@ use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, sync::mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
-use url::Url;
 
+use crate::release_links::{
+    InternalReleaseRef, ReleaseLocator, locator_matches_github_release_url,
+    parse_internal_release_ref, parse_release_locator_from_github_release_url,
+    parse_repo_full_name_from_release_url, resolve_release_refs,
+};
 use crate::{admin_runtime, ai, briefs, jobs, local_id, sync};
 use crate::{error::ApiError, state::AppState};
 
@@ -30,52 +34,12 @@ const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_BRIEF_DAILY_SLOT, "日报"),
 ];
 
-fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
-    let parsed = Url::parse(html_url).ok()?;
-    let host = parsed.host_str()?;
-    if host != "github.com" && host != "www.github.com" {
-        return None;
-    }
-    let mut segments = parsed.path_segments()?;
-    let owner = segments.next()?.trim();
-    let repo = segments.next()?.trim();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
-}
-
 fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
 
-fn parse_internal_brief_release_id(target: &str) -> Option<i64> {
-    let base = Url::parse("https://octorill.local/").expect("valid local base url");
-    let joined = base.join(target.trim()).ok()?;
-
-    if joined.host_str() != Some("octorill.local") {
-        return None;
-    }
-
-    let tab = joined
-        .query_pairs()
-        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))?;
-    if tab != "briefs" {
-        return None;
-    }
-
-    let raw_release = joined
-        .query_pairs()
-        .find_map(|(k, v)| (k == "release").then_some(v.into_owned()))?;
-    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-
-    raw_release.parse::<i64>().ok()
-}
-
-fn extract_brief_release_ids(markdown: &str) -> Vec<i64> {
-    let mut ids = Vec::new();
+fn extract_brief_release_refs(markdown: &str) -> Vec<InternalReleaseRef> {
+    let mut refs = Vec::new();
     let mut seen = HashSet::new();
     let mut i = 0usize;
 
@@ -89,10 +53,10 @@ fn extract_brief_release_ids(markdown: &str) -> Vec<i64> {
             let url_start = i + text_end_rel + 2;
             let url_end = url_start + url_end_rel;
             let target = &markdown[url_start..url_end];
-            if let Some(release_id) = parse_internal_brief_release_id(target)
-                && seen.insert(release_id)
+            if let Some(reference) = parse_internal_release_ref(target)
+                && seen.insert(reference.clone())
             {
-                ids.push(release_id);
+                refs.push(reference);
             }
             i = url_end + 1;
             continue;
@@ -103,13 +67,33 @@ fn extract_brief_release_ids(markdown: &str) -> Vec<i64> {
         i += ch.len_utf8();
     }
 
-    ids
+    refs
 }
 
-fn brief_contains_release_link(markdown: &str, release_id: i64) -> bool {
-    extract_brief_release_ids(markdown)
+#[cfg(test)]
+fn extract_brief_release_ids(markdown: &str) -> Vec<i64> {
+    extract_brief_release_refs(markdown)
         .into_iter()
-        .any(|candidate| candidate == release_id)
+        .filter_map(|reference| match reference {
+            InternalReleaseRef::ReleaseId(release_id) => Some(release_id),
+            InternalReleaseRef::Locator(_) => None,
+        })
+        .collect()
+}
+
+fn brief_contains_release_link(
+    markdown: &str,
+    release_id: i64,
+    locator: Option<&ReleaseLocator>,
+) -> bool {
+    extract_brief_release_refs(markdown)
+        .into_iter()
+        .any(|candidate| match candidate {
+            InternalReleaseRef::ReleaseId(candidate_id) => candidate_id == release_id,
+            InternalReleaseRef::Locator(candidate_locator) => {
+                locator.is_some_and(|expected_locator| candidate_locator.matches(expected_locator))
+            }
+        })
 }
 
 fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
@@ -123,6 +107,7 @@ async fn user_has_brief_access_to_release(
     state: &AppState,
     user_id: &str,
     release_id: i64,
+    locator: Option<&ReleaseLocator>,
 ) -> Result<bool, ApiError> {
     let membership_exists = sqlx::query_scalar::<_, i64>(
         r#"
@@ -143,25 +128,22 @@ async fn user_has_brief_access_to_release(
         return Ok(true);
     }
 
-    let hint = format!("%release={release_id}%");
     let briefs = sqlx::query_scalar::<_, String>(
         r#"
         SELECT content_markdown
         FROM briefs
         WHERE user_id = ?
           AND generation_source IN ('legacy', 'history_recompute_failed', 'content_refresh_failed')
-          AND content_markdown LIKE ?
         "#,
     )
     .bind(user_id)
-    .bind(hint)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
 
     Ok(briefs
         .iter()
-        .any(|markdown| brief_contains_release_link(markdown, release_id)))
+        .any(|markdown| brief_contains_release_link(markdown, release_id, locator)))
 }
 
 pub(crate) fn parse_local_id_param(raw: String, field: &str) -> Result<String, ApiError> {
@@ -4530,38 +4512,35 @@ pub struct ReleaseDetailResponse {
     translated: Option<TranslatedItem>,
 }
 
-pub async fn get_release_detail(
-    State(state): State<Arc<AppState>>,
-    session: Session,
-    Path(release_id_raw): Path<String>,
-) -> Result<Json<ReleaseDetailResponse>, ApiError> {
-    let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let release_id = parse_release_id_param(&release_id_raw)?;
+#[derive(Debug, sqlx::FromRow)]
+struct ReleaseDetailRow {
+    repo_id: i64,
+    release_id: i64,
+    repo_full_name: Option<String>,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    trans_source_hash: Option<String>,
+    trans_status: Option<String>,
+    trans_title: Option<String>,
+    trans_summary: Option<String>,
+    trans_error_text: Option<String>,
+    trans_work_status: Option<String>,
+}
 
-    #[derive(Debug, sqlx::FromRow)]
-    struct ReleaseDetailRow {
-        repo_id: i64,
-        release_id: i64,
-        repo_full_name: Option<String>,
-        owner_avatar_url: Option<String>,
-        open_graph_image_url: Option<String>,
-        uses_custom_open_graph_image: Option<i64>,
-        tag_name: String,
-        name: Option<String>,
-        body: Option<String>,
-        html_url: String,
-        published_at: Option<String>,
-        is_prerelease: i64,
-        is_draft: i64,
-        trans_source_hash: Option<String>,
-        trans_status: Option<String>,
-        trans_title: Option<String>,
-        trans_summary: Option<String>,
-        trans_error_text: Option<String>,
-        trans_work_status: Option<String>,
-    }
-
-    let row = sqlx::query_as::<_, ReleaseDetailRow>(
+async fn fetch_release_detail_row_by_release_id(
+    state: &AppState,
+    user_id: &str,
+    release_id: i64,
+) -> Result<Option<ReleaseDetailRow>, ApiError> {
+    sqlx::query_as::<_, ReleaseDetailRow>(
         r#"
         SELECT
           r.repo_id,
@@ -4598,23 +4577,77 @@ pub async fn get_release_detail(
         LIMIT 1
         "#,
     )
-    .bind(&user_id)
-    .bind(&user_id)
+    .bind(user_id)
+    .bind(user_id)
     .bind(release_id)
     .fetch_optional(&state.pool)
     .await
+    .map_err(ApiError::internal)
+}
+
+async fn fetch_release_detail_row_by_locator(
+    state: &AppState,
+    user_id: &str,
+    locator: &ReleaseLocator,
+) -> Result<Option<ReleaseDetailRow>, ApiError> {
+    let rows = sqlx::query_as::<_, ReleaseDetailRow>(
+        r#"
+        SELECT
+          r.repo_id,
+          r.release_id,
+          sr.full_name AS repo_full_name,
+          sr.owner_avatar_url AS owner_avatar_url,
+          sr.open_graph_image_url AS open_graph_image_url,
+          sr.uses_custom_open_graph_image AS uses_custom_open_graph_image,
+          r.tag_name,
+          r.name,
+          r.body,
+          r.html_url,
+          r.published_at,
+          r.is_prerelease,
+          r.is_draft,
+          t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
+          t.title AS trans_title,
+          t.summary AS trans_summary,
+          t.error_text AS trans_error_text,
+          tw.status AS trans_work_status
+        FROM repo_releases r
+        LEFT JOIN user_release_visible_repos sr
+          ON sr.user_id = ? AND sr.repo_id = r.repo_id
+        LEFT JOIN ai_translations t
+          ON t.user_id = ?
+          AND t.entity_type = 'release_detail'
+          AND t.entity_id = CAST(r.release_id AS TEXT)
+          AND t.lang = 'zh-CN'
+          AND t.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items tw
+          ON tw.id = t.active_work_item_id
+        WHERE r.tag_name = ?
+        ORDER BY r.published_at DESC, r.created_at DESC, r.release_id DESC
+        "#,
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(&locator.tag)
+    .fetch_all(&state.pool)
+    .await
     .map_err(ApiError::internal)?;
 
-    let Some(row) = row else {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "release not found",
-        ));
-    };
+    Ok(rows
+        .into_iter()
+        .find(|row| locator_matches_github_release_url(locator, &row.html_url)))
+}
 
+async fn build_release_detail_response(
+    state: &AppState,
+    user_id: &str,
+    row: ReleaseDetailRow,
+) -> Result<ReleaseDetailResponse, ApiError> {
+    let locator = parse_release_locator_from_github_release_url(&row.html_url);
     if row.repo_full_name.is_none()
-        && !user_has_brief_access_to_release(state.as_ref(), &user_id, release_id).await?
+        && !user_has_brief_access_to_release(state, user_id, row.release_id, locator.as_ref())
+            .await?
     {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -4685,7 +4718,7 @@ pub async fn get_release_detail(
         row.uses_custom_open_graph_image.unwrap_or(0) != 0,
     );
 
-    Ok(Json(ReleaseDetailResponse {
+    Ok(ReleaseDetailResponse {
         release_id: row.release_id.to_string(),
         repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
         repo_visual,
@@ -4697,7 +4730,50 @@ pub async fn get_release_detail(
         is_prerelease: row.is_prerelease,
         is_draft: row.is_draft,
         translated,
-    }))
+    })
+}
+
+pub async fn get_release_detail(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(release_id_raw): Path<String>,
+) -> Result<Json<ReleaseDetailResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let release_id = parse_release_id_param(&release_id_raw)?;
+
+    let row = fetch_release_detail_row_by_release_id(state.as_ref(), &user_id, release_id)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "release not found"))?;
+
+    Ok(Json(
+        build_release_detail_response(state.as_ref(), &user_id, row).await?,
+    ))
+}
+
+pub async fn get_release_detail_by_repo_tag(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path((owner_raw, repo_raw, tag_raw)): Path<(String, String, String)>,
+) -> Result<Json<ReleaseDetailResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let owner = urlencoding::decode(&owner_raw)
+        .map(|value| value.into_owned())
+        .map_err(|_| ApiError::bad_request("invalid owner"))?;
+    let repo = urlencoding::decode(&repo_raw)
+        .map(|value| value.into_owned())
+        .map_err(|_| ApiError::bad_request("invalid repo"))?;
+    let tag = urlencoding::decode(&tag_raw)
+        .map(|value| value.into_owned())
+        .map_err(|_| ApiError::bad_request("invalid tag"))?;
+    let locator = ReleaseLocator { owner, repo, tag };
+
+    let row = fetch_release_detail_row_by_locator(state.as_ref(), &user_id, &locator)
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "release not found"))?;
+
+    Ok(Json(
+        build_release_detail_response(state.as_ref(), &user_id, row).await?,
+    ))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -4819,19 +4895,37 @@ pub async fn list_briefs(
         }
     }
 
+    let mut markdown_release_ids_by_brief = HashMap::<String, Vec<String>>::new();
+    for row in &rows {
+        if !brief_uses_markdown_release_fallback(&row.generation_source)
+            || release_ids_by_brief.contains_key(&row.id)
+        {
+            continue;
+        }
+        let refs = extract_brief_release_refs(&row.content_markdown);
+        if refs.is_empty() {
+            continue;
+        }
+        let resolved = resolve_release_refs(&state.pool, &refs)
+            .await
+            .map_err(ApiError::internal)?;
+        markdown_release_ids_by_brief.insert(
+            row.id.clone(),
+            resolved
+                .ids
+                .into_iter()
+                .map(|value| value.to_string())
+                .collect(),
+        );
+    }
+
     let items = rows
         .into_iter()
         .map(|r| {
-            let release_ids = release_ids_by_brief.remove(&r.id).unwrap_or_else(|| {
-                if brief_uses_markdown_release_fallback(&r.generation_source) {
-                    extract_brief_release_ids(&r.content_markdown)
-                        .into_iter()
-                        .map(|value| value.to_string())
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            });
+            let release_ids = release_ids_by_brief
+                .remove(&r.id)
+                .or_else(|| markdown_release_ids_by_brief.remove(&r.id))
+                .unwrap_or_default();
             BriefItem {
                 id: r.id,
                 date: r.date,
@@ -10699,8 +10793,10 @@ async fn translate_release_detail_internal(
         ));
     };
 
+    let release_locator = parse_release_locator_from_github_release_url(&row.html_url);
     if row.starred_repo_id.is_none()
-        && !user_has_brief_access_to_release(state, user_id, release_id).await?
+        && !user_has_brief_access_to_release(state, user_id, release_id, release_locator.as_ref())
+            .await?
     {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -11704,6 +11800,7 @@ mod tests {
         config::{AiConfig, AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
         jobs,
+        release_links::ReleaseLocator,
         state::{AppState, build_oauth_client},
         sync,
     };
@@ -13359,11 +13456,7 @@ mod tests {
             )
             .single()
             .expect("build today window start");
-        let safe_today_local = if now_local > today_window_start + chrono::Duration::minutes(5) {
-            now_local - chrono::Duration::minutes(5)
-        } else {
-            today_window_start + chrono::Duration::seconds(1)
-        };
+        let safe_today_local = today_window_start + (now_local - today_window_start) / 2;
         let today_time = safe_today_local.with_timezone(&chrono::Utc).to_rfc3339();
 
         set_last_active_at(&pool, test_user_id(1).as_str(), Some(today_time.as_str())).await;
@@ -16340,14 +16433,25 @@ line two",
     #[test]
     fn brief_contains_release_link_matches_exact_id() {
         let markdown = "- [v1.2.3](/?tab=briefs&release=123)";
-        assert!(brief_contains_release_link(markdown, 123));
-        assert!(!brief_contains_release_link(markdown, 12));
+        assert!(brief_contains_release_link(markdown, 123, None));
+        assert!(!brief_contains_release_link(markdown, 12, None));
     }
 
     #[test]
     fn brief_contains_release_link_accepts_query_order_variant() {
         let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
-        assert!(brief_contains_release_link(markdown, 123));
+        assert!(brief_contains_release_link(markdown, 123, None));
+    }
+
+    #[test]
+    fn brief_contains_release_link_accepts_canonical_repo_tag_path() {
+        let markdown = "- [v1.2.3](/acme/rocket/releases/tag/v1.2.3?from=briefs)";
+        let locator = ReleaseLocator {
+            owner: "acme".to_owned(),
+            repo: "rocket".to_owned(),
+            tag: "v1.2.3".to_owned(),
+        };
+        assert!(brief_contains_release_link(markdown, 999, Some(&locator)));
     }
 
     #[test]

@@ -45,8 +45,13 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { describeUnknownError } from "@/lib/errorPresentation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
+	buildDashboardReleaseTarget,
+	buildDashboardRouteUrl,
+	buildDashboardWarmRouteState,
+	parseDashboardRouteStateFromLocation,
+	releaseLocatorFromReleaseDetail,
+	type DashboardReleaseTarget,
 	type DashboardRouteState,
-	parseDashboardRouteState,
 } from "@/dashboard/routeState";
 import {
 	DashboardMobileControlBand,
@@ -178,11 +183,10 @@ function isSidebarBootstrapNotificationsError(
 }
 
 function parseDashboardQuery() {
-	const params = new URLSearchParams(window.location.search);
-	return parseDashboardRouteState({
-		tab: params.get("tab"),
-		release: params.get("release"),
-	});
+	return parseDashboardRouteStateFromLocation(
+		window.location.pathname,
+		window.location.search,
+	);
 }
 
 function readStoredPageDefaultLane() {
@@ -312,6 +316,19 @@ export function Dashboard(props: {
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
 	const tab = routeState.tab;
 	const activeReleaseId = routeState.activeReleaseId;
+	const activeReleaseLocator = routeState.activeReleaseLocator;
+	const releaseReturnTab = routeState.releaseReturnTab;
+	const activeReleaseTarget = useMemo(
+		() =>
+			activeReleaseId || activeReleaseLocator
+				? buildDashboardReleaseTarget({
+						releaseId: activeReleaseId,
+						locator: activeReleaseLocator,
+						fromTab: releaseReturnTab,
+					})
+				: null,
+		[activeReleaseId, activeReleaseLocator, releaseReturnTab],
+	);
 	const setRouteState = useCallback(
 		(
 			nextRouteState: DashboardRouteState,
@@ -1333,17 +1350,21 @@ export function Dashboard(props: {
 		(nextTab: Tab) => {
 			setRouteState({
 				tab: nextTab,
-				activeReleaseId: nextTab === "briefs" ? activeReleaseId : null,
+				activeReleaseId: null,
+				activeReleaseLocator: null,
+				releaseReturnTab: "briefs",
 			});
 		},
-		[activeReleaseId, setRouteState],
+		[setRouteState],
 	);
 
 	const onOpenReleaseDetail = useCallback(
-		(releaseId: string) => {
+		(target: DashboardReleaseTarget) => {
 			setRouteState({
-				tab: "briefs",
-				activeReleaseId: releaseId,
+				tab: target.fromTab,
+				activeReleaseId: target.releaseId,
+				activeReleaseLocator: target.locator,
+				releaseReturnTab: target.fromTab,
 			});
 		},
 		[setRouteState],
@@ -1352,12 +1373,41 @@ export function Dashboard(props: {
 	const onCloseReleaseDetail = useCallback(() => {
 		setRouteState(
 			{
-				tab,
+				tab: releaseReturnTab,
 				activeReleaseId: null,
+				activeReleaseLocator: null,
+				releaseReturnTab,
 			},
 			{ replace: true },
 		);
-	}, [setRouteState, tab]);
+	}, [releaseReturnTab, setRouteState]);
+
+	const onReleaseDetailResolved = useCallback(
+		(detail: {
+			release_id: string;
+			repo_full_name: string | null;
+			tag_name: string;
+			html_url: string;
+		}) => {
+			if (activeReleaseLocator) {
+				return;
+			}
+			const locator = releaseLocatorFromReleaseDetail(detail);
+			if (!locator) {
+				return;
+			}
+			setRouteState(
+				{
+					tab,
+					activeReleaseId: detail.release_id,
+					activeReleaseLocator: locator,
+					releaseReturnTab,
+				},
+				{ replace: true },
+			);
+		},
+		[activeReleaseLocator, releaseReturnTab, setRouteState, tab],
+	);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
 	const renderSidebarInbox = hasDesktopSidebarInbox;
 	const renderSidebar =
@@ -1458,23 +1508,12 @@ export function Dashboard(props: {
 
 	useEffect(() => {
 		if (isRouteControlled) return;
-		const params = new URLSearchParams(window.location.search);
-		if (tab === "all") {
-			params.delete("tab");
-		} else {
-			params.set("tab", tab);
-		}
-		if (activeReleaseId) {
-			params.set("release", activeReleaseId);
-		} else {
-			params.delete("release");
-		}
-		const query = params.toString();
-		const nextUrl = `${window.location.pathname}${query ? `?${query}` : ""}`;
-		if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+		const nextUrl = buildDashboardRouteUrl(routeState);
+		const currentUrl = `${window.location.pathname}${window.location.search}`;
+		if (nextUrl !== currentUrl) {
 			window.history.replaceState({}, "", nextUrl);
 		}
-	}, [isRouteControlled, tab, activeReleaseId]);
+	}, [isRouteControlled, routeState]);
 
 	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
@@ -1525,10 +1564,7 @@ export function Dashboard(props: {
 		}
 		persistDashboardWarmSnapshot({
 			userId: me.user.id,
-			routeState: {
-				tab,
-				activeReleaseId,
-			},
+			routeState: buildDashboardWarmRouteState(routeState),
 			feedRequestType,
 			feedItems: feed.items,
 			nextCursor: feed.nextCursor,
@@ -1537,7 +1573,6 @@ export function Dashboard(props: {
 			selectedBriefId,
 		});
 	}, [
-		activeReleaseId,
 		briefs,
 		feed.items,
 		feed.loadingInitial,
@@ -1545,9 +1580,9 @@ export function Dashboard(props: {
 		feedRequestType,
 		me.user.id,
 		notifications,
+		routeState,
 		selectedBriefId,
 		sidebarLoading,
-		tab,
 	]);
 
 	const showStartupSkeleton =
@@ -1704,8 +1739,9 @@ export function Dashboard(props: {
 				</Tabs>
 
 				<ReleaseDetailCard
-					releaseId={activeReleaseId}
+					target={activeReleaseTarget}
 					onClose={onCloseReleaseDetail}
+					onResolvedDetail={onReleaseDetailResolved}
 				/>
 
 				<Dialog

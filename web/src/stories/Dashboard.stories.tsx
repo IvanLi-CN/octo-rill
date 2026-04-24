@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, within } from "storybook/test";
 
@@ -37,6 +37,12 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { AppShell } from "@/layout/AppShell";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import {
+	buildDashboardReleaseHref,
+	buildDashboardReleaseTarget,
+	releaseLocatorFromReleaseDetail,
+	type DashboardReleaseTarget,
+} from "@/dashboard/routeState";
 import type { RepoVisual } from "@/lib/repoVisual";
 import {
 	DashboardMobileControlBand,
@@ -148,6 +154,10 @@ const DASHBOARD_VIEWPORTS = {
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
 const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · owner release opt-in";
+
+function storyBriefReleaseHref(owner: string, repo: string, tag: string) {
+	return buildDashboardReleaseHref({ owner, repo, tag }, "briefs");
+}
 
 function dispatchSyntheticTouchEvent(
 	target: HTMLElement,
@@ -1304,8 +1314,30 @@ const mockBriefs: BriefItem[] = [
 		window_end: "2026-04-04T08:00:00+08:00",
 		release_count: 2,
 		release_ids: ["10003", "10004"],
-		content_markdown:
-			"## 项目更新\n\n### [acme/rocket](https://github.com/acme/rocket)\n\n- [nightly guardrails](/?tab=briefs&release=10003) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)\n  - 收敛上传守卫，避免批量发布时的顺序漂移。\n  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999)\n\n### [acme/satellite](https://github.com/acme/satellite)\n\n- [oauth action bubble polish](/?tab=briefs&release=10004) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)\n  - 统一 oauth 批量操作气泡与 hover 态。\n  - 相关链接：[#13840](https://github.com/acme/satellite/pull/13840)\n\n## 获星与关注\n\n### 获星\n\n- [acme/rocket](https://github.com/acme/rocket)：[@yyx990803](https://github.com/yyx990803)、[@gaearon](https://github.com/gaearon)\n\n### 关注\n\n- [@antfu](https://github.com/antfu)、[@sindresorhus](https://github.com/sindresorhus)\n",
+		content_markdown: `## 项目更新
+
+### [acme/rocket](https://github.com/acme/rocket)
+
+- [nightly guardrails](${storyBriefReleaseHref("acme", "rocket", "nightly-guardrails")}) · 2026-04-03T23:10:00+08:00 · [GitHub Release](https://github.com/acme/rocket/releases/tag/nightly-guardrails)
+  - 收敛上传守卫，避免批量发布时的顺序漂移。
+  - 相关链接：[4d8f459](https://github.com/acme/rocket/commit/4d8f459e7869d3e0b57fafe1b7a9034cb9b2d999)
+
+### [acme/satellite](https://github.com/acme/satellite)
+
+- [oauth action bubble polish](${storyBriefReleaseHref("acme", "satellite", "oauth-action-bubble")}) · 2026-04-03T21:30:00+08:00 · [GitHub Release](https://github.com/acme/satellite/releases/tag/oauth-action-bubble)
+  - 统一 oauth 批量操作气泡与 hover 态。
+  - 相关链接：[#13840](https://github.com/acme/satellite/pull/13840)
+
+## 获星与关注
+
+### 获星
+
+- [acme/rocket](https://github.com/acme/rocket)：[@yyx990803](https://github.com/yyx990803)、[@gaearon](https://github.com/gaearon)
+
+### 关注
+
+- [@antfu](https://github.com/antfu)、[@sindresorhus](https://github.com/sindresorhus)
+`,
 		created_at: "2026-04-04T08:00:03+08:00",
 	}),
 ];
@@ -1318,8 +1350,14 @@ const projectOnlyBriefs: BriefItem[] = [
 		window_end: "2026-04-05T08:00:00+08:00",
 		release_count: 1,
 		release_ids: ["10006"],
-		content_markdown:
-			"## 项目更新\n\n### [acme/relay](https://github.com/acme/relay)\n\n- [stability lane release](/?tab=briefs&release=10006) · 2026-04-04T20:15:00+08:00 · [GitHub Release](https://github.com/acme/relay/releases/tag/stability-lane-release)\n  - 收敛日报刷新流程，避免历史摘要与卡片重复呈现。\n  - 相关链接：[#13888](https://github.com/acme/relay/pull/13888)\n",
+		content_markdown: `## 项目更新
+
+### [acme/relay](https://github.com/acme/relay)
+
+- [stability lane release](${storyBriefReleaseHref("acme", "relay", "stability-lane-release")}) · 2026-04-04T20:15:00+08:00 · [GitHub Release](https://github.com/acme/relay/releases/tag/stability-lane-release)
+  - 收敛日报刷新流程，避免历史摘要与卡片重复呈现。
+  - 相关链接：[#13888](https://github.com/acme/relay/pull/13888)
+`,
 		created_at: "2026-04-05T08:00:03+08:00",
 	}),
 ];
@@ -1338,11 +1376,12 @@ const longBriefMarkdown = [
 			"acme/relay",
 			"acme/fleet",
 		][index];
-		const releaseId = index === 0 ? LONG_BRIEF_RELEASE_ID : `${777002 + index}`;
+		const [owner, repoName] = repo.split("/", 2);
+		const tag = `v${index + 3}.4.${index}`;
 		return [
 			`### [${repo}](https://github.com/${repo})`,
 			"",
-			`- [v${index + 3}.4.${index}](/?tab=briefs&release=${releaseId}) · 2026-04-03T0${index}:12:00Z · [GitHub Release](https://github.com/${repo}/releases/tag/v${index + 3}.4.${index})`,
+			`- [${tag}](${storyBriefReleaseHref(owner ?? "", repoName ?? "", tag)}) · 2026-04-03T0${index}:12:00Z · [GitHub Release](https://github.com/${repo}/releases/tag/${tag})`,
 			`  - 完成第 ${index + 1} 波发布，补齐构建链路、监控面板与回滚脚本。`,
 			`  - 新增 \`owner-reviewed\` 发布检查项，并收敛环境差异带来的配置漂移。`,
 			`  - 清理过期镜像标签、重跑 smoke tests，并同步更新部署说明。`,
@@ -1393,8 +1432,19 @@ const generatedBriefTemplates: Record<string, BriefItem> = {
 		window_end: "2026-04-03T08:00:00+08:00",
 		release_count: 1,
 		release_ids: ["10005"],
-		content_markdown:
-			"## 项目更新\n\n### [acme/fleet](https://github.com/acme/fleet)\n\n- [fallback lane release](/?tab=briefs&release=10005) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)\n  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。\n\n## 获星与关注\n\n### 关注\n\n- [@withastro](https://github.com/withastro)\n",
+		content_markdown: `## 项目更新
+
+### [acme/fleet](https://github.com/acme/fleet)
+
+- [fallback lane release](${storyBriefReleaseHref("acme", "fleet", "fallback-lane-release")}) · 2026-04-03T06:20:00+08:00 · [GitHub Release](https://github.com/acme/fleet/releases/tag/fallback-lane-release)
+  - 回补这一天的日报摘要，用来验证按天生成后的展示切换。
+
+## 获星与关注
+
+### 关注
+
+- [@withastro](https://github.com/withastro)
+`,
 		created_at: "2026-04-03T08:00:03+08:00",
 	}),
 };
@@ -1412,7 +1462,7 @@ const githubAutolinkWrapBriefs: BriefItem[] = [
 			"",
 			"### [CherryHQ/cherry-studio](https://github.com/CherryHQ/cherry-studio)",
 			"",
-			"- [skills workspace links](/?tab=briefs&release=14247) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)",
+			`- [skills workspace links](${storyBriefReleaseHref("CherryHQ", "cherry-studio", "v1.0.0")}) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)`,
 			`  - 原始 GitHub PR autolink 会被压缩成短标签：${RAW_GITHUB_PULL_URL}`,
 			"  - 已有自定义标签保持原样：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
 			`  - 非 GitHub 长链接继续保留原文，但必须允许自动换行：${RAW_EXTERNAL_DOCS_URL}`,
@@ -1502,6 +1552,10 @@ function useStorybookReleaseDetailMock(detail: ReleaseDetailResponse | null) {
 
 		const previousFetch = globalThis.fetch.bind(globalThis);
 		const detailPath = `/api/releases/${encodeURIComponent(detail.release_id)}/detail`;
+		const locator = releaseLocatorFromReleaseDetail(detail);
+		const repoTagDetailPath = locator
+			? `/api/repos/${encodeURIComponent(locator.owner)}/${encodeURIComponent(locator.repo)}/releases/tag/${encodeURIComponent(locator.tag)}/detail`
+			: null;
 
 		globalThis.fetch = async (input, init) => {
 			const rawUrl =
@@ -1512,7 +1566,11 @@ function useStorybookReleaseDetailMock(detail: ReleaseDetailResponse | null) {
 						: input.url;
 			const resolvedUrl = new URL(rawUrl, window.location.origin);
 
-			if (resolvedUrl.pathname === detailPath) {
+			if (
+				resolvedUrl.pathname === detailPath ||
+				(repoTagDetailPath !== null &&
+					resolvedUrl.pathname === repoTagDetailPath)
+			) {
 				return new Response(JSON.stringify(detail), {
 					headers: { "Content-Type": "application/json" },
 					status: 200,
@@ -1613,6 +1671,19 @@ function DashboardPreview(props: {
 		setStoryBriefs(briefs);
 	}, [briefs]);
 
+	const seededReleaseTarget = useMemo(() => {
+		const locator = releaseDetail
+			? releaseLocatorFromReleaseDetail(releaseDetail)
+			: null;
+		const releaseId = initialReleaseId ?? releaseDetail?.release_id ?? null;
+		if (!releaseId && !locator) return null;
+		return buildDashboardReleaseTarget({
+			releaseId,
+			locator,
+			fromTab: "briefs",
+		});
+	}, [initialReleaseId, releaseDetail]);
+
 	const items =
 		emptyState !== "content"
 			? []
@@ -1670,9 +1741,8 @@ function DashboardPreview(props: {
 	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
 		briefs[0]?.id ?? null,
 	);
-	const [activeReleaseId, setActiveReleaseId] = useState<string | null>(
-		initialReleaseId,
-	);
+	const [activeReleaseTarget, setActiveReleaseTarget] =
+		useState<DashboardReleaseTarget | null>(seededReleaseTarget);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
@@ -1716,6 +1786,10 @@ function DashboardPreview(props: {
 	}, [storyBriefs]);
 
 	useEffect(() => {
+		setActiveReleaseTarget(seededReleaseTarget);
+	}, [seededReleaseTarget]);
+
+	useEffect(() => {
 		if (!pendingFeedTab || !isFeedBackedTab(pendingFeedTab)) {
 			return;
 		}
@@ -1745,9 +1819,14 @@ function DashboardPreview(props: {
 		setPendingFeedTab(tab);
 	}, [deferredFeedTabs, pendingFeedTab, resolvedDeferredFeedTabs, tab]);
 
-	const openReleaseDetail = (releaseId: string) => {
-		setTab("briefs");
-		setActiveReleaseId(releaseId);
+	const handleSelectTab = (nextTab: Tab) => {
+		setTab(nextTab);
+		setActiveReleaseTarget(null);
+	};
+
+	const openReleaseDetail = (target: DashboardReleaseTarget) => {
+		setTab(target.fromTab);
+		setActiveReleaseTarget(target);
 	};
 
 	const generateBriefForDate = async (date: string) => {
@@ -1886,7 +1965,7 @@ function DashboardPreview(props: {
 						mobileControlBand={
 							<DashboardMobileControlBand
 								tab={tab}
-								onSelectTab={(nextTab) => setTab(nextTab)}
+								onSelectTab={handleSelectTab}
 								showPageLaneSelector={tab === "all" || tab === "releases"}
 								pageLane={effectivePageDefaultLane}
 								onSelectPageLane={(lane) => {
@@ -1904,7 +1983,7 @@ function DashboardPreview(props: {
 			>
 				<Tabs
 					value={tab}
-					onValueChange={(nextTab) => setTab(nextTab as Tab)}
+					onValueChange={(nextTab) => handleSelectTab(nextTab as Tab)}
 					className="gap-4 sm:gap-6"
 				>
 					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
@@ -1956,7 +2035,7 @@ function DashboardPreview(props: {
 									selectedId={selectedBriefId}
 									busy={false}
 									onGenerate={() => {}}
-									onOpenRelease={setActiveReleaseId}
+									onOpenRelease={openReleaseDetail}
 								/>
 							</TabsContent>
 							<TabsContent value="inbox" className="mt-0 min-w-0">
@@ -1989,8 +2068,8 @@ function DashboardPreview(props: {
 				</Tabs>
 
 				<ReleaseDetailCard
-					releaseId={activeReleaseId}
-					onClose={() => setActiveReleaseId(null)}
+					target={activeReleaseTarget}
+					onClose={() => setActiveReleaseTarget(null)}
 				/>
 
 				<Dialog open={patDialogOpen} onOpenChange={setPatDialogOpen}>

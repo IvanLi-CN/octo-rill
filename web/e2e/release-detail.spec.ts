@@ -70,6 +70,15 @@ type TranslationErrorPayload = {
 	error_detail?: string | null;
 };
 
+function buildCanonicalReleaseHref(
+	owner: string,
+	repo: string,
+	tag: string,
+	from = "briefs",
+) {
+	return `/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/tag/${encodeURIComponent(tag)}?from=${encodeURIComponent(from)}`;
+}
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -363,7 +372,7 @@ async function installApiMocks(
 		briefDate: "2026-02-23",
 		briefWindowStart: "2026-02-22T00:00:00Z",
 		briefWindowEnd: "2026-02-23T00:00:00Z",
-		briefMarkdown: `[repo/v1.2.3](/?tab=briefs&release=${options?.releaseId ?? "123"})`,
+		briefMarkdown: `[repo/v1.2.3](${buildCanonicalReleaseHref("owner", "repo", "v1.2.3")})`,
 		briefCreatedAt: "2026-02-23T08:00:00Z",
 		releaseDetailPendingPolls: 0,
 		releaseDetailInitialStatus: "missing",
@@ -594,6 +603,46 @@ async function installApiMocks(
 					cfg.releaseDetailInitialStatus ?? "missing",
 				),
 			});
+		}
+
+		if (
+			req.method() === "GET" &&
+			pathname.startsWith("/api/repos/") &&
+			pathname.endsWith("/detail")
+		) {
+			const segments = pathname.split("/").filter(Boolean);
+			if (
+				segments.length === 8 &&
+				segments[0] === "api" &&
+				segments[1] === "repos" &&
+				segments[4] === "releases" &&
+				segments[5] === "tag"
+			) {
+				const owner = decodeURIComponent(segments[2] ?? "owner");
+				const repo = decodeURIComponent(segments[3] ?? "repo");
+				const tag = decodeURIComponent(segments[6] ?? "v1.2.3");
+				return json(route, {
+					release_id: cfg.releaseId,
+					repo_full_name: `${owner}/${repo}`,
+					repo_visual: {
+						owner_avatar_url: svgDataUrl("OR", "#2563eb"),
+						open_graph_image_url: null,
+						uses_custom_open_graph_image: false,
+					},
+					tag_name: tag,
+					name: cfg.detailTitle,
+					body: "- fix A\n- fix B",
+					body_truncated: false,
+					html_url: `https://github.com/${owner}/${repo}/releases/tag/${tag}`,
+					published_at: cfg.detailPublishedAt,
+					is_prerelease: 0,
+					is_draft: 0,
+					translated: makeReleaseDetailTranslatedPayload(
+						cfg,
+						cfg.releaseDetailInitialStatus ?? "missing",
+					),
+				});
+			}
 		}
 
 		if (req.method() === "POST" && pathname === "/api/translate/results") {
@@ -843,12 +892,15 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	await page.goto("/?release=289513858");
 	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
-	await expect(page).toHaveURL(/tab=briefs/);
-	await expect(page).toHaveURL(/release=289513858/);
+	await expect(page).toHaveURL(
+		/\/owner\/repo\/releases\/tag\/v1\.2\.3\?from=briefs$/,
+	);
 	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
 	await expect(detailDialog).toBeVisible();
-	await expect(detailDialog.getByText("#289513858")).toBeVisible();
-	await expect(detailDialog.getByText("owner/repo")).toBeVisible();
+	await expect(detailDialog.getByText("owner/repo · v1.2.3")).toBeVisible();
+	await expect(
+		detailDialog.getByText("owner/repo", { exact: true }),
+	).toBeVisible();
 	await expect(
 		detailDialog.getByRole("heading", { name: "Release 289513858" }),
 	).toBeVisible();
@@ -857,8 +909,7 @@ test("deep link with release id opens briefs tab and loads release detail", asyn
 	).toBeVisible();
 
 	await detailDialog.getByRole("button", { name: "关闭" }).click();
-	await expect(page).toHaveURL(/tab=briefs/);
-	await expect(page).not.toHaveURL(/release=289513858/);
+	await expect(page).toHaveURL(/\/briefs$/);
 	await expect(detailDialog).toHaveCount(0);
 	await expect(page.getByRole("tab", { name: "日报" })).toHaveAttribute(
 		"aria-selected",
@@ -906,7 +957,7 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 			"",
 			"### [CherryHQ/cherry-studio](https://github.com/CherryHQ/cherry-studio)",
 			"",
-			"- [skills workspace links](/?tab=briefs&release=123) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)",
+			`- [skills workspace links](${buildCanonicalReleaseHref("CherryHQ", "cherry-studio", "v1.0.0")}) · 2026-04-20T15:18:00Z · [GitHub Release](https://github.com/CherryHQ/cherry-studio/releases/tag/v1.0.0)`,
 			`  - 原始 GitHub PR autolink 会被压缩成短标签：${rawPrUrl}`,
 			"  - 已有短标签保持不变：[#13840](https://github.com/CherryHQ/cherry-studio/pull/13840)",
 			`  - 长文档链接继续保留原文并允许换行：${rawDocsUrl}`,
@@ -1185,12 +1236,13 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await page.goto("/?tab=briefs&release=00123");
 	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
-	await expect(page).toHaveURL(/tab=briefs/);
-	await expect(page).toHaveURL(/release=123/);
+	await expect(page).toHaveURL(
+		/\/owner\/repo\/releases\/tag\/v1\.2\.3\?from=briefs$/,
+	);
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
-	await expect(page.getByText("#123")).toBeVisible();
+	await expect(page.getByText("owner/repo · v1.2.3")).toBeVisible();
 });
 
 test("feed smart lane auto generates for visible cards by default", async ({
@@ -1682,7 +1734,9 @@ test.describe("localized timestamps", () => {
 			await page.goto("/?tab=briefs&release=123");
 			await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 			await expect(
-				page.getByText("#123 · 2026-02-22 19:22:33", { exact: true }),
+				page.getByText("owner/repo · v1.2.3 · 2026-02-22 19:22:33", {
+					exact: true,
+				}),
 			).toBeVisible();
 		});
 
