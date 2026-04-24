@@ -360,6 +360,12 @@ export type AdminJobsOverviewResponse = {
 	enabled_scheduled_slots: number;
 	total_scheduled_slots: number;
 };
+export type AdminDashboardBusinessCounts = {
+	ok: number;
+	partial: number;
+	failed: number;
+	disabled: number;
+};
 export type AdminDashboardTaskStatusItem = {
 	task_type: string;
 	label: string;
@@ -368,8 +374,10 @@ export type AdminDashboardTaskStatusItem = {
 	succeeded: number;
 	failed: number;
 	canceled: number;
+	business_counts: AdminDashboardBusinessCounts;
 	total: number;
 	success_rate: number;
+	business_success_rate: number;
 };
 export type AdminDashboardTaskShareItem = {
 	task_type: string;
@@ -377,6 +385,8 @@ export type AdminDashboardTaskShareItem = {
 	total: number;
 	share_ratio: number;
 	success_rate: number;
+	business_counts: AdminDashboardBusinessCounts;
+	business_success_rate: number;
 };
 export type AdminDashboardTrendPoint = {
 	date: string;
@@ -385,12 +395,22 @@ export type AdminDashboardTrendPoint = {
 	active_users: number;
 	translations_total: number;
 	translations_failed: number;
+	translations_partial: number;
+	translations_business_failed: number;
 	summaries_total: number;
 	summaries_failed: number;
+	summaries_partial: number;
+	summaries_business_failed: number;
 	briefs_total: number;
 	briefs_failed: number;
+	briefs_partial: number;
+	briefs_business_failed: number;
 };
 export type AdminDashboardWindowValue = "7d" | "30d";
+export type AdminDashboardLlmHealthBucket = {
+	label: string;
+	count: number;
+};
 export type AdminDashboardResponse = {
 	generated_at: string;
 	time_zone: string;
@@ -420,11 +440,19 @@ export type AdminDashboardResponse = {
 		succeeded_total: number;
 		failed_total: number;
 		canceled_total: number;
+		business_counts: AdminDashboardBusinessCounts;
 		total: number;
 		items: AdminDashboardTaskStatusItem[];
 	};
 	task_share: AdminDashboardTaskShareItem[];
 	trend_points: AdminDashboardTrendPoint[];
+	llm_health: {
+		calls_24h: number;
+		failed_24h: number;
+		last_failure_at: string | null;
+		top_failure_reasons: AdminDashboardLlmHealthBucket[];
+		top_failure_sources: AdminDashboardLlmHealthBucket[];
+	};
 	window_meta: {
 		selected_window: AdminDashboardWindowValue;
 		available_windows: AdminDashboardWindowValue[];
@@ -1067,7 +1095,11 @@ export type AdminTranslationStatusResponse = {
 	running_batches: number;
 	requests_24h: number;
 	completed_batches_24h: number;
+	clean_completed_batches_24h: number;
+	completed_with_issues_batches_24h: number;
 	failed_batches_24h: number;
+	error_work_items_24h: number;
+	missing_work_items_24h: number;
 	avg_wait_ms_24h: number | null;
 	last_batch_finished_at: string | null;
 };
@@ -1118,6 +1150,15 @@ export type AdminTranslationBatchListItem = {
 	started_at: string | null;
 	finished_at: string | null;
 	updated_at: string;
+	result_summary: {
+		ready: number;
+		error: number;
+		missing: number;
+		disabled: number;
+		queued: number;
+		running: number;
+	};
+	business_outcome: AdminBusinessOutcome;
 };
 export type AdminTranslationBatchesResponse = {
 	items: AdminTranslationBatchListItem[];

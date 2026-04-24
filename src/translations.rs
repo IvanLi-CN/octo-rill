@@ -253,7 +253,11 @@ pub struct AdminTranslationStatusResponse {
     pub running_batches: i64,
     pub requests_24h: i64,
     pub completed_batches_24h: i64,
+    pub clean_completed_batches_24h: i64,
+    pub completed_with_issues_batches_24h: i64,
     pub failed_batches_24h: i64,
+    pub error_work_items_24h: i64,
+    pub missing_work_items_24h: i64,
     pub avg_wait_ms_24h: Option<i64>,
     pub last_batch_finished_at: Option<String>,
 }
@@ -297,7 +301,17 @@ pub struct AdminTranslationRequestDetailResponse {
     pub result: AdminTranslationRequestResultItem,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AdminTranslationBatchResultSummary {
+    pub ready: i64,
+    pub error: i64,
+    pub missing: i64,
+    pub disabled: i64,
+    pub queued: i64,
+    pub running: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminTranslationBatchListItem {
     pub id: String,
     pub status: String,
@@ -310,6 +324,8 @@ pub struct AdminTranslationBatchListItem {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub updated_at: String,
+    pub result_summary: AdminTranslationBatchResultSummary,
+    pub business_outcome: api::AdminBusinessOutcome,
 }
 
 #[derive(Debug, Serialize)]
@@ -336,6 +352,22 @@ pub struct AdminTranslationBatchDetailResponse {
     pub batch: AdminTranslationBatchListItem,
     pub items: Vec<AdminTranslationBatchResultItem>,
     pub llm_calls: Vec<AdminTranslationLinkedLlmCall>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AdminTranslationBatchRow {
+    id: String,
+    status: String,
+    trigger_reason: String,
+    worker_slot: i64,
+    request_count: i64,
+    item_count: i64,
+    estimated_input_tokens: i64,
+    error_text: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -760,6 +792,130 @@ fn request_status_from_work_item_status(work_item_status: &str) -> &'static str 
         "queued"
     } else {
         "running"
+    }
+}
+
+fn translation_batch_item_effective_result_status_sql(
+    batch_result_col: &str,
+    work_result_col: &str,
+    work_status_col: &str,
+) -> String {
+    format!(
+        "CASE \
+            WHEN {batch_result_col} IS NOT NULL AND {batch_result_col} != '' THEN {batch_result_col} \
+            WHEN {work_result_col} IS NOT NULL AND {work_result_col} != '' THEN {work_result_col} \
+            WHEN {work_status_col} = 'queued' OR {work_status_col} IS NULL THEN 'queued' \
+            ELSE 'running' \
+        END",
+    )
+}
+
+fn translation_batch_result_summary_total(summary: &AdminTranslationBatchResultSummary) -> i64 {
+    summary.ready
+        + summary.error
+        + summary.missing
+        + summary.disabled
+        + summary.queued
+        + summary.running
+}
+
+fn translation_batch_business_outcome(
+    status: &str,
+    summary: &AdminTranslationBatchResultSummary,
+    expected_total: i64,
+    error_text: Option<&str>,
+) -> api::AdminBusinessOutcome {
+    let total = translation_batch_result_summary_total(summary).max(expected_total.max(0));
+    let result_pending = summary.queued > 0 || summary.running > 0;
+
+    match status {
+        "failed" => api::AdminBusinessOutcome {
+            code: "failed".to_owned(),
+            label: "业务失败".to_owned(),
+            message: error_text
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("批次执行失败，未产出可用结果。")
+                .to_owned(),
+        },
+        "queued" | "running" => api::AdminBusinessOutcome {
+            code: "unknown".to_owned(),
+            label: "处理中".to_owned(),
+            message: "批次仍在执行中，业务结果尚未稳定。".to_owned(),
+        },
+        _ if total <= 0 => api::AdminBusinessOutcome {
+            code: "unknown".to_owned(),
+            label: "结果未知".to_owned(),
+            message: "批次已结束，但没有可汇总的条目结果。".to_owned(),
+        },
+        _ if summary.disabled == total => api::AdminBusinessOutcome {
+            code: "disabled".to_owned(),
+            label: "AI 已禁用".to_owned(),
+            message: "批次条目全部命中禁用路径，未执行翻译。".to_owned(),
+        },
+        _ if summary.error + summary.missing > 0 && summary.ready == 0 && summary.disabled == 0 => {
+            api::AdminBusinessOutcome {
+                code: "failed".to_owned(),
+                label: "业务失败".to_owned(),
+                message: "批次已完成，但全部条目失败或缺失。".to_owned(),
+            }
+        }
+        _ if summary.error > 0 || summary.missing > 0 => api::AdminBusinessOutcome {
+            code: "partial".to_owned(),
+            label: "部分成功".to_owned(),
+            message: "批次已完成，但仍有条目失败或缺失。".to_owned(),
+        },
+        _ if result_pending => api::AdminBusinessOutcome {
+            code: "partial".to_owned(),
+            label: "部分成功".to_owned(),
+            message: "批次已标记完成，但仍有条目未收敛。".to_owned(),
+        },
+        _ if summary.ready == total => api::AdminBusinessOutcome {
+            code: "ok".to_owned(),
+            label: "业务成功".to_owned(),
+            message: "批次条目已全部成功完成。".to_owned(),
+        },
+        _ if summary.ready > 0 && summary.ready + summary.disabled == total => {
+            api::AdminBusinessOutcome {
+                code: "ok".to_owned(),
+                label: "业务成功".to_owned(),
+                message: "批次已完成；可翻译条目成功完成，其余条目命中禁用路径。".to_owned(),
+            }
+        }
+        _ => api::AdminBusinessOutcome {
+            code: "unknown".to_owned(),
+            label: "结果未知".to_owned(),
+            message: "批次已结束，但缺少稳定的业务结果统计。".to_owned(),
+        },
+    }
+}
+
+impl AdminTranslationBatchRow {
+    fn into_list_item(
+        self,
+        result_summary: AdminTranslationBatchResultSummary,
+    ) -> AdminTranslationBatchListItem {
+        let business_outcome = translation_batch_business_outcome(
+            self.status.as_str(),
+            &result_summary,
+            self.item_count,
+            self.error_text.as_deref(),
+        );
+        AdminTranslationBatchListItem {
+            id: self.id,
+            status: self.status,
+            trigger_reason: self.trigger_reason,
+            worker_slot: self.worker_slot,
+            request_count: self.request_count,
+            item_count: self.item_count,
+            estimated_input_tokens: self.estimated_input_tokens,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            updated_at: self.updated_at,
+            result_summary,
+            business_outcome,
+        }
     }
 }
 
@@ -1582,7 +1738,9 @@ pub async fn admin_patch_translation_runtime_config(
 async fn load_admin_translation_status_response(
     state: &AppState,
 ) -> Result<AdminTranslationStatusResponse, ApiError> {
-    let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    let now_utc = Utc::now();
+    let since = (now_utc - chrono::Duration::hours(24)).to_rfc3339();
+    let until = now_utc.to_rfc3339();
     let runtime_config = state.translation_scheduler.desired_config().await;
     let workers = translation_worker_runtime_statuses(state).await;
     let general_worker_concurrency = i64::try_from(
@@ -1635,30 +1793,110 @@ async fn load_admin_translation_status_response(
     .await?;
     let requests_24h = scalar_i64(
         state,
-        "SELECT COUNT(*) FROM translation_requests WHERE created_at >= ?",
-        &[&since],
+        "SELECT COUNT(*) FROM translation_requests WHERE created_at >= ? AND created_at <= ?",
+        &[&since, &until],
     )
     .await?;
-    let completed_batches_24h = scalar_i64(
-        state,
-        "SELECT COUNT(*) FROM translation_batches WHERE created_at >= ? AND status = 'completed'",
-        &[&since],
+    let recent_batches = sqlx::query_as::<_, AdminTranslationBatchRow>(
+        r#"
+        SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
+               error_text, created_at, started_at, finished_at, updated_at
+        FROM translation_batches
+        WHERE created_at >= ?
+          AND created_at <= ?
+        "#,
     )
-    .await?;
-    let failed_batches_24h = scalar_i64(
-        state,
-        "SELECT COUNT(*) FROM translation_batches WHERE created_at >= ? AND status = 'failed'",
-        &[&since],
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let recent_batch_ids = recent_batches
+        .iter()
+        .map(|batch| batch.id.clone())
+        .collect::<Vec<_>>();
+    let recent_summaries =
+        load_translation_batch_result_summaries(state, recent_batch_ids.as_slice()).await?;
+    let completed_batches_24h = i64::try_from(
+        recent_batches
+            .iter()
+            .filter(|batch| batch.status == "completed")
+            .count(),
     )
-    .await?;
+    .unwrap_or(i64::MAX);
+    let failed_batches_24h = i64::try_from(
+        recent_batches
+            .iter()
+            .filter(|batch| batch.status == "failed")
+            .count(),
+    )
+    .unwrap_or(i64::MAX);
+    let mut clean_completed_batches_24h = 0_i64;
+    let mut completed_with_issues_batches_24h = 0_i64;
+    for batch in &recent_batches {
+        if batch.status != "completed" {
+            continue;
+        }
+        let summary = recent_summaries.get(&batch.id).cloned().unwrap_or_default();
+        let outcome = translation_batch_business_outcome(
+            batch.status.as_str(),
+            &summary,
+            batch.item_count,
+            batch.error_text.as_deref(),
+        );
+        match outcome.code.as_str() {
+            "ok" | "disabled" => clean_completed_batches_24h += 1,
+            _ => completed_with_issues_batches_24h += 1,
+        }
+    }
+    let effective_result_status = translation_batch_item_effective_result_status_sql(
+        "bi.result_status",
+        "w.result_status",
+        "w.status",
+    );
+    let error_work_items_24h = sqlx::query_scalar::<_, i64>(&format!(
+        r#"
+        SELECT COUNT(*)
+        FROM translation_batch_items bi
+        JOIN translation_batches b ON b.id = bi.batch_id
+        JOIN translation_work_items w ON w.id = bi.work_item_id
+        WHERE b.created_at >= ?
+          AND b.created_at <= ?
+          AND {effective_result_status} = 'error'
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let missing_work_items_24h = sqlx::query_scalar::<_, i64>(&format!(
+        r#"
+        SELECT COUNT(*)
+        FROM translation_batch_items bi
+        JOIN translation_batches b ON b.id = bi.batch_id
+        JOIN translation_work_items w ON w.id = bi.work_item_id
+        WHERE b.created_at >= ?
+          AND b.created_at <= ?
+          AND {effective_result_status} = 'missing'
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
     let avg_wait_ms_24h = sqlx::query_scalar::<_, Option<f64>>(
         r#"
         SELECT AVG((julianday(deadline_at) - julianday(created_at)) * 86400000.0)
         FROM translation_work_items
-        WHERE finished_at IS NOT NULL AND created_at >= ?
+        WHERE finished_at IS NOT NULL
+          AND created_at >= ?
+          AND created_at <= ?
         "#,
     )
     .bind(since.as_str())
+    .bind(until.as_str())
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?
@@ -1700,7 +1938,11 @@ async fn load_admin_translation_status_response(
         running_batches,
         requests_24h,
         completed_batches_24h,
+        clean_completed_batches_24h,
+        completed_with_issues_batches_24h,
         failed_batches_24h,
+        error_work_items_24h,
+        missing_work_items_24h,
         avg_wait_ms_24h,
         last_batch_finished_at,
     })
@@ -1865,10 +2107,10 @@ pub async fn admin_list_translation_batches(
     .await
     .map_err(ApiError::internal)?;
 
-    let items = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+    let batch_rows = sqlx::query_as::<_, AdminTranslationBatchRow>(
         r#"
         SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
-               created_at, started_at, finished_at, updated_at
+               error_text, created_at, started_at, finished_at, updated_at
         FROM translation_batches
         WHERE (? = 'all' OR status = ?)
         ORDER BY created_at DESC, id DESC
@@ -1882,6 +2124,21 @@ pub async fn admin_list_translation_batches(
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::internal)?;
+    let summary_map = load_translation_batch_result_summaries(
+        state.as_ref(),
+        &batch_rows
+            .iter()
+            .map(|batch| batch.id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let items = batch_rows
+        .into_iter()
+        .map(|batch| {
+            let summary = summary_map.get(&batch.id).cloned().unwrap_or_default();
+            batch.into_list_item(summary)
+        })
+        .collect::<Vec<_>>();
 
     Ok(Json(AdminTranslationBatchesResponse {
         items,
@@ -1898,10 +2155,10 @@ pub async fn admin_get_translation_batch_detail(
 ) -> Result<Json<AdminTranslationBatchDetailResponse>, ApiError> {
     let _acting_user_id = api::require_admin_user_id(state.as_ref(), &session).await?;
     let batch_id = api::parse_local_id_param(batch_id, "batch_id")?;
-    let batch = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+    let batch = sqlx::query_as::<_, AdminTranslationBatchRow>(
         r#"
         SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
-               created_at, started_at, finished_at, updated_at
+               error_text, created_at, started_at, finished_at, updated_at
         FROM translation_batches
         WHERE id = ?
         LIMIT 1
@@ -1918,6 +2175,10 @@ pub async fn admin_get_translation_batch_detail(
             "translation batch not found",
         )
     })?;
+    let summary_map =
+        load_translation_batch_result_summaries(state.as_ref(), std::slice::from_ref(&batch_id))
+            .await?;
+    let batch = batch.into_list_item(summary_map.get(&batch_id).cloned().unwrap_or_default());
 
     let items = load_translation_result_items_by_batch(state.as_ref(), &batch_id).await?;
     let llm_calls = sqlx::query_as::<_, AdminTranslationLinkedLlmCall>(
@@ -4557,29 +4818,98 @@ async fn load_translation_request_detail(
     Ok(LoadedRequestDetail { request, result })
 }
 
+async fn load_translation_batch_result_summaries(
+    state: &AppState,
+    batch_ids: &[String],
+) -> Result<HashMap<String, AdminTranslationBatchResultSummary>, ApiError> {
+    let mut result = HashMap::new();
+    if batch_ids.is_empty() {
+        return Ok(result);
+    }
+
+    let effective_result_status = translation_batch_item_effective_result_status_sql(
+        "bi.result_status",
+        "w.result_status",
+        "w.status",
+    );
+    let mut query = sqlx::QueryBuilder::<Sqlite>::new(format!(
+        r#"
+        SELECT
+          bi.batch_id AS batch_id,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'ready' THEN 1 ELSE 0 END), 0) AS ready_count,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'error' THEN 1 ELSE 0 END), 0) AS error_count,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'missing' THEN 1 ELSE 0 END), 0) AS missing_count,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'disabled' THEN 1 ELSE 0 END), 0) AS disabled_count,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+          COALESCE(SUM(CASE WHEN {effective_result_status} = 'running' THEN 1 ELSE 0 END), 0) AS running_count
+        FROM translation_batch_items bi
+        JOIN translation_work_items w ON w.id = bi.work_item_id
+        WHERE bi.batch_id IN ("#
+    ));
+    {
+        let mut separated = query.separated(", ");
+        for batch_id in batch_ids {
+            separated.push_bind(batch_id);
+        }
+    }
+    query.push(
+        r#")
+        GROUP BY bi.batch_id
+        "#,
+    );
+
+    let rows = query
+        .build_query_as::<(String, i64, i64, i64, i64, i64, i64)>()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    for (batch_id, ready, error, missing, disabled, queued, running) in rows {
+        result.insert(
+            batch_id,
+            AdminTranslationBatchResultSummary {
+                ready,
+                error,
+                missing,
+                disabled,
+                queued,
+                running,
+            },
+        );
+    }
+
+    Ok(result)
+}
+
 async fn load_translation_result_items_by_batch(
     state: &AppState,
     batch_id: &str,
 ) -> Result<Vec<AdminTranslationBatchResultItem>, ApiError> {
-    let rows = sqlx::query(
+    let effective_result_status = translation_batch_item_effective_result_status_sql(
+        "b.result_status",
+        "w.result_status",
+        "w.status",
+    );
+    let sql = format!(
         r#"
         SELECT w.id AS work_item_id, b.entity_id, b.kind, b.variant,
-               COALESCE(b.result_status, w.result_status, 'queued') AS result_status,
+               {effective_result_status} AS result_status,
                w.title_zh, w.summary_md, w.body_md, COALESCE(b.error_text, w.error_text) AS error_text,
                MIN(r.producer_ref) AS producer_ref
         FROM translation_batch_items b
         JOIN translation_work_items w ON w.id = b.work_item_id
         LEFT JOIN translation_requests r ON r.work_item_id = w.id
         WHERE b.batch_id = ?
-        GROUP BY w.id, b.entity_id, b.kind, b.variant, b.result_status, w.result_status,
+        GROUP BY w.id, b.entity_id, b.kind, b.variant, b.result_status, w.result_status, w.status,
                  w.title_zh, w.summary_md, w.body_md, b.error_text, w.error_text
         ORDER BY b.item_index ASC, w.id ASC
         "#,
-    )
-    .bind(batch_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    );
+    let rows = sqlx::query(sql.as_str())
+        .bind(batch_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
 
     Ok(rows
         .into_iter()
@@ -5943,6 +6273,19 @@ mod tests {
                 started_at: Some(now.to_owned()),
                 finished_at: Some(now.to_owned()),
                 updated_at: now.to_owned(),
+                result_summary: AdminTranslationBatchResultSummary {
+                    ready: 0,
+                    error: 1,
+                    missing: 0,
+                    disabled: 0,
+                    queued: 0,
+                    running: 0,
+                },
+                business_outcome: api::AdminBusinessOutcome {
+                    code: "failed".to_owned(),
+                    label: "业务失败".to_owned(),
+                    message: "批次已完成，但全部条目失败或缺失。".to_owned(),
+                },
             },
             items,
             llm_calls: Vec::new(),
@@ -6054,6 +6397,19 @@ mod tests {
                 started_at: Some("2026-04-15T03:24:12Z".to_owned()),
                 finished_at: Some("2026-04-15T03:24:13Z".to_owned()),
                 updated_at: "2026-04-15T03:24:13Z".to_owned(),
+                result_summary: AdminTranslationBatchResultSummary {
+                    ready: 1,
+                    error: 0,
+                    missing: 0,
+                    disabled: 0,
+                    queued: 0,
+                    running: 0,
+                },
+                business_outcome: api::AdminBusinessOutcome {
+                    code: "ok".to_owned(),
+                    label: "业务成功".to_owned(),
+                    message: "批次条目已全部成功完成。".to_owned(),
+                },
             },
             items: vec![AdminTranslationBatchResultItem {
                 item: TranslationResultItem {
@@ -7949,10 +8305,9 @@ mod tests {
             .await
             .expect("scheduler tick");
 
-        let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+        let row = sqlx::query_as::<_, (i64, i64)>(
             r#"
-            SELECT id, status, trigger_reason, worker_slot, request_count, item_count, estimated_input_tokens,
-                   created_at, started_at, finished_at, updated_at
+            SELECT worker_slot, request_count
             FROM translation_batches
             LIMIT 1
             "#,
@@ -7961,8 +8316,8 @@ mod tests {
         .await
         .expect("load batch");
 
-        assert_eq!(row.worker_slot, 2);
-        assert_eq!(row.request_count, 1);
+        assert_eq!(row.0, 2);
+        assert_eq!(row.1, 1);
     }
 
     #[tokio::test]
@@ -8766,10 +9121,9 @@ mod tests {
             .await
             .expect("shrink runtime");
 
-        let row = sqlx::query_as::<_, AdminTranslationBatchListItem>(
+        let row = sqlx::query_scalar::<_, i64>(
             r#"
-            SELECT id, status, trigger_reason, worker_slot, request_count, item_count,
-                   estimated_input_tokens, created_at, started_at, finished_at, updated_at
+            SELECT worker_slot
             FROM translation_batches
             WHERE id = ?
             "#,
@@ -8779,7 +9133,7 @@ mod tests {
         .await
         .expect("load running batch");
 
-        assert_eq!(row.worker_slot, 3);
+        assert_eq!(row, 3);
     }
 
     #[tokio::test]
@@ -9423,6 +9777,340 @@ mod tests {
         assert_eq!(status.workers.len(), 7);
 
         state.translation_scheduler.abort_all().await;
+    }
+
+    #[test]
+    fn translation_batch_business_outcome_marks_completed_batch_with_errors_as_partial() {
+        let outcome = translation_batch_business_outcome(
+            "completed",
+            &AdminTranslationBatchResultSummary {
+                ready: 2,
+                error: 1,
+                missing: 1,
+                disabled: 0,
+                queued: 0,
+                running: 0,
+            },
+            4,
+            None,
+        );
+        assert_eq!(outcome.code, "partial");
+        assert_eq!(outcome.label, "部分成功");
+    }
+
+    #[test]
+    fn translation_batch_business_outcome_treats_ready_and_disabled_as_clean_completion() {
+        let outcome = translation_batch_business_outcome(
+            "completed",
+            &AdminTranslationBatchResultSummary {
+                ready: 1,
+                error: 0,
+                missing: 0,
+                disabled: 1,
+                queued: 0,
+                running: 0,
+            },
+            2,
+            None,
+        );
+        assert_eq!(outcome.code, "ok");
+        assert_eq!(outcome.label, "业务成功");
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_counts_completed_batches_with_item_issues() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let first = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("status-error"),
+        )
+        .await
+        .expect("create first translation request");
+        let second = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("status-missing"),
+        )
+        .await
+        .expect("create second translation request");
+        let first_work_item = first
+            .result
+            .work_item_id
+            .clone()
+            .expect("first request should have work item");
+        let second_work_item = second
+            .result
+            .work_item_id
+            .clone()
+            .expect("second request should have work item");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', NULL, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-status-issues")
+        .bind("general:release_detail:feed_body:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline")
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(2_i64)
+        .bind(256_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert completed batch");
+
+        for (id, work_item_id, item_index, result_status, error_text) in [
+            (
+                "batch-status-issues-item-1",
+                first_work_item.as_str(),
+                0_i64,
+                "error",
+                Some("upstream 429"),
+            ),
+            (
+                "batch-status-issues-item-2",
+                second_work_item.as_str(),
+                1_i64,
+                "missing",
+                Some("release not found"),
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO translation_batch_items (
+                  id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+                  token_estimate, result_status, error_text, created_at, updated_at
+                ) VALUES (?, 'batch-status-issues', ?, ?, 'release_summary', 'feed_body', ?, 1, 128, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(id)
+            .bind(work_item_id)
+            .bind(item_index)
+            .bind(if item_index == 0 { "status-error" } else { "status-missing" })
+            .bind(result_status)
+            .bind(error_text)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&pool)
+            .await
+            .expect("insert batch item");
+        }
+
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load admin translation status");
+        assert_eq!(status.completed_batches_24h, 1);
+        assert_eq!(status.clean_completed_batches_24h, 0);
+        assert_eq!(status.completed_with_issues_batches_24h, 1);
+        assert_eq!(status.failed_batches_24h, 0);
+        assert_eq!(status.error_work_items_24h, 1);
+        assert_eq!(status.missing_work_items_24h, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_counts_fallback_item_failures_from_work_items() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let request = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("status-fallback-error"),
+        )
+        .await
+        .expect("create translation request");
+        let work_item_id = request
+            .result
+            .work_item_id
+            .clone()
+            .expect("request should have work item");
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'fallback upstream 429',
+                updated_at = ?,
+                finished_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item as failed");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', NULL, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-status-fallback")
+        .bind("general:release_detail:feed_body:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert fallback batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, result_status, error_text, created_at, updated_at
+            ) VALUES (?, 'batch-status-fallback', ?, 0, 'release_summary', 'feed_body', ?, 1, 128, NULL, NULL, ?, ?)
+            "#,
+        )
+        .bind("batch-status-fallback-item-1")
+        .bind(work_item_id.as_str())
+        .bind("status-fallback-error")
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert fallback batch item");
+
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load admin translation status");
+        assert_eq!(status.completed_batches_24h, 1);
+        assert_eq!(status.clean_completed_batches_24h, 0);
+        assert_eq!(status.completed_with_issues_batches_24h, 1);
+        assert_eq!(status.error_work_items_24h, 1);
+        assert_eq!(status.missing_work_items_24h, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_translation_status_excludes_future_dated_batch_metrics() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+
+        let request = create_translation_request(
+            state.as_ref(),
+            "1",
+            "async",
+            &sample_release_item("status-future-error"),
+        )
+        .await
+        .expect("create translation request");
+        let work_item_id = request
+            .result
+            .work_item_id
+            .clone()
+            .expect("request should have work item");
+
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = 'future upstream 429',
+                updated_at = ?,
+                finished_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(future.as_str())
+        .bind(future.as_str())
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark future work item as failed");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batches (
+              id, partition_key, protocol_version, model_profile, target_lang, trigger_reason,
+              worker_slot, request_count, item_count, estimated_input_tokens, status, error_text,
+              created_at, started_at, finished_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', NULL, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("batch-status-future")
+        .bind("general:release_detail:feed_body:zh-CN")
+        .bind(TRANSLATION_PROTOCOL_VERSION)
+        .bind(current_model_profile())
+        .bind("zh-CN")
+        .bind("deadline")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(128_i64)
+        .bind(future.as_str())
+        .bind(future.as_str())
+        .bind(future.as_str())
+        .bind(future.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert future batch");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_batch_items (
+              id, batch_id, work_item_id, item_index, kind, variant, entity_id, producer_count,
+              token_estimate, result_status, error_text, created_at, updated_at
+            ) VALUES (?, 'batch-status-future', ?, 0, 'release_summary', 'feed_body', ?, 1, 128, 'error', 'future upstream 429', ?, ?)
+            "#,
+        )
+        .bind("batch-status-future-item-1")
+        .bind(work_item_id.as_str())
+        .bind("status-future-error")
+        .bind(future.as_str())
+        .bind(future.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert future batch item");
+
+        let status = load_admin_translation_status_response(state.as_ref())
+            .await
+            .expect("load admin translation status");
+        assert_eq!(status.completed_batches_24h, 0);
+        assert_eq!(status.clean_completed_batches_24h, 0);
+        assert_eq!(status.completed_with_issues_batches_24h, 0);
+        assert_eq!(status.failed_batches_24h, 0);
+        assert_eq!(status.error_work_items_24h, 0);
+        assert_eq!(status.missing_work_items_24h, 0);
     }
 
     #[tokio::test]

@@ -79,6 +79,22 @@ const STATUS_ORDER = [
 	"canceled",
 ] as const;
 
+const BUSINESS_COLORS = {
+	ok: "#10b981",
+	partial: "#f59e0b",
+	failed: "#ef4444",
+	disabled: "#94a3b8",
+} as const;
+
+const BUSINESS_LABELS = {
+	ok: "业务成功",
+	partial: "部分成功",
+	failed: "业务失败",
+	disabled: "已禁用",
+} as const;
+
+const BUSINESS_ORDER = ["ok", "partial", "failed", "disabled"] as const;
+
 const WINDOW_LABELS: Record<AdminDashboardWindowValue, string> = {
 	"7d": "近 7 天",
 	"30d": "近 30 天",
@@ -131,6 +147,19 @@ function statusBadgeClass(status: keyof typeof STATUS_COLORS) {
 		case "failed":
 			return "border-red-300 bg-red-100/90 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100";
 		case "canceled":
+			return "border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100";
+	}
+}
+
+function businessBadgeClass(status: keyof typeof BUSINESS_COLORS) {
+	switch (status) {
+		case "ok":
+			return "border-emerald-300 bg-emerald-100/90 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100";
+		case "partial":
+			return "border-amber-300 bg-amber-100/90 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100";
+		case "failed":
+			return "border-red-300 bg-red-100/90 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100";
+		case "disabled":
 			return "border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100";
 	}
 }
@@ -405,11 +434,10 @@ export function AdminDashboard() {
 		() =>
 			statusItems.map((item) => ({
 				label: item.label,
-				queued: item.queued,
-				running: item.running,
-				succeeded: item.succeeded,
-				failed: item.failed,
-				canceled: item.canceled,
+				ok: item.business_counts.ok,
+				partial: item.business_counts.partial,
+				failed: item.business_counts.failed,
+				disabled: item.business_counts.disabled,
 			})),
 		[statusItems],
 	);
@@ -421,6 +449,12 @@ export function AdminDashboard() {
 				翻译: item.translations_total,
 				润色: item.summaries_total,
 				日报: item.briefs_total,
+				翻译部分成功: item.translations_partial,
+				翻译业务失败: item.translations_business_failed,
+				润色部分成功: item.summaries_partial,
+				润色业务失败: item.summaries_business_failed,
+				日报部分成功: item.briefs_partial,
+				日报业务失败: item.briefs_business_failed,
 				active_users: item.active_users,
 				total_users: item.total_users,
 			})),
@@ -437,6 +471,8 @@ export function AdminDashboard() {
 					fill: chartTaskColor(item.label),
 					share_ratio: item.share_ratio,
 					success_rate: item.success_rate,
+					business_success_rate: item.business_success_rate,
+					business_counts: item.business_counts,
 				})),
 		[data],
 	);
@@ -452,16 +488,29 @@ export function AdminDashboard() {
 	}, [statusItems]);
 
 	const totalTodayTasks = data?.status_breakdown.total ?? 0;
+	const businessCounts = data?.status_breakdown.business_counts ?? {
+		ok: 0,
+		partial: 0,
+		failed: 0,
+		disabled: 0,
+	};
+	const businessTerminalTotal =
+		businessCounts.ok +
+		businessCounts.partial +
+		businessCounts.failed +
+		businessCounts.disabled;
 	const successRate =
-		totalTodayTasks > 0
-			? (data?.status_breakdown.succeeded_total ?? 0) / totalTodayTasks
+		businessTerminalTotal > 0 ? businessCounts.ok / businessTerminalTotal : 0;
+	const partialRate =
+		businessTerminalTotal > 0
+			? businessCounts.partial / businessTerminalTotal
 			: 0;
 	const activeRate =
 		(data?.today_live.total_users ?? 0) > 0
 			? (data?.today_live.active_users ?? 0) /
 				(data?.today_live.total_users ?? 1)
 			: 0;
-	const latestTrendPoint = trendChartData.at(-1);
+	const latestTrendPoint = data?.trend_points.at(-1);
 	const maxShareTotal = Math.max(
 		1,
 		...shareChartData.map((item) => item.value),
@@ -471,8 +520,8 @@ export function AdminDashboard() {
 			? highestVolumeTask.total / totalTodayTasks
 			: 0;
 	const failureRate =
-		totalTodayTasks > 0
-			? (data?.status_breakdown.failed_total ?? 0) / totalTodayTasks
+		businessTerminalTotal > 0
+			? businessCounts.failed / businessTerminalTotal
 			: 0;
 
 	if (loading && !data) {
@@ -556,7 +605,7 @@ export function AdminDashboard() {
 						<StatCard
 							label="今日任务总量"
 							value={formatCount(totalTodayTasks)}
-							description={`成功 ${formatCount(data?.status_breakdown.succeeded_total)} · 失败 ${formatCount(data?.status_breakdown.failed_total)}`}
+							description={`业务成功 ${formatCount(businessCounts.ok)} · 部分成功 ${formatCount(businessCounts.partial)} · 业务失败 ${formatCount(businessCounts.failed)}`}
 							dotClass="bg-emerald-500"
 							meta={formatPercent(successRate)}
 						/>
@@ -565,9 +614,9 @@ export function AdminDashboard() {
 					<OverviewSummaryStrip
 						items={[
 							{
-								label: "今日成功率",
+								label: "今日业务成功率",
 								value: formatPercent(successRate),
-								detail: "已完成任务中的成功占比",
+								detail: "已完成业务结果中的成功占比",
 								dotClass: "bg-sky-500",
 							},
 							{
@@ -579,10 +628,10 @@ export function AdminDashboard() {
 								dotClass: "bg-indigo-500",
 							},
 							{
-								label: "今日活跃占比",
-								value: formatPercent(activeRate),
-								detail: "活跃用户相对总用户的覆盖率",
-								dotClass: "bg-foreground",
+								label: "部分成功占比",
+								value: formatPercent(partialRate),
+								detail: "已完成业务结果中的部分成功占比",
+								dotClass: "bg-amber-500",
 							},
 						]}
 					/>
@@ -611,21 +660,19 @@ export function AdminDashboard() {
 								<div>
 									<CardTitle>今日执行状态分布</CardTitle>
 									<CardDescription>
-										按任务类型拆分今日排队 / 运行 / 成功 / 失败 /
-										取消的实时状态。
+										主视图按业务结果拆分今日成功 / 部分成功 / 失败 /
+										禁用；原始任务状态保留在辅助标签中。
 									</CardDescription>
 								</div>
 								<div className="flex flex-wrap gap-2">
-									{STATUS_ORDER.map((status) => (
+									{BUSINESS_ORDER.map((status) => (
 										<Badge
 											key={status}
 											variant="outline"
-											className={statusBadgeClass(status)}
+											className={businessBadgeClass(status)}
 										>
-											{STATUS_LABELS[status]}{" "}
-											{formatCount(
-												data?.status_breakdown[`${status}_total` as const] ?? 0,
-											)}
+											{BUSINESS_LABELS[status]}{" "}
+											{formatCount(businessCounts[status])}
 										</Badge>
 									))}
 								</div>
@@ -657,44 +704,51 @@ export function AdminDashboard() {
 										/>
 										<Tooltip content={<ChartTooltip />} />
 										<Bar
-											dataKey="queued"
-											name="排队"
-											stackId="status"
-											fill={STATUS_COLORS.queued}
+											dataKey="ok"
+											name="业务成功"
+											stackId="business"
+											fill={BUSINESS_COLORS.ok}
 											radius={[6, 6, 0, 0]}
 											isAnimationActive={false}
 										/>
 										<Bar
-											dataKey="running"
-											name="运行中"
-											stackId="status"
-											fill={STATUS_COLORS.running}
-											isAnimationActive={false}
-										/>
-										<Bar
-											dataKey="succeeded"
-											name="成功"
-											stackId="status"
-											fill={STATUS_COLORS.succeeded}
+											dataKey="partial"
+											name="部分成功"
+											stackId="business"
+											fill={BUSINESS_COLORS.partial}
 											isAnimationActive={false}
 										/>
 										<Bar
 											dataKey="failed"
-											name="失败"
-											stackId="status"
-											fill={STATUS_COLORS.failed}
+											name="业务失败"
+											stackId="business"
+											fill={BUSINESS_COLORS.failed}
 											isAnimationActive={false}
 										/>
 										<Bar
-											dataKey="canceled"
-											name="取消"
-											stackId="status"
-											fill={STATUS_COLORS.canceled}
+											dataKey="disabled"
+											name="已禁用"
+											stackId="business"
+											fill={BUSINESS_COLORS.disabled}
 											radius={[6, 6, 0, 0]}
 											isAnimationActive={false}
 										/>
 									</BarChart>
 								</ResponsiveContainer>
+							</div>
+							<div className="mt-3 flex flex-wrap gap-2">
+								{STATUS_ORDER.map((status) => (
+									<Badge
+										key={status}
+										variant="outline"
+										className={statusBadgeClass(status)}
+									>
+										{STATUS_LABELS[status]}{" "}
+										{formatCount(
+											data?.status_breakdown[`${status}_total` as const] ?? 0,
+										)}
+									</Badge>
+								))}
 							</div>
 						</CardContent>
 					</Card>
@@ -769,7 +823,7 @@ export function AdminDashboard() {
 										</div>
 										<div className="rounded-md border bg-card/70 px-3 py-2">
 											<p className="text-muted-foreground font-mono text-[11px]">
-												失败占比
+												业务失败占比
 											</p>
 											<p className="mt-1 text-lg font-semibold">
 												{formatPercent(failureRate)}
@@ -807,9 +861,17 @@ export function AdminDashboard() {
 												value={item.value / maxShareTotal}
 												color={item.fill}
 											/>
-											<p className="text-muted-foreground text-xs">
-												{formatPercent(item.success_rate)} 成功率
-											</p>
+											<div className="flex flex-wrap items-center gap-2 text-xs">
+												<span className="text-muted-foreground">
+													{formatPercent(item.business_success_rate)} 业务成功率
+												</span>
+												<span className="text-muted-foreground">
+													部分成功 {formatCount(item.business_counts.partial)}
+												</span>
+												<span className="text-muted-foreground">
+													业务失败 {formatCount(item.business_counts.failed)}
+												</span>
+											</div>
 										</div>
 									))
 								) : (
@@ -943,23 +1005,113 @@ export function AdminDashboard() {
 											variant="outline"
 											className="border-emerald-300 bg-emerald-100/90 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
 										>
-											{formatPercent(highestVolumeTask.success_rate)} 成功率
+											{formatPercent(highestVolumeTask.business_success_rate)}{" "}
+											业务成功率
 										</Badge>
 									) : null}
 								</div>
 								<div className="flex flex-wrap gap-2">
-									{STATUS_ORDER.map((status) => (
+									{BUSINESS_ORDER.map((status) => (
 										<Badge
 											key={status}
 											variant="outline"
-											className={statusBadgeClass(status)}
+											className={businessBadgeClass(status)}
 										>
-											{STATUS_LABELS[status]}{" "}
-											{formatCount(
-												data?.status_breakdown[`${status}_total` as const] ?? 0,
-											)}
+											{BUSINESS_LABELS[status]}{" "}
+											{formatCount(businessCounts[status])}
 										</Badge>
 									))}
+								</div>
+								<p className="text-muted-foreground text-xs">
+									原始任务态：排队{" "}
+									{formatCount(data?.status_breakdown.queued_total)} · 运行中{" "}
+									{formatCount(data?.status_breakdown.running_total)} · 取消{" "}
+									{formatCount(data?.status_breakdown.canceled_total)}
+								</p>
+							</div>
+						</CardContent>
+					</Card>
+
+					<Card>
+						<CardHeader>
+							<CardTitle>LLM 24h 健康摘要</CardTitle>
+							<CardDescription>
+								直接暴露最近 24 小时调用失败热点，便于定位 429 / 403 /
+								超时等系统性问题。
+							</CardDescription>
+						</CardHeader>
+						<CardContent className="space-y-3">
+							<div className="grid gap-3 sm:grid-cols-3">
+								<MiniMetric
+									label="调用总量"
+									value={formatCount(data?.llm_health.calls_24h)}
+									description="最近 24 小时 LLM 调用次数"
+									dotClass="bg-foreground"
+								/>
+								<MiniMetric
+									label="失败总量"
+									value={formatCount(data?.llm_health.failed_24h)}
+									description={`最近失败 ${formatGeneratedAt(data?.llm_health.last_failure_at)}`}
+									dotClass="bg-red-500"
+								/>
+								<MiniMetric
+									label="失败率"
+									value={formatPercent(
+										(data?.llm_health.calls_24h ?? 0) > 0
+											? (data?.llm_health.failed_24h ?? 0) /
+													(data?.llm_health.calls_24h ?? 1)
+											: 0,
+									)}
+									description="按调用数计算的失败占比"
+									dotClass="bg-amber-500"
+								/>
+							</div>
+							<div className="grid gap-3 lg:grid-cols-2">
+								<div className={cn(SUBPANEL_CLASS, "space-y-2")}>
+									<p className="text-muted-foreground font-mono text-xs">
+										热点失败原因
+									</p>
+									{(data?.llm_health.top_failure_reasons ?? []).length > 0 ? (
+										(data?.llm_health.top_failure_reasons ?? []).map((item) => (
+											<div
+												key={`reason-${item.label}`}
+												className="flex items-start justify-between gap-3 rounded-md border bg-card/70 px-3 py-2"
+											>
+												<p className="text-sm leading-5">{item.label}</p>
+												<p className="font-mono text-xs font-semibold">
+													{formatCount(item.count)}
+												</p>
+											</div>
+										))
+									) : (
+										<p className="text-muted-foreground text-sm">
+											暂无失败原因。
+										</p>
+									)}
+								</div>
+								<div className={cn(SUBPANEL_CLASS, "space-y-2")}>
+									<p className="text-muted-foreground font-mono text-xs">
+										热点失败来源
+									</p>
+									{(data?.llm_health.top_failure_sources ?? []).length > 0 ? (
+										(data?.llm_health.top_failure_sources ?? []).map((item) => (
+											<div
+												key={`source-${item.label}`}
+												className="flex items-start justify-between gap-3 rounded-md border bg-card/70 px-3 py-2"
+											>
+												<p className="font-mono text-xs leading-5">
+													{item.label}
+												</p>
+												<p className="font-mono text-xs font-semibold">
+													{formatCount(item.count)}
+												</p>
+											</div>
+										))
+									) : (
+										<p className="text-muted-foreground text-sm">
+											暂无失败来源。
+										</p>
+									)}
 								</div>
 							</div>
 						</CardContent>
@@ -979,20 +1131,20 @@ export function AdminDashboard() {
 								items={[
 									{
 										label: "翻译",
-										value: formatCount(latestTrendPoint?.翻译),
-										description: "最新日翻译任务量",
+										value: formatCount(latestTrendPoint?.translations_total),
+										description: `部分成功 ${formatCount(latestTrendPoint?.translations_partial)} · 业务失败 ${formatCount(latestTrendPoint?.translations_business_failed)}`,
 										dotClass: "bg-sky-500",
 									},
 									{
 										label: "润色",
-										value: formatCount(latestTrendPoint?.润色),
-										description: "最新日润色任务量",
+										value: formatCount(latestTrendPoint?.summaries_total),
+										description: `部分成功 ${formatCount(latestTrendPoint?.summaries_partial)} · 业务失败 ${formatCount(latestTrendPoint?.summaries_business_failed)}`,
 										dotClass: "bg-indigo-500",
 									},
 									{
 										label: "日报",
-										value: formatCount(latestTrendPoint?.日报),
-										description: "最新日日报任务量",
+										value: formatCount(latestTrendPoint?.briefs_total),
+										description: `部分成功 ${formatCount(latestTrendPoint?.briefs_partial)} · 业务失败 ${formatCount(latestTrendPoint?.briefs_business_failed)}`,
 										dotClass: "bg-emerald-500",
 									},
 								]}
@@ -1124,9 +1276,10 @@ export function AdminDashboard() {
 											<th className="px-4 py-3 font-medium">总量</th>
 											<th className="px-4 py-3 font-medium">排队</th>
 											<th className="px-4 py-3 font-medium">运行中</th>
-											<th className="px-4 py-3 font-medium">成功</th>
-											<th className="px-4 py-3 font-medium">失败</th>
-											<th className="px-4 py-3 font-medium">成功率</th>
+											<th className="px-4 py-3 font-medium">业务成功</th>
+											<th className="px-4 py-3 font-medium">部分成功</th>
+											<th className="px-4 py-3 font-medium">业务失败</th>
+											<th className="px-4 py-3 font-medium">业务成功率</th>
 										</tr>
 									</thead>
 									<tbody>
@@ -1158,13 +1311,16 @@ export function AdminDashboard() {
 													{formatCount(item.running)}
 												</td>
 												<td className="px-4 py-3">
-													{formatCount(item.succeeded)}
+													{formatCount(item.business_counts.ok)}
 												</td>
 												<td className="px-4 py-3">
-													{formatCount(item.failed)}
+													{formatCount(item.business_counts.partial)}
+												</td>
+												<td className="px-4 py-3">
+													{formatCount(item.business_counts.failed)}
 												</td>
 												<td className="px-4 py-3 font-medium">
-													{formatPercent(item.success_rate)}
+													{formatPercent(item.business_success_rate)}
 												</td>
 											</tr>
 										))}

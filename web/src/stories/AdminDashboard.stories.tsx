@@ -2,10 +2,66 @@ import { useEffect, useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, within } from "storybook/test";
 
-import type { AdminDashboardWindowValue } from "@/api";
+import type {
+	AdminDashboardBusinessCounts,
+	AdminDashboardResponse,
+	AdminDashboardTaskShareItem,
+	AdminDashboardTaskStatusItem,
+	AdminDashboardTrendPoint,
+	AdminDashboardWindowValue,
+} from "@/api";
 import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
 
 type PreviewVariant = "default" | "busy" | "quiet" | "empty" | "error";
+type StoryTaskStatusItem = Omit<
+	AdminDashboardTaskStatusItem,
+	"business_counts" | "business_success_rate"
+> & {
+	business_counts?: AdminDashboardBusinessCounts;
+	business_success_rate?: number;
+};
+type StoryTaskShareItem = Omit<
+	AdminDashboardTaskShareItem,
+	"business_counts" | "business_success_rate"
+> & {
+	business_counts?: AdminDashboardBusinessCounts;
+	business_success_rate?: number;
+};
+type StoryTrendPoint = Omit<
+	AdminDashboardTrendPoint,
+	| "translations_partial"
+	| "translations_business_failed"
+	| "summaries_partial"
+	| "summaries_business_failed"
+	| "briefs_partial"
+	| "briefs_business_failed"
+> &
+	Partial<
+		Pick<
+			AdminDashboardTrendPoint,
+			| "translations_partial"
+			| "translations_business_failed"
+			| "summaries_partial"
+			| "summaries_business_failed"
+			| "briefs_partial"
+			| "briefs_business_failed"
+		>
+	>;
+type StoryDashboardPayload = Omit<
+	AdminDashboardResponse,
+	"status_breakdown" | "task_share" | "trend_points" | "llm_health"
+> & {
+	status_breakdown: Omit<
+		AdminDashboardResponse["status_breakdown"],
+		"items" | "business_counts"
+	> & {
+		items: StoryTaskStatusItem[];
+		business_counts?: AdminDashboardBusinessCounts;
+	};
+	task_share: StoryTaskShareItem[];
+	trend_points: StoryTrendPoint[];
+	llm_health?: AdminDashboardResponse["llm_health"];
+};
 
 function buildTrendPoints(
 	window: AdminDashboardWindowValue,
@@ -44,6 +100,179 @@ function buildTrendPoints(
 	});
 }
 
+function inferBusinessCounts(
+	variant: PreviewVariant,
+	taskType: string,
+	succeeded: number,
+	failed: number,
+): AdminDashboardBusinessCounts {
+	if (variant === "quiet" || variant === "empty") {
+		return {
+			ok: succeeded,
+			partial: 0,
+			failed,
+			disabled: 0,
+		};
+	}
+
+	if (taskType === "summarize.release.smart.batch") {
+		const partial = Math.max(
+			0,
+			Math.floor(succeeded * (variant === "busy" ? 0.35 : 0.38)),
+		);
+		return {
+			ok: Math.max(0, succeeded - partial),
+			partial,
+			failed,
+			disabled: 0,
+		};
+	}
+
+	if (taskType === "translate.release.batch") {
+		const partial = Math.max(
+			0,
+			Math.floor(succeeded * (variant === "busy" ? 0.28 : 0.29)),
+		);
+		return {
+			ok: Math.max(0, succeeded - partial),
+			partial,
+			failed,
+			disabled: 0,
+		};
+	}
+
+	const partial = Math.max(
+		0,
+		Math.floor(succeeded * (variant === "busy" ? 0.07 : 0.17)),
+	);
+	return {
+		ok: Math.max(0, succeeded - partial),
+		partial,
+		failed,
+		disabled: 0,
+	};
+}
+
+function finalizePayload(
+	variant: PreviewVariant,
+	payload: StoryDashboardPayload,
+): AdminDashboardResponse {
+	const items = payload.status_breakdown.items.map(
+		(item: StoryTaskStatusItem) => {
+			const business_counts =
+				item.business_counts ??
+				inferBusinessCounts(
+					variant,
+					item.task_type,
+					item.succeeded ?? 0,
+					item.failed ?? 0,
+				);
+			const terminalTotal =
+				business_counts.ok +
+				business_counts.partial +
+				business_counts.failed +
+				business_counts.disabled;
+			return {
+				...item,
+				business_counts,
+				business_success_rate:
+					terminalTotal > 0 ? business_counts.ok / terminalTotal : 0,
+			};
+		},
+	);
+	const business_counts = items.reduce(
+		(
+			acc: AdminDashboardBusinessCounts,
+			item: AdminDashboardTaskStatusItem,
+		) => ({
+			ok: acc.ok + item.business_counts.ok,
+			partial: acc.partial + item.business_counts.partial,
+			failed: acc.failed + item.business_counts.failed,
+			disabled: acc.disabled + item.business_counts.disabled,
+		}),
+		{ ok: 0, partial: 0, failed: 0, disabled: 0 },
+	);
+	const task_share = payload.task_share.map((item: StoryTaskShareItem) => {
+		const match = items.find(
+			(candidate: AdminDashboardTaskStatusItem) =>
+				candidate.task_type === item.task_type,
+		);
+		return {
+			...item,
+			business_counts: match?.business_counts ?? {
+				ok: 0,
+				partial: 0,
+				failed: 0,
+				disabled: 0,
+			},
+			business_success_rate: match?.business_success_rate ?? 0,
+		};
+	});
+
+	return {
+		...payload,
+		status_breakdown: {
+			...payload.status_breakdown,
+			items,
+			business_counts,
+		},
+		task_share,
+		trend_points: payload.trend_points.map(
+			(point: StoryTrendPoint, index: number) => ({
+				...point,
+				translations_partial:
+					point.translations_partial ?? (index % 4 === 0 ? 2 : 1),
+				translations_business_failed:
+					point.translations_business_failed ?? point.translations_failed,
+				summaries_partial:
+					point.summaries_partial ??
+					(index % (variant === "busy" ? 3 : 5) === 0 ? 2 : 1),
+				summaries_business_failed:
+					point.summaries_business_failed ?? point.summaries_failed,
+				briefs_partial:
+					point.briefs_partial ?? (point.briefs_total > 0 ? 1 : 0),
+				briefs_business_failed:
+					point.briefs_business_failed ?? point.briefs_failed,
+			}),
+		),
+		llm_health:
+			payload.llm_health ??
+			(variant === "empty"
+				? {
+						calls_24h: 0,
+						failed_24h: 0,
+						last_failure_at: null,
+						top_failure_reasons: [],
+						top_failure_sources: [],
+					}
+				: {
+						calls_24h: variant === "busy" ? 2196 : 884,
+						failed_24h: variant === "busy" ? 1390 : 214,
+						last_failure_at: "2026-04-18T09:10:00Z",
+						top_failure_reasons: [
+							{
+								label: "429 No available accounts for this model tier",
+								count: variant === "busy" ? 1198 : 132,
+							},
+							{
+								label: "403 Chat upstream returned 403",
+								count: variant === "busy" ? 159 : 38,
+							},
+						],
+						top_failure_sources: [
+							{
+								label: "job.sync.subscriptions.auto_translate",
+								count: variant === "busy" ? 648 : 73,
+							},
+							{
+								label: "job.sync.subscriptions.auto_smart",
+								count: variant === "busy" ? 480 : 59,
+							},
+						],
+					}),
+	};
+}
+
 function buildPayload(
 	variant: PreviewVariant,
 	window: AdminDashboardWindowValue,
@@ -53,7 +282,7 @@ function buildPayload(
 	}
 
 	if (variant === "busy") {
-		return {
+		return finalizePayload(variant, {
 			generated_at: "2026-04-18T09:12:00Z",
 			time_zone: "Asia/Shanghai",
 			summary: {
@@ -155,11 +384,11 @@ function buildPayload(
 				window_end: "2026-04-18",
 				point_count: window === "30d" ? 30 : 7,
 			},
-		};
+		});
 	}
 
 	if (variant === "quiet") {
-		return {
+		return finalizePayload(variant, {
 			generated_at: "2026-04-18T09:12:00Z",
 			time_zone: "Asia/Shanghai",
 			summary: {
@@ -261,11 +490,11 @@ function buildPayload(
 				window_end: "2026-04-18",
 				point_count: window === "30d" ? 30 : 7,
 			},
-		};
+		});
 	}
 
 	if (variant === "empty") {
-		return {
+		return finalizePayload(variant, {
 			generated_at: "2026-04-18T09:12:00Z",
 			time_zone: "Asia/Shanghai",
 			summary: {
@@ -345,10 +574,10 @@ function buildPayload(
 				window_end: "2026-04-18",
 				point_count: window === "30d" ? 30 : 7,
 			},
-		};
+		});
 	}
 
-	return {
+	return finalizePayload(variant, {
 		generated_at: "2026-04-18T09:12:00Z",
 		time_zone: "Asia/Shanghai",
 		summary: {
@@ -450,7 +679,7 @@ function buildPayload(
 			window_end: "2026-04-18",
 			point_count: window === "30d" ? 30 : 7,
 		},
-	};
+	});
 }
 
 function AdminDashboardPreview(props: {
