@@ -1245,6 +1245,25 @@ test("deep link with zero-padded release id still resolves detail", async ({
 	await expect(page.getByText("owner/repo · v1.2.3")).toBeVisible();
 });
 
+test("canonical deep link keeps literal percent sequences in repo tag routes", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseId: "123",
+		detailTitle: "Release release%2F2026.04",
+	});
+
+	await page.goto("/owner/repo/releases/tag/release%252F2026.04?from=briefs");
+	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
+	await expect(page).toHaveURL(
+		/\/owner\/repo\/releases\/tag\/release%252F2026\.04\?from=briefs$/,
+	);
+	await expect(
+		page.getByRole("heading", { name: "Release release%2F2026.04" }),
+	).toBeVisible();
+	await expect(page.getByText("owner/repo · release%2F2026.04")).toBeVisible();
+});
+
 test("feed smart lane auto generates for visible cards by default", async ({
 	page,
 }) => {

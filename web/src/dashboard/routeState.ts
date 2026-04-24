@@ -229,9 +229,9 @@ export function parseDashboardRouteState(input: {
 }): DashboardRouteState {
 	if (input.owner && input.repo && input.tag) {
 		const locator = {
-			owner: decodeSegment(input.owner),
-			repo: decodeSegment(input.repo),
-			tag: decodeSegment(input.tag),
+			owner: input.owner,
+			repo: input.repo,
+			tag: input.tag,
 		};
 		const fromTab = normalizeDashboardReturnTab(input.from);
 		return {

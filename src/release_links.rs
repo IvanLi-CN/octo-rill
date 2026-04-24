@@ -118,8 +118,8 @@ pub fn parse_internal_release_ref(target: &str) -> Option<InternalReleaseRef> {
     let release = joined
         .query_pairs()
         .find_map(|(key, value)| (key == "release").then_some(value.into_owned()));
-    if let (Some(tab), Some(raw_release)) = (tab, release)
-        && tab == "briefs"
+    if let Some(raw_release) = release
+        && tab.as_deref().is_none_or(|value| value == "briefs")
         && raw_release.chars().all(|ch| ch.is_ascii_digit())
         && let Ok(release_id) = raw_release.parse::<i64>()
     {
@@ -232,6 +232,10 @@ mod tests {
     fn parse_internal_release_ref_accepts_legacy_query_links() {
         assert_eq!(
             parse_internal_release_ref("/?release=123&tab=briefs"),
+            Some(InternalReleaseRef::ReleaseId(123))
+        );
+        assert_eq!(
+            parse_internal_release_ref("/?release=123"),
             Some(InternalReleaseRef::ReleaseId(123))
         );
     }

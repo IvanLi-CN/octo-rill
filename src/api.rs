@@ -4756,16 +4756,11 @@ pub async fn get_release_detail_by_repo_tag(
     Path((owner_raw, repo_raw, tag_raw)): Path<(String, String, String)>,
 ) -> Result<Json<ReleaseDetailResponse>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
-    let owner = urlencoding::decode(&owner_raw)
-        .map(|value| value.into_owned())
-        .map_err(|_| ApiError::bad_request("invalid owner"))?;
-    let repo = urlencoding::decode(&repo_raw)
-        .map(|value| value.into_owned())
-        .map_err(|_| ApiError::bad_request("invalid repo"))?;
-    let tag = urlencoding::decode(&tag_raw)
-        .map(|value| value.into_owned())
-        .map_err(|_| ApiError::bad_request("invalid tag"))?;
-    let locator = ReleaseLocator { owner, repo, tag };
+    let locator = ReleaseLocator {
+        owner: owner_raw,
+        repo: repo_raw,
+        tag: tag_raw,
+    };
 
     let row = fetch_release_detail_row_by_locator(state.as_ref(), &user_id, &locator)
         .await?
@@ -11766,11 +11761,12 @@ mod tests {
         brief_contains_release_link, build_compare_digest, build_task_diagnostics,
         ensure_account_enabled, execute_sync_all_sync_with, extract_brief_release_ids,
         extract_translation_fields, feed_item_from_row, get_release_detail,
-        github_access_restricted_error, github_graphql_errors_to_api_error,
-        github_graphql_http_error, github_rate_limited_error, github_reauth_required_error,
-        guard_admin_user_update, has_repo_scope, last_active_is_stale, list_feed, list_releases,
-        llm_call_order_by_clause, load_pending_access_sync_reason, looks_like_json_blob,
-        map_job_action_error, map_public_compare_fallback_error, mark_translation_requested,
+        get_release_detail_by_repo_tag, github_access_restricted_error,
+        github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
+        github_reauth_required_error, guard_admin_user_update, has_repo_scope,
+        last_active_is_stale, list_feed, list_releases, llm_call_order_by_clause,
+        load_pending_access_sync_reason, looks_like_json_blob, map_job_action_error,
+        map_public_compare_fallback_error, mark_translation_requested,
         markdown_structure_preserved, me, normalize_markdown_translation_output,
         normalize_translation_fields, parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
@@ -16714,6 +16710,47 @@ line two",
         assert_eq!(
             detail.html_url,
             "https://github.com/openai/codex/releases/tag/v1.2.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_release_detail_by_repo_tag_keeps_literal_percent_sequences() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET tag_name = ?, name = ?, html_url = ?
+            WHERE release_id = ?
+            "#,
+        )
+        .bind("release%2F2026.04")
+        .bind("Release release%2F2026.04")
+        .bind("https://github.com/openai/codex/releases/tag/release%252F2026.04")
+        .bind(120_i64)
+        .execute(&pool)
+        .await
+        .expect("update release tag");
+        let state = setup_state(pool);
+
+        let Json(detail) = get_release_detail_by_repo_tag(
+            State(state),
+            setup_session(1).await,
+            Path((
+                "openai".to_owned(),
+                "codex".to_owned(),
+                "release%2F2026.04".to_owned(),
+            )),
+        )
+        .await
+        .expect("get release detail by repo tag");
+
+        assert_eq!(detail.release_id, "120");
+        assert_eq!(detail.tag_name, "release%2F2026.04");
+        assert_eq!(
+            detail.html_url,
+            "https://github.com/openai/codex/releases/tag/release%252F2026.04"
         );
     }
 

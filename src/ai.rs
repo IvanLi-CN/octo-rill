@@ -3595,9 +3595,8 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
     out
 }
 
-fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseRef> {
-    let mut seen = HashSet::new();
-    let mut refs = Vec::new();
+fn extract_markdown_link_targets(markdown: &str) -> Vec<String> {
+    let mut targets = Vec::new();
     let mut i = 0usize;
 
     while i < markdown.len() {
@@ -3609,12 +3608,7 @@ fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseR
         {
             let url_start = i + text_end_rel + 2;
             let url_end = url_start + url_end_rel;
-            let target = &markdown[url_start..url_end];
-            if let Some(reference) = parse_internal_release_ref(target)
-                && seen.insert(reference.clone())
-            {
-                refs.push(reference);
-            }
+            targets.push(markdown[url_start..url_end].to_owned());
             i = url_end + 1;
             continue;
         }
@@ -3624,7 +3618,51 @@ fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseR
         i += ch.len_utf8();
     }
 
+    targets
+}
+
+fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseRef> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for target in extract_markdown_link_targets(markdown) {
+        if let Some(reference) = parse_internal_release_ref(&target)
+            && seen.insert(reference.clone())
+        {
+            refs.push(reference);
+        }
+    }
+
     refs
+}
+
+fn parse_legacy_release_id_without_tab(target: &str) -> Option<i64> {
+    let base = Url::parse("https://octorill.local/").expect("valid local base url");
+    let joined = base.join(target.trim()).ok()?;
+
+    if joined.host_str() != Some("octorill.local") {
+        return None;
+    }
+
+    let mut release = None;
+    let mut has_tab = false;
+    for (key, value) in joined.query_pairs() {
+        match key.as_ref() {
+            "tab" => has_tab = true,
+            "release" => release = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    if has_tab {
+        return None;
+    }
+
+    let raw_release = release?;
+    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    raw_release.parse::<i64>().ok()
 }
 
 fn internal_release_ref_matches_digest(
@@ -3830,13 +3868,16 @@ fn preserves_social_summary_items(source: &str, candidate: &str) -> bool {
 }
 
 fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> String {
-    let present = extract_internal_release_ref_sequence(markdown);
+    let link_targets = extract_markdown_link_targets(markdown);
     let mut missing = releases
         .iter()
         .filter(|release| {
-            !present
-                .iter()
-                .any(|reference| internal_release_ref_matches_digest(reference, release))
+            !link_targets.iter().any(|target| {
+                parse_legacy_release_id_without_tab(target).is_none()
+                    && parse_internal_release_ref(target).is_some_and(|reference| {
+                        internal_release_ref_matches_digest(&reference, release)
+                    })
+            })
         })
         .collect::<Vec<_>>();
 
@@ -6958,7 +6999,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_all_release_links_requires_tab_briefs() {
+    fn contains_all_release_links_accepts_bare_release_query_links() {
         let markdown = "- [v1.2.3](/?release=123)";
         let release_123 = test_release_digest(
             123,
@@ -6966,7 +7007,7 @@ mod tests {
             "v1.2.3",
             "https://github.com/acme/rocket/releases/tag/v1.2.3",
         );
-        assert!(!contains_all_release_links(
+        assert!(contains_all_release_links(
             markdown,
             std::slice::from_ref(&release_123),
         ));
