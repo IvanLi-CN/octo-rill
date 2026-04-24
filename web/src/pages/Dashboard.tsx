@@ -162,6 +162,19 @@ const REACTION_CONTENTS: ReactionContent[] = [
 	"eyes",
 ];
 
+type DashboardSessionState = {
+	notifications: NotificationItem[];
+	briefs: BriefItem[];
+	selectedBriefId: string | null;
+	shellHydrated: boolean;
+	sidebarBootstrapped: boolean;
+	notificationsBootstrapped: boolean;
+	reactionTokenBootstrapped: boolean;
+	reactionTokenConfigured: boolean | null;
+};
+
+const dashboardSessionStateByUser = new Map<string, DashboardSessionState>();
+
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
 		if (a.unread !== b.unread) return b.unread - a.unread;
@@ -285,13 +298,18 @@ export function Dashboard(props: {
 					mode: "access" as const,
 				}
 			: null;
+	const sessionState = dashboardSessionStateByUser.get(me.user.id) ?? null;
 
 	const [busy, setBusy] = useState<string | null>(null);
 	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
 		warmStart ? "warm-cache" : "network",
 	);
-	const [bootedFromWarmStart] = useState(() => warmStart !== null);
-	const [shellHydrated, setShellHydrated] = useState(() => warmStart !== null);
+	const [bootedFromWarmStart] = useState(
+		() => warmStart !== null || sessionState?.shellHydrated === true,
+	);
+	const [shellHydrated, setShellHydrated] = useState(
+		() => warmStart !== null || sessionState?.shellHydrated === true,
+	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
@@ -379,7 +397,7 @@ export function Dashboard(props: {
 		[feed.items, pageDefaultLane],
 	);
 	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
-		() => warmStart?.selectedBriefId ?? null,
+		() => sessionState?.selectedBriefId ?? warmStart?.selectedBriefId ?? null,
 	);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
@@ -399,7 +417,7 @@ export function Dashboard(props: {
 	>({});
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
-	>(null);
+	>(() => sessionState?.reactionTokenConfigured ?? null);
 	const [patGuideOpen, setPatGuideOpen] = useState<boolean>(false);
 	const [patGuideMessage, setPatGuideMessage] = useState<string | null>(null);
 	const pendingReactionRef = useRef<{
@@ -437,10 +455,10 @@ export function Dashboard(props: {
 	});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>(
-		() => warmStart?.notifications ?? [],
+		() => sessionState?.notifications ?? warmStart?.notifications ?? [],
 	);
 	const [briefs, setBriefs] = useState<BriefItem[]>(
-		() => warmStart?.briefs ?? [],
+		() => sessionState?.briefs ?? warmStart?.briefs ?? [],
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const [briefsError, setBriefsError] = useState<DashboardSectionError | null>(
@@ -453,10 +471,26 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
 	);
-	const startupBootstrapRequestedRef = useRef(false);
+	const sidebarBootstrapCompletedRef = useRef(
+		sessionState?.sidebarBootstrapped ?? false,
+	);
+	const notificationsBootstrapCompletedRef = useRef(
+		sessionState?.notificationsBootstrapped ?? false,
+	);
+	const reactionTokenBootstrapCompletedRef = useRef(
+		sessionState?.reactionTokenBootstrapped ?? false,
+	);
+	const startupBootstrapRequestedRef = useRef(
+		sidebarBootstrapCompletedRef.current,
+	);
 	const startupSidebarRetriedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
-		initialNotificationBootstrapRef.current,
+		notificationsBootstrapCompletedRef.current ||
+			(initialNotificationBootstrapRef.current &&
+				!startupBootstrapRequestedRef.current),
+	);
+	const reactionTokenBootstrapRequestedRef = useRef(
+		reactionTokenBootstrapCompletedRef.current,
 	);
 	const notificationsRequestInFlightRef = useRef(false);
 	const [sidebarLoading, setSidebarLoading] = useState(
@@ -550,6 +584,10 @@ export function Dashboard(props: {
 					if (prev && b.some((x) => x.id === prev)) return prev;
 					return b[0]?.id ?? null;
 				});
+				sidebarBootstrapCompletedRef.current = true;
+				if (options?.includeNotifications) {
+					notificationsBootstrapCompletedRef.current = true;
+				}
 			} catch (error) {
 				if (isSidebarBootstrapNotificationsError(error)) {
 					throw error.cause;
@@ -579,6 +617,7 @@ export function Dashboard(props: {
 			}
 			try {
 				await loadNotifications(options?.background ? "refresh" : "initial");
+				notificationsBootstrapCompletedRef.current = true;
 			} finally {
 				setNotificationsLoading(false);
 			}
@@ -721,8 +760,19 @@ export function Dashboard(props: {
 			});
 		};
 		startSidebarBootstrap(true);
-		void loadReactionToken();
-	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
+	}, [bootedFromWarmStart, refreshSidebar]);
+
+	useEffect(() => {
+		if (reactionTokenBootstrapRequestedRef.current) {
+			return;
+		}
+		reactionTokenBootstrapRequestedRef.current = true;
+		void loadReactionToken().then((status) => {
+			if (status) {
+				reactionTokenBootstrapCompletedRef.current = true;
+			}
+		});
+	}, [loadReactionToken]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
@@ -1557,6 +1607,26 @@ export function Dashboard(props: {
 			setShellHydrated(true);
 		}
 	}, [feed.loadingInitial, shellHydrated, sidebarLoading]);
+
+	useEffect(() => {
+		dashboardSessionStateByUser.set(me.user.id, {
+			notifications,
+			briefs,
+			selectedBriefId,
+			shellHydrated,
+			sidebarBootstrapped: sidebarBootstrapCompletedRef.current,
+			notificationsBootstrapped: notificationsBootstrapCompletedRef.current,
+			reactionTokenBootstrapped: reactionTokenBootstrapCompletedRef.current,
+			reactionTokenConfigured,
+		});
+	}, [
+		briefs,
+		me.user.id,
+		notifications,
+		reactionTokenConfigured,
+		selectedBriefId,
+		shellHydrated,
+	]);
 
 	useEffect(() => {
 		if (feed.loadingInitial || sidebarLoading) {

@@ -18,7 +18,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
 
 use crate::release_links::{
-    InternalReleaseRef, ReleaseLocator, locator_matches_github_release_url,
+    InternalReleaseRef, ReleaseLocator, build_github_release_url_prefixes,
     parse_internal_release_ref, parse_release_locator_from_github_release_url,
     parse_repo_full_name_from_release_url, resolve_release_refs,
 };
@@ -4713,7 +4713,8 @@ async fn fetch_release_detail_row_by_locator(
     user_id: &str,
     locator: &ReleaseLocator,
 ) -> Result<Option<ReleaseDetailRow>, ApiError> {
-    let rows = sqlx::query_as::<_, ReleaseDetailRow>(
+    let [github_prefix, www_prefix] = build_github_release_url_prefixes(locator);
+    sqlx::query_as::<_, ReleaseDetailRow>(
         r#"
         SELECT
           r.repo_id,
@@ -4747,19 +4748,19 @@ async fn fetch_release_detail_row_by_locator(
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
         WHERE r.tag_name = ?
+          AND (instr(lower(r.html_url), ?) = 1 OR instr(lower(r.html_url), ?) = 1)
         ORDER BY r.published_at DESC, r.created_at DESC, r.release_id DESC
+        LIMIT 1
         "#,
     )
     .bind(user_id)
     .bind(user_id)
     .bind(&locator.tag)
-    .fetch_all(&state.pool)
+    .bind(github_prefix.to_ascii_lowercase())
+    .bind(www_prefix.to_ascii_lowercase())
+    .fetch_optional(&state.pool)
     .await
-    .map_err(ApiError::internal)?;
-
-    Ok(rows
-        .into_iter()
-        .find(|row| locator_matches_github_release_url(locator, &row.html_url)))
+    .map_err(ApiError::internal)
 }
 
 async fn build_release_detail_response(
@@ -5014,6 +5015,8 @@ pub async fn list_briefs(
     }
 
     let mut markdown_release_ids_by_brief = HashMap::<String, Vec<String>>::new();
+    let mut markdown_release_refs_by_brief = HashMap::<String, Vec<InternalReleaseRef>>::new();
+    let mut all_markdown_release_refs = Vec::<InternalReleaseRef>::new();
     for row in &rows {
         if !brief_uses_markdown_release_fallback(&row.generation_source)
             || release_ids_by_brief.contains_key(&row.id)
@@ -5024,17 +5027,29 @@ pub async fn list_briefs(
         if refs.is_empty() {
             continue;
         }
-        let resolved = resolve_release_refs(&state.pool, &refs)
+        all_markdown_release_refs.extend(refs.iter().cloned());
+        markdown_release_refs_by_brief.insert(row.id.clone(), refs);
+    }
+
+    if !all_markdown_release_refs.is_empty() {
+        let resolved = resolve_release_refs(&state.pool, &all_markdown_release_refs)
             .await
             .map_err(ApiError::internal)?;
-        markdown_release_ids_by_brief.insert(
-            row.id.clone(),
-            resolved
-                .ids
+        let resolved_ids_by_ref = resolved
+            .resolved
+            .into_iter()
+            .collect::<HashMap<InternalReleaseRef, i64>>();
+
+        for (brief_id, refs) in markdown_release_refs_by_brief {
+            let release_ids = refs
                 .into_iter()
+                .filter_map(|reference| resolved_ids_by_ref.get(&reference).copied())
                 .map(|value| value.to_string())
-                .collect(),
-        );
+                .collect::<Vec<_>>();
+            if !release_ids.is_empty() {
+                markdown_release_ids_by_brief.insert(brief_id, release_ids);
+            }
+        }
     }
 
     let items = rows
@@ -11887,7 +11902,7 @@ mod tests {
         get_release_detail_by_repo_tag, github_access_restricted_error,
         github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
         github_reauth_required_error, guard_admin_user_update, has_repo_scope,
-        last_active_is_stale, list_feed, list_releases, llm_call_order_by_clause,
+        last_active_is_stale, list_briefs, list_feed, list_releases, llm_call_order_by_clause,
         load_admin_dashboard_today_live_snapshot, load_pending_access_sync_reason,
         looks_like_json_blob, map_job_action_error, map_public_compare_fallback_error,
         mark_translation_requested, markdown_structure_preserved, me, me_delete_passkey,
@@ -17085,6 +17100,78 @@ line two",
             detail.html_url,
             "https://github.com/openai/codex/releases/tag/release%252F2026.04"
         );
+    }
+
+    #[tokio::test]
+    async fn list_briefs_resolves_canonical_repo_tag_links_across_multiple_fallback_rows() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+            "#,
+        )
+        .bind("repo-release-42-121")
+        .bind(42_i64)
+        .bind(121_i64)
+        .bind("node-121")
+        .bind("v1.2.4")
+        .bind("Release v1.2.4")
+        .bind("- item 121")
+        .bind("https://github.com/openai/codex/releases/tag/v1.2.4")
+        .bind("2026-02-24T08:00:00Z")
+        .bind("2026-02-24T08:00:00Z")
+        .bind("2026-02-24T08:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed second shared repo release");
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "- [v1.2.3](/openai/codex/releases/tag/v1.2.3?from=briefs)",
+        )
+        .await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-24",
+            "- [v1.2.4](/openai/codex/releases/tag/v1.2.4?from=briefs)",
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_briefs(State(state), setup_session(1).await)
+            .await
+            .expect("list briefs");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].date, "2026-02-24");
+        assert_eq!(items[0].release_ids, vec!["121".to_owned()]);
+        assert_eq!(items[1].date, "2026-02-23");
+        assert_eq!(items[1].release_ids, vec!["120".to_owned()]);
     }
 
     #[tokio::test]

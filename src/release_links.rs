@@ -32,13 +32,45 @@ pub enum InternalReleaseRef {
 pub struct ResolvedReleaseRefs {
     pub ids: Vec<i64>,
     pub unresolved: Vec<InternalReleaseRef>,
+    pub resolved: Vec<(InternalReleaseRef, i64)>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct ReleaseTagLookupRow {
     release_id: i64,
-    tag_name: String,
     html_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReleaseLocatorMatchKey {
+    owner_lower: String,
+    repo_lower: String,
+    tag: String,
+}
+
+impl From<&ReleaseLocator> for ReleaseLocatorMatchKey {
+    fn from(locator: &ReleaseLocator) -> Self {
+        Self {
+            owner_lower: locator.owner.to_ascii_lowercase(),
+            repo_lower: locator.repo.to_ascii_lowercase(),
+            tag: locator.tag.clone(),
+        }
+    }
+}
+
+fn build_github_release_url_prefix_for_host(locator: &ReleaseLocator, host: &str) -> String {
+    format!(
+        "https://{host}/{}/{}/releases/tag/",
+        urlencoding::encode(&locator.owner),
+        urlencoding::encode(&locator.repo),
+    )
+}
+
+pub(crate) fn build_github_release_url_prefixes(locator: &ReleaseLocator) -> [String; 2] {
+    [
+        build_github_release_url_prefix_for_host(locator, "github.com"),
+        build_github_release_url_prefix_for_host(locator, "www.github.com"),
+    ]
 }
 
 fn decode_path_segment(raw: &str) -> Option<String> {
@@ -76,7 +108,8 @@ pub fn parse_release_locator_from_github_release_url(html_url: &str) -> Option<R
     parse_release_locator_from_url(&parsed)
 }
 
-pub fn locator_matches_github_release_url(locator: &ReleaseLocator, html_url: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn locator_matches_github_release_url(locator: &ReleaseLocator, html_url: &str) -> bool {
     parse_release_locator_from_github_release_url(html_url)
         .is_some_and(|candidate| locator.matches(&candidate))
 }
@@ -138,9 +171,12 @@ where
 {
     let mut ids = Vec::new();
     let mut unresolved = Vec::new();
+    let mut resolved = Vec::new();
     let mut seen_ids = HashSet::<i64>::new();
     let mut seen_refs = HashSet::<InternalReleaseRef>::new();
-    let mut locators = Vec::<ReleaseLocator>::new();
+    let mut seen_locator_keys = HashSet::<ReleaseLocatorMatchKey>::new();
+    let mut locator_refs = Vec::<(InternalReleaseRef, ReleaseLocatorMatchKey)>::new();
+    let mut locator_filters = Vec::<ReleaseLocator>::new();
 
     for reference in refs {
         if !seen_refs.insert(reference.clone()) {
@@ -151,70 +187,86 @@ where
                 if seen_ids.insert(*release_id) {
                     ids.push(*release_id);
                 }
+                resolved.push((reference.clone(), *release_id));
             }
-            InternalReleaseRef::Locator(locator) => locators.push(locator.clone()),
+            InternalReleaseRef::Locator(locator) => {
+                let key = ReleaseLocatorMatchKey::from(locator);
+                if seen_locator_keys.insert(key.clone()) {
+                    locator_filters.push(locator.clone());
+                }
+                locator_refs.push((reference.clone(), key));
+            }
         }
     }
 
-    if locators.is_empty() {
-        return Ok(ResolvedReleaseRefs { ids, unresolved });
+    if locator_filters.is_empty() {
+        return Ok(ResolvedReleaseRefs {
+            ids,
+            unresolved,
+            resolved,
+        });
     }
 
-    let mut tags = Vec::<String>::new();
-    let mut seen_tags = HashSet::<String>::new();
-    for locator in &locators {
-        if seen_tags.insert(locator.tag.clone()) {
-            tags.push(locator.tag.clone());
-        }
-    }
-
-    let placeholders = vec!["?"; tags.len()].join(", ");
+    let predicates = vec![
+        "(tag_name = ? AND (instr(lower(html_url), ?) = 1 OR instr(lower(html_url), ?) = 1))";
+        locator_filters.len()
+    ]
+    .join(" OR ");
     let sql = format!(
         r#"
         SELECT release_id, tag_name, html_url
         FROM repo_releases
-        WHERE tag_name IN ({placeholders})
+        WHERE {predicates}
         ORDER BY published_at DESC, created_at DESC, release_id DESC
         "#
     );
     let mut query = sqlx::query_as::<_, ReleaseTagLookupRow>(&sql);
-    for tag in &tags {
-        query = query.bind(tag);
+    for locator in &locator_filters {
+        let [github_prefix, www_prefix] = build_github_release_url_prefixes(locator);
+        query = query
+            .bind(&locator.tag)
+            .bind(github_prefix.to_ascii_lowercase())
+            .bind(www_prefix.to_ascii_lowercase());
     }
 
     let rows = query.fetch_all(executor).await?;
-    let mut rows_by_tag = HashMap::<String, Vec<ReleaseTagLookupRow>>::new();
+    let mut matched_ids_by_locator = HashMap::<ReleaseLocatorMatchKey, i64>::new();
     for row in rows {
-        rows_by_tag
-            .entry(row.tag_name.clone())
-            .or_default()
-            .push(row);
+        let Some(locator) = parse_release_locator_from_github_release_url(&row.html_url) else {
+            continue;
+        };
+        matched_ids_by_locator
+            .entry(ReleaseLocatorMatchKey::from(&locator))
+            .or_insert(row.release_id);
     }
 
-    for locator in locators {
-        let Some(matched_id) = rows_by_tag.get(&locator.tag).and_then(|rows| {
-            rows.iter()
-                .find(|row| locator_matches_github_release_url(&locator, &row.html_url))
-                .map(|row| row.release_id)
-        }) else {
-            unresolved.push(InternalReleaseRef::Locator(locator));
+    for (reference, key) in locator_refs {
+        let Some(matched_id) = matched_ids_by_locator.get(&key).copied() else {
+            unresolved.push(reference);
             continue;
         };
 
         if seen_ids.insert(matched_id) {
             ids.push(matched_id);
         }
+        resolved.push((reference, matched_id));
     }
 
-    Ok(ResolvedReleaseRefs { ids, unresolved })
+    Ok(ResolvedReleaseRefs {
+        ids,
+        unresolved,
+        resolved,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
     use super::{
         InternalReleaseRef, ReleaseLocator, build_internal_brief_release_href,
         locator_matches_github_release_url, parse_internal_release_ref,
-        parse_release_locator_from_github_release_url,
+        parse_release_locator_from_github_release_url, resolve_release_refs,
     };
 
     #[test]
@@ -280,5 +332,123 @@ mod tests {
             &locator,
             "https://github.com/acme/rocket/releases/tag/release%2F2026.05"
         ));
+    }
+
+    async fn setup_release_lookup_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::query(
+            r#"
+            CREATE TABLE repo_releases (
+              release_id INTEGER NOT NULL PRIMARY KEY,
+              tag_name TEXT NOT NULL,
+              html_url TEXT NOT NULL,
+              published_at TEXT,
+              created_at TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create repo_releases");
+        pool
+    }
+
+    async fn seed_release_lookup_row(
+        pool: &sqlx::SqlitePool,
+        release_id: i64,
+        tag_name: &str,
+        html_url: &str,
+        published_at: &str,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              release_id,
+              tag_name,
+              html_url,
+              published_at,
+              created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(release_id)
+        .bind(tag_name)
+        .bind(html_url)
+        .bind(published_at)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed repo release lookup row");
+    }
+
+    #[tokio::test]
+    async fn resolve_release_refs_matches_repo_and_tag_without_scanning_cross_repo_results() {
+        let pool = setup_release_lookup_pool().await;
+        seed_release_lookup_row(
+            &pool,
+            10,
+            "v1.0.0",
+            "https://github.com/acme/rocket/releases/tag/v1.0.0",
+            "2026-02-10T08:00:00Z",
+            "2026-02-10T08:00:00Z",
+        )
+        .await;
+        seed_release_lookup_row(
+            &pool,
+            11,
+            "v1.0.0",
+            "https://github.com/other/rocket/releases/tag/v1.0.0",
+            "2026-02-11T08:00:00Z",
+            "2026-02-11T08:00:00Z",
+        )
+        .await;
+        seed_release_lookup_row(
+            &pool,
+            12,
+            "v1.0.0",
+            "https://github.com/acme/rocket/releases/tag/v1.0.0",
+            "2026-02-12T08:00:00Z",
+            "2026-02-12T08:00:00Z",
+        )
+        .await;
+        seed_release_lookup_row(
+            &pool,
+            13,
+            "release%2F2026.04",
+            "https://github.com/acme/rocket/releases/tag/release%252F2026.04",
+            "2026-02-13T08:00:00Z",
+            "2026-02-13T08:00:00Z",
+        )
+        .await;
+
+        let refs = vec![
+            InternalReleaseRef::Locator(ReleaseLocator {
+                owner: "Acme".to_owned(),
+                repo: "Rocket".to_owned(),
+                tag: "v1.0.0".to_owned(),
+            }),
+            InternalReleaseRef::Locator(ReleaseLocator {
+                owner: "acme".to_owned(),
+                repo: "rocket".to_owned(),
+                tag: "release%2F2026.04".to_owned(),
+            }),
+        ];
+
+        let resolved = resolve_release_refs(&pool, &refs)
+            .await
+            .expect("resolve refs");
+
+        assert_eq!(resolved.ids, vec![12, 13]);
+        assert!(resolved.unresolved.is_empty());
+        assert_eq!(
+            resolved.resolved,
+            vec![(refs[0].clone(), 12), (refs[1].clone(), 13),]
+        );
     }
 }
