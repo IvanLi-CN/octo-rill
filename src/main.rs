@@ -11,6 +11,7 @@ mod jobs;
 mod linuxdo;
 mod local_id;
 mod passkeys;
+mod release_links;
 mod runtime;
 mod server;
 mod state;

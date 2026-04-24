@@ -8,7 +8,7 @@ import {
 
 primeDashboardRouteSurfaceForStartup();
 
-export const Route = createFileRoute("/")({
+export const Route = createFileRoute("/followers")({
 	validateSearch: validateDashboardSearch,
 	pendingMs: 0,
 	pendingMinMs: 200,

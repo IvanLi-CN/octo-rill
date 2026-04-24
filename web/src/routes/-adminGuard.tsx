@@ -16,6 +16,7 @@ export function useRequiredAdmin() {
 			search: {
 				tab: undefined,
 				release: undefined,
+				from: undefined,
 			},
 			replace: true,
 		});

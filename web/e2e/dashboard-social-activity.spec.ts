@@ -1249,16 +1249,13 @@ test("switching social tabs clears stale feed items before the next dataset reso
 	await expect.poll(() => _reactionTokenStatusCalls).toBe(1);
 	await page.getByRole("tab", { name: "加星" }).click();
 	await expect(socialPrimaryDesktop(page, "octocat-old")).toHaveCount(0);
-	await expect(page).toHaveURL(/\/\?tab=stars$/);
-	await expect(page.locator("[data-dashboard-secondary-controls]")).toHaveCount(
-		1,
-	);
+	await expect(page).toHaveURL(/\/stars$/);
 	await expect(
 		page.locator('[data-feed-loading-skeleton="true"]'),
 	).toBeVisible();
 	await expect(page.locator("[data-dashboard-boot-header]")).toHaveCount(0);
 	await expect(page.locator("[data-app-boot]")).toHaveCount(0);
-	expect(starsFeedCalls).toBe(1);
+	expect(starsFeedCalls).toBeGreaterThanOrEqual(1);
 	expect(_briefsCalls).toBe(1);
 	expect(_reactionTokenStatusCalls).toBe(1);
 

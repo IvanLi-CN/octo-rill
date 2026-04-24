@@ -140,6 +140,13 @@
 - 开放问题：无。
 - 假设：Dashboard 的 feed-backed tabs 继续共用当前 `useFeed` 初载语义，本轮仅在页面层切开启动骨架边界。
 
+## 变更记录（Change log）
+
+- 2026-04-17: 新建 follow-up spec，冻结“SPA 内 tab 切换不得回退到 Dashboard startup skeleton”的验收口径。
+- 2026-04-17: 实现完成；Dashboard shell hydration guard、Storybook pending story、Playwright 回归与视觉证据路径已补齐。
+- 2026-04-17: 主人确认本轮不需要截图资产，最终以本地浏览器手测替代截图落盘。
+- 2026-04-22: 同步 Dashboard 主 tab current truth；SPA tab 切换的 canonical URL 已切到 pathname-driven `/stars` 等路径。
+
 ## 参考（References）
 
 - `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`

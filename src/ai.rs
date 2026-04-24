@@ -19,7 +19,13 @@ use crate::{
     admin_runtime,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    jobs, local_id, runtime,
+    jobs, local_id,
+    release_links::{
+        InternalReleaseRef, build_internal_brief_release_href_from_html_url,
+        parse_internal_release_ref, parse_release_locator_from_github_release_url,
+        parse_repo_full_name_from_release_url, resolve_release_refs,
+    },
+    runtime,
     state::AppState,
 };
 
@@ -2502,22 +2508,6 @@ fn compact_link_label(raw: &str) -> String {
     truncate_chars(raw, 64)
 }
 
-fn parse_repo_full_name_from_release_url(html_url: &str) -> Option<String> {
-    let parsed = Url::parse(html_url).ok()?;
-    let host = parsed.host_str()?;
-    if host != "github.com" && host != "www.github.com" {
-        return None;
-    }
-
-    let mut segments = parsed.path_segments()?;
-    let owner = segments.next()?.trim();
-    let repo = segments.next()?.trim();
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some(format!("{owner}/{repo}"))
-}
-
 fn resolve_release_full_name(html_url: &str, repo_id: i64) -> String {
     parse_repo_full_name_from_release_url(html_url).unwrap_or_else(|| format!("unknown/{repo_id}"))
 }
@@ -2537,10 +2527,7 @@ fn is_allowed_github_url(raw: &str) -> bool {
 
 fn is_allowed_markdown_link_target(raw: &str) -> bool {
     let target = raw.trim();
-    if target.starts_with("/?tab=briefs&release=") {
-        return true;
-    }
-    is_allowed_github_url(target)
+    parse_internal_release_ref(target).is_some() || is_allowed_github_url(target)
 }
 
 fn trim_url_suffix(raw: &str) -> (&str, &str) {
@@ -2715,7 +2702,7 @@ fn is_canonical_release_line(line: &str) -> bool {
     }
 
     first_markdown_link_target(line.trim_start_matches("- "))
-        .and_then(parse_internal_release_id)
+        .and_then(parse_internal_release_ref)
         .is_some()
 }
 
@@ -2883,7 +2870,8 @@ fn brief_content_is_canonical(markdown: &str) -> bool {
 }
 
 fn preserves_release_link_sequence(source: &str, candidate: &str) -> bool {
-    extract_internal_release_id_sequence(source) == extract_internal_release_id_sequence(candidate)
+    extract_internal_release_ref_sequence(source)
+        == extract_internal_release_ref_sequence(candidate)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3542,7 +3530,9 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
             ));
 
             for release in &repo.releases {
-                let internal_link = format!("/?tab=briefs&release={}", release.release_id);
+                let internal_link =
+                    build_internal_brief_release_href_from_html_url(&release.html_url)
+                        .unwrap_or_else(|| format!("/?tab=briefs&release={}", release.release_id));
                 let prerelease_mark = if release.is_prerelease {
                     " · 预发布"
                 } else {
@@ -3605,33 +3595,8 @@ fn build_brief_markdown(repos: &[RepoRendered], social: &SocialSummaryRendered) 
     out
 }
 
-fn parse_internal_release_id(target: &str) -> Option<i64> {
-    let base = Url::parse("https://octorill.local/").expect("valid local base url");
-    let joined = base.join(target.trim()).ok()?;
-
-    if joined.host_str() != Some("octorill.local") {
-        return None;
-    }
-    let tab = joined
-        .query_pairs()
-        .find_map(|(k, v)| (k == "tab").then_some(v.into_owned()))?;
-    if tab != "briefs" {
-        return None;
-    }
-
-    let raw_release = joined
-        .query_pairs()
-        .find_map(|(k, v)| (k == "release").then_some(v.into_owned()))?;
-    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-
-    raw_release.parse::<i64>().ok()
-}
-
-fn extract_internal_release_id_sequence(markdown: &str) -> Vec<i64> {
-    let mut seen = HashSet::new();
-    let mut ids = Vec::new();
+fn extract_markdown_link_targets(markdown: &str) -> Vec<String> {
+    let mut targets = Vec::new();
     let mut i = 0usize;
 
     while i < markdown.len() {
@@ -3643,12 +3608,7 @@ fn extract_internal_release_id_sequence(markdown: &str) -> Vec<i64> {
         {
             let url_start = i + text_end_rel + 2;
             let url_end = url_start + url_end_rel;
-            let target = &markdown[url_start..url_end];
-            if let Some(release_id) = parse_internal_release_id(target)
-                && seen.insert(release_id)
-            {
-                ids.push(release_id);
-            }
+            targets.push(markdown[url_start..url_end].to_owned());
             i = url_end + 1;
             continue;
         }
@@ -3658,15 +3618,64 @@ fn extract_internal_release_id_sequence(markdown: &str) -> Vec<i64> {
         i += ch.len_utf8();
     }
 
-    ids
+    targets
 }
 
-fn extract_internal_release_ids(markdown: &str) -> HashSet<i64> {
-    let mut ids = HashSet::new();
-    for release_id in extract_internal_release_id_sequence(markdown) {
-        ids.insert(release_id);
+fn extract_internal_release_ref_sequence(markdown: &str) -> Vec<InternalReleaseRef> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for target in extract_markdown_link_targets(markdown) {
+        if let Some(reference) = parse_internal_release_ref(&target)
+            && seen.insert(reference.clone())
+        {
+            refs.push(reference);
+        }
     }
-    ids
+
+    refs
+}
+
+fn parse_legacy_release_id_without_tab(target: &str) -> Option<i64> {
+    let base = Url::parse("https://octorill.local/").expect("valid local base url");
+    let joined = base.join(target.trim()).ok()?;
+
+    if joined.host_str() != Some("octorill.local") {
+        return None;
+    }
+
+    let mut release = None;
+    let mut has_tab = false;
+    for (key, value) in joined.query_pairs() {
+        match key.as_ref() {
+            "tab" => has_tab = true,
+            "release" => release = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    if has_tab {
+        return None;
+    }
+
+    let raw_release = release?;
+    if !raw_release.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    raw_release.parse::<i64>().ok()
+}
+
+fn internal_release_ref_matches_digest(
+    reference: &InternalReleaseRef,
+    release: &ReleaseDigest,
+) -> bool {
+    match reference {
+        InternalReleaseRef::ReleaseId(release_id) => *release_id == release.release_id,
+        InternalReleaseRef::Locator(locator) => {
+            parse_release_locator_from_github_release_url(&release.html_url)
+                .is_some_and(|candidate| locator.matches(&candidate))
+        }
+    }
 }
 
 async fn load_release_digests_by_ids<'e, E>(
@@ -3787,9 +3796,13 @@ where
     ))
 }
 
-fn contains_all_release_links(markdown: &str, release_ids: &[i64]) -> bool {
-    let present = extract_internal_release_ids(markdown);
-    release_ids.iter().all(|id| present.contains(id))
+fn contains_all_release_links(markdown: &str, releases: &[ReleaseDigest]) -> bool {
+    let present = extract_internal_release_ref_sequence(markdown);
+    releases.iter().all(|release| {
+        present
+            .iter()
+            .any(|reference| internal_release_ref_matches_digest(reference, release))
+    })
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -3855,10 +3868,17 @@ fn preserves_social_summary_items(source: &str, candidate: &str) -> bool {
 }
 
 fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> String {
-    let present = extract_internal_release_ids(markdown);
+    let link_targets = extract_markdown_link_targets(markdown);
     let mut missing = releases
         .iter()
-        .filter(|release| !present.contains(&release.release_id))
+        .filter(|release| {
+            !link_targets.iter().any(|target| {
+                parse_legacy_release_id_without_tab(target).is_none()
+                    && parse_internal_release_ref(target).is_some_and(|reference| {
+                        internal_release_ref_matches_digest(&reference, release)
+                    })
+            })
+        })
         .collect::<Vec<_>>();
 
     if missing.is_empty() {
@@ -3874,10 +3894,9 @@ fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> 
     out.push_str("## Release links\n");
     for release in missing {
         let label = escape_markdown_link_text(&format!("{}/{}", release.full_name, release.title));
-        out.push_str(&format!(
-            "- [{}](/?tab=briefs&release={})\n",
-            label, release.release_id
-        ));
+        let href = build_internal_brief_release_href_from_html_url(&release.html_url)
+            .unwrap_or_else(|| format!("/?tab=briefs&release={}", release.release_id));
+        out.push_str(&format!("- [{}]({})\n", label, href));
     }
     out
 }
@@ -3885,7 +3904,7 @@ fn reconcile_brief_release_links(markdown: &str, releases: &[ReleaseDigest]) -> 
 async fn polish_brief_markdown(
     state: &AppState,
     markdown: &str,
-    release_ids: &[i64],
+    releases: &[ReleaseDigest],
 ) -> Option<String> {
     let social_structure_rule = match extract_social_summary_items(markdown) {
         SocialSummaryItems {
@@ -3917,7 +3936,7 @@ async fn polish_brief_markdown(
         }
     };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /?tab=briefs&release=...）；\n{social_structure_rule}\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/?tab=briefs&release=...)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
@@ -3935,7 +3954,7 @@ async fn polish_brief_markdown(
     if !brief_content_is_canonical(&sanitized) {
         return None;
     }
-    if !contains_all_release_links(&sanitized, release_ids) {
+    if !contains_all_release_links(&sanitized, releases) {
         return None;
     }
     if !preserves_release_link_sequence(markdown, &sanitized) {
@@ -3991,8 +4010,7 @@ async fn build_brief_content_from_digests(
         });
     }
 
-    let release_ids = releases.iter().map(|r| r.release_id).collect::<Vec<_>>();
-    if let Some(polished) = polish_brief_markdown(state, &deterministic, &release_ids).await {
+    if let Some(polished) = polish_brief_markdown(state, &deterministic, &releases).await {
         return Ok(BuiltBriefContent {
             content_markdown: reconcile_brief_release_links(&polished, &releases),
             releases,
@@ -4588,7 +4606,18 @@ async fn load_stored_brief_release_ids(
         return Ok(release_ids);
     }
 
-    Ok(extract_internal_release_id_sequence(content_markdown))
+    let refs = extract_internal_release_ref_sequence(content_markdown);
+    let resolved = resolve_release_refs(&state.pool, &refs)
+        .await
+        .context("failed to resolve brief markdown release links")?;
+    if !resolved.unresolved.is_empty() {
+        anyhow::bail!(
+            "historical brief references unresolved release links: {:?}",
+            resolved.unresolved
+        );
+    }
+
+    Ok(resolved.ids)
 }
 
 async fn load_stored_brief_repo_ids(
@@ -5250,9 +5279,18 @@ pub async fn recompute_legacy_brief_snapshot(
             && existing.effective_time_zone.is_some()
             && existing.effective_local_boundary.is_some();
         if !is_normalized_snapshot {
-            let legacy_release_ids = extract_internal_release_id_sequence(&legacy.content_markdown);
+            let legacy_refs = extract_internal_release_ref_sequence(&legacy.content_markdown);
+            let legacy_resolved = resolve_release_refs(&mut *tx, &legacy_refs)
+                .await
+                .context("failed to resolve colliding legacy brief release links")?;
+            if !legacy_resolved.unresolved.is_empty() {
+                anyhow::bail!(
+                    "historical brief references unresolved release links: {:?}",
+                    legacy_resolved.unresolved
+                );
+            }
             let historical_releases =
-                load_release_digests_by_ids(&mut *tx, &legacy_release_ids).await?;
+                load_release_digests_by_ids(&mut *tx, &legacy_resolved.ids).await?;
             let content_markdown = legacy.content_markdown.clone();
             sqlx::query(
                 r#"
@@ -5299,8 +5337,17 @@ pub async fn recompute_legacy_brief_snapshot(
         return load_stored_brief_snapshot(state, &existing.id).await;
     }
 
-    let legacy_release_ids = extract_internal_release_id_sequence(&legacy.content_markdown);
-    let historical_releases = load_release_digests_by_ids(&mut *tx, &legacy_release_ids).await?;
+    let legacy_refs = extract_internal_release_ref_sequence(&legacy.content_markdown);
+    let legacy_resolved = resolve_release_refs(&mut *tx, &legacy_refs)
+        .await
+        .context("failed to resolve legacy brief release links")?;
+    if !legacy_resolved.unresolved.is_empty() {
+        anyhow::bail!(
+            "historical brief references unresolved release links: {:?}",
+            legacy_resolved.unresolved
+        );
+    }
+    let historical_releases = load_release_digests_by_ids(&mut *tx, &legacy_resolved.ids).await?;
     let content_markdown = legacy.content_markdown.clone();
 
     sqlx::query(
@@ -5440,6 +5487,23 @@ mod tests {
             encryption_key,
             runtime_owner_id: "ai-test-runtime-owner".to_owned(),
         })
+    }
+
+    fn test_release_digest(
+        release_id: i64,
+        full_name: &str,
+        title: &str,
+        html_url: &str,
+    ) -> ReleaseDigest {
+        ReleaseDigest {
+            release_id,
+            full_name: full_name.to_owned(),
+            title: title.to_owned(),
+            body: String::new(),
+            html_url: html_url.to_owned(),
+            published_at: "2026-02-20T09:00:00Z".to_owned(),
+            is_prerelease: false,
+        }
     }
 
     async fn spawn_test_ai_server(app: Router) -> Url {
@@ -6899,79 +6963,117 @@ mod tests {
     #[test]
     fn contains_all_release_links_matches_exact_release_id() {
         let markdown = "- [v1.2.3](/?tab=briefs&release=123)";
-        assert!(contains_all_release_links(markdown, &[123]));
-        assert!(!contains_all_release_links(markdown, &[12, 123]));
+        let release_12 = test_release_digest(
+            12,
+            "acme/rocket",
+            "v1.2.2",
+            "https://github.com/acme/rocket/releases/tag/v1.2.2",
+        );
+        let release_123 = test_release_digest(
+            123,
+            "acme/rocket",
+            "v1.2.3",
+            "https://github.com/acme/rocket/releases/tag/v1.2.3",
+        );
+        assert!(contains_all_release_links(
+            markdown,
+            std::slice::from_ref(&release_123)
+        ));
+        assert!(!contains_all_release_links(
+            markdown,
+            &[release_12, release_123]
+        ));
     }
 
     #[test]
     fn contains_all_release_links_accepts_query_order_variants() {
         let markdown = "- [v1.2.3](/?release=123&tab=briefs)";
-        assert!(contains_all_release_links(markdown, &[123]));
+        let release_123 = test_release_digest(
+            123,
+            "acme/rocket",
+            "v1.2.3",
+            "https://github.com/acme/rocket/releases/tag/v1.2.3",
+        );
+        assert!(contains_all_release_links(
+            markdown,
+            std::slice::from_ref(&release_123),
+        ));
     }
 
     #[test]
-    fn contains_all_release_links_requires_tab_briefs() {
+    fn contains_all_release_links_accepts_bare_release_query_links() {
         let markdown = "- [v1.2.3](/?release=123)";
-        assert!(!contains_all_release_links(markdown, &[123]));
+        let release_123 = test_release_digest(
+            123,
+            "acme/rocket",
+            "v1.2.3",
+            "https://github.com/acme/rocket/releases/tag/v1.2.3",
+        );
+        assert!(contains_all_release_links(
+            markdown,
+            std::slice::from_ref(&release_123),
+        ));
     }
 
     #[test]
     fn reconcile_brief_release_links_adds_missing_release_ids() {
         let markdown = "- [v1.2.3](/?tab=briefs&release=12)\n";
         let releases = vec![
-            ReleaseDigest {
-                release_id: 12,
-                full_name: "acme/rocket".to_owned(),
-                title: "v1.2.3".to_owned(),
-                body: String::new(),
-                html_url: "https://github.com/acme/rocket/releases/tag/v1.2.3".to_owned(),
-                published_at: "2026-02-20T09:00:00Z".to_owned(),
-                is_prerelease: false,
-            },
-            ReleaseDigest {
-                release_id: 123,
-                full_name: "acme/rocket".to_owned(),
-                title: "v1.2.4".to_owned(),
-                body: String::new(),
-                html_url: "https://github.com/acme/rocket/releases/tag/v1.2.4".to_owned(),
-                published_at: "2026-02-20T10:00:00Z".to_owned(),
-                is_prerelease: false,
-            },
+            test_release_digest(
+                12,
+                "acme/rocket",
+                "v1.2.3",
+                "https://github.com/acme/rocket/releases/tag/v1.2.3",
+            ),
+            test_release_digest(
+                123,
+                "acme/rocket",
+                "v1.2.4",
+                "https://github.com/acme/rocket/releases/tag/v1.2.4",
+            ),
         ];
         let out = reconcile_brief_release_links(markdown, &releases);
-        assert!(contains_all_release_links(&out, &[12, 123]));
+        assert!(contains_all_release_links(&out, &releases));
     }
 
     #[test]
     fn reconcile_brief_release_links_avoids_prefix_false_positive() {
         let markdown = "- [v1.2.4](/?tab=briefs&release=123)\n";
-        let releases = vec![ReleaseDigest {
-            release_id: 12,
-            full_name: "acme/rocket".to_owned(),
-            title: "v1.2.3".to_owned(),
-            body: String::new(),
-            html_url: "https://github.com/acme/rocket/releases/tag/v1.2.3".to_owned(),
-            published_at: "2026-02-20T09:00:00Z".to_owned(),
-            is_prerelease: false,
-        }];
+        let releases = vec![test_release_digest(
+            12,
+            "acme/rocket",
+            "v1.2.3",
+            "https://github.com/acme/rocket/releases/tag/v1.2.3",
+        )];
         let out = reconcile_brief_release_links(markdown, &releases);
-        assert!(contains_all_release_links(&out, &[12, 123]));
+        let expected = vec![
+            test_release_digest(
+                12,
+                "acme/rocket",
+                "v1.2.3",
+                "https://github.com/acme/rocket/releases/tag/v1.2.3",
+            ),
+            test_release_digest(
+                123,
+                "acme/rocket",
+                "v1.2.4",
+                "https://github.com/acme/rocket/releases/tag/v1.2.4",
+            ),
+        ];
+        assert!(contains_all_release_links(&out, &expected));
     }
 
     #[test]
     fn reconcile_brief_release_links_replaces_links_missing_tab() {
         let markdown = "- [v1.2.3](/?release=123)\n";
-        let releases = vec![ReleaseDigest {
-            release_id: 123,
-            full_name: "acme/rocket".to_owned(),
-            title: "v1.2.3".to_owned(),
-            body: String::new(),
-            html_url: "https://github.com/acme/rocket/releases/tag/v1.2.3".to_owned(),
-            published_at: "2026-02-20T09:00:00Z".to_owned(),
-            is_prerelease: false,
-        }];
+        let releases = vec![test_release_digest(
+            123,
+            "acme/rocket",
+            "v1.2.3",
+            "https://github.com/acme/rocket/releases/tag/v1.2.3",
+        )];
         let out = reconcile_brief_release_links(markdown, &releases);
-        assert!(out.contains("/?tab=briefs&release=123"));
+        assert!(out.contains("/acme/rocket/releases/tag/v1.2.3?from=briefs"));
     }
 
     #[test]
@@ -6990,7 +7092,13 @@ mod tests {
         };
 
         let markdown = build_brief_markdown(&[repo], &SocialSummaryRendered::default());
-        assert!(markdown.contains("- [v1.0 \\[beta\\]\\(rc\\)](/?tab=briefs&release=42)"));
+        assert!(markdown.contains(&format!(
+            "- [v1.0 \\[beta\\]\\(rc\\)]({})",
+            build_internal_brief_release_href_from_html_url(
+                "https://github.com/acme/rocket/releases/tag/v1.0"
+            )
+            .expect("canonical brief href"),
+        )));
         assert!(!markdown.contains("## 获星与关注"));
     }
 
@@ -7113,8 +7221,11 @@ mod tests {
         assert!(built.content_markdown.contains("### 关注"));
         assert!(!built.content_markdown.contains("### 获星"));
         assert_eq!(
-            extract_internal_release_id_sequence(&built.content_markdown),
-            vec![42]
+            extract_internal_release_ref_sequence(&built.content_markdown),
+            vec![
+                parse_internal_release_ref("/acme/rocket/releases/tag/v1.0.0?from=briefs")
+                    .expect("canonical internal release ref")
+            ]
         );
     }
 
@@ -7732,7 +7843,7 @@ mod tests {
         assert!(
             stored
                 .content_markdown
-                .contains("[v2.1.0](/?tab=briefs&release=407)")
+                .contains("[v2.1.0](/acme/rocket/releases/tag/v2.1.0?from=briefs)")
         );
         assert_eq!(stored.release_ids, vec![407]);
     }
