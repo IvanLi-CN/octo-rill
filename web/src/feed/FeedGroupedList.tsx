@@ -20,6 +20,7 @@ import {
 import type { FeedLoadError } from "@/feed/useFeed";
 import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
+import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 
 type BriefLike = BriefSnapshotCandidate & {
 	date: string;
@@ -158,7 +159,7 @@ function FeedDayDivider(props: {
 
 function FeedBriefBody(props: {
 	brief: BriefLike | null;
-	onOpenRelease?: (releaseId: string) => void;
+	onOpenRelease?: (target: DashboardReleaseTarget) => void;
 }) {
 	const { brief, onOpenRelease } = props;
 
@@ -188,7 +189,7 @@ function FeedBriefBody(props: {
 
 function HistoricalBriefPanel(props: {
 	brief: BriefLike | null;
-	onOpenReleaseFromBrief?: (releaseId: string) => void;
+	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 }) {
 	const { brief, onOpenReleaseFromBrief } = props;
 	return (
@@ -210,7 +211,7 @@ function FeedHistoricalDayGroup(props: {
 	showDivider: boolean;
 	showBriefPanel: boolean;
 	brief: BriefLike | null;
-	onOpenReleaseFromBrief?: (releaseId: string) => void;
+	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 	items: FeedItem[];
 	feedCardProps: Omit<FeedCardListProps, "items">;
 }) {
@@ -320,7 +321,7 @@ export function FeedGroupedList(
 		dailyBoundaryTimeZone: string | null | undefined;
 		dailyBoundaryUtcOffsetMinutes: number | null | undefined;
 		now?: Date;
-		onOpenReleaseFromBrief?: (releaseId: string) => void;
+		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
 	},
 ) {

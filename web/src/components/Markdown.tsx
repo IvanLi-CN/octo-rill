@@ -1,6 +1,9 @@
-import { normalizeReleaseId } from "@/lib/releaseId";
 import { replaceIsoTimestampsWithLocal } from "@/lib/datetime";
 import { cn } from "@/lib/utils";
+import {
+	parseInternalDashboardReleaseTarget,
+	type DashboardReleaseTarget,
+} from "@/dashboard/routeState";
 import { isValidElement, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -116,22 +119,6 @@ function isAutolinkLiteral(labelText: string, href: string | undefined) {
 	return variants.has(normalizedLabel);
 }
 
-function parseInternalReleaseLink(href: string | undefined): string | null {
-	if (!href) return null;
-	try {
-		const url = new URL(href, window.location.origin);
-		if (url.origin !== window.location.origin) return null;
-		if (url.pathname !== "/") return null;
-		const release = normalizeReleaseId(url.searchParams.get("release"));
-		const tab = url.searchParams.get("tab");
-		if (!release) return null;
-		if (tab !== "briefs") return null;
-		return release;
-	} catch {
-		return null;
-	}
-}
-
 function localizeTextNodes(node: MarkdownNode | null | undefined) {
 	if (!node) return;
 	if (node.type === "code" || node.type === "inlineCode") return;
@@ -148,7 +135,7 @@ function remarkLocalizeIsoTimestamps() {
 }
 
 function buildMarkdownComponents(
-	onInternalReleaseClick?: (releaseId: string) => void,
+	onInternalReleaseClick?: (target: DashboardReleaseTarget) => void,
 ): Components {
 	return {
 		h1: ({ children }) => (
@@ -187,22 +174,22 @@ function buildMarkdownComponents(
 			</li>
 		),
 		a: ({ children, href }) => {
-			const releaseId = parseInternalReleaseLink(href);
+			const releaseTarget = parseInternalDashboardReleaseTarget(href);
 			const textContent = collectTextContent(children).trim();
 			const compactLabel =
-				!releaseId && href && isAutolinkLiteral(textContent, href)
+				!releaseTarget && href && isAutolinkLiteral(textContent, href)
 					? compactGithubLinkLabel(href)
 					: null;
 			return (
 				<a
 					href={href}
-					target={releaseId ? undefined : "_blank"}
-					rel={releaseId ? undefined : "noreferrer noopener"}
+					target={releaseTarget ? undefined : "_blank"}
+					rel={releaseTarget ? undefined : "noreferrer noopener"}
 					className="text-foreground underline underline-offset-4 [overflow-wrap:anywhere]"
 					onClick={(e) => {
-						if (!releaseId || !onInternalReleaseClick) return;
+						if (!releaseTarget || !onInternalReleaseClick) return;
 						e.preventDefault();
-						onInternalReleaseClick(releaseId);
+						onInternalReleaseClick(releaseTarget);
 					}}
 				>
 					{compactLabel ?? children}
@@ -240,7 +227,7 @@ function buildMarkdownComponents(
 export function Markdown(props: {
 	content: string;
 	className?: string;
-	onInternalReleaseClick?: (releaseId: string) => void;
+	onInternalReleaseClick?: (target: DashboardReleaseTarget) => void;
 }) {
 	const { content, className, onInternalReleaseClick } = props;
 

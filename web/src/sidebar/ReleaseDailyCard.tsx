@@ -1,6 +1,7 @@
 import { Sparkles } from "lucide-react";
 
 import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
+import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import { formatIsoRangeInTimeZone } from "@/lib/datetime";
@@ -40,7 +41,7 @@ export function ReleaseDailyCard(props: {
 	error?: string | null;
 	onGenerate: () => void;
 	onRetry?: () => void;
-	onOpenRelease?: (releaseId: string) => void;
+	onOpenRelease?: (target: DashboardReleaseTarget) => void;
 }) {
 	const {
 		briefs,

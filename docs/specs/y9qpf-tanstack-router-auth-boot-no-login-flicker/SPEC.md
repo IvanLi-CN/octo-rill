@@ -60,8 +60,9 @@
   - 非 401 错误 => Landing + `bootError`
 - `/admin`、`/admin/jobs`：仅在 auth bootstrap 完成后执行管理员权限判断；匿名或非管理员统一回到 `/`。
 - Dashboard deep links：
-  - `/?tab=<tab>` 继续可用
-  - `/?release=<id>` 与 `/?tab=briefs&release=<id>` 继续可用，并规范化到合法 search
+  - canonical 顶部主 tab 改为 pathname-driven：`/`、`/releases`、`/stars`、`/followers`、`/briefs`、`/inbox`
+  - `/?tab=<tab>` 继续作为 legacy ingress 可用，并在首轮导航中规范化到对应 canonical path
+  - `/?release=<id>` 与 `/?tab=briefs&release=<id>` 继续作为 legacy ingress 可用；resolve 到 repo/tag 后规范化到 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`
 - Admin Jobs deep links：
   - `/admin/jobs`
   - `/admin/jobs/scheduled`
@@ -92,9 +93,9 @@
   When 站内导航完成
   Then 不触发整页 reload，不重复请求 `/api/me`，且不出现 Landing 登录卡闪现。
 
-- Given 用户访问 `/?tab=briefs&release=123` 或 `/?release=123`
+- Given 用户访问 `/<owner>/<repo>/releases/tag/<tag>?from=briefs`，或 legacy `/?tab=briefs&release=123` / `/?release=123`
   When 页面完成首载
-  Then 仍能打开对应 release detail，并把 URL 规范化到合法 search。
+  Then 仍能打开对应 release detail，并把 URL 规范化到合法 canonical path。
 
 - Given 用户访问 `/admin/jobs/translations`
   When 路由校验完成
@@ -159,6 +160,11 @@
 
 - Story: `Pages/Dashboard Header / Default`
 - 证明点：登录后稳态页头保留站内“管理员面板”入口，配合 `app-auth-boot.spec.ts` 证明 Dashboard → Admin → Dashboard 为 SPA 导航且不回退 Landing。
+
+## Change log
+
+- 2026-04-15：完成 TanStack Router 接管、auth bootstrap 与原有 Dashboard / Admin / Admin Jobs deep link 兼容。
+- 2026-04-22：同步 Dashboard 路由 current truth；顶部主 tab 改为 pathname-driven canonical surface，release detail canonical deep link 改为 `/<owner>/<repo>/releases/tag/<tag>?from=<tab>`，legacy query ingress 继续兼容。
 
 ## 风险 / 假设
 
