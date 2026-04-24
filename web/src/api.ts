@@ -942,6 +942,15 @@ export async function apiGetReleaseDetail(
 		`/api/releases/${encodeURIComponent(releaseId)}/detail`,
 	);
 }
+export async function apiGetReleaseDetailByRepoTag(input: {
+	owner: string;
+	repo: string;
+	tag: string;
+}): Promise<ReleaseDetailResponse> {
+	return apiGet<ReleaseDetailResponse>(
+		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}/detail`,
+	);
+}
 export type TranslationSourceBlock = {
 	slot: "title" | "excerpt" | "body_markdown" | "metadata";
 	text: string;

@@ -45,8 +45,13 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { describeUnknownError } from "@/lib/errorPresentation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
+	buildDashboardReleaseTarget,
+	buildDashboardRouteUrl,
+	buildDashboardWarmRouteState,
+	parseDashboardRouteStateFromLocation,
+	releaseLocatorFromReleaseDetail,
+	type DashboardReleaseTarget,
 	type DashboardRouteState,
-	parseDashboardRouteState,
 } from "@/dashboard/routeState";
 import {
 	DashboardMobileControlBand,
@@ -157,6 +162,19 @@ const REACTION_CONTENTS: ReactionContent[] = [
 	"eyes",
 ];
 
+type DashboardSessionState = {
+	notifications: NotificationItem[];
+	briefs: BriefItem[];
+	selectedBriefId: string | null;
+	shellHydrated: boolean;
+	sidebarBootstrapped: boolean;
+	notificationsBootstrapped: boolean;
+	reactionTokenBootstrapped: boolean;
+	reactionTokenConfigured: boolean | null;
+};
+
+const dashboardSessionStateByUser = new Map<string, DashboardSessionState>();
+
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
 		if (a.unread !== b.unread) return b.unread - a.unread;
@@ -178,11 +196,10 @@ function isSidebarBootstrapNotificationsError(
 }
 
 function parseDashboardQuery() {
-	const params = new URLSearchParams(window.location.search);
-	return parseDashboardRouteState({
-		tab: params.get("tab"),
-		release: params.get("release"),
-	});
+	return parseDashboardRouteStateFromLocation(
+		window.location.pathname,
+		window.location.search,
+	);
 }
 
 function readStoredPageDefaultLane() {
@@ -281,13 +298,18 @@ export function Dashboard(props: {
 					mode: "access" as const,
 				}
 			: null;
+	const sessionState = dashboardSessionStateByUser.get(me.user.id) ?? null;
 
 	const [busy, setBusy] = useState<string | null>(null);
 	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
 		warmStart ? "warm-cache" : "network",
 	);
-	const [bootedFromWarmStart] = useState(() => warmStart !== null);
-	const [shellHydrated, setShellHydrated] = useState(() => warmStart !== null);
+	const [bootedFromWarmStart] = useState(
+		() => warmStart !== null || sessionState?.shellHydrated === true,
+	);
+	const [shellHydrated, setShellHydrated] = useState(
+		() => warmStart !== null || sessionState?.shellHydrated === true,
+	);
 	const [accessTaskStream, setAccessTaskStream] =
 		useState<TaskStreamState | null>(initialAccessTask);
 	const [refreshTaskStreams, setRefreshTaskStreams] = useState<
@@ -312,6 +334,19 @@ export function Dashboard(props: {
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
 	const tab = routeState.tab;
 	const activeReleaseId = routeState.activeReleaseId;
+	const activeReleaseLocator = routeState.activeReleaseLocator;
+	const releaseReturnTab = routeState.releaseReturnTab;
+	const activeReleaseTarget = useMemo(
+		() =>
+			activeReleaseId || activeReleaseLocator
+				? buildDashboardReleaseTarget({
+						releaseId: activeReleaseId,
+						locator: activeReleaseLocator,
+						fromTab: releaseReturnTab,
+					})
+				: null,
+		[activeReleaseId, activeReleaseLocator, releaseReturnTab],
+	);
 	const setRouteState = useCallback(
 		(
 			nextRouteState: DashboardRouteState,
@@ -362,7 +397,7 @@ export function Dashboard(props: {
 		[feed.items, pageDefaultLane],
 	);
 	const [selectedBriefId, setSelectedBriefId] = useState<string | null>(
-		() => warmStart?.selectedBriefId ?? null,
+		() => sessionState?.selectedBriefId ?? warmStart?.selectedBriefId ?? null,
 	);
 	const [reactionBusyKeys, setReactionBusyKeys] = useState<Set<string>>(
 		() => new Set<string>(),
@@ -382,7 +417,7 @@ export function Dashboard(props: {
 	>({});
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
-	>(null);
+	>(() => sessionState?.reactionTokenConfigured ?? null);
 	const [patGuideOpen, setPatGuideOpen] = useState<boolean>(false);
 	const [patGuideMessage, setPatGuideMessage] = useState<string | null>(null);
 	const pendingReactionRef = useRef<{
@@ -420,10 +455,10 @@ export function Dashboard(props: {
 	});
 
 	const [notifications, setNotifications] = useState<NotificationItem[]>(
-		() => warmStart?.notifications ?? [],
+		() => sessionState?.notifications ?? warmStart?.notifications ?? [],
 	);
 	const [briefs, setBriefs] = useState<BriefItem[]>(
-		() => warmStart?.briefs ?? [],
+		() => sessionState?.briefs ?? warmStart?.briefs ?? [],
 	);
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const [briefsError, setBriefsError] = useState<DashboardSectionError | null>(
@@ -436,10 +471,26 @@ export function Dashboard(props: {
 	const initialNotificationBootstrapRef = useRef(
 		hasDesktopSidebarInbox || tab === "inbox",
 	);
-	const startupBootstrapRequestedRef = useRef(false);
+	const sidebarBootstrapCompletedRef = useRef(
+		sessionState?.sidebarBootstrapped ?? false,
+	);
+	const notificationsBootstrapCompletedRef = useRef(
+		sessionState?.notificationsBootstrapped ?? false,
+	);
+	const reactionTokenBootstrapCompletedRef = useRef(
+		sessionState?.reactionTokenBootstrapped ?? false,
+	);
+	const startupBootstrapRequestedRef = useRef(
+		sidebarBootstrapCompletedRef.current,
+	);
 	const startupSidebarRetriedRef = useRef(false);
 	const notificationsBootstrapRequestedRef = useRef(
-		initialNotificationBootstrapRef.current,
+		notificationsBootstrapCompletedRef.current ||
+			(initialNotificationBootstrapRef.current &&
+				!startupBootstrapRequestedRef.current),
+	);
+	const reactionTokenBootstrapRequestedRef = useRef(
+		reactionTokenBootstrapCompletedRef.current,
 	);
 	const notificationsRequestInFlightRef = useRef(false);
 	const [sidebarLoading, setSidebarLoading] = useState(
@@ -533,6 +584,10 @@ export function Dashboard(props: {
 					if (prev && b.some((x) => x.id === prev)) return prev;
 					return b[0]?.id ?? null;
 				});
+				sidebarBootstrapCompletedRef.current = true;
+				if (options?.includeNotifications) {
+					notificationsBootstrapCompletedRef.current = true;
+				}
 			} catch (error) {
 				if (isSidebarBootstrapNotificationsError(error)) {
 					throw error.cause;
@@ -562,6 +617,7 @@ export function Dashboard(props: {
 			}
 			try {
 				await loadNotifications(options?.background ? "refresh" : "initial");
+				notificationsBootstrapCompletedRef.current = true;
 			} finally {
 				setNotificationsLoading(false);
 			}
@@ -704,8 +760,19 @@ export function Dashboard(props: {
 			});
 		};
 		startSidebarBootstrap(true);
-		void loadReactionToken();
-	}, [bootedFromWarmStart, loadReactionToken, refreshSidebar]);
+	}, [bootedFromWarmStart, refreshSidebar]);
+
+	useEffect(() => {
+		if (reactionTokenBootstrapRequestedRef.current) {
+			return;
+		}
+		reactionTokenBootstrapRequestedRef.current = true;
+		void loadReactionToken().then((status) => {
+			if (status) {
+				reactionTokenBootstrapCompletedRef.current = true;
+			}
+		});
+	}, [loadReactionToken]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
@@ -1333,17 +1400,21 @@ export function Dashboard(props: {
 		(nextTab: Tab) => {
 			setRouteState({
 				tab: nextTab,
-				activeReleaseId: nextTab === "briefs" ? activeReleaseId : null,
+				activeReleaseId: null,
+				activeReleaseLocator: null,
+				releaseReturnTab: "briefs",
 			});
 		},
-		[activeReleaseId, setRouteState],
+		[setRouteState],
 	);
 
 	const onOpenReleaseDetail = useCallback(
-		(releaseId: string) => {
+		(target: DashboardReleaseTarget) => {
 			setRouteState({
-				tab: "briefs",
-				activeReleaseId: releaseId,
+				tab: target.fromTab,
+				activeReleaseId: target.releaseId,
+				activeReleaseLocator: target.locator,
+				releaseReturnTab: target.fromTab,
 			});
 		},
 		[setRouteState],
@@ -1352,12 +1423,41 @@ export function Dashboard(props: {
 	const onCloseReleaseDetail = useCallback(() => {
 		setRouteState(
 			{
-				tab,
+				tab: releaseReturnTab,
 				activeReleaseId: null,
+				activeReleaseLocator: null,
+				releaseReturnTab,
 			},
 			{ replace: true },
 		);
-	}, [setRouteState, tab]);
+	}, [releaseReturnTab, setRouteState]);
+
+	const onReleaseDetailResolved = useCallback(
+		(detail: {
+			release_id: string;
+			repo_full_name: string | null;
+			tag_name: string;
+			html_url: string;
+		}) => {
+			if (activeReleaseLocator) {
+				return;
+			}
+			const locator = releaseLocatorFromReleaseDetail(detail);
+			if (!locator) {
+				return;
+			}
+			setRouteState(
+				{
+					tab,
+					activeReleaseId: detail.release_id,
+					activeReleaseLocator: locator,
+					releaseReturnTab,
+				},
+				{ replace: true },
+			);
+		},
+		[activeReleaseLocator, releaseReturnTab, setRouteState, tab],
+	);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
 	const renderSidebarInbox = hasDesktopSidebarInbox;
 	const renderSidebar =
@@ -1458,23 +1558,12 @@ export function Dashboard(props: {
 
 	useEffect(() => {
 		if (isRouteControlled) return;
-		const params = new URLSearchParams(window.location.search);
-		if (tab === "all") {
-			params.delete("tab");
-		} else {
-			params.set("tab", tab);
-		}
-		if (activeReleaseId) {
-			params.set("release", activeReleaseId);
-		} else {
-			params.delete("release");
-		}
-		const query = params.toString();
-		const nextUrl = `${window.location.pathname}${query ? `?${query}` : ""}`;
-		if (nextUrl !== `${window.location.pathname}${window.location.search}`) {
+		const nextUrl = buildDashboardRouteUrl(routeState);
+		const currentUrl = `${window.location.pathname}${window.location.search}`;
+		if (nextUrl !== currentUrl) {
 			window.history.replaceState({}, "", nextUrl);
 		}
-	}, [isRouteControlled, tab, activeReleaseId]);
+	}, [isRouteControlled, routeState]);
 
 	useEffect(() => {
 		if (tab !== "all" && tab !== "releases") {
@@ -1520,15 +1609,32 @@ export function Dashboard(props: {
 	}, [feed.loadingInitial, shellHydrated, sidebarLoading]);
 
 	useEffect(() => {
+		dashboardSessionStateByUser.set(me.user.id, {
+			notifications,
+			briefs,
+			selectedBriefId,
+			shellHydrated,
+			sidebarBootstrapped: sidebarBootstrapCompletedRef.current,
+			notificationsBootstrapped: notificationsBootstrapCompletedRef.current,
+			reactionTokenBootstrapped: reactionTokenBootstrapCompletedRef.current,
+			reactionTokenConfigured,
+		});
+	}, [
+		briefs,
+		me.user.id,
+		notifications,
+		reactionTokenConfigured,
+		selectedBriefId,
+		shellHydrated,
+	]);
+
+	useEffect(() => {
 		if (feed.loadingInitial || sidebarLoading) {
 			return;
 		}
 		persistDashboardWarmSnapshot({
 			userId: me.user.id,
-			routeState: {
-				tab,
-				activeReleaseId,
-			},
+			routeState: buildDashboardWarmRouteState(routeState),
 			feedRequestType,
 			feedItems: feed.items,
 			nextCursor: feed.nextCursor,
@@ -1537,7 +1643,6 @@ export function Dashboard(props: {
 			selectedBriefId,
 		});
 	}, [
-		activeReleaseId,
 		briefs,
 		feed.items,
 		feed.loadingInitial,
@@ -1545,9 +1650,9 @@ export function Dashboard(props: {
 		feedRequestType,
 		me.user.id,
 		notifications,
+		routeState,
 		selectedBriefId,
 		sidebarLoading,
-		tab,
 	]);
 
 	const showStartupSkeleton =
@@ -1704,8 +1809,9 @@ export function Dashboard(props: {
 				</Tabs>
 
 				<ReleaseDetailCard
-					releaseId={activeReleaseId}
+					target={activeReleaseTarget}
 					onClose={onCloseReleaseDetail}
+					onResolvedDetail={onReleaseDetailResolved}
 				/>
 
 				<Dialog

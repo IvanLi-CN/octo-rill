@@ -4,11 +4,11 @@ import { validateDashboardSearch } from "@/dashboard/routeState";
 import {
 	DashboardRoutePendingComponent,
 	primeDashboardRouteSurfaceForStartup,
-} from "./-dashboardRoute";
+} from "@/routes/-dashboardRoute";
 
 primeDashboardRouteSurfaceForStartup();
 
-export const Route = createFileRoute("/")({
+export const Route = createFileRoute("/$owner/$repo/releases/tag/$tag")({
 	validateSearch: validateDashboardSearch,
 	pendingMs: 0,
 	pendingMinMs: 200,

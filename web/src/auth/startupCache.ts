@@ -2,6 +2,7 @@ import type { MeResponse } from "@/api";
 import type { FeedItem } from "@/feed/types";
 import type { NotificationItem } from "@/sidebar/InboxQuickList";
 import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
+import type { DashboardWarmRouteState } from "@/dashboard/routeState";
 
 const AUTH_CACHE_KEY = "octo-rill.auth-bootstrap.v3";
 const DASHBOARD_CACHE_KEY = "octo-rill.dashboard-warm.v1";
@@ -25,11 +26,6 @@ export type StartupRouteFamily =
 	| "admin-users"
 	| "admin-jobs";
 type FeedRequestType = "all" | "releases" | "stars" | "followers";
-
-export type DashboardWarmRouteState = {
-	tab: "all" | "releases" | "stars" | "followers" | "briefs" | "inbox";
-	activeReleaseId: string | null;
-};
 
 type AuthCacheRecord = {
 	savedAt: number;
@@ -195,13 +191,26 @@ export function readDashboardWarmSnapshot(input: {
 	if (!cached) return null;
 	if (cached.userId !== input.userId) return null;
 	if (!isFresh(cached.savedAt, STARTUP_WARM_TTL_MS, input.now)) return null;
+	const cachedActiveReleaseLocatorKey =
+		cached.routeState.activeReleaseLocatorKey ?? null;
+	const cachedReleaseReturnTab = cached.routeState.releaseReturnTab ?? "briefs";
 	if (
 		cached.routeState.tab !== input.routeState.tab ||
-		cached.routeState.activeReleaseId !== input.routeState.activeReleaseId
+		cached.routeState.activeReleaseId !== input.routeState.activeReleaseId ||
+		cachedActiveReleaseLocatorKey !==
+			input.routeState.activeReleaseLocatorKey ||
+		cachedReleaseReturnTab !== input.routeState.releaseReturnTab
 	) {
 		return null;
 	}
-	return cached;
+	return {
+		...cached,
+		routeState: {
+			...cached.routeState,
+			activeReleaseLocatorKey: cachedActiveReleaseLocatorKey,
+			releaseReturnTab: cachedReleaseReturnTab,
+		},
+	};
 }
 
 export function persistDashboardWarmSnapshot(

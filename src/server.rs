@@ -175,6 +175,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/releases/{release_id}/detail",
             get(api::get_release_detail),
         )
+        .route(
+            "/repos/{owner}/{repo}/releases/tag/{tag}/detail",
+            get(api::get_release_detail_by_repo_tag),
+        )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
         .route("/admin/users", get(api::admin_list_users))
