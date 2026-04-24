@@ -18,7 +18,7 @@ OctoRill 不是另一个完整的 GitHub 客户端。它更像一个“与我相
 
 ### Landing
 
-未登录用户先看到公开入口页。它只做两件事：说明产品定位，以及承接 GitHub OAuth 登录。
+未登录用户先看到公开入口页。它负责说明产品定位，并承接 GitHub、LinuxDO 与 Passkey 登录：返回用户可以直接使用 Passkey，首次用户也可以先创建 Passkey，再继续绑定 GitHub。
 
 ### Dashboard
 
@@ -63,7 +63,8 @@ Release 是 OctoRill 的核心阅读对象，支持三种 lane：
 
 ## 权限与数据语义
 
-- **GitHub OAuth**：负责登录、读取与同步。
+- **GitHub OAuth**：负责登录、首次绑定与同步。
+- **Passkey**：作为补充登录方式使用；正式账号仍然要求至少一条 GitHub connection。
 - **GitHub PAT**：仅用于 Release 反馈等额外写操作；不参与日常登录。
 - **SQLite**：本地缓存和派生数据存储，不替代 GitHub 作为事实源。
 

@@ -1,11 +1,5 @@
 # 翻译请求单条记录制重建（#apras）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-03-09
-- Last: 2026-03-10
-
 ## 背景 / 问题陈述
 
 当前翻译调度已把真正的聚合职责放进 scheduler / batch 层，但 request 层仍残留旧的“一个 request 可以挂多个 item”的结构，导致语义与展示都出现偏差：
@@ -92,20 +86,6 @@
 - [x] `cd web && bun run build`
 - [x] `cd web && bun run e2e -- e2e/admin-jobs.spec.ts e2e/release-detail.spec.ts`
 - [x] `cd web && bun run storybook:build`
-
-## 变更记录（Change log）
-
-- 2026-03-09: 新增 follow-up spec，明确 request 层单条化、破坏式迁移与公开 API breaking changes；替代旧 spec 中 request-stage aggregation 的描述。
-- 2026-03-09: 实现与验证同步完成：后端迁移/调度逻辑切到单 request 直连 work item，前端与 fixtures 改为 singular result，并补跑 Rust、web build、Playwright 与 Storybook build。
-- 2026-03-09: 创建 PR #35，补上发布标签门禁与类型窄化修复；当前 checks 全绿、review-loop 无阻塞项，状态更新为 `已完成`。
-- 2026-03-10: 补上 work item 去重竞争保护，并将 `wait` 语义收敛为“最多等待 `max_wait_ms` 后返回当前单结果快照”，前端调用方同步增加超时保护。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: follow-up spec 与 breaking contracts 冻结。
-- [x] M2: 迁移与后端 request/work-item/batch 逻辑重建，移除 request-item/watcher 依赖。
-- [x] M3: 前端 API、feed 自动翻译与 admin 请求视图切换到单条 request 语义。
-- [x] M4: 测试、快车道 PR、checks 与 review-loop 收敛。
 
 ## 风险与开放问题
 

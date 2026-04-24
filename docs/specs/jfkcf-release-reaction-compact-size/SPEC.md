@@ -1,11 +1,5 @@
 # Release reaction 反馈图标轻量收敛（#jfkcf）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-12
-- Last: 2026-04-12
-
 ## 背景 / 问题陈述
 
 `#zcp33` 已经把 Dashboard release card 的 reaction footer 收敛为本地 SVG、圆形按钮与外置 badge，但当前按钮本体、图标和 badge 仍然偏大，在正文区下方的视觉存在感过强，容易抢走 release 内容本身的注意力。

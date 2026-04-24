@@ -1,11 +1,5 @@
 # “我的发布”开关与自有仓库 Release 可见性扩展（#w5gaz）
 
-## 状态
-
-- Status: 部分完成（3/4）
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 - 当前 Release 相关能力只认真实 `starred_repos`，因此用户自己的个人仓库如果没有手动加星，就不会进入 `发布 / 全部`、Release 详情、翻译、润色与日报链路。
@@ -120,15 +114,6 @@
 - Dashboard 必须提供 owner-only release 开 / 关与 `加星` 隔离的稳定场景。
 - 最终 owner-facing 视觉证据写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/README.md`
-- `docs/specs/w5gaz-owned-release-opt-in/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/w5gaz-owned-release-opt-in/assets/`
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -151,13 +136,6 @@
   evidence_note: 开启“我的发布”后，owner-only repo release 会进入 `全部` 时间线，与真实 starred repo release 并列展示。
 
 ![Dashboard owner releases in all tab](./assets/dashboard-owned-releases-all.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新增 spec、README 索引、`include_own_releases` migration 与 profile 契约扩展。
-- [x] M2: Release 可见性统一改到 `user_release_visible_repos`，并接通同步 / 详情 / 翻译 / 润色 / 日报。
-- [x] M3: Settings / Dashboard Storybook、Playwright 与 owner-facing 视觉证据完成。
-- [ ] M4: 提交、推送、PR、review-loop 收敛到 merge-ready。
 
 ## 方案概述（Approach, high-level）
 

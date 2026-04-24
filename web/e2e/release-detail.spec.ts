@@ -1130,9 +1130,14 @@ test("reaction fallback lets users configure PAT inline from the dialog", async 
 	await expect(patInput).toHaveAttribute("data-1p-ignore", "true");
 	await expect(patInput).toHaveAttribute("data-form-type", "other");
 	await expect(patInput).toHaveAttribute("data-secret-visible", "false");
+	await expect(patInput).toHaveAttribute(
+		"data-secret-mask-mode",
+		"native-password",
+	);
 	await patDialog.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(patInput).toHaveAttribute("type", "text");
 	await expect(patInput).toHaveAttribute("data-secret-visible", "true");
+	await expect(patInput).toHaveAttribute("data-secret-mask-mode", "plain-text");
 	await expect(page.getByRole("link", { name: "去完整设置" })).toHaveAttribute(
 		"href",
 		"/settings?section=github-pat",

@@ -1,11 +1,5 @@
 # TanStack Router 接管前端路由并消除登录页闪现（#y9qpf）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-15
-- Last: 2026-04-15
-
 ## 背景 / 问题陈述
 
 当前前端仍停留在“伪 SPA”状态：
@@ -121,13 +115,6 @@
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 - `cd web && bun run e2e -- app-auth-boot.spec.ts landing-login.spec.ts dashboard-access-sync.spec.ts admin-jobs.spec.ts release-detail.spec.ts`
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 接入 TanStack Router file-based 基建，并由根路由统一承接 auth bootstrap。
-- [x] M2: `/`、`/admin`、`/admin/jobs` 与相关 URL 状态迁入 Router，站内导航改为 SPA。
-- [x] M3: 补齐 Storybook、Playwright 与可视化验证证据。
-- [x] M4: 完成 spec 同步、review-loop 与 merge-ready PR 收口。
 
 ## Visual Evidence
 

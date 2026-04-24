@@ -1,11 +1,5 @@
 # 前台错误呈现分层改造（#wt8rb）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-20
-- Last: 2026-04-20
-
 ## 背景 / 问题陈述
 
 当前 Dashboard 会把 feed 首载失败、后台同步失败、release detail 翻译失败、reaction 失败等不同粒度的异常统一堆到页面顶部，导致错误位置和实际出错点脱节；一旦原内容区域失败，用户也看不到明确的补救动作。
@@ -146,15 +140,6 @@
 - 必须通过稳定 Storybook 场景生成 owner-facing 视觉证据。
 - 最终视觉证据统一写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `/Users/ivan/.codex/worktrees/7289/octo-rill/docs/specs/README.md`
-- `/Users/ivan/.codex/worktrees/7289/octo-rill/docs/specs/wt8rb-frontend-error-presentation/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `/Users/ivan/.codex/worktrees/7289/octo-rill/docs/specs/wt8rb-frontend-error-presentation/assets/`
-
 ## Visual Evidence
 
 - source_type: storybook_canvas
@@ -180,13 +165,6 @@ PR: include
 PR: include
 
 ![Release detail translation failure storybook evidence](./assets/release-detail-translation-failure-storybook.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: spec 与 index 行落盘，冻结错误分流规则与公开接口契约。
-- [x] M2: shared feedback primitives（ErrorStatePanel / ErrorBubble / AppToast）完成并接入壳层避障。
-- [x] M3: Dashboard、Release detail、Landing、Settings 依规则完成错误呈现改造。
-- [x] M4: Storybook、视觉证据、构建/验证、review-loop 与 PR 收敛到 merge-ready。
 
 ## 方案概述（Approach, high-level）
 

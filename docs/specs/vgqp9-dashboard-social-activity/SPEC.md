@@ -1,11 +1,5 @@
 # Dashboard 社交活动记录扩展（含头像）（#vgqp9）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-10
-- Last: 2026-04-16
-
 ## 背景 / 问题陈述
 
 - Dashboard 当前只展示 release feed，缺少“谁关注了我”“谁给我的仓库加星”的个人向动态，无法完整体现 GitHub 上与“我”直接相关的变化。
@@ -190,15 +184,6 @@
 - 必须提供 Storybook 稳定场景覆盖：All 混排、Stars tab、Followers tab、头像 fallback。
 - 最终视觉证据必须写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
-- `docs/specs/s8qkn-subscription-sync/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/vgqp9-dashboard-social-activity/assets/`
-
 ## Visual Evidence
 
 ### All mixed timeline
@@ -228,13 +213,6 @@
 ### Avatar fallback
 
 ![Avatar fallback](assets/dashboard-social-avatar-fallback.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 冻结 spec、tab 口径、baseline 规则与 feed mixed contract。
-- [x] M2: 落地后端 social activity schema、同步链路与 mixed feed API。
-- [x] M3: 落地 Dashboard 新 tabs、社交卡片、头像 fallback 与日组行为。
-- [x] M4: 完成 Storybook、视觉证据、回归测试与 merge-ready 收口。
 
 ## 方案概述（Approach, high-level）
 

@@ -1,11 +1,5 @@
 # 移除项目内 UI UX Pro Max skill（#cm2je）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-18
-- Last: 2026-04-18
-
 ## 背景 / 问题陈述
 
 项目曾把 `ui-ux-pro-max` 作为仓库内 skill 资产直接提交，并为此保留了一份安装规格。当前主人明确要求从项目中删除该 skill；如果只删目录而不同步 canonical spec 与索引，仓库会留下失效的文档引用与错误的安装承诺。
@@ -85,20 +79,9 @@
 - `cargo test`
 - `cd web && biome check .`
 
-## 文档更新（Docs to Update）
-
-- `/Users/ivan/.codex/worktrees/351e/octo-rill/docs/specs/README.md`
-- `/Users/ivan/.codex/worktrees/351e/octo-rill/docs/specs/cm2je-remove-ui-ux-pro-max-skill/SPEC.md`
-
 ## Visual Evidence
 
 - 不适用：本任务不涉及用户可见 UI 变更。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 删除项目内 `ui-ux-pro-max` skill 资产。
-- [x] M2: 删除旧安装规格并清理 specs index 悬空引用。
-- [x] M3: 完成搜索与门禁验证，确认仓库无残留引用。
 
 ## 风险 / 假设
 

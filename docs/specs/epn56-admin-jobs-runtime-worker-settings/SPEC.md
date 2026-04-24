@@ -1,11 +1,5 @@
 # 管理员任务中心运行时 worker 数量设置（#epn56）
 
-## 状态
-
-- Status: 重新设计（#y2yf8）
-- Created: 2026-03-27
-- Last: 2026-04-13
-
 ## 背景 / 问题陈述
 
 当前管理员任务中心已经能展示 LLM 调度与翻译调度的实时运行态，但这两个页面仍缺少运行时并发设置入口：
@@ -51,15 +45,6 @@
 - 新增独立的 LLM 只读配置查询接口。
 - 对历史 batch / request 数据做额外回填之外的结构性迁移。
 - 允许 dedicated worker 回补 general 请求之外的调度策略变化。
-
-## 当前实现说明
-
-- 后端已支持 LLM permit 热更新，并通过单例 `admin_runtime_settings` 记录 `llm_max_concurrency`、`translation_general_worker_concurrency`、`translation_dedicated_worker_concurrency`。
-- 所有 live runtime 会在 `runtime_owner` heartbeat 与管理员状态读取时回拉 `admin_runtime_settings`，因此无需显式广播也能把并发设置收敛到最新持久化值。
-- translation scheduler 已从固定 `3 + 1` runtime 改为动态 worker registry，worker 以 `general` 在前、`user_dedicated` 在后生成连续槽位与稳定 `worker_id`。
-- `GET /api/admin/jobs/translations/status` 同时返回 live worker 统计与 `target_*` 目标配置，页面文案与设置回填读取 `target_*`，排空中的工作者板卡片继续读取 live `workers`。
-- 管理页已增加两个设置按钮和对应对话框，并在保存成功后立即刷新当前卡片/工作者板状态。
-- Storybook 与 Playwright 已覆盖打开弹窗、非法值校验、保存成功与工作者板数量变化路径。
 
 ## 接口契约（Interfaces & Contracts）
 
@@ -136,13 +121,6 @@
 - [x] `cd web && bun run storybook:build`
 - [x] `cd web && bun run e2e -- admin-jobs.spec.ts`
 
-## 文档更新（Docs to Update）
-
-- `README.md`
-- `docs-site/docs/config.md`
-- `docs-site/docs/quick-start.md`
-- `docs/specs/README.md`
-
 ## Visual Evidence
 
 ### LLM 设置弹窗打开态
@@ -183,13 +161,6 @@
 - evidence_note: 验证保存 `5 general + 2 dedicated` 后，工作者板文案、卡片数量与顺序立即收敛到新运行时配置。
 
 ![翻译设置保存后工作者板收敛态](./assets/translation-settings-saved.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 单例 runtime settings 表、启动种子逻辑与接口契约冻结。
-- [x] M2: LLM permit gate 与 translation worker runtime registry 支持热更新与排空缩容。
-- [x] M3: 管理端设置按钮、弹窗、Storybook 与 Playwright 覆盖完成。
-- [x] M4: 视觉证据、PR 与 review-loop 收敛到 merge-ready。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 

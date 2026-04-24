@@ -24,6 +24,7 @@ function jsonResponse(payload: unknown, status = 200) {
 
 type BindGitHubStoryArgs = {
 	linuxdoStatus?: string;
+	passkeyStatus?: string;
 	pendingLinuxDo: {
 		linuxdo_user_id: number;
 		username: string;
@@ -32,6 +33,10 @@ type BindGitHubStoryArgs = {
 		trust_level: number;
 		active: boolean;
 		silenced: boolean;
+	} | null;
+	pendingPasskey: {
+		label: string;
+		created_at: string;
 	} | null;
 	linuxdoAvailable: boolean;
 };
@@ -51,6 +56,7 @@ function BindGitHubStoryScene(args: BindGitHubStoryArgs) {
 			return jsonResponse({
 				linuxdo_available: args.linuxdoAvailable,
 				pending_linuxdo: args.pendingLinuxDo,
+				pending_passkey: args.pendingPasskey,
 			});
 		}
 		return jsonResponse(
@@ -79,7 +85,10 @@ function BindGitHubStoryScene(args: BindGitHubStoryArgs) {
 				refreshPage: () => {},
 			}}
 		>
-			<BindGitHubPage linuxdoStatus={args.linuxdoStatus} />
+			<BindGitHubPage
+				linuxdoStatus={args.linuxdoStatus}
+				passkeyStatus={args.passkeyStatus}
+			/>
 		</VersionMonitorStateProvider>
 	);
 }
@@ -99,6 +108,7 @@ const meta = {
 	},
 	args: {
 		linuxdoStatus: "connected",
+		passkeyStatus: undefined,
 		linuxdoAvailable: true,
 		pendingLinuxDo: {
 			linuxdo_user_id: 9527,
@@ -109,6 +119,7 @@ const meta = {
 			active: true,
 			silenced: false,
 		},
+		pendingPasskey: null,
 	},
 } satisfies Meta<typeof BindGitHubStoryScene>;
 
@@ -155,10 +166,43 @@ export const ConflictState: Story = {
 	},
 };
 
+export const PendingPasskey: Story = {
+	args: {
+		linuxdoStatus: undefined,
+		passkeyStatus: "created",
+		pendingLinuxDo: null,
+		pendingPasskey: {
+			label: "Passkey · 2026-04-22 10:12 UTC",
+			created_at: "2026-04-22T10:12:00Z",
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Passkey-first onboarding：匿名用户先创建 Passkey，再来到 `/bind/github` 继续补 GitHub 绑定。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("Passkey 已暂存")).toBeVisible();
+		await expect(canvas.getByText("待挂接的 Passkey")).toBeVisible();
+		await expect(
+			canvas.getByText("Passkey · 2026-04-22 10:12 UTC"),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "绑定 GitHub 并继续" }),
+		).toBeVisible();
+	},
+};
+
 export const MissingPendingContext: Story = {
 	args: {
 		linuxdoStatus: undefined,
+		passkeyStatus: undefined,
 		pendingLinuxDo: null,
+		pendingPasskey: null,
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);

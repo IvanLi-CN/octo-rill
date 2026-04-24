@@ -116,6 +116,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let github_oauth = state::build_oauth_client(&config)?;
     let linuxdo_oauth = state::build_linuxdo_oauth_client(&config)?;
+    let webauthn = state::build_webauthn(&config)?;
     let http = reqwest::Client::builder()
         .user_agent("OctoRill")
         .redirect(reqwest::redirect::Policy::none())
@@ -135,6 +136,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         http,
         github_oauth,
         linuxdo_oauth,
+        webauthn,
         encryption_key: config.encryption_key.clone(),
         runtime_owner_id: crate::local_id::generate_local_id(),
     });
@@ -263,7 +265,28 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/me/github-connections/{connection_id}",
             axum::routing::delete(api::me_delete_github_connection),
         )
+        .route("/me/passkeys", get(api::me_get_passkeys))
+        .route(
+            "/me/passkeys/{passkey_id}",
+            axum::routing::delete(api::me_delete_passkey),
+        )
         .route("/auth/bind-context", get(api::auth_get_bind_context))
+        .route(
+            "/auth/passkeys/register/options",
+            post(auth::passkey_register_options),
+        )
+        .route(
+            "/auth/passkeys/register/verify",
+            post(auth::passkey_register_verify),
+        )
+        .route(
+            "/auth/passkeys/authenticate/options",
+            post(auth::passkey_authenticate_options),
+        )
+        .route(
+            "/auth/passkeys/authenticate/verify",
+            post(auth::passkey_authenticate_verify),
+        )
         .route("/reaction-token/check", post(api::check_reaction_token))
         .route("/reaction-token", put(api::upsert_reaction_token))
         .route(

@@ -10,5 +10,10 @@ export const Route = createLazyFileRoute("/bind/github")({
 
 function BindGitHubRoute() {
 	const search = routeApi.useSearch();
-	return <BindGitHubPage linuxdoStatus={search.linuxdo} />;
+	return (
+		<BindGitHubPage
+			linuxdoStatus={search.linuxdo}
+			passkeyStatus={search.passkey}
+		/>
+	);
 }

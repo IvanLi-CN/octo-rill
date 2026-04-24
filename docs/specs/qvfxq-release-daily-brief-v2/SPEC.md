@@ -1,11 +1,5 @@
 # Release 日报内容格式 V2 与历史快照修复（#qvfxq）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-16
-- Last: 2026-04-19
-
 ## 背景 / 问题陈述
 
 - 当前 Release 日报正文仍以 `## 概览` 开头，并把时间窗口、项目数、预发布数等元数据直接堆进正文，导致内容主体被稀释。
@@ -58,8 +52,8 @@
 
 - 新生成 brief 正文不得再包含 `## 概览`、`时间窗口（本地）` 或等价概览文案。
 - brief 正文必须稳定包含 `## 项目更新` 与 `## 获星与关注` 两个章节；任一类数据为空时也要输出对应空态。
-- `## 项目更新` 继续按仓库分组，保留 release 主链接 `/<owner>/<repo>/releases/tag/<tag>?from=briefs` 与 GitHub Release 外链。
-- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/<owner>/<repo>/releases/tag/<tag>?from=briefs)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
+- `## 项目更新` 继续按仓库分组，保留 release 主链接 `/?tab=briefs&release=<release_id>` 与 GitHub Release 外链。
+- `## 项目更新` 中的仓库标题必须保持 `### [owner/repo](...)`；每条 release 必须保持顶层 `- [title](/?tab=briefs&release=...)`；release 详情只能由连续的 `  - ...` 子 bullet 组成。
 - `## 获星与关注` 必须覆盖同一窗口内的 `repo_star_received` 与 `follower_received` 事件，并按最新事件倒序展示紧凑摘要。
 - related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
 - 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
@@ -167,28 +161,6 @@ None
 - `cd web && bun run build`
 - `cd web && bun run storybook:build`
 
-### Verification results
-
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test` → `386 passed`
-- `cd web && bun run lint`
-- `cd web && bun run build`
-- `cd web && bun run storybook:build`
-- `cd web && bun run e2e -- e2e/release-detail.spec.ts` → `21 passed`
-
-## 文档更新（Docs to Update）
-
-- `docs/product.md`: 日报内容结构改为 `项目更新 + 获星与关注`
-- `docs/specs/README.md`: 登记本 spec，收口后写入 PR 号与状态
-- `docs/specs/qvfxq-release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据与验证结果
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/qvfxq-release-daily-brief-v2/assets/`
-- In-plan references: `![...](./assets/<file>.png)`
-- Visual evidence source: Storybook docs / canvas
-
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
@@ -211,17 +183,6 @@ None
   evidence_note: 证明新增 `brief.refresh_content` 任务详情已展示内容修复摘要、总量、成功/失败、当前 brief 与最后错误。
   image:
   ![Admin 日报内容修复详情](./assets/admin-brief-refresh-content.png)
-
-## 资产晋升（Asset promotion）
-
-None
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 spec 并冻结日报 V2 / 历史修复 contract。
-- [x] M2: 后端生成链路升级为 V2 正文，并补齐短链接 / fence 清洗 / 原位刷新。
-- [x] M3: 内容刷新任务、admin diagnostics 与相关回归测试落地。
-- [x] M4: Storybook、文档、视觉证据与快车道收口完成。
 
 ## 方案概述（Approach, high-level）
 

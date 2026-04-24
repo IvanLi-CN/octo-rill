@@ -1,11 +1,5 @@
 # SPA 内导航全局骨架回退修复（#67g9w）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-17
-- Last: 2026-04-17
-
 ## 背景 / 问题陈述
 
 - Dashboard 在首次 hydration 完成后，用户通过 SPA 直接切换 `全部 / 发布 / 加星 / 关注` 这类 feed-backed tabs 时，URL 已经完成前端导航，但主页面仍会因为新的 feed 请求短暂回退到 `DashboardStartupSkeleton`。
@@ -85,7 +79,7 @@
 
 - Given Dashboard 已完成首次 hydration
   When 用户点击 `加星`
-  Then URL 更新为 `/stars`，且 `data-dashboard-secondary-controls` 仍保持可见。
+  Then URL 更新为 `/?tab=stars`，且 `data-dashboard-secondary-controls` 仍保持可见。
 
 - Given `/api/feed?types=stars` 仍在 pending
   When 页面处于 tab 切换中的 loading 态
@@ -127,28 +121,11 @@
 - Visual evidence source: `storybook_canvas`
 - Owner-facing screenshot persistence: 不要求；主人通过本地浏览器手测验收
 
-## 文档更新（Docs to Update）
-
-- `docs/specs/67g9w-spa-nav-startup-skeleton-guard/SPEC.md`
-- `docs/specs/README.md`
-
-## 计划资产（Plan assets）
-
-- Directory: 不要求新增截图资产
-- Visual evidence source: Storybook pending story + 本地浏览器手测
-
 ## Visual Evidence
 
 - 主人已明确选择“不需要截图”；本轮以稳定 Storybook pending story 作为回归入口，并通过本地浏览器手测完成验收。
 - 主人已在真实应用页 `http://127.0.0.1:55174/` 手测 `全部 -> 加星` 的 SPA 切换链路，确认壳层持续保留且未再回退全局 startup skeleton。
 - 验收关注点：Dashboard 已完成首屏 hydration 后，切到 `加星` 时只让主列进入局部 skeleton；页头、tabs、notice 与 footer 继续保留，不再回退到全局 startup skeleton。
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 拆分 Dashboard 首屏 hydration 与后续 feed tab 切换的 loading 边界。
-- [x] M2: 为局部 feed loading 补稳定 selector 与 Storybook pending story。
-- [x] M3: 补齐 Playwright 回归，并审计 admin startup skeleton guard。
-- [x] M4: 回填视觉证据并同步 specs index。
 
 ## 方案概述（Approach, high-level）
 

@@ -1,11 +1,5 @@
 # Dashboard 按日报边界分组与历史日报折叠（#xaycu）
 
-## 状态
-
-- Status: 已完成
-- Created: 2026-04-04
-- Last: 2026-04-16
-
 ## 背景 / 问题陈述
 
 - Dashboard 首页当前把 `全部` 与 `发布` 两个 tab 都渲染为同一条平铺 Release feed，缺少“按天阅读”的结构感。
@@ -161,16 +155,6 @@
   - `全部` tab 历史组手动生成日报
 - 最终视觉证据必须写入本 spec 的 `## Visual Evidence`。
 
-## 文档更新（Docs to Update）
-
-- `docs/product.md`
-- `docs/specs/README.md`
-- `docs/specs/xaycu-dashboard-day-grouping/SPEC.md`
-
-## 计划资产（Plan assets）
-
-- Directory: `docs/specs/xaycu-dashboard-day-grouping/assets/`
-
 ## Visual Evidence
 
 - 交互态细节（`列表` 后切回原始列表、`生成日报` 的 spinning 与占位日报、生成完成后的替换）由 Storybook `play` 覆盖校验。
@@ -186,12 +170,6 @@
 
 - `全部` tab 历史日组缺少日报时显示“生成日报”入口并保留原始 Release 卡片流
 ![全部 tab 历史日组生成入口](./assets/dashboard-all-history-fallback.png)
-
-## 实现里程碑（Milestones / Delivery checklist）
-
-- [x] M1: 新建 spec 并冻结 Dashboard 分组/折叠口径。
-- [x] M2: 落地 Dashboard 日分组、历史日报折叠与启动期边界配置。
-- [x] M3: 更新 Storybook、完成视觉证据并通过前端校验。
 
 ## 方案概述（Approach, high-level）
 
