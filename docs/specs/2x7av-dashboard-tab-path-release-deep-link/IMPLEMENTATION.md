@@ -36,4 +36,5 @@
 
 - repo/tag release detail lookup 已在 SQL 层同时约束 `tag_name + repo release URL prefix`，避免 common tag 先按 tag 扫全库、再在 Rust 侧逐行过滤。
 - brief markdown fallback 的 release ref 解析已改为“跨 brief 批量 resolve 一次，再按 brief 回填”，不再对每条 fallback brief 单独发起一轮 locator 解析查询。
+- brief markdown fallback 的 batched resolve 现已按 locator 数分批执行，避免超过 SQLite bind limit；同时按 brief 回填时再次去重，保持 `release_ids` / `release_count` 的既有唯一性语义。
 - canonical path-backed tab 切换继续遵守 `67g9w` 的壳层保留约束：Dashboard 在同一会话内已完成首屏 hydration 后，再切 `/stars` 等 path-backed tab 只显示局部 feed skeleton，不再回退全局 startup skeleton。

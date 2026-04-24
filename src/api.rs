@@ -110,6 +110,47 @@ fn brief_uses_markdown_release_fallback(generation_source: &str) -> bool {
     )
 }
 
+const BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT: usize = 300;
+
+async fn resolve_brief_release_refs_batched(
+    pool: &sqlx::SqlitePool,
+    refs: &[InternalReleaseRef],
+) -> Result<HashMap<InternalReleaseRef, i64>, sqlx::Error> {
+    let mut unique_refs = Vec::<InternalReleaseRef>::new();
+    let mut seen_refs = HashSet::<InternalReleaseRef>::new();
+    for reference in refs {
+        if seen_refs.insert(reference.clone()) {
+            unique_refs.push(reference.clone());
+        }
+    }
+
+    let mut resolved_ids_by_ref = HashMap::<InternalReleaseRef, i64>::new();
+    let mut batch = Vec::<InternalReleaseRef>::new();
+    let mut batch_locator_count = 0usize;
+
+    for reference in unique_refs {
+        let locator_count = usize::from(matches!(reference, InternalReleaseRef::Locator(_)));
+        if !batch.is_empty()
+            && batch_locator_count + locator_count > BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT
+        {
+            let resolved = resolve_release_refs(pool, &batch).await?;
+            resolved_ids_by_ref.extend(resolved.resolved);
+            batch.clear();
+            batch_locator_count = 0;
+        }
+
+        batch.push(reference);
+        batch_locator_count += locator_count;
+    }
+
+    if !batch.is_empty() {
+        let resolved = resolve_release_refs(pool, &batch).await?;
+        resolved_ids_by_ref.extend(resolved.resolved);
+    }
+
+    Ok(resolved_ids_by_ref)
+}
+
 async fn user_has_brief_access_to_release(
     state: &AppState,
     user_id: &str,
@@ -5032,18 +5073,17 @@ pub async fn list_briefs(
     }
 
     if !all_markdown_release_refs.is_empty() {
-        let resolved = resolve_release_refs(&state.pool, &all_markdown_release_refs)
-            .await
-            .map_err(ApiError::internal)?;
-        let resolved_ids_by_ref = resolved
-            .resolved
-            .into_iter()
-            .collect::<HashMap<InternalReleaseRef, i64>>();
+        let resolved_ids_by_ref =
+            resolve_brief_release_refs_batched(&state.pool, &all_markdown_release_refs)
+                .await
+                .map_err(ApiError::internal)?;
 
         for (brief_id, refs) in markdown_release_refs_by_brief {
+            let mut seen_release_ids = HashSet::<i64>::new();
             let release_ids = refs
                 .into_iter()
                 .filter_map(|reference| resolved_ids_by_ref.get(&reference).copied())
+                .filter(|release_id| seen_release_ids.insert(*release_id))
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>();
             if !release_ids.is_empty() {
@@ -11888,9 +11928,10 @@ mod tests {
         ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery, AdminLlmCallListScope,
         AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest, AdminRealtimeTaskDetailItem,
         AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
-        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery, FeedQuery, FeedRow,
-        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
-        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
+        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, FeedQuery, FeedRow, GitHubCompareCommit,
+        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
+        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
@@ -17172,6 +17213,131 @@ line two",
         assert_eq!(items[0].release_ids, vec!["121".to_owned()]);
         assert_eq!(items[1].date, "2026-02-23");
         assert_eq!(items[1].release_ids, vec!["120".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn list_briefs_dedupes_repeated_markdown_fallback_release_matches() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-23",
+            "\
+- [legacy](/?release=120&tab=briefs)\n\
+- [canonical](/openai/codex/releases/tag/v1.2.3?from=briefs)\n\
+",
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_briefs(State(state), setup_session(1).await)
+            .await
+            .expect("list briefs");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].release_ids, vec!["120".to_owned()]);
+        assert_eq!(items[0].release_count, 1);
+    }
+
+    #[tokio::test]
+    async fn list_briefs_batches_markdown_fallback_resolution_under_sqlite_bind_limit() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+
+        let mut first_brief_markdown = String::new();
+        let mut second_brief_markdown = String::new();
+        let split_index = BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT / 2;
+        let total_refs = BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT + 40;
+
+        for index in 0..total_refs {
+            let release_id = 10_000 + index as i64;
+            let tag = format!("v1.2.{index}");
+            sqlx::query(
+                r#"
+                INSERT INTO repo_releases (
+                  id,
+                  repo_id,
+                  release_id,
+                  node_id,
+                  tag_name,
+                  name,
+                  body,
+                  html_url,
+                  published_at,
+                  created_at,
+                  is_prerelease,
+                  is_draft,
+                  updated_at,
+                  react_plus1,
+                  react_laugh,
+                  react_heart,
+                  react_hooray,
+                  react_rocket,
+                  react_eyes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+                "#,
+            )
+            .bind(format!("repo-release-42-{release_id}"))
+            .bind(42_i64)
+            .bind(release_id)
+            .bind(format!("node-{release_id}"))
+            .bind(&tag)
+            .bind(format!("Release {tag}"))
+            .bind(format!("- item {release_id}"))
+            .bind(format!(
+                "https://github.com/openai/codex/releases/tag/{tag}"
+            ))
+            .bind("2026-02-24T08:00:00Z")
+            .bind("2026-02-24T08:00:00Z")
+            .bind("2026-02-24T08:00:00Z")
+            .execute(&pool)
+            .await
+            .expect("seed repo release");
+
+            let line = format!("- [{tag}](/openai/codex/releases/tag/{tag}?from=briefs)\n");
+            if index < split_index {
+                first_brief_markdown.push_str(&line);
+            } else {
+                second_brief_markdown.push_str(&line);
+            }
+        }
+
+        seed_brief(&pool, user_id.as_str(), "2026-02-23", &first_brief_markdown).await;
+        seed_brief(
+            &pool,
+            user_id.as_str(),
+            "2026-02-24",
+            &second_brief_markdown,
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(items) = list_briefs(State(state), setup_session(1).await)
+            .await
+            .expect("list briefs");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].release_count, total_refs - split_index);
+        assert_eq!(items[1].release_count, split_index);
+        assert_eq!(
+            items[0].release_ids.first().map(String::as_str),
+            Some("10150")
+        );
+        assert_eq!(
+            items[0].release_ids.last().map(String::as_str),
+            Some("10339")
+        );
+        assert_eq!(
+            items[1].release_ids.first().map(String::as_str),
+            Some("10000")
+        );
+        assert_eq!(
+            items[1].release_ids.last().map(String::as_str),
+            Some("10149")
+        );
     }
 
     #[tokio::test]
