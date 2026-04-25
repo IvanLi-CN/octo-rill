@@ -415,10 +415,9 @@ export function Dashboard(props: {
 	const reactionFlushTimerByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
-	const lastFeedReactionRefreshRef = useRef<{
-		key: string;
-		at: number;
-	} | null>(null);
+	const lastFeedReactionRefreshByKeyRef = useRef<Map<string, number>>(
+		new Map<string, number>(),
+	);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
@@ -798,31 +797,28 @@ export function Dashboard(props: {
 		}
 
 		const uniqueReleaseIds = Array.from(new Set(releaseIds)).sort();
-		const releaseIdsToRefresh = uniqueReleaseIds.filter(
-			(releaseId) =>
-				!reactionRefreshingKeysRef.current.has(
-					itemKey({ kind: "release", id: releaseId }),
-				),
-		);
+		const now = Date.now();
+		const releaseIdsToRefresh = uniqueReleaseIds.filter((releaseId) => {
+			const key = itemKey({ kind: "release", id: releaseId });
+			if (reactionRefreshingKeysRef.current.has(key)) {
+				return false;
+			}
+			const lastRefreshAt = lastFeedReactionRefreshByKeyRef.current.get(key);
+			return (
+				lastRefreshAt === undefined ||
+				now - lastRefreshAt >= FEED_REACTION_REFRESH_TTL_MS
+			);
+		});
 		if (releaseIdsToRefresh.length === 0) {
 			return;
 		}
 
-		const refreshKey = `${feedRequestType}:${releaseIdsToRefresh.join(",")}`;
-		const now = Date.now();
-		const lastRefresh = lastFeedReactionRefreshRef.current;
-		if (
-			lastRefresh?.key === refreshKey &&
-			now - lastRefresh.at < FEED_REACTION_REFRESH_TTL_MS
-		) {
-			return;
-		}
-		lastFeedReactionRefreshRef.current = { key: refreshKey, at: now };
 		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
 			itemKey({ kind: "release", id: releaseId }),
 		);
 		for (const key of refreshingKeys) {
 			reactionRefreshingKeysRef.current.add(key);
+			lastFeedReactionRefreshByKeyRef.current.set(key, now);
 		}
 		setReactionRefreshingKeys((current) => {
 			const next = new Set(current);
@@ -886,12 +882,7 @@ export function Dashboard(props: {
 					return next;
 				});
 			});
-	}, [
-		feed.applyReactions,
-		feed.items,
-		feedRequestType,
-		reactionTokenConfigured,
-	]);
+	}, [feed.applyReactions, feed.items, reactionTokenConfigured]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
@@ -1779,12 +1770,12 @@ export function Dashboard(props: {
 		feed.items,
 		feed.loadingInitial,
 		feed.nextCursor,
-		feedRequestType,
 		me.user.id,
 		notifications,
 		routeState,
 		selectedBriefId,
 		sidebarLoading,
+		feedRequestType,
 	]);
 
 	const showStartupSkeleton =
