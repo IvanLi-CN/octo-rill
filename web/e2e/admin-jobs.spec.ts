@@ -256,6 +256,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:03Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-2",
@@ -268,6 +271,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:03Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-3",
@@ -280,6 +286,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:03Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-4",
@@ -292,6 +301,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:03Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 	];
 
@@ -307,6 +319,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:00Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-2",
@@ -319,6 +334,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:00Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-3",
@@ -331,6 +349,9 @@ async function installAdminJobsMocks(
 			trigger_reason: null,
 			updated_at: "2026-02-26T04:00:00Z",
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 		{
 			worker_id: "translation-worker-4",
@@ -343,6 +364,9 @@ async function installAdminJobsMocks(
 			trigger_reason: "deadline",
 			updated_at: recentRunningWorkerUpdatedAt,
 			error_text: null,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
 		},
 	];
 	let translationRuntimeOverride: {
@@ -367,6 +391,9 @@ async function installAdminJobsMocks(
 				trigger_reason: null,
 				updated_at: "2026-02-26T04:00:03Z",
 				error_text: null,
+				error_code: null,
+				error_summary: null,
+				error_detail: null,
 			})),
 			...Array.from({ length: dedicatedWorkerConcurrency }, (_, index) => ({
 				worker_id: `translation-worker-user-dedicated-${index + 1}`,
@@ -379,6 +406,9 @@ async function installAdminJobsMocks(
 				trigger_reason: null,
 				updated_at: "2026-02-26T04:00:03Z",
 				error_text: null,
+				error_code: null,
+				error_summary: null,
+				error_detail: null,
 			})),
 		];
 	}
@@ -393,6 +423,9 @@ async function installAdminJobsMocks(
 		summary_md: null,
 		body_md: "- 修复了调度窗口\n- 保持单请求语义",
 		error: null,
+		error_code: null,
+		error_summary: null,
+		error_detail: null,
 		work_item_id: "work-translation-1",
 		batch_id: "batch-translation-1",
 	};
@@ -409,6 +442,19 @@ async function installAdminJobsMocks(
 		started_at: "2026-02-26T04:00:01Z",
 		finished_at: "2026-02-26T04:00:03Z",
 		updated_at: "2026-02-26T04:00:03Z",
+		result_summary: {
+			ready: 1,
+			error: 0,
+			missing: 0,
+			disabled: 0,
+			queued: 0,
+			running: 0,
+		},
+		business_outcome: {
+			code: "ok",
+			label: "业务成功",
+			message: "批次与条目均已成功完成。",
+		},
 	};
 
 	const completedTranslationBatchDetail = {
@@ -482,7 +528,11 @@ async function installAdminJobsMocks(
 				running_batches: 0,
 				requests_24h: 1,
 				completed_batches_24h: 1,
+				clean_completed_batches_24h: 1,
+				completed_with_issues_batches_24h: 0,
 				failed_batches_24h: 0,
+				error_work_items_24h: 0,
+				missing_work_items_24h: 0,
 				avg_wait_ms_24h: 320,
 				last_batch_finished_at: "2026-02-26T04:00:03Z",
 			};
@@ -512,7 +562,11 @@ async function installAdminJobsMocks(
 				running_batches: 0,
 				requests_24h: 1,
 				completed_batches_24h: 1,
+				clean_completed_batches_24h: 1,
+				completed_with_issues_batches_24h: 0,
 				failed_batches_24h: 0,
+				error_work_items_24h: 0,
+				missing_work_items_24h: 0,
 				avg_wait_ms_24h: 320,
 				last_batch_finished_at: "2026-02-26T04:00:03Z",
 			};
@@ -542,7 +596,11 @@ async function installAdminJobsMocks(
 			running_batches: 1,
 			requests_24h: 1,
 			completed_batches_24h: 0,
+			clean_completed_batches_24h: 0,
+			completed_with_issues_batches_24h: 0,
 			failed_batches_24h: 0,
+			error_work_items_24h: 0,
+			missing_work_items_24h: 0,
 			avg_wait_ms_24h: null,
 			last_batch_finished_at: null,
 		};

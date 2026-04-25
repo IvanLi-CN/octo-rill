@@ -1274,6 +1274,47 @@ function translationRunTone(status: string): TaskStatusTone {
 	}
 }
 
+function translationBusinessOutcomeTone(code: string): BadgeTone {
+	switch (code) {
+		case "ok":
+			return taskStatusTone("succeeded");
+		case "partial":
+			return taskStatusTone("canceled");
+		case "failed":
+			return taskStatusTone("failed");
+		case "disabled":
+			return {
+				badgeClass:
+					"border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100",
+				dotClass: "bg-slate-500",
+			};
+		default:
+			return {
+				badgeClass:
+					"border-border bg-muted/60 text-foreground dark:border-border dark:bg-muted/50 dark:text-foreground",
+				dotClass: "bg-muted-foreground",
+			};
+	}
+}
+
+function translationBatchResultSummaryText(
+	summary:
+		| AdminTranslationBatchListItem["result_summary"]
+		| AdminTranslationBatchDetailResponse["batch"]["result_summary"],
+) {
+	const segments = [
+		{ label: "就绪", count: summary.ready },
+		{ label: "错误", count: summary.error },
+		{ label: "缺失", count: summary.missing },
+		{ label: "禁用", count: summary.disabled },
+		{ label: "排队", count: summary.queued },
+		{ label: "运行中", count: summary.running },
+	]
+		.filter((item) => item.count > 0)
+		.map((item) => `${item.label} ${formatCount(item.count)}`);
+	return segments.length > 0 ? segments.join(" · ") : "暂无条目汇总";
+}
+
 function translationItemTone(status: string): BadgeTone {
 	switch (status) {
 		case "ready":
@@ -1680,11 +1721,15 @@ function TranslationSchedulerSection(props: {
 					<div className="bg-card/70 rounded-lg border p-3">
 						<p className="text-muted-foreground text-xs">近24h 批次</p>
 						<p className="mt-1 text-sm font-semibold">
-							{formatCount(status?.completed_batches_24h)} /{" "}
+							{formatCount(status?.clean_completed_batches_24h)} /{" "}
+							{formatCount(status?.completed_with_issues_batches_24h)} /{" "}
 							{formatCount(status?.failed_batches_24h)}
 						</p>
 						<p className="text-muted-foreground mt-1 text-xs">
-							平均等待 {formatDurationMs(status?.avg_wait_ms_24h ?? null)}
+							干净完成 / 带问题完成 / 失败 · error items{" "}
+							{formatCount(status?.error_work_items_24h)} · missing items{" "}
+							{formatCount(status?.missing_work_items_24h)} · 平均等待{" "}
+							{formatDurationMs(status?.avg_wait_ms_24h ?? null)}
 						</p>
 					</div>
 				</CardContent>
@@ -1990,10 +2035,25 @@ function TranslationSchedulerSection(props: {
 															</div>
 														</TableCell>
 														<TableCell className="px-3 py-3 whitespace-nowrap">
-															<StatusBadge
-																label={translationRunStatusLabel(batch.status)}
-																tone={translationRunTone(batch.status)}
-															/>
+															<div className="flex flex-wrap items-center gap-2">
+																<StatusBadge
+																	label={translationRunStatusLabel(
+																		batch.status,
+																	)}
+																	tone={translationRunTone(batch.status)}
+																/>
+																<StatusBadge
+																	label={batch.business_outcome.label}
+																	tone={translationBusinessOutcomeTone(
+																		batch.business_outcome.code,
+																	)}
+																/>
+															</div>
+															<p className="text-muted-foreground mt-1 whitespace-normal text-[11px] leading-5">
+																{translationBatchResultSummaryText(
+																	batch.result_summary,
+																)}
+															</p>
 														</TableCell>
 														<TableCell className="px-3 py-3 whitespace-nowrap">
 															{translationWorkerSlotLabel(batch.worker_slot)}
@@ -2040,6 +2100,12 @@ function TranslationSchedulerSection(props: {
 														label={translationRunStatusLabel(batch.status)}
 														tone={translationRunTone(batch.status)}
 													/>
+													<StatusBadge
+														label={batch.business_outcome.label}
+														tone={translationBusinessOutcomeTone(
+															batch.business_outcome.code,
+														)}
+													/>
 												</div>
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
 													{translationWorkerSlotLabel(batch.worker_slot)} · 请求{" "}
@@ -2049,6 +2115,11 @@ function TranslationSchedulerSection(props: {
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap text-xs">
 													预算 {formatCount(batch.estimated_input_tokens)}{" "}
 													tokens · 更新 {formatLocalDateTime(batch.updated_at)}
+												</p>
+												<p className="text-muted-foreground mt-1 text-xs">
+													{translationBatchResultSummaryText(
+														batch.result_summary,
+													)}
 												</p>
 												<p className="text-muted-foreground mt-1 truncate whitespace-nowrap font-mono text-[11px]">
 													{batch.id}
@@ -2330,11 +2401,25 @@ function TranslationSchedulerSection(props: {
 								<div className="grid gap-2 md:grid-cols-2">
 									<div className="rounded-lg border p-3">
 										<p className="text-muted-foreground text-xs">批次状态</p>
-										<p className="mt-1 font-medium">
-											{translationRunStatusLabel(batchDetail.batch.status)}
-										</p>
+										<div className="mt-1 flex flex-wrap items-center gap-2">
+											<StatusBadge
+												label={translationRunStatusLabel(
+													batchDetail.batch.status,
+												)}
+												tone={translationRunTone(batchDetail.batch.status)}
+											/>
+											<StatusBadge
+												label={batchDetail.batch.business_outcome.label}
+												tone={translationBusinessOutcomeTone(
+													batchDetail.batch.business_outcome.code,
+												)}
+											/>
+										</div>
 										<p className="text-muted-foreground mt-1 text-xs">
 											{batchDetail.batch.trigger_reason}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs leading-5">
+											{batchDetail.batch.business_outcome.message}
 										</p>
 									</div>
 									<div className="rounded-lg border p-3">
@@ -2351,6 +2436,11 @@ function TranslationSchedulerSection(props: {
 											items {formatCount(batchDetail.batch.item_count)} ·{" "}
 											{formatCount(batchDetail.batch.estimated_input_tokens)}{" "}
 											tokens
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs leading-5">
+											{translationBatchResultSummaryText(
+												batchDetail.batch.result_summary,
+											)}
 										</p>
 									</div>
 								</div>

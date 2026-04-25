@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-02-25
-- Last: 2026-03-27
+- Last: 2026-04-24
 
 ## 变更记录
 
@@ -13,3 +13,4 @@
 - 2026-02-27: 新增“管理端独立页头 + 管理员导航”要求，并在 `/admin` 与 `/admin/jobs` 落地统一页头组件。
 - 2026-03-07: 澄清用户详情抽屉中的日报时间语义为“浏览器当前时区”，并要求按浏览器当前日期换算 UTC 时钟值以避免 DST 偏差。
 - 2026-03-08: 对齐 Admin Jobs / Admin Users 相关 Playwright 断言与合并门禁证据，保持浏览器时区语义回归覆盖稳定。
+- 2026-04-24: 扩展翻译任务中心观测口径，补齐 `completed_with_issues`、批次 `result_summary` / `business_outcome` 与 Storybook 视觉证据。

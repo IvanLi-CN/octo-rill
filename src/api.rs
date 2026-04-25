@@ -1431,6 +1431,7 @@ pub struct AdminDashboardResponse {
     status_breakdown: AdminDashboardStatusBreakdown,
     task_share: Vec<AdminDashboardTaskShareItem>,
     trend_points: Vec<AdminDashboardTrendPoint>,
+    llm_health: AdminDashboardLlmHealth,
     window_meta: AdminDashboardWindowMeta,
 }
 
@@ -1468,8 +1469,17 @@ pub struct AdminDashboardStatusBreakdown {
     succeeded_total: i64,
     failed_total: i64,
     canceled_total: i64,
+    business_counts: AdminDashboardBusinessCounts,
     total: i64,
     items: Vec<AdminDashboardTaskStatusItem>,
+}
+
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct AdminDashboardBusinessCounts {
+    ok: i64,
+    partial: i64,
+    failed: i64,
+    disabled: i64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1481,8 +1491,10 @@ pub struct AdminDashboardTaskStatusItem {
     succeeded: i64,
     failed: i64,
     canceled: i64,
+    business_counts: AdminDashboardBusinessCounts,
     total: i64,
     success_rate: f64,
+    business_success_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1492,6 +1504,8 @@ pub struct AdminDashboardTaskShareItem {
     total: i64,
     share_ratio: f64,
     success_rate: f64,
+    business_counts: AdminDashboardBusinessCounts,
+    business_success_rate: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1502,10 +1516,16 @@ pub struct AdminDashboardTrendPoint {
     active_users: i64,
     translations_total: i64,
     translations_failed: i64,
+    translations_partial: i64,
+    translations_business_failed: i64,
     summaries_total: i64,
     summaries_failed: i64,
+    summaries_partial: i64,
+    summaries_business_failed: i64,
     briefs_total: i64,
     briefs_failed: i64,
+    briefs_partial: i64,
+    briefs_business_failed: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1517,6 +1537,22 @@ pub struct AdminDashboardWindowMeta {
     point_count: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardLlmHealthBucket {
+    label: String,
+    count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminDashboardLlmHealth {
+    calls_24h: i64,
+    failed_24h: i64,
+    last_failure_at: Option<String>,
+    top_failure_reasons: Vec<AdminDashboardLlmHealthBucket>,
+    top_failure_sources: Vec<AdminDashboardLlmHealthBucket>,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 struct AdminDashboardRollupRow {
     rollup_date: String,
@@ -1528,15 +1564,23 @@ struct AdminDashboardRollupRow {
     succeeded_count: i64,
     failed_count: i64,
     canceled_count: i64,
+    business_ok_count: i64,
+    business_partial_count: i64,
+    business_failed_count: i64,
+    business_disabled_count: i64,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
 struct AdminDashboardStatusCountRow {
     queued_count: i64,
     running_count: i64,
     succeeded_count: i64,
     failed_count: i64,
     canceled_count: i64,
+    business_ok_count: i64,
+    business_partial_count: i64,
+    business_failed_count: i64,
+    business_disabled_count: i64,
 }
 
 const ADMIN_DASHBOARD_DEFAULT_WINDOW_DAYS: i64 = 7;
@@ -1641,7 +1685,31 @@ async fn count_admin_dashboard_active_users_between(
     .map_err(ApiError::internal)
 }
 
-async fn load_admin_dashboard_task_status_counts(
+fn admin_dashboard_status_count_business_counts(
+    counts: &AdminDashboardStatusCountRow,
+) -> AdminDashboardBusinessCounts {
+    AdminDashboardBusinessCounts {
+        ok: counts.business_ok_count,
+        partial: counts.business_partial_count,
+        failed: counts.business_failed_count,
+        disabled: counts.business_disabled_count,
+    }
+}
+
+fn admin_dashboard_business_terminal_total(counts: &AdminDashboardBusinessCounts) -> i64 {
+    counts.ok + counts.partial + counts.failed + counts.disabled
+}
+
+fn admin_dashboard_business_success_rate(counts: &AdminDashboardBusinessCounts) -> f64 {
+    let terminal_total = admin_dashboard_business_terminal_total(counts);
+    if terminal_total <= 0 {
+        0.0
+    } else {
+        counts.ok as f64 / terminal_total as f64
+    }
+}
+
+async fn load_admin_dashboard_release_task_status_counts(
     pool: &sqlx::SqlitePool,
     task_type: &str,
     start_at: &str,
@@ -1654,11 +1722,44 @@ async fn load_admin_dashboard_task_status_counts(
           COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_count,
           COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
-          COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled_count
-        FROM job_tasks
-        WHERE task_type = ?
-          AND julianday(created_at) >= julianday(?)
-          AND julianday(created_at) <= julianday(?)
+          COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled_count,
+          COALESCE(SUM(CASE WHEN business_code = 'ok' THEN 1 ELSE 0 END), 0) AS business_ok_count,
+          COALESCE(SUM(CASE WHEN business_code = 'partial' THEN 1 ELSE 0 END), 0) AS business_partial_count,
+          COALESCE(SUM(CASE WHEN business_code = 'failed' THEN 1 ELSE 0 END), 0) AS business_failed_count,
+          COALESCE(SUM(CASE WHEN business_code = 'disabled' THEN 1 ELSE 0 END), 0) AS business_disabled_count
+        FROM (
+          SELECT
+            status,
+            CASE
+              WHEN status = 'canceled' THEN 'unknown'
+              WHEN status = 'queued' OR status = 'running' THEN 'unknown'
+              WHEN status = 'failed' THEN 'failed'
+              WHEN release_total = 0 THEN 'ok'
+              WHEN disabled_count = release_total THEN 'disabled'
+              WHEN error_count > 0 AND ready_count = 0 THEN 'failed'
+              WHEN error_count > 0 OR missing_count > 0 THEN 'partial'
+              WHEN ready_count > 0 AND ready_count >= release_total THEN 'ok'
+              WHEN ready_count > 0 THEN 'partial'
+              ELSE 'unknown'
+            END AS business_code
+          FROM (
+            SELECT
+              status,
+              COALESCE(
+                CAST(json_extract(result_json, '$.total') AS INTEGER),
+                json_array_length(json_extract(payload_json, '$.release_ids')),
+                0
+              ) AS release_total,
+              COALESCE(CAST(json_extract(result_json, '$.ready') AS INTEGER), 0) AS ready_count,
+              COALESCE(CAST(json_extract(result_json, '$.missing') AS INTEGER), 0) AS missing_count,
+              COALESCE(CAST(json_extract(result_json, '$.disabled') AS INTEGER), 0) AS disabled_count,
+              COALESCE(CAST(json_extract(result_json, '$.error') AS INTEGER), 0) AS error_count
+            FROM job_tasks
+            WHERE task_type = ?
+              AND julianday(created_at) >= julianday(?)
+              AND julianday(created_at) <= julianday(?)
+          ) task_rows
+        ) business_rows
         "#,
     )
     .bind(task_type)
@@ -1667,6 +1768,78 @@ async fn load_admin_dashboard_task_status_counts(
     .fetch_one(pool)
     .await
     .map_err(ApiError::internal)
+}
+
+async fn load_admin_dashboard_brief_task_status_counts(
+    pool: &sqlx::SqlitePool,
+    task_type: &str,
+    start_at: &str,
+    end_at: &str,
+) -> Result<AdminDashboardStatusCountRow, ApiError> {
+    sqlx::query_as::<_, AdminDashboardStatusCountRow>(
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
+          COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
+          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+          COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled_count,
+          COALESCE(SUM(CASE WHEN business_code = 'ok' THEN 1 ELSE 0 END), 0) AS business_ok_count,
+          COALESCE(SUM(CASE WHEN business_code = 'partial' THEN 1 ELSE 0 END), 0) AS business_partial_count,
+          COALESCE(SUM(CASE WHEN business_code = 'failed' THEN 1 ELSE 0 END), 0) AS business_failed_count,
+          COALESCE(SUM(CASE WHEN business_code = 'disabled' THEN 1 ELSE 0 END), 0) AS business_disabled_count
+        FROM (
+          SELECT
+            status,
+            CASE
+              WHEN status = 'canceled' THEN 'unknown'
+              WHEN status = 'queued' OR status = 'running' THEN 'unknown'
+              WHEN status = 'failed' THEN 'failed'
+              WHEN canceled_flag != 0 THEN 'partial'
+              WHEN total_users = 0 THEN 'ok'
+              WHEN failed_users > 0 AND succeeded_users = 0 THEN 'failed'
+              WHEN failed_users > 0 THEN 'partial'
+              WHEN succeeded_users > 0 THEN 'ok'
+              ELSE 'unknown'
+            END AS business_code
+          FROM (
+            SELECT
+              status,
+              COALESCE(CAST(json_extract(result_json, '$.total') AS INTEGER), 0) AS total_users,
+              COALESCE(CAST(json_extract(result_json, '$.succeeded') AS INTEGER), 0) AS succeeded_users,
+              COALESCE(CAST(json_extract(result_json, '$.failed') AS INTEGER), 0) AS failed_users,
+              COALESCE(CAST(json_extract(result_json, '$.canceled') AS INTEGER), 0) AS canceled_flag
+            FROM job_tasks
+            WHERE task_type = ?
+              AND julianday(created_at) >= julianday(?)
+              AND julianday(created_at) <= julianday(?)
+          ) task_rows
+        ) business_rows
+        "#,
+    )
+    .bind(task_type)
+    .bind(start_at)
+    .bind(end_at)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+async fn load_admin_dashboard_task_status_counts(
+    pool: &sqlx::SqlitePool,
+    task_type: &str,
+    start_at: &str,
+    end_at: &str,
+) -> Result<AdminDashboardStatusCountRow, ApiError> {
+    match task_type {
+        jobs::TASK_TRANSLATE_RELEASE_BATCH | jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
+            load_admin_dashboard_release_task_status_counts(pool, task_type, start_at, end_at).await
+        }
+        jobs::TASK_BRIEF_DAILY_SLOT => {
+            load_admin_dashboard_brief_task_status_counts(pool, task_type, start_at, end_at).await
+        }
+        _ => Ok(AdminDashboardStatusCountRow::default()),
+    }
 }
 
 async fn upsert_admin_dashboard_rollup_for_day(
@@ -1706,9 +1879,13 @@ async fn upsert_admin_dashboard_rollup_for_day(
               succeeded_count,
               failed_count,
               canceled_count,
+              business_ok_count,
+              business_partial_count,
+              business_failed_count,
+              business_disabled_count,
               updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(rollup_date, time_zone, task_type)
             DO UPDATE SET
               total_users = excluded.total_users,
@@ -1718,6 +1895,10 @@ async fn upsert_admin_dashboard_rollup_for_day(
               succeeded_count = excluded.succeeded_count,
               failed_count = excluded.failed_count,
               canceled_count = excluded.canceled_count,
+              business_ok_count = excluded.business_ok_count,
+              business_partial_count = excluded.business_partial_count,
+              business_failed_count = excluded.business_failed_count,
+              business_disabled_count = excluded.business_disabled_count,
               updated_at = excluded.updated_at
             "#,
         )
@@ -1731,6 +1912,10 @@ async fn upsert_admin_dashboard_rollup_for_day(
         .bind(counts.succeeded_count)
         .bind(counts.failed_count)
         .bind(counts.canceled_count)
+        .bind(counts.business_ok_count)
+        .bind(counts.business_partial_count)
+        .bind(counts.business_failed_count)
+        .bind(counts.business_disabled_count)
         .bind(updated_at.as_str())
         .execute(&state.pool)
         .await
@@ -1785,6 +1970,7 @@ fn build_admin_dashboard_task_status_item(
     } else {
         counts.succeeded_count as f64 / finished_total as f64
     };
+    let business_counts = admin_dashboard_status_count_business_counts(counts);
 
     AdminDashboardTaskStatusItem {
         task_type: task_type.to_owned(),
@@ -1794,6 +1980,8 @@ fn build_admin_dashboard_task_status_item(
         succeeded: counts.succeeded_count,
         failed: counts.failed_count,
         canceled: counts.canceled_count,
+        business_success_rate: admin_dashboard_business_success_rate(&business_counts),
+        business_counts,
         total,
         success_rate,
     }
@@ -1814,6 +2002,8 @@ fn build_admin_dashboard_task_share_item(
         total: item.total,
         share_ratio,
         success_rate: item.success_rate,
+        business_counts: item.business_counts.clone(),
+        business_success_rate: item.business_success_rate,
     }
 }
 
@@ -1834,7 +2024,11 @@ async fn load_admin_dashboard_rollups(
           running_count,
           succeeded_count,
           failed_count,
-          canceled_count
+          canceled_count,
+          business_ok_count,
+          business_partial_count,
+          business_failed_count,
+          business_disabled_count
         FROM admin_dashboard_daily_rollups
         WHERE time_zone = ?
           AND rollup_date >= ?
@@ -1908,6 +2102,106 @@ async fn count_admin_dashboard_live_tasks_by_status(
     .map_err(ApiError::internal)
 }
 
+async fn load_admin_dashboard_llm_health(
+    pool: &sqlx::SqlitePool,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Result<AdminDashboardLlmHealth, ApiError> {
+    let since = (now_utc - chrono::Duration::hours(24)).to_rfc3339();
+    let until = now_utc.to_rfc3339();
+    let health_window_timestamp_expr = "COALESCE(finished_at, updated_at, created_at)";
+    let calls_24h = sqlx::query_scalar::<_, i64>(&format!(
+        r#"
+        SELECT COUNT(*)
+        FROM llm_calls
+        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
+          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let failed_24h = sqlx::query_scalar::<_, i64>(&format!(
+        r#"
+        SELECT COUNT(*)
+        FROM llm_calls
+        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
+          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+          AND status = 'failed'
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let last_failure_at = sqlx::query_scalar::<_, Option<String>>(&format!(
+        r#"
+        SELECT MAX({health_window_timestamp_expr})
+        FROM llm_calls
+        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
+          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+          AND status = 'failed'
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let top_failure_reasons = sqlx::query_as::<_, (String, i64)>(&format!(
+        r#"
+        SELECT
+          COALESCE(NULLIF(TRIM(error_text), ''), '未记录错误文本') AS label,
+          COUNT(*) AS count
+        FROM llm_calls
+        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
+          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+          AND status = 'failed'
+        GROUP BY label
+        ORDER BY count DESC, label ASC
+        LIMIT 5
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .map(|(label, count)| AdminDashboardLlmHealthBucket { label, count })
+    .collect::<Vec<_>>();
+    let top_failure_sources = sqlx::query_as::<_, (String, i64)>(&format!(
+        r#"
+        SELECT source AS label, COUNT(*) AS count
+        FROM llm_calls
+        WHERE julianday({health_window_timestamp_expr}) >= julianday(?)
+          AND julianday({health_window_timestamp_expr}) <= julianday(?)
+          AND status = 'failed'
+        GROUP BY source
+        ORDER BY count DESC, label ASC
+        LIMIT 5
+        "#,
+    ))
+    .bind(since.as_str())
+    .bind(until.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .map(|(label, count)| AdminDashboardLlmHealthBucket { label, count })
+    .collect::<Vec<_>>();
+
+    Ok(AdminDashboardLlmHealth {
+        calls_24h,
+        failed_24h,
+        last_failure_at,
+        top_failure_reasons,
+        top_failure_sources,
+    })
+}
+
 async fn load_admin_dashboard_today_live_snapshot(
     state: &AppState,
     time_zone: Tz,
@@ -1950,6 +2244,16 @@ async fn load_admin_dashboard_today_live_snapshot(
     let succeeded_total = items.iter().map(|item| item.succeeded).sum::<i64>();
     let failed_total = items.iter().map(|item| item.failed).sum::<i64>();
     let canceled_total = items.iter().map(|item| item.canceled).sum::<i64>();
+    let business_counts =
+        items
+            .iter()
+            .fold(AdminDashboardBusinessCounts::default(), |mut acc, item| {
+                acc.ok += item.business_counts.ok;
+                acc.partial += item.business_counts.partial;
+                acc.failed += item.business_counts.failed;
+                acc.disabled += item.business_counts.disabled;
+                acc
+            });
     let total = items.iter().map(|item| item.total).sum::<i64>();
 
     Ok((
@@ -1967,6 +2271,7 @@ async fn load_admin_dashboard_today_live_snapshot(
             succeeded_total,
             failed_total,
             canceled_total,
+            business_counts,
             total,
             items,
         },
@@ -2001,6 +2306,7 @@ pub async fn admin_dashboard(
     let (today_live, status_breakdown) =
         load_admin_dashboard_today_live_snapshot(state.as_ref(), time_zone, now_utc).await?;
     let ongoing_by_task = load_admin_dashboard_ongoing_counts(&state.pool).await?;
+    let llm_health = load_admin_dashboard_llm_health(&state.pool, now_utc).await?;
 
     let today_value = today_live.date.clone();
     let mut trend_points_by_date = HashMap::<String, AdminDashboardTrendPoint>::new();
@@ -2016,10 +2322,16 @@ pub async fn admin_dashboard(
                 active_users: 0,
                 translations_total: 0,
                 translations_failed: 0,
+                translations_partial: 0,
+                translations_business_failed: 0,
                 summaries_total: 0,
                 summaries_failed: 0,
+                summaries_partial: 0,
+                summaries_business_failed: 0,
                 briefs_total: 0,
                 briefs_failed: 0,
+                briefs_partial: 0,
+                briefs_business_failed: 0,
             },
         );
         if day >= end_day {
@@ -2046,10 +2358,16 @@ pub async fn admin_dashboard(
                 active_users: row.active_users,
                 translations_total: 0,
                 translations_failed: 0,
+                translations_partial: 0,
+                translations_business_failed: 0,
                 summaries_total: 0,
                 summaries_failed: 0,
+                summaries_partial: 0,
+                summaries_business_failed: 0,
                 briefs_total: 0,
                 briefs_failed: 0,
+                briefs_partial: 0,
+                briefs_business_failed: 0,
             });
         point.total_users = row.total_users;
         point.active_users = row.active_users;
@@ -2061,6 +2379,8 @@ pub async fn admin_dashboard(
                     + row.failed_count
                     + row.canceled_count;
                 point.translations_failed = row.failed_count;
+                point.translations_partial = row.business_partial_count;
+                point.translations_business_failed = row.business_failed_count;
             }
             jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
                 point.summaries_total = row.queued_count
@@ -2069,6 +2389,8 @@ pub async fn admin_dashboard(
                     + row.failed_count
                     + row.canceled_count;
                 point.summaries_failed = row.failed_count;
+                point.summaries_partial = row.business_partial_count;
+                point.summaries_business_failed = row.business_failed_count;
             }
             jobs::TASK_BRIEF_DAILY_SLOT => {
                 point.briefs_total = row.queued_count
@@ -2077,6 +2399,8 @@ pub async fn admin_dashboard(
                     + row.failed_count
                     + row.canceled_count;
                 point.briefs_failed = row.failed_count;
+                point.briefs_partial = row.business_partial_count;
+                point.briefs_business_failed = row.business_failed_count;
             }
             _ => {}
         }
@@ -2094,10 +2418,16 @@ pub async fn admin_dashboard(
             active_users: 0,
             translations_total: 0,
             translations_failed: 0,
+            translations_partial: 0,
+            translations_business_failed: 0,
             summaries_total: 0,
             summaries_failed: 0,
+            summaries_partial: 0,
+            summaries_business_failed: 0,
             briefs_total: 0,
             briefs_failed: 0,
+            briefs_partial: 0,
+            briefs_business_failed: 0,
         });
     today_point.total_users = today_live.total_users;
     today_point.active_users = today_live.active_users;
@@ -2106,14 +2436,20 @@ pub async fn admin_dashboard(
             jobs::TASK_TRANSLATE_RELEASE_BATCH => {
                 today_point.translations_total = item.total;
                 today_point.translations_failed = item.failed;
+                today_point.translations_partial = item.business_counts.partial;
+                today_point.translations_business_failed = item.business_counts.failed;
             }
             jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
                 today_point.summaries_total = item.total;
                 today_point.summaries_failed = item.failed;
+                today_point.summaries_partial = item.business_counts.partial;
+                today_point.summaries_business_failed = item.business_counts.failed;
             }
             jobs::TASK_BRIEF_DAILY_SLOT => {
                 today_point.briefs_total = item.total;
                 today_point.briefs_failed = item.failed;
+                today_point.briefs_partial = item.business_counts.partial;
+                today_point.briefs_business_failed = item.business_counts.failed;
             }
             _ => {}
         }
@@ -2143,6 +2479,7 @@ pub async fn admin_dashboard(
         status_breakdown,
         task_share,
         trend_points,
+        llm_health,
         window_meta: AdminDashboardWindowMeta {
             selected_window,
             available_windows: ADMIN_DASHBOARD_WINDOW_OPTIONS
@@ -2352,11 +2689,11 @@ pub struct AdminTaskEventMeta {
     truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminBusinessOutcome {
-    code: String, // ok | partial | failed | disabled | unknown
-    label: String,
-    message: String,
+    pub code: String, // ok | partial | failed | disabled | unknown
+    pub label: String,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -13883,6 +14220,273 @@ mod tests {
         assert_eq!(today_point.translations_total, 1);
         assert_eq!(today_point.summaries_total, 1);
         assert_eq!(today_point.briefs_total, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_dashboard_surfaces_partial_business_results_and_llm_hotspots() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+
+        let time_zone = chrono_tz::Asia::Shanghai;
+        let now_local = chrono::Utc::now().with_timezone(&time_zone);
+        let today_local = now_local.date_naive();
+        let today_window_start = time_zone
+            .with_ymd_and_hms(
+                today_local.year(),
+                today_local.month(),
+                today_local.day(),
+                0,
+                0,
+                0,
+            )
+            .single()
+            .expect("build dashboard day start");
+        let safe_today_local = if now_local > today_window_start + chrono::Duration::minutes(5) {
+            now_local - chrono::Duration::minutes(5)
+        } else {
+            today_window_start + chrono::Duration::seconds(1)
+        };
+        let today_time = safe_today_local.with_timezone(&chrono::Utc).to_rfc3339();
+
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (
+              'dashboard-business-partial',
+              ?,
+              'succeeded',
+              'tests',
+              ?,
+              NULL,
+              ?,
+              ?,
+              NULL,
+              0,
+              ?,
+              ?,
+              ?,
+              ?
+            )
+            "#,
+        )
+        .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+        .bind(test_user_id(1))
+        .bind(r#"{"user_id":1,"release_ids":[101,102,103]}"#)
+        .bind(r#"{"total":3,"ready":2,"missing":0,"disabled":0,"error":1}"#)
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert partial business task");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (
+              'dashboard-business-canceled',
+              ?,
+              'canceled',
+              'tests',
+              ?,
+              NULL,
+              ?,
+              NULL,
+              NULL,
+              1,
+              ?,
+              ?,
+              ?,
+              ?
+            )
+            "#,
+        )
+        .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+        .bind(test_user_id(1))
+        .bind(r#"{"user_id":1,"release_ids":[104]}"#)
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert canceled summary task");
+
+        seed_llm_call_with_created_at(
+            &pool,
+            "dashboard-llm-hotspot-1",
+            "failed",
+            "job.sync.subscriptions.auto_smart",
+            Some(test_user_id(1)),
+            today_time.as_str(),
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET error_text = '429 No available accounts for this model tier'
+            WHERE id = 'dashboard-llm-hotspot-1'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("update llm hotspot reason");
+        let historic_created_at = (chrono::Utc::now() - chrono::Duration::hours(30)).to_rfc3339();
+        seed_llm_call_with_created_at(
+            &pool,
+            "dashboard-llm-hotspot-late-failure",
+            "failed",
+            "job.sync.subscriptions.auto_translate",
+            Some(test_user_id(1)),
+            historic_created_at.as_str(),
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET error_text = 'late surfaced 403',
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = 'dashboard-llm-hotspot-late-failure'
+            "#,
+        )
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("update late failure timestamps");
+        let future_time = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        seed_llm_call_with_created_at(
+            &pool,
+            "dashboard-llm-hotspot-future",
+            "failed",
+            "job.sync.subscriptions.auto_translate",
+            Some(test_user_id(1)),
+            future_time.as_str(),
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE llm_calls
+            SET error_text = 'future dated failure should be ignored'
+            WHERE id = 'dashboard-llm-hotspot-future'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("update future llm hotspot reason");
+
+        let state = setup_state(pool.clone());
+        refresh_admin_dashboard_rollups(state.as_ref(), ADMIN_DASHBOARD_PREAGGREGATE_DAYS)
+            .await
+            .expect("dashboard rollup refresh should succeed");
+        let session = setup_session(1).await;
+        let Json(resp) = admin_dashboard(
+            State(state),
+            session,
+            Query(AdminDashboardQuery {
+                window: Some("7d".to_owned()),
+            }),
+        )
+        .await
+        .expect("admin dashboard should succeed");
+
+        let summary_item = resp
+            .status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+            .expect("summary task item");
+        assert_eq!(summary_item.business_counts.partial, 1);
+        assert_eq!(summary_item.business_counts.failed, 0);
+        assert_eq!(resp.status_breakdown.business_counts.partial, 1);
+        assert_eq!(summary_item.canceled, 1);
+
+        let today_point = resp
+            .trend_points
+            .iter()
+            .find(|point| point.date == today_local.format("%Y-%m-%d").to_string())
+            .expect("today trend point should exist");
+        assert_eq!(today_point.summaries_partial, 1);
+        assert_eq!(today_point.summaries_business_failed, 0);
+
+        assert_eq!(resp.llm_health.calls_24h, 2);
+        assert_eq!(resp.llm_health.failed_24h, 2);
+        assert_ne!(
+            resp.llm_health.last_failure_at.as_deref(),
+            Some(future_time.as_str())
+        );
+        assert_eq!(
+            resp.llm_health.top_failure_reasons[0].label,
+            "429 No available accounts for this model tier"
+        );
+        assert!(
+            resp.llm_health
+                .top_failure_reasons
+                .iter()
+                .any(|item| item.label == "late surfaced 403")
+        );
+        assert!(
+            resp.llm_health
+                .top_failure_sources
+                .iter()
+                .any(|item| item.label == "job.sync.subscriptions.auto_translate")
+        );
+
+        let rollup_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r#"
+            SELECT
+              business_ok_count,
+              business_partial_count,
+              business_failed_count,
+              business_disabled_count
+            FROM admin_dashboard_daily_rollups
+            WHERE time_zone = 'Asia/Shanghai'
+              AND rollup_date = ?
+              AND task_type = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(today_local.format("%Y-%m-%d").to_string())
+        .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+        .fetch_one(&pool)
+        .await
+        .expect("load summary rollup counts");
+        assert_eq!(rollup_counts, (0, 1, 0, 0));
     }
 
     #[tokio::test]
