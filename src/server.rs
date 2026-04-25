@@ -181,6 +181,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/notifications", get(api::list_notifications))
         .route("/feed", get(api::list_feed))
+        .route("/feed/reactions/refresh", post(api::refresh_feed_reactions))
         .route("/admin/users", get(api::admin_list_users))
         .route("/admin/users/{user_id}", patch(api::admin_patch_user))
         .route(

@@ -27,6 +27,7 @@ import {
 	resolvePreferredLaneForItem,
 } from "@/feed/laneOptions";
 import type {
+	FeedReactionRefreshResponse,
 	FeedItem,
 	FeedLane,
 	ReactionContent,
@@ -153,6 +154,7 @@ type BriefGenerateResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const FEED_REACTION_REFRESH_TTL_MS = 15_000;
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -273,7 +275,7 @@ export function Dashboard(props: {
 		onRouteStateChange,
 		warmStart = null,
 	} = props;
-	const { pushErrorToast } = useAppToast();
+	const { pushErrorToast, pushToast } = useAppToast();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
@@ -412,9 +414,16 @@ export function Dashboard(props: {
 	const reactionFlushTimerByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
+	const lastFeedReactionRefreshRef = useRef<{
+		key: string;
+		at: number;
+	} | null>(null);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
+	const [reactionLiveReadyKeys, setReactionLiveReadyKeys] = useState<
+		Set<string>
+	>(() => new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
 	>(() => sessionState?.reactionTokenConfigured ?? null);
@@ -773,6 +782,74 @@ export function Dashboard(props: {
 			}
 		});
 	}, [loadReactionToken]);
+
+	useEffect(() => {
+		if (reactionTokenConfigured !== true) {
+			return;
+		}
+		const releaseIds = feed.items
+			.filter(isReleaseFeedItem)
+			.filter((item) => item.reactions?.status === "ready")
+			.map((item) => item.id);
+		if (releaseIds.length === 0) {
+			return;
+		}
+
+		const uniqueReleaseIds = Array.from(new Set(releaseIds)).sort();
+		const refreshKey = `${feedRequestType}:${uniqueReleaseIds.join(",")}`;
+		const now = Date.now();
+		const lastRefresh = lastFeedReactionRefreshRef.current;
+		if (
+			lastRefresh?.key === refreshKey &&
+			now - lastRefresh.at < FEED_REACTION_REFRESH_TTL_MS
+		) {
+			return;
+		}
+		lastFeedReactionRefreshRef.current = { key: refreshKey, at: now };
+
+		void apiPostJson<FeedReactionRefreshResponse>(
+			"/api/feed/reactions/refresh",
+			{
+				release_ids: uniqueReleaseIds,
+			},
+		)
+			.then((response) => {
+				const refreshedKeys = new Set<string>();
+				for (const item of response.items) {
+					const key = itemKey({ kind: "release", id: item.release_id });
+					refreshedKeys.add(key);
+					if (
+						reactionBusyKeysRef.current.has(key) ||
+						reactionDesiredByKeyRef.current.has(key)
+					) {
+						continue;
+					}
+					reactionServerByKeyRef.current.set(key, item.reactions);
+					feed.applyReactions(
+						{ kind: "release", id: item.release_id },
+						item.reactions,
+					);
+				}
+				if (refreshedKeys.size > 0) {
+					setReactionLiveReadyKeys((current) => {
+						const next = new Set(current);
+						for (const key of refreshedKeys) {
+							next.add(key);
+						}
+						return next;
+					});
+				}
+			})
+			.catch(() => {
+				// The feed hot path has already rendered cached reactions. Live reaction
+				// refresh is best-effort and must not regress startup into an error state.
+			});
+	}, [
+		feed.applyReactions,
+		feed.items,
+		feedRequestType,
+		reactionTokenConfigured,
+	]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
@@ -1306,6 +1383,17 @@ export function Dashboard(props: {
 				});
 				return;
 			}
+			if (
+				isReleaseFeedItem(item) &&
+				item.reactions?.status === "ready" &&
+				!reactionLiveReadyKeys.has(itemKey(item))
+			) {
+				pushToast({
+					title: "反馈状态同步中",
+					description: "正在确认 GitHub 上的最新反馈状态，请稍后再试。",
+				});
+				return;
+			}
 			performReactionToggle(item, content);
 		},
 		[
@@ -1313,6 +1401,8 @@ export function Dashboard(props: {
 			patCheckMessage,
 			patCheckState,
 			performReactionToggle,
+			pushToast,
+			reactionLiveReadyKeys,
 			reactionTokenConfigured,
 		],
 	);

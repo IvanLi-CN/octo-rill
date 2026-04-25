@@ -164,3 +164,10 @@ export type ToggleReleaseReactionResponse = {
 	release_id: string;
 	reactions: ReleaseReactions;
 };
+
+export type FeedReactionRefreshResponse = {
+	items: Array<{
+		release_id: string;
+		reactions: ReleaseReactions;
+	}>;
+};
