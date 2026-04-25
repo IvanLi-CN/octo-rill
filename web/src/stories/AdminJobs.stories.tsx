@@ -403,6 +403,19 @@ const translationBatchSeed = {
 	started_at: "2026-02-26T04:00:01Z",
 	finished_at: "2026-02-26T04:00:03Z",
 	updated_at: "2026-02-26T04:00:03Z",
+	result_summary: {
+		ready: 1,
+		error: 0,
+		missing: 0,
+		disabled: 0,
+		queued: 0,
+		running: 0,
+	},
+	business_outcome: {
+		code: "ok",
+		label: "业务成功",
+		message: "批次条目已全部成功完成。",
+	},
 };
 
 const translationBatchDetailSeed = {
@@ -426,6 +439,19 @@ const translationBatchDetailRecoveredSeed = {
 		...translationBatchSeed,
 		updated_at: "2026-04-15T03:16:08Z",
 		finished_at: "2026-04-15T03:16:08Z",
+		result_summary: {
+			ready: 1,
+			error: 0,
+			missing: 0,
+			disabled: 0,
+			queued: 0,
+			running: 0,
+		},
+		business_outcome: {
+			code: "ok",
+			label: "业务成功",
+			message: "批次条目已全部成功完成。",
+		},
 	},
 	items: [
 		{
@@ -469,6 +495,19 @@ const translationBatchDetailFailedSeed = {
 		status: "completed",
 		updated_at: "2026-04-15T03:24:11Z",
 		finished_at: "2026-04-15T03:24:11Z",
+		result_summary: {
+			ready: 0,
+			error: 1,
+			missing: 0,
+			disabled: 0,
+			queued: 0,
+			running: 0,
+		},
+		business_outcome: {
+			code: "failed",
+			label: "业务失败",
+			message: "批次已完成，但全部条目失败或缺失。",
+		},
 	},
 	items: [
 		{
@@ -897,9 +936,28 @@ function AdminJobsPreview({
 							trigger_reason: "deadline",
 							updated_at: "2026-02-26T04:00:02Z",
 							finished_at: null,
+							result_summary: {
+								ready: 0,
+								error: 0,
+								missing: 0,
+								disabled: 0,
+								queued: 1,
+								running: 2,
+							},
+							business_outcome: {
+								code: "unknown",
+								label: "处理中",
+								message: "批次仍在执行中，业务结果尚未稳定。",
+							},
 						},
 					]
-				: [translationBatchSeed];
+				: [
+						translationState === "failed"
+							? translationBatchDetailFailedSeed.batch
+							: translationState === "recovered"
+								? translationBatchDetailRecoveredSeed.batch
+								: translationBatchSeed,
+					];
 
 		function buildIdleWorkers(
 			generalWorkerConcurrency: number,
@@ -978,7 +1036,12 @@ function AdminJobsPreview({
 				running_batches: translationState === "busy" ? 1 : 0,
 				requests_24h: 1,
 				completed_batches_24h: translationState === "busy" ? 0 : 1,
+				clean_completed_batches_24h: translationState === "recovered" ? 1 : 0,
+				completed_with_issues_batches_24h:
+					translationState === "failed" ? 1 : 0,
 				failed_batches_24h: 0,
+				error_work_items_24h: translationState === "failed" ? 1 : 0,
+				missing_work_items_24h: translationState === "failed" ? 1 : 0,
 				avg_wait_ms_24h: translationState === "busy" ? null : 320,
 				last_batch_finished_at:
 					translationState === "busy" ? null : "2026-02-26T04:00:03Z",
