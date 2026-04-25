@@ -44,7 +44,7 @@
 - `GET /api/feed` 不得调用 `fetch_live_release_reactions`、`mutate_release_reaction` 或任何 GitHub HTTP/GraphQL 请求。
 - `GET /api/feed` 对 release item 继续返回现有 `reactions` shape；counts 来自本地缓存，viewer 初始可为默认 false。
 - Dashboard 仅在确认 reaction PAT 可用且 feed 中存在 ready release reaction 时，异步请求 reaction refresh。
-- Reaction refresh 结果按 `release_id` 合并回现有 feed item；若该 item 正在 optimistic toggle 或 flush 中，不得覆盖本地 pending 状态；普通 feed refresh 合并缓存 counts 时应保留已知 live viewer 状态，直到下一次异步 refresh 更新。
+- Reaction refresh 结果按 `release_id` 合并回现有 feed item；若该 item 正在 optimistic toggle 或 flush 中，不得覆盖本地 pending 状态；普通 feed refresh 或分页合并缓存 counts 时应保留已知 live viewer 状态，直到下一次异步 refresh 更新。
 - PAT 可用且某条 release reaction 正在执行首屏异步 refresh 时，客户端暂缓 toggle；refresh 失败或未返回该 item 后必须允许用户继续点击，由 toggle API 的现有 live 校验与错误处理兜底。
 - Reaction refresh 失败必须静默降级为缓存状态，不阻断 feed、sidebar、toast 或全页渲染。
 - Reaction refresh 成功后应把最新 counts 持久化回本地缓存，供后续 feed 热路径使用。

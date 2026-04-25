@@ -22,6 +22,36 @@ function itemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
 }
 
+function mergeReleaseFeedItem(current: FeedItem, incoming: FeedItem): FeedItem {
+	if (!isReleaseFeedItem(current) || !isReleaseFeedItem(incoming)) {
+		return incoming;
+	}
+	return {
+		...current,
+		...incoming,
+		actor: null,
+		reactions:
+			current.reactions?.status === "ready" &&
+			incoming.reactions?.status === "ready"
+				? { ...incoming.reactions, viewer: current.reactions.viewer }
+				: incoming.reactions,
+	};
+}
+
+function preserveReleaseViewers(existing: FeedItem[], incoming: FeedItem[]) {
+	const existingByKey = new Map<string, FeedItem>();
+	for (const item of existing) {
+		existingByKey.set(itemKey(item), item);
+	}
+	return incoming.map((item) => {
+		const current = existingByKey.get(itemKey(item));
+		if (current?.kind === "release" && item.kind === "release") {
+			return mergeReleaseFeedItem(current, item);
+		}
+		return item;
+	});
+}
+
 function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 	const out = existing.slice();
 	const indexByKey = new Map<string, number>();
@@ -42,16 +72,7 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 				continue;
 			}
 			if (current.kind === "release" && n.kind === "release") {
-				out[idx] = {
-					...current,
-					...n,
-					actor: null,
-					reactions:
-						current.reactions?.status === "ready" &&
-						n.reactions?.status === "ready"
-							? { ...n.reactions, viewer: current.reactions.viewer }
-							: n.reactions,
-				};
+				out[idx] = mergeReleaseFeedItem(current, n);
 				continue;
 			}
 			if (isSocialFeedItem(current) && isSocialFeedItem(n)) {
@@ -140,7 +161,7 @@ export function useFeed(
 			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type));
 			if (reqId !== reqIdRef.current) return;
 			setDataType(type);
-			setItems(res.items);
+			setItems((prev) => preserveReleaseViewers(prev, res.items));
 			setNextCursor(res.next_cursor);
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
