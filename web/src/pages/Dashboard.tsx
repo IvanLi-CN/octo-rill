@@ -155,6 +155,7 @@ type BriefGenerateResponse = {
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
 const FEED_REACTION_REFRESH_TTL_MS = 15_000;
+const FEED_REACTION_REFRESH_BATCH_SIZE = 100;
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -817,31 +818,47 @@ export function Dashboard(props: {
 			return next;
 		});
 
-		void apiPostJson<FeedReactionRefreshResponse>(
-			"/api/feed/reactions/refresh",
-			{
-				release_ids: uniqueReleaseIds,
-			},
+		const refreshBatches: string[][] = [];
+		for (
+			let i = 0;
+			i < uniqueReleaseIds.length;
+			i += FEED_REACTION_REFRESH_BATCH_SIZE
+		) {
+			refreshBatches.push(
+				uniqueReleaseIds.slice(i, i + FEED_REACTION_REFRESH_BATCH_SIZE),
+			);
+		}
+
+		void Promise.allSettled(
+			refreshBatches.map((releaseIdsBatch) =>
+				apiPostJson<FeedReactionRefreshResponse>(
+					"/api/feed/reactions/refresh",
+					{
+						release_ids: releaseIdsBatch,
+					},
+				),
+			),
 		)
-			.then((response) => {
-				for (const item of response.items) {
-					const key = itemKey({ kind: "release", id: item.release_id });
-					if (
-						reactionBusyKeysRef.current.has(key) ||
-						reactionDesiredByKeyRef.current.has(key)
-					) {
+			.then((results) => {
+				for (const result of results) {
+					if (result.status !== "fulfilled") {
 						continue;
 					}
-					reactionServerByKeyRef.current.set(key, item.reactions);
-					feed.applyReactions(
-						{ kind: "release", id: item.release_id },
-						item.reactions,
-					);
+					for (const item of result.value.items) {
+						const key = itemKey({ kind: "release", id: item.release_id });
+						if (
+							reactionBusyKeysRef.current.has(key) ||
+							reactionDesiredByKeyRef.current.has(key)
+						) {
+							continue;
+						}
+						reactionServerByKeyRef.current.set(key, item.reactions);
+						feed.applyReactions(
+							{ kind: "release", id: item.release_id },
+							item.reactions,
+						);
+					}
 				}
-			})
-			.catch(() => {
-				// The feed hot path has already rendered cached reactions. Live reaction
-				// refresh is best-effort and must not regress startup into an error state.
 			})
 			.finally(() => {
 				setReactionRefreshingKeys((current) => {
