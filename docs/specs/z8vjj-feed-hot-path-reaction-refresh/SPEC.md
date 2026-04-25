@@ -45,7 +45,7 @@
 - `GET /api/feed` 对 release item 继续返回现有 `reactions` shape；counts 来自本地缓存，viewer 初始可为默认 false。
 - Dashboard 仅在确认 reaction PAT 可用且 feed 中存在 ready release reaction 时，异步请求 reaction refresh。
 - Reaction refresh 结果按 `release_id` 合并回现有 feed item；若该 item 正在 optimistic toggle 或 flush 中，不得覆盖本地 pending 状态。
-- PAT 可用但某条 release reaction 尚未完成 live viewer 补齐前，客户端不得执行 toggle，避免默认 viewer=false 导致用户意图与 GitHub 实际状态相反。
+- PAT 可用且某条 release reaction 正在执行首屏异步 refresh 时，客户端暂缓 toggle；refresh 失败或未返回该 item 后必须允许用户继续点击，由 toggle API 的现有 live 校验与错误处理兜底。
 - Reaction refresh 失败必须静默降级为缓存状态，不阻断 feed、sidebar、toast 或全页渲染。
 - Reaction refresh 成功后应把最新 counts 持久化回本地缓存，供后续 feed 热路径使用。
 - 后端必须记录 feed DB/total 耗时，以及 reaction refresh 的 DB/GitHub/persist/total 耗时。
@@ -112,9 +112,9 @@ Response:
   When 异步 refresh 返回旧状态
   Then 不覆盖 pending reaction 状态。
 
-- Given reaction PAT 可用但某条 release 尚未完成 live viewer 补齐
+- Given reaction PAT 可用且某条 release 的异步 refresh 正在进行
   When 用户点击 reaction
-  Then 页面提示正在同步状态且不执行 toggle mutation，避免误反转真实 GitHub reaction。
+  Then 页面提示正在同步状态且暂缓本次 toggle；若 refresh 失败或未返回该 item，后续点击必须进入现有 toggle API 兜底流程。
 
 - Given access sync 或顶部同步任务完成
   When SSE completion 触发 `refreshAll`
@@ -145,7 +145,7 @@ Response:
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
-- 风险：viewer 初始默认 false 时，reaction 按钮可能短暂未高亮；异步 refresh 成功后会恢复真实状态。
+- 风险：viewer 初始默认 false 时，reaction 按钮可能短暂未高亮；异步 refresh 成功后会恢复真实状态，refresh 失败时由 toggle API 的实时校验兜底。
 - 风险：GitHub GraphQL 长时间失败时，counts 会停留在本地缓存；顶部同步与后续 refresh 仍可更新 release/social/inbox 主数据。
 - 假设：100ms 目标针对本地热路径开始返回，不包含冷启动、认证 cookie 解密、浏览器 chunk 加载或第三方 GitHub 请求耗时。
 

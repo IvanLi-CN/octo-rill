@@ -421,7 +421,7 @@ export function Dashboard(props: {
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
-	const [reactionLiveReadyKeys, setReactionLiveReadyKeys] = useState<
+	const [reactionRefreshingKeys, setReactionRefreshingKeys] = useState<
 		Set<string>
 	>(() => new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
@@ -806,6 +806,16 @@ export function Dashboard(props: {
 			return;
 		}
 		lastFeedReactionRefreshRef.current = { key: refreshKey, at: now };
+		const refreshingKeys = uniqueReleaseIds.map((releaseId) =>
+			itemKey({ kind: "release", id: releaseId }),
+		);
+		setReactionRefreshingKeys((current) => {
+			const next = new Set(current);
+			for (const key of refreshingKeys) {
+				next.add(key);
+			}
+			return next;
+		});
 
 		void apiPostJson<FeedReactionRefreshResponse>(
 			"/api/feed/reactions/refresh",
@@ -814,10 +824,8 @@ export function Dashboard(props: {
 			},
 		)
 			.then((response) => {
-				const refreshedKeys = new Set<string>();
 				for (const item of response.items) {
 					const key = itemKey({ kind: "release", id: item.release_id });
-					refreshedKeys.add(key);
 					if (
 						reactionBusyKeysRef.current.has(key) ||
 						reactionDesiredByKeyRef.current.has(key)
@@ -830,19 +838,19 @@ export function Dashboard(props: {
 						item.reactions,
 					);
 				}
-				if (refreshedKeys.size > 0) {
-					setReactionLiveReadyKeys((current) => {
-						const next = new Set(current);
-						for (const key of refreshedKeys) {
-							next.add(key);
-						}
-						return next;
-					});
-				}
 			})
 			.catch(() => {
 				// The feed hot path has already rendered cached reactions. Live reaction
 				// refresh is best-effort and must not regress startup into an error state.
+			})
+			.finally(() => {
+				setReactionRefreshingKeys((current) => {
+					const next = new Set(current);
+					for (const key of refreshingKeys) {
+						next.delete(key);
+					}
+					return next;
+				});
 			});
 	}, [
 		feed.applyReactions,
@@ -1386,7 +1394,7 @@ export function Dashboard(props: {
 			if (
 				isReleaseFeedItem(item) &&
 				item.reactions?.status === "ready" &&
-				!reactionLiveReadyKeys.has(itemKey(item))
+				reactionRefreshingKeys.has(itemKey(item))
 			) {
 				pushToast({
 					title: "反馈状态同步中",
@@ -1402,7 +1410,7 @@ export function Dashboard(props: {
 			patCheckState,
 			performReactionToggle,
 			pushToast,
-			reactionLiveReadyKeys,
+			reactionRefreshingKeys,
 			reactionTokenConfigured,
 		],
 	);
