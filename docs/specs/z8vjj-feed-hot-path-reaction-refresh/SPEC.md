@@ -52,7 +52,7 @@
 
 ### SHOULD
 
-- 前端应对同一组 release ids 做短 TTL 去重，并按后端 100-id 上限切分 batch，避免 reaction refresh 因合并结果触发重复请求或超限失败。
+- 前端应对同一组 release ids 做短 TTL 去重、跳过已在 refresh 中的 release，并按后端 100-id 上限切分 batch，避免 reaction refresh 因合并结果触发重复请求、并发重叠或超限失败。
 - 无 PAT 或 release 缺少 node id 时，reaction refresh 应返回空结果而不是制造首屏错误。
 
 ## 接口契约（Interfaces & Contracts）

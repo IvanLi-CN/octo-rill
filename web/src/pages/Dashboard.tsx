@@ -425,6 +425,7 @@ export function Dashboard(props: {
 	const [reactionRefreshingKeys, setReactionRefreshingKeys] = useState<
 		Set<string>
 	>(() => new Set<string>());
+	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
 	>(() => sessionState?.reactionTokenConfigured ?? null);
@@ -797,7 +798,17 @@ export function Dashboard(props: {
 		}
 
 		const uniqueReleaseIds = Array.from(new Set(releaseIds)).sort();
-		const refreshKey = `${feedRequestType}:${uniqueReleaseIds.join(",")}`;
+		const releaseIdsToRefresh = uniqueReleaseIds.filter(
+			(releaseId) =>
+				!reactionRefreshingKeysRef.current.has(
+					itemKey({ kind: "release", id: releaseId }),
+				),
+		);
+		if (releaseIdsToRefresh.length === 0) {
+			return;
+		}
+
+		const refreshKey = `${feedRequestType}:${releaseIdsToRefresh.join(",")}`;
 		const now = Date.now();
 		const lastRefresh = lastFeedReactionRefreshRef.current;
 		if (
@@ -807,9 +818,12 @@ export function Dashboard(props: {
 			return;
 		}
 		lastFeedReactionRefreshRef.current = { key: refreshKey, at: now };
-		const refreshingKeys = uniqueReleaseIds.map((releaseId) =>
+		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
 			itemKey({ kind: "release", id: releaseId }),
 		);
+		for (const key of refreshingKeys) {
+			reactionRefreshingKeysRef.current.add(key);
+		}
 		setReactionRefreshingKeys((current) => {
 			const next = new Set(current);
 			for (const key of refreshingKeys) {
@@ -821,11 +835,11 @@ export function Dashboard(props: {
 		const refreshBatches: string[][] = [];
 		for (
 			let i = 0;
-			i < uniqueReleaseIds.length;
+			i < releaseIdsToRefresh.length;
 			i += FEED_REACTION_REFRESH_BATCH_SIZE
 		) {
 			refreshBatches.push(
-				uniqueReleaseIds.slice(i, i + FEED_REACTION_REFRESH_BATCH_SIZE),
+				releaseIdsToRefresh.slice(i, i + FEED_REACTION_REFRESH_BATCH_SIZE),
 			);
 		}
 
@@ -861,6 +875,9 @@ export function Dashboard(props: {
 				}
 			})
 			.finally(() => {
+				for (const key of refreshingKeys) {
+					reactionRefreshingKeysRef.current.delete(key);
+				}
 				setReactionRefreshingKeys((current) => {
 					const next = new Set(current);
 					for (const key of refreshingKeys) {

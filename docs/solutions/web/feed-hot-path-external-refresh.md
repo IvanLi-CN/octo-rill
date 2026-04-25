@@ -35,7 +35,7 @@ related_specs:
 - 首屏响应保持兼容 shape，允许部分字段先返回缓存/默认值。
 - 异步 refresh 成功后合并进当前 UI，并按需持久化回缓存。
 - 异步 refresh 失败只影响对应增强字段，不阻断主内容展示。
-- 前端 batch 大小必须匹配后端解析上限；分页累积列表不能把所有已渲染 ID 无界塞进单个 refresh 请求。
+- 前端 batch 大小必须匹配后端解析上限；分页累积列表不能把所有已渲染 ID 无界塞进单个 refresh 请求，也不能对已在 refresh 中的同一 ID 发起重叠请求。
 
 ## Guardrails / Reuse notes
 
