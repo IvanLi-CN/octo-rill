@@ -5,7 +5,7 @@
 - `GET /api/feed` 已从首屏热路径移除 GitHub GraphQL reaction 拉取，只读取本地 SQLite 并返回缓存 reaction counts。
 - `POST /api/feed/reactions/refresh` 提供 batch reaction refresh，负责在 PAT 可用时拉取 GitHub GraphQL、持久化 counts，并返回 viewer/counts 给前端合并。
 - Dashboard 在 reaction PAT 可用后异步刷新当前 feed release reactions；失败静默降级为缓存状态。
-- 前端使用 per-release 短 TTL、100-id batch 切分、in-flight 去重、in-flight refresh toggle guard 与 optimistic pending guard，避免刷新结果造成请求风暴、超限失败、分页重复刷新、并发重叠、刷新中误操作或覆盖用户正在提交的 reaction 状态；refresh 失败后不会永久阻断 toggle。
+- 前端使用 per-release 短 TTL、100-id batch 切分、in-flight 去重、in-flight refresh toggle guard、feed merge viewer preservation 与 optimistic pending guard，避免刷新结果造成请求风暴、超限失败、分页重复刷新、并发重叠、缓存 feed 覆盖 live viewer、刷新中误操作或覆盖用户正在提交的 reaction 状态；refresh 失败后不会永久阻断 toggle。
 - 后端对 feed hot path 与 reaction refresh 均输出耗时日志。
 
 ## 验证

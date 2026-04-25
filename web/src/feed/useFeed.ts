@@ -46,6 +46,11 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 					...current,
 					...n,
 					actor: null,
+					reactions:
+						current.reactions?.status === "ready" &&
+						n.reactions?.status === "ready"
+							? { ...n.reactions, viewer: current.reactions.viewer }
+							: n.reactions,
 				};
 				continue;
 			}
