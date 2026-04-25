@@ -1416,16 +1416,18 @@ export function Dashboard(props: {
 				});
 				return;
 			}
-			if (
-				isReleaseFeedItem(item) &&
-				item.reactions?.status === "ready" &&
-				reactionRefreshingKeys.has(itemKey(item))
-			) {
-				pushToast({
-					title: "反馈状态同步中",
-					description: "正在确认 GitHub 上的最新反馈状态，请稍后再试。",
-				});
-				return;
+			if (isReleaseFeedItem(item) && item.reactions?.status === "ready") {
+				const key = itemKey(item);
+				if (
+					reactionRefreshingKeys.has(key) ||
+					reactionRefreshingKeysRef.current.has(key)
+				) {
+					pushToast({
+						title: "反馈状态同步中",
+						description: "正在确认 GitHub 上的最新反馈状态，请稍后再试。",
+					});
+					return;
+				}
 			}
 			performReactionToggle(item, content);
 		},
