@@ -42,7 +42,7 @@ related_specs:
 - 热路径里不要同步调用 GitHub、OpenAI、对象存储、第三方图像探测或其它不可控网络。
 - 如果必须保留最新性，优先使用“缓存先返回 + refresh after render + task/SSE completion refresh”。
 - 对 optimistic UI 或用户正在提交的局部状态，异步 refresh 合并前必须检查 pending guard，避免旧状态覆盖新操作；缓存 feed 重新替换或合并时也要保留已知 live viewer 状态，避免默认值短暂回滚 UI。
-- 如果缓存默认值可能改变用户操作语义，只能在 live refresh 正在进行时短暂阻止对应 mutation；refresh 失败后必须允许 mutation API 的实时校验或显式 desired-state 设计兜底，避免永久卡死用户操作。
+- 如果缓存默认值可能改变用户操作语义，应优先让 mutation API 做实时校验或采用显式 desired-state 设计兜底；后台 refresh 不应通过额外 UI 阻断首屏或正常操作。
 - 给热路径和 refresh path 分别记录耗时，防止外部依赖重新混入首屏接口。
 
 ## References

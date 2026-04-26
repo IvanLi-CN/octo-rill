@@ -8,5 +8,5 @@
 ## 决策记录
 
 - 保持 `/api/feed` 响应 shape 兼容，避免大规模前端迁移。
-- 接受 viewer 初始短暂默认 false，以换取首屏不被外部 API 阻塞；只在异步 refresh 正在进行时暂缓 toggle，失败后回到 toggle API 兜底。
+- 接受 viewer 初始短暂默认 false，以换取首屏不被外部 API 阻塞；异步 refresh 静默补齐，用户操作由 toggle API 的 live 校验兜底。
 - Reaction refresh 失败不打扰用户，因为它只影响 reaction 最新 viewer/counts，不影响 feed 主信息展示。

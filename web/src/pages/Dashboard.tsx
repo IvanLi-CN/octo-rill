@@ -276,7 +276,7 @@ export function Dashboard(props: {
 		onRouteStateChange,
 		warmStart = null,
 	} = props;
-	const { pushErrorToast, pushToast } = useAppToast();
+	const { pushErrorToast } = useAppToast();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
@@ -421,9 +421,6 @@ export function Dashboard(props: {
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
-	const [reactionRefreshingKeys, setReactionRefreshingKeys] = useState<
-		Set<string>
-	>(() => new Set<string>());
 	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
@@ -820,14 +817,6 @@ export function Dashboard(props: {
 			reactionRefreshingKeysRef.current.add(key);
 			lastFeedReactionRefreshByKeyRef.current.set(key, now);
 		}
-		setReactionRefreshingKeys((current) => {
-			const next = new Set(current);
-			for (const key of refreshingKeys) {
-				next.add(key);
-			}
-			return next;
-		});
-
 		const refreshBatches: string[][] = [];
 		for (
 			let i = 0;
@@ -874,13 +863,6 @@ export function Dashboard(props: {
 				for (const key of refreshingKeys) {
 					reactionRefreshingKeysRef.current.delete(key);
 				}
-				setReactionRefreshingKeys((current) => {
-					const next = new Set(current);
-					for (const key of refreshingKeys) {
-						next.delete(key);
-					}
-					return next;
-				});
 			});
 	}, [feed.applyReactions, feed.items, reactionTokenConfigured]);
 
@@ -1416,19 +1398,6 @@ export function Dashboard(props: {
 				});
 				return;
 			}
-			if (isReleaseFeedItem(item) && item.reactions?.status === "ready") {
-				const key = itemKey(item);
-				if (
-					reactionRefreshingKeys.has(key) ||
-					reactionRefreshingKeysRef.current.has(key)
-				) {
-					pushToast({
-						title: "反馈状态同步中",
-						description: "正在确认 GitHub 上的最新反馈状态，请稍后再试。",
-					});
-					return;
-				}
-			}
 			performReactionToggle(item, content);
 		},
 		[
@@ -1436,8 +1405,6 @@ export function Dashboard(props: {
 			patCheckMessage,
 			patCheckState,
 			performReactionToggle,
-			pushToast,
-			reactionRefreshingKeys,
 			reactionTokenConfigured,
 		],
 	);

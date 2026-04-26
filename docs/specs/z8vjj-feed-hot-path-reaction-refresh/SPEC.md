@@ -45,7 +45,7 @@
 - `GET /api/feed` 对 release item 继续返回现有 `reactions` shape；counts 来自本地缓存，viewer 初始可为默认 false。
 - Dashboard 仅在确认 reaction PAT 可用且 feed 中存在 ready release reaction 时，异步请求 reaction refresh。
 - Reaction refresh 结果按 `release_id` 合并回现有 feed item；若该 item 正在 optimistic toggle 或 flush 中，不得覆盖本地 pending 状态；普通 feed refresh 或分页合并缓存 counts 时应保留已知 live viewer 状态，直到下一次异步 refresh 更新。
-- PAT 可用且某条 release reaction 正在执行首屏异步 refresh 时，客户端暂缓 toggle；refresh 失败或未返回该 item 后必须允许用户继续点击，由 toggle API 的现有 live 校验与错误处理兜底。
+- PAT 可用时，reaction 异步 refresh 不得阻止用户操作；如果 refresh 与 toggle 并发，客户端必须用 pending guard 避免后台 refresh 覆盖用户正在提交的状态，并由 toggle API 的现有 live 校验与错误处理兜底。
 - Reaction refresh 失败必须静默降级为缓存状态，不阻断 feed、sidebar、toast 或全页渲染。
 - Reaction refresh 成功后应把最新 counts 持久化回本地缓存，供后续 feed 热路径使用。
 - 后端必须记录 feed DB/total 耗时，以及 reaction refresh 的 DB/GitHub/persist/total 耗时。
@@ -114,7 +114,7 @@ Response:
 
 - Given reaction PAT 可用且某条 release 的异步 refresh 正在进行
   When 用户点击 reaction
-  Then 页面提示正在同步状态且暂缓本次 toggle；若 refresh 失败或未返回该 item，后续点击必须进入现有 toggle API 兜底流程。
+  Then 操作不被 refresh UI 阻塞；后台 refresh 不得覆盖该次 toggle 的 pending/confirmed 状态。
 
 - Given access sync 或顶部同步任务完成
   When SSE completion 触发 `refreshAll`
