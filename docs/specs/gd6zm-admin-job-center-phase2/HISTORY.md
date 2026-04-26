@@ -14,3 +14,4 @@
 - 2026-03-07: 澄清用户详情抽屉中的日报时间语义为“浏览器当前时区”，并要求按浏览器当前日期换算 UTC 时钟值以避免 DST 偏差。
 - 2026-03-08: 对齐 Admin Jobs / Admin Users 相关 Playwright 断言与合并门禁证据，保持浏览器时区语义回归覆盖稳定。
 - 2026-04-24: 扩展翻译任务中心观测口径，补齐 `completed_with_issues`、批次 `result_summary` / `business_outcome` 与 Storybook 视觉证据。
+- 2026-04-27: 热修复 release-batch 诊断兼容 legacy `result_json.items[]`，避免后台任务详情把真实失败误判成“结果未知”。

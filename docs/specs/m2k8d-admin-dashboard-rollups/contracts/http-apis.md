@@ -147,5 +147,6 @@
 - `trend_points` come from rollups, but the point for today is overwritten by live stats.
 - `status_breakdown.items`, `task_share`, and `trend_points` are limited to translation, smart summary, and daily brief tasks.
 - `status_breakdown.business_counts` and every per-task `business_counts` are derived from task payload/result/error, not from `job_tasks.status` alone.
+- For `translate.release.batch` and `summarize.release.smart.batch`, the backend must accept both legacy `result_json = { "items": [...] }` rows and summary-enriched rows carrying `total / ready / missing / disabled / error`.
 - `business_success_rate` uses business terminal outcomes (`ok / partial / failed / disabled`) as denominator and only counts `ok` as full success.
 - `llm_health` summarizes the latest 24h of `llm_calls` and is intended for operator triage rather than billing-grade analytics.
