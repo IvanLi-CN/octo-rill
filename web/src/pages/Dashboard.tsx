@@ -841,6 +841,14 @@ export function Dashboard(props: {
 			.then((results) => {
 				for (const result of results) {
 					if (result.status !== "fulfilled") {
+						const reason = result.reason;
+						if (
+							reason instanceof ApiError &&
+							(reason.code === "pat_invalid" || reason.code === "pat_required")
+						) {
+							setReactionTokenConfigured(false);
+							void loadReactionToken();
+						}
 						continue;
 					}
 					for (const item of result.value.items) {
@@ -864,7 +872,12 @@ export function Dashboard(props: {
 					reactionRefreshingKeysRef.current.delete(key);
 				}
 			});
-	}, [feed.applyReactions, feed.items, reactionTokenConfigured]);
+	}, [
+		feed.applyReactions,
+		feed.items,
+		loadReactionToken,
+		reactionTokenConfigured,
+	]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";

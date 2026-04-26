@@ -505,8 +505,11 @@ function makeReactionCompactFeed(): FeedItem[] {
 	);
 }
 
-function makeFeedHotPathReactionFeed(live: boolean): FeedItem[] {
-	return makeMockFeed().map((item, index) =>
+function makeFeedHotPathReactionFeed(
+	live: boolean,
+	includeSyncedItem = false,
+): FeedItem[] {
+	const cachedItems = makeMockFeed().map((item, index) =>
 		item.kind === "release" && index === 0
 			? {
 					...item,
@@ -515,7 +518,7 @@ function makeFeedHotPathReactionFeed(live: boolean): FeedItem[] {
 					body: "- Feed returns cached data first\n- GitHub reaction refresh hydrates silently after render\n- No skeleton or toast is added while reactions refresh",
 					smart: {
 						lang: "zh-CN",
-						status: "ready",
+						status: "ready" as const,
 						title: "v2.63.0 · cached feed hot path",
 						summary:
 							"- Feed returns cached data first\n- Reaction refresh hydrates silently after render\n- No skeleton or toast is added while reactions refresh",
@@ -546,34 +549,81 @@ function makeFeedHotPathReactionFeed(live: boolean): FeedItem[] {
 							rocket: false,
 							eyes: false,
 						},
-						status: "ready",
+						status: "ready" as const,
 					},
 				}
 			: item,
 	);
+	if (!includeSyncedItem) {
+		return cachedItems;
+	}
+	return [
+		buildFeedItem("feed-hot-path-new-release", {
+			ts: "2026-04-04T16:45:00+08:00",
+			repo_full_name: "IvanLi-CN/octo-rill",
+			repo_visual: repoVisualFixtures.social,
+			title: "v2.64.0 · synced after background refresh",
+			body: "- Background sync completed\n- Feed refresh merged the newest release card\n- Existing cached cards stayed visible while the update arrived",
+			html_url: `${PROJECT_REPO_URL}/releases/tag/v2.64.0`,
+			smart: {
+				lang: "zh-CN",
+				status: "ready" as const,
+				title: "v2.64.0 · synced after background refresh",
+				summary:
+					"- Background sync completed\n- Newest release card was merged into the feed\n- The page never returned to the loading skeleton",
+			},
+			reactions: {
+				counts: {
+					plus1: 1,
+					laugh: 0,
+					heart: 1,
+					hooray: 0,
+					rocket: 1,
+					eyes: 0,
+				},
+				viewer: {
+					plus1: false,
+					laugh: false,
+					heart: false,
+					hooray: false,
+					rocket: false,
+					eyes: false,
+				},
+				status: "ready" as const,
+			},
+		}),
+		...cachedItems,
+	];
 }
 
 function FeedHotPathReactionRefreshPreview(props: {
 	initialLive?: boolean;
+	initialSynced?: boolean;
 	refreshDelayMs?: number | null;
 }) {
-	const { initialLive = false, refreshDelayMs = 5000 } = props;
+	const {
+		initialLive = false,
+		initialSynced = false,
+		refreshDelayMs = 5000,
+	} = props;
 	const [liveReactions, setLiveReactions] = useState(initialLive);
+	const [syncedFeed, setSyncedFeed] = useState(initialSynced);
 
 	useEffect(() => {
 		setLiveReactions(initialLive);
+		setSyncedFeed(initialSynced);
 		if (refreshDelayMs === null) return;
-		const timer = window.setTimeout(
-			() => setLiveReactions(true),
-			refreshDelayMs,
-		);
+		const timer = window.setTimeout(() => {
+			setLiveReactions(true);
+			setSyncedFeed(true);
+		}, refreshDelayMs);
 		return () => window.clearTimeout(timer);
-	}, [initialLive, refreshDelayMs]);
+	}, [initialLive, initialSynced, refreshDelayMs]);
 
 	return (
 		<DashboardPreview
 			initialTab="releases"
-			feedItems={makeFeedHotPathReactionFeed(liveReactions)}
+			feedItems={makeFeedHotPathReactionFeed(liveReactions, syncedFeed)}
 			showFooter={false}
 		/>
 	);
@@ -3480,13 +3530,23 @@ export const EvidenceReactionCompact: Story = {
 
 export const FeedHotPathReactionRefresh: Story = {
 	name: "Feed hot path / Silent reaction refresh",
-	render: () => <FeedHotPathReactionRefreshPreview refreshDelayMs={5000} />,
+	render: () => <FeedHotPathReactionRefreshPreview refreshDelayMs={8000} />,
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton；打开或刷新 Story 后，第一张 release 的 reaction 会在 5 秒后从缓存默认值静默补齐为 live viewer/counts。刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
+					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton；打开或刷新 Story 后，8 秒内页面保持可用，随后模拟后台同步完成：新增一张最新 release 卡片，同时第一张缓存 release 的 reaction 静默补齐为 live viewer/counts。刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
 			},
+		},
+	},
+};
+
+export const FeedHotPathReactionRefreshVerification: Story = {
+	name: "Feed hot path / Reaction refresh verification",
+	render: () => <FeedHotPathReactionRefreshPreview refreshDelayMs={5000} />,
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 	play: async ({ canvasElement }) => {
@@ -3510,8 +3570,13 @@ export const FeedHotPathReactionRefresh: Story = {
 
 		await waitFor(
 			() => expect(canvas.getByRole("button", { name: "赞 7" })).toBeVisible(),
-			{ timeout: 6000 },
+			{ timeout: 10_000 },
 		);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.64.0 · synced after background refresh",
+			}),
+		).toBeVisible();
 		await expect(canvas.getByRole("button", { name: "赞 7" })).toHaveAttribute(
 			"aria-pressed",
 			"true",
@@ -3535,7 +3600,7 @@ export const FeedHotPathCachedBeforeRefresh: Story = {
 		docs: {
 			description: {
 				story:
-					"缓存首屏态对照：release 内容已经渲染，reaction 使用本地缓存默认值；这里没有 feed loading skeleton，也没有异步刷新提示。",
+					"缓存首屏态对照：已有 release 内容已经渲染，reaction 使用本地缓存默认值，最新 release 还没通过后台同步回流；这里没有 feed loading skeleton，也没有异步刷新提示。",
 			},
 		},
 	},
@@ -3559,13 +3624,17 @@ export const FeedHotPathCachedBeforeRefresh: Story = {
 export const FeedHotPathAfterReactionRefresh: Story = {
 	name: "Feed hot path / After reaction refresh",
 	render: () => (
-		<FeedHotPathReactionRefreshPreview initialLive refreshDelayMs={null} />
+		<FeedHotPathReactionRefreshPreview
+			initialLive
+			initialSynced
+			refreshDelayMs={null}
+		/>
 	),
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"异步补齐后的稳定态对照：同一张 release 的 reaction viewer/counts 已经合并到页面，但 feed 主体和 skeleton 状态没有被重新拉回加载态。",
+					"异步补齐后的稳定态对照：后台同步带回的新 release 卡片已经合并到页面，同一张缓存 release 的 reaction viewer/counts 也已更新，但 feed 主体没有被重新拉回 loading skeleton。",
 			},
 		},
 	},
@@ -3580,6 +3649,11 @@ export const FeedHotPathAfterReactionRefresh: Story = {
 			"aria-pressed",
 			"true",
 		);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.64.0 · synced after background refresh",
+			}),
+		).toBeVisible();
 		expect(
 			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
 		).toBeNull();
