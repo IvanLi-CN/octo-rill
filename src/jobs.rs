@@ -1667,7 +1667,7 @@ async fn execute_task(
             let res = api::translate_releases_batch_for_user(state, user_id.as_str(), &release_ids)
                 .await
                 .map_err(|err| anyhow!("translate_releases_batch failed: {}", err.code()))?;
-            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
+            Ok(translate_batch_task_result_json(res.items))
         }
         TASK_SUMMARIZE_RELEASE_SMART_BATCH => {
             let user_id = payload_local_id(payload, "user_id")?;
@@ -1678,7 +1678,7 @@ async fn execute_task(
                     .map_err(|err| {
                         anyhow!("summarize_releases_smart_batch failed: {}", err.code())
                     })?;
-            Ok(serde_json::to_value(res).unwrap_or_else(|_| json!({"ok": true})))
+            Ok(translate_batch_task_result_json(res.items))
         }
         TASK_TRANSLATE_RELEASE_DETAIL => {
             let user_id = payload_local_id(payload, "user_id")?;
@@ -2751,6 +2751,32 @@ fn payload_i64_array(payload: &Value, key: &str) -> Result<Vec<i64>> {
     Ok(result)
 }
 
+fn translate_batch_task_result_json(items: Vec<api::TranslateBatchItem>) -> Value {
+    let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+    let mut ready = 0_i64;
+    let mut missing = 0_i64;
+    let mut disabled = 0_i64;
+    let mut error = 0_i64;
+    for item in &items {
+        match item.status.as_str() {
+            "ready" => ready += 1,
+            "missing" => missing += 1,
+            "disabled" => disabled += 1,
+            "error" => error += 1,
+            _ => {}
+        }
+    }
+
+    json!({
+        "total": total,
+        "ready": ready,
+        "missing": missing,
+        "disabled": disabled,
+        "error": error,
+        "items": items,
+    })
+}
+
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, STATUS_SUCCEEDED | STATUS_FAILED | STATUS_CANCELED)
 }
@@ -3124,6 +3150,55 @@ mod tests {
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
         assert!(!is_scheduled_task_type("translate.release"));
         assert!(!is_scheduled_task_type(TASK_SUMMARIZE_RELEASE_SMART_BATCH));
+    }
+
+    #[test]
+    fn translate_batch_task_result_json_includes_summary_and_items() {
+        let result = super::translate_batch_task_result_json(vec![
+            crate::api::TranslateBatchItem {
+                id: "101".to_owned(),
+                lang: "zh-CN".to_owned(),
+                status: "ready".to_owned(),
+                title: Some("Ready".to_owned()),
+                summary: Some("ok".to_owned()),
+                error: None,
+            },
+            crate::api::TranslateBatchItem {
+                id: "102".to_owned(),
+                lang: "zh-CN".to_owned(),
+                status: "missing".to_owned(),
+                title: None,
+                summary: None,
+                error: Some("missing".to_owned()),
+            },
+            crate::api::TranslateBatchItem {
+                id: "103".to_owned(),
+                lang: "zh-CN".to_owned(),
+                status: "disabled".to_owned(),
+                title: None,
+                summary: None,
+                error: Some("disabled".to_owned()),
+            },
+            crate::api::TranslateBatchItem {
+                id: "104".to_owned(),
+                lang: "zh-CN".to_owned(),
+                status: "error".to_owned(),
+                title: None,
+                summary: None,
+                error: Some("boom".to_owned()),
+            },
+        ]);
+
+        assert_eq!(result["total"], json!(4));
+        assert_eq!(result["ready"], json!(1));
+        assert_eq!(result["missing"], json!(1));
+        assert_eq!(result["disabled"], json!(1));
+        assert_eq!(result["error"], json!(1));
+        assert_eq!(
+            result["items"].as_array().map(Vec::len),
+            Some(4),
+            "items should remain available for legacy readers"
+        );
     }
 
     #[test]

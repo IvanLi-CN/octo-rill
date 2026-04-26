@@ -81,7 +81,7 @@
     "cancel_requested": false,
     "error_message": null,
     "payload_json": "{\"user_id\":1,\"release_ids\":[290836643]}",
-    "result_json": "{\"total\":1,\"ready\":1,\"missing\":0,\"disabled\":0,\"error\":0}",
+    "result_json": "{\"total\":1,\"ready\":1,\"missing\":0,\"disabled\":0,\"error\":0,\"items\":[{\"id\":\"290836643\",\"lang\":\"zh-CN\",\"status\":\"ready\",\"title\":\"...\",\"summary\":\"...\",\"error\":null}]}",
     "created_at": "2026-02-25T00:00:00Z",
     "started_at": "2026-02-25T00:00:01Z",
     "finished_at": "2026-02-25T00:00:05Z",
@@ -98,7 +98,7 @@
 }
 ```
 
-`payload_json` 与 `result_json` 由前端任务详情页用于按 `task_type` 渲染专属业务信息，不再依赖单一通用文案。
+`payload_json` 与 `result_json` 由前端任务详情页用于按 `task_type` 渲染专属业务信息，不再依赖单一通用文案。对于 `translate.release.batch` / `summarize.release.smart.batch`，后端应优先写入带 `items[]` 的 summary-enriched superset；读取端仍需兼容仅有 `items[]` 的 legacy 行。
 
 ### `GET /api/admin/jobs/translations/status` response
 
