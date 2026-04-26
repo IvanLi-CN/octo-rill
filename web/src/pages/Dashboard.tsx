@@ -27,6 +27,7 @@ import {
 	resolvePreferredLaneForItem,
 } from "@/feed/laneOptions";
 import type {
+	FeedReactionRefreshResponse,
 	FeedItem,
 	FeedLane,
 	ReactionContent,
@@ -153,6 +154,8 @@ type BriefGenerateResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const FEED_REACTION_REFRESH_TTL_MS = 15_000;
+const FEED_REACTION_REFRESH_BATCH_SIZE = 100;
 const REACTION_CONTENTS: ReactionContent[] = [
 	"plus1",
 	"laugh",
@@ -412,9 +415,13 @@ export function Dashboard(props: {
 	const reactionFlushTimerByKeyRef = useRef<Map<string, number>>(
 		new Map<string, number>(),
 	);
+	const lastFeedReactionRefreshByKeyRef = useRef<Map<string, number>>(
+		new Map<string, number>(),
+	);
 	const [reactionErrorByKey, setReactionErrorByKey] = useState<
 		Record<string, string>
 	>({});
+	const reactionRefreshingKeysRef = useRef<Set<string>>(new Set<string>());
 	const [reactionTokenConfigured, setReactionTokenConfigured] = useState<
 		boolean | null
 	>(() => sessionState?.reactionTokenConfigured ?? null);
@@ -773,6 +780,104 @@ export function Dashboard(props: {
 			}
 		});
 	}, [loadReactionToken]);
+
+	useEffect(() => {
+		if (reactionTokenConfigured !== true) {
+			return;
+		}
+		const releaseIds = feed.items
+			.filter(isReleaseFeedItem)
+			.filter((item) => item.reactions?.status === "ready")
+			.map((item) => item.id);
+		if (releaseIds.length === 0) {
+			return;
+		}
+
+		const uniqueReleaseIds = Array.from(new Set(releaseIds)).sort();
+		const now = Date.now();
+		const releaseIdsToRefresh = uniqueReleaseIds.filter((releaseId) => {
+			const key = itemKey({ kind: "release", id: releaseId });
+			if (reactionRefreshingKeysRef.current.has(key)) {
+				return false;
+			}
+			const lastRefreshAt = lastFeedReactionRefreshByKeyRef.current.get(key);
+			return (
+				lastRefreshAt === undefined ||
+				now - lastRefreshAt >= FEED_REACTION_REFRESH_TTL_MS
+			);
+		});
+		if (releaseIdsToRefresh.length === 0) {
+			return;
+		}
+
+		const refreshingKeys = releaseIdsToRefresh.map((releaseId) =>
+			itemKey({ kind: "release", id: releaseId }),
+		);
+		for (const key of refreshingKeys) {
+			reactionRefreshingKeysRef.current.add(key);
+			lastFeedReactionRefreshByKeyRef.current.set(key, now);
+		}
+		const refreshBatches: string[][] = [];
+		for (
+			let i = 0;
+			i < releaseIdsToRefresh.length;
+			i += FEED_REACTION_REFRESH_BATCH_SIZE
+		) {
+			refreshBatches.push(
+				releaseIdsToRefresh.slice(i, i + FEED_REACTION_REFRESH_BATCH_SIZE),
+			);
+		}
+
+		void Promise.allSettled(
+			refreshBatches.map((releaseIdsBatch) =>
+				apiPostJson<FeedReactionRefreshResponse>(
+					"/api/feed/reactions/refresh",
+					{
+						release_ids: releaseIdsBatch,
+					},
+				),
+			),
+		)
+			.then((results) => {
+				for (const result of results) {
+					if (result.status !== "fulfilled") {
+						const reason = result.reason;
+						if (
+							reason instanceof ApiError &&
+							(reason.code === "pat_invalid" || reason.code === "pat_required")
+						) {
+							setReactionTokenConfigured(false);
+							void loadReactionToken();
+						}
+						continue;
+					}
+					for (const item of result.value.items) {
+						const key = itemKey({ kind: "release", id: item.release_id });
+						if (
+							reactionBusyKeysRef.current.has(key) ||
+							reactionDesiredByKeyRef.current.has(key)
+						) {
+							continue;
+						}
+						reactionServerByKeyRef.current.set(key, item.reactions);
+						feed.applyReactions(
+							{ kind: "release", id: item.release_id },
+							item.reactions,
+						);
+					}
+				}
+			})
+			.finally(() => {
+				for (const key of refreshingKeys) {
+					reactionRefreshingKeysRef.current.delete(key);
+				}
+			});
+	}, [
+		feed.applyReactions,
+		feed.items,
+		loadReactionToken,
+		reactionTokenConfigured,
+	]);
 
 	useEffect(() => {
 		const shouldLoadNotifications = hasDesktopSidebarInbox || tab === "inbox";
@@ -1647,12 +1752,12 @@ export function Dashboard(props: {
 		feed.items,
 		feed.loadingInitial,
 		feed.nextCursor,
-		feedRequestType,
 		me.user.id,
 		notifications,
 		routeState,
 		selectedBriefId,
 		sidebarLoading,
+		feedRequestType,
 	]);
 
 	const showStartupSkeleton =

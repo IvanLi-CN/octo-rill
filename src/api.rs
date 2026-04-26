@@ -3,6 +3,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
@@ -6279,6 +6280,22 @@ pub struct FeedResponse {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FeedReactionRefreshRequest {
+    release_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeedReactionRefreshResponse {
+    items: Vec<FeedReactionRefreshItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeedReactionRefreshItem {
+    release_id: String,
+    reactions: ReleaseReactions,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct RepoVisual {
     owner_avatar_url: Option<String>,
@@ -6375,6 +6392,7 @@ struct FeedRow {
     ts: String,
     id_key: String,
     entity_id: String,
+    #[allow(dead_code)]
     release_id: Option<i64>,
     release_node_id: Option<String>,
     repo_full_name: Option<String>,
@@ -7058,6 +7076,39 @@ async fn fetch_feed_items(
         .map_err(ApiError::internal)
 }
 
+async fn fetch_visible_release_reaction_rows(
+    state: &AppState,
+    user_id: &str,
+    release_ids: &[i64],
+) -> Result<Vec<ReleaseReactionRow>, ApiError> {
+    if release_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..release_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT rr.release_id, rr.node_id
+        FROM repo_releases rr
+        JOIN user_release_visible_repos sr
+          ON sr.user_id = ? AND sr.repo_id = rr.repo_id
+        WHERE rr.release_id IN ({placeholders})
+        "#
+    );
+
+    let mut query = sqlx::query_as::<_, ReleaseReactionRow>(&sql).bind(user_id);
+    for release_id in release_ids {
+        query = query.bind(release_id);
+    }
+    query
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)
+}
+
 fn release_counts_from_row(r: &FeedRow) -> ReleaseReactionCounts {
     ReleaseReactionCounts {
         plus1: r.react_plus1.unwrap_or(0),
@@ -7736,6 +7787,7 @@ pub async fn list_feed(
     session: Session,
     Query(q): Query<FeedQuery>,
 ) -> Result<Json<FeedResponse>, ApiError> {
+    let started_at = Instant::now();
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
     let types = parse_feed_types(q.types.as_deref())?;
 
@@ -7746,44 +7798,11 @@ pub async fn list_feed(
         None => None,
     };
 
+    let db_started_at = Instant::now();
     let rows =
         fetch_feed_items(state.as_ref(), &user_id, feed_cursor.as_ref(), types, limit).await?;
+    let db_elapsed = db_started_at.elapsed();
     let ai_enabled = state.config.ai.is_some();
-
-    let mut node_ids: Vec<String> = Vec::new();
-    let mut release_by_node = std::collections::HashMap::<String, i64>::new();
-    for row in &rows {
-        if let (Some(release_id), Some(node_id)) = (row.release_id, row.release_node_id.as_deref())
-        {
-            let node_id = node_id.trim();
-            if !node_id.is_empty() {
-                node_ids.push(node_id.to_owned());
-                release_by_node.insert(node_id.to_owned(), release_id);
-            }
-        }
-    }
-    node_ids.sort();
-    node_ids.dedup();
-
-    let mut live_reactions_by_node =
-        std::collections::HashMap::<String, LiveReleaseReactions>::new();
-    let reaction_pat = load_reaction_pat_token(state.as_ref(), &user_id)
-        .await
-        .ok()
-        .flatten();
-    if !node_ids.is_empty()
-        && let Some(pat) = reaction_pat
-        && let Ok(live) = fetch_live_release_reactions(state.as_ref(), &pat, &node_ids).await
-    {
-        for (node_id, reaction) in &live {
-            if let Some(release_id) = release_by_node.get(node_id) {
-                let _ =
-                    persist_release_reaction_counts(state.as_ref(), *release_id, &reaction.counts)
-                        .await;
-            }
-        }
-        live_reactions_by_node = live;
-    }
 
     let mut items = Vec::with_capacity(rows.len());
     let mut next_cursor: Option<String> = None;
@@ -7791,17 +7810,20 @@ pub async fn list_feed(
         if idx == limit.saturating_sub(1) as usize {
             next_cursor = Some(format!("{}|{}|{}", r.sort_ts, r.kind, r.id_key));
         }
-        let live = r
-            .release_node_id
-            .as_deref()
-            .and_then(|id| live_reactions_by_node.get(id));
-        items.push(feed_item_from_row(r, ai_enabled, live));
+        items.push(feed_item_from_row(r, ai_enabled, None));
     }
 
     // If we returned fewer than limit, there's no next page.
     if items.len() < limit as usize {
         next_cursor = None;
     }
+
+    tracing::info!(
+        db_ms = db_elapsed.as_millis() as u64,
+        total_ms = started_at.elapsed().as_millis() as u64,
+        item_count = items.len(),
+        "feed hot path served from local cache"
+    );
 
     Ok(Json(FeedResponse { items, next_cursor }))
 }
@@ -7822,6 +7844,129 @@ pub struct ToggleReleaseReactionResponse {
 struct ReleaseReactionRow {
     release_id: i64,
     node_id: Option<String>,
+}
+
+pub async fn refresh_feed_reactions(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<FeedReactionRefreshRequest>,
+) -> Result<Json<FeedReactionRefreshResponse>, ApiError> {
+    let started_at = Instant::now();
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let release_ids = parse_unique_release_ids(&req.release_ids, 100)?;
+
+    let db_started_at = Instant::now();
+    let rows = fetch_visible_release_reaction_rows(state.as_ref(), &user_id, &release_ids).await?;
+    let db_elapsed = db_started_at.elapsed();
+
+    let mut node_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.node_id.as_deref().map(str::trim))
+        .filter(|node_id| !node_id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    node_ids.sort();
+    node_ids.dedup();
+
+    if node_ids.is_empty() {
+        tracing::info!(
+            db_ms = db_elapsed.as_millis() as u64,
+            github_ms = 0_u64,
+            persist_ms = 0_u64,
+            total_ms = started_at.elapsed().as_millis() as u64,
+            release_count = release_ids.len(),
+            refreshed_count = 0_usize,
+            "feed reaction refresh skipped without release node ids"
+        );
+        return Ok(Json(FeedReactionRefreshResponse { items: Vec::new() }));
+    }
+
+    let token = match load_reaction_pat_token(state.as_ref(), &user_id).await {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            tracing::info!(
+                db_ms = db_elapsed.as_millis() as u64,
+                github_ms = 0_u64,
+                persist_ms = 0_u64,
+                total_ms = started_at.elapsed().as_millis() as u64,
+                release_count = release_ids.len(),
+                refreshed_count = 0_usize,
+                "feed reaction refresh skipped without configured PAT"
+            );
+            return Ok(Json(FeedReactionRefreshResponse { items: Vec::new() }));
+        }
+        Err(err) if err.code() == "pat_invalid" => {
+            let _ = persist_reaction_pat_check_result(
+                state.as_ref(),
+                &user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await;
+            return Err(err);
+        }
+        Err(err) => return Err(err),
+    };
+
+    let github_started_at = Instant::now();
+    let live = match fetch_live_release_reactions(state.as_ref(), &token, &node_ids).await {
+        Ok(live) => live,
+        Err(err) if err.code() == "reauth_required" => {
+            let _ = persist_reaction_pat_check_result(
+                state.as_ref(),
+                &user_id,
+                "invalid",
+                Some("PAT is invalid or expired"),
+            )
+            .await;
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "pat_invalid",
+                "PAT is invalid or expired",
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+    let github_elapsed = github_started_at.elapsed();
+
+    let persist_started_at = Instant::now();
+    let mut items = Vec::new();
+    for row in rows {
+        let Some(node_id) = row
+            .node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|node_id| !node_id.is_empty())
+        else {
+            continue;
+        };
+        let Some(reaction) = live.get(node_id) else {
+            continue;
+        };
+        persist_release_reaction_counts(state.as_ref(), row.release_id, &reaction.counts).await?;
+        items.push(FeedReactionRefreshItem {
+            release_id: row.release_id.to_string(),
+            reactions: ReleaseReactions {
+                counts: reaction.counts.clone(),
+                viewer: reaction.viewer.clone(),
+                status: "ready".to_owned(),
+            },
+        });
+    }
+    let persist_elapsed = persist_started_at.elapsed();
+
+    let refreshed_count = items.len();
+    tracing::info!(
+        db_ms = db_elapsed.as_millis() as u64,
+        github_ms = github_elapsed.as_millis() as u64,
+        persist_ms = persist_elapsed.as_millis() as u64,
+        total_ms = started_at.elapsed().as_millis() as u64,
+        release_count = release_ids.len(),
+        refreshed_count,
+        "feed reaction refresh completed outside feed hot path"
+    );
+
+    Ok(Json(FeedReactionRefreshResponse { items }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -12290,9 +12435,9 @@ mod tests {
         AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest, AdminRealtimeTaskDetailItem,
         AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
         AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
-        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, FeedQuery, FeedRow, GitHubCompareCommit,
-        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
+        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, FeedQuery, FeedReactionRefreshRequest, FeedRow,
+        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
+        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
@@ -12315,12 +12460,13 @@ mod tests {
         parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
         parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
         prepare_release_batch, preserve_chunk_edge_newlines, refresh_admin_dashboard_rollups,
-        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_feed_body, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, should_retry_public_compare_without_auth,
-        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
+        refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_feed_body,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_releases_batch_for_user,
+        translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -17722,6 +17868,65 @@ line two",
         .expect("list releases feed");
         assert_eq!(releases_only.items.len(), 1);
         assert_eq!(releases_only.items[0].kind, "release");
+    }
+
+    #[tokio::test]
+    async fn list_feed_serves_cached_reactions_without_live_viewer_lookup() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET react_plus1 = 7,
+                react_heart = 3
+            WHERE release_id = 120
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed cached reactions");
+        let state = setup_state(pool);
+
+        let Json(feed) = list_feed(
+            State(state),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("releases".to_owned()),
+            }),
+        )
+        .await
+        .expect("list release feed");
+
+        let item = feed.items.first().expect("release feed item");
+        assert_eq!(item.kind, "release");
+        let reactions = item.reactions.as_ref().expect("cached reactions");
+        assert_eq!(reactions.counts.plus1, 7);
+        assert_eq!(reactions.counts.heart, 3);
+        assert!(!reactions.viewer.plus1);
+        assert!(!reactions.viewer.heart);
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_reactions_without_pat_is_non_blocking_empty_result() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool);
+
+        let Json(resp) = refresh_feed_reactions(
+            State(state),
+            setup_session(1).await,
+            Json(FeedReactionRefreshRequest {
+                release_ids: vec!["120".to_owned()],
+            }),
+        )
+        .await
+        .expect("refresh feed reactions");
+
+        assert!(resp.items.is_empty());
     }
 
     #[tokio::test]
