@@ -1,6 +1,8 @@
 import {
 	ArrowUpRight,
 	FolderGit2,
+	GitFork,
+	Megaphone,
 	RefreshCcw,
 	Star,
 	UserPlus,
@@ -542,13 +544,35 @@ function SocialActivityCard(props: {
 	const { item, currentViewer } = props;
 	const actor = item.actor;
 	const isRepoStar = item.kind === "repo_star_received";
-	const showTimestamp = isRepoStar;
+	const isFollower = item.kind === "follower_received";
+	const isRepoTarget = !isFollower;
+	const showTimestamp = !isFollower;
+	const ActionIcon =
+		item.kind === "announcement"
+			? Megaphone
+			: item.kind === "repo_forked"
+				? GitFork
+				: isRepoStar
+					? Star
+					: UserPlus;
+	const actionTitle =
+		item.kind === "announcement"
+			? "公告"
+			: item.kind === "repo_forked"
+				? "Fork"
+				: isRepoStar
+					? "标星"
+					: "关注";
 	const actorHref = actor.html_url ?? `https://github.com/${actor.login}`;
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
 		: null;
 	const actorCardHref = actorHref;
-	const targetCardHref = isRepoStar ? repoHref : null;
+	const targetCardHref = isRepoStar
+		? repoHref
+		: isRepoTarget
+			? (item.html_url ?? repoHref)
+			: null;
 	const targetViewer: FeedActor = currentViewer ?? {
 		login: "",
 		avatar_url: null,
@@ -558,8 +582,8 @@ function SocialActivityCard(props: {
 		targetViewer.html_url ??
 		(targetViewer.login ? `https://github.com/${targetViewer.login}` : null);
 	const actorMobileLabel = actor.login;
-	const targetMobileLabel = isRepoStar
-		? compactRepoFullName(item.repo_full_name ?? "你的仓库")
+	const targetMobileLabel = isRepoTarget
+		? compactRepoFullName(item.title ?? item.repo_full_name ?? "仓库")
 		: targetViewer.login;
 	const mobileRowRef = useRef<HTMLDivElement | null>(null);
 	const mobileActorGroupRef = useRef<HTMLSpanElement | null>(null);
@@ -654,12 +678,19 @@ function SocialActivityCard(props: {
 			data-social-card-time-visible={showTimestamp ? "true" : "false"}
 		>
 			{showTimestamp ? (
-				<p
-					className="mb-1 font-mono text-[11px] leading-none text-muted-foreground sm:mb-0.5 sm:text-xs"
-					data-social-card-timestamp
-				>
-					{formatIsoShortLocal(item.ts)}
-				</p>
+				<div className="mb-1 flex min-w-0 items-center gap-2 sm:mb-0.5">
+					<p
+						className="font-mono text-[11px] leading-none text-muted-foreground sm:text-xs"
+						data-social-card-timestamp
+					>
+						{formatIsoShortLocal(item.ts)}
+					</p>
+					{item.kind === "announcement" || item.kind === "repo_forked" ? (
+						<p className="min-w-0 truncate text-[11px] leading-none font-medium text-foreground/70 sm:text-xs">
+							{item.title ?? actionTitle}
+						</p>
+					) : null}
+				</div>
 			) : null}
 			<div
 				ref={mobileRowRef}
@@ -675,7 +706,7 @@ function SocialActivityCard(props: {
 						: { gridTemplateColumns: mobileGridTemplate }
 				}
 			>
-				{isRepoStar ? (
+				{isRepoTarget ? (
 					<>
 						<a
 							href={actorCardHref}
@@ -716,7 +747,7 @@ function SocialActivityCard(props: {
 							ref={mobileActionShellRef}
 							className="flex items-center justify-center"
 						>
-							<SocialActionChip icon={Star} title="标星" />
+							<SocialActionChip icon={ActionIcon} title={actionTitle} />
 						</div>
 						<a
 							href={targetCardHref ?? undefined}
@@ -746,10 +777,10 @@ function SocialActivityCard(props: {
 								<p
 									data-social-card-primary="true"
 									data-social-card-primary-full={
-										item.repo_full_name ?? "你的仓库"
+										item.title ?? item.repo_full_name ?? "仓库"
 									}
 									data-social-card-primary-mobile={targetMobileLabel}
-									title={item.repo_full_name ?? "你的仓库"}
+									title={item.title ?? item.repo_full_name ?? "仓库"}
 									className="min-w-0 truncate font-mono text-[10px] leading-none font-medium tracking-tight text-foreground"
 								>
 									<span data-social-card-primary-mobile-label="true">
@@ -876,11 +907,11 @@ function SocialActivityCard(props: {
 					primary={actor.login}
 				/>
 				<SocialActionBridge
-					icon={isRepoStar ? Star : UserPlus}
-					title={isRepoStar ? "标星" : "关注"}
+					icon={ActionIcon}
+					title={actionTitle}
 					className="px-0"
 				/>
-				{isRepoStar ? (
+				{isRepoTarget ? (
 					<SocialEntityCard
 						href={targetCardHref}
 						segment="target"
@@ -896,7 +927,7 @@ function SocialActivityCard(props: {
 								className="size-11 border-border/60"
 							/>
 						}
-						primary={item.repo_full_name ?? "你的仓库"}
+						primary={item.title ?? item.repo_full_name ?? "仓库"}
 						mono
 					/>
 				) : (
@@ -915,6 +946,101 @@ function SocialActivityCard(props: {
 				)}
 			</div>
 		</div>
+	);
+}
+
+function AnnouncementContentCard(props: { item: SocialFeedItem }) {
+	const { item } = props;
+	const title = item.title?.trim() || item.repo_full_name || "仓库公告";
+	const subtitleBits = [
+		item.subtitle || "仓库公告",
+		item.actor?.login ? `by ${item.actor.login}` : null,
+	].filter(Boolean);
+	const subtitle = subtitleBits.join(" · ");
+
+	return (
+		<Card
+			className="group bg-card/80 shadow-sm transition-shadow hover:shadow-md"
+			data-announcement-card="true"
+			data-feed-item-id={item.id}
+		>
+			<CardHeader className="px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6">
+				<div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+					<div className="min-w-0 flex-1">
+						<div className="flex items-start gap-2">
+							<div className="min-w-0 flex-1">
+								<div className="flex flex-wrap items-center gap-2">
+									<RepoIdentity
+										repoFullName={item.repo_full_name}
+										repoVisual={item.repo_visual}
+										className="min-w-0 min-h-8"
+										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+										visualClassName="size-8"
+									/>
+									<span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-muted/35 px-2 py-1 text-[11px] font-medium text-muted-foreground">
+										<Megaphone className="size-3.5" />
+										公告
+									</span>
+								</div>
+
+								<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
+									{title}
+								</CardTitle>
+								<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
+									{formatIsoShortLocal(item.ts)}
+									{subtitle ? ` · ${subtitle}` : ""}
+								</p>
+							</div>
+
+							<a
+								href={item.html_url ?? "#"}
+								target="_blank"
+								rel="noreferrer"
+								aria-label="GitHub"
+								title="GitHub"
+								data-feed-mobile-github-link="true"
+								className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 sm:hidden"
+							>
+								<ArrowUpRight className="size-4" />
+								<span className="sr-only">GitHub</span>
+							</a>
+						</div>
+					</div>
+
+					<div className="hidden flex-wrap items-center gap-2 sm:flex sm:justify-end">
+						<Button
+							asChild
+							variant="outline"
+							size="sm"
+							className="h-8 shrink-0 px-3 font-mono text-xs"
+						>
+							<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
+								<ArrowUpRight className="size-4" />
+								GitHub
+							</a>
+						</Button>
+					</div>
+				</div>
+			</CardHeader>
+
+			<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
+				{item.body?.trim() ? (
+					<>
+						{item.body_truncated ? (
+							<div className="mb-2 font-mono text-[11px] text-muted-foreground">
+								列表正文已截断显示；完整公告内容请前往 GitHub 查看。
+							</div>
+						) : null}
+						<Markdown content={item.body} />
+					</>
+				) : (
+					<EmptyPanel
+						title="公告暂无可读正文"
+						description="这条公告没有可直接展示的正文，主人可以前往 GitHub 查看完整内容。"
+					/>
+				)}
+			</CardContent>
+		</Card>
 	);
 }
 
@@ -1183,6 +1309,10 @@ export function FeedItemCard(props: {
 	onToggleReaction: (content: ReactionContent) => void;
 }) {
 	const { item, currentViewer } = props;
+
+	if (item.kind === "announcement") {
+		return <AnnouncementContentCard item={item} />;
+	}
 
 	if (isSocialFeedItem(item)) {
 		return <SocialActivityCard item={item} currentViewer={currentViewer} />;

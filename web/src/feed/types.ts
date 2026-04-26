@@ -34,7 +34,9 @@ export type FeedLane = "original" | "translated" | "smart";
 export type FeedItemKind =
 	| "release"
 	| "repo_star_received"
-	| "follower_received";
+	| "follower_received"
+	| "announcement"
+	| "repo_forked";
 
 export type FeedActor = {
 	login: string;
@@ -101,7 +103,11 @@ export type ReleaseFeedItem = FeedItemBase & {
 };
 
 export type SocialFeedItem = FeedItemBase & {
-	kind: "repo_star_received" | "follower_received";
+	kind:
+		| "repo_star_received"
+		| "follower_received"
+		| "announcement"
+		| "repo_forked";
 	actor: FeedActor;
 	translated: null;
 	smart: null;
@@ -116,7 +122,10 @@ export function isReleaseFeedItem(item: FeedItem): item is ReleaseFeedItem {
 
 export function isSocialFeedItem(item: FeedItem): item is SocialFeedItem {
 	return (
-		item.kind === "repo_star_received" || item.kind === "follower_received"
+		item.kind === "repo_star_received" ||
+		item.kind === "follower_received" ||
+		item.kind === "announcement" ||
+		item.kind === "repo_forked"
 	);
 }
 

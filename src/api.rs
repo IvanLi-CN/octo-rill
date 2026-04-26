@@ -6483,7 +6483,9 @@ fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
 
 fn feed_kind_rank(kind: &str) -> Option<i64> {
     match kind {
-        "release" => Some(3),
+        "release" => Some(5),
+        "announcement" => Some(4),
+        "repo_forked" => Some(3),
         "repo_star_received" => Some(2),
         "follower_received" => Some(1),
         "notification" => Some(0),
@@ -6496,6 +6498,7 @@ struct FeedTypeSelection {
     releases: bool,
     stars: bool,
     followers: bool,
+    ambient: bool,
 }
 
 impl FeedTypeSelection {
@@ -6504,6 +6507,7 @@ impl FeedTypeSelection {
             releases: true,
             stars: true,
             followers: true,
+            ambient: true,
         }
     }
 }
@@ -6517,6 +6521,7 @@ fn parse_feed_types(types: Option<&str>) -> Result<FeedTypeSelection, ApiError> 
         releases: false,
         stars: false,
         followers: false,
+        ambient: false,
     };
     let mut saw_any = false;
     for part in types.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -6853,7 +6858,7 @@ async fn fetch_feed_items(
         WITH items AS (
           SELECT
             'release' AS kind,
-            3 AS kind_rank,
+            5 AS kind_rank,
             sort_ts,
             ts,
             id_key,
@@ -6923,6 +6928,8 @@ async fn fetch_feed_items(
           SELECT
             e.kind AS kind,
             CASE e.kind
+              WHEN 'announcement' THEN 4
+              WHEN 'repo_forked' THEN 3
               WHEN 'repo_star_received' THEN 2
               WHEN 'follower_received' THEN 1
               ELSE 0
@@ -6942,16 +6949,24 @@ async fn fetch_feed_items(
             ) AS uses_custom_open_graph_image,
             NULL AS release_tag_name,
             NULL AS release_previous_tag_name,
-            NULL AS title,
-            NULL AS subtitle,
+            e.title AS title,
+            CASE e.kind
+              WHEN 'announcement' THEN '仓库公告'
+              WHEN 'repo_forked' THEN 'Fork'
+              ELSE NULL
+            END AS subtitle,
             NULL AS reason,
-            NULL AS subject_type,
-            COALESCE(e.actor_html_url, 'https://github.com/' || e.actor_login) AS html_url,
+            CASE e.kind
+              WHEN 'announcement' THEN 'release'
+              WHEN 'repo_forked' THEN 'repository'
+              ELSE NULL
+            END AS subject_type,
+            COALESCE(e.html_url, e.actor_html_url, 'https://github.com/' || e.actor_login) AS html_url,
             NULL AS unread,
             e.actor_login AS actor_login,
             e.actor_avatar_url AS actor_avatar_url,
             e.actor_html_url AS actor_html_url,
-            NULL AS release_body,
+            e.body AS release_body,
             NULL AS react_plus1,
             NULL AS react_laugh,
             NULL AS react_heart,
@@ -7005,6 +7020,7 @@ async fn fetch_feed_items(
           (? = 1 AND i.kind = 'release')
           OR (? = 1 AND i.kind = 'repo_star_received')
           OR (? = 1 AND i.kind = 'follower_received')
+          OR (? = 1 AND i.kind IN ('announcement', 'repo_forked'))
         )
           AND (
             ? = 0
@@ -7028,6 +7044,7 @@ async fn fetch_feed_items(
     qy.bind(if types.releases { 1_i64 } else { 0_i64 })
         .bind(if types.stars { 1_i64 } else { 0_i64 })
         .bind(if types.followers { 1_i64 } else { 0_i64 })
+        .bind(if types.ambient { 1_i64 } else { 0_i64 })
         .bind(if has_cursor { 1_i64 } else { 0_i64 })
         .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
         .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
@@ -7496,6 +7513,13 @@ fn feed_item_from_row(
     );
 
     if r.kind != "release" {
+        let (body, body_truncated) = match r.kind.as_str() {
+            "announcement" => (
+                release_feed_body(r.release_body.as_deref()),
+                release_feed_body_is_over_limit(r.release_body.as_deref()),
+            ),
+            _ => (None, false),
+        };
         return FeedItem {
             kind: r.kind,
             ts: r.ts,
@@ -7503,8 +7527,8 @@ fn feed_item_from_row(
             repo_full_name: r.repo_full_name,
             repo_visual,
             title: r.title,
-            body: None,
-            body_truncated: false,
+            body,
+            body_truncated,
             subtitle: r.subtitle,
             reason: r.reason,
             subject_type: r.subject_type,
@@ -13329,6 +13353,9 @@ mod tests {
         repo_owner_avatar_url: Option<&'a str>,
         repo_open_graph_image_url: Option<&'a str>,
         repo_uses_custom_open_graph_image: Option<bool>,
+        title: Option<&'a str>,
+        body: Option<&'a str>,
+        html_url: Option<&'a str>,
         actor_login: &'a str,
         occurred_at: &'a str,
     }
@@ -13345,6 +13372,9 @@ mod tests {
               repo_owner_avatar_url,
               repo_open_graph_image_url,
               repo_uses_custom_open_graph_image,
+              title,
+              body,
+              html_url,
               actor_github_user_id,
               actor_login,
               actor_avatar_url,
@@ -13354,7 +13384,7 @@ mod tests {
               created_at,
               updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(args.event_id)
@@ -13368,6 +13398,9 @@ mod tests {
             args.repo_uses_custom_open_graph_image
                 .map(|uses_custom| if uses_custom { 1_i64 } else { 0_i64 }),
         )
+        .bind(args.title)
+        .bind(args.body)
+        .bind(args.html_url)
         .bind(90_000_i64 + i64::from(args.actor_login.bytes().map(i16::from).sum::<i16>()))
         .bind(args.actor_login)
         .bind(format!("https://avatars.example/{}.png", args.actor_login))
@@ -17191,6 +17224,13 @@ body={}
         assert!(selection.releases);
         assert!(selection.stars);
         assert!(selection.followers);
+        assert!(!selection.ambient);
+    }
+
+    #[test]
+    fn parse_feed_types_rejects_ambient_activity_as_dedicated_tab() {
+        assert!(parse_feed_types(Some("announcements")).is_err());
+        assert!(parse_feed_types(Some("forks")).is_err());
     }
 
     #[test]
@@ -17505,6 +17545,9 @@ line two",
                 repo_owner_avatar_url: None,
                 repo_open_graph_image_url: None,
                 repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
                 actor_login: "octocat",
                 occurred_at: "2026-02-23T10:00:00Z",
             },
@@ -17521,8 +17564,49 @@ line two",
                 repo_owner_avatar_url: None,
                 repo_open_graph_image_url: None,
                 repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: None,
                 actor_login: "monalisa",
                 occurred_at: "2026-02-23T09:00:00Z",
+            },
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "announcement",
+                event_id: "social-announcement-1",
+                repo_id: Some(42),
+                repo_full_name: Some("openai/codex"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: Some("Release v2.0.0"),
+                body: Some("- dashboard announcement"),
+                html_url: Some("https://github.com/openai/codex/releases/tag/v2.0.0"),
+                actor_login: "maintainer",
+                occurred_at: "2026-02-23T11:00:00Z",
+            },
+        )
+        .await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_forked",
+                event_id: "social-fork-1",
+                repo_id: Some(43),
+                repo_full_name: Some("octocat/codex-fork"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: Some("octocat/codex-fork"),
+                body: Some("Forked repository"),
+                html_url: Some("https://github.com/octocat/codex-fork"),
+                actor_login: "octocat",
+                occurred_at: "2026-02-23T10:30:00Z",
             },
         )
         .await;
@@ -17547,7 +17631,18 @@ line two",
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
-            vec!["repo_star_received", "follower_received", "release"]
+            vec![
+                "announcement",
+                "repo_forked",
+                "repo_star_received",
+                "follower_received",
+                "release",
+            ]
+        );
+        assert_eq!(feed.items[0].title.as_deref(), Some("Release v2.0.0"));
+        assert_eq!(
+            feed.items[0].html_url.as_deref(),
+            Some("https://github.com/openai/codex/releases/tag/v2.0.0")
         );
         assert_eq!(
             feed.items[0]
@@ -17556,11 +17651,51 @@ line two",
                 .expect("social actor")
                 .login
                 .as_str(),
-            "octocat"
+            "maintainer"
+        );
+
+        let Json(first_page) = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(2),
+                types: None,
+            }),
+        )
+        .await
+        .expect("list first mixed feed page");
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["announcement", "repo_forked"]
+        );
+        let cursor = first_page.next_cursor.expect("first page cursor");
+        let Json(second_page) = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: Some(cursor),
+                limit: Some(30),
+                types: None,
+            }),
+        )
+        .await
+        .expect("list second mixed feed page");
+        assert_eq!(
+            second_page
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["repo_star_received", "follower_received", "release"]
         );
 
         let Json(stars_only) = list_feed(
-            State(state),
+            State(state.clone()),
             setup_session(1).await,
             Query(FeedQuery {
                 cursor: None,
@@ -17573,6 +17708,20 @@ line two",
 
         assert_eq!(stars_only.items.len(), 1);
         assert_eq!(stars_only.items[0].kind, "repo_star_received");
+
+        let Json(releases_only) = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("releases".to_owned()),
+            }),
+        )
+        .await
+        .expect("list releases feed");
+        assert_eq!(releases_only.items.len(), 1);
+        assert_eq!(releases_only.items[0].kind, "release");
     }
 
     #[tokio::test]
@@ -17592,6 +17741,9 @@ line two",
                     "https://repository-images.githubusercontent.com/14957082/codex",
                 ),
                 repo_uses_custom_open_graph_image: Some(true),
+                title: None,
+                body: None,
+                html_url: None,
                 actor_login: "octocat",
                 occurred_at: "2026-02-23T10:00:00Z",
             },

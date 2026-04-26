@@ -433,6 +433,61 @@ struct FollowerSnapshot {
     actor: GitHubActor,
 }
 
+#[derive(Debug, Clone)]
+struct FeedActivityEventSnapshot {
+    kind: &'static str,
+    event_id: String,
+    repo_id: Option<i64>,
+    repo_full_name: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+    github_event_id: Option<String>,
+    actor: GitHubActor,
+    occurred_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubActivityEvent {
+    id: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    actor: GitHubActor,
+    repo: GitHubEventRepo,
+    #[serde(default)]
+    payload: GitHubActivityPayload,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubEventRepo {
+    id: Option<i64>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct GitHubActivityPayload {
+    action: Option<String>,
+    release: Option<GitHubEventRelease>,
+    forkee: Option<GitHubEventRepoTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubEventRelease {
+    name: Option<String>,
+    tag_name: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubEventRepoTarget {
+    id: Option<i64>,
+    full_name: Option<String>,
+    html_url: Option<String>,
+    description: Option<String>,
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct RepoStarCurrentMemberRow {
     actor_github_user_id: i64,
@@ -921,6 +976,7 @@ pub async fn sync_social_activity(
     let mut source_errors = Vec::new();
     let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
     let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
+    let mut feed_events_by_id = HashMap::<String, FeedActivityEventSnapshot>::new();
 
     for connection in connections {
         match fetch_owned_repo_snapshot(state, &connection.access_token).await {
@@ -967,6 +1023,34 @@ pub async fn sync_social_activity(
                 ));
             }
         }
+
+        match fetch_feed_activity_events_snapshot(
+            state,
+            &connection.access_token,
+            &connection.login,
+        )
+        .await
+        {
+            Ok(events) => {
+                for event in events {
+                    feed_events_by_id
+                        .entry(event.event_id.clone())
+                        .or_insert(event);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync social activity: skip feed activity events snapshot"
+                );
+                source_errors.push(format!(
+                    "feed_events(@{}, {}): {}",
+                    connection.login, err.reason_code, err.message
+                ));
+            }
+        }
     }
 
     let mut owned_repos = owned_repo_sources
@@ -985,7 +1069,16 @@ pub async fn sync_social_activity(
         RepoStargazerCollectionResult::default()
     };
 
-    let events = match (
+    let mut feed_events = feed_events_by_id.into_values().collect::<Vec<_>>();
+    feed_events.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| left.kind.cmp(right.kind))
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+
+    let mut events = match (
         (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
         (!followers.is_empty()).then_some(followers.as_slice()),
     ) {
@@ -1010,6 +1103,7 @@ pub async fn sync_social_activity(
             .await?
         }
     };
+    events += insert_feed_activity_events(state, user_id, feed_events.as_slice()).await?;
 
     Ok(SyncSocialActivityResult {
         repo_stars: repo_collection.repo_stars,
@@ -1565,6 +1659,10 @@ async fn apply_social_activity_snapshot_partial(
                         repo_id: None,
                         repo_full_name: None,
                         repo_visual: None,
+                        title: None,
+                        body: None,
+                        html_url: None,
+                        github_event_id: None,
                         actor: &follower.actor,
                         occurred_at: now.as_str(),
                         detected_at: now.as_str(),
@@ -1750,6 +1848,10 @@ async fn apply_social_activity_snapshot_partial(
                             repo_id: Some(repo.repo_id),
                             repo_full_name: Some(repo.full_name.as_str()),
                             repo_visual: Some(repo),
+                            title: None,
+                            body: None,
+                            html_url: None,
+                            github_event_id: None,
                             actor: &member.actor,
                             occurred_at,
                             detected_at: now.as_str(),
@@ -1876,6 +1978,10 @@ struct SocialActivityEventInsert<'a> {
     repo_id: Option<i64>,
     repo_full_name: Option<&'a str>,
     repo_visual: Option<&'a OwnedRepoSnapshot>,
+    title: Option<&'a str>,
+    body: Option<&'a str>,
+    html_url: Option<&'a str>,
+    github_event_id: Option<&'a str>,
     actor: &'a GitHubActor,
     occurred_at: &'a str,
     detected_at: &'a str,
@@ -1909,6 +2015,10 @@ async fn insert_social_activity_event_tx(
           repo_owner_avatar_url,
           repo_open_graph_image_url,
           repo_uses_custom_open_graph_image,
+          title,
+          body,
+          html_url,
+          github_event_id,
           actor_github_user_id,
           actor_login,
           actor_avatar_url,
@@ -1918,7 +2028,7 @@ async fn insert_social_activity_event_tx(
           created_at,
           updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT DO NOTHING
         "#,
     )
@@ -1930,6 +2040,10 @@ async fn insert_social_activity_event_tx(
     .bind(repo_owner_avatar_url)
     .bind(repo_open_graph_image_url)
     .bind(repo_uses_custom_open_graph_image)
+    .bind(event.title)
+    .bind(event.body)
+    .bind(event.html_url)
+    .bind(event.github_event_id)
     .bind(event.actor.id)
     .bind(event.actor.login.as_str())
     .bind(event.actor.avatar_url.as_deref())
@@ -2080,6 +2194,10 @@ async fn materialize_follower_current_members_tx(
                 repo_id: None,
                 repo_full_name: None,
                 repo_visual: None,
+                title: None,
+                body: None,
+                html_url: None,
+                github_event_id: None,
                 actor: &actor,
                 occurred_at,
                 detected_at: now,
@@ -2155,6 +2273,10 @@ async fn materialize_repo_star_current_members_tx(
                 repo_id: Some(repo.repo_id),
                 repo_full_name: Some(repo.full_name.as_str()),
                 repo_visual: Some(repo),
+                title: None,
+                body: None,
+                html_url: None,
+                github_event_id: None,
                 actor: &actor,
                 occurred_at,
                 detected_at: now,
@@ -4855,6 +4977,189 @@ async fn fetch_followers_snapshot(
     Ok(followers)
 }
 
+async fn fetch_feed_activity_events_snapshot(
+    state: &AppState,
+    access_token: &str,
+    login: &str,
+) -> Result<Vec<FeedActivityEventSnapshot>, SyncRequestError> {
+    let mut page = 1usize;
+    let mut events = Vec::new();
+
+    while page <= 3 {
+        let operation = format!("sync social received events @{login} page {page}");
+        let url = format!(
+            "{REST_API_BASE}/users/{}/received_events?per_page=100&page={page}",
+            urlencoding::encode(login)
+        );
+        let items = fetch_github_rest_page::<Vec<GitHubActivityEvent>>(
+            state,
+            access_token,
+            url.as_str(),
+            "application/vnd.github+json",
+            operation.as_str(),
+        )
+        .await?;
+
+        let count = items.len();
+        events.extend(
+            items
+                .into_iter()
+                .filter_map(feed_activity_event_from_github),
+        );
+        if count < 100 {
+            break;
+        }
+        page += 1;
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| left.kind.cmp(right.kind))
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(events)
+}
+
+fn feed_activity_event_from_github(
+    event: GitHubActivityEvent,
+) -> Option<FeedActivityEventSnapshot> {
+    match event.event_type.as_str() {
+        "ForkEvent" => {
+            let forkee = event.payload.forkee;
+            let repo_full_name = forkee
+                .as_ref()
+                .and_then(|repo| repo.full_name.clone())
+                .or(event.repo.name.clone());
+            let repo_id = forkee.as_ref().and_then(|repo| repo.id).or(event.repo.id);
+            let html_url = forkee
+                .as_ref()
+                .and_then(|repo| repo.html_url.clone())
+                .or_else(|| {
+                    repo_full_name
+                        .as_ref()
+                        .map(|name| format!("{GITHUB_WEB_BASE}/{name}"))
+                });
+            let github_event_id = event.id;
+            Some(FeedActivityEventSnapshot {
+                kind: "repo_forked",
+                event_id: github_event_id.clone(),
+                repo_id,
+                repo_full_name,
+                title: forkee.as_ref().and_then(|repo| repo.full_name.clone()),
+                body: forkee.and_then(|repo| repo.description),
+                html_url,
+                github_event_id: Some(github_event_id),
+                actor: event.actor,
+                occurred_at: event.created_at,
+            })
+        }
+        "ReleaseEvent" => {
+            if !matches!(event.payload.action.as_deref(), Some("published") | None) {
+                return None;
+            }
+            let release = event.payload.release?;
+            let title = release
+                .name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .or(release.tag_name);
+            let github_event_id = event.id;
+            Some(FeedActivityEventSnapshot {
+                kind: "announcement",
+                event_id: github_event_id.clone(),
+                repo_id: event.repo.id,
+                repo_full_name: event.repo.name,
+                title,
+                body: release.body,
+                html_url: release.html_url,
+                github_event_id: Some(github_event_id),
+                actor: event.actor,
+                occurred_at: event.created_at,
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn insert_feed_activity_events(
+    state: &AppState,
+    user_id: &str,
+    events: &[FeedActivityEventSnapshot],
+) -> Result<usize> {
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("begin feed activity events tx")?;
+    let now = Utc::now().to_rfc3339();
+    let mut written = 0usize;
+    for event in events {
+        if event.kind == "announcement"
+            && let Some(html_url) = event.html_url.as_deref()
+        {
+            let duplicate_release = sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM repo_releases r
+                JOIN user_release_visible_repos vr
+                  ON vr.user_id = ? AND vr.repo_id = r.repo_id
+                WHERE r.html_url = ?
+                "#,
+            )
+            .bind(user_id)
+            .bind(html_url)
+            .fetch_one(&mut *tx)
+            .await
+            .context("check announcement duplicate release")?
+                > 0;
+            if duplicate_release {
+                continue;
+            }
+        }
+
+        let repo_visual = event.repo_id.map(|repo_id| OwnedRepoSnapshot {
+            repo_id,
+            full_name: event.repo_full_name.clone().unwrap_or_default(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        });
+        let inserted = insert_social_activity_event_tx(
+            &mut tx,
+            SocialActivityEventInsert {
+                user_id,
+                kind: event.kind,
+                repo_id: event.repo_id,
+                repo_full_name: event.repo_full_name.as_deref(),
+                repo_visual: repo_visual.as_ref(),
+                title: event.title.as_deref(),
+                body: event.body.as_deref(),
+                html_url: event.html_url.as_deref(),
+                github_event_id: event.github_event_id.as_deref(),
+                actor: &event.actor,
+                occurred_at: event.occurred_at.as_str(),
+                detected_at: now.as_str(),
+            },
+        )
+        .await?;
+        if inserted {
+            written += 1;
+        }
+    }
+    tx.commit()
+        .await
+        .context("commit feed activity events tx")?;
+    Ok(written)
+}
+
 async fn fetch_repo_stargazers_snapshot(
     state: &AppState,
     access_token: &str,
@@ -5797,15 +6102,16 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, FollowerSnapshot, GitHubActor, GitHubNotification,
-        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
-        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
-        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseOrigin, RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess,
-        StarredRepoSnapshot, SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        attach_and_wait_for_user_release_demand, attach_release_demand, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActor,
+        GitHubNotification, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
+        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
+        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
+        OwnedRepoSnapshot, ReleaseDemandRepo, RepoOwner, RepoReleaseOrigin, RepoStargazerSnapshot,
+        SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
+        apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
+        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, insert_feed_activity_events,
         insert_social_activity_event_tx, is_terminal_notification_thread_error,
         owned_repo_snapshot_from_node, recover_repo_release_runtime_state_on_startup,
         repo_release_deadline_at, resolve_notification_open_url,
@@ -7543,6 +7849,10 @@ mod tests {
                 repo_id: None,
                 repo_full_name: None,
                 repo_visual: None,
+                title: None,
+                body: None,
+                html_url: None,
+                github_event_id: None,
                 actor: &GitHubActor {
                     id: 201,
                     login: "monalisa".to_owned(),
@@ -7753,6 +8063,10 @@ mod tests {
                 repo_id: Some(repo.repo_id),
                 repo_full_name: Some(repo.full_name.as_str()),
                 repo_visual: Some(&repo),
+                title: None,
+                body: None,
+                html_url: None,
+                github_event_id: None,
                 actor: &GitHubActor {
                     id: 301,
                     login: "ghost".to_owned(),
@@ -8254,6 +8568,10 @@ mod tests {
                     repo_id: None,
                     repo_full_name: None,
                     repo_visual: None,
+                    title: None,
+                    body: None,
+                    html_url: None,
+                    github_event_id: None,
                     actor: &actor,
                     occurred_at,
                     detected_at,
@@ -8276,6 +8594,10 @@ mod tests {
                     repo_id: None,
                     repo_full_name: None,
                     repo_visual: None,
+                    title: None,
+                    body: None,
+                    html_url: None,
+                    github_event_id: None,
                     actor: &actor,
                     occurred_at,
                     detected_at,
@@ -8295,6 +8617,87 @@ mod tests {
                 .await
                 .expect("count deduped follower history");
         assert_eq!(history_count, 1);
+    }
+
+    #[tokio::test]
+    async fn feed_activity_events_dedupe_ambient_items_by_github_event_id() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("feed-ambient-event-id-dedupe");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let actor = GitHubActor {
+            id: 501,
+            login: "release-cat".to_owned(),
+            avatar_url: Some("https://avatars.example/release-cat.png".to_owned()),
+            html_url: Some("https://github.com/release-cat".to_owned()),
+        };
+        let occurred_at = "2026-03-06T12:00:00Z".to_owned();
+        let events = vec![
+            FeedActivityEventSnapshot {
+                kind: "announcement",
+                event_id: "evt-1".to_owned(),
+                github_event_id: Some("evt-1".to_owned()),
+                repo_id: Some(42),
+                repo_full_name: Some("octo/alpha".to_owned()),
+                title: Some("Alpha release".to_owned()),
+                body: Some("First announcement body".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/releases/tag/v1".to_owned()),
+                actor: actor.clone(),
+                occurred_at: occurred_at.clone(),
+            },
+            FeedActivityEventSnapshot {
+                kind: "announcement",
+                event_id: "evt-2".to_owned(),
+                github_event_id: Some("evt-2".to_owned()),
+                repo_id: Some(42),
+                repo_full_name: Some("octo/alpha".to_owned()),
+                title: Some("Beta release".to_owned()),
+                body: Some("Second announcement body".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/releases/tag/v2".to_owned()),
+                actor,
+                occurred_at,
+            },
+        ];
+
+        let inserted_first = insert_feed_activity_events(state.as_ref(), user_id.as_str(), &events)
+            .await
+            .expect("insert ambient feed events");
+        assert_eq!(inserted_first, 2);
+
+        let inserted_second =
+            insert_feed_activity_events(state.as_ref(), user_id.as_str(), &events)
+                .await
+                .expect("dedupe ambient feed events");
+        assert_eq!(inserted_second, 0);
+
+        let history_rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT github_event_id, title, body
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'announcement'
+            ORDER BY github_event_id ASC
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load ambient event history");
+        assert_eq!(
+            history_rows,
+            vec![
+                (
+                    "evt-1".to_owned(),
+                    "Alpha release".to_owned(),
+                    Some("First announcement body".to_owned()),
+                ),
+                (
+                    "evt-2".to_owned(),
+                    "Beta release".to_owned(),
+                    Some("Second announcement body".to_owned()),
+                ),
+            ]
+        );
     }
 
     #[tokio::test]

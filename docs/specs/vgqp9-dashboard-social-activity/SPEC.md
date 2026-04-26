@@ -11,8 +11,8 @@
 ### Goals
 
 - 新增 `加星`、`关注` 两个 Dashboard 顶层 tab。
-- 将 `全部` tab 改为 `release + repo_star_received + follower_received` 三类记录按统一时间倒序混排。
-- `/api/feed` 支持返回混合活动流，并支持 `types=releases|stars|followers` 过滤。
+- 将 `全部` tab 改为 `release + repo_star_received + follower_received + announcement + repo_forked` 五类记录按统一时间倒序混排。
+- `/api/feed` 支持返回混合活动流，并支持 `types=releases|stars|followers` 过滤；公告与 Fork 只属于默认 `全部` 流，不新增独立 tab。
 - 社交记录在写入时快照 `actor.login`、`actor.avatar_url`、`actor.html_url`，前端直接渲染头像，不额外查询 GitHub 用户资料。
 - 自动 access refresh 与顶部 `同步` / `sync.all` 纳入社交活动同步。
 - 首次成功获取 social snapshot 时，当前 followers / stargazers 必须直接落入同一条事件流。
@@ -22,7 +22,7 @@
 ### Non-goals
 
 - 不统计组织仓库被加星或组织成员变更。
-- 不引入 GitHub Events API、Webhook 或其他实时推送机制。
+- 不引入 Webhook 或其他实时推送机制。
 - 不在 `日报` / `收件箱` tab 内复用社交活动列表。
 - 不给 `Sync starred` 单独增加“加星 / 关注”能力。
 - 不追加“空 social tab 再自动触发一次同步”的前端策略。
@@ -35,6 +35,7 @@
 - `src/api.rs`
 - `src/sync.rs`
 - `src/jobs.rs`
+- `migrations/0042_social_activity_event_targets.sql`
 - `migrations/0027_dashboard_social_activity.sql`
 - `migrations/0028_social_activity_event_dedupe.sql`
 - `migrations/0029_owned_repo_star_baseline_snapshot_state.sql`
@@ -44,6 +45,7 @@
 - `web/src/feed/**`
 - `web/src/pages/Dashboard.tsx`
 - `web/src/stories/Dashboard.stories.tsx`
+- `migrations/0042_social_activity_event_targets.sql`
 - `web/e2e/**`
 - `docs/specs/vgqp9-dashboard-social-activity/SPEC.md`
 - `docs/specs/s8qkn-subscription-sync/SPEC.md`
@@ -58,22 +60,22 @@
 
 ### MUST
 
-- `全部` tab 必须混排 `release`、`repo_star_received`、`follower_received` 三类记录。
+- `全部` tab 必须混排 `release`、`repo_star_received`、`follower_received`、`announcement`、`repo_forked` 五类记录。
 - `发布` tab 必须继续只展示 release cards，保留原文 / 翻译 / 润色 lane 与 reactions。
-- `加星` tab 必须只展示 `repo_star_received` 记录；`关注` tab 必须只展示 `follower_received` 记录。
-- 社交记录卡片必须展示对方头像、login 与单个 GitHub CTA。
+- `加星` tab 必须只展示 `repo_star_received` 记录；`关注` tab 必须只展示 `follower_received` 记录；公告与 Fork 不得进入任何独立筛选 tab。
+- 社交记录卡片必须展示对方头像、login 与 GitHub CTA；Fork 必须展示目标仓库名；公告必须使用内容卡片形式展示标题、正文与 GitHub CTA。
 - `repo_star_received` 记录必须展示目标仓库名。
 - `repo_star_received` 记录必须展示真实 `starred_at`。
 - `follower_received` 记录不得显示时间文案；内部仍保留检测时间用于排序与去重。
 - actor 头像缺失或加载失败时，必须回退到稳定占位头像，且布局不抖动。
 - 首次成功获取的 follower / repo star snapshot 必须直接写入 `social_activity_events`，而不是只留在 current membership 快照。
 - `sync.access_refresh` 与 `sync.all` 必须在 release 阶段后继续执行社交活动同步。
-- `/api/feed` 必须支持 `types=releases|stars|followers`，并在分页时保持去重和顺序稳定。
+- `/api/feed` 必须支持 `types=releases|stars|followers`，并在分页时保持去重和顺序稳定；不得接受 `announcements` 或 `forks` 作为独立 `types`。
 - 历史日组的 brief 逻辑只能概括 release；社交记录不得折叠进 brief 正文。
 
 ### SHOULD
 
-- 社交记录卡片应与 release card 复用同一时间线容器，但视觉上弱化为更轻量的动态卡片。
+- 社交记录卡片应与 release card 复用同一时间线容器，但视觉上弱化为更轻量的动态卡片；公告应贴近 release 内容卡片而非 actor → action → target 桥接卡。
 - 社交活动数据模型应保留 append-only 事件表与 current membership 快照，方便后续增量同步扩展。
 - `全部` tab 的历史日组若存在 brief，社交记录应继续在同日组里按时间显示。
 
@@ -85,11 +87,11 @@
 
 ### Core flows
 
-- 用户打开 Dashboard 默认进入 `全部` tab 时，主列按统一日边界分组，并在每个日组内按 `ts DESC` 混排三类记录。
+- 用户打开 Dashboard 默认进入 `全部` tab 时，主列按统一日边界分组，并在每个日组内按 `ts DESC` 混排 release、repo star、follower、announcement 与 repo fork 记录。
 - 用户切到 `加星` tab 时，只看到“谁给哪个个人仓库加了星”的记录列表；release 与 follower 记录不会出现。
 - 用户切到 `关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
 - 用户点击顶部 `同步` 时，系统继续沿用既有 `starred -> releases -> notifications` 主体验，并在 release 同步完成后补跑社交活动 diff，再刷新页面。
-- access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab。
+- access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab；GitHub received events 中的 ReleaseEvent / ForkEvent 会分别落为 `announcement` / `repo_forked`，只显示在 `全部`。
 - 若账号在升级前已经持有 `follower_current_members` 或 `repo_star_current_members`，但历史 `social_activity_events` 为空，则下一次正常 social sync 必须自动把当前快照补齐成可见事件。
 
 ### Edge cases / errors
@@ -105,13 +107,13 @@
 
 ### `GET /api/feed`
 
-- 默认返回三类记录的时间倒序混排。
-- `types` 支持：`releases|release|stars|star|followers|follower`。
+- 默认返回五类记录的时间倒序混排。
+- `types` 支持：`releases|release|stars|star|followers|follower`；公告与 Fork 无独立 `types`。
 - 记录结构扩展为 discriminated union：
 
 ```json
 {
-  "kind": "release | repo_star_received | follower_received",
+  "kind": "release | repo_star_received | follower_received | announcement | repo_forked",
   "ts": "2026-04-10T08:00:00Z",
   "id": "...",
   "repo_full_name": "owner/repo | null",
@@ -124,7 +126,8 @@
 }
 ```
 
-- `translated` / `smart` / `reactions` 仅对 `kind=release` 返回有效内容；社交记录固定为 `null`。
+- `translated` / `smart` / `reactions` 仅对 `kind=release` 返回有效内容；非 release 记录固定为 `null`。
+- `announcement` / `repo_forked` 可通过 `title`、`body`、`html_url` 暴露目标公告或 fork 仓库的展示信息。
 
 ### 社交活动持久化
 
@@ -132,13 +135,13 @@
 - `repo_star_current_members`：记录当前 stargazer membership 快照。
 - `follower_sync_baselines`：记录某个用户是否已完成 follower baseline。
 - `follower_current_members`：记录当前 follower membership 快照。
-- `social_activity_events`：append-only 历史事件流，供 `/api/feed` 读取。
+- `social_activity_events`：append-only 历史事件流，供 `/api/feed` 读取；公告与 Fork 事件额外持久化 `title`、`body`、`html_url` 与 GitHub event id，并以 GitHub event id 去重，避免同一 repo / actor / 秒级时间内的多条 GitHub 活动被误合并。
 
 ## 验收标准（Acceptance Criteria）
 
 - Given `/api/feed` 不带 `types`
   When 接口返回第一页结果
-  Then 结果按统一时间倒序混排 release、repo star、follower 三类记录，且分页 cursor 不重复不漏项。
+  Then 结果按统一时间倒序混排 release、repo star、follower、announcement、repo fork 五类记录，且分页 cursor 不重复不漏项。
 
 - Given `/api/feed?types=stars`
   When 接口返回数据
@@ -148,9 +151,9 @@
   When 页面渲染完成
   Then 只显示 release cards，且仍支持原文 / 翻译 / 润色 lane 与 reactions。
 
-- Given Dashboard `全部` tab 某日既有 release 又有社交记录
+- Given Dashboard `全部` tab 某日既有 release 又有社交记录、公告与 Fork
   When 页面渲染完成
-  Then 历史日组的 brief 只概括 release，社交记录仍在同日组中单独显示。
+  Then 历史日组的 brief 只概括 release，公告、Fork 与其它社交记录仍在同日组中单独显示。
 
 - Given 某条 `repo_star_received` 记录
   When 卡片渲染完成
@@ -181,7 +184,7 @@
 
 ### Visual verification
 
-- 必须提供 Storybook 稳定场景覆盖：All 混排、Stars tab、Followers tab、头像 fallback。
+- 必须提供 Storybook 稳定场景覆盖：All 混排、公告与 Fork、Stars tab、Followers tab、头像 fallback。
 - 最终视觉证据必须写入本 spec 的 `## Visual Evidence`。
 
 ## Visual Evidence
@@ -214,25 +217,31 @@
 
 ![Avatar fallback](assets/dashboard-social-avatar-fallback.png)
 
+### All mixed timeline with announcement and Fork
+
+![All mixed timeline with announcement and Fork](./assets/dashboard-all-announcement-fork-feed.png)
+
 ## 方案概述（Approach, high-level）
 
 - 在同步层新增“本人个人仓库 stargazers + 本人 followers”的快照拉取与写入，首次与增量 snapshot 都进入 append-only `social_activity_events`。
-- `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`发布 / 加星 / 关注` 通过 `types` 请求服务端专属数据集，避免跨 tab 分页串味。
-- 前端保持 release card 行为不变，为社交记录新增轻量只读卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行。
+- `/api/feed` 改为 release + social events 的统一 union query，并让分页 cursor 以 `sort_ts + kind_rank + id_key` 稳定排序；`发布 / 加星 / 关注` 通过 `types` 请求服务端专属数据集，公告与 Fork 仅随默认 `全部` 数据集返回。
+- 前端保持 release card 行为不变，为 star / follower / Fork 新增轻量只读动态卡片，并在头像缺失或加载失败时回退到稳定占位头像；followers 卡片不渲染时间行，Fork 卡片显示目标仓库名和对应动作图标；公告使用内容卡片展示标题与 Markdown 正文。
 - 历史日报组继续只概括 release，社交记录在同日组中以原始卡片单独呈现。
 
 ## 风险 / 开放问题 / 假设（Risks, Open Questions, Assumptions）
 
-- 风险：GitHub stargazers / followers 分页拉取在大量数据下会增加同步耗时，需要依赖现有 task + refresh 机制承接。
+- 风险：GitHub stargazers / followers / received events 分页拉取在大量数据下会增加同步耗时，需要依赖现有 task + refresh 机制承接。
 - 风险：若同一秒出现多条跨类型活动，cursor 排序必须稳定，否则分页会抖动。
 - 开放问题：无。
-- 假设：个人仓库集合以 GitHub `/user/repos?type=owner` 的当前返回结果为准，不依赖本地缓存 login。
+- 假设：个人仓库集合以 GitHub GraphQL owner repositories 的当前返回结果为准；公告与 Fork 来源以 GitHub received events 当前可见范围为准。
 
 ## 参考（References）
 
 - `src/api.rs`
 - `src/sync.rs`
 - `src/jobs.rs`
+- `migrations/0042_social_activity_event_targets.sql`
 - `web/src/pages/Dashboard.tsx`
 - `web/src/feed/FeedGroupedList.tsx`
 - `web/src/stories/Dashboard.stories.tsx`
+- `migrations/0042_social_activity_event_targets.sql`

@@ -8,7 +8,7 @@ import type {
 	SmartItem,
 	TranslatedItem,
 } from "@/feed/types";
-import { isReleaseFeedItem } from "@/feed/types";
+import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
 
 export type FeedRequestType = "all" | "releases" | "stars" | "followers";
 export type FeedLoadErrorPhase = "initial" | "append";
@@ -49,11 +49,7 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 				};
 				continue;
 			}
-			if (
-				(current.kind === "repo_star_received" ||
-					current.kind === "follower_received") &&
-				(n.kind === "repo_star_received" || n.kind === "follower_received")
-			) {
+			if (isSocialFeedItem(current) && isSocialFeedItem(n)) {
 				out[idx] = {
 					...current,
 					...n,
