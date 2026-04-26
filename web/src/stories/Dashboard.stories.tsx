@@ -695,6 +695,66 @@ function buildFollowerItem(
 	};
 }
 
+function buildAnnouncementItem(
+	id: string,
+	overrides?: Partial<SocialFeedItem>,
+): SocialFeedItem {
+	return {
+		kind: "announcement",
+		ts: "2026-04-04T15:20:00+08:00",
+		id,
+		repo_full_name: PROJECT_REPO_FULL_NAME,
+		repo_visual: repoVisualFixtures.social,
+		title: "v2.64.0 发布公告",
+		body: "- 新增信息流公告入口\n- 修复移动端卡片节奏",
+		body_truncated: false,
+		subtitle: "仓库公告",
+		reason: null,
+		subject_type: "release",
+		html_url: "https://github.com/acme/rocket/releases/tag/v2.64.0",
+		unread: null,
+		actor: {
+			login: "maintainer",
+			avatar_url: githubAvatarUrl("maintainer"),
+			html_url: "https://github.com/maintainer",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+		...overrides,
+	};
+}
+
+function buildForkItem(
+	id: string,
+	overrides?: Partial<SocialFeedItem>,
+): SocialFeedItem {
+	return {
+		kind: "repo_forked",
+		ts: "2026-04-04T15:02:00+08:00",
+		id,
+		repo_full_name: "octocat/rocket-fork",
+		repo_visual: repoVisualFixtures.avatar,
+		title: "octocat/rocket-fork",
+		body: "Forked repository",
+		body_truncated: false,
+		subtitle: "Fork",
+		reason: null,
+		subject_type: "repository",
+		html_url: "https://github.com/octocat/rocket-fork",
+		unread: null,
+		actor: {
+			login: "octocat",
+			avatar_url: githubAvatarUrl("octocat"),
+			html_url: "https://github.com/octocat",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+		...overrides,
+	};
+}
+
 const RUNTIME_PARITY_REPOS = [
 	"acme/rocket",
 	"acme/satellite",
@@ -820,6 +880,8 @@ function makeMixedSocialFeed(): FeedItem[] {
 			ts: "2026-04-04T16:06:00+08:00",
 			repo_full_name: PROJECT_REPO_FULL_NAME,
 		}),
+		buildAnnouncementItem("announcement-10001"),
+		buildForkItem("fork-10001"),
 		buildFollowerItem("follow-10001", {
 			ts: "2026-04-04T14:48:00+08:00",
 		}),
@@ -842,6 +904,42 @@ function makeMixedSocialFeed(): FeedItem[] {
 				html_url: "https://github.com/yyx990803",
 			},
 			html_url: "https://github.com/yyx990803",
+		}),
+	];
+}
+
+function makeAnnouncementAndForkFocusFeed(): FeedItem[] {
+	return [
+		buildAnnouncementItem("announcement-focus", {
+			ts: "2026-04-04T16:30:00+08:00",
+			title: "公告以内容卡片进入全部流",
+			body: [
+				"这条 Story 专门展示本次变更的核心：公告不是社交桥接卡。",
+				"",
+				"- 公告用内容卡片展示标题与正文",
+				"- Fork 仍用活动卡展示 actor → action → repo",
+				"- 二者只出现在 `全部` tab，不新增独立 tab",
+			].join("\n"),
+			actor: {
+				login: "release-captain",
+				avatar_url: githubAvatarUrl("release-captain"),
+				html_url: "https://github.com/release-captain",
+			},
+		}),
+		buildForkItem("fork-focus", {
+			ts: "2026-04-04T16:10:00+08:00",
+			repo_full_name: "octocat/content-card-demo-fork",
+			title: "octocat/content-card-demo-fork",
+			actor: {
+				login: "octocat",
+				avatar_url: githubAvatarUrl("octocat"),
+				html_url: "https://github.com/octocat",
+			},
+			html_url: "https://github.com/octocat/content-card-demo-fork",
+		}),
+		buildRepoStarItem("star-focus-control", {
+			ts: "2026-04-04T15:40:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
 		}),
 	];
 }
@@ -3701,13 +3799,59 @@ export const SmartInsufficient: Story = {
 	},
 };
 
+export const AnnouncementAndForkAllTab: Story = {
+	name: "All tab / Announcement content card + Fork",
+	render: () => (
+		<DashboardPreview feedItems={makeAnnouncementAndForkFocusFeed()} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"聚焦展示本次变更：公告在 `全部` tab 中以内容卡片展示，Fork 仍以活动卡展示；两者都没有独立 tab。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "公告以内容卡片进入全部流" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText(
+				"这条 Story 专门展示本次变更的核心：公告不是社交桥接卡。",
+			),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("octocat/content-card-demo-fork", { exact: true }),
+		).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll<HTMLElement>("[data-announcement-card]")
+				.length,
+		).toBe(1);
+		expect(
+			canvasElement.querySelector('[data-social-card-kind="announcement"]'),
+		).toBeNull();
+		expect(
+			canvasElement.querySelectorAll('[data-social-card-kind="repo_forked"]')
+				.length,
+		).toBe(1);
+		await expect(
+			canvas.queryByRole("tab", { name: "公告" }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByRole("tab", { name: "Fork" }),
+		).not.toBeInTheDocument();
+	},
+};
+
 export const AllMixedSocialActivity: Story = {
 	render: () => <DashboardPreview feedItems={makeMixedSocialFeed()} />,
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"`全部` tab 会把 release、仓库被加星和账号被关注三类记录按统一时间线混排显示。",
+					"`全部` tab 会把 release、仓库被加星、账号被关注、公告与 Fork 按统一时间线混排显示。",
 			},
 		},
 	},
@@ -3715,7 +3859,22 @@ export const AllMixedSocialActivity: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("torvalds", { exact: true })).toBeVisible();
 		await expect(canvas.getByText("gaearon", { exact: true })).toBeVisible();
+		await expect(
+			canvas.getByText("v2.64.0 发布公告", { exact: true }),
+		).toBeVisible();
+		await expect(
+			canvas.getByText("octocat/rocket-fork", { exact: true }),
+		).toBeVisible();
 		await expect(canvas.getByText("标星", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("公告", { exact: true })).toBeVisible();
+		await expect(canvas.getByText("Fork", { exact: true })).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll<HTMLElement>("[data-announcement-card]")
+				.length,
+		).toBeGreaterThan(0);
+		expect(
+			canvasElement.querySelector('[data-social-card-kind="announcement"]'),
+		).toBeNull();
 		await expect(
 			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
 		).toBeVisible();
@@ -3752,7 +3911,7 @@ export const AllMixedSocialActivity: Story = {
 				expect(socialCards.length).toBeGreaterThan(0);
 				for (const card of socialCards) {
 					const expectedLinks =
-						card.dataset.socialCardKind === "repo_star_received" ? 2 : 1;
+						card.dataset.socialCardKind === "follower_received" ? 1 : 2;
 					expect(countVisibleGithubLinks(card)).toBe(expectedLinks);
 				}
 			},
@@ -3768,7 +3927,7 @@ export const StarsTab: Story = {
 		docs: {
 			description: {
 				story:
-					"`加星` tab 只显示 repo star 收到记录，不混入 release 或 follower。",
+					"`加星` tab 只显示 repo star 收到记录，不混入 release、follower、公告或 Fork。",
 			},
 		},
 	},
@@ -3790,6 +3949,12 @@ export const StarsTab: Story = {
 		}
 		await expect(
 			canvas.queryByText("gaearon", { exact: true }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByText("v2.64.0 发布公告", { exact: true }),
+		).not.toBeInTheDocument();
+		await expect(
+			canvas.queryByText("octocat/rocket-fork", { exact: true }),
 		).not.toBeInTheDocument();
 	},
 };
