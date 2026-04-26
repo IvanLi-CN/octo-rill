@@ -553,13 +553,22 @@ function makeFeedHotPathReactionFeed(live: boolean): FeedItem[] {
 	);
 }
 
-function FeedHotPathReactionRefreshPreview() {
-	const [liveReactions, setLiveReactions] = useState(false);
+function FeedHotPathReactionRefreshPreview(props: {
+	initialLive?: boolean;
+	refreshDelayMs?: number | null;
+}) {
+	const { initialLive = false, refreshDelayMs = 5000 } = props;
+	const [liveReactions, setLiveReactions] = useState(initialLive);
 
 	useEffect(() => {
-		const timer = window.setTimeout(() => setLiveReactions(true), 350);
+		setLiveReactions(initialLive);
+		if (refreshDelayMs === null) return;
+		const timer = window.setTimeout(
+			() => setLiveReactions(true),
+			refreshDelayMs,
+		);
 		return () => window.clearTimeout(timer);
-	}, []);
+	}, [initialLive, refreshDelayMs]);
 
 	return (
 		<DashboardPreview
@@ -3471,12 +3480,12 @@ export const EvidenceReactionCompact: Story = {
 
 export const FeedHotPathReactionRefresh: Story = {
 	name: "Feed hot path / Silent reaction refresh",
-	render: () => <FeedHotPathReactionRefreshPreview />,
+	render: () => <FeedHotPathReactionRefreshPreview refreshDelayMs={5000} />,
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton，reaction viewer/counts 在后台静默补齐；刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
+					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton；打开或刷新 Story 后，第一张 release 的 reaction 会在 5 秒后从缓存默认值静默补齐为 live viewer/counts。刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
 			},
 		},
 	},
@@ -3499,9 +3508,74 @@ export const FeedHotPathReactionRefresh: Story = {
 		await expect(cachedPlusOne).toBeEnabled();
 		await userEvent.click(cachedPlusOne);
 
-		await waitFor(() =>
-			expect(canvas.getByRole("button", { name: "赞 7" })).toBeVisible(),
+		await waitFor(
+			() => expect(canvas.getByRole("button", { name: "赞 7" })).toBeVisible(),
+			{ timeout: 6000 },
 		);
+		await expect(canvas.getByRole("button", { name: "赞 7" })).toHaveAttribute(
+			"aria-pressed",
+			"true",
+		);
+		expect(
+			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+		).toBeNull();
+		await expect(canvas.queryByText("反馈状态同步中")).not.toBeInTheDocument();
+	},
+};
+
+export const FeedHotPathCachedBeforeRefresh: Story = {
+	name: "Feed hot path / Cached before refresh",
+	render: () => (
+		<FeedHotPathReactionRefreshPreview
+			initialLive={false}
+			refreshDelayMs={null}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"缓存首屏态对照：release 内容已经渲染，reaction 使用本地缓存默认值；这里没有 feed loading skeleton，也没有异步刷新提示。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.63.0 · cached feed hot path",
+			}),
+		).toBeVisible();
+		await expect(
+			canvas.getAllByRole("button", { name: "赞" })[0],
+		).toBeEnabled();
+		expect(
+			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+		).toBeNull();
+		await expect(canvas.queryByText("反馈状态同步中")).not.toBeInTheDocument();
+	},
+};
+
+export const FeedHotPathAfterReactionRefresh: Story = {
+	name: "Feed hot path / After reaction refresh",
+	render: () => (
+		<FeedHotPathReactionRefreshPreview initialLive refreshDelayMs={null} />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"异步补齐后的稳定态对照：同一张 release 的 reaction viewer/counts 已经合并到页面，但 feed 主体和 skeleton 状态没有被重新拉回加载态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.63.0 · cached feed hot path",
+			}),
+		).toBeVisible();
 		await expect(canvas.getByRole("button", { name: "赞 7" })).toHaveAttribute(
 			"aria-pressed",
 			"true",
