@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -502,6 +502,71 @@ function makeReactionCompactFeed(): FeedItem[] {
 					},
 				}
 			: item,
+	);
+}
+
+function makeFeedHotPathReactionFeed(live: boolean): FeedItem[] {
+	return makeMockFeed().map((item, index) =>
+		item.kind === "release" && index === 0
+			? {
+					...item,
+					id: "feed-hot-path-cached-release",
+					title: "v2.63.0 · cached feed hot path",
+					body: "- Feed returns cached data first\n- GitHub reaction refresh hydrates silently after render\n- No skeleton or toast is added while reactions refresh",
+					smart: {
+						lang: "zh-CN",
+						status: "ready",
+						title: "v2.63.0 · cached feed hot path",
+						summary:
+							"- Feed returns cached data first\n- Reaction refresh hydrates silently after render\n- No skeleton or toast is added while reactions refresh",
+					},
+					reactions: {
+						counts: live
+							? {
+									plus1: 7,
+									laugh: 1,
+									heart: 4,
+									hooray: 2,
+									rocket: 3,
+									eyes: 1,
+								}
+							: {
+									plus1: 0,
+									laugh: 0,
+									heart: 0,
+									hooray: 0,
+									rocket: 0,
+									eyes: 0,
+								},
+						viewer: {
+							plus1: live,
+							laugh: false,
+							heart: false,
+							hooray: false,
+							rocket: false,
+							eyes: false,
+						},
+						status: "ready",
+					},
+				}
+			: item,
+	);
+}
+
+function FeedHotPathReactionRefreshPreview() {
+	const [liveReactions, setLiveReactions] = useState(false);
+
+	useEffect(() => {
+		const timer = window.setTimeout(() => setLiveReactions(true), 350);
+		return () => window.clearTimeout(timer);
+	}, []);
+
+	return (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={makeFeedHotPathReactionFeed(liveReactions)}
+			showFooter={false}
+		/>
 	);
 }
 
@@ -3401,6 +3466,50 @@ export const EvidenceReactionCompact: Story = {
 		docs: {
 			disable: true,
 		},
+	},
+};
+
+export const FeedHotPathReactionRefresh: Story = {
+	name: "Feed hot path / Silent reaction refresh",
+	render: () => <FeedHotPathReactionRefreshPreview />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton，reaction viewer/counts 在后台静默补齐；刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.63.0 · cached feed hot path",
+			}),
+		).toBeVisible();
+		expect(
+			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+		).toBeNull();
+		await expect(canvas.queryByText("反馈状态同步中")).not.toBeInTheDocument();
+
+		const cachedPlusOne = canvas.getAllByRole("button", { name: "赞" })[0];
+		if (!cachedPlusOne) {
+			throw new Error("Expected cached plus-one reaction button");
+		}
+		await expect(cachedPlusOne).toBeEnabled();
+		await userEvent.click(cachedPlusOne);
+
+		await waitFor(() =>
+			expect(canvas.getByRole("button", { name: "赞 7" })).toBeVisible(),
+		);
+		await expect(canvas.getByRole("button", { name: "赞 7" })).toHaveAttribute(
+			"aria-pressed",
+			"true",
+		);
+		expect(
+			canvasElement.querySelector('[data-feed-loading-skeleton="true"]'),
+		).toBeNull();
+		await expect(canvas.queryByText("反馈状态同步中")).not.toBeInTheDocument();
 	},
 };
 
