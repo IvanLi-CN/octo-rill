@@ -135,7 +135,7 @@
   When 请求 `GET /api/admin/dashboard`
   Then 今日 KPI、进行中任务、LLM 健康摘要与今日趋势点仍返回实时值。
 
-- Given 某个 `summarize.release.smart.batch` raw `status=succeeded`，但 `result_json` 为 `2 ready + 1 error`
+- Given 某个 `summarize.release.smart.batch` raw `status=succeeded`，且 `result_json` 只带 `items[]`，其 item-level 结果为 `2 ready + 1 error`
   When 请求 `GET /api/admin/dashboard`
   Then 返回 `status_breakdown.business_counts.partial > 0`，且 `trend_points` 中当天 `summaries_partial + summaries_business_failed > 0`。
 

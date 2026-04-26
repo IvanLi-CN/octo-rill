@@ -1584,6 +1584,13 @@ struct AdminDashboardStatusCountRow {
     business_disabled_count: i64,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AdminDashboardReleaseTaskRow {
+    status: String,
+    payload_json: String,
+    result_json: Option<String>,
+}
+
 const ADMIN_DASHBOARD_DEFAULT_WINDOW_DAYS: i64 = 7;
 pub(crate) const ADMIN_DASHBOARD_PREAGGREGATE_DAYS: i64 = 30;
 const ADMIN_DASHBOARD_WINDOW_OPTIONS: [(&str, i64); 2] = [("7d", 7), ("30d", 30)];
@@ -1716,59 +1723,53 @@ async fn load_admin_dashboard_release_task_status_counts(
     start_at: &str,
     end_at: &str,
 ) -> Result<AdminDashboardStatusCountRow, ApiError> {
-    sqlx::query_as::<_, AdminDashboardStatusCountRow>(
+    let rows = sqlx::query_as::<_, AdminDashboardReleaseTaskRow>(
         r#"
         SELECT
-          COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_count,
-          COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0) AS running_count,
-          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
-          COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
-          COALESCE(SUM(CASE WHEN status = 'canceled' THEN 1 ELSE 0 END), 0) AS canceled_count,
-          COALESCE(SUM(CASE WHEN business_code = 'ok' THEN 1 ELSE 0 END), 0) AS business_ok_count,
-          COALESCE(SUM(CASE WHEN business_code = 'partial' THEN 1 ELSE 0 END), 0) AS business_partial_count,
-          COALESCE(SUM(CASE WHEN business_code = 'failed' THEN 1 ELSE 0 END), 0) AS business_failed_count,
-          COALESCE(SUM(CASE WHEN business_code = 'disabled' THEN 1 ELSE 0 END), 0) AS business_disabled_count
-        FROM (
-          SELECT
-            status,
-            CASE
-              WHEN status = 'canceled' THEN 'unknown'
-              WHEN status = 'queued' OR status = 'running' THEN 'unknown'
-              WHEN status = 'failed' THEN 'failed'
-              WHEN release_total = 0 THEN 'ok'
-              WHEN disabled_count = release_total THEN 'disabled'
-              WHEN error_count > 0 AND ready_count = 0 THEN 'failed'
-              WHEN error_count > 0 OR missing_count > 0 THEN 'partial'
-              WHEN ready_count > 0 AND ready_count >= release_total THEN 'ok'
-              WHEN ready_count > 0 THEN 'partial'
-              ELSE 'unknown'
-            END AS business_code
-          FROM (
-            SELECT
-              status,
-              COALESCE(
-                CAST(json_extract(result_json, '$.total') AS INTEGER),
-                json_array_length(json_extract(payload_json, '$.release_ids')),
-                0
-              ) AS release_total,
-              COALESCE(CAST(json_extract(result_json, '$.ready') AS INTEGER), 0) AS ready_count,
-              COALESCE(CAST(json_extract(result_json, '$.missing') AS INTEGER), 0) AS missing_count,
-              COALESCE(CAST(json_extract(result_json, '$.disabled') AS INTEGER), 0) AS disabled_count,
-              COALESCE(CAST(json_extract(result_json, '$.error') AS INTEGER), 0) AS error_count
-            FROM job_tasks
-            WHERE task_type = ?
-              AND julianday(created_at) >= julianday(?)
-              AND julianday(created_at) <= julianday(?)
-          ) task_rows
-        ) business_rows
+          status,
+          payload_json,
+          result_json
+        FROM job_tasks
+        WHERE task_type = ?
+          AND julianday(created_at) >= julianday(?)
+          AND julianday(created_at) <= julianday(?)
         "#,
     )
     .bind(task_type)
     .bind(start_at)
     .bind(end_at)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
-    .map_err(ApiError::internal)
+    .map_err(ApiError::internal)?;
+
+    let mut counts = AdminDashboardStatusCountRow::default();
+    for row in rows {
+        match row.status.as_str() {
+            jobs::STATUS_QUEUED => counts.queued_count += 1,
+            jobs::STATUS_RUNNING => counts.running_count += 1,
+            jobs::STATUS_SUCCEEDED => counts.succeeded_count += 1,
+            jobs::STATUS_FAILED => counts.failed_count += 1,
+            jobs::STATUS_CANCELED => counts.canceled_count += 1,
+            _ => {}
+        }
+
+        let payload_value = parse_json_value(Some(row.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let result_value = parse_json_value(row.result_json.as_deref());
+        let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+        let summary = derive_release_batch_summary(payload_object, result_object);
+        match release_batch_business_code(row.status.as_str(), &summary) {
+            "ok" => counts.business_ok_count += 1,
+            "partial" => counts.business_partial_count += 1,
+            "failed" => counts.business_failed_count += 1,
+            "disabled" => counts.business_disabled_count += 1,
+            _ => {}
+        }
+    }
+
+    Ok(counts)
 }
 
 async fn load_admin_dashboard_brief_task_status_counts(
@@ -2723,7 +2724,7 @@ pub struct AdminTranslateReleaseBatchDiagnostics {
     items: Vec<AdminTranslateReleaseBatchItemDiagnostic>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct AdminTranslateReleaseBatchSummary {
     total: i64,
     ready: i64,
@@ -2981,6 +2982,16 @@ fn json_object_get_local_id(
     })
 }
 
+fn json_object_get_array_len(
+    object: Option<&serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+) -> Option<i64> {
+    object
+        .and_then(|obj| obj.get(key))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| i64::try_from(items.len()).ok())
+}
+
 fn json_object_get_bool(
     object: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
@@ -3024,6 +3035,123 @@ fn task_events_for_diagnostics(events: &[AdminTaskEventItem]) -> Vec<&AdminTaskE
     ordered_events
 }
 
+fn derive_release_batch_summary(
+    payload_object: Option<&serde_json::Map<String, serde_json::Value>>,
+    result_object: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> AdminTranslateReleaseBatchSummary {
+    let payload_total = json_object_get_array_len(payload_object, "release_ids").unwrap_or(0);
+    let explicit_total = json_object_get_i64(result_object, "total").unwrap_or(0);
+    let mut summary = AdminTranslateReleaseBatchSummary {
+        total: explicit_total,
+        ready: json_object_get_i64(result_object, "ready").unwrap_or(0),
+        missing: json_object_get_i64(result_object, "missing").unwrap_or(0),
+        disabled: json_object_get_i64(result_object, "disabled").unwrap_or(0),
+        error: json_object_get_i64(result_object, "error").unwrap_or(0),
+    };
+    let mut result_items_total = 0_i64;
+
+    if let Some(items) = result_object
+        .and_then(|obj| obj.get("items"))
+        .and_then(serde_json::Value::as_array)
+    {
+        summary.ready = 0;
+        summary.missing = 0;
+        summary.disabled = 0;
+        summary.error = 0;
+        result_items_total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        for item in items {
+            let item_status = item
+                .as_object()
+                .and_then(|obj| obj.get("status"))
+                .and_then(json_value_to_string)
+                .unwrap_or_default();
+            match item_status.as_str() {
+                "ready" => summary.ready += 1,
+                "missing" => summary.missing += 1,
+                "disabled" => summary.disabled += 1,
+                "error" => summary.error += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let counted_total = summary.ready + summary.missing + summary.disabled + summary.error;
+    summary.total = summary
+        .total
+        .max(payload_total)
+        .max(result_items_total)
+        .max(counted_total);
+    summary
+}
+
+fn release_batch_business_code(
+    status: &str,
+    summary: &AdminTranslateReleaseBatchSummary,
+) -> &'static str {
+    let release_total = summary.total.max(0);
+    if matches!(
+        status,
+        jobs::STATUS_CANCELED | jobs::STATUS_QUEUED | jobs::STATUS_RUNNING
+    ) {
+        "unknown"
+    } else if status == jobs::STATUS_FAILED {
+        "failed"
+    } else if release_total == 0 {
+        "ok"
+    } else if summary.disabled == release_total {
+        "disabled"
+    } else if summary.error > 0 && summary.ready == 0 {
+        "failed"
+    } else if summary.error > 0 || summary.missing > 0 {
+        "partial"
+    } else if summary.ready > 0 && summary.ready >= release_total {
+        "ok"
+    } else if summary.ready > 0 {
+        "partial"
+    } else {
+        "unknown"
+    }
+}
+
+fn release_batch_business_outcome(
+    status: &str,
+    summary: &AdminTranslateReleaseBatchSummary,
+    error_message: Option<&str>,
+) -> AdminBusinessOutcome {
+    if status == jobs::STATUS_CANCELED {
+        return business_outcome("partial", "已取消", "任务已取消，结果可能不完整。");
+    }
+    if matches!(status, jobs::STATUS_QUEUED | jobs::STATUS_RUNNING) {
+        return business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。");
+    }
+    match release_batch_business_code(status, summary) {
+        "failed" if status == jobs::STATUS_FAILED => business_outcome(
+            "failed",
+            "业务失败",
+            error_message
+                .map(str::to_owned)
+                .unwrap_or_else(|| "任务执行失败，未产出可用翻译。".to_owned()),
+        ),
+        "ok" if summary.total == 0 => {
+            business_outcome("ok", "无需翻译", "任务未命中可翻译的 Release。")
+        }
+        "disabled" => business_outcome("disabled", "AI 已禁用", "翻译能力未启用，任务未进行翻译。"),
+        "failed" => business_outcome("failed", "业务失败", "任务已运行完成，但全部翻译项失败。"),
+        "partial" if summary.error > 0 || summary.missing > 0 => business_outcome(
+            "partial",
+            "部分成功",
+            "部分 Release 翻译成功，部分失败或缺失。",
+        ),
+        "ok" => business_outcome("ok", "业务成功", "所有目标 Release 已完成翻译。"),
+        "partial" => business_outcome("partial", "部分成功", "已有翻译结果，但统计未完全收敛。"),
+        _ => business_outcome(
+            "unknown",
+            "结果未知",
+            "任务状态显示成功，但缺少可判定的翻译结果统计。",
+        ),
+    }
+}
+
 fn build_translate_release_batch_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
@@ -3037,23 +3165,7 @@ fn build_translate_release_batch_diagnostics(
 
     let target_user_id = json_object_get_local_id(payload_object, "user_id");
 
-    let release_total_from_payload = payload_object
-        .and_then(|obj| obj.get("release_ids"))
-        .and_then(serde_json::Value::as_array)
-        .map(|items| i64::try_from(items.len()).unwrap_or(0))
-        .unwrap_or(0);
-
-    let mut summary = AdminTranslateReleaseBatchSummary {
-        total: json_object_get_i64(result_object, "total").unwrap_or(0),
-        ready: json_object_get_i64(result_object, "ready").unwrap_or(0),
-        missing: json_object_get_i64(result_object, "missing").unwrap_or(0),
-        disabled: json_object_get_i64(result_object, "disabled").unwrap_or(0),
-        error: json_object_get_i64(result_object, "error").unwrap_or(0),
-    };
-
-    if summary.total == 0 {
-        summary.total = release_total_from_payload;
-    }
+    let mut summary = derive_release_batch_summary(payload_object, result_object);
 
     let ordered_events = task_events_for_diagnostics(events);
 
@@ -3099,51 +3211,50 @@ fn build_translate_release_batch_diagnostics(
         });
     }
 
+    if items.is_empty() {
+        let fallback_item_time = task
+            .finished_at
+            .clone()
+            .unwrap_or_else(|| task.updated_at.clone());
+        if let Some(result_items) = result_object
+            .and_then(|obj| obj.get("items"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in result_items {
+                let item_object = item.as_object();
+                items.push(AdminTranslateReleaseBatchItemDiagnostic {
+                    release_id: json_object_get_string(item_object, "id")
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    item_status: json_object_get_string(item_object, "status")
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    item_error: json_object_get_string(item_object, "error"),
+                    last_event_at: fallback_item_time.clone(),
+                });
+            }
+        }
+        if processed == 0 {
+            processed = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        }
+        if last_stage.is_none() && !items.is_empty() {
+            last_stage = Some("release".to_owned());
+        }
+    }
+
     if summary.total == 0 {
         summary.total = processed;
     }
 
-    let release_total = summary.total.max(release_total_from_payload);
+    let release_total = summary.total.max(processed);
     let progress = AdminTranslateReleaseBatchProgress {
         processed,
         last_stage,
     };
 
-    let outcome = if task.status == jobs::STATUS_FAILED {
-        business_outcome(
-            "failed",
-            "业务失败",
-            task.error_message
-                .clone()
-                .unwrap_or_else(|| "任务执行失败，未产出可用翻译。".to_owned()),
-        )
-    } else if task.status == jobs::STATUS_CANCELED {
-        business_outcome("partial", "已取消", "任务已取消，结果可能不完整。")
-    } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
-        business_outcome("unknown", "处理中", "任务正在执行中，结果尚未稳定。")
-    } else if release_total == 0 {
-        business_outcome("ok", "无需翻译", "任务未命中可翻译的 Release。")
-    } else if summary.disabled == release_total {
-        business_outcome("disabled", "AI 已禁用", "翻译能力未启用，任务未进行翻译。")
-    } else if summary.error > 0 && summary.ready == 0 {
-        business_outcome("failed", "业务失败", "任务已运行完成，但全部翻译项失败。")
-    } else if summary.error > 0 || summary.missing > 0 {
-        business_outcome(
-            "partial",
-            "部分成功",
-            "部分 Release 翻译成功，部分失败或缺失。",
-        )
-    } else if summary.ready > 0 && summary.ready >= release_total {
-        business_outcome("ok", "业务成功", "所有目标 Release 已完成翻译。")
-    } else if summary.ready > 0 {
-        business_outcome("partial", "部分成功", "已有翻译结果，但统计未完全收敛。")
-    } else {
-        business_outcome(
-            "unknown",
-            "结果未知",
-            "任务状态显示成功，但缺少可判定的翻译结果统计。",
-        )
-    };
+    let outcome = release_batch_business_outcome(
+        task.status.as_str(),
+        &summary,
+        task.error_message.as_deref(),
+    );
 
     (
         outcome,
@@ -14470,7 +14581,13 @@ mod tests {
         .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
         .bind(test_user_id(1))
         .bind(r#"{"user_id":1,"release_ids":[101,102,103]}"#)
-        .bind(r#"{"total":3,"ready":2,"missing":0,"disabled":0,"error":1}"#)
+        .bind(
+            r#"{"items":[
+              {"id":"101","lang":"zh-CN","status":"ready","title":"A","summary":"alpha","error":null},
+              {"id":"102","lang":"zh-CN","status":"ready","title":"B","summary":"beta","error":null},
+              {"id":"103","lang":"zh-CN","status":"error","title":null,"summary":null,"error":"upstream 403"}
+            ]}"#,
+        )
         .bind(today_time.as_str())
         .bind(today_time.as_str())
         .bind(today_time.as_str())
@@ -14478,6 +14595,58 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert partial business task");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (
+              'dashboard-business-failed',
+              ?,
+              'succeeded',
+              'tests',
+              ?,
+              NULL,
+              ?,
+              ?,
+              NULL,
+              0,
+              ?,
+              ?,
+              ?,
+              ?
+            )
+            "#,
+        )
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(test_user_id(1))
+        .bind(r#"{"user_id":1,"release_ids":[201,202]}"#)
+        .bind(
+            r#"{"items":[
+              {"id":"201","lang":"zh-CN","status":"error","title":null,"summary":null,"error":"translation failed"},
+              {"id":"202","lang":"zh-CN","status":"error","title":null,"summary":null,"error":"translation failed"}
+            ]}"#,
+        )
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("insert failed translation task");
         sqlx::query(
             r#"
             INSERT INTO job_tasks (
@@ -14524,6 +14693,62 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert canceled summary task");
+        sqlx::query(
+            r#"
+            INSERT INTO admin_dashboard_daily_rollups (
+              rollup_date,
+              time_zone,
+              task_type,
+              total_users,
+              active_users,
+              queued_count,
+              running_count,
+              succeeded_count,
+              failed_count,
+              canceled_count,
+              business_ok_count,
+              business_partial_count,
+              business_failed_count,
+              business_disabled_count,
+              updated_at
+            )
+            VALUES (?, 'Asia/Shanghai', ?, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ?)
+            "#,
+        )
+        .bind(today_local.format("%Y-%m-%d").to_string())
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed stale translation rollup");
+        sqlx::query(
+            r#"
+            INSERT INTO admin_dashboard_daily_rollups (
+              rollup_date,
+              time_zone,
+              task_type,
+              total_users,
+              active_users,
+              queued_count,
+              running_count,
+              succeeded_count,
+              failed_count,
+              canceled_count,
+              business_ok_count,
+              business_partial_count,
+              business_failed_count,
+              business_disabled_count,
+              updated_at
+            )
+            VALUES (?, 'Asia/Shanghai', ?, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, ?)
+            "#,
+        )
+        .bind(today_local.format("%Y-%m-%d").to_string())
+        .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+        .bind(today_time.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed stale summary rollup");
 
         seed_llm_call_with_created_at(
             &pool,
@@ -14610,9 +14835,18 @@ mod tests {
             .iter()
             .find(|item| item.task_type == jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
             .expect("summary task item");
+        let translation_item = resp
+            .status_breakdown
+            .items
+            .iter()
+            .find(|item| item.task_type == jobs::TASK_TRANSLATE_RELEASE_BATCH)
+            .expect("translation task item");
         assert_eq!(summary_item.business_counts.partial, 1);
         assert_eq!(summary_item.business_counts.failed, 0);
+        assert_eq!(translation_item.business_counts.failed, 1);
+        assert_eq!(translation_item.business_counts.partial, 0);
         assert_eq!(resp.status_breakdown.business_counts.partial, 1);
+        assert_eq!(resp.status_breakdown.business_counts.failed, 1);
         assert_eq!(summary_item.canceled, 1);
 
         let today_point = resp
@@ -14620,6 +14854,8 @@ mod tests {
             .iter()
             .find(|point| point.date == today_local.format("%Y-%m-%d").to_string())
             .expect("today trend point should exist");
+        assert_eq!(today_point.translations_business_failed, 1);
+        assert_eq!(today_point.translations_partial, 0);
         assert_eq!(today_point.summaries_partial, 1);
         assert_eq!(today_point.summaries_business_failed, 0);
 
@@ -14646,7 +14882,7 @@ mod tests {
                 .any(|item| item.label == "job.sync.subscriptions.auto_translate")
         );
 
-        let rollup_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        let summary_rollup_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
             r#"
             SELECT
               business_ok_count,
@@ -14665,7 +14901,27 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load summary rollup counts");
-        assert_eq!(rollup_counts, (0, 1, 0, 0));
+        assert_eq!(summary_rollup_counts, (0, 1, 0, 0));
+        let translation_rollup_counts = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r#"
+            SELECT
+              business_ok_count,
+              business_partial_count,
+              business_failed_count,
+              business_disabled_count
+            FROM admin_dashboard_daily_rollups
+            WHERE time_zone = 'Asia/Shanghai'
+              AND rollup_date = ?
+              AND task_type = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(today_local.format("%Y-%m-%d").to_string())
+        .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+        .fetch_one(&pool)
+        .await
+        .expect("load translation rollup counts");
+        assert_eq!(translation_rollup_counts, (0, 0, 1, 0));
     }
 
     #[tokio::test]
@@ -16020,6 +16276,51 @@ mod tests {
         assert_eq!(translate_diag.items[0].release_id, "291058027");
         assert_eq!(
             translate_diag.items[0].item_error.as_deref(),
+            Some("translation failed")
+        );
+    }
+
+    #[test]
+    fn task_diagnostics_translate_batch_item_only_result_surfaces_partial() {
+        let task = test_task_detail_item(
+            jobs::TASK_TRANSLATE_RELEASE_BATCH,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"user_id":1,"release_ids":[291058027,291042015,291040000]}"#,
+            Some(
+                r#"{"items":[
+                  {"id":"291058027","lang":"zh-CN","status":"ready","title":"A","summary":"alpha","error":null},
+                  {"id":"291042015","lang":"zh-CN","status":"missing","title":null,"summary":null,"error":"not found"},
+                  {"id":"291040000","lang":"zh-CN","status":"error","title":null,"summary":null,"error":"translation failed"}
+                ]}"#,
+            ),
+            None,
+        );
+
+        let diagnostics = build_task_diagnostics(&task, &[], &[]).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "partial");
+        let translate_diag = diagnostics
+            .translate_release_batch
+            .expect("translate batch diagnostics");
+        assert_eq!(
+            translate_diag.summary,
+            super::AdminTranslateReleaseBatchSummary {
+                total: 3,
+                ready: 1,
+                missing: 1,
+                disabled: 0,
+                error: 1,
+            }
+        );
+        assert_eq!(translate_diag.progress.processed, 3);
+        assert_eq!(translate_diag.items.len(), 3);
+        assert_eq!(translate_diag.items[0].release_id, "291058027");
+        assert_eq!(translate_diag.items[0].item_status, "ready");
+        assert_eq!(translate_diag.items[1].release_id, "291042015");
+        assert_eq!(translate_diag.items[1].item_status, "missing");
+        assert_eq!(translate_diag.items[2].release_id, "291040000");
+        assert_eq!(translate_diag.items[2].item_status, "error");
+        assert_eq!(
+            translate_diag.items[2].item_error.as_deref(),
             Some("translation failed")
         );
     }
