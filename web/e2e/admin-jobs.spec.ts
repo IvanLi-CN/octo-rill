@@ -221,6 +221,27 @@ async function installAdminJobsMocks(
 		last_success_at: "2026-02-26T03:00:01Z",
 		last_failure_at: "2026-02-26T02:00:03Z",
 	};
+	const syncSubscriptionChainFinishedAt: Record<string, string> = {
+		"task-subscriptions-1": "2026-02-26T14:50:30Z",
+	};
+	let syncRuntimeConfig = {
+		sync_auto_fetch_interval_minutes: 10,
+		recent_sync_tasks: tasks
+			.filter((task) => task.task_type === "sync.subscriptions")
+			.slice(0, 3)
+			.map((task) => ({
+				id: task.id,
+				status: task.status,
+				source: task.source,
+				duration_ms: syncSubscriptionChainFinishedAt[task.id]
+					? new Date(syncSubscriptionChainFinishedAt[task.id]).getTime() -
+						new Date(task.created_at).getTime()
+					: null,
+				created_at: task.created_at,
+				started_at: task.started_at,
+				finished_at: syncSubscriptionChainFinishedAt[task.id] ?? null,
+			})),
+	};
 
 	const recentRunningWorkerUpdatedAt = new Date(
 		Date.now() - 75_000,
@@ -1263,6 +1284,29 @@ async function installAdminJobsMocks(
 		}
 
 		if (
+			req.method() === "GET" &&
+			pathname === "/api/admin/jobs/sync/runtime-config"
+		) {
+			return json(route, syncRuntimeConfig);
+		}
+
+		if (
+			req.method() === "PATCH" &&
+			pathname === "/api/admin/jobs/sync/runtime-config"
+		) {
+			const body = (req.postDataJSON() ?? {}) as {
+				sync_auto_fetch_interval_minutes?: number;
+			};
+			syncRuntimeConfig = {
+				...syncRuntimeConfig,
+				sync_auto_fetch_interval_minutes: Number(
+					body.sync_auto_fetch_interval_minutes ?? 60,
+				),
+			};
+			return json(route, syncRuntimeConfig);
+		}
+
+		if (
 			req.method() === "PATCH" &&
 			pathname === "/api/admin/jobs/llm/runtime-config"
 		) {
@@ -1604,7 +1648,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	await expect(page.getByText("订阅同步")).toBeVisible();
-	await expect(page.getByText("sync.subscriptions")).toBeVisible();
+	await expect(
+		page.getByText("sync.subscriptions", { exact: true }),
+	).toBeVisible();
 	await expect(
 		page.getByText("brief.daily_slot", { exact: true }),
 	).toBeVisible();

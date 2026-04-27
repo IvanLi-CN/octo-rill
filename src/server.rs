@@ -217,6 +217,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             patch(api::admin_patch_scheduled_slot),
         )
         .route(
+            "/admin/jobs/sync/runtime-config",
+            get(api::admin_get_sync_runtime_config).patch(api::admin_patch_sync_runtime_config),
+        )
+        .route(
             "/admin/jobs/llm/status",
             get(api::admin_get_llm_scheduler_status),
         )

@@ -27,9 +27,12 @@ import {
 	type AdminTranslationRequestDetailResponse,
 	type AdminTranslationRequestListItem,
 	type AdminTranslationStatusResponse,
+	type AdminSyncRuntimeConfigResponse,
+	type SyncAutoFetchTaskItem,
 	type LocalUserId,
 	ApiError,
 	apiCancelAdminRealtimeTask,
+	apiGetAdminSyncRuntimeConfig,
 	apiGetAdminLlmCallDetail,
 	apiGetAdminLlmCalls,
 	apiGetAdminLlmSchedulerStatus,
@@ -43,6 +46,7 @@ import {
 	apiGetAdminTranslationStatus,
 	apiOpenAdminJobsEventsStream,
 	apiPatchAdminLlmRuntimeConfig,
+	apiPatchAdminSyncRuntimeConfig,
 	apiPatchAdminTranslationRuntimeConfig,
 	apiRetryAdminRealtimeTask,
 } from "@/api";
@@ -109,6 +113,9 @@ const DATETIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	hour12: false,
 });
 const NUMBER_FORMATTER = new Intl.NumberFormat();
+const SYNC_AUTO_FETCH_INTERVAL_MIN = 1;
+const SYNC_AUTO_FETCH_INTERVAL_MAX = 120;
+const SYNC_AUTO_FETCH_INTERVAL_MARKS = [1, 5, 10, 15, 30, 60, 120];
 
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
@@ -139,6 +146,23 @@ function formatDurationMs(value: number | null | undefined) {
 	return `${(value / 1000).toFixed(2)}s`;
 }
 
+function formatElapsedDurationMs(value: number | null | undefined) {
+	if (typeof value !== "number") return "-";
+	if (value < 1000) return `${value}ms`;
+	const totalSeconds = Math.round(value / 1000);
+	if (totalSeconds < 60) return `${(value / 1000).toFixed(2)}s`;
+	const totalMinutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (totalMinutes < 60) {
+		return seconds === 0
+			? `${totalMinutes} 分钟`
+			: `${totalMinutes} 分 ${seconds} 秒`;
+	}
+	const hours = Math.floor(totalMinutes / 60);
+	const minutes = totalMinutes % 60;
+	return minutes === 0 ? `${hours} 小时` : `${hours} 小时 ${minutes} 分`;
+}
+
 function parsePositiveIntegerInput(value: string) {
 	if (!/^\d+$/.test(value.trim())) {
 		return null;
@@ -148,6 +172,64 @@ function parsePositiveIntegerInput(value: string) {
 		return null;
 	}
 	return parsed;
+}
+
+function clampSyncAutoFetchInterval(value: number) {
+	if (!Number.isFinite(value)) return 60;
+	return Math.min(
+		SYNC_AUTO_FETCH_INTERVAL_MAX,
+		Math.max(SYNC_AUTO_FETCH_INTERVAL_MIN, Math.round(value)),
+	);
+}
+
+function syncIntervalToSliderPosition(value: number) {
+	const clamped = clampSyncAutoFetchInterval(value);
+	const minLog = Math.log(SYNC_AUTO_FETCH_INTERVAL_MIN);
+	const maxLog = Math.log(SYNC_AUTO_FETCH_INTERVAL_MAX);
+	return Math.round(((Math.log(clamped) - minLog) / (maxLog - minLog)) * 100);
+}
+
+function syncSliderPositionToInterval(position: number) {
+	const normalized = Math.min(100, Math.max(0, position)) / 100;
+	const minLog = Math.log(SYNC_AUTO_FETCH_INTERVAL_MIN);
+	const maxLog = Math.log(SYNC_AUTO_FETCH_INTERVAL_MAX);
+	return clampSyncAutoFetchInterval(
+		Math.exp(minLog + normalized * (maxLog - minLog)),
+	);
+}
+
+function syncIntervalMarkPosition(value: number) {
+	return `${syncIntervalToSliderPosition(value)}%`;
+}
+
+function SyncTaskDurationButton(props: {
+	task: SyncAutoFetchTaskItem;
+	disabled: boolean;
+	onOpen: (taskId: string) => void;
+}) {
+	const { task, disabled, onOpen } = props;
+	return (
+		<button
+			type="button"
+			disabled={disabled}
+			onClick={() => onOpen(task.id)}
+			className="group flex min-h-14 w-full items-center justify-between gap-3 rounded-lg border bg-card/70 px-3 py-2 text-left transition-colors hover:bg-card/90 disabled:pointer-events-none disabled:opacity-60"
+			aria-label={`查看定时拉取任务 ${task.id} 详情`}
+		>
+			<span className="min-w-0">
+				<span className="block truncate font-mono text-[11px] text-muted-foreground">
+					{task.id}
+				</span>
+				<span className="mt-1 block text-xs text-muted-foreground">
+					{taskStatusLabel(task.status)} · 链路完成{" "}
+					{formatLocalDateTime(task.finished_at)}
+				</span>
+			</span>
+			<span className="shrink-0 rounded-md border bg-background px-2.5 py-1 font-mono text-xs font-semibold">
+				{formatElapsedDurationMs(task.duration_ms)}
+			</span>
+		</button>
+	);
 }
 
 function formatModelInputLimitSource(source: string | null | undefined) {
@@ -1172,6 +1254,8 @@ type JobManagementProps = {
 			replace?: boolean;
 		},
 	) => void;
+	syncSettingsDialogDefaultOpen?: boolean;
+	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
 type LoadOptions = {
@@ -2625,8 +2709,12 @@ export function JobManagement({
 	currentUserId,
 	routeState: controlledRouteState,
 	onNavigateRoute,
+	syncSettingsDialogDefaultOpen = false,
+	syncSettingsHelpTooltipsOpen = false,
 }: JobManagementProps) {
 	const isRouteControlled = controlledRouteState !== undefined;
+	const tooltipDemoContentClass =
+		"w-60 max-w-60 whitespace-normal break-words text-left leading-relaxed";
 	const [uncontrolledRouteState, setUncontrolledRouteState] =
 		useState<AdminJobsRouteState>(() =>
 			parseAdminJobsRoute(window.location.pathname, window.location.search),
@@ -2653,6 +2741,19 @@ export function JobManagement({
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
 	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
 		useState<ListLoadPhase>("idle");
+	const [syncRuntimeConfig, setSyncRuntimeConfig] =
+		useState<AdminSyncRuntimeConfigResponse | null>(null);
+	const [syncRuntimeConfigLoading, setSyncRuntimeConfigLoading] =
+		useState(false);
+	const [syncRuntimeConfigSaving, setSyncRuntimeConfigSaving] = useState(false);
+	const [syncRuntimeConfigError, setSyncRuntimeConfigError] = useState<
+		string | null
+	>(null);
+	const [syncSettingsDialogOpen, setSyncSettingsDialogOpen] = useState(
+		syncSettingsDialogDefaultOpen,
+	);
+	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
+		useState(60);
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
@@ -2705,6 +2806,9 @@ export function JobManagement({
 	const scheduledRunsLoadedOnceRef = useRef(false);
 	const scheduledRunsInitialRequestInFlightRef = useRef(false);
 	const scheduledRunsRequestIdRef = useRef(0);
+	const syncRuntimeConfigLoadedOnceRef = useRef(false);
+	const syncRuntimeConfigInitialRequestInFlightRef = useRef(false);
+	const syncRuntimeConfigRequestIdRef = useRef(0);
 	const llmStatusLoadedOnceRef = useRef(false);
 	const llmStatusInitialRequestInFlightRef = useRef(false);
 	const llmStatusRequestIdRef = useRef(0);
@@ -2781,6 +2885,7 @@ export function JobManagement({
 		overviewLoading ||
 		tasksLoadPhase !== "idle" ||
 		scheduledRunsLoadPhase !== "idle" ||
+		syncRuntimeConfigLoading ||
 		llmStatusLoading ||
 		llmCallsLoadPhase !== "idle";
 
@@ -2994,6 +3099,72 @@ export function JobManagement({
 		[scheduledRunPage, scheduledRunStatusFilter],
 	);
 
+	const loadSyncRuntimeConfig = useCallback(async (options?: LoadOptions) => {
+		if (
+			options?.background &&
+			!syncRuntimeConfigLoadedOnceRef.current &&
+			syncRuntimeConfigInitialRequestInFlightRef.current
+		) {
+			return;
+		}
+		const requestId = syncRuntimeConfigRequestIdRef.current + 1;
+		syncRuntimeConfigRequestIdRef.current = requestId;
+		syncRuntimeConfigInitialRequestInFlightRef.current =
+			!syncRuntimeConfigLoadedOnceRef.current;
+		setSyncRuntimeConfigLoading(true);
+		setSyncRuntimeConfigError(null);
+		try {
+			const res = await apiGetAdminSyncRuntimeConfig();
+			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
+				return;
+			}
+			setSyncRuntimeConfig(res);
+			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			syncRuntimeConfigLoadedOnceRef.current = true;
+		} catch (err) {
+			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
+				return;
+			}
+			setSyncRuntimeConfigError(normalizeErrorMessage(err));
+			throw err;
+		} finally {
+			if (requestId === syncRuntimeConfigRequestIdRef.current) {
+				setSyncRuntimeConfigLoading(false);
+				syncRuntimeConfigInitialRequestInFlightRef.current = false;
+			}
+		}
+	}, []);
+
+	const saveSyncRuntimeConfig = useCallback(async () => {
+		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
+		setSyncRuntimeConfigSaving(true);
+		setSyncRuntimeConfigError(null);
+		try {
+			const res = await apiPatchAdminSyncRuntimeConfig({
+				sync_auto_fetch_interval_minutes: nextInterval,
+			});
+			setSyncRuntimeConfig(res);
+			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setSyncSettingsDialogOpen(false);
+			await Promise.all([
+				loadScheduledRuns({ background: true }),
+				loadOverview({ background: true }),
+			]);
+		} catch (err) {
+			setSyncRuntimeConfigError(normalizeErrorMessage(err));
+		} finally {
+			setSyncRuntimeConfigSaving(false);
+		}
+	}, [loadOverview, loadScheduledRuns, syncAutoFetchIntervalInput]);
+
+	const openSyncSettingsDialog = useCallback(() => {
+		setSyncRuntimeConfigError(null);
+		setSyncAutoFetchIntervalInput(
+			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
+		);
+		setSyncSettingsDialogOpen(true);
+	}, [syncRuntimeConfig]);
+
 	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
 		if (
 			options?.background &&
@@ -3146,6 +3317,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks(options),
 					loadScheduledRuns(options),
+					loadSyncRuntimeConfig(options),
 					loadLlmSchedulerStatus(options),
 					loadLlmCalls(options),
 				]);
@@ -3157,6 +3329,7 @@ export function JobManagement({
 			loadOverview,
 			loadRealtimeTasks,
 			loadScheduledRuns,
+			loadSyncRuntimeConfig,
 			loadLlmSchedulerStatus,
 			loadLlmCalls,
 		],
@@ -3214,6 +3387,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks({ background: true }),
 					loadScheduledRuns({ background: true }),
+					loadSyncRuntimeConfig({ background: true }),
 					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
 				]);
@@ -3267,6 +3441,7 @@ export function JobManagement({
 		loadOverview,
 		loadRealtimeTasks,
 		loadScheduledRuns,
+		loadSyncRuntimeConfig,
 		loadLlmSchedulerStatus,
 		loadLlmCalls,
 		refreshTaskDetail,
@@ -3331,6 +3506,16 @@ export function JobManagement({
 			setError(normalizeErrorMessage(err));
 		});
 	}, [loadScheduledRuns]);
+
+	useEffect(() => {
+		setError(null);
+		const options = syncRuntimeConfigLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void loadSyncRuntimeConfig(options).catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadSyncRuntimeConfig]);
 
 	useEffect(() => {
 		setError(null);
@@ -3602,6 +3787,14 @@ export function JobManagement({
 			});
 		},
 		[navigateAdminJobsRoute, tab, translationView],
+	);
+
+	const onOpenSyncTaskDetailFromSettings = useCallback(
+		(taskId: string) => {
+			setSyncSettingsDialogOpen(false);
+			window.setTimeout(() => onOpenTaskDetail(taskId), 150);
+		},
+		[onOpenTaskDetail],
 	);
 
 	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
@@ -3978,11 +4171,23 @@ export function JobManagement({
 
 				<TabsContent value="scheduled">
 					<Card>
-						<CardHeader>
-							<CardTitle>定时任务</CardTitle>
-							<CardDescription>
-								查看 `brief.daily_slot` 运行记录，并保留重试/取消与详情联动。
-							</CardDescription>
+						<CardHeader className="flex flex-row items-start justify-between gap-4">
+							<div className="space-y-1.5">
+								<CardTitle>定时任务</CardTitle>
+								<CardDescription>
+									查看 `brief.daily_slot` 与 `sync.subscriptions` 运行记录。
+								</CardDescription>
+							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="icon"
+								aria-label="配置全局自动获取间隔"
+								onClick={openSyncSettingsDialog}
+								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+							>
+								<Settings2 />
+							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -4357,6 +4562,218 @@ export function JobManagement({
 					/>
 				</TabsContent>
 			</Tabs>
+
+			<Dialog
+				open={syncSettingsDialogOpen}
+				onOpenChange={(open) => {
+					setSyncSettingsDialogOpen(open);
+					if (!open) {
+						setSyncRuntimeConfigError(null);
+					}
+				}}
+			>
+				<DialogContent
+					className="sm:max-w-3xl"
+					onOpenAutoFocus={(event) => {
+						event.preventDefault();
+						window.requestAnimationFrame(() => {
+							document.getElementById("sync-auto-fetch-interval")?.focus();
+						});
+					}}
+				>
+					<DialogHeader>
+						<div className="flex items-center gap-2">
+							<DialogTitle>配置全局自动获取间隔</DialogTitle>
+							<Tooltip open={syncSettingsHelpTooltipsOpen ? true : undefined}>
+								<TooltipTrigger asChild>
+									<Button
+										type="button"
+										variant="ghost"
+										size="icon"
+										className="text-muted-foreground size-7 rounded-full"
+									>
+										<CircleHelp className="size-4" />
+										<span className="sr-only">全局自动获取间隔说明</span>
+									</Button>
+								</TooltipTrigger>
+								<TooltipContent
+									align={syncSettingsHelpTooltipsOpen ? "center" : "start"}
+									className={
+										syncSettingsHelpTooltipsOpen
+											? "w-56 max-w-56 whitespace-normal break-words text-left leading-relaxed"
+											: "max-w-72"
+									}
+									side={syncSettingsHelpTooltipsOpen ? "top" : "bottom"}
+									sideOffset={6}
+								>
+									保存后立即生效；该间隔只控制 `sync.subscriptions`
+									定时拉取，不关联账号访问状态。
+								</TooltipContent>
+							</Tooltip>
+						</div>
+						<DialogDescription className="sr-only">
+							保存后立即生效；该间隔只控制 `sync.subscriptions`
+							定时拉取，不关联账号访问状态。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+						<div className="space-y-2">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<Label htmlFor="sync-auto-fetch-interval">自动获取间隔</Label>
+									<Tooltip
+										open={syncSettingsHelpTooltipsOpen ? true : undefined}
+									>
+										<TooltipTrigger asChild>
+											<Button
+												type="button"
+												variant="ghost"
+												size="icon"
+												className="text-muted-foreground size-6 rounded-full"
+											>
+												<CircleHelp className="size-3.5" />
+												<span className="sr-only">自动获取间隔刻度说明</span>
+											</Button>
+										</TooltipTrigger>
+										<TooltipContent
+											align={syncSettingsHelpTooltipsOpen ? "start" : "end"}
+											className={
+												syncSettingsHelpTooltipsOpen
+													? tooltipDemoContentClass
+													: "max-w-72"
+											}
+											side="bottom"
+											sideOffset={6}
+										>
+											刻度按非线性分布：短间隔更容易细调，长间隔可快速拉到
+											60/120 分钟。
+										</TooltipContent>
+									</Tooltip>
+								</div>
+								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+									{syncAutoFetchIntervalInput} 分钟
+								</span>
+							</div>
+							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+								<input
+									id="sync-auto-fetch-interval"
+									type="range"
+									min={0}
+									max={100}
+									step={1}
+									value={syncIntervalToSliderPosition(
+										syncAutoFetchIntervalInput,
+									)}
+									onChange={(event) =>
+										setSyncAutoFetchIntervalInput(
+											syncSliderPositionToInterval(Number(event.target.value)),
+										)
+									}
+									aria-label="自动获取间隔（分钟）"
+									aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+									aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+									aria-valuenow={syncAutoFetchIntervalInput}
+									aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
+									className="h-2 w-full cursor-pointer accent-primary"
+								/>
+								<div className="relative h-8 text-[11px] text-muted-foreground">
+									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+										<button
+											key={mark}
+											type="button"
+											className="-translate-x-1/2 absolute top-0 flex flex-col items-center gap-1 transition-colors hover:text-foreground"
+											style={{ left: syncIntervalMarkPosition(mark) }}
+											onClick={() => setSyncAutoFetchIntervalInput(mark)}
+										>
+											<span className="h-1.5 w-px bg-border" />
+											<span>{mark}</span>
+										</button>
+									))}
+								</div>
+							</div>
+							{syncRuntimeConfigError ? (
+								<p className="text-destructive text-sm">
+									{syncRuntimeConfigError}
+								</p>
+							) : null}
+						</div>
+
+						<div className="space-y-3">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<p className="text-sm font-medium">最近三次链路用时</p>
+									<Tooltip
+										open={syncSettingsHelpTooltipsOpen ? true : undefined}
+									>
+										<TooltipTrigger asChild>
+											<Button
+												type="button"
+												variant="ghost"
+												size="icon"
+												className="text-muted-foreground size-6 rounded-full"
+											>
+												<CircleHelp className="size-3.5" />
+												<span className="sr-only">链路用时说明</span>
+											</Button>
+										</TooltipTrigger>
+										<TooltipContent
+											align={syncSettingsHelpTooltipsOpen ? "end" : "center"}
+											className={
+												syncSettingsHelpTooltipsOpen
+													? "w-72 max-w-72 whitespace-normal break-words text-left leading-relaxed"
+													: "max-w-80"
+											}
+											side="top"
+											sideOffset={6}
+										>
+											用时从定时触发开始，直到同步、润色和翻译子任务全部完成；点击记录可打开任务详情。
+										</TooltipContent>
+									</Tooltip>
+								</div>
+								<Badge variant="outline">sync.subscriptions</Badge>
+							</div>
+							{syncRuntimeConfigLoading && !syncRuntimeConfig ? (
+								<LoadingMessage>正在加载同步记录...</LoadingMessage>
+							) : !syncRuntimeConfig ||
+								syncRuntimeConfig.recent_sync_tasks.length === 0 ? (
+								<p className="rounded-lg border bg-card/70 px-3 py-4 text-sm text-muted-foreground">
+									暂无定时拉取记录。
+								</p>
+							) : (
+								<div className="space-y-2">
+									{syncRuntimeConfig.recent_sync_tasks.map((task) => (
+										<SyncTaskDurationButton
+											key={task.id}
+											task={task}
+											disabled={detailLoading}
+											onOpen={onOpenSyncTaskDetailFromSettings}
+										/>
+									))}
+								</div>
+							)}
+						</div>
+					</div>
+
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setSyncSettingsDialogOpen(false)}
+							disabled={syncRuntimeConfigSaving}
+						>
+							取消
+						</Button>
+						<Button
+							type="button"
+							onClick={() => void saveSyncRuntimeConfig()}
+							disabled={syncRuntimeConfigSaving}
+						>
+							{syncRuntimeConfigSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
 
 			<Dialog
 				open={llmSettingsDialogOpen}
