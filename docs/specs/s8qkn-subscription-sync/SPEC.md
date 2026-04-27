@@ -238,10 +238,11 @@ capture_scope=browser-viewport
 requested_viewport=1280x920
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=Pages/AdminJobs/ScheduledTab
 state=admin-jobs-sync-auto-fetch-interval-task-detail
 evidence_note=验证 Admin Jobs 定时任务页通过设置按钮打开全局自动获取间隔弹窗，使用非线性滑块配置 1-120 分钟，并在旁侧展示最近三次 `sync.subscriptions` 链路用时
+PR: include
 ![Admin Jobs sync auto fetch interval and task detail](./assets/admin-jobs-sync-auto-fetch-interval-task-detail.png)
 
 source_type=storybook_canvas
@@ -250,10 +251,11 @@ capture_scope=browser-viewport
 requested_viewport=1121x1020
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=Pages/AdminJobs/SyncSettingsTooltipDemo
 state=admin-jobs-sync-settings-tooltips
 evidence_note=验证全局自动获取间隔弹窗通过三个问号 tooltip 承载说明文本，并在一个 Story 中同时展示三个提示
+PR: include
 ![Admin Jobs sync settings tooltip demo](./assets/admin-jobs-sync-settings-tooltips.png)
 
 source_type=storybook_canvas
@@ -262,10 +264,11 @@ capture_scope=browser-viewport
 requested_viewport=1280x920
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
+submission_gate=approved
 story_id_or_title=Pages/AdminJobs/ScheduledTab
 state=admin-jobs-sync-task-detail-drawer
 evidence_note=验证点击最近三次链路用时中的记录后，任务详情以抽屉形式打开
+PR: include
 ![Admin Jobs sync task detail drawer](./assets/admin-jobs-sync-task-detail-drawer.png)
 
 ![Access sync empty state](./assets/access-sync-empty-state.png)
