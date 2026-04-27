@@ -15,8 +15,16 @@ export function AdminJobs(props: {
 			replace?: boolean;
 		},
 	) => void;
+	syncSettingsDialogDefaultOpen?: boolean;
+	syncSettingsHelpTooltipsOpen?: boolean;
 }) {
-	const { me, routeState, onNavigateRoute } = props;
+	const {
+		me,
+		routeState,
+		onNavigateRoute,
+		syncSettingsDialogDefaultOpen,
+		syncSettingsHelpTooltipsOpen,
+	} = props;
 
 	return (
 		<AppShell
@@ -29,6 +37,8 @@ export function AdminJobs(props: {
 				currentUserId={me.user.id}
 				routeState={routeState}
 				onNavigateRoute={onNavigateRoute}
+				syncSettingsDialogDefaultOpen={syncSettingsDialogDefaultOpen}
+				syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 			/>
 		</AppShell>
 	);

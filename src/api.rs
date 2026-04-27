@@ -36,6 +36,7 @@ use crate::{
 const SESSION_PENDING_ACCESS_SYNC_REASON: &str = "pending_access_sync_reason";
 const SESSION_ACTIVITY_TOUCHED_AT: &str = "activity_touched_at";
 const SESSION_ACTIVITY_TOUCH_INTERVAL_SECS: i64 = 15 * 60;
+const ACCESS_SYNC_REASON_INACTIVE_OVER_1H: &str = "inactive_over_1h";
 const ADMIN_DASHBOARD_TASK_TYPES: [(&str, &str); 3] = [
     (jobs::TASK_TRANSLATE_RELEASE_BATCH, "翻译"),
     (jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH, "润色"),
@@ -405,7 +406,7 @@ async fn maybe_bootstrap_access_sync(
     let reason = if let Some(reason) = pending_reason.as_deref() {
         reason
     } else if row.last_active_at.is_some() {
-        "inactive_over_1h"
+        ACCESS_SYNC_REASON_INACTIVE_OVER_1H
     } else {
         "first_visit"
     };
@@ -821,6 +822,17 @@ pub struct DailyBriefProfilePatchRequest {
     include_own_releases: Option<bool>,
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct SyncAutoFetchTaskItem {
+    id: String,
+    status: String,
+    source: String,
+    duration_ms: Option<i64>,
+    created_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct DailyBriefProfileRow {
     daily_brief_local_time: Option<String>,
@@ -828,6 +840,75 @@ struct DailyBriefProfileRow {
     include_own_releases: i64,
     daily_brief_utc_time: String,
     last_active_at: Option<String>,
+}
+
+async fn load_recent_sync_auto_fetch_tasks(
+    state: &AppState,
+) -> Result<Vec<SyncAutoFetchTaskItem>, ApiError> {
+    sqlx::query_as::<_, SyncAutoFetchTaskItem>(
+        r#"
+        WITH recent_roots AS (
+          SELECT
+            id,
+            status,
+            source,
+            created_at,
+            started_at,
+            finished_at
+          FROM job_tasks
+          WHERE task_type = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT 3
+        ),
+        chain_tasks AS (
+          SELECT
+            id AS root_id,
+            finished_at
+          FROM recent_roots
+
+          UNION ALL
+
+          SELECT
+            child.parent_task_id AS root_id,
+            child.finished_at
+          FROM job_tasks child
+          JOIN recent_roots root ON root.id = child.parent_task_id
+          WHERE child.task_type IN (?, ?)
+        ),
+        chain_rollup AS (
+          SELECT
+            root_id,
+            MAX(finished_at) AS chain_finished_at,
+            SUM(CASE WHEN finished_at IS NULL THEN 1 ELSE 0 END) AS unfinished_count
+          FROM chain_tasks
+          GROUP BY root_id
+        )
+        SELECT
+          root.id,
+          root.status,
+          root.source,
+          CASE
+            WHEN rollup.unfinished_count = 0 AND rollup.chain_finished_at IS NOT NULL
+              THEN CAST((julianday(rollup.chain_finished_at) - julianday(root.created_at)) * 86400000 AS INTEGER)
+            ELSE NULL
+          END AS duration_ms,
+          root.created_at,
+          root.started_at,
+          CASE
+            WHEN rollup.unfinished_count = 0 THEN rollup.chain_finished_at
+            ELSE NULL
+          END AS finished_at
+        FROM recent_roots root
+        JOIN chain_rollup rollup ON rollup.root_id = root.id
+        ORDER BY root.created_at DESC, root.id DESC
+        "#,
+    )
+    .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+    .bind(jobs::TASK_TRANSLATE_RELEASE_BATCH)
+    .bind(jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
 }
 
 async fn load_daily_brief_profile(
@@ -949,6 +1030,67 @@ pub async fn me_patch_profile(
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
     Ok(Json(
         persist_daily_brief_profile(state.as_ref(), &user_id, req).await?,
+    ))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncRuntimeConfigResponse {
+    sync_auto_fetch_interval_minutes: i64,
+    recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncRuntimeConfigPatchRequest {
+    sync_auto_fetch_interval_minutes: i64,
+}
+
+async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
+    let interval = admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(SyncRuntimeConfigResponse {
+        sync_auto_fetch_interval_minutes: interval,
+        recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
+    })
+}
+
+async fn persist_sync_runtime_config(
+    state: &AppState,
+    req: SyncRuntimeConfigPatchRequest,
+) -> Result<SyncRuntimeConfigResponse, ApiError> {
+    if !(1..=120).contains(&req.sync_auto_fetch_interval_minutes) {
+        return Err(ApiError::bad_request(
+            "sync_auto_fetch_interval_minutes must be between 1 and 120",
+        ));
+    }
+
+    admin_runtime::update_sync_auto_fetch_interval_minutes(
+        &state.pool,
+        req.sync_auto_fetch_interval_minutes,
+    )
+    .await
+    .map_err(ApiError::internal)?;
+
+    load_sync_runtime_config(state).await
+}
+
+pub async fn admin_get_sync_runtime_config(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+) -> Result<Json<SyncRuntimeConfigResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    Ok(Json(load_sync_runtime_config(state.as_ref()).await?))
+}
+
+pub async fn admin_patch_sync_runtime_config(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Json(req): Json<SyncRuntimeConfigPatchRequest>,
+) -> Result<Json<SyncRuntimeConfigResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    Ok(Json(
+        persist_sync_runtime_config(state.as_ref(), req).await?,
     ))
 }
 
@@ -4008,7 +4150,15 @@ pub async fn admin_get_realtime_task_detail(
 ) -> Result<Json<AdminRealtimeTaskDetailResponse>, ApiError> {
     let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
     let task_id = parse_local_id_param(task_id, "task_id")?;
+    Ok(Json(
+        load_realtime_task_detail_response(state.as_ref(), task_id.as_str()).await?,
+    ))
+}
 
+async fn load_realtime_task_detail_response(
+    state: &AppState,
+    task_id: &str,
+) -> Result<AdminRealtimeTaskDetailResponse, ApiError> {
     let task = sqlx::query_as::<_, AdminRealtimeTaskDetailItem>(
         r#"
         SELECT
@@ -4032,7 +4182,7 @@ pub async fn admin_get_realtime_task_detail(
         LIMIT 1
         "#,
     )
-    .bind(task_id.as_str())
+    .bind(task_id)
     .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::internal)?
@@ -4045,7 +4195,7 @@ pub async fn admin_get_realtime_task_detail(
         WHERE task_id = ?
         "#,
     )
-    .bind(task_id.as_str())
+    .bind(task_id)
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -4059,7 +4209,7 @@ pub async fn admin_get_realtime_task_detail(
         LIMIT ?
         "#,
     )
-    .bind(task_id.as_str())
+    .bind(task_id)
     .bind(ADMIN_TASK_DETAIL_EVENT_LIMIT)
     .fetch_all(&state.pool)
     .await
@@ -4095,7 +4245,7 @@ pub async fn admin_get_realtime_task_detail(
             LIMIT ?
             "#,
         )
-        .bind(task_id.as_str())
+        .bind(task_id)
         .bind(ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT)
         .fetch_all(&state.pool)
         .await
@@ -4107,12 +4257,12 @@ pub async fn admin_get_realtime_task_detail(
 
     let diagnostics = build_task_diagnostics(&task, &events, &subscription_events);
 
-    Ok(Json(AdminRealtimeTaskDetailResponse {
+    Ok(AdminRealtimeTaskDetailResponse {
         task,
         events,
         event_meta,
         diagnostics,
-    }))
+    })
 }
 
 pub async fn admin_download_realtime_task_log(
@@ -12482,7 +12632,7 @@ pub(crate) async fn require_active_user_id(
         && last_active_is_stale(row.last_active_at.as_deref())
     {
         let reason = if row.last_active_at.is_some() {
-            "inactive_over_1h"
+            ACCESS_SYNC_REASON_INACTIVE_OVER_1H
         } else {
             "first_visit"
         };
@@ -12541,11 +12691,11 @@ mod tests {
     use chrono::{Datelike, TimeZone};
 
     use super::{
-        ADMIN_DASHBOARD_PREAGGREGATE_DAYS, ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT,
-        ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery, AdminLlmCallListScope,
-        AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest, AdminRealtimeTaskDetailItem,
-        AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem, AdminTaskEventItem,
-        AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
+        ACCESS_SYNC_REASON_INACTIVE_OVER_1H, ADMIN_DASHBOARD_PREAGGREGATE_DAYS,
+        ADMIN_SYNC_SUBSCRIPTION_EVENT_LIMIT, ADMIN_TASK_DETAIL_EVENT_LIMIT, AdminDashboardQuery,
+        AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
+        AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem,
+        AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, FeedQuery, FeedReactionRefreshRequest, FeedRow,
         GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
         GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
@@ -13033,7 +13183,7 @@ mod tests {
                 .await
                 .expect("load pending reason")
                 .as_deref(),
-            Some("inactive_over_1h")
+            Some(ACCESS_SYNC_REASON_INACTIVE_OVER_1H)
         );
         let touched_last_active_at = sqlx::query_scalar::<_, Option<String>>(
             r#"
@@ -13056,7 +13206,7 @@ mod tests {
         let Json(resp) = me(State(state.clone()), session)
             .await
             .expect("bootstrap me");
-        assert_eq!(resp.access_sync.reason, "inactive_over_1h");
+        assert_eq!(resp.access_sync.reason, ACCESS_SYNC_REASON_INACTIVE_OVER_1H);
         assert_eq!(
             resp.access_sync.task_type.as_deref(),
             Some(jobs::TASK_SYNC_ACCESS_REFRESH)
@@ -13078,6 +13228,17 @@ mod tests {
         .await
         .expect("count queued access sync tasks");
         assert_eq!(queued, 1);
+    }
+
+    #[test]
+    fn last_active_is_stale_uses_one_hour_window() {
+        let recent_last_active_at =
+            (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
+        let stale_last_active_at =
+            (chrono::Utc::now() - chrono::Duration::minutes(61)).to_rfc3339();
+
+        assert!(!last_active_is_stale(Some(recent_last_active_at.as_str())));
+        assert!(last_active_is_stale(Some(stale_last_active_at.as_str())));
     }
 
     #[tokio::test]
@@ -19948,6 +20109,59 @@ echo should_not_be_in_excerpt
     }
 
     #[tokio::test]
+    async fn persist_sync_runtime_config_updates_global_interval() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let settings = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: 10,
+            },
+        )
+        .await
+        .expect("sync settings update should succeed");
+
+        assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
+
+        let interval = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT sync_auto_fetch_interval_minutes
+            FROM admin_runtime_settings
+            WHERE id = 1
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load sync auto fetch interval");
+
+        assert_eq!(interval, 10);
+    }
+
+    #[tokio::test]
+    async fn persist_sync_runtime_config_rejects_interval_out_of_range() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        for interval in [0, 121] {
+            let err = super::persist_sync_runtime_config(
+                state.as_ref(),
+                super::SyncRuntimeConfigPatchRequest {
+                    sync_auto_fetch_interval_minutes: interval,
+                },
+            )
+            .await
+            .expect_err("sync settings update should reject invalid interval");
+
+            assert_eq!(err.code(), "bad_request");
+            assert!(
+                err.to_string()
+                    .contains("sync_auto_fetch_interval_minutes must be between 1 and 120")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn load_daily_brief_profile_defaults_include_own_releases_to_false() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -19957,6 +20171,137 @@ echo should_not_be_in_excerpt
             .expect("load profile");
 
         assert!(!profile.include_own_releases);
+    }
+
+    #[tokio::test]
+    async fn load_sync_runtime_config_includes_recent_task_durations() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        for (idx, task_id, started_at, finished_at) in [
+            (
+                1,
+                crate::local_id::test_local_id("subscription-history-1"),
+                "2026-04-27T08:00:01Z",
+                "2026-04-27T08:00:06Z",
+            ),
+            (
+                2,
+                crate::local_id::test_local_id("subscription-history-2"),
+                "2026-04-27T08:10:01Z",
+                "2026-04-27T08:10:11Z",
+            ),
+            (
+                3,
+                crate::local_id::test_local_id("subscription-history-3"),
+                "2026-04-27T08:20:01Z",
+                "2026-04-27T08:20:16Z",
+            ),
+            (
+                4,
+                crate::local_id::test_local_id("subscription-history-4"),
+                "2026-04-27T08:30:01Z",
+                "2026-04-27T08:30:21Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id,
+                  task_type,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  payload_json,
+                  result_json,
+                  error_message,
+                  cancel_requested,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                )
+                VALUES (?, ?, 'succeeded', 'scheduler', NULL, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(task_id.as_str())
+            .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+            .bind(format!("2026-04-27T08:{:02}:00Z", idx * 10 - 10))
+            .bind(started_at)
+            .bind(finished_at)
+            .bind(finished_at)
+            .execute(&pool)
+            .await
+            .expect("seed subscription sync history");
+        }
+
+        let newest_task_id = crate::local_id::test_local_id("subscription-history-4");
+        for (task_type, child_id, created_at, started_at, finished_at) in [
+            (
+                jobs::TASK_TRANSLATE_RELEASE_BATCH,
+                crate::local_id::test_local_id("subscription-history-4-translate"),
+                "2026-04-27T08:30:22Z",
+                "2026-04-27T08:30:23Z",
+                "2026-04-27T08:34:10Z",
+            ),
+            (
+                jobs::TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+                crate::local_id::test_local_id("subscription-history-4-smart"),
+                "2026-04-27T08:30:22Z",
+                "2026-04-27T08:30:24Z",
+                "2026-04-27T08:36:40Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id,
+                  task_type,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  payload_json,
+                  result_json,
+                  error_message,
+                  cancel_requested,
+                  created_at,
+                  started_at,
+                  finished_at,
+                  updated_at
+                )
+                VALUES (?, ?, 'succeeded', 'sync.subscriptions', NULL, ?, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(child_id.as_str())
+            .bind(task_type)
+            .bind(newest_task_id.as_str())
+            .bind(created_at)
+            .bind(started_at)
+            .bind(finished_at)
+            .bind(finished_at)
+            .execute(&pool)
+            .await
+            .expect("seed subscription sync child task");
+        }
+
+        let settings = super::load_sync_runtime_config(state.as_ref())
+            .await
+            .expect("load sync settings");
+
+        assert_eq!(settings.recent_sync_tasks.len(), 3);
+        assert_eq!(settings.recent_sync_tasks[0].id, newest_task_id);
+        let duration_ms = settings.recent_sync_tasks[0].duration_ms.expect("duration");
+        assert!((399_999..=400_000).contains(&duration_ms));
+        assert_eq!(
+            settings.recent_sync_tasks[0].finished_at.as_deref(),
+            Some("2026-04-27T08:36:40Z")
+        );
+        assert_eq!(
+            settings.recent_sync_tasks[2].id,
+            crate::local_id::test_local_id("subscription-history-2")
+        );
     }
 
     #[tokio::test]
