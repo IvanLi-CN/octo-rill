@@ -105,7 +105,41 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		finished_at: "2026-02-27T14:37:18Z",
 		updated_at: "2026-02-27T14:37:18Z",
 	},
+	{
+		id: "task-subscription-1420",
+		task_type: "sync.subscriptions",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:20:00Z",
+		started_at: "2026-02-27T14:20:01Z",
+		finished_at: "2026-02-27T14:24:33Z",
+		updated_at: "2026-02-27T14:24:33Z",
+	},
+	{
+		id: "task-subscription-1410",
+		task_type: "sync.subscriptions",
+		status: "failed",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: "release sync candidate failed for octo/private-repo",
+		created_at: "2026-02-27T14:10:00Z",
+		started_at: "2026-02-27T14:10:02Z",
+		finished_at: "2026-02-27T14:11:19Z",
+		updated_at: "2026-02-27T14:11:19Z",
+	},
 ];
+
+const syncSubscriptionChainFinishedAt: Record<string, string> = {
+	"task-subscription-1430": "2026-02-27T14:48:30Z",
+	"task-subscription-1420": "2026-02-27T14:31:10Z",
+	"task-subscription-1410": "2026-02-27T14:15:45Z",
+};
 
 const llmCallsSeed: AdminLlmCallDetailResponse[] = [
 	{
@@ -834,6 +868,8 @@ type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
 	llmSourceFilter?: string;
 	translationState?: "default" | "busy" | "recovered" | "failed";
+	syncSettingsDialogDefaultOpen?: boolean;
+	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
 function setInputValue(element: HTMLInputElement, value: string) {
@@ -869,6 +905,8 @@ function AdminJobsPreview({
 	autoOpenConversation = false,
 	llmSourceFilter = "",
 	translationState = "default",
+	syncSettingsDialogDefaultOpen = false,
+	syncSettingsHelpTooltipsOpen = false,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
 	const autoOpenedRef = useRef(false);
@@ -895,6 +933,25 @@ function AdminJobsPreview({
 			avg_duration_ms_24h: 1570,
 			last_success_at: llmCalls.at(-1)?.finished_at ?? null,
 			last_failure_at: llmCalls[0]?.finished_at ?? null,
+		};
+		let syncRuntimeConfig = {
+			sync_auto_fetch_interval_minutes: 10,
+			recent_sync_tasks: scheduledRuns
+				.filter((item) => item.task_type === "sync.subscriptions")
+				.slice(0, 3)
+				.map((item) => ({
+					...item,
+					id: item.id,
+					status: item.status,
+					source: item.source,
+					duration_ms: syncSubscriptionChainFinishedAt[item.id]
+						? new Date(syncSubscriptionChainFinishedAt[item.id]).getTime() -
+							new Date(item.created_at).getTime()
+						: null,
+					created_at: item.created_at,
+					started_at: item.started_at,
+					finished_at: syncSubscriptionChainFinishedAt[item.id] ?? null,
+				})),
 		};
 		let translationWorkers =
 			translationState === "busy"
@@ -1202,6 +1259,35 @@ function AdminJobsPreview({
 						headers: { "content-type": "application/json" },
 					},
 				);
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/sync/runtime-config" &&
+				req.method === "GET"
+			) {
+				return new Response(JSON.stringify(syncRuntimeConfig), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+
+			if (
+				url.pathname === "/api/admin/jobs/sync/runtime-config" &&
+				req.method === "PATCH"
+			) {
+				const body = (await req.json()) as {
+					sync_auto_fetch_interval_minutes?: number;
+				};
+				syncRuntimeConfig = {
+					...syncRuntimeConfig,
+					sync_auto_fetch_interval_minutes: Number(
+						body.sync_auto_fetch_interval_minutes ?? 60,
+					),
+				};
+				return new Response(JSON.stringify(syncRuntimeConfig), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
 			}
 
 			if (
@@ -1603,6 +1689,8 @@ function AdminJobsPreview({
 					daily_boundary_utc_offset_minutes: 480,
 				},
 			}}
+			syncSettingsDialogDefaultOpen={syncSettingsDialogDefaultOpen}
+			syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 		/>
 	);
 }
@@ -1651,11 +1739,55 @@ export const ScheduledTab: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "定时任务" }),
 		).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("button", { name: "配置全局自动获取间隔" }),
+		);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
+		).toBeVisible();
+		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "自动获取间隔（分钟）" }),
+		).toHaveAttribute("aria-valuenow", "10");
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/scheduled",
 			),
 		);
+	},
+};
+
+export const SyncSettingsTooltipDemo: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/scheduled"
+			syncSettingsDialogDefaultOpen
+			syncSettingsHelpTooltipsOpen
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"演示全局自动获取间隔弹窗中的三个帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const screen = within(canvasElement.ownerDocument.body);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
+		).toBeVisible();
+		await waitFor(() => {
+			const tooltipText = screen
+				.getAllByRole("tooltip")
+				.map((element) => element.textContent ?? "")
+				.join("\n");
+			expect(tooltipText).toContain("保存后立即生效");
+			expect(tooltipText).toContain("刻度按非线性分布");
+			expect(tooltipText).toContain("用时从定时触发开始");
+		});
 	},
 };
 

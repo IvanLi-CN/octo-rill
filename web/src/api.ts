@@ -229,6 +229,22 @@ export type MeProfileResponse = {
 	include_own_releases: boolean;
 	last_active_at: string | null;
 };
+export type SyncAutoFetchTaskItem = {
+	id: string;
+	status: string;
+	source: string;
+	duration_ms: number | null;
+	created_at: string;
+	started_at: string | null;
+	finished_at: string | null;
+};
+export type AdminSyncRuntimeConfigResponse = {
+	sync_auto_fetch_interval_minutes: number;
+	recent_sync_tasks: SyncAutoFetchTaskItem[];
+};
+export type AdminSyncRuntimeConfigUpdateRequest = {
+	sync_auto_fetch_interval_minutes: number;
+};
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_local_time: string;
 	daily_brief_time_zone: string;
@@ -885,6 +901,19 @@ export async function apiPatchAdminScheduledSlot(
 	return apiPatchJson<AdminScheduledSlotItem>(
 		`/api/admin/jobs/scheduled/${hourUtc}`,
 		{ enabled },
+	);
+}
+export async function apiGetAdminSyncRuntimeConfig(): Promise<AdminSyncRuntimeConfigResponse> {
+	return apiGet<AdminSyncRuntimeConfigResponse>(
+		"/api/admin/jobs/sync/runtime-config",
+	);
+}
+export async function apiPatchAdminSyncRuntimeConfig(
+	body: AdminSyncRuntimeConfigUpdateRequest,
+): Promise<AdminSyncRuntimeConfigResponse> {
+	return apiPatchJson<AdminSyncRuntimeConfigResponse>(
+		"/api/admin/jobs/sync/runtime-config",
+		body,
 	);
 }
 export async function apiGetAdminLlmSchedulerStatus(): Promise<AdminLlmSchedulerStatusResponse> {

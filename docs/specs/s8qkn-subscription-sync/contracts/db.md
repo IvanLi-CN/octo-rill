@@ -100,6 +100,18 @@ Notes:
 
 ## Historical tables
 
+### `admin_runtime_settings`
+
+Additional global sync runtime setting:
+
+- `sync_auto_fetch_interval_minutes INTEGER NOT NULL DEFAULT 60`
+
+Notes:
+
+- Valid range is `1-120`.
+- The value controls global `sync.subscriptions` scheduler cadence.
+- The setting is not user- or account-scoped.
+
 ### `releases`
 
 Status:

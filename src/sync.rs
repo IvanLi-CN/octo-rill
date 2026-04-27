@@ -2993,7 +2993,12 @@ pub async fn sync_subscriptions(
         .get("schedule_key")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| jobs::current_subscription_schedule_key(chrono::Utc::now()));
+        .unwrap_or_else(|| {
+            jobs::current_subscription_schedule_key(
+                chrono::Utc::now(),
+                crate::admin_runtime::DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES,
+            )
+        });
 
     let context = SubscriptionRunContext::new(state, task_id).await?;
     context

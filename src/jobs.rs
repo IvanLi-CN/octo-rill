@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
-use crate::{ai, api, briefs, local_id, runtime, state::AppState, sync, translations};
+use crate::{
+    admin_runtime, ai, api, briefs, local_id, runtime, state::AppState, sync, translations,
+};
 
 pub const STATUS_QUEUED: &str = "queued";
 pub const STATUS_RUNNING: &str = "running";
@@ -289,7 +291,9 @@ pub async fn enqueue_subscription_run_if_due(
     state: &AppState,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
-    let schedule_key = current_subscription_schedule_key(now);
+    let interval_minutes =
+        admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool).await?;
+    let schedule_key = current_subscription_schedule_key(now, interval_minutes);
     let row = sqlx::query_as::<_, DispatchStateRow>(
         r#"
         SELECT last_dispatch_key
@@ -314,6 +318,7 @@ pub async fn enqueue_subscription_run_if_due(
     let payload = json!({
         "trigger": "schedule",
         "schedule_key": schedule_key,
+        "interval_minutes": interval_minutes,
     });
 
     let task = if subscription_run_in_flight(state).await? {
@@ -384,9 +389,14 @@ pub async fn enqueue_brief_refresh_content_if_needed(state: &AppState) -> Result
     Ok(Some(task.task_id))
 }
 
-pub(crate) fn current_subscription_schedule_key(now: DateTime<Utc>) -> String {
-    let minute = if now.minute() < 30 { 0 } else { 30 };
-    format!("{}:{minute:02}", now.format("%Y-%m-%dT%H"))
+pub(crate) fn current_subscription_schedule_key(
+    now: DateTime<Utc>,
+    interval_minutes: i64,
+) -> String {
+    let interval_minutes =
+        admin_runtime::normalize_sync_auto_fetch_interval_minutes(interval_minutes);
+    let bucket_start = now.timestamp().div_euclid(interval_minutes * 60) * interval_minutes * 60;
+    format!("interval:{interval_minutes}:{bucket_start}")
 }
 
 async fn subscription_run_in_flight(state: &AppState) -> Result<bool> {
@@ -2814,7 +2824,7 @@ mod tests {
     };
 
     #[test]
-    fn current_subscription_schedule_key_uses_half_hour_buckets() {
+    fn current_subscription_schedule_key_uses_configured_minute_buckets() {
         let on_the_hour = Utc
             .with_ymd_and_hms(2026, 3, 6, 14, 5, 12)
             .single()
@@ -2825,12 +2835,12 @@ mod tests {
             .expect("valid datetime");
 
         assert_eq!(
-            current_subscription_schedule_key(on_the_hour),
-            "2026-03-06T14:00"
+            current_subscription_schedule_key(on_the_hour, 10),
+            "interval:10:1772805600"
         );
         assert_eq!(
-            current_subscription_schedule_key(on_the_half_hour),
-            "2026-03-06T14:30"
+            current_subscription_schedule_key(on_the_half_hour, 10),
+            "interval:10:1772808000"
         );
     }
 

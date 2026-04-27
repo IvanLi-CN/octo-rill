@@ -28,7 +28,52 @@ Notes:
 
 - `access_sync.reason` uses `first_visit | inactive_over_1h | reused_inflight | none`.
 - `task_id / task_type / event_path` are `null` when `reason=none`.
-- `GET /api/me` decides whether to create or reuse `sync.access_refresh` by comparing the pre-touch `last_active_at` against a 1 hour inactivity window.
+- `GET /api/me` decides whether to create or reuse `sync.access_refresh` by comparing the pre-touch `last_active_at` against the fixed 1-hour access window.
+
+## `GET /api/admin/jobs/sync/runtime-config`
+
+Response shape:
+
+```json
+{
+  "sync_auto_fetch_interval_minutes": 10,
+  "recent_sync_tasks": [
+    {
+      "id": "task_xxx",
+      "status": "succeeded",
+      "source": "api.me",
+      "duration_ms": 630000,
+      "created_at": "2026-04-27T08:20:00Z",
+      "started_at": "2026-04-27T08:20:02Z",
+      "finished_at": "2026-04-27T08:30:30Z"
+    }
+  ]
+}
+```
+
+Notes:
+
+- `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`.
+- `recent_sync_tasks` returns the newest three `sync.subscriptions` tasks.
+- `duration_ms` is the chain duration from the root `sync.subscriptions.created_at` to the latest finished time among the root task and direct child `translate.release.batch` / `summarize.release.smart.batch` tasks.
+- `finished_at` is the same chain completion time; `duration_ms` and `finished_at` are `null` until the root and those direct child tasks all have `finished_at`.
+
+## `PATCH /api/admin/jobs/sync/runtime-config`
+
+Request shape:
+
+```json
+{
+  "sync_auto_fetch_interval_minutes": 10
+}
+```
+
+Behavior:
+
+- `sync_auto_fetch_interval_minutes` must be between `1` and `120`.
+- The response uses the same shape as `GET /api/admin/jobs/sync/runtime-config`.
+- Task detail links reuse `GET /api/admin/jobs/realtime/{task_id}`.
+- Response shape matches the admin realtime task detail contract used by Admin Jobs.
 
 ## `GET /api/tasks/{task_id}/events`
 

@@ -30,10 +30,11 @@
   - 挂到共享 repo release queue
   - 等待关联 outcome 并输出 `Release + social + Inbox` 摘要
 - `GET /api/me` 返回 `access_sync` 元信息，前端可直接附着到用户自己的 task SSE。
+- Admin Jobs 允许管理员配置全局自动获取间隔，并展示最近三次 `sync.subscriptions` 用时。
 
 ### Non-goals
 
-- 不改定时任务的半小时 bucket 调度频率。
+- 不新增专门的 repo release 管理后台页面。
 - 不引入跨实例分布式锁或 leader election。
 - 不引入 GitHub webhook / upstream push 模式。
 
@@ -47,10 +48,11 @@
   - `repo_release_watchers`
   - 从旧 `releases` 去重回填到 `repo_releases`
 - 后端运行时：
-  - repo 级共享 release worker
+- repo 级共享 release worker
   - runtime lease heartbeat / recovery
   - `sync.access_refresh`
   - `/api/me.access_sync`
+  - `/api/admin/jobs/sync/runtime-config`
   - `/api/tasks/{task_id}/events`
 - 读模型切换：
   - `/api/releases`
@@ -80,6 +82,7 @@
 | --- | --- | --- | --- | --- | --- | --- |
 | `GET /api/me` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
 | `GET /api/tasks/{task_id}/events` | HTTP API / SSE | external | New | `./contracts/http-apis.md` | backend | web |
+| `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` | HTTP API | external | New | `./contracts/http-apis.md` | backend | admin web |
 | `POST /api/sync/all` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web |
 | `POST /api/sync/releases` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web |
 | `sync.access_refresh` | Job task | internal | New | `./contracts/http-apis.md` | backend | api / web |
@@ -96,6 +99,18 @@
   - 或者距当前时间超过 1 小时
 - 若当前用户已有 `queued|running` 的 `sync.access_refresh`，则直接复用该 task，`reason=reused_inflight`。
 - 否则新建 `sync.access_refresh`，`reason=first_visit|inactive_over_1h`。
+
+### Admin Jobs 全局自动获取控制
+
+- Admin Jobs 的定时任务页展示全局 `sync_auto_fetch_interval_minutes` 控件，允许保存 `1-120` 分钟。
+- 该配置保存在 `admin_runtime_settings`，仅影响全局 `sync.subscriptions` 定时拉取，不影响账号访问状态。
+- 同一区域展示最近三次全局 `sync.subscriptions` 任务：
+  - 来源为 `job_tasks.task_type = sync.subscriptions`
+  - 不按用户过滤
+  - 显示任务状态、链路完成时间、链路用时
+  - 链路用时从根 `sync.subscriptions` 创建时间开始，到根任务及其直接触发的 `translate.release.batch` / `summarize.release.smart.batch` 子任务全部完成时结束
+- 点击任一用时项打开 Admin Jobs 任务详情抽屉，抽屉展示该任务详情、阶段摘要和最近事件。
+- `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
 
 ### `sync.access_refresh`
 
@@ -174,6 +189,14 @@
   When `GET /api/me` 返回
   Then 响应包含 `access_sync.task_id`，并且同一用户不会重复入队多个 `sync.access_refresh`。
 
+- Given 管理员在 Admin Jobs 定时任务页配置 `1-120` 分钟自动获取间隔
+  When 保存设置
+  Then 后端持久化全局 `sync_auto_fetch_interval_minutes`，后续 scheduler 按该间隔判断是否触发 `sync.subscriptions`。
+
+- Given 系统已有最近三次 `sync.subscriptions` 历史
+  When 打开 Admin Jobs 定时任务页
+  Then 页面展示最近三次链路用时；点击用时项会打开只读任务详情抽屉。
+
 - Given 用户已经有旧缓存 Release
   When `sync.access_refresh` 发出 `star_refreshed`
   Then Dashboard 第一次刷新可以看到与当前 `starred_repos` 匹配的共享 `repo_releases`。
@@ -186,7 +209,7 @@
   When feed / release detail / brief / translation / reaction 读取 Release
   Then 只依赖“当前用户 star 可见 + 共享 repo release 缓存”，不依赖用户私有 `releases`。
 
-- Given `sync.subscriptions` 被 scheduler 在半小时槽触发
+- Given `sync.subscriptions` 被 scheduler 按全局自动获取间隔触发
   When 本轮 Star / Release 摘要已经完成
   Then 同一 task 还会继续发出 `social_summary` 与 `notifications_summary`，并在 `result_json` 中包含四段聚合摘要。
 
@@ -200,14 +223,53 @@
 
 ## Visual Evidence
 
-source_type=storybook_canvas  
-target_program=mock-only  
-capture_scope=element  
-sensitive_exclusion=N/A  
-submission_gate=pending-owner-approval  
-story_id_or_title=Pages/Dashboard/AccessSyncEmptyState  
-state=auto-sync-empty-state  
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Pages/Dashboard/AccessSyncEmptyState
+state=auto-sync-empty-state
 evidence_note=验证访问触发同步期间，Dashboard 空态不再提示手动 Sync all，而是展示 staged refresh 文案
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1280x920
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Pages/AdminJobs/ScheduledTab
+state=admin-jobs-sync-auto-fetch-interval-task-detail
+evidence_note=验证 Admin Jobs 定时任务页通过设置按钮打开全局自动获取间隔弹窗，使用非线性滑块配置 1-120 分钟，并在旁侧展示最近三次 `sync.subscriptions` 链路用时
+PR: include
+![Admin Jobs sync auto fetch interval and task detail](./assets/admin-jobs-sync-auto-fetch-interval-task-detail.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1280x1120
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Pages/AdminJobs/SyncSettingsTooltipDemo
+state=admin-jobs-sync-settings-tooltips
+evidence_note=验证全局自动获取间隔弹窗通过三个问号 tooltip 承载说明文本，并在一个 Story 中同时展示三个提示
+PR: include
+![Admin Jobs sync settings tooltip demo](./assets/admin-jobs-sync-settings-tooltips.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1280x920
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Pages/AdminJobs/ScheduledTab
+state=admin-jobs-sync-task-detail-drawer
+evidence_note=验证点击最近三次链路用时中的记录后，任务详情以抽屉形式打开
+PR: include
+![Admin Jobs sync task detail drawer](./assets/admin-jobs-sync-task-detail-drawer.png)
 
 ![Access sync empty state](./assets/access-sync-empty-state.png)
 
