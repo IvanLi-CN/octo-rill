@@ -60,7 +60,10 @@ import {
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
 import { DashboardStartupSkeleton } from "@/pages/AppBoot";
-import { DashboardHeader } from "@/pages/DashboardHeader";
+import {
+	DashboardHeader,
+	type DashboardSyncProgress,
+} from "@/pages/DashboardHeader";
 import { buildSettingsHref, buildSettingsSearch } from "@/settings/routeState";
 import {
 	isReactionTokenUsable,
@@ -139,6 +142,7 @@ type TaskEventPayload = {
 	stage?: string;
 	status?: string;
 	error?: string;
+	[key: string]: unknown;
 };
 type BriefGenerateResponse = {
 	id: string;
@@ -154,6 +158,7 @@ type BriefGenerateResponse = {
 
 const SYNC_ALL_LABEL = "同步";
 const TASK_STREAM_RECOVERY_GRACE_MS = 5000;
+const ACCESS_SYNC_TOTAL_STEPS = 4;
 const FEED_REACTION_REFRESH_TTL_MS = 15_000;
 const FEED_REACTION_REFRESH_BATCH_SIZE = 100;
 const REACTION_CONTENTS: ReactionContent[] = [
@@ -221,6 +226,97 @@ function sessionExpiredHint() {
 	return `当前页面（${window.location.origin}）的 OctoRill 登录已失效（不是 PAT 本身）。请先点右上角 Logout，再重新 Login with GitHub；若同时开了多个本地实例，请只保留这个端口。`;
 }
 
+function readPayloadNumber(payload: TaskEventPayload, key: string) {
+	const value = payload[key];
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function pluralCount(count: number, label: string) {
+	return `${count} ${label}`;
+}
+
+function joinSyncDetails(parts: string[]) {
+	return parts.filter(Boolean).join(" · ");
+}
+
+function accessSyncProgressFromStage(
+	stage:
+		| "waiting"
+		| "star_refreshed"
+		| "release_summary"
+		| "social_summary"
+		| "notifications_summary",
+	payload: TaskEventPayload = {},
+): DashboardSyncProgress {
+	switch (stage) {
+		case "star_refreshed": {
+			const repos = readPayloadNumber(payload, "repos");
+			return {
+				currentStep: 1,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "Star 与仓库快照已同步",
+				detail:
+					repos !== null
+						? `已刷新 ${pluralCount(repos, "个仓库")}`
+						: "正在整理你的仓库快照",
+			};
+		}
+		case "release_summary": {
+			const releases = readPayloadNumber(payload, "releases");
+			const repos = readPayloadNumber(payload, "repos");
+			const failed = readPayloadNumber(payload, "failed");
+			return {
+				currentStep: 2,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "Release 已同步",
+				detail:
+					joinSyncDetails([
+						releases !== null
+							? `写入 ${pluralCount(releases, "条 Release")}`
+							: "",
+						repos !== null ? `覆盖 ${pluralCount(repos, "个仓库")}` : "",
+						failed !== null && failed > 0 ? `失败 ${failed}` : "",
+					]) || "正在更新 Release 记录",
+			};
+		}
+		case "social_summary": {
+			const repoStars = readPayloadNumber(payload, "repo_stars");
+			const followers = readPayloadNumber(payload, "followers");
+			const events = readPayloadNumber(payload, "events");
+			return {
+				currentStep: 3,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "社交动态已同步",
+				detail:
+					joinSyncDetails([
+						repoStars !== null ? `仓库获星 ${repoStars}` : "",
+						followers !== null ? `关注者 ${followers}` : "",
+						events !== null ? `事件 ${events}` : "",
+					]) || "正在整理 Star 与关注事件",
+			};
+		}
+		case "notifications_summary": {
+			const notifications = readPayloadNumber(payload, "notifications");
+			return {
+				currentStep: 4,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "Inbox 已同步",
+				detail:
+					notifications !== null
+						? `拉取 ${pluralCount(notifications, "条通知")}`
+						: "正在刷新 Inbox 通知",
+			};
+		}
+		default:
+			return {
+				currentStep: 0,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "等待后台任务开始",
+				detail: "正在连接任务事件流",
+			};
+	}
+}
+
 function formatDateTime(value: string | null | undefined) {
 	if (!value) return "—";
 	const date = new Date(value);
@@ -276,7 +372,7 @@ export function Dashboard(props: {
 		onRouteStateChange,
 		warmStart = null,
 	} = props;
-	const { pushErrorToast } = useAppToast();
+	const { pushErrorToast, pushToast } = useAppToast();
 	const isRouteControlled = controlledRouteState !== undefined;
 	const isAdmin = me.user.is_admin;
 	const [dailyBoundaryLocal, _setDailyBoundaryLocal] = useState(
@@ -321,7 +417,12 @@ export function Dashboard(props: {
 	const [accessSyncStage, setAccessSyncStage] = useState<
 		"idle" | "waiting" | "star_refreshed" | "completed" | "failed"
 	>(initialAccessTask ? "waiting" : "idle");
+	const [accessSyncProgress, setAccessSyncProgress] =
+		useState<DashboardSyncProgress | null>(
+			initialAccessTask ? accessSyncProgressFromStage("waiting") : null,
+		);
 	const refreshTaskSourcesRef = useRef<Map<string, EventSource>>(new Map());
+	const syncAllInFlightRef = useRef(false);
 	const taskWaitersRef = useRef<
 		Map<
 			string,
@@ -682,6 +783,7 @@ export function Dashboard(props: {
 					current?.taskId === next.taskId ? current : next,
 				);
 				setAccessSyncStage("waiting");
+				setAccessSyncProgress(accessSyncProgressFromStage("waiting"));
 				return promise;
 			}
 			setRefreshTaskStreams((current) =>
@@ -946,6 +1048,15 @@ export function Dashboard(props: {
 			setAccessSyncStage((current) =>
 				current === "completed" ? current : "failed",
 			);
+			setAccessSyncProgress((current) =>
+				current
+					? {
+							...current,
+							stageLabel: "同步事件流已断开",
+							detail: message,
+						}
+					: null,
+			);
 			pushErrorToast("同步事件流已断开", message);
 			source.close();
 			settleTaskWaiter(accessTaskStream.taskId, new Error(message));
@@ -958,7 +1069,20 @@ export function Dashboard(props: {
 			const payload = parsePayload(event as MessageEvent<string>);
 			if (payload.stage === "star_refreshed") {
 				setAccessSyncStage("star_refreshed");
+				setAccessSyncProgress(
+					accessSyncProgressFromStage("star_refreshed", payload),
+				);
 				refreshOnUi();
+				return;
+			}
+			if (
+				payload.stage === "release_summary" ||
+				payload.stage === "social_summary" ||
+				payload.stage === "notifications_summary"
+			) {
+				setAccessSyncProgress(
+					accessSyncProgressFromStage(payload.stage, payload),
+				);
 			}
 		};
 
@@ -974,6 +1098,19 @@ export function Dashboard(props: {
 				setAccessSyncStage(
 					payload.status === "succeeded" ? "completed" : "failed",
 				);
+				setAccessSyncProgress((current) => ({
+					currentStep:
+						payload.status === "succeeded"
+							? ACCESS_SYNC_TOTAL_STEPS
+							: (current?.currentStep ?? 0),
+					totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+					stageLabel:
+						payload.status === "succeeded" ? "同步完成" : "后台同步失败",
+					detail:
+						payload.status === "succeeded"
+							? "正在刷新页面内容"
+							: (payload.error ?? "后台同步失败"),
+				}));
 				if (payload.status === "succeeded") {
 					try {
 						await refreshAll();
@@ -1475,7 +1612,26 @@ export function Dashboard(props: {
 		);
 	}, [run, trackTaskStream]);
 
+	const accessSyncRunning =
+		accessTaskStream !== null &&
+		accessSyncStage !== "completed" &&
+		accessSyncStage !== "failed";
 	const onSyncAll = useCallback(() => {
+		if (
+			syncAllInFlightRef.current ||
+			busy === SYNC_ALL_LABEL ||
+			accessSyncRunning
+		) {
+			pushToast({
+				title: "后台同步正在进行",
+				description:
+					"系统正在同步你的 GitHub 数据，可以悬浮在同步按钮上查看进度。",
+				duration: 3200,
+			});
+			return;
+		}
+		syncAllInFlightRef.current = true;
+		setAccessSyncProgress(accessSyncProgressFromStage("waiting"));
 		void run(
 			SYNC_ALL_LABEL,
 			async () => {
@@ -1488,9 +1644,11 @@ export function Dashboard(props: {
 				errorTitle: "全量同步失败",
 				fallback: "全量同步失败，请稍后重试。",
 			},
-		);
-	}, [run, trackTaskStream]);
-	const syncingAll = busy === SYNC_ALL_LABEL;
+		).finally(() => {
+			syncAllInFlightRef.current = false;
+		});
+	}, [accessSyncRunning, busy, pushToast, run, trackTaskStream]);
+	const syncingAll = busy === SYNC_ALL_LABEL || accessSyncRunning;
 	const syncingInbox = busy === "Sync inbox";
 
 	const aiDisabledHint = useMemo(() => {
@@ -1779,6 +1937,7 @@ export function Dashboard(props: {
 					aiDisabledHint={aiDisabledHint}
 					busy={Boolean(busy)}
 					syncingAll={syncingAll}
+					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
 					mobileControlBand={
 						<DashboardMobileControlBand

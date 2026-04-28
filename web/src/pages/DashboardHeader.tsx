@@ -12,10 +12,22 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { Button } from "@/components/ui/button";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { clearAllWarmStartupCaches } from "@/auth/startupCache";
 import { useAppShellChrome } from "@/layout/AppShell";
 import { InternalLink } from "@/lib/internalNavigation";
 import { cn } from "@/lib/utils";
+
+export type DashboardSyncProgress = {
+	currentStep: number;
+	totalSteps: number;
+	stageLabel: string;
+	detail: string;
+};
 
 export type DashboardHeaderProps = {
 	login: string;
@@ -26,6 +38,7 @@ export type DashboardHeaderProps = {
 	aiDisabledHint?: boolean;
 	busy?: boolean;
 	syncingAll?: boolean;
+	syncProgress?: DashboardSyncProgress | null;
 	onSyncAll?: () => void;
 	logoutHref?: string;
 	mobileControlBand?: React.ReactNode;
@@ -50,6 +63,44 @@ function resolveUserInitials(login: string, name?: string | null) {
 
 function clearStartupCacheBeforeLogout() {
 	clearAllWarmStartupCaches();
+}
+
+function DashboardSyncTooltipContent(props: {
+	progress: DashboardSyncProgress | null | undefined;
+}) {
+	const { progress } = props;
+	const currentStep = progress?.currentStep ?? 0;
+	const totalSteps = progress?.totalSteps ?? 4;
+	const stageLabel = progress?.stageLabel ?? "等待后台任务开始";
+	const detail = progress?.detail ?? "正在连接任务事件流";
+	const progressValue =
+		totalSteps > 0
+			? Math.max(0, Math.min(100, (currentStep / totalSteps) * 100))
+			: 0;
+
+	return (
+		<div className="w-64 space-y-2 py-0.5">
+			<div className="space-y-1">
+				<p className="text-xs font-semibold">正在后台同步你的 GitHub 数据</p>
+				<p className="text-[11px] leading-snug opacity-80">{stageLabel}</p>
+			</div>
+			<div className="space-y-1.5">
+				<div className="flex items-center justify-between gap-3 text-[11px] font-medium">
+					<span>阶段进度</span>
+					<span className="font-mono">
+						{currentStep}/{totalSteps}
+					</span>
+				</div>
+				<div className="h-1.5 overflow-hidden rounded-full bg-background/20">
+					<div
+						className="h-full rounded-full bg-background"
+						style={{ width: `${progressValue}%` }}
+					/>
+				</div>
+			</div>
+			<p className="text-[11px] leading-snug opacity-80">{detail}</p>
+		</div>
+	);
 }
 
 function DashboardUserAvatar(props: {
@@ -332,6 +383,7 @@ export function DashboardHeader({
 	aiDisabledHint = false,
 	busy = false,
 	syncingAll = false,
+	syncProgress = null,
 	onSyncAll,
 	logoutHref = "/auth/logout",
 	mobileControlBand = null,
@@ -525,32 +577,41 @@ export function DashboardHeader({
 							)}
 						/>
 					</div>
-					<Button
-						disabled={busy}
-						onClick={onSyncAll}
-						size={hideSubtitle ? "sm" : "default"}
-						data-app-shell-gesture-guard
-						className={cn(
-							!disableHeaderMotion &&
-								"motion-safe:transition-[height,padding,border-radius,transform] motion-safe:duration-200 motion-safe:ease-out",
-							disableHeaderMotion && "transition-none",
-							hideSubtitle && "h-9 rounded-full px-3.5 text-sm",
-							useMobileCompact && "h-8 px-3",
-						)}
-						style={
-							hideSubtitle
-								? {
-										height: `${mix(36, 32, mobileHeaderProgress)}px`,
-										paddingInline: `${mix(14, 12, mobileHeaderProgress)}px`,
-									}
-								: undefined
-						}
-					>
-						<RefreshCcw
-							className={syncingAll ? "size-4 animate-spin" : "size-4"}
-						/>
-						同步
-					</Button>
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								disabled={busy && !syncingAll}
+								onClick={onSyncAll}
+								size={hideSubtitle ? "sm" : "default"}
+								data-app-shell-gesture-guard
+								className={cn(
+									!disableHeaderMotion &&
+										"motion-safe:transition-[height,padding,border-radius,transform] motion-safe:duration-200 motion-safe:ease-out",
+									disableHeaderMotion && "transition-none",
+									hideSubtitle && "h-9 rounded-full px-3.5 text-sm",
+									useMobileCompact && "h-8 px-3",
+								)}
+								style={
+									hideSubtitle
+										? {
+												height: `${mix(36, 32, mobileHeaderProgress)}px`,
+												paddingInline: `${mix(14, 12, mobileHeaderProgress)}px`,
+											}
+										: undefined
+								}
+							>
+								<RefreshCcw
+									className={syncingAll ? "size-4 animate-spin" : "size-4"}
+								/>
+								同步
+							</Button>
+						</TooltipTrigger>
+						{syncingAll ? (
+							<TooltipContent side="bottom" align="center" sideOffset={8}>
+								<DashboardSyncTooltipContent progress={syncProgress} />
+							</TooltipContent>
+						) : null}
+					</Tooltip>
 					<DashboardUserMenu
 						login={login}
 						name={name}

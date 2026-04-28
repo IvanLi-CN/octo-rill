@@ -11,7 +11,7 @@
 ### Goals
 
 - 将 Dashboard 头部操作收敛为 `同步` 与 `Logout`，不再保留单独的 `Refresh`。
-- 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转。
+- 主同步按钮使用左侧刷新 icon，并且只在全量同步执行中旋转；同步中按钮保持可点击，悬浮提示展示阶段进度与已完成工作量。
 - 保证客户端全量同步顺序固定为 `starred -> releases -> notifications -> refreshAll`。
 - 更新 Storybook 审阅入口，并保留一张默认态视觉证据。
 
@@ -46,6 +46,8 @@
 - 顶部同步操作只保留一个名为 `同步` 的按钮。
 - 顶部不得再显示单独的 `Refresh` 按钮。
 - `同步` 按钮左侧必须有刷新系 icon，并在全量同步执行中旋转。
+- 全量同步进行中，顶部 `同步` 按钮必须保持可点击；重复点击不得新建第二个同步任务，只提示后台同步正在进行。
+- 全量同步进行中，悬浮在顶部 `同步` 按钮上必须显示阶段进度，进度来源只能使用现有 `task.progress` SSE 事件。
 - `Sync starred`、`Sync releases`、`Sync inbox` 的顶部按钮必须移除。
 - Feed 空态仅保留一个页面内 `同步` CTA，不再展示拆分同步按钮。
 - Inbox 空态与 release reaction `sync_required` 场景不得再渲染局部同步按钮。
@@ -64,7 +66,9 @@
 
 ### Core flows
 
-- 用户在 Dashboard 顶部点击 `同步`，页面进入 busy 状态；按钮禁用并展示旋转 icon。
+- 用户在 Dashboard 顶部点击 `同步`，页面进入 busy 状态；按钮保持可点击并展示旋转 icon。
+- 同步中悬浮在按钮上时，tooltip 展示“正在后台同步你的 GitHub 数据”、当前阶段、`0/4` 到 `4/4` 阶段进度，以及 SSE payload 中已有的仓库、Release、社交事件或 Inbox 通知计数。
+- 同步中再次点击 `同步` 时，前端只发出轻量 toast，不再次调用 `/api/sync/all?return_mode=task_id`。
 - 同步流程依次请求 starred、releases、notifications 三个端点；任一步失败时沿用既有 `run/busy` 错误处理，不继续后续请求。
 - Feed 空态仍可提供一个页面内 `同步` CTA，但其行为与顶部主按钮完全一致。
 
@@ -76,7 +80,7 @@
 
 ## 接口契约（Interfaces & Contracts）
 
-- `DashboardHeaderProps`：收敛为单一 `onSyncAll` 入口，并增加显式全量同步渲染态 `syncingAll`。
+- `DashboardHeaderProps`：收敛为单一 `onSyncAll` 入口，并增加显式全量同步渲染态 `syncingAll`；同步进度作为内部 UI props 传入，不改变后端接口契约。
 - `FeedList` / `FeedItemCard`：移除 `onSyncReleases` 透传，`sync_required` 仅保留提示文案。
 
 ## 验收标准（Acceptance Criteria）
@@ -87,7 +91,7 @@
 
 - Given 用户触发全量同步
   When `同步` 流程进行中
-  Then 顶部 `同步` 按钮禁用，左侧 icon 旋转，且流程顺序为 starred、releases、notifications。
+  Then 顶部 `同步` 按钮可点击，左侧 icon 旋转，悬浮 tooltip 展示阶段进度与已完成工作量，且重复点击不会新建第二个同步任务。
 
 - Given Feed 为空
   When 空态卡片显示
@@ -118,6 +122,20 @@
 ## Visual Evidence
 
 ![Dashboard default sync entry](./assets/dashboard-default.png)
+
+- source_type: `storybook_canvas`
+  target_program: `mock-only`
+  capture_scope: `browser-viewport`
+  requested_viewport: `none`
+  viewport_strategy: `storybook-viewport`
+  sensitive_exclusion: `N/A`
+  submission_gate: `approved`
+  story_id_or_title: `Pages/Dashboard Header / Syncing`
+  state: `sync-progress-tooltip`
+  evidence_note: 验证 Dashboard 页头 `同步` 按钮在全量同步中保持可点击、刷新 icon 旋转，并在悬浮气泡中展示阶段进度与已完成工作量。
+  PR: include
+  image:
+  ![Dashboard sync progress tooltip](./assets/dashboard-sync-progress-tooltip.png)
 
 ## 方案概述（Approach, high-level）
 

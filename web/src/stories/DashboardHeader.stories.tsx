@@ -2,7 +2,7 @@ import type * as React from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, userEvent, within } from "storybook/test";
+import { expect, screen, userEvent, within } from "storybook/test";
 
 import { DEFAULT_PAGE_LANE } from "@/feed/laneOptions";
 import type { FeedLane } from "@/feed/types";
@@ -261,6 +261,7 @@ const meta = {
 		aiDisabledHint: false,
 		busy: false,
 		syncingAll: false,
+		syncProgress: null,
 		onSyncAll: () => {},
 		logoutHref: "#",
 	},
@@ -310,19 +311,36 @@ export const Syncing: Story = {
 	args: {
 		busy: true,
 		syncingAll: true,
+		syncProgress: {
+			currentStep: 2,
+			totalSteps: 4,
+			stageLabel: "Release 已同步",
+			detail: "写入 42 条 Release · 覆盖 18 个仓库",
+		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
-		await expect(syncButton).toBeDisabled();
+		await expect(syncButton).toBeEnabled();
 		const icon = syncButton.querySelector("svg");
 		expect(icon?.classList.contains("animate-spin")).toBe(true);
+		await userEvent.hover(syncButton);
+		const tooltipTitles = await screen.findAllByText(
+			"正在后台同步你的 GitHub 数据",
+		);
+		expect(tooltipTitles.length).toBeGreaterThan(0);
+		await expect(tooltipTitles[0]).toBeVisible();
+		await expect(screen.getAllByText("Release 已同步")[0]).toBeVisible();
+		await expect(screen.getAllByText("2/4")[0]).toBeVisible();
+		await expect(
+			screen.getAllByText("写入 42 条 Release · 覆盖 18 个仓库")[0],
+		).toBeVisible();
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"同步中状态：右侧主按钮禁用并旋转 icon，头像入口保持稳定，退出登录继续收在浮层内。",
+					"同步中状态：右侧主按钮保持可点并旋转 icon，悬浮提示展示阶段进度与已完成工作量。",
 			},
 		},
 	},
