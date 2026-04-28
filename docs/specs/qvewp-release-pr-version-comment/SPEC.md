@@ -8,6 +8,7 @@
 
 ## 目标
 
+- Release backfill 的 GitHub API 读取请求可自愈瞬时失败，避免 `5xx` / 限流 / 临时网络错误直接阻断发布计划。
 - 仅在 release 全链路成功后，为对应 PR 回写一条版本评论。
 - 评论内容固定展示 `Version`、`Tag` 与 `Release` 链接。
 - 同一 PR 对本功能只保留一条 bot 评论；rerun / backfill 走更新，不刷屏。
@@ -16,6 +17,7 @@
 ## 非目标
 
 - 不修改 release label 语义与版本计算规则。
+- 不做 Release workflow 级自动 rerun。
 - 不为 `type:docs` / `type:skip` PR 追加“未发布”评论。
 - 不修改应用运行时 API、数据库、Docker 产物或 UI。
 - 不清理历史人工评论或其他不带本功能 marker 的 bot 评论。
@@ -30,6 +32,9 @@
   - `Release`: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${APP_RELEASE_TAG}`
 - 评论 job 必须依赖 `prepare` 与 `docker-release` 成功，确保“发版成功后”才回写。
 - 新 job 只授予评论所需的最小权限：`issues: write` 与 `pull-requests: write`，不放大全局 workflow 权限。
+- `release_backfill.py` 的 GitHub API `GET` 读取请求必须对 `429 / 500 / 502 / 503 / 504`、网络瞬断与超时做有界指数退避重试。
+- 非幂等写入请求默认不重试，避免重复 dispatch workflow 或重复写入远端状态。
+- `allow_404` 语义必须保持：允许缺失时立即返回缺失状态，不消耗重试。
 
 ## 实现要求
 
@@ -42,8 +47,13 @@
   - 支持 create / update / skip 三态。
   - 通过 GitHub Issues Comments API 查询 PR comments，并只更新最新一条受控评论。
   - 通过 `GITHUB_OUTPUT` 输出 `comment_action`、`comment_url`、`release_url` 供 workflow summary 使用。
+- Release backfill script:
+  - GitHub API `GET` object/list 读取使用统一 retry helper。
+  - 默认最多尝试 4 次；优先尊重 `Retry-After`，否则按指数退避等待。
+  - GitHub API 请求必须设置有界 timeout，确保连接卡死能进入 retry / fail-fast 路径。
+  - `POST` 请求不进入 retry helper 的多次尝试路径。
 - CI:
-  - 新增脚本级自测，覆盖 create、update、skip、stable、rc 与 workflow 接线校验。
+  - 新增脚本级自测，覆盖 create、update、skip、stable、rc、GitHub API 瞬时失败重试与 workflow 接线校验。
   - `Lint & Checks` 必须编译校验该脚本，并执行新增自测。
 
 ## 验收
@@ -67,3 +77,11 @@
 - Given `should_release=false` 或 `pr_number` 为空
   When helper 执行
   Then 不发起评论写入请求，并返回 `skip`。
+
+- Given release backfill 查询 commit 对应 PR 时 GitHub API 第一次返回 `500`
+  When 后续重试返回正常 PR 列表
+  Then `plan` 继续完成 candidate 选择，不需要人工 rerun 整条 workflow。
+
+- Given release backfill 发送 workflow dispatch 或其它非 GET 请求时远端返回 `500`
+  When helper 执行
+  Then 该请求快速失败，不自动重复提交非幂等写入。

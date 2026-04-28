@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import json
 import os
 import re
@@ -12,12 +13,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 API_VERSION = "2022-11-28"
 COMMENT_MARKER = "<!-- octo-rill:release-version -->"
 DEFAULT_COMMENT_AUTHOR = "github-actions[bot]"
+DEFAULT_GITHUB_API_MAX_ATTEMPTS = 4
+DEFAULT_GITHUB_API_TIMEOUT_SECONDS = 30
+RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 STABLE_TAG_RE = re.compile(r"^v?(?P<version>\d+\.\d+\.\d+)$")
 RC_TAG_RE = re.compile(r"^v?(?P<version>\d+\.\d+\.\d+)-rc\.[0-9a-f]{7}$")
 
@@ -81,6 +86,8 @@ class GitHubApiClient:
     def __init__(self, api_root: str, token: str) -> None:
         self.api_root = api_root.rstrip("/")
         self.token = token
+        self.max_attempts = DEFAULT_GITHUB_API_MAX_ATTEMPTS
+        self.timeout_seconds = DEFAULT_GITHUB_API_TIMEOUT_SECONDS
         self._release_cache: dict[str, bool] = {}
         self._comment_cache: dict[int, bool] = {}
 
@@ -105,14 +112,9 @@ class GitHubApiClient:
             data = json.dumps(body).encode("utf-8")
 
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request) as response:
-                payload = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            if allow_404 and exc.code == 404:
-                return None
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+        payload = self._open_with_retry(request, method=method, path=path, allow_404=allow_404)
+        if payload is None:
+            return None
 
         if not payload:
             return {}
@@ -129,12 +131,9 @@ class GitHubApiClient:
             "X-GitHub-Api-Version": API_VERSION,
         }
         request = urllib.request.Request(url, headers=headers, method="GET")
-        try:
-            with urllib.request.urlopen(request) as response:
-                payload = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub API GET {path} failed: {exc.code} {detail}") from exc
+        payload = self._open_with_retry(request, method="GET", path=path, allow_404=False)
+        if payload is None:
+            return []
 
         decoded = json.loads(payload)
         if not isinstance(decoded, list):
@@ -237,6 +236,63 @@ class GitHubApiClient:
         if not params:
             return f"{self.api_root}{path}"
         return f"{self.api_root}{path}?{params}"
+
+    def _open_with_retry(
+        self,
+        request: urllib.request.Request,
+        *,
+        method: str,
+        path: str,
+        allow_404: bool,
+    ) -> str | None:
+        max_attempts = self.max_attempts if method.upper() == "GET" else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                if allow_404 and exc.code == 404:
+                    return None
+                detail = exc.read().decode("utf-8", errors="replace")
+                if not self._should_retry_http_error(exc, method=method, attempt=attempt, max_attempts=max_attempts):
+                    raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+                self._sleep_before_retry(exc, attempt=attempt)
+            except (TimeoutError, urllib.error.URLError) as exc:
+                if method.upper() != "GET" or attempt >= max_attempts:
+                    raise RuntimeError(f"GitHub API {method} {path} failed: {exc}") from exc
+                self._sleep_before_retry(None, attempt=attempt)
+        raise RuntimeError(f"GitHub API {method} {path} failed after {max_attempts} attempts")
+
+    def _should_retry_http_error(
+        self,
+        exc: urllib.error.HTTPError,
+        *,
+        method: str,
+        attempt: int,
+        max_attempts: int,
+    ) -> bool:
+        return (
+            method.upper() == "GET"
+            and exc.code in RETRYABLE_HTTP_STATUS_CODES
+            and attempt < max_attempts
+        )
+
+    def _sleep_before_retry(self, exc: urllib.error.HTTPError | None, *, attempt: int) -> None:
+        headers = exc.headers if exc is not None else None
+        retry_after = headers.get("Retry-After") if headers is not None else None
+        if retry_after and retry_after.isdecimal():
+            delay = int(retry_after)
+        elif retry_after:
+            try:
+                retry_at = email.utils.parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = int(max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0))
+            except (TypeError, ValueError):
+                delay = min(2 ** (attempt - 1), 8)
+        else:
+            delay = min(2 ** (attempt - 1), 8)
+        time.sleep(max(delay, 0))
 
 
 def parse_args() -> argparse.Namespace:

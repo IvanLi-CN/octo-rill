@@ -144,6 +144,7 @@ python3 - <<'PY' \
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 from pathlib import Path
 
@@ -164,6 +165,125 @@ def load_module(path: Path, name: str):
 
 module = load_module(backfill_path, "release_backfill")
 contract = load_module(contract_path, "quality_gates_contract")
+
+
+class FakeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self.payload
+
+
+def http_error(
+    url: str,
+    code: int,
+    body: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> module.urllib.error.HTTPError:
+    return module.urllib.error.HTTPError(
+        url,
+        code,
+        "error",
+        headers or {},
+        io.BytesIO(body),
+    )
+
+
+original_urlopen = module.urllib.request.urlopen
+original_sleep = module.time.sleep
+sleep_calls: list[int] = []
+module.time.sleep = lambda delay: sleep_calls.append(delay)
+
+try:
+    transient_calls = {"count": 0}
+
+    def flaky_commit_pulls(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        transient_calls["count"] += 1
+        if transient_calls["count"] == 1:
+            raise http_error(request.full_url, 500, b"temporary", {"Retry-After": "3"})
+        return FakeResponse(b'[{"number":128,"html_url":"https://github.com/IvanLi-CN/octo-rill/pull/128"}]')
+
+    module.urllib.request.urlopen = flaky_commit_pulls
+    retry_client = module.GitHubApiClient("https://api.github.test", "token")
+    assert retry_client.pull_for_commit("IvanLi-CN/octo-rill", "sha-transient") == (
+        128,
+        "https://github.com/IvanLi-CN/octo-rill/pull/128",
+    )
+    assert transient_calls["count"] == 2
+    assert sleep_calls == [3]
+    sleep_calls.clear()
+
+    network_calls = {"count": 0}
+
+    def flaky_network(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        network_calls["count"] += 1
+        if network_calls["count"] == 1:
+            raise module.urllib.error.URLError("connection reset")
+        return FakeResponse(b'{"ok":true}')
+
+    module.urllib.request.urlopen = flaky_network
+    assert retry_client.request_json("/repos/IvanLi-CN/octo-rill/actions/runs/1") == {"ok": True}
+    assert network_calls["count"] == 2
+    assert sleep_calls == [1]
+
+    allow_404_calls = {"count": 0}
+
+    def missing_release(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        allow_404_calls["count"] += 1
+        raise http_error(request.full_url, 404, b"not found")
+
+    module.urllib.request.urlopen = missing_release
+    assert retry_client.request_json("/repos/IvanLi-CN/octo-rill/releases/tags/v0.0.0", allow_404=True) is None
+    assert allow_404_calls["count"] == 1
+
+    forbidden_calls = {"count": 0}
+
+    def forbidden_request(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        forbidden_calls["count"] += 1
+        raise http_error(request.full_url, 403, b"forbidden")
+
+    module.urllib.request.urlopen = forbidden_request
+    try:
+        retry_client.request_json_list("/repos/IvanLi-CN/octo-rill/commits/sha/pulls")
+    except RuntimeError as exc:
+        assert "failed: 403 forbidden" in str(exc)
+    else:
+        raise AssertionError("expected non-retryable 403 to fail")
+    assert forbidden_calls["count"] == 1
+
+    post_calls = {"count": 0}
+
+    def failing_post(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        post_calls["count"] += 1
+        raise http_error(request.full_url, 500, b"server error")
+
+    module.urllib.request.urlopen = failing_post
+    try:
+        retry_client.request_json(
+            "/repos/IvanLi-CN/octo-rill/actions/workflows/release.yml/dispatches",
+            method="POST",
+            body={"ref": "main"},
+        )
+    except RuntimeError as exc:
+        assert "failed: 500 server error" in str(exc)
+    else:
+        raise AssertionError("expected non-GET 500 to fail without retry")
+    assert post_calls["count"] == 1
+finally:
+    module.urllib.request.urlopen = original_urlopen
+    module.time.sleep = original_sleep
 
 stable_intent = module.parse_release_intent(["type:minor", "channel:stable"])
 assert stable_intent.should_release is True
