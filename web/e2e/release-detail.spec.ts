@@ -50,6 +50,11 @@ type ApiOptions = {
 	releaseDetailPendingPolls?: number;
 	releaseDetailInitialStatus?: "ready" | "missing" | "error";
 	releaseDetailInitialError?: TranslationErrorPayload;
+	releaseDetailSmartInitialStatus?:
+		| "ready"
+		| "missing"
+		| "error"
+		| "insufficient";
 	releaseDetailRequestStatus?: "ready" | "error" | "disabled";
 	releaseDetailRequestError?: TranslationErrorPayload;
 };
@@ -326,6 +331,33 @@ function makeReleaseDetailTranslatedPayload(
 	};
 }
 
+function makeReleaseDetailSmartPayload(
+	cfg: ApiOptions,
+	status: "ready" | "missing" | "error" | "insufficient",
+) {
+	if (status === "ready") {
+		return {
+			lang: "zh-CN",
+			status: "ready" as const,
+			title: `润色 ${cfg.releaseId}`,
+			summary: `- 润色 release ${cfg.releaseId} 的主要版本变化。`,
+			error_code: null,
+			error_summary: null,
+			error_detail: null,
+		};
+	}
+	return {
+		lang: "zh-CN",
+		status,
+		title: null,
+		summary: null,
+		error_code: status === "error" ? "smart_error" : null,
+		error_summary: status === "error" ? "润色失败" : null,
+		error_detail: status === "error" ? "smart summary failed" : null,
+		auto_translate: status === "missing" ? undefined : false,
+	};
+}
+
 function makeReleaseDetailRequestResult(
 	cfg: ApiOptions,
 	status: "queued" | "running" | "ready" | "error" | "disabled",
@@ -591,6 +623,7 @@ async function installApiMocks(
 					uses_custom_open_graph_image: false,
 				},
 				tag_name: "v1.2.3",
+				previous_tag_name: "v1.2.2",
 				name: cfg.detailTitle,
 				body: "- fix A\n- fix B",
 				body_truncated: false,
@@ -601,6 +634,10 @@ async function installApiMocks(
 				translated: makeReleaseDetailTranslatedPayload(
 					cfg,
 					cfg.releaseDetailInitialStatus ?? "missing",
+				),
+				smart: makeReleaseDetailSmartPayload(
+					cfg,
+					cfg.releaseDetailSmartInitialStatus ?? "insufficient",
 				),
 			});
 		}
@@ -630,6 +667,7 @@ async function installApiMocks(
 						uses_custom_open_graph_image: false,
 					},
 					tag_name: tag,
+					previous_tag_name: "v1.2.2",
 					name: cfg.detailTitle,
 					body: "- fix A\n- fix B",
 					body_truncated: false,
@@ -640,6 +678,10 @@ async function installApiMocks(
 					translated: makeReleaseDetailTranslatedPayload(
 						cfg,
 						cfg.releaseDetailInitialStatus ?? "missing",
+					),
+					smart: makeReleaseDetailSmartPayload(
+						cfg,
+						cfg.releaseDetailSmartInitialStatus ?? "insufficient",
 					),
 				});
 			}
@@ -926,7 +968,7 @@ test("detail translate button updates card content", async ({ page }) => {
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
-	await page.getByRole("button", { name: "翻译" }).click();
+	await page.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		page.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
@@ -934,10 +976,47 @@ test("detail translate button updates card content", async ({ page }) => {
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
 
-	await page.getByRole("button", { name: "原文" }).click();
+	await page.getByRole("tab", { name: "原文" }).click();
 	await expect(
 		page.getByRole("heading", { name: "Release 123" }),
 	).toBeVisible();
+});
+
+test("detail dialog defaults to smart when smart content is ready", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseDetailSmartInitialStatus: "ready",
+	});
+
+	await page.goto("/?tab=briefs&release=123");
+	const dialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(
+		dialog.getByRole("tab", { name: "润色", selected: true }),
+	).toBeVisible();
+	await expect(dialog.getByRole("heading", { name: "润色 123" })).toBeVisible();
+	await expect(
+		dialog.getByText("润色 release 123 的主要版本变化。", { exact: true }),
+	).toBeVisible();
+});
+
+test("detail smart loading keeps original content visible", async ({
+	page,
+}) => {
+	await installApiMocks(page, {
+		releaseDetailSmartInitialStatus: "missing",
+		smartResolveDelayMs: 3000,
+	});
+
+	await page.goto("/?tab=briefs&release=123");
+	const dialog = page.getByRole("dialog", { name: "Release 详情" });
+	await expect(
+		dialog.getByRole("tab", { name: "润色中…", selected: true }),
+	).toBeVisible();
+	await expect(
+		dialog.getByRole("heading", { name: "Release 123" }),
+	).toBeVisible();
+	await expect(dialog.getByText("fix A", { exact: true })).toBeVisible();
 });
 
 test("shared markdown compacts raw GitHub links and keeps long links wrapped", async ({
@@ -988,7 +1067,7 @@ test("shared markdown compacts raw GitHub links and keeps long links wrapped", a
 		.click();
 	const detailDialog = page.getByRole("dialog", { name: "Release 详情" });
 	await expect(detailDialog).toBeVisible();
-	await detailDialog.getByRole("button", { name: "翻译" }).click();
+	await detailDialog.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		detailDialog.getByRole("link", { name: "4d8f459" }),
 	).toBeVisible();
@@ -1007,7 +1086,7 @@ test("detail translate keeps polling an in-flight request until the result is re
 	await page.goto("/?tab=briefs&release=123");
 	await expect(page.getByText(/Cannot read properties/i)).toHaveCount(0);
 
-	await page.getByRole("button", { name: "翻译" }).click();
+	await page.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		page.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
@@ -1033,6 +1112,7 @@ test("detail translate failure keeps the last ready translation visible and fall
 	});
 
 	await page.goto("/?tab=briefs&release=123");
+	await page.getByRole("tab", { name: "翻译" }).click();
 	await expect(
 		page.getByRole("heading", { name: "发布说明 123" }),
 	).toBeVisible();
@@ -1040,7 +1120,7 @@ test("detail translate failure keeps the last ready translation visible and fall
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
 
-	await page.getByRole("button", { name: "翻译" }).click();
+	await page.getByRole("tab", { name: "翻译" }).click();
 
 	await expect(
 		page.getByRole("heading", { name: "发布说明 123" }),
@@ -1048,7 +1128,7 @@ test("detail translate failure keeps the last ready translation visible and fall
 	await expect(
 		page.getByText("这是 release 123 的中文详情摘要。", { exact: true }),
 	).toBeVisible();
-	await expect(page.getByRole("button", { name: "原文" })).toBeVisible();
+	await expect(page.getByRole("tab", { name: "原文" })).toBeVisible();
 	await expect(page.getByRole("button", { name: "查看原文" })).toHaveCount(0);
 	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
 	await expect(
@@ -1079,6 +1159,7 @@ test("detail retry failure stays visible after switching to the original text", 
 	});
 
 	await page.goto("/?tab=briefs&release=123");
+	await page.getByRole("tab", { name: "翻译" }).click();
 	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
 
 	await page.getByRole("button", { name: "查看原文" }).click();
@@ -1087,7 +1168,7 @@ test("detail retry failure stays visible after switching to the original text", 
 	).toBeVisible();
 	await expect(page.getByText("fix A", { exact: true })).toBeVisible();
 
-	await page.getByRole("button", { name: "翻译" }).click();
+	await page.getByRole("tab", { name: "翻译" }).click();
 	await expect(page.getByText("翻译失败", { exact: true })).toBeVisible();
 	await expect(
 		page.getByText("Markdown 结构校验失败", { exact: true }),
