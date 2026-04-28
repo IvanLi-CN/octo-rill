@@ -5266,6 +5266,7 @@ pub struct ReleaseDetailResponse {
     repo_full_name: Option<String>,
     repo_visual: Option<RepoVisual>,
     tag_name: String,
+    previous_tag_name: Option<String>,
     name: Option<String>,
     body: Option<String>,
     html_url: String,
@@ -5273,6 +5274,7 @@ pub struct ReleaseDetailResponse {
     is_prerelease: i64,
     is_draft: i64,
     translated: Option<TranslatedItem>,
+    smart: Option<SmartItem>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -5290,12 +5292,19 @@ struct ReleaseDetailRow {
     published_at: Option<String>,
     is_prerelease: i64,
     is_draft: i64,
+    previous_tag_name: Option<String>,
     trans_source_hash: Option<String>,
     trans_status: Option<String>,
     trans_title: Option<String>,
     trans_summary: Option<String>,
     trans_error_text: Option<String>,
     trans_work_status: Option<String>,
+    smart_source_hash: Option<String>,
+    smart_status: Option<String>,
+    smart_title: Option<String>,
+    smart_summary: Option<String>,
+    smart_error_text: Option<String>,
+    smart_work_status: Option<String>,
 }
 
 async fn fetch_release_detail_row_by_release_id(
@@ -5319,13 +5328,30 @@ async fn fetch_release_detail_row_by_release_id(
           r.published_at,
           r.is_prerelease,
           r.is_draft,
+          rp.previous_tag_name,
           t.source_hash AS trans_source_hash,
           t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary,
           t.error_text AS trans_error_text,
-          tw.status AS trans_work_status
+          tw.status AS trans_work_status,
+          s.source_hash AS smart_source_hash,
+          s.status AS smart_status,
+          s.title AS smart_title,
+          s.summary AS smart_summary,
+          s.error_text AS smart_error_text,
+          sw.status AS smart_work_status
         FROM repo_releases r
+        LEFT JOIN (
+          SELECT
+            release_id,
+            LAG(tag_name) OVER (
+              PARTITION BY repo_id
+              ORDER BY COALESCE(published_at, created_at, updated_at) ASC, release_id ASC
+            ) AS previous_tag_name
+          FROM repo_releases
+        ) rp
+          ON rp.release_id = r.release_id
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
@@ -5336,10 +5362,19 @@ async fn fetch_release_detail_row_by_release_id(
           AND t.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
+        LEFT JOIN ai_translations s
+          ON s.user_id = ?
+          AND s.entity_type = 'release_smart'
+          AND s.entity_id = CAST(r.release_id AS TEXT)
+          AND s.lang = 'zh-CN'
+          AND s.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items sw
+          ON sw.id = s.active_work_item_id
         WHERE r.release_id = ?
         LIMIT 1
         "#,
     )
+    .bind(user_id)
     .bind(user_id)
     .bind(user_id)
     .bind(release_id)
@@ -5370,13 +5405,30 @@ async fn fetch_release_detail_row_by_locator(
           r.published_at,
           r.is_prerelease,
           r.is_draft,
+          rp.previous_tag_name,
           t.source_hash AS trans_source_hash,
           t.status AS trans_status,
           t.title AS trans_title,
           t.summary AS trans_summary,
           t.error_text AS trans_error_text,
-          tw.status AS trans_work_status
+          tw.status AS trans_work_status,
+          s.source_hash AS smart_source_hash,
+          s.status AS smart_status,
+          s.title AS smart_title,
+          s.summary AS smart_summary,
+          s.error_text AS smart_error_text,
+          sw.status AS smart_work_status
         FROM repo_releases r
+        LEFT JOIN (
+          SELECT
+            release_id,
+            LAG(tag_name) OVER (
+              PARTITION BY repo_id
+              ORDER BY COALESCE(published_at, created_at, updated_at) ASC, release_id ASC
+            ) AS previous_tag_name
+          FROM repo_releases
+        ) rp
+          ON rp.release_id = r.release_id
         LEFT JOIN user_release_visible_repos sr
           ON sr.user_id = ? AND sr.repo_id = r.repo_id
         LEFT JOIN ai_translations t
@@ -5387,12 +5439,21 @@ async fn fetch_release_detail_row_by_locator(
           AND t.status IN ('ready', 'disabled', 'missing', 'error')
         LEFT JOIN translation_work_items tw
           ON tw.id = t.active_work_item_id
+        LEFT JOIN ai_translations s
+          ON s.user_id = ?
+          AND s.entity_type = 'release_smart'
+          AND s.entity_id = CAST(r.release_id AS TEXT)
+          AND s.lang = 'zh-CN'
+          AND s.status IN ('ready', 'disabled', 'missing', 'error')
+        LEFT JOIN translation_work_items sw
+          ON sw.id = s.active_work_item_id
         WHERE r.tag_name = ?
           AND (instr(lower(r.html_url), ?) = 1 OR instr(lower(r.html_url), ?) = 1)
         ORDER BY r.published_at DESC, r.created_at DESC, r.release_id DESC
         LIMIT 1
         "#,
     )
+    .bind(user_id)
     .bind(user_id)
     .bind(user_id)
     .bind(&locator.tag)
@@ -5431,12 +5492,28 @@ async fn build_release_detail_response(
     let resolved_full_name = resolve_release_full_name(&row.html_url, row.repo_id);
     let source_hash =
         release_detail_source_hash(&resolved_full_name, &original_title, &original_body);
+    let smart_body = release_feed_body(row.body.as_deref());
+    let smart_source_hash = crate::translations::release_smart_feed_source_hash(
+        row.release_id.to_string().as_str(),
+        &resolved_full_name,
+        &original_title,
+        smart_body.as_deref(),
+        &row.tag_name,
+        row.previous_tag_name.as_deref(),
+    );
     let translation_fresh = row.trans_source_hash.as_deref() == Some(source_hash.as_str());
+    let smart_fresh = row.smart_source_hash.as_deref() == Some(smart_source_hash.as_str());
 
     let refresh_in_flight = !translation_fresh
         && row.trans_status.as_deref() == Some("ready")
         && matches!(
             row.trans_work_status.as_deref(),
+            Some("queued" | "batched" | "running")
+        );
+    let smart_refresh_in_flight = !smart_fresh
+        && row.smart_status.as_deref() == Some("ready")
+        && matches!(
+            row.smart_work_status.as_deref(),
             Some("queued" | "batched" | "running")
         );
 
@@ -5476,6 +5553,28 @@ async fn build_release_detail_response(
         }
     };
 
+    let smart = if state.config.ai.is_none() {
+        Some(smart_item("disabled", None, None, None, None))
+    } else if smart_fresh {
+        if let Some(status) = row.smart_status.as_deref()
+            && status != "ready"
+        {
+            smart_terminal_item(status, row.smart_error_text.as_deref())
+        } else {
+            smart_ready_item(row.smart_title.clone(), row.smart_summary.clone(), None)
+                .or_else(|| Some(smart_missing_item(None)))
+        }
+    } else if smart_refresh_in_flight {
+        smart_ready_item(
+            row.smart_title.clone(),
+            row.smart_summary.clone(),
+            Some(true),
+        )
+        .or_else(|| Some(smart_missing_item(Some(false))))
+    } else {
+        Some(smart_missing_item(None))
+    };
+
     let repo_visual = repo_visual_from_parts(
         row.owner_avatar_url,
         row.open_graph_image_url,
@@ -5487,6 +5586,7 @@ async fn build_release_detail_response(
         repo_full_name: row.repo_full_name.or(Some(resolved_full_name)),
         repo_visual,
         tag_name: row.tag_name,
+        previous_tag_name: row.previous_tag_name,
         name: row.name,
         body: row.body,
         html_url: row.html_url,
@@ -5494,6 +5594,7 @@ async fn build_release_detail_response(
         is_prerelease: row.is_prerelease,
         is_draft: row.is_draft,
         translated,
+        smart,
     })
 }
 

@@ -19,11 +19,11 @@
 - 新增独立的 `release_smart` 调度/缓存语义，与现有 release 翻译缓存隔离。
 - 卡片内 lane selector 改为 icon-only，但保留 tooltip 与可访问标签。
 - 当 `翻译` / `润色` 正在生成时，卡片正文继续显示原文；加载反馈仅通过对应 option 的呼吸态表达，不再把正文区替换成空白加载面板。
+- Release detail 弹窗补齐 `原文 / 翻译 / 润色` 三态阅读模式，打开时默认选中 `润色`，并复用 `release_smart/feed_card` 缓存与请求链路。
 - 为 UI 改动补齐 Storybook 场景、视觉证据和回归测试，并推进到 PR merge-ready。
 
 ### Non-goals
 
-- 不扩展 Release detail 弹窗为三 tabs。
 - 不为历史全量 release 做 smart 预热。
 - 不重构 `ai_translations` 的全局唯一键结构。
 - 不持久化完整 raw compare diff。
@@ -39,12 +39,12 @@
 - compare diff 的按需精简 payload builder。
 - 翻译 / 润色 lane 的原文回退展示与 option 呼吸态。
 - 仅版本号折叠卡片样式。
+- Release detail 弹窗的三态 segmented control、默认 `润色` 状态、smart 缺失按需生成与原文 fallback。
 - 本地 SQLite 运行时稳定性修复，避免 smart/translation 后台任务把桌面预览拖进 `database is locked` 自锁状态。
 - Storybook 状态覆盖、Playwright 回归、spec visual evidence。
 
 ### Out of scope
 
-- Release detail 页面/弹窗的 smart lane。
 - 历史 release 数据回填任务。
 - 后台数据模型新增新的 terminal status 列举。
 - 原始 GitHub diff 存档与下载能力。
@@ -66,6 +66,16 @@
 - 固定 variant：`feed_card`
 - entity_type：`release_smart`
 - target slots：`title_zh` + `body_md`
+
+### `/api/releases/{id}/detail` release detail 扩展
+
+- 现有 `translated` 字段保持兼容。
+- 新增 additive 字段 `smart`，结构与 `/api/feed` 的 smart lane 语义一致：
+  - `status` 允许 `ready | missing | disabled | error | insufficient`
+  - `title` 为可选中文标题；为空时前端回退原始 release 标题
+  - `summary` 为 Markdown 要点正文；缺失或生成中时详情弹窗继续展示原文正文
+  - `auto_translate` 继续用于判断是否允许自动补算或重试
+- 详情弹窗的 smart cache 判定使用 `release_smart/feed_card` source hash，不新增 entity_type、kind 或数据库迁移。
 
 ### Smart terminal mapping
 
@@ -132,6 +142,8 @@
 - 若 smart lane 处于 `error` 且用户点击 `重试润色`，错误态 action 按钮必须立刻进入 spinning/loading，并在请求完成前保持 disabled，避免重复点击。
 - 原文 tab 永远可立即阅读；若正文为空，仅显示无正文提示，不回退其它 lane 内容。
 - 润色 ready 内容必须是纯要点列表，不得退化为原文直译。
+- Release detail 弹窗打开时默认选中 `润色`；当 smart ready 时显示润色标题和正文，当 smart missing 或可自动重试错误时触发 `/api/translate/results` 按需补算，并在生成期间继续显示原文。
+- Release detail 弹窗仍保留 `原文`、`翻译`、`润色` 三个明确入口；`GitHub` 与 `关闭` 动作保持在弹窗头部右侧，不被阅读模式切换遮挡。
 
 ## 验收标准（Acceptance Criteria）
 
@@ -215,6 +227,14 @@
   When feed 刷新
   Then 两者互不覆盖，分别保持独立缓存与状态。
 
+- Given Release detail 同时存在 translated 与 smart 结果
+  When 用户打开 Release 详情弹窗
+  Then 弹窗默认选中 `润色` 并展示 smart 内容；切换 `原文` / `翻译` / `润色` 不会遮挡 GitHub 与关闭动作。
+
+- Given Release detail 的 smart 结果缺失
+  When 弹窗默认进入 `润色`
+  Then `润色` 选项显示生成中，正文继续展示原始 release notes，直到 smart 结果回填或进入终态。
+
 ## 非功能性要求 / 质量门槛
 
 - Rust：补 smart prompt/parser/diff fallback/read-model 单测。
@@ -266,3 +286,17 @@
   evidence_note: 验证 body 与 diff 都没有有效版本信息时，卡片收敛为仅版本号折叠样式，不再渲染 tabs 与正文区。
 
   ![仅版本号折叠卡片](./assets/release-smart-insufficient-focused.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/ReleaseDetailSmartDefaultReady`
+  state: `release-detail-smart-default-ready`
+  evidence_note: 验证 Release 详情弹窗默认选中 `润色`，并优先展示 `release_smart/feed_card` 缓存，同时保留 GitHub 与关闭动作。
+
+  ![Release 详情默认润色](./assets/release-detail-smart-default-ready.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/ReleaseDetailSmartLoadingOriginalFallback`
+  state: `release-detail-smart-loading-original-fallback`
+  evidence_note: 验证 Release 详情弹窗在 smart 缺失时显示 `润色中…`，正文继续保留原始 release notes。
+
+  ![Release 详情润色生成中保留原文](./assets/release-detail-smart-loading-original-fallback.png)
