@@ -951,11 +951,22 @@ export type ReleaseDetailTranslated = {
 	error_detail?: string | null;
 	auto_translate?: boolean;
 };
+export type ReleaseDetailSmart = {
+	lang: string;
+	status: "ready" | "missing" | "disabled" | "error" | "insufficient";
+	title: string | null;
+	summary: string | null;
+	error_code?: string | null;
+	error_summary?: string | null;
+	error_detail?: string | null;
+	auto_translate?: boolean;
+};
 export type ReleaseDetailResponse = {
 	release_id: string;
 	repo_full_name: string | null;
 	repo_visual: RepoVisual | null;
 	tag_name: string;
+	previous_tag_name: string | null;
 	name: string | null;
 	body: string | null;
 	html_url: string;
@@ -963,6 +974,7 @@ export type ReleaseDetailResponse = {
 	is_prerelease: number;
 	is_draft: number;
 	translated: ReleaseDetailTranslated | null;
+	smart: ReleaseDetailSmart | null;
 };
 export async function apiGetReleaseDetail(
 	releaseId: string,
@@ -1072,6 +1084,43 @@ export function mapTranslationResultToReleaseDetailTranslated(
 		error_code: result.error_code,
 		error_summary: result.error_summary,
 		error_detail: result.error_detail,
+	};
+}
+export function mapTranslationResultToReleaseDetailSmart(
+	result: TranslationResultItem,
+): ReleaseDetailSmart | null {
+	if (
+		result.status !== "ready" &&
+		result.status !== "disabled" &&
+		result.status !== "missing" &&
+		result.status !== "error"
+	) {
+		return null;
+	}
+	const retrySignal = result.error_detail ?? result.error;
+	const retryable =
+		typeof retrySignal === "string" &&
+		/runtime_lease_expired|repo scope required; re-login via github oauth|database is locked|busy|timeout|timed out|temporarily unavailable|connection reset|connection refused/i.test(
+			retrySignal,
+		);
+	const status =
+		result.status === "missing" && result.error === "no_valuable_version_info"
+			? "insufficient"
+			: result.status === "error" && retryable
+				? "missing"
+				: result.status;
+	return {
+		lang: "zh-CN",
+		status,
+		title: result.title_zh,
+		summary: result.body_md ?? result.summary_md,
+		error_code: result.error_code,
+		error_summary: result.error_summary,
+		error_detail: result.error_detail,
+		auto_translate:
+			status === "insufficient" || (result.status === "error" && !retryable)
+				? false
+				: retryable || undefined,
 	};
 }
 export type TranslationBatchSubmitItemResponse = {

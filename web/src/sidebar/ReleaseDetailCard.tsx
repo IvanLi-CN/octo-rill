@@ -1,4 +1,11 @@
-import { ArrowUpRight, Languages, RefreshCcw, X } from "lucide-react";
+import {
+	ArrowUpRight,
+	FileText,
+	Languages,
+	RefreshCcw,
+	Sparkles,
+	X,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -7,9 +14,11 @@ import {
 	ApiError,
 	apiGetReleaseDetail,
 	apiGetReleaseDetailByRepoTag,
+	apiResolveTranslationResults,
 	apiGetTranslationRequest,
 	apiTranslateReleaseDetail,
 	isPendingTranslationResultStatus,
+	mapTranslationResultToReleaseDetailSmart,
 	mapTranslationResultToReleaseDetailTranslated,
 } from "@/api";
 import { useAppToast } from "@/components/feedback/AppToast";
@@ -32,15 +41,30 @@ import {
 	resolveErrorSummary,
 } from "@/lib/errorPresentation";
 import { normalizeReleaseId } from "@/lib/releaseId";
+import { cn } from "@/lib/utils";
 
 const REQUEST_STATUS_POLL_INTERVAL_MS = 600;
 const REQUEST_STATUS_POLL_WINDOW_MS = 20_000;
 const REQUEST_NOT_FOUND_ERROR_CODE = "not_found";
+const SMART_RESOLVE_MAX_WAIT_MS = 5_000;
+const RELEASE_FEED_BODY_MAX_CHARS = 3_000;
 
 type ReleaseDetailUiError = {
 	summary: string;
 	detail?: string | null;
 };
+
+type ReleaseDetailLane = "original" | "translated" | "smart";
+
+const RELEASE_DETAIL_LANES: Array<{
+	lane: ReleaseDetailLane;
+	label: string;
+	icon: typeof FileText;
+}> = [
+	{ lane: "original", label: "原文", icon: FileText },
+	{ lane: "translated", label: "翻译", icon: Languages },
+	{ lane: "smart", label: "润色", icon: Sparkles },
+];
 
 function sleep(ms: number) {
 	return new Promise((resolve) => {
@@ -89,6 +113,57 @@ function hasReadyTranslatedContent(
 		return false;
 	}
 	return Boolean(translated.title?.trim() || translated.summary?.trim());
+}
+
+function shouldResolveSmart(
+	smart: ReleaseDetailResponse["smart"] | null | undefined,
+) {
+	return (
+		!smart ||
+		(smart.status === "missing" && smart.auto_translate !== false) ||
+		(smart.status === "error" && smart.auto_translate !== false)
+	);
+}
+
+function truncateChars(raw: string, maxChars: number) {
+	return Array.from(raw).slice(0, maxChars).join("");
+}
+
+function releaseFeedBody(body: string | null | undefined) {
+	const trimmed = body?.replace(/\r\n/g, "\n").trim();
+	if (!trimmed) return null;
+	return truncateChars(trimmed, RELEASE_FEED_BODY_MAX_CHARS);
+}
+
+function releaseSmartMetadataText(detail: ReleaseDetailResponse) {
+	const repoFullName = detail.repo_full_name?.trim() ?? "";
+	let metadata = `repo=${repoFullName}\nhead_tag=${detail.tag_name}`;
+	const previousTagName = detail.previous_tag_name?.trim();
+	if (previousTagName) {
+		metadata += `\ncompare_base_tag=${previousTagName}`;
+	}
+	return metadata;
+}
+
+function buildReleaseSmartRequestItem(detail: ReleaseDetailResponse) {
+	const title =
+		detail.name?.trim() || detail.tag_name || `release:${detail.release_id}`;
+	const body = releaseFeedBody(detail.body);
+	const metadata = releaseSmartMetadataText(detail);
+	return {
+		producer_ref: `feed.smart:release:${detail.release_id}`,
+		kind: "release_smart" as const,
+		variant: "feed_card",
+		entity_id: detail.release_id,
+		target_lang: "zh-CN",
+		max_wait_ms: SMART_RESOLVE_MAX_WAIT_MS,
+		source_blocks: [
+			{ slot: "title" as const, text: title },
+			...(body ? [{ slot: "body_markdown" as const, text: body }] : []),
+			...(metadata ? [{ slot: "metadata" as const, text: metadata }] : []),
+		],
+		target_slots: ["title_zh" as const, "body_md" as const],
+	};
 }
 
 function normalizeReleaseTarget(
@@ -151,14 +226,20 @@ export function ReleaseDetailCard(props: {
 	);
 	const [loading, setLoading] = useState(false);
 	const [translating, setTranslating] = useState(false);
+	const [smartResolving, setSmartResolving] = useState(false);
 	const [loadError, setLoadError] = useState<ReleaseDetailUiError | null>(null);
 	const [translateError, setTranslateError] =
 		useState<ReleaseDetailUiError | null>(null);
-	const [showOriginal, setShowOriginal] = useState(false);
+	const [smartError, setSmartError] = useState<ReleaseDetailUiError | null>(
+		null,
+	);
+	const [selectedLane, setSelectedLane] = useState<ReleaseDetailLane>("smart");
 	const [detail, setDetail] = useState<ReleaseDetailResponse | null>(null);
 	const [detailTargetKey, setDetailTargetKey] = useState<string | null>(null);
 	const translateRequestSeqRef = useRef(0);
+	const smartRequestSeqRef = useRef(0);
 	const loadRequestSeqRef = useRef(0);
+	const smartAutoAttemptedKeyRef = useRef<string | null>(null);
 	const pendingTranslationRequestRef = useRef<{
 		releaseId: string;
 		requestId: string;
@@ -175,8 +256,9 @@ export function ReleaseDetailCard(props: {
 			setLoading(true);
 			setLoadError(null);
 			setTranslateError(null);
+			setSmartError(null);
 			if (options?.resetDisplay !== false) {
-				setShowOriginal(false);
+				setSelectedLane("smart");
 				setDetail(null);
 				setDetailTargetKey(null);
 			}
@@ -205,13 +287,17 @@ export function ReleaseDetailCard(props: {
 
 	useEffect(() => {
 		translateRequestSeqRef.current += 1;
+		smartRequestSeqRef.current += 1;
+		smartAutoAttemptedKeyRef.current = null;
 		setTranslating(false);
+		setSmartResolving(false);
 		if (!normalizedTarget || !activeTargetKey) {
 			pendingTranslationRequestRef.current = null;
 			setDetail(null);
 			setDetailTargetKey(null);
 			setLoadError(null);
 			setTranslateError(null);
+			setSmartError(null);
 			return;
 		}
 		loadDetail(normalizedTarget, { resetDisplay: true });
@@ -232,7 +318,19 @@ export function ReleaseDetailCard(props: {
 	}, [activeDetail]);
 
 	const activeTranslationError =
-		translateError ?? (showOriginal ? null : detailTranslationError);
+		selectedLane === "translated"
+			? (translateError ?? detailTranslationError)
+			: null;
+
+	const detailSmartError = useMemo(() => {
+		if (activeDetail?.smart?.status !== "error") {
+			return null;
+		}
+		return toUiError(activeDetail.smart, "这次润色没有成功完成。");
+	}, [activeDetail]);
+
+	const activeSmartError =
+		selectedLane === "smart" ? (smartError ?? detailSmartError) : null;
 
 	const onTranslate = useCallback(() => {
 		if (!activeDetail || translating) return;
@@ -314,7 +412,7 @@ export function ReleaseDetailCard(props: {
 					: null,
 			);
 			if (translated.status === "ready") {
-				setShowOriginal(false);
+				setSelectedLane("translated");
 			}
 		})()
 			.catch((error) => {
@@ -334,6 +432,97 @@ export function ReleaseDetailCard(props: {
 			});
 	}, [activeDetail, pushErrorToast, translating]);
 
+	const onResolveSmart = useCallback(
+		(options?: { selectLane?: boolean; retryOnError?: boolean }) => {
+			if (!activeDetail || smartResolving) return;
+			if (options?.selectLane !== false) {
+				setSelectedLane("smart");
+			}
+			const requestSeq = smartRequestSeqRef.current + 1;
+			smartRequestSeqRef.current = requestSeq;
+			const requestReleaseId = activeDetail.release_id;
+			setSmartResolving(true);
+			setSmartError(null);
+			void (async () => {
+				const requestItem = buildReleaseSmartRequestItem(activeDetail);
+				const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
+				let result = (
+					await apiResolveTranslationResults({
+						items: [requestItem],
+						retry_on_error: options?.retryOnError ?? true,
+					})
+				).items.find((item) => item.producer_ref === requestItem.producer_ref);
+
+				while (result && isPendingTranslationResultStatus(result.status)) {
+					if (Date.now() >= deadline) {
+						return;
+					}
+					if (smartRequestSeqRef.current !== requestSeq) return;
+					await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
+					if (smartRequestSeqRef.current !== requestSeq) return;
+					result = (
+						await apiResolveTranslationResults({
+							items: [requestItem],
+							retry_on_error: false,
+						})
+					).items.find(
+						(item) => item.producer_ref === requestItem.producer_ref,
+					);
+				}
+
+				if (!result) {
+					throw new Error("release polish result missing");
+				}
+				if (smartRequestSeqRef.current !== requestSeq) return;
+				const smart = mapTranslationResultToReleaseDetailSmart(result);
+				if (!smart) {
+					throw new Error(resolveErrorSummary(result, "润色失败"));
+				}
+				setDetail((prev) => {
+					if (!prev) return prev;
+					if (prev.release_id !== requestReleaseId) return prev;
+					return { ...prev, smart };
+				});
+				setSmartError(
+					smart.status === "error"
+						? toUiError(smart, "这次润色没有成功完成。")
+						: null,
+				);
+			})()
+				.catch((error) => {
+					if (smartRequestSeqRef.current !== requestSeq) return;
+					setSmartError(toUnknownUiError(error, "润色失败，请稍后重试。"));
+				})
+				.finally(() => {
+					if (smartRequestSeqRef.current !== requestSeq) return;
+					setSmartResolving(false);
+				});
+		},
+		[activeDetail, smartResolving],
+	);
+
+	useEffect(() => {
+		if (!activeDetail || selectedLane !== "smart" || smartResolving) return;
+		if (!shouldResolveSmart(activeDetail.smart)) return;
+		const autoAttemptKey = activeDetail.release_id;
+		if (smartAutoAttemptedKeyRef.current === autoAttemptKey) return;
+		smartAutoAttemptedKeyRef.current = autoAttemptKey;
+		onResolveSmart({ selectLane: false, retryOnError: true });
+	}, [activeDetail, onResolveSmart, selectedLane, smartResolving]);
+
+	useEffect(() => {
+		if (!activeDetail) return;
+		if (selectedLane === "smart" && activeDetail.smart?.status === "disabled") {
+			setSelectedLane("original");
+		}
+		if (
+			selectedLane === "translated" &&
+			activeDetail.translated?.status === "disabled"
+		) {
+			setSelectedLane("original");
+		}
+	}, [activeDetail, selectedLane]);
+
 	const display = useMemo(() => {
 		if (!activeDetail) return null;
 		const originalTitle =
@@ -344,27 +533,37 @@ export function ReleaseDetailCard(props: {
 			activeDetail.translated?.status === "ready"
 				? activeDetail.translated.title
 				: null;
-		const title = showOriginal
-			? originalTitle
-			: translatedTitle?.trim() || originalTitle;
+		const smartTitle =
+			activeDetail.smart?.status === "ready" ? activeDetail.smart.title : null;
+		const title =
+			selectedLane === "translated"
+				? translatedTitle?.trim() || originalTitle
+				: selectedLane === "smart"
+					? smartTitle?.trim() || originalTitle
+					: originalTitle;
 
 		const translatedBody =
 			activeDetail.translated?.status === "ready"
 				? activeDetail.translated.summary
 				: null;
+		const smartBody =
+			activeDetail.smart?.status === "ready"
+				? activeDetail.smart.summary
+				: null;
 		const originalBody = activeDetail.body?.trim() ? activeDetail.body : null;
-		const body = showOriginal
-			? originalBody
-			: translatedBody?.trim()
-				? translatedBody
-				: originalBody;
+		const body =
+			selectedLane === "translated"
+				? translatedBody?.trim()
+					? translatedBody
+					: originalBody
+				: selectedLane === "smart"
+					? smartBody?.trim()
+						? smartBody
+						: originalBody
+					: originalBody;
 
 		return { title, body };
-	}, [activeDetail, showOriginal]);
-
-	const hasReadyTranslation = useMemo(() => {
-		return hasReadyTranslatedContent(activeDetail?.translated);
-	}, [activeDetail]);
+	}, [activeDetail, selectedLane]);
 
 	if (!normalizedTarget || !activeTargetKey) {
 		return null;
@@ -396,36 +595,68 @@ export function ReleaseDetailCard(props: {
 						</div>
 
 						<div className="flex shrink-0 flex-wrap items-center gap-2">
-							{activeDetail?.translated?.status === "disabled" ? (
-								<span className="text-muted-foreground font-mono text-[11px]">
-									AI 未配置
-								</span>
-							) : (
-								<>
-									{hasReadyTranslation ? (
+							<div
+								role="tablist"
+								aria-label="Release 详情阅读模式"
+								className="flex rounded-full border border-border/55 bg-muted/35 p-0.5 shadow-sm"
+							>
+								{RELEASE_DETAIL_LANES.map((option) => {
+									const isSelected = selectedLane === option.lane;
+									const isBusy =
+										(option.lane === "translated" && translating) ||
+										(option.lane === "smart" && smartResolving);
+									const wasSelected = selectedLane === option.lane;
+									const isDisabled =
+										loading ||
+										!activeDetail ||
+										(option.lane === "translated" &&
+											activeDetail.translated?.status === "disabled") ||
+										(option.lane === "smart" &&
+											activeDetail.smart?.status === "disabled");
+									const Icon = isBusy ? RefreshCcw : option.icon;
+									return (
 										<Button
+											key={option.lane}
+											type="button"
+											role="tab"
+											aria-selected={isSelected}
 											variant="ghost"
 											size="sm"
-											className="font-mono text-xs"
-											onClick={() => setShowOriginal((value) => !value)}
-											disabled={loading || !activeDetail}
+											className={cn(
+												"h-8 rounded-full px-3 font-mono text-xs",
+												isSelected &&
+													"bg-background text-foreground shadow-sm hover:bg-background",
+												isBusy && "text-foreground",
+											)}
+											onClick={() => {
+												setSelectedLane(option.lane);
+												if (
+													option.lane === "translated" &&
+													(wasSelected ||
+														activeDetail?.translated?.status !== "ready") &&
+													activeDetail?.translated?.status !== "disabled"
+												) {
+													onTranslate();
+												}
+												if (
+													option.lane === "smart" &&
+													activeDetail &&
+													shouldResolveSmart(activeDetail.smart)
+												) {
+													onResolveSmart({ retryOnError: true });
+												}
+											}}
+											disabled={isDisabled}
+											aria-busy={isBusy ? "true" : undefined}
 										>
-											<Languages className="size-4" />
-											{showOriginal ? "中文" : "原文"}
+											<Icon
+												className={cn("size-4", isBusy && "animate-spin")}
+											/>
+											{isBusy ? `${option.label}中…` : option.label}
 										</Button>
-									) : null}
-									<Button
-										variant="ghost"
-										size="sm"
-										className="font-mono text-xs"
-										onClick={onTranslate}
-										disabled={loading || !activeDetail || translating}
-									>
-										<RefreshCcw className="size-4" />
-										{translating ? "翻译中…" : "翻译"}
-									</Button>
-								</>
-							)}
+									);
+								})}
+							</div>
 
 							{activeDetail?.html_url ? (
 								<Button
@@ -505,9 +736,62 @@ export function ReleaseDetailCard(props: {
 											variant="ghost"
 											size="sm"
 											className="font-mono text-xs"
-											onClick={() => setShowOriginal(true)}
+											onClick={() => setSelectedLane("original")}
 										>
 											<Languages className="size-4" />
+											查看原文
+										</Button>
+										{activeDetail.html_url ? (
+											<Button
+												asChild
+												variant="outline"
+												size="sm"
+												className="font-mono text-xs"
+											>
+												<a
+													href={activeDetail.html_url}
+													target="_blank"
+													rel="noreferrer"
+												>
+													<ArrowUpRight className="size-4" />
+													GitHub
+												</a>
+											</Button>
+										) : null}
+									</div>
+								}
+							/>
+						) : activeSmartError ? (
+							<ErrorStatePanel
+								title="润色失败"
+								summary={activeSmartError.summary}
+								detail={activeSmartError.detail}
+								actions={
+									<div className="flex flex-wrap gap-2">
+										<Button
+											variant="outline"
+											size="sm"
+											className="font-mono text-xs"
+											onClick={() =>
+												onResolveSmart({ selectLane: true, retryOnError: true })
+											}
+											disabled={smartResolving}
+										>
+											<RefreshCcw
+												className={cn(
+													"size-4",
+													smartResolving && "animate-spin",
+												)}
+											/>
+											{smartResolving ? "润色中…" : "重试润色"}
+										</Button>
+										<Button
+											variant="ghost"
+											size="sm"
+											className="font-mono text-xs"
+											onClick={() => setSelectedLane("original")}
+										>
+											<FileText className="size-4" />
 											查看原文
 										</Button>
 										{activeDetail.html_url ? (

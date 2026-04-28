@@ -1704,6 +1704,7 @@ const longReleaseDetail: ReleaseDetailResponse = {
 	repo_full_name: "acme/rocket",
 	repo_visual: repoVisualFixtures.social,
 	tag_name: "v3.4.0",
+	previous_tag_name: "v3.3.2",
 	name: "v3.4.0 · release train",
 	body: [
 		"## Release train summary",
@@ -1742,6 +1743,18 @@ const longReleaseDetail: ReleaseDetailResponse = {
 			}),
 		].join("\n"),
 	},
+	smart: {
+		lang: "zh-CN",
+		status: "ready",
+		title: "v3.4.0 · 发布波次总览",
+		summary: [
+			"## 润色总览",
+			"",
+			"- 本次发布把环境差异下的 rollout guardrail 补齐，减少配置漂移造成的发布风险。",
+			"- staging 与 production 快照重新跑过迁移校验，交付前验证链路更完整。",
+			"- smoke test、值班 SOP 与发布后核对清单同步更新，方便团队按同一套步骤收口。",
+		].join("\n"),
+	},
 };
 
 const githubAutolinkWrapReleaseDetail: ReleaseDetailResponse = {
@@ -1749,6 +1762,7 @@ const githubAutolinkWrapReleaseDetail: ReleaseDetailResponse = {
 	repo_full_name: "CherryHQ/cherry-studio",
 	repo_visual: repoVisualFixtures.social,
 	tag_name: "v1.0.0",
+	previous_tag_name: "v0.9.8",
 	name: "feat(skills): workspace link follow-up",
 	body: [
 		"## Release detail",
@@ -1766,9 +1780,42 @@ const githubAutolinkWrapReleaseDetail: ReleaseDetailResponse = {
 		title: null,
 		summary: null,
 	},
+	smart: {
+		lang: "zh-CN",
+		status: "missing",
+		title: null,
+		summary: null,
+	},
 };
 
-function useStorybookReleaseDetailMock(detail: ReleaseDetailResponse | null) {
+const releaseDetailSmartMissing: ReleaseDetailResponse = {
+	...longReleaseDetail,
+	smart: {
+		lang: "zh-CN",
+		status: "missing",
+		title: null,
+		summary: null,
+	},
+};
+
+const releaseDetailSmartError: ReleaseDetailResponse = {
+	...longReleaseDetail,
+	smart: {
+		lang: "zh-CN",
+		status: "error",
+		title: null,
+		summary: null,
+		error_code: "temporary_unavailable",
+		error_summary: "润色暂时失败",
+		error_detail: "temporarily unavailable",
+		auto_translate: false,
+	},
+};
+
+function useStorybookReleaseDetailMock(
+	detail: ReleaseDetailResponse | null,
+	options?: { smartResolveMode?: "ready" | "queued" },
+) {
 	useLayoutEffect(() => {
 		if (!detail) return;
 
@@ -1799,13 +1846,57 @@ function useStorybookReleaseDetailMock(detail: ReleaseDetailResponse | null) {
 				});
 			}
 
+			if (
+				resolvedUrl.pathname === "/api/translate/results" &&
+				options?.smartResolveMode
+			) {
+				const body =
+					typeof init?.body === "string"
+						? JSON.parse(init.body)
+						: { items: [] };
+				const items = Array.isArray(body.items) ? body.items : [];
+				return new Response(
+					JSON.stringify({
+						items: items.map((item: { producer_ref: string }) => ({
+							producer_ref: item.producer_ref,
+							entity_id: detail.release_id,
+							kind: "release_smart",
+							variant: "feed_card",
+							status:
+								options.smartResolveMode === "queued" ? "queued" : "ready",
+							title_zh: "v3.4.0 · 发布波次总览",
+							summary_md: null,
+							body_md:
+								options.smartResolveMode === "queued"
+									? null
+									: [
+											"## 润色总览",
+											"",
+											"- Storybook mock 在详情弹窗内回填润色内容。",
+											"- 弹窗默认选中润色，生成期间仍保留原文阅读。",
+										].join("\n"),
+							error: null,
+							error_code: null,
+							error_summary: null,
+							error_detail: null,
+							work_item_id: null,
+							batch_id: null,
+						})),
+					}),
+					{
+						headers: { "Content-Type": "application/json" },
+						status: 200,
+					},
+				);
+			}
+
 			return previousFetch(input, init);
 		};
 
 		return () => {
 			globalThis.fetch = previousFetch;
 		};
-	}, [detail]);
+	}, [detail, options?.smartResolveMode]);
 }
 
 const mockNotifs: NotificationItem[] = [
@@ -1857,6 +1948,7 @@ function DashboardPreview(props: {
 	now?: Date;
 	initialReleaseId?: string | null;
 	releaseDetail?: ReleaseDetailResponse | null;
+	releaseDetailSmartResolveMode?: "ready" | "queued";
 	showFooter?: boolean;
 	deferredFeedTabs?: Tab[];
 	initialFeedTabLoading?: Tab | null;
@@ -1879,6 +1971,7 @@ function DashboardPreview(props: {
 		now = STORYBOOK_NOW,
 		initialReleaseId = null,
 		releaseDetail = null,
+		releaseDetailSmartResolveMode,
 		showFooter = true,
 		deferredFeedTabs = [],
 		initialFeedTabLoading = null,
@@ -1886,7 +1979,9 @@ function DashboardPreview(props: {
 		feedError = null,
 		reactionErrorByKey = {},
 	} = props;
-	useStorybookReleaseDetailMock(releaseDetail);
+	useStorybookReleaseDetailMock(releaseDetail, {
+		smartResolveMode: releaseDetailSmartResolveMode,
+	});
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
 
 	useEffect(() => {
@@ -3169,6 +3264,7 @@ export const EvidenceBriefsGithubAutolinkWrapDetail: Story = {
 		const body = within(canvasElement.ownerDocument.body);
 		const dialog = await body.findByRole("dialog");
 		const dialogScope = within(dialog);
+		await userEvent.click(dialogScope.getByRole("tab", { name: "原文" }));
 
 		await expect(
 			dialogScope.getByRole("link", { name: "4d8f459" }),
@@ -3229,13 +3325,115 @@ export const BriefsLongContentWithDetail: Story = {
 		const canvas = within(canvasElement);
 		const body = within(canvasElement.ownerDocument.body);
 		await expect(await body.findByRole("dialog")).toBeVisible();
-		await expect(await body.findByText(/翻译总览/)).toBeVisible();
-		await expect(body.getByText(/变更波次 10/)).toBeVisible();
+		await expect(await body.findByText(/润色总览/)).toBeVisible();
+		await expect(
+			body.getByRole("tab", { name: "润色", selected: true }),
+		).toBeVisible();
 		expect(canvasElement.querySelector(".max-h-96")).toBeNull();
 		expect(canvasElement.querySelector(".overflow-auto")).toBeNull();
 		await expect(
 			canvas.queryByRole("heading", { name: "Release 详情" }),
 		).not.toBeInTheDocument();
+	},
+};
+
+export const ReleaseDetailSmartDefaultReady: Story = {
+	name: "Release Detail / Smart default ready",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={longBriefs}
+			initialReleaseId={LONG_BRIEF_RELEASE_ID}
+			releaseDetail={longReleaseDetail}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Release 详情弹窗默认选中 `润色`，并优先展示 release_smart/feed_card 缓存。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const dialog = await body.findByRole("dialog");
+		const dialogScope = within(dialog);
+		await expect(
+			dialogScope.getByRole("tab", { name: "润色", selected: true }),
+		).toBeVisible();
+		await expect(dialogScope.getByText(/润色总览/)).toBeVisible();
+		await expect(
+			dialogScope.getByRole("link", { name: "GitHub" }),
+		).toBeVisible();
+		await expect(
+			dialogScope.getByRole("button", { name: "关闭" }),
+		).toBeVisible();
+	},
+};
+
+export const ReleaseDetailSmartLoadingOriginalFallback: Story = {
+	name: "Release Detail / Smart loading original fallback",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={longBriefs}
+			initialReleaseId={LONG_BRIEF_RELEASE_ID}
+			releaseDetail={releaseDetailSmartMissing}
+			releaseDetailSmartResolveMode="queued"
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"润色缺失时默认仍选中 `润色`，选项显示生成中，正文保留原始 release notes。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const dialog = await body.findByRole("dialog");
+		const dialogScope = within(dialog);
+		await expect(
+			await dialogScope.findByRole("tab", { name: "润色中…", selected: true }),
+		).toBeVisible();
+		await expect(dialogScope.getByText(/Release train summary/)).toBeVisible();
+	},
+};
+
+export const ReleaseDetailSmartError: Story = {
+	name: "Release Detail / Smart error",
+	render: () => (
+		<DashboardPreview
+			initialTab="briefs"
+			briefs={longBriefs}
+			initialReleaseId={LONG_BRIEF_RELEASE_ID}
+			releaseDetail={releaseDetailSmartError}
+			showFooter={false}
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story: "润色终态失败时，详情弹窗在原位给出重试与查看原文动作。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		const dialog = await body.findByRole("dialog");
+		const dialogScope = within(dialog);
+		await expect(dialogScope.getByText("润色失败")).toBeVisible();
+		await expect(dialogScope.getByText("润色暂时失败")).toBeVisible();
+		await expect(
+			dialogScope.getByRole("button", { name: "重试润色" }),
+		).toBeVisible();
+		await expect(
+			dialogScope.getByRole("button", { name: "查看原文" }),
+		).toBeVisible();
 	},
 };
 
@@ -4820,6 +5018,8 @@ export const ErrorReleaseDetailTranslationFailure: Story = {
 	),
 	play: async ({ canvasElement }) => {
 		const body = within(canvasElement.ownerDocument.body);
+		const dialog = await body.findByRole("dialog");
+		await userEvent.click(within(dialog).getByRole("tab", { name: "翻译" }));
 		await expect(body.getByText("翻译失败")).toBeVisible();
 		await expect(body.getByText("Markdown 结构校验失败")).toBeVisible();
 		await expect(body.getByRole("button", { name: "重试翻译" })).toBeVisible();
