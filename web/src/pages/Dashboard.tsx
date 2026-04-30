@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDownToLine, Radio } from "lucide-react";
+import { ArrowDownToLine } from "lucide-react";
 
 import { type MeResponse, ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import {
@@ -140,42 +140,21 @@ function NewContentNotice(props: {
 }) {
 	const { count, label, onReveal } = props;
 	if (count <= 0) return null;
-	const countLabel = `有 ${count} 条新${label}`;
+	const countLabel = `${count} 条${label}`;
 	return (
-		<div
-			className="dashboard-new-content-notice mb-3 flex items-center justify-between gap-3 rounded-xl border px-3.5 py-3 sm:px-4"
+		<button
+			type="button"
+			className="dashboard-new-content-hint group mb-3 grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-1.5 text-left"
 			data-dashboard-new-content-notice="true"
+			onClick={onReveal}
 		>
-			<div className="relative z-10 flex min-w-0 items-start gap-3">
-				<span
-					className="dashboard-new-content-signal mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-full"
-					aria-hidden="true"
-				>
-					<Radio className="size-3.5 text-foreground/78" />
-				</span>
-				<div className="min-w-0">
-					<p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm font-semibold text-foreground">
-						<span>系统发现新内容</span>
-						<span className="rounded-full border border-primary/15 bg-background/55 px-2 py-0.5 font-mono text-[11px] font-medium text-foreground/80">
-							{countLabel}
-						</span>
-					</p>
-					<p className="mt-1 text-xs leading-5 text-muted-foreground">
-						后台同步和处理已完成，先保留当前位置，点击后合并到当前列表。
-					</p>
-				</div>
-			</div>
-			<Button
-				type="button"
-				size="sm"
-				variant="outline"
-				className="relative z-10 h-8 shrink-0 rounded-full bg-background/70 px-3 font-mono text-xs shadow-none"
-				onClick={onReveal}
-			>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
 				<ArrowDownToLine className="size-3.5" />
-				<span>显示</span>
-			</Button>
-		</div>
+				<span>刚刚同步 · {countLabel}</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
 	);
 }
 

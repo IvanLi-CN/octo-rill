@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { ArrowDownToLine, Radio } from "lucide-react";
+import { ArrowDownToLine } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, waitFor, within } from "storybook/test";
@@ -247,42 +247,21 @@ function StoryNewContentNotice(props: {
 }) {
 	const { count, label, onReveal } = props;
 	if (count <= 0) return null;
-	const countLabel = `有 ${count} 条新${label}`;
+	const countLabel = `${count} 条${label}`;
 	return (
-		<div
-			className="dashboard-new-content-notice mb-3 flex items-center justify-between gap-3 rounded-xl border px-3.5 py-3 sm:px-4"
+		<button
+			type="button"
+			className="dashboard-new-content-hint group mb-3 grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-1.5 text-left"
 			data-dashboard-new-content-notice="true"
+			onClick={onReveal}
 		>
-			<div className="relative z-10 flex min-w-0 items-start gap-3">
-				<span
-					className="dashboard-new-content-signal mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-full"
-					aria-hidden="true"
-				>
-					<Radio className="size-3.5 text-foreground/78" />
-				</span>
-				<div className="min-w-0">
-					<p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm font-semibold text-foreground">
-						<span>系统发现新内容</span>
-						<span className="rounded-full border border-primary/15 bg-background/55 px-2 py-0.5 font-mono text-[11px] font-medium text-foreground/80">
-							{countLabel}
-						</span>
-					</p>
-					<p className="mt-1 text-xs leading-5 text-muted-foreground">
-						后台同步和处理已完成，先保留当前位置，点击后合并到当前列表。
-					</p>
-				</div>
-			</div>
-			<Button
-				type="button"
-				size="sm"
-				variant="outline"
-				className="relative z-10 h-8 shrink-0 rounded-full bg-background/70 px-3 font-mono text-xs shadow-none"
-				onClick={onReveal}
-			>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
 				<ArrowDownToLine className="size-3.5" />
-				<span>显示</span>
-			</Button>
-		</div>
+				<span>刚刚同步 · {countLabel}</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
 	);
 }
 
@@ -3868,15 +3847,17 @@ export const QuasiRealtimeNewFeedBatch: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时更新状态：后台同步和润色完成后，列表顶部先出现可揭示的新内容提示；点击显示后，新卡片保留克制的 `新` 标记。",
+					"Dashboard 准实时更新状态：后台同步和润色完成后，阅读流里出现低声量批次痕迹；展开后，新卡片只保留轻微底色和小圆点暗示。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("有 1 条新动态")).toBeVisible();
-		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
-		await expect(canvas.queryByText("有 1 条新动态")).not.toBeInTheDocument();
+		await expect(canvas.getByText("刚刚同步 · 1 条动态")).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
+		await expect(
+			canvas.queryByText("刚刚同步 · 1 条动态"),
+		).not.toBeInTheDocument();
 		await expect(
 			canvasElement.querySelector('[data-feed-item-fresh="true"]'),
 		).not.toBeNull();
@@ -3905,18 +3886,20 @@ export const QuasiRealtimeNewDailyBrief: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时更新状态：日报同步完成后，Briefs 页先出现新内容提示，日报正文和列表入口用同一套 session-only fresh 标记。",
+					"Dashboard 准实时更新状态：日报同步完成后，Briefs 页先出现低声量批次痕迹，日报正文和列表入口用同一套 session-only fresh 标记。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("有 1 条新日报")).toBeVisible();
+		await expect(canvas.getByText("刚刚同步 · 1 条日报")).toBeVisible();
 		await expect(
 			canvasElement.querySelector('[data-brief-item-fresh="true"]'),
 		).not.toBeNull();
-		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
-		await expect(canvas.queryByText("有 1 条新日报")).not.toBeInTheDocument();
+		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
+		await expect(
+			canvas.queryByText("刚刚同步 · 1 条日报"),
+		).not.toBeInTheDocument();
 	},
 };
 
@@ -3942,19 +3925,19 @@ export const QuasiRealtimeNewInboxThreads: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时更新状态：Inbox 新线程先以顶部提示进入阅读面，揭示后线程卡片保留克制的新内容暗示。",
+					"Dashboard 准实时更新状态：Inbox 新线程先以列表内的低声量批次痕迹进入阅读面，揭示后线程卡片保留克制的新内容暗示。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("有 1 条新Inbox 内容")).toBeVisible();
+		await expect(canvas.getByText("刚刚同步 · 1 条Inbox 内容")).toBeVisible();
 		await expect(
 			canvasElement.querySelector('[data-inbox-item-fresh="true"]'),
 		).not.toBeNull();
-		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
+		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
 		await expect(
-			canvas.queryByText("有 1 条新Inbox 内容"),
+			canvas.queryByText("刚刚同步 · 1 条Inbox 内容"),
 		).not.toBeInTheDocument();
 	},
 };

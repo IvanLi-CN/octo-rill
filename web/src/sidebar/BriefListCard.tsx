@@ -70,12 +70,11 @@ export function BriefListCard(props: {
 									>
 										<span>#{b.date}</span>
 										{isFresh ? (
-											<span className="dashboard-fresh-badge ml-2 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 align-middle font-mono text-[10px] font-medium">
-												<span
-													className="size-1.5 rounded-full bg-foreground/55"
-													aria-hidden="true"
-												/>
-												刚同步
+											<span
+												className="dashboard-fresh-cue ml-2 inline-flex size-2 rounded-full align-middle"
+												title="刚刚同步"
+											>
+												<span className="sr-only">刚刚同步</span>
 											</span>
 										) : null}
 										<span className="text-muted-foreground ml-2 text-[11px]">

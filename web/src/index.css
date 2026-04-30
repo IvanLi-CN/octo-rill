@@ -133,106 +133,72 @@
 }
 
 @layer components {
-	.dashboard-new-content-notice {
-		position: relative;
-		overflow: hidden;
-		border-color: color-mix(in oklch, var(--primary) 16%, var(--border));
-		background:
-			radial-gradient(
-				180px circle at 24px 0,
-				oklch(0.9 0.045 98 / 0.34),
-				transparent 72%
-			),
-			linear-gradient(
-				135deg,
-				oklch(0.982 0.012 95 / 0.96),
-				oklch(0.95 0.018 105 / 0.68)
-			);
+	.dashboard-new-content-hint {
+		color: color-mix(in oklch, var(--foreground) 62%, var(--muted-foreground));
+	}
+
+	.dashboard-new-content-rule {
+		height: 1px;
+		background: linear-gradient(
+			90deg,
+			transparent,
+			color-mix(in oklch, var(--primary) 14%, var(--border)),
+			transparent
+		);
+	}
+
+	.dashboard-new-content-chip {
+		border-color: color-mix(in oklch, var(--primary) 12%, var(--border));
+		background: color-mix(in oklch, var(--background) 82%, var(--card));
+		box-shadow: 0 1px 0 oklch(1 0 0 / 0.48) inset;
+		transition:
+			border-color 180ms ease-out,
+			background-color 180ms ease-out,
+			color 180ms ease-out,
+			box-shadow 180ms ease-out;
+	}
+
+	.dashboard-new-content-hint:hover .dashboard-new-content-chip,
+	.dashboard-new-content-hint:focus-visible .dashboard-new-content-chip {
+		border-color: color-mix(in oklch, var(--primary) 22%, var(--border));
+		background: color-mix(in oklch, var(--card) 88%, var(--primary));
+		color: var(--foreground);
 		box-shadow:
 			0 1px 0 oklch(1 0 0 / 0.5) inset,
-			0 10px 26px oklch(0.18 0.02 70 / 0.06);
-	}
-
-	.dark .dashboard-new-content-notice {
-		border-color: color-mix(in oklch, var(--primary) 18%, var(--border));
-		background:
-			radial-gradient(
-				180px circle at 24px 0,
-				oklch(0.76 0.04 115 / 0.16),
-				transparent 72%
-			),
-			linear-gradient(
-				135deg,
-				oklch(0.24 0.008 95 / 0.82),
-				oklch(0.18 0.014 245 / 0.78)
-			);
-		box-shadow:
-			0 1px 0 oklch(1 0 0 / 0.08) inset,
-			0 14px 30px oklch(0 0 0 / 0.18);
-	}
-
-	.dashboard-new-content-signal {
-		background:
-			radial-gradient(
-				circle at 50% 45%,
-				oklch(0.72 0.055 96 / 0.38) 0 28%,
-				transparent 30% 100%
-			),
-			oklch(0.96 0.014 95 / 0.86);
-		box-shadow:
-			0 0 0 1px color-mix(in oklch, var(--primary) 12%, var(--border)),
-			0 0 0 5px oklch(0.86 0.03 96 / 0.18);
-	}
-
-	.dark .dashboard-new-content-signal {
-		background:
-			radial-gradient(
-				circle at 50% 45%,
-				oklch(0.78 0.045 110 / 0.26) 0 28%,
-				transparent 30% 100%
-			),
-			oklch(0.3 0.006 95 / 0.72);
-		box-shadow:
-			0 0 0 1px color-mix(in oklch, var(--primary) 14%, var(--border)),
-			0 0 0 5px oklch(0.72 0.035 105 / 0.1);
+			0 8px 18px oklch(0.18 0.02 70 / 0.05);
 	}
 
 	.dashboard-fresh-surface {
 		border-color: color-mix(in oklch, var(--primary) 18%, var(--border));
 		background:
 			radial-gradient(
-				220px circle at 20% 0,
-				oklch(0.91 0.035 98 / 0.24),
+				260px circle at 20% 0,
+				oklch(0.91 0.035 98 / 0.16),
 				transparent 70%
 			),
-			oklch(0.972 0.012 95 / 0.54);
+			color-mix(in oklch, var(--card) 78%, var(--background));
 		box-shadow:
-			0 0 0 1px color-mix(in oklch, var(--primary) 8%, transparent),
-			0 10px 24px oklch(0.18 0.02 70 / 0.05);
+			0 0 0 1px color-mix(in oklch, var(--primary) 6%, transparent),
+			0 8px 20px oklch(0.18 0.02 70 / 0.035);
 	}
 
 	.dark .dashboard-fresh-surface {
 		background:
 			radial-gradient(
-				220px circle at 20% 0,
-				oklch(0.74 0.04 112 / 0.12),
+				260px circle at 20% 0,
+				oklch(0.74 0.04 112 / 0.08),
 				transparent 70%
 			),
-			oklch(0.24 0.006 95 / 0.52);
+			color-mix(in oklch, var(--card) 78%, var(--background));
 		box-shadow:
-			0 0 0 1px color-mix(in oklch, var(--primary) 9%, transparent),
-			0 12px 28px oklch(0 0 0 / 0.18);
+			0 0 0 1px color-mix(in oklch, var(--primary) 8%, transparent),
+			0 10px 24px oklch(0 0 0 / 0.14);
 	}
 
-	.dashboard-fresh-badge {
-		border-color: color-mix(in oklch, var(--primary) 18%, var(--border));
-		background: oklch(0.972 0.012 95 / 0.94);
-		color: color-mix(in oklch, var(--foreground) 86%, var(--primary));
-		box-shadow: 0 6px 16px oklch(0.18 0.02 70 / 0.07);
-	}
-
-	.dark .dashboard-fresh-badge {
-		background: oklch(0.25 0.006 95 / 0.96);
-		box-shadow: 0 8px 18px oklch(0 0 0 / 0.24);
+	.dashboard-fresh-cue {
+		background: oklch(0.72 0.055 96 / 0.78);
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, var(--background) 84%, transparent),
+			0 0 0 4px oklch(0.78 0.04 96 / 0.12);
 	}
 }

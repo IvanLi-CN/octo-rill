@@ -136,12 +136,11 @@ export function InboxList(props: {
 										<div className="mt-1 line-clamp-2 text-sm font-medium">
 											{n.subject_title ?? "(no title)"}
 											{isFresh ? (
-												<span className="dashboard-fresh-badge ml-2 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 align-middle font-mono text-[10px] font-medium">
-													<span
-														className="size-1.5 rounded-full bg-foreground/55"
-														aria-hidden="true"
-													/>
-													刚同步
+												<span
+													className="dashboard-fresh-cue ml-2 inline-flex size-2 rounded-full align-middle"
+													title="刚刚同步"
+												>
+													<span className="sr-only">刚刚同步</span>
 												</span>
 											) : null}
 										</div>

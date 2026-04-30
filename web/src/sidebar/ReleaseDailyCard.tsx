@@ -130,12 +130,11 @@ export function ReleaseDailyCard(props: {
 					>
 						{selectedFresh ? (
 							<div className="mb-2">
-								<span className="dashboard-fresh-badge inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[10px] font-medium">
-									<span
-										className="size-1.5 rounded-full bg-foreground/55"
-										aria-hidden="true"
-									/>
-									刚同步
+								<span
+									className="dashboard-fresh-cue inline-flex size-2 rounded-full"
+									title="刚刚同步"
+								>
+									<span className="sr-only">刚刚同步</span>
 								</span>
 							</div>
 						) : null}

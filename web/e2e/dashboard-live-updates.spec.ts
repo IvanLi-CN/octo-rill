@@ -172,28 +172,28 @@ test("dashboard live updates only refresh feed after the user reveals a new batc
 
 	const feedRequestsBeforeLiveUpdate = feedRequests;
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
-	await expect(page.getByText("有 1 条新动态")).toBeVisible();
+	await expect(page.getByText("刚刚同步 · 1 条动态")).toBeVisible();
 	await expect.poll(() => allFeedUpdateTokens.length).toBe(1);
 	expect(feedRequests).toBe(feedRequestsBeforeLiveUpdate);
 	await expect(page.getByText("Release 20002")).toHaveCount(0);
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
 	await expect.poll(() => allFeedUpdateTokens.length).toBe(2);
 	expect(allFeedUpdateTokens.at(-1)).toBe("token-1");
-	await expect(page.getByText("有 2 条新动态")).toBeVisible();
+	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
 	await page.getByRole("tab", { name: "加星" }).click();
-	await expect(page.getByText("有 2 条新动态")).toHaveCount(0);
+	await expect(page.getByText("刚刚同步 · 2 条动态")).toHaveCount(0);
 	await page.getByRole("tab", { name: "全部" }).click();
-	await expect(page.getByText("有 2 条新动态")).toBeVisible();
+	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
 
 	revealFeed = true;
 	failNextFeedRefresh = true;
 	const feedRequestsBeforeFailedReveal = feedRequests;
-	await page.getByRole("button", { name: "显示" }).click();
-	await expect(page.getByText("有 2 条新动态")).toBeVisible();
+	await page.getByRole("button", { name: /刚刚同步/ }).click();
+	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
 	expect(feedRequests).toBe(feedRequestsBeforeFailedReveal + 1);
 
 	const feedRequestsBeforeReveal = feedRequests;
-	await page.getByRole("button", { name: "显示" }).click();
+	await page.getByRole("button", { name: /刚刚同步/ }).click();
 	await expect(page.getByText("Release 20003")).toBeVisible();
 	await expect(page.getByText("Release 20002")).toBeVisible();
 	await expect(
@@ -321,5 +321,5 @@ test("dashboard live updates re-baselines when inbox polling is enabled later", 
 	await page.getByRole("tab", { name: "收件箱" }).click();
 	await expect(page.getByText("Existing thread")).toBeVisible();
 	await expect.poll(() => notificationUpdateTokens.length).toBeGreaterThan(0);
-	await expect(page.getByText("有 1 条新Inbox 内容")).toHaveCount(0);
+	await expect(page.getByText("刚刚同步 · 1 条Inbox 内容")).toHaveCount(0);
 });
