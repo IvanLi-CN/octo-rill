@@ -629,6 +629,183 @@ function makeFeedHotPathReactionFeed(
 	];
 }
 
+const continuousLivePushTemplates: ReleaseFeedItem[] = [
+	buildFeedItem("continuous-live-push-1", {
+		ts: "2026-04-04T16:58:00+08:00",
+		repo_full_name: "IvanLi-CN/octo-rill",
+		repo_visual: repoVisualFixtures.social,
+		title: "v2.65.0 · live update lane",
+		body: "- Dashboard update token advanced\n- The release card appeared without a full page reload\n- The fresh cue keeps breathing while the session is active",
+		html_url: `${PROJECT_REPO_URL}/releases/tag/v2.65.0`,
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "v2.65.0 · live update lane",
+			summary:
+				"- Dashboard update token advanced\n- A new release card appeared in-place\n- The session-only cue stays visible after insertion",
+		},
+		reactions: {
+			counts: {
+				plus1: 3,
+				laugh: 0,
+				heart: 2,
+				hooray: 1,
+				rocket: 2,
+				eyes: 0,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+	buildFeedItem("continuous-live-push-2", {
+		ts: "2026-04-04T16:59:30+08:00",
+		repo_full_name: "acme/realtime-kit",
+		repo_visual: repoVisualFixtures.avatar,
+		title: "sync worker batch complete",
+		body: "- Background worker finished enrichment\n- Translation and polish were committed together\n- The list reflects the completed batch as new",
+		html_url:
+			"https://github.com/acme/realtime-kit/releases/tag/sync-worker-batch-complete",
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "sync worker batch complete",
+			summary:
+				"- Background worker finished enrichment\n- Translation and polish arrived together\n- The list marks the completed batch as fresh",
+		},
+		reactions: {
+			counts: {
+				plus1: 1,
+				laugh: 1,
+				heart: 1,
+				hooray: 2,
+				rocket: 3,
+				eyes: 1,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+	buildFeedItem("continuous-live-push-3", {
+		ts: "2026-04-04T17:01:00+08:00",
+		repo_full_name: "openai/codex",
+		repo_visual: repoVisualFixtures.avatar,
+		title: "0.127.0-alpha.1",
+		body: "- New alpha release detected\n- Dashboard keeps the reader at their current context\n- Fresh metadata separates this card from older content",
+		html_url: "https://github.com/openai/codex/releases/tag/0.127.0-alpha.1",
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "0.127.0-alpha.1",
+			summary:
+				"- New alpha release detected\n- The reader stays in context while the feed updates\n- Fresh metadata separates this card from older content",
+		},
+		reactions: {
+			counts: {
+				plus1: 5,
+				laugh: 0,
+				heart: 2,
+				hooray: 1,
+				rocket: 4,
+				eyes: 2,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+];
+
+function makeContinuousLivePushItem(index: number): ReleaseFeedItem {
+	const template =
+		continuousLivePushTemplates[
+			(index - 1) % continuousLivePushTemplates.length
+		] ?? continuousLivePushTemplates[0];
+	const waveLabel =
+		index > continuousLivePushTemplates.length ? ` · wave ${index}` : "";
+	const minute = String((56 + index * 2) % 60).padStart(2, "0");
+	return {
+		...template,
+		id: `continuous-live-push-${index}`,
+		ts: `2026-04-04T17:${minute}:00+08:00`,
+		title: `${template.title}${waveLabel}`,
+		body: `${template.body}\n- Story push wave ${index}`,
+		html_url: `${template.html_url}?story_push=${index}`,
+		smart:
+			template.smart.status === "ready"
+				? {
+						...template.smart,
+						title: `${template.smart.title ?? template.title}${waveLabel}`,
+						summary: `${template.smart.summary ?? template.body}\n- Story push wave ${index}`,
+					}
+				: template.smart,
+	};
+}
+
+function ContinuousLivePushPreview() {
+	const [pushIndex, setPushIndex] = useState(0);
+
+	useEffect(() => {
+		setPushIndex(0);
+		const firstPushTimer = window.setTimeout(() => {
+			setPushIndex(1);
+		}, 900);
+		const interval = window.setInterval(() => {
+			setPushIndex((current) => current + 1);
+		}, 3600);
+		return () => {
+			window.clearTimeout(firstPushTimer);
+			window.clearInterval(interval);
+		};
+	}, []);
+
+	const pushedItems = useMemo(() => {
+		const visiblePushCount = Math.min(pushIndex, 5);
+		return Array.from({ length: visiblePushCount }, (_, offset) =>
+			makeContinuousLivePushItem(pushIndex - offset),
+		);
+	}, [pushIndex]);
+	const freshKeys = pushedItems.map(feedItemKey);
+	const liveNotice =
+		pushIndex > 0
+			? {
+					feed: {
+						newCount: pushIndex,
+						latestKeys: freshKeys,
+					},
+				}
+			: {};
+
+	return (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={[...pushedItems, ...makeFeedHotPathReactionFeed(true, false)]}
+			freshFeedKeys={freshKeys}
+			liveNotices={liveNotice}
+			showFooter={false}
+		/>
+	);
+}
+
 function FeedHotPathReactionRefreshPreview(props: {
 	initialLive?: boolean;
 	initialSynced?: boolean;
@@ -3861,6 +4038,56 @@ export const QuasiRealtimeNewFeedBatch: Story = {
 		await expect(
 			canvasElement.querySelector('[data-feed-item-fresh="true"]'),
 		).not.toBeNull();
+	},
+};
+
+export const QuasiRealtimeContinuousFeedPush: Story = {
+	name: "Live updates / Continuous feed push",
+	render: () => <ContinuousLivePushPreview />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入阅读流，顶部批次提示递增，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.63.0 · cached feed hot path",
+			}),
+		).toBeVisible();
+
+		await waitFor(
+			() =>
+				expect(
+					canvas.getByRole("heading", {
+						name: "v2.65.0 · live update lane",
+					}),
+				).toBeVisible(),
+			{ timeout: 2400 },
+		);
+		await expect(canvas.getByText("刚刚同步 · 1 条动态")).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll('[data-dashboard-fresh-cue="true"]')
+				.length,
+		).toBeGreaterThanOrEqual(1);
+
+		await waitFor(
+			() =>
+				expect(
+					canvas.getByRole("heading", {
+						name: "sync worker batch complete",
+					}),
+				).toBeVisible(),
+			{ timeout: 5200 },
+		);
+		await expect(canvas.getByText("刚刚同步 · 2 条动态")).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll('[data-feed-item-fresh="true"]').length,
+		).toBeGreaterThanOrEqual(2);
 	},
 };
 
