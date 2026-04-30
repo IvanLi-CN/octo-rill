@@ -58,12 +58,11 @@ export function BriefListCard(props: {
 									onClick={() => onSelectId(b.id)}
 									data-brief-item-fresh={isFresh ? "true" : "false"}
 									className={cn(
-										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none transition-colors duration-200",
+										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none transition-[background-color,border-color,box-shadow] duration-200",
 										active
 											? "border-primary/40 bg-background hover:bg-background"
 											: "border-transparent bg-background/40 hover:bg-background",
-										isFresh &&
-											"border-primary/25 bg-primary/[0.07] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)] hover:bg-primary/[0.09]",
+										isFresh && "dashboard-fresh-surface hover:bg-background/70",
 									)}
 								>
 									<span
@@ -71,8 +70,12 @@ export function BriefListCard(props: {
 									>
 										<span>#{b.date}</span>
 										{isFresh ? (
-											<span className="ml-2 inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 align-middle font-mono text-[10px] text-primary">
-												新
+											<span className="dashboard-fresh-badge ml-2 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 align-middle font-mono text-[10px] font-medium">
+												<span
+													className="size-1.5 rounded-full bg-foreground/55"
+													aria-hidden="true"
+												/>
+												刚同步
 											</span>
 										) : null}
 										<span className="text-muted-foreground ml-2 text-[11px]">

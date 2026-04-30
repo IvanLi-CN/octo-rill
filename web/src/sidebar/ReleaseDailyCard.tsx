@@ -123,16 +123,19 @@ export function ReleaseDailyCard(props: {
 				) : selected ? (
 					<div
 						className={cn(
-							"rounded-lg border bg-muted/10 p-3.5 transition-colors duration-200 sm:p-4",
-							selectedFresh &&
-								"border-primary/25 bg-primary/[0.06] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)]",
+							"rounded-lg border bg-muted/10 p-3.5 transition-[background-color,border-color,box-shadow] duration-200 sm:p-4",
+							selectedFresh && "dashboard-fresh-surface",
 						)}
 						data-brief-item-fresh={selectedFresh ? "true" : "false"}
 					>
 						{selectedFresh ? (
 							<div className="mb-2">
-								<span className="inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary">
-									新
+								<span className="dashboard-fresh-badge inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[10px] font-medium">
+									<span
+										className="size-1.5 rounded-full bg-foreground/55"
+										aria-hidden="true"
+									/>
+									刚同步
 								</span>
 							</div>
 						) : null}

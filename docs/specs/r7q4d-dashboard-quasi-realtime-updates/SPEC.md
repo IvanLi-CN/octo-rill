@@ -67,9 +67,9 @@ Response:
 - source_type: storybook_canvas
 - story_id_or_title: Pages/Dashboard / Evidence / Live updates feed batch
 - scenario: Dashboard Feed 发现新批次但尚未自动插入
-- evidence_note: 验证顶部“有 1 条新动态”提示、用户控制的“显示”动作、新 release 卡片的 session-only `新` 标记，以及未受影响的 Inbox 侧栏保持稳定。
-- requested_viewport: 1440x1100
-- viewport_strategy: devtools-emulate
+- evidence_note: 验证顶部“系统发现新内容”托盘、用户控制的“显示”动作、新 release 卡片的 session-only `刚同步` 标记，以及未受影响的 Inbox 侧栏保持稳定。
+- requested_viewport: 1773x929 CSS px
+- viewport_strategy: storybook-viewport
 - capture_scope: browser-viewport
 - sensitive_exclusion: N/A, mock-only Storybook data
 

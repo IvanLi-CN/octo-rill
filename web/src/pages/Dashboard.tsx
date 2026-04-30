@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDownToLine, Radio } from "lucide-react";
 
 import { type MeResponse, ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import {
@@ -139,27 +140,40 @@ function NewContentNotice(props: {
 }) {
 	const { count, label, onReveal } = props;
 	if (count <= 0) return null;
+	const countLabel = `有 ${count} 条新${label}`;
 	return (
 		<div
-			className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-primary/15 bg-primary/[0.06] px-3 py-2 shadow-sm"
+			className="dashboard-new-content-notice mb-3 flex items-center justify-between gap-3 rounded-xl border px-3.5 py-3 sm:px-4"
 			data-dashboard-new-content-notice="true"
 		>
-			<div className="min-w-0">
-				<p className="font-mono text-xs font-medium text-foreground/82">
-					有 {count} 条新{label}
-				</p>
-				<p className="text-muted-foreground text-xs">
-					后端同步和处理已完成，点击后一次性显示。
-				</p>
+			<div className="relative z-10 flex min-w-0 items-start gap-3">
+				<span
+					className="dashboard-new-content-signal mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-full"
+					aria-hidden="true"
+				>
+					<Radio className="size-3.5 text-foreground/78" />
+				</span>
+				<div className="min-w-0">
+					<p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm font-semibold text-foreground">
+						<span>系统发现新内容</span>
+						<span className="rounded-full border border-primary/15 bg-background/55 px-2 py-0.5 font-mono text-[11px] font-medium text-foreground/80">
+							{countLabel}
+						</span>
+					</p>
+					<p className="mt-1 text-xs leading-5 text-muted-foreground">
+						后台同步和处理已完成，先保留当前位置，点击后合并到当前列表。
+					</p>
+				</div>
 			</div>
 			<Button
 				type="button"
 				size="sm"
 				variant="outline"
-				className="h-8 shrink-0 rounded-full px-3 font-mono text-xs"
+				className="relative z-10 h-8 shrink-0 rounded-full bg-background/70 px-3 font-mono text-xs shadow-none"
 				onClick={onReveal}
 			>
-				显示
+				<ArrowDownToLine className="size-3.5" />
+				<span>显示</span>
 			</Button>
 		</div>
 	);

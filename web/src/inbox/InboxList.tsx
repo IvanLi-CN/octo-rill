@@ -114,9 +114,8 @@ export function InboxList(props: {
 								<a
 									key={n.thread_id}
 									className={cn(
-										"group block rounded-lg border bg-background/40 px-3 py-2 transition-colors duration-200 hover:bg-background",
-										isFresh &&
-											"border-primary/25 bg-primary/[0.07] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)]",
+										"group block rounded-lg border bg-background/40 px-3 py-2 transition-[background-color,border-color,box-shadow] duration-200 hover:bg-background",
+										isFresh && "dashboard-fresh-surface hover:bg-background/70",
 									)}
 									data-inbox-item-fresh={isFresh ? "true" : "false"}
 									href={resolveNotificationHref(n)}
@@ -137,8 +136,12 @@ export function InboxList(props: {
 										<div className="mt-1 line-clamp-2 text-sm font-medium">
 											{n.subject_title ?? "(no title)"}
 											{isFresh ? (
-												<span className="ml-2 inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 align-middle font-mono text-[10px] text-primary">
-													新
+												<span className="dashboard-fresh-badge ml-2 inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 align-middle font-mono text-[10px] font-medium">
+													<span
+														className="size-1.5 rounded-full bg-foreground/55"
+														aria-hidden="true"
+													/>
+													刚同步
 												</span>
 											) : null}
 										</div>

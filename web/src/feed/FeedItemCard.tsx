@@ -1324,14 +1324,20 @@ export function FeedItemCard(props: {
 	return (
 		<div
 			className={cn(
-				"relative rounded-[24px] transition-[background-color,box-shadow] duration-200 ease-out",
-				isFresh && "bg-primary/5 shadow-[0_0_0_1px_var(--border)]",
+				"relative rounded-[24px] transition-[background-color,border-color,box-shadow] duration-200 ease-out",
+				isFresh && "dashboard-fresh-surface",
 			)}
 			data-feed-item-fresh={isFresh ? "true" : "false"}
 		>
 			{isFresh ? (
-				<span className="absolute right-3 top-3 z-10 rounded-full border border-primary/20 bg-background px-2 py-0.5 font-mono text-[11px] font-medium text-foreground/80 shadow-sm">
-					新
+				<span className="absolute -top-2 right-5 z-10">
+					<span className="dashboard-fresh-badge inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium">
+						<span
+							className="size-1.5 rounded-full bg-foreground/55"
+							aria-hidden="true"
+						/>
+						刚同步
+					</span>
 				</span>
 			) : null}
 			{card}
