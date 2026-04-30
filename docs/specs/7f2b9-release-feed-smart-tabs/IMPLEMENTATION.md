@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-07
 - Last: 2026-04-30
-- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, and native title removed from card lane tooltip triggers
+- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, native title removed from card lane tooltip triggers, and Dashboard page-level lane selector styling refreshed with Storybook evidence
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 

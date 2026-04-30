@@ -1965,7 +1965,7 @@ export function Dashboard(props: {
 						<DashboardTabsList />
 
 						<div
-							className="flex items-center gap-2"
+							className="flex min-h-8 items-center gap-2 self-center"
 							data-dashboard-secondary-controls
 						>
 							{showPageLaneSelector ? (
@@ -1976,12 +1976,12 @@ export function Dashboard(props: {
 								/>
 							) : null}
 							{aiDisabledHint ? (
-								<span className="text-muted-foreground font-mono text-xs">
+								<span className="inline-flex h-8 items-center rounded-lg border border-border/45 bg-muted/35 px-3 font-mono text-xs text-muted-foreground">
 									AI 未配置，将只显示原文
 								</span>
 							) : null}
 							{busy ? (
-								<span className="text-muted-foreground font-mono text-xs">
+								<span className="inline-flex h-8 items-center rounded-lg border border-border/45 bg-muted/35 px-3 font-mono text-xs text-muted-foreground">
 									{busy}…
 								</span>
 							) : null}
@@ -1990,7 +1990,7 @@ export function Dashboard(props: {
 									asChild
 									variant="outline"
 									size="sm"
-									className="font-mono text-xs"
+									className="h-8 rounded-lg border-border/60 bg-muted/35 px-3 font-mono text-xs text-foreground/75 shadow-none hover:bg-muted/60 hover:text-foreground"
 								>
 									<InternalLink href="/admin" to="/admin">
 										管理员面板
