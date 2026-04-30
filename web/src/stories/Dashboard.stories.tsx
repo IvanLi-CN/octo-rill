@@ -3953,6 +3953,13 @@ export const SmartReadyBody: Story = {
 			"data-state",
 			"active",
 		);
+		for (const lane of ["original", "translated", "smart"] as const) {
+			const trigger = canvasElement.querySelector(
+				`[data-feed-lane-trigger="${lane}"]`,
+			);
+			expect(trigger).not.toBeNull();
+			expect(trigger).not.toHaveAttribute("title");
+		}
 	},
 };
 

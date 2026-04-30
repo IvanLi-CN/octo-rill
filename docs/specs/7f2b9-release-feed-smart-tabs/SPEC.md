@@ -129,7 +129,7 @@
 - 页面级默认显示模式持久化到 `localStorage`：`octo-rill.dashboard.releaseDefaultLane`；默认值为 `润色`，AI disabled 或 lane 不可用时按既有保护回退到 `原文`。
 - 页面级控制器切换时，当前已渲染的 release 卡片立即切到新 lane；切换后用户仍可通过单卡 selector 临时覆盖。
 - 页面级控制器切换到 `翻译` / `润色` 时，需要沿用单卡 selector 的按需生成语义：对当前 feed 中仍为 `missing` 的卡片立即触发对应请求，避免整页切换后长期停留在原文回退态。
-- 卡片内 selector 改为 icon-only；hover / focus 通过 tooltip 与 `aria-label` 暴露 `原文 / 翻译 / 润色`。
+- 卡片内 selector 改为 icon-only；hover / focus 只通过产品内 tooltip 与 `aria-label` 暴露 `原文 / 翻译 / 润色`，触发器不能同时携带浏览器原生 `title`。
 - 润色 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
 - sync 新写入的 release：后台同时预热 `翻译` 与 `润色` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
@@ -258,6 +258,13 @@
   evidence_note: 验证默认落在“润色” tab，且正文可直接生成版本变化要点而非直译。
 
   ![润色（正文直出）](./assets/release-smart-ready-body-focused.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/SmartReadyBody`
+  state: `release-card-lane-tooltip`
+  evidence_note: 验证卡片内 icon-only selector 的 `润色` hover 只显示产品内 tooltip，且 `原文 / 翻译 / 润色` 触发器不再携带浏览器原生 `title`。
+
+  ![Release 卡片 lane tooltip](./assets/release-card-lane-tooltip.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartReadyDiff`
