@@ -253,6 +253,20 @@
   ![页面级默认显示模式切换](./assets/release-page-default-lane-switching.png)
 
 - source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/Evidence/Desktop Dark Lane Selector`
+  state: `desktop-dark-page-lane-selector-polish`
+  evidence_note: 验证暗色桌面下页面级阅读模式切换器与管理员入口同高、同基线、低阴影，控件不再在顶部控制带里显得漂浮或抢焦点。
+
+  ![暗色桌面阅读模式控件](./assets/dashboard-lane-selector-dark.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/Evidence/Tablet Header Inline`
+  state: `tablet-page-lane-selector-alignment`
+  evidence_note: 验证窄平板控制带中页面级阅读模式切换器与管理员入口保持同高、同基线，并与 tabs 控制带维持稳定间距。
+
+  ![窄平板阅读模式控件对齐](./assets/dashboard-lane-selector-tablet.png)
+
+- source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartReadyBody`
   state: `smart-ready-body`
   evidence_note: 验证默认落在“润色” tab，且正文可直接生成版本变化要点而非直译。
