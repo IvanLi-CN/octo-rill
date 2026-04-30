@@ -56,7 +56,7 @@ Response:
 
 - Given 用户首次打开 Dashboard，When updates 首次完成，Then 页面不显示新内容提示。
 - Given 后台同步写入新的 release/social/brief/notification，When 下一轮 updates 命中，Then 对应列表显示“有 N 条新内容”。
-- Given 用户点击 Feed 新内容提示，When 刷新完成，Then 新卡片出现 `新` 标记，旧卡片不丢失 reaction viewer 状态。
+- Given 用户点击 Feed 新内容提示，When 刷新完成，Then 新卡片在时间元信息旁出现 session-only 圆点暗示，旧卡片不丢失 reaction viewer 状态。
 - Given Inbox 在当前视口未加载，When 轮询执行，Then 不主动请求 notifications 更新。
 - Given 显式同步任务完成，When 页面刷新成功，Then silent updates check 刷新 baseline，不重复提示刚同步的内容。
 
@@ -67,7 +67,7 @@ Response:
 - source_type: storybook_canvas
 - story_id_or_title: Pages/Dashboard / Evidence / Live updates feed batch
 - scenario: Dashboard Feed 发现新批次但尚未自动插入
-- evidence_note: 验证列表内“刚刚同步”批次分隔、用户控制的展开动作、新 release 卡片在时间元信息旁保留 session-only 圆点暗示，以及未受影响的 Inbox 侧栏保持稳定。
+- evidence_note: 验证列表内“刚刚同步”批次分隔、用户控制的展开动作、新 release 卡片在时间元信息旁保留带层次和短时呼吸动效的 session-only 圆点暗示，以及未受影响的 Inbox 侧栏保持稳定。
 - requested_viewport: 1773x929 CSS px
 - viewport_strategy: storybook-viewport
 - capture_scope: browser-viewport

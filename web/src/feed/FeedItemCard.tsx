@@ -543,7 +543,8 @@ function FreshContentCue(props: { className?: string }) {
 			title="刚刚同步"
 		>
 			<span
-				className="dashboard-fresh-cue inline-flex size-1.5 rounded-full"
+				className="dashboard-fresh-cue inline-flex size-2.5 rounded-full"
+				data-dashboard-fresh-cue="true"
 				aria-hidden="true"
 			/>
 			<span className="sr-only">刚刚同步</span>
