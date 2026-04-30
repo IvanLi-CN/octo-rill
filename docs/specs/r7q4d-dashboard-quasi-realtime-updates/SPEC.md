@@ -67,7 +67,7 @@ Response:
 - source_type: storybook_canvas
 - story_id_or_title: Pages/Dashboard / Evidence / Live updates feed batch
 - scenario: Dashboard Feed 发现新批次但尚未自动插入
-- evidence_note: 验证列表内“刚刚同步”批次分隔、用户控制的展开动作、新 release 卡片在时间元信息旁保留带层次和持续低声量呼吸动效的 session-only 圆点暗示，以及未受影响的 Inbox 侧栏保持稳定。
+- evidence_note: 验证列表内“刚刚同步”批次分隔、用户控制的展开动作、新 release 卡片在时间元信息旁保留青蓝同步色、带层次和持续低声量呼吸动效的 session-only 圆点暗示，以及未受影响的 Inbox 侧栏保持稳定。
 - requested_viewport: 1773x929 CSS px
 - viewport_strategy: storybook-viewport
 - capture_scope: browser-viewport

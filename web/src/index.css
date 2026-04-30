@@ -201,32 +201,32 @@
 		background:
 			radial-gradient(
 				circle at 34% 28%,
-				oklch(0.98 0.018 96 / 0.9) 0 13%,
+				oklch(0.97 0.045 188 / 0.95) 0 13%,
 				transparent 16%
 			),
 			linear-gradient(
 				145deg,
-				oklch(0.86 0.058 96 / 0.94),
-				oklch(0.58 0.074 98 / 0.9)
+				oklch(0.82 0.12 188 / 0.96),
+				oklch(0.55 0.155 206 / 0.94)
 			);
 		box-shadow:
 			0 0 0 1px color-mix(in oklch, var(--background) 88%, transparent),
-			0 0 0 3px oklch(0.78 0.04 96 / 0.14),
-			0 2px 8px oklch(0.2 0.03 82 / 0.14);
+			0 0 0 3px oklch(0.76 0.12 194 / 0.18),
+			0 2px 8px oklch(0.28 0.05 205 / 0.16);
 	}
 
 	.dashboard-fresh-cue::before {
 		position: absolute;
 		inset: -6px;
-		border: 1px solid oklch(0.72 0.054 96 / 0.34);
+		border: 1px solid oklch(0.68 0.15 198 / 0.42);
 		border-radius: inherit;
+		background: oklch(0.77 0.12 192 / 0.1);
 		opacity: 0;
 		transform: scale(0.68);
 		animation: dashboard-fresh-cue-breathe 1800ms cubic-bezier(0.22, 1, 0.36, 1)
 			infinite;
 		content: "";
 		will-change: opacity, transform;
-		z-index: -1;
 	}
 
 	.dashboard-fresh-cue::after {
@@ -236,7 +236,7 @@
 		width: 3px;
 		height: 3px;
 		border-radius: inherit;
-		background: oklch(1 0 0 / 0.72);
+		background: oklch(0.99 0.028 180 / 0.9);
 		animation: dashboard-fresh-cue-spark 1800ms ease-in-out infinite;
 		content: "";
 		will-change: opacity, transform;
@@ -246,18 +246,18 @@
 		background:
 			radial-gradient(
 				circle at 34% 28%,
-				oklch(0.94 0.018 96 / 0.82) 0 13%,
+				oklch(0.94 0.05 188 / 0.9) 0 13%,
 				transparent 16%
 			),
 			linear-gradient(
 				145deg,
-				oklch(0.8 0.058 96 / 0.94),
-				oklch(0.55 0.074 98 / 0.94)
+				oklch(0.76 0.13 188 / 0.96),
+				oklch(0.54 0.16 206 / 0.96)
 			);
 		box-shadow:
 			0 0 0 1px color-mix(in oklch, var(--background) 84%, transparent),
-			0 0 0 3px oklch(0.78 0.04 96 / 0.17),
-			0 0 14px oklch(0.75 0.055 96 / 0.17);
+			0 0 0 3px oklch(0.72 0.13 194 / 0.2),
+			0 0 16px oklch(0.72 0.14 198 / 0.22);
 	}
 
 	@keyframes dashboard-fresh-cue-breathe {
