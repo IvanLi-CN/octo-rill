@@ -196,6 +196,7 @@
 	}
 
 	.dashboard-fresh-cue {
+		isolation: isolate;
 		position: relative;
 		background:
 			radial-gradient(
@@ -216,15 +217,16 @@
 
 	.dashboard-fresh-cue::before {
 		position: absolute;
-		inset: -4px;
-		border: 1px solid oklch(0.72 0.054 96 / 0.28);
+		inset: -6px;
+		border: 1px solid oklch(0.72 0.054 96 / 0.34);
 		border-radius: inherit;
 		opacity: 0;
-		transform: scale(0.72);
-		animation: dashboard-fresh-cue-breathe 2200ms cubic-bezier(0.22, 1, 0.36, 1)
-			220ms 3 both;
+		transform: scale(0.68);
+		animation: dashboard-fresh-cue-breathe 1800ms cubic-bezier(0.22, 1, 0.36, 1)
+			infinite;
 		content: "";
 		will-change: opacity, transform;
+		z-index: -1;
 	}
 
 	.dashboard-fresh-cue::after {
@@ -235,7 +237,9 @@
 		height: 3px;
 		border-radius: inherit;
 		background: oklch(1 0 0 / 0.72);
+		animation: dashboard-fresh-cue-spark 1800ms ease-in-out infinite;
 		content: "";
+		will-change: opacity, transform;
 	}
 
 	.dark .dashboard-fresh-cue {
@@ -259,17 +263,30 @@
 	@keyframes dashboard-fresh-cue-breathe {
 		0% {
 			opacity: 0;
-			transform: scale(0.72);
+			transform: scale(0.68);
 		}
 
-		28% {
-			opacity: 0.62;
-			transform: scale(1);
+		36% {
+			opacity: 0.68;
+			transform: scale(1.04);
 		}
 
 		100% {
 			opacity: 0;
-			transform: scale(1.6);
+			transform: scale(1.85);
+		}
+	}
+
+	@keyframes dashboard-fresh-cue-spark {
+		0%,
+		100% {
+			opacity: 0.48;
+			transform: scale(0.86);
+		}
+
+		42% {
+			opacity: 1;
+			transform: scale(1.08);
 		}
 	}
 
@@ -278,6 +295,12 @@
 			animation: none;
 			opacity: 0.34;
 			transform: scale(1);
+		}
+
+		.dashboard-fresh-cue::after {
+			animation: none;
+			opacity: 0.72;
+			transform: none;
 		}
 	}
 }
