@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-07
-- Last: 2026-04-08
-- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, and translation empty-content retries capped at 8 attempts in-call
+- Last: 2026-04-30
+- Summary: 已交付；PR #53; page-level lane selector, segmented selector polish, visual evidence refreshed, translation empty-content retries capped at 8 attempts in-call, and native title removed from card lane tooltip triggers
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -15,4 +15,4 @@
 - [x] M1: Spec 与 API/数据契约冻结。
 - [x] M2: 后端 `release_smart` 调度、prompt、diff fallback 与 `/api/feed` smart lane 完成。
 - [x] M3: 前端三 tabs、呼吸态、折叠卡片与 on-demand 生成完成。
-- [ ] M4: Storybook / Playwright / visual evidence / PR merge-ready 收敛完成。
+- [x] M4: Storybook / Playwright / visual evidence / PR merge-ready 收敛完成。

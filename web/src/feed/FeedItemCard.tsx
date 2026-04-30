@@ -273,7 +273,6 @@ function FeedCardLaneTabs(props: {
 							<TabsTrigger
 								value={option.lane}
 								aria-label={option.label}
-								title={option.label}
 								data-feed-lane-trigger={option.lane}
 								data-active={active ? "true" : "false"}
 								data-feed-lane-loading={isLoading ? "true" : "false"}
