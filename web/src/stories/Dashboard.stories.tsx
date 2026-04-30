@@ -3847,7 +3847,7 @@ export const QuasiRealtimeNewFeedBatch: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时更新状态：后台同步和润色完成后，阅读流里出现低声量批次痕迹；展开后，新卡片只保留轻微底色和小圆点暗示。",
+					"Dashboard 准实时更新状态：后台同步和润色完成后，阅读流里出现低声量批次痕迹；展开后，新卡片只在时间元信息旁保留小圆点暗示。",
 			},
 		},
 	},
