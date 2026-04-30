@@ -5,6 +5,7 @@ import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 import { Markdown } from "@/components/Markdown";
 import { Button } from "@/components/ui/button";
 import { formatIsoRangeInTimeZone } from "@/lib/datetime";
+import { cn } from "@/lib/utils";
 import {
 	Card,
 	CardContent,
@@ -39,6 +40,7 @@ export function ReleaseDailyCard(props: {
 	selectedId: string | null;
 	busy: boolean;
 	error?: string | null;
+	freshKeys?: Set<string>;
 	onGenerate: () => void;
 	onRetry?: () => void;
 	onOpenRelease?: (target: DashboardReleaseTarget) => void;
@@ -48,6 +50,7 @@ export function ReleaseDailyCard(props: {
 		selectedId,
 		busy,
 		error = null,
+		freshKeys = new Set<string>(),
 		onGenerate,
 		onRetry,
 		onOpenRelease,
@@ -60,6 +63,9 @@ export function ReleaseDailyCard(props: {
 		}
 		return briefs[0] ?? null;
 	})();
+	const selectedFresh = selected
+		? freshKeys.has(`brief:${selected.id}`)
+		: false;
 
 	const windowText = selected ? formatWindow(selected) : null;
 	const boundaryText =
@@ -115,7 +121,21 @@ export function ReleaseDailyCard(props: {
 						时区”生成快照，历史窗口不会因为之后改设置而漂移。
 					</p>
 				) : selected ? (
-					<div className="bg-muted/10 rounded-lg border p-3.5 sm:p-4">
+					<div
+						className={cn(
+							"rounded-lg border bg-muted/10 p-3.5 transition-colors duration-200 sm:p-4",
+							selectedFresh &&
+								"border-primary/25 bg-primary/[0.06] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)]",
+						)}
+						data-brief-item-fresh={selectedFresh ? "true" : "false"}
+					>
+						{selectedFresh ? (
+							<div className="mb-2">
+								<span className="inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary">
+									新
+								</span>
+							</div>
+						) : null}
 						<Markdown
 							content={selected.content_markdown}
 							onInternalReleaseClick={onOpenRelease}

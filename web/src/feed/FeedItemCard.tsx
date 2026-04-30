@@ -1302,24 +1302,39 @@ export function FeedItemCard(props: {
 	isSmartGenerating: boolean;
 	isReactionBusy: boolean;
 	reactionError: string | null;
+	isFresh?: boolean;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
 }) {
-	const { item, currentViewer } = props;
+	const { item, currentViewer, isFresh = false } = props;
+	let card: ReactNode = null;
 
 	if (item.kind === "announcement") {
-		return <AnnouncementContentCard item={item} />;
-	}
-
-	if (isSocialFeedItem(item)) {
-		return <SocialActivityCard item={item} currentViewer={currentViewer} />;
-	}
-
-	if (!isReleaseFeedItem(item)) {
+		card = <AnnouncementContentCard item={item} />;
+	} else if (isSocialFeedItem(item)) {
+		card = <SocialActivityCard item={item} currentViewer={currentViewer} />;
+	} else if (isReleaseFeedItem(item)) {
+		card = <ReleaseFeedCard {...props} item={item} />;
+	} else {
 		return null;
 	}
 
-	return <ReleaseFeedCard {...props} item={item} />;
+	return (
+		<div
+			className={cn(
+				"relative rounded-[24px] transition-[background-color,box-shadow] duration-200 ease-out",
+				isFresh && "bg-primary/5 shadow-[0_0_0_1px_var(--border)]",
+			)}
+			data-feed-item-fresh={isFresh ? "true" : "false"}
+		>
+			{isFresh ? (
+				<span className="absolute right-3 top-3 z-10 rounded-full border border-primary/20 bg-background px-2 py-0.5 font-mono text-[11px] font-medium text-foreground/80 shadow-sm">
+					新
+				</span>
+			) : null}
+			{card}
+		</div>
+	);
 }

@@ -3,6 +3,7 @@ import { ArrowUpRight, Inbox, RefreshCcw } from "lucide-react";
 import { ErrorStatePanel } from "@/components/feedback/ErrorStatePanel";
 import { Button } from "@/components/ui/button";
 import { formatIsoShortLocal } from "@/lib/datetime";
+import { cn } from "@/lib/utils";
 import {
 	Card,
 	CardContent,
@@ -19,6 +20,7 @@ export function InboxList(props: {
 	busy?: boolean;
 	syncing?: boolean;
 	error?: string | null;
+	freshKeys?: Set<string>;
 	onSync?: () => void;
 	onRetry?: () => void;
 }) {
@@ -28,6 +30,7 @@ export function InboxList(props: {
 		busy = false,
 		syncing = false,
 		error = null,
+		freshKeys = new Set<string>(),
 		onSync,
 		onRetry,
 	} = props;
@@ -105,38 +108,51 @@ export function InboxList(props: {
 					)
 				) : (
 					<div className="space-y-3">
-						{notifications.map((n) => (
-							<a
-								key={n.thread_id}
-								className="group block rounded-lg border bg-background/40 px-3 py-2 transition-colors hover:bg-background"
-								href={resolveNotificationHref(n)}
-								target="_blank"
-								rel="noreferrer"
-							>
-								<div className="min-w-0">
-									<div className="flex items-center gap-2">
-										{n.unread ? (
-											<span className="bg-primary size-1.5 shrink-0 rounded-full" />
-										) : (
-											<span className="bg-muted size-1.5 shrink-0 rounded-full" />
-										)}
-										<span className="font-mono text-muted-foreground truncate text-[11px]">
-											{n.repo_full_name ?? "(unknown repo)"}
-										</span>
+						{notifications.map((n) => {
+							const isFresh = freshKeys.has(`notification:${n.thread_id}`);
+							return (
+								<a
+									key={n.thread_id}
+									className={cn(
+										"group block rounded-lg border bg-background/40 px-3 py-2 transition-colors duration-200 hover:bg-background",
+										isFresh &&
+											"border-primary/25 bg-primary/[0.07] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)]",
+									)}
+									data-inbox-item-fresh={isFresh ? "true" : "false"}
+									href={resolveNotificationHref(n)}
+									target="_blank"
+									rel="noreferrer"
+								>
+									<div className="min-w-0">
+										<div className="flex items-center gap-2">
+											{n.unread ? (
+												<span className="bg-primary size-1.5 shrink-0 rounded-full" />
+											) : (
+												<span className="bg-muted size-1.5 shrink-0 rounded-full" />
+											)}
+											<span className="font-mono text-muted-foreground truncate text-[11px]">
+												{n.repo_full_name ?? "(unknown repo)"}
+											</span>
+										</div>
+										<div className="mt-1 line-clamp-2 text-sm font-medium">
+											{n.subject_title ?? "(no title)"}
+											{isFresh ? (
+												<span className="ml-2 inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 align-middle font-mono text-[10px] text-primary">
+													新
+												</span>
+											) : null}
+										</div>
+										<div className="text-muted-foreground mt-1 font-mono text-[11px]">
+											{n.reason ? n.reason : "update"}
+											{n.subject_type ? ` · ${n.subject_type}` : ""}
+											{n.updated_at
+												? ` · ${formatIsoShortLocal(n.updated_at)}`
+												: ""}
+										</div>
 									</div>
-									<div className="mt-1 line-clamp-2 text-sm font-medium">
-										{n.subject_title ?? "(no title)"}
-									</div>
-									<div className="text-muted-foreground mt-1 font-mono text-[11px]">
-										{n.reason ? n.reason : "update"}
-										{n.subject_type ? ` · ${n.subject_type}` : ""}
-										{n.updated_at
-											? ` · ${formatIsoShortLocal(n.updated_at)}`
-											: ""}
-									</div>
-								</div>
-							</a>
-						))}
+								</a>
+							);
+						})}
 					</div>
 				)}
 			</CardContent>

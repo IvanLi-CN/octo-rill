@@ -129,6 +129,7 @@ export function useFeed(
 	const [loadingInitial, setLoadingInitial] = useState(!initialStateMatches);
 	const [loadingMore, setLoadingMore] = useState(false);
 	const [error, setError] = useState<FeedLoadError | null>(null);
+	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
 	const isCurrentType = dataType === type;
@@ -146,36 +147,44 @@ export function useFeed(
 		setLoadingInitial(false);
 		setLoadingMore(false);
 		setError(null);
+		setFreshKeys(new Set());
 	}, [type]);
 
-	const loadInitial = useCallback(async () => {
-		reqIdRef.current += 1;
-		const reqId = reqIdRef.current;
+	const loadInitial = useCallback(
+		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+			reqIdRef.current += 1;
+			const reqId = reqIdRef.current;
 
-		// Cancel any in-flight "load more" state; we are replacing the list.
-		setLoadingMore(false);
+			// Cancel any in-flight "load more" state; we are replacing the list.
+			setLoadingMore(false);
 
-		setLoadingInitial(true);
-		setError(null);
-		try {
-			const res = await apiGet<FeedResponse>(buildFeedUrl(30, type));
-			if (reqId !== reqIdRef.current) return;
-			setDataType(type);
-			setItems((prev) => preserveReleaseViewers(prev, res.items));
-			setNextCursor(res.next_cursor);
-		} catch (err) {
-			if (reqId !== reqIdRef.current) return;
-			setError({
-				phase: "initial",
-				message: err instanceof Error ? err.message : String(err),
-				at: Date.now(),
-			});
-		} finally {
-			if (reqId === reqIdRef.current) {
-				setLoadingInitial(false);
+			setLoadingInitial(true);
+			setError(null);
+			try {
+				const res = await apiGet<FeedResponse>(buildFeedUrl(30, type));
+				if (reqId !== reqIdRef.current) return;
+				setDataType(type);
+				setItems((prev) => preserveReleaseViewers(prev, res.items));
+				setNextCursor(res.next_cursor);
+				setFreshKeys(new Set(options?.freshKeys ?? []));
+			} catch (err) {
+				if (reqId !== reqIdRef.current) return;
+				setError({
+					phase: "initial",
+					message: err instanceof Error ? err.message : String(err),
+					at: Date.now(),
+				});
+				if (options?.throwOnError) {
+					throw err;
+				}
+			} finally {
+				if (reqId === reqIdRef.current) {
+					setLoadingInitial(false);
+				}
 			}
-		}
-	}, [type]);
+		},
+		[type],
+	);
 
 	const loadMore = useCallback(async () => {
 		if (!currentNextCursor || loadingMore || currentLoadingInitial) return;
@@ -204,9 +213,12 @@ export function useFeed(
 		}
 	}, [currentLoadingInitial, currentNextCursor, loadingMore, type]);
 
-	const refresh = useCallback(async () => {
-		await loadInitial();
-	}, [loadInitial]);
+	const refresh = useCallback(
+		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
+			await loadInitial(options);
+		},
+		[loadInitial],
+	);
 
 	const applyTranslation = useCallback(
 		(item: Pick<FeedItem, "kind" | "id">, translated: TranslatedItem) => {
@@ -274,6 +286,7 @@ export function useFeed(
 
 	return {
 		items: currentItems,
+		freshKeys: isCurrentType ? freshKeys : new Set<string>(),
 		nextCursor: currentNextCursor,
 		hasMore,
 		loadingInitial: currentLoadingInitial,

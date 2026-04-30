@@ -10,6 +10,7 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, extract::State};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{Datelike, TimeZone};
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -5815,6 +5816,325 @@ pub async fn list_briefs(
         .collect::<Vec<_>>();
 
     Ok(Json(items))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DashboardUpdatesQuery {
+    token: Option<String>,
+    feed_type: Option<String>,
+    include: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardUpdatesResponse {
+    token: String,
+    generated_at: String,
+    lists: DashboardUpdatesLists,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardUpdatesLists {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feed: Option<DashboardListUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    briefs: Option<DashboardListUpdate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notifications: Option<DashboardListUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DashboardListUpdate {
+    changed: bool,
+    new_count: usize,
+    latest_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct DashboardUpdatesToken {
+    feed: Vec<String>,
+    briefs: Vec<String>,
+    notifications: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DashboardUpdateInclude {
+    feed: bool,
+    briefs: bool,
+    notifications: bool,
+}
+
+impl DashboardUpdateInclude {
+    fn all() -> Self {
+        Self {
+            feed: true,
+            briefs: true,
+            notifications: true,
+        }
+    }
+}
+
+fn parse_dashboard_update_include(raw: Option<&str>) -> Result<DashboardUpdateInclude, ApiError> {
+    let Some(raw) = raw else {
+        return Ok(DashboardUpdateInclude::all());
+    };
+    let mut include = DashboardUpdateInclude {
+        feed: false,
+        briefs: false,
+        notifications: false,
+    };
+    let mut saw_any = false;
+    for part in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        saw_any = true;
+        match part {
+            "feed" => include.feed = true,
+            "briefs" => include.briefs = true,
+            "notifications" | "inbox" => include.notifications = true,
+            _ => return Err(ApiError::bad_request(format!("invalid include: {part}"))),
+        }
+    }
+    if saw_any {
+        Ok(include)
+    } else {
+        Ok(DashboardUpdateInclude::all())
+    }
+}
+
+fn parse_dashboard_feed_type(raw: Option<&str>) -> Result<FeedTypeSelection, ApiError> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("all") => Ok(FeedTypeSelection::all()),
+        Some("releases") => parse_feed_types(Some("releases")),
+        Some("stars") => parse_feed_types(Some("stars")),
+        Some("followers") => parse_feed_types(Some("followers")),
+        Some(value) => Err(ApiError::bad_request(format!("invalid feed_type: {value}"))),
+    }
+}
+
+fn decode_dashboard_updates_token(
+    raw: Option<&str>,
+) -> Result<Option<DashboardUpdatesToken>, ApiError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| ApiError::bad_request("invalid dashboard updates token"))?;
+    serde_json::from_slice::<DashboardUpdatesToken>(&bytes)
+        .map(Some)
+        .map_err(|_| ApiError::bad_request("invalid dashboard updates token"))
+}
+
+fn encode_dashboard_updates_token(token: &DashboardUpdatesToken) -> Result<String, ApiError> {
+    let bytes = serde_json::to_vec(token).map_err(ApiError::internal)?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn build_dashboard_list_update(
+    previous_signature_digests: Option<&[String]>,
+    latest_signatures: &[String],
+) -> DashboardListUpdate {
+    let latest_keys = latest_signatures
+        .iter()
+        .map(|signature| dashboard_update_signature_key(signature).to_owned())
+        .collect::<Vec<_>>();
+    let latest_digests = compact_dashboard_signatures(latest_signatures);
+    let Some(previous_signature_digests) = previous_signature_digests else {
+        return DashboardListUpdate {
+            changed: false,
+            new_count: 0,
+            latest_keys,
+        };
+    };
+    if previous_signature_digests == latest_digests {
+        return DashboardListUpdate {
+            changed: false,
+            new_count: 0,
+            latest_keys,
+        };
+    }
+    let previous = previous_signature_digests
+        .iter()
+        .map(|digest| digest.as_str())
+        .collect::<HashSet<_>>();
+    let mut changed_keys = Vec::new();
+    let mut seen_changed_keys = HashSet::new();
+    for (signature, digest) in latest_signatures.iter().zip(latest_digests.iter()) {
+        if previous.contains(digest.as_str()) {
+            continue;
+        }
+        let key = dashboard_update_signature_key(signature);
+        if seen_changed_keys.insert(key) {
+            changed_keys.push(key.to_owned());
+        }
+    }
+    DashboardListUpdate {
+        changed: !changed_keys.is_empty(),
+        new_count: changed_keys.len(),
+        latest_keys: changed_keys,
+    }
+}
+
+fn dashboard_update_signature_digest(signature: &str) -> String {
+    ai::sha256_hex(signature).chars().take(16).collect()
+}
+
+fn compact_dashboard_signatures(signatures: &[String]) -> Vec<String> {
+    signatures
+        .iter()
+        .map(|signature| dashboard_update_signature_digest(signature))
+        .collect()
+}
+
+fn dashboard_update_signature_key(signature: &str) -> &str {
+    signature
+        .split_once('|')
+        .map(|(key, _)| key)
+        .unwrap_or(signature)
+}
+
+fn option_signature_value(value: Option<&str>) -> &str {
+    value.unwrap_or("")
+}
+
+fn dashboard_feed_signature(row: &FeedRow) -> String {
+    let key = format!("{}:{}", row.kind, row.entity_id);
+    let state_hash = ai::sha256_hex(&format!(
+        "sort={}\ntrans_hash={}\ntrans_status={}\ntrans_work={}\ntrans_title={}\ntrans_summary={}\ndetail_hash={}\ndetail_status={}\ndetail_work={}\ndetail_title={}\ndetail_summary={}\nsmart_hash={}\nsmart_status={}\nsmart_work={}\nsmart_title={}\nsmart_summary={}\n",
+        row.sort_ts,
+        option_signature_value(row.trans_source_hash.as_deref()),
+        option_signature_value(row.trans_status.as_deref()),
+        option_signature_value(row.trans_work_status.as_deref()),
+        option_signature_value(row.trans_title.as_deref()),
+        option_signature_value(row.trans_summary.as_deref()),
+        option_signature_value(row.detail_trans_source_hash.as_deref()),
+        option_signature_value(row.detail_trans_status.as_deref()),
+        option_signature_value(row.detail_trans_work_status.as_deref()),
+        option_signature_value(row.detail_trans_title.as_deref()),
+        option_signature_value(row.detail_trans_summary.as_deref()),
+        option_signature_value(row.smart_source_hash.as_deref()),
+        option_signature_value(row.smart_status.as_deref()),
+        option_signature_value(row.smart_work_status.as_deref()),
+        option_signature_value(row.smart_title.as_deref()),
+        option_signature_value(row.smart_summary.as_deref()),
+    ));
+    format!("{key}|{state_hash}")
+}
+
+async fn load_dashboard_feed_signatures(
+    state: &AppState,
+    user_id: &str,
+    types: FeedTypeSelection,
+) -> Result<Vec<String>, ApiError> {
+    fetch_feed_items(state, user_id, None, types, 30)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| dashboard_feed_signature(&row))
+                .collect()
+        })
+}
+
+async fn load_dashboard_brief_signatures(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let signatures = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT 'brief:' || id || '|' || updated_at
+        FROM briefs
+        WHERE user_id = ?
+        ORDER BY COALESCE(window_end_utc, created_at) DESC, created_at DESC, id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(signatures)
+}
+
+async fn load_dashboard_notification_signatures(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<String>, ApiError> {
+    let signatures = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT 'notification:' || thread_id || '|' || COALESCE(updated_at, '') || '|' || unread
+        FROM notifications
+        WHERE user_id = ?
+        ORDER BY updated_at DESC, thread_id DESC
+        LIMIT 50
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(signatures)
+}
+
+pub async fn dashboard_updates(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(q): Query<DashboardUpdatesQuery>,
+) -> Result<Json<DashboardUpdatesResponse>, ApiError> {
+    let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let previous = decode_dashboard_updates_token(q.token.as_deref())?;
+    let include = parse_dashboard_update_include(q.include.as_deref())?;
+    let feed_types = parse_dashboard_feed_type(q.feed_type.as_deref())?;
+
+    let mut next_token = DashboardUpdatesToken::default();
+    let mut lists = DashboardUpdatesLists {
+        feed: None,
+        briefs: None,
+        notifications: None,
+    };
+
+    if include.feed {
+        let signatures =
+            load_dashboard_feed_signatures(state.as_ref(), &user_id, feed_types).await?;
+        lists.feed = Some(build_dashboard_list_update(
+            previous.as_ref().map(|token| token.feed.as_slice()),
+            &signatures,
+        ));
+        next_token.feed = compact_dashboard_signatures(&signatures);
+    } else if let Some(previous) = previous.as_ref() {
+        next_token.feed = previous.feed.clone();
+    }
+
+    if include.briefs {
+        let signatures = load_dashboard_brief_signatures(state.as_ref(), &user_id).await?;
+        lists.briefs = Some(build_dashboard_list_update(
+            previous.as_ref().map(|token| token.briefs.as_slice()),
+            &signatures,
+        ));
+        next_token.briefs = compact_dashboard_signatures(&signatures);
+    } else if let Some(previous) = previous.as_ref() {
+        next_token.briefs = previous.briefs.clone();
+    }
+
+    if include.notifications {
+        let signatures = load_dashboard_notification_signatures(state.as_ref(), &user_id).await?;
+        lists.notifications = Some(build_dashboard_list_update(
+            previous
+                .as_ref()
+                .map(|token| token.notifications.as_slice()),
+            &signatures,
+        ));
+        next_token.notifications = compact_dashboard_signatures(&signatures);
+    } else if let Some(previous) = previous.as_ref() {
+        next_token.notifications = previous.notifications.clone();
+    }
+
+    Ok(Json(DashboardUpdatesResponse {
+        token: encode_dashboard_updates_token(&next_token)?,
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        lists,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -12797,15 +13117,17 @@ mod tests {
         AdminLlmCallListScope, AdminLlmCallsQuery, AdminLlmRuntimeConfigUpdateRequest,
         AdminRealtimeTaskDetailItem, AdminRealtimeTasksQuery, AdminSyncSubscriptionEventItem,
         AdminTaskEventItem, AdminUserPatchRequest, AdminUserUpdateGuard, AdminUsersQuery,
-        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, FeedQuery, FeedReactionRefreshRequest, FeedRow,
-        GitHubCompareCommit, GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse,
-        GraphQlError, LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
+        BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, DashboardUpdatesQuery, DashboardUpdatesToken,
+        FeedQuery, FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit,
+        GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
+        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
         SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
         admin_dashboard, admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
         admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
         brief_contains_release_link, build_compare_digest, build_task_diagnostics,
+        compact_dashboard_signatures, dashboard_updates, encode_dashboard_updates_token,
         ensure_account_enabled, execute_sync_all_sync_with, extract_brief_release_ids,
         extract_translation_fields, feed_item_from_row, get_release_detail,
         get_release_detail_by_repo_tag, github_access_restricted_error,
@@ -13950,6 +14272,49 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed brief");
+    }
+
+    async fn seed_notification(
+        pool: &SqlitePool,
+        user_id: &str,
+        thread_id: &str,
+        updated_at: &str,
+    ) {
+        seed_notification_with_timestamp(pool, user_id, thread_id, Some(updated_at)).await;
+    }
+
+    async fn seed_notification_with_timestamp(
+        pool: &SqlitePool,
+        user_id: &str,
+        thread_id: &str,
+        updated_at: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id,
+              user_id,
+              thread_id,
+              repo_full_name,
+              subject_title,
+              subject_type,
+              reason,
+              updated_at,
+              unread,
+              html_url
+            )
+            VALUES (?, ?, ?, 'openai/codex', ?, 'PullRequest', 'state_change', ?, 1, ?)
+            "#,
+        )
+        .bind(format!("notification-{thread_id}"))
+        .bind(user_id)
+        .bind(thread_id)
+        .bind(format!("Thread {thread_id}"))
+        .bind(updated_at)
+        .bind(format!("https://github.com/notifications/{thread_id}"))
+        .execute(pool)
+        .await
+        .expect("seed notification");
     }
 
     async fn seed_release_detail_translation(
@@ -18470,6 +18835,318 @@ line two",
         assert_eq!(reactions.counts.heart, 3);
         assert!(!reactions.viewer.plus1);
         assert!(!reactions.viewer.heart);
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_token_stays_below_common_request_line_limits() {
+        let feed = (0..30)
+            .map(|i| {
+                format!(
+                    "release:{}|sort=2026-04-30T10:00:{i:02}Z|{}",
+                    1_000_000_000_i64 + i,
+                    "a".repeat(256)
+                )
+            })
+            .collect::<Vec<_>>();
+        let briefs = (0..50)
+            .map(|i| {
+                format!(
+                    "brief:brief-2026-04-{i:02}|2026-04-30T10:00:00.000000Z|{}",
+                    "b".repeat(128)
+                )
+            })
+            .collect::<Vec<_>>();
+        let notifications = (0..50)
+            .map(|i| {
+                format!(
+                    "notification:github-thread-{}-{i}|2026-04-30T10:00:00.000000Z|1|{}",
+                    "c".repeat(32),
+                    "d".repeat(128)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let token = DashboardUpdatesToken {
+            feed: compact_dashboard_signatures(&feed),
+            briefs: compact_dashboard_signatures(&briefs),
+            notifications: compact_dashboard_signatures(&notifications),
+        };
+        let encoded = encode_dashboard_updates_token(&token).expect("encode compact token");
+
+        assert!(
+            encoded.len() < 4096,
+            "compact token should leave room for path and query overhead, got {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_requires_active_session() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let store = Arc::new(MemoryStore::default());
+        let session = Session::new(None, store, None);
+
+        let err = dashboard_updates(
+            State(state),
+            session,
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: None,
+                include: None,
+            }),
+        )
+        .await
+        .expect_err("dashboard updates should require auth");
+
+        assert_eq!(err.code(), "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_reports_changed_lists_after_token() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        seed_brief(&pool, user_id.as_str(), "2026-02-23", "## 初始日报").await;
+        seed_notification(
+            &pool,
+            user_id.as_str(),
+            "thread-initial",
+            "2026-02-23T08:00:00Z",
+        )
+        .await;
+        let state = setup_state(pool.clone());
+
+        let Json(initial) = dashboard_updates(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("all".to_owned()),
+                include: Some("feed,briefs,notifications".to_owned()),
+            }),
+        )
+        .await
+        .expect("initial dashboard updates");
+        assert!(!initial.lists.feed.as_ref().expect("feed list").changed);
+
+        seed_repo_release(&pool, 42, 121).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET published_at = '2026-02-24T08:00:00Z',
+                created_at = '2026-02-24T08:00:00Z',
+                updated_at = '2026-02-24T08:00:00Z',
+                tag_name = 'v1.2.4',
+                name = 'Release v1.2.4',
+                html_url = 'https://github.com/openai/codex/releases/tag/v1.2.4'
+            WHERE release_id = 121
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("retime new release");
+        seed_brief(&pool, user_id.as_str(), "2026-02-24", "## 新日报").await;
+        seed_notification(
+            &pool,
+            user_id.as_str(),
+            "thread-new",
+            "2026-02-24T08:00:00Z",
+        )
+        .await;
+
+        let Json(changed) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: Some(initial.token),
+                feed_type: Some("all".to_owned()),
+                include: Some("feed,briefs,notifications".to_owned()),
+            }),
+        )
+        .await
+        .expect("changed dashboard updates");
+
+        let feed = changed.lists.feed.as_ref().expect("feed update");
+        assert!(feed.changed);
+        assert_eq!(feed.new_count, 1);
+        assert_eq!(
+            feed.latest_keys.first().map(String::as_str),
+            Some("release:121")
+        );
+
+        let briefs = changed.lists.briefs.as_ref().expect("brief update");
+        assert!(briefs.changed);
+        assert_eq!(briefs.new_count, 1);
+        assert_eq!(
+            briefs.latest_keys.first().map(String::as_str),
+            Some("brief:brief-2026-02-24")
+        );
+
+        let notifications = changed
+            .lists
+            .notifications
+            .as_ref()
+            .expect("notification update");
+        assert!(notifications.changed);
+        assert_eq!(notifications.new_count, 1);
+        assert_eq!(
+            notifications.latest_keys.first().map(String::as_str),
+            Some("notification:thread-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_reports_existing_feed_item_processing_change() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_repo_release(&pool, 42, 121).await;
+        sqlx::query(
+            r#"
+            UPDATE repo_releases
+            SET published_at = '2026-02-24T08:00:00Z',
+                created_at = '2026-02-24T08:00:00Z',
+                updated_at = '2026-02-24T08:00:00Z',
+                tag_name = 'v1.2.4',
+                name = 'Release v1.2.4',
+                html_url = 'https://github.com/openai/codex/releases/tag/v1.2.4'
+            WHERE release_id = 121
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("retime leading release");
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool.clone());
+
+        let Json(initial) = dashboard_updates(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("releases".to_owned()),
+                include: Some("feed".to_owned()),
+            }),
+        )
+        .await
+        .expect("initial dashboard updates");
+
+        seed_release_translation(
+            &pool,
+            user_id.as_str(),
+            "120",
+            "release-120-hash",
+            Some("Release 120 中文标题"),
+            Some("Release 120 中文摘要"),
+        )
+        .await;
+
+        let Json(changed) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: Some(initial.token),
+                feed_type: Some("releases".to_owned()),
+                include: Some("feed".to_owned()),
+            }),
+        )
+        .await
+        .expect("processed dashboard updates");
+
+        let feed = changed.lists.feed.as_ref().expect("feed update");
+        assert!(feed.changed);
+        assert_eq!(feed.new_count, 1);
+        assert_eq!(
+            feed.latest_keys.first().map(String::as_str),
+            Some("release:120")
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_handles_notifications_without_updated_at() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_notification_with_timestamp(
+            &pool,
+            user_id.as_str(),
+            "thread-without-updated-at",
+            None,
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(initial) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("all".to_owned()),
+                include: Some("notifications".to_owned()),
+            }),
+        )
+        .await
+        .expect("dashboard updates with nullable notification timestamp");
+
+        let notifications = initial
+            .lists
+            .notifications
+            .as_ref()
+            .expect("notification update");
+        assert!(!notifications.changed);
+        assert_eq!(
+            notifications.latest_keys.first().map(String::as_str),
+            Some("notification:thread-without-updated-at")
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_updates_respects_feed_type_filter() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id(1);
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        seed_social_event(
+            &pool,
+            user_id.as_str(),
+            SeedSocialEventArgs {
+                kind: "repo_star_received",
+                event_id: "social-star-update",
+                repo_id: Some(500),
+                repo_full_name: Some("IvanLi-CN/octo-rill"),
+                repo_owner_avatar_url: None,
+                repo_open_graph_image_url: None,
+                repo_uses_custom_open_graph_image: None,
+                title: None,
+                body: None,
+                html_url: Some("https://github.com/IvanLi-CN/octo-rill/stargazers"),
+                actor_login: "octocat",
+                occurred_at: "2026-02-24T08:00:00Z",
+            },
+        )
+        .await;
+        let state = setup_state(pool);
+
+        let Json(stars) = dashboard_updates(
+            State(state),
+            setup_session(1).await,
+            Query(DashboardUpdatesQuery {
+                token: None,
+                feed_type: Some("stars".to_owned()),
+                include: Some("feed".to_owned()),
+            }),
+        )
+        .await
+        .expect("stars dashboard updates");
+
+        let feed = stars.lists.feed.expect("feed update");
+        assert_eq!(
+            feed.latest_keys,
+            vec!["repo_star_received:social-star-update"]
+        );
+        assert!(stars.lists.briefs.is_none());
+        assert!(stars.lists.notifications.is_none());
     }
 
     #[tokio::test]

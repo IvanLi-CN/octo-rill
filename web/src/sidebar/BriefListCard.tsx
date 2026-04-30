@@ -15,9 +15,15 @@ import type { BriefItem } from "@/sidebar/ReleaseDailyCard";
 export function BriefListCard(props: {
 	briefs: BriefItem[];
 	selectedId: string | null;
+	freshKeys?: Set<string>;
 	onSelectId: (id: string) => void;
 }) {
-	const { briefs, selectedId, onSelectId } = props;
+	const {
+		briefs,
+		selectedId,
+		freshKeys = new Set<string>(),
+		onSelectId,
+	} = props;
 
 	const list = briefs.slice(0, 12);
 
@@ -42,6 +48,7 @@ export function BriefListCard(props: {
 					<div className="space-y-1">
 						{list.map((b) => {
 							const active = selectedId === b.id;
+							const isFresh = freshKeys.has(`brief:${b.id}`);
 							return (
 								<Button
 									key={b.id}
@@ -49,17 +56,25 @@ export function BriefListCard(props: {
 									variant={active ? "outline" : "ghost"}
 									size="sm"
 									onClick={() => onSelectId(b.id)}
+									data-brief-item-fresh={isFresh ? "true" : "false"}
 									className={cn(
-										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none",
+										"h-auto w-full justify-between gap-2 rounded-md border px-2 py-1 text-left font-mono text-xs shadow-none transition-colors duration-200",
 										active
 											? "border-primary/40 bg-background hover:bg-background"
 											: "border-transparent bg-background/40 hover:bg-background",
+										isFresh &&
+											"border-primary/25 bg-primary/[0.07] shadow-[0_0_0_1px_hsl(var(--primary)/0.08)] hover:bg-primary/[0.09]",
 									)}
 								>
 									<span
 										className={cn("min-w-0", active ? "text-foreground" : "")}
 									>
 										<span>#{b.date}</span>
+										{isFresh ? (
+											<span className="ml-2 inline-flex rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 align-middle font-mono text-[10px] text-primary">
+												新
+											</span>
+										) : null}
 										<span className="text-muted-foreground ml-2 text-[11px]">
 											{b.release_count} 条
 										</span>

@@ -55,6 +55,10 @@ import {
 	type DashboardRouteState,
 } from "@/dashboard/routeState";
 import {
+	type DashboardLiveUpdateNotice,
+	useDashboardLiveUpdates,
+} from "@/dashboard/useDashboardLiveUpdates";
+import {
 	DashboardMobileControlBand,
 	type DashboardTab as Tab,
 	DashboardTabsList,
@@ -103,8 +107,62 @@ type SidebarBootstrapNotificationsError = {
 	cause: unknown;
 };
 
+type DashboardLiveNoticeState = {
+	feed?: Partial<Record<FeedRequestType, DashboardLiveUpdateNotice>>;
+	briefs?: DashboardLiveUpdateNotice;
+	notifications?: DashboardLiveUpdateNotice;
+};
+
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+function mergeDashboardLiveNotice(
+	current: DashboardLiveUpdateNotice | undefined,
+	incoming: DashboardLiveUpdateNotice,
+) {
+	if (!current) return incoming;
+	const latestKeys = Array.from(
+		new Set([...incoming.latestKeys, ...current.latestKeys]),
+	);
+	return {
+		...incoming,
+		newCount: latestKeys.length,
+		latestKeys,
+	};
+}
+
+function NewContentNotice(props: {
+	count: number;
+	label: string;
+	onReveal: () => void;
+}) {
+	const { count, label, onReveal } = props;
+	if (count <= 0) return null;
+	return (
+		<div
+			className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-primary/15 bg-primary/[0.06] px-3 py-2 shadow-sm"
+			data-dashboard-new-content-notice="true"
+		>
+			<div className="min-w-0">
+				<p className="font-mono text-xs font-medium text-foreground/82">
+					有 {count} 条新{label}
+				</p>
+				<p className="text-muted-foreground text-xs">
+					后端同步和处理已完成，点击后一次性显示。
+				</p>
+			</div>
+			<Button
+				type="button"
+				size="sm"
+				variant="outline"
+				className="h-8 shrink-0 rounded-full px-3 font-mono text-xs"
+				onClick={onReveal}
+			>
+				显示
+			</Button>
+		</div>
+	);
 }
 
 function resolveLaneForItem(
@@ -489,6 +547,14 @@ export function Dashboard(props: {
 	});
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
+	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
+	const activeFeedNotice = liveNotices.feed?.[feedRequestType];
+	const [freshBriefKeys, setFreshBriefKeys] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [freshNotificationKeys, setFreshNotificationKeys] = useState<
+		Set<string>
+	>(() => new Set());
 
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
@@ -656,6 +722,7 @@ export function Dashboard(props: {
 		async (options?: {
 			background?: boolean;
 			includeNotifications?: boolean;
+			preferredBriefId?: string | null;
 		}) => {
 			if (!options?.background) {
 				setSidebarLoading(true);
@@ -689,6 +756,12 @@ export function Dashboard(props: {
 				const b = briefsResult.value;
 				setBriefs(b);
 				setSelectedBriefId((prev) => {
+					if (
+						options?.preferredBriefId &&
+						b.some((x) => x.id === options.preferredBriefId)
+					) {
+						return options.preferredBriefId;
+					}
 					if (prev && b.some((x) => x.id === prev)) return prev;
 					return b[0]?.id ?? null;
 				});
@@ -737,10 +810,99 @@ export function Dashboard(props: {
 		await Promise.all([
 			refreshFeed(),
 			refreshSidebar({
-				includeNotifications: hasDesktopSidebarInbox || tab === "inbox",
+				includeNotifications:
+					hasDesktopSidebarInbox ||
+					tab === "inbox" ||
+					notificationsBootstrapCompletedRef.current,
 			}),
 		]);
 	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, tab]);
+
+	const onDashboardLiveUpdate = useCallback(
+		(notices: DashboardLiveUpdateNotice[]) => {
+			setLiveNotices((current) => {
+				const next = { ...current };
+				for (const notice of notices) {
+					if (notice.list === "feed") {
+						const noticeFeedType = notice.feedType ?? feedRequestType;
+						next.feed = {
+							...next.feed,
+							[noticeFeedType]: mergeDashboardLiveNotice(
+								next.feed?.[noticeFeedType],
+								notice,
+							),
+						};
+						continue;
+					}
+					next[notice.list] = mergeDashboardLiveNotice(
+						next[notice.list],
+						notice,
+					);
+				}
+				return next;
+			});
+		},
+		[feedRequestType],
+	);
+	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
+		enabled: shellHydrated && !feed.loadingInitial,
+		feedType: feedRequestType,
+		includeBriefs: true,
+		includeNotifications:
+			hasDesktopSidebarInbox ||
+			tab === "inbox" ||
+			notificationsBootstrapCompletedRef.current,
+		onUpdate: onDashboardLiveUpdate,
+	});
+
+	const revealFeedUpdates = useCallback(async () => {
+		const notice = activeFeedNotice;
+		if (!notice) return;
+		await refreshFeed({
+			freshKeys: notice.latestKeys.slice(0, notice.newCount),
+			throwOnError: true,
+		});
+		setLiveNotices((current) => {
+			const { [feedRequestType]: _removed, ...remainingFeedNotices } =
+				current.feed ?? {};
+			return { ...current, feed: remainingFeedNotices };
+		});
+		await checkDashboardUpdates({ emit: false, include: ["feed"] });
+	}, [activeFeedNotice, checkDashboardUpdates, feedRequestType, refreshFeed]);
+
+	const revealBriefUpdates = useCallback(async () => {
+		const notice = liveNotices.briefs;
+		if (!notice) return;
+		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+		const preferredBriefId =
+			freshKeys
+				.find((key) => key.startsWith("brief:"))
+				?.replace(/^brief:/, "") ?? null;
+		await refreshSidebar({
+			background: true,
+			includeNotifications: false,
+			preferredBriefId,
+		});
+		setFreshBriefKeys(new Set(freshKeys));
+		setLiveNotices((current) => ({ ...current, briefs: undefined }));
+		await checkDashboardUpdates({ emit: false, include: ["briefs"] });
+	}, [checkDashboardUpdates, liveNotices.briefs, refreshSidebar]);
+
+	const revealNotificationUpdates = useCallback(async () => {
+		const notice = liveNotices.notifications;
+		if (!notice) return;
+		await refreshNotifications({ background: true });
+		setFreshNotificationKeys(
+			new Set(notice.latestKeys.slice(0, notice.newCount)),
+		);
+		setLiveNotices((current) => ({ ...current, notifications: undefined }));
+		await checkDashboardUpdates({ emit: false, include: ["notifications"] });
+	}, [checkDashboardUpdates, liveNotices.notifications, refreshNotifications]);
+	const clearDashboardLiveNotices = useCallback(() => {
+		setLiveNotices({});
+		setFreshBriefKeys(new Set());
+		setFreshNotificationKeys(new Set());
+	}, []);
 
 	const ensureTaskWaiter = useCallback((taskId: string) => {
 		const existing = taskWaitersRef.current.get(taskId);
@@ -1114,6 +1276,8 @@ export function Dashboard(props: {
 				if (payload.status === "succeeded") {
 					try {
 						await refreshAll();
+						clearDashboardLiveNotices();
+						await checkDashboardUpdates({ emit: false });
 					} catch (error) {
 						const resolvedError =
 							error instanceof Error ? error : new Error(String(error));
@@ -1164,6 +1328,8 @@ export function Dashboard(props: {
 		};
 	}, [
 		accessTaskStream,
+		checkDashboardUpdates,
+		clearDashboardLiveNotices,
 		notifyGlobalError,
 		pushErrorToast,
 		refreshAll,
@@ -1219,6 +1385,8 @@ export function Dashboard(props: {
 					if (payload.status === "succeeded") {
 						try {
 							await refreshAll();
+							clearDashboardLiveNotices();
+							await checkDashboardUpdates({ emit: false });
 						} catch (error) {
 							const resolvedError =
 								error instanceof Error ? error : new Error(String(error));
@@ -1259,6 +1427,8 @@ export function Dashboard(props: {
 		pushErrorToast,
 		refreshTaskStreams,
 		refreshAll,
+		checkDashboardUpdates,
+		clearDashboardLiveNotices,
 		settleTaskWaiter,
 	]);
 
@@ -1575,13 +1745,15 @@ export function Dashboard(props: {
 			async () => {
 				await apiPost<BriefGenerateResponse>("/api/briefs/generate");
 				await refreshSidebar();
+				setLiveNotices((current) => ({ ...current, briefs: undefined }));
+				await checkDashboardUpdates({ emit: false, include: ["briefs"] });
 			},
 			{
 				errorTitle: "日报生成失败",
 				fallback: "日报生成失败，请稍后重试。",
 			},
 		);
-	}, [refreshSidebar, run]);
+	}, [checkDashboardUpdates, refreshSidebar, run]);
 	const onGenerateBriefForDate = useCallback(
 		async (date: string) => {
 			try {
@@ -1589,12 +1761,14 @@ export function Dashboard(props: {
 					date,
 				});
 				await refreshSidebar();
+				setLiveNotices((current) => ({ ...current, briefs: undefined }));
+				await checkDashboardUpdates({ emit: false, include: ["briefs"] });
 			} catch (error) {
 				notifyGlobalError("日报生成失败", error, "日报生成失败，请稍后重试。");
 				throw error;
 			}
 		},
-		[notifyGlobalError, refreshSidebar],
+		[checkDashboardUpdates, notifyGlobalError, refreshSidebar],
 	);
 	const onSyncInbox = useCallback(() => {
 		void run(
@@ -1770,6 +1944,20 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
+				<NewContentNotice
+					count={activeFeedNotice?.newCount ?? 0}
+					label="动态"
+					onReveal={() => {
+						void revealFeedUpdates().catch((error) => {
+							notifyGlobalError(
+								"新动态显示失败",
+								error,
+								"新动态显示失败，请稍后重试。",
+							);
+						});
+					}}
+				/>
+
 				<FeedGroupedList
 					mode={mode}
 					items={filteredItems}
@@ -1807,6 +1995,7 @@ export function Dashboard(props: {
 					onSmartNow={onSmartNow}
 					reactionBusyKeys={reactionBusyKeys}
 					reactionErrorByKey={reactionErrorByKey}
+					freshKeys={feed.freshKeys}
 					onToggleReaction={onToggleReaction}
 					onOpenReleaseFromBrief={
 						mode === "all" ? onOpenReleaseDetail : undefined
@@ -2015,10 +2204,24 @@ export function Dashboard(props: {
 								{renderFeedPanel("followers")}
 							</TabsContent>
 							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<NewContentNotice
+									count={liveNotices.briefs?.newCount ?? 0}
+									label="日报"
+									onReveal={() => {
+										void revealBriefUpdates().catch((error) => {
+											notifyGlobalError(
+												"新日报显示失败",
+												error,
+												"新日报显示失败，请稍后重试。",
+											);
+										});
+									}}
+								/>
 								<ReleaseDailyCard
 									briefs={briefs}
 									selectedId={selectedBriefId}
 									busy={busy === "Generate brief"}
+									freshKeys={freshBriefKeys}
 									error={
 										briefsError?.phase === "initial"
 											? briefsError.message
@@ -2035,11 +2238,25 @@ export function Dashboard(props: {
 								/>
 							</TabsContent>
 							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<NewContentNotice
+									count={liveNotices.notifications?.newCount ?? 0}
+									label="Inbox 内容"
+									onReveal={() => {
+										void revealNotificationUpdates().catch((error) => {
+											notifyGlobalError(
+												"Inbox 新内容显示失败",
+												error,
+												"Inbox 新内容显示失败，请稍后重试。",
+											);
+										});
+									}}
+								/>
 								<InboxList
 									notifications={notifications}
 									loading={notificationsLoading}
 									busy={Boolean(busy)}
 									syncing={syncingInbox}
+									freshKeys={freshNotificationKeys}
 									error={
 										notificationsError?.phase === "initial"
 											? notificationsError.message
@@ -2059,12 +2276,31 @@ export function Dashboard(props: {
 									<BriefListCard
 										briefs={briefs}
 										selectedId={selectedBriefId}
+										freshKeys={freshBriefKeys}
 										onSelectId={(id) => setSelectedBriefId(id)}
 									/>
 								) : null}
 								{renderSidebarInbox ? (
 									<div data-dashboard-sidebar-inbox="true">
-										<InboxQuickList notifications={notifications} />
+										{tab !== "inbox" ? (
+											<NewContentNotice
+												count={liveNotices.notifications?.newCount ?? 0}
+												label="Inbox 内容"
+												onReveal={() => {
+													void revealNotificationUpdates().catch((error) => {
+														notifyGlobalError(
+															"Inbox 新内容显示失败",
+															error,
+															"Inbox 新内容显示失败，请稍后重试。",
+														);
+													});
+												}}
+											/>
+										) : null}
+										<InboxQuickList
+											notifications={notifications}
+											freshKeys={freshNotificationKeys}
+										/>
 									</div>
 								) : null}
 							</aside>

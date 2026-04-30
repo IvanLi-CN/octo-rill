@@ -72,6 +72,13 @@ type FeedMode =
 	| "smart-loading"
 	| "smart-retry-error"
 	| "smart-insufficient";
+type StoryLiveNotice = {
+	newCount: number;
+	latestKeys: string[];
+};
+type StoryLiveNotices = Partial<
+	Record<"feed" | "briefs" | "notifications", StoryLiveNotice>
+>;
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
 const STORYBOOK_DAILY_BOUNDARY = "08:00";
@@ -230,6 +237,39 @@ function expectTabletInlineHeaderLayout(options: {
 		mainRect.left + mainRect.width * 0.5,
 	);
 	expect(controlBandRect.top).toBeGreaterThanOrEqual(mainRect.bottom - 1);
+}
+
+function StoryNewContentNotice(props: {
+	count: number;
+	label: string;
+	onReveal: () => void;
+}) {
+	const { count, label, onReveal } = props;
+	if (count <= 0) return null;
+	return (
+		<div
+			className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-primary/15 bg-primary/[0.06] px-3 py-2 shadow-sm"
+			data-dashboard-new-content-notice="true"
+		>
+			<div className="min-w-0">
+				<p className="font-mono text-xs font-medium text-foreground/82">
+					有 {count} 条新{label}
+				</p>
+				<p className="text-muted-foreground text-xs">
+					后端同步和处理已完成，点击后一次性显示。
+				</p>
+			</div>
+			<Button
+				type="button"
+				size="sm"
+				variant="outline"
+				className="h-8 shrink-0 rounded-full px-3 font-mono text-xs"
+				onClick={onReveal}
+			>
+				显示
+			</Button>
+		</div>
+	);
 }
 
 function makeBrief(
@@ -1955,6 +1995,10 @@ function DashboardPreview(props: {
 	deferredFeedLoadDelayMs?: number;
 	feedError?: FeedLoadError | null;
 	reactionErrorByKey?: Record<string, string>;
+	liveNotices?: StoryLiveNotices;
+	freshFeedKeys?: string[];
+	freshBriefKeys?: string[];
+	freshNotificationKeys?: string[];
 }) {
 	const {
 		initialTab = "all",
@@ -1978,15 +2022,25 @@ function DashboardPreview(props: {
 		deferredFeedLoadDelayMs = 1400,
 		feedError = null,
 		reactionErrorByKey = {},
+		liveNotices = {},
+		freshFeedKeys = [],
+		freshBriefKeys = [],
+		freshNotificationKeys = [],
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail, {
 		smartResolveMode: releaseDetailSmartResolveMode,
 	});
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
+	const [storyLiveNotices, setStoryLiveNotices] =
+		useState<StoryLiveNotices>(liveNotices);
 
 	useEffect(() => {
 		setStoryBriefs(briefs);
 	}, [briefs]);
+
+	useEffect(() => {
+		setStoryLiveNotices(liveNotices);
+	}, [liveNotices]);
 
 	const seededReleaseTarget = useMemo(() => {
 		const locator = releaseDetail
@@ -2218,51 +2272,63 @@ function DashboardPreview(props: {
 				)}
 			</div>
 		) : (
-			<FeedGroupedList
-				mode={mode}
-				items={filteredItems}
-				currentViewer={STORYBOOK_VIEWER}
-				briefs={storyBriefs}
-				dailyBoundaryLocal={dailyBoundaryLocal}
-				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
-				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-				now={now}
-				error={feedError}
-				loadingInitial={loadingInitial}
-				loadingMore={false}
-				hasMore={false}
-				translationInFlightKeys={translationInFlightKeys}
-				smartInFlightKeys={smartInFlightKeys}
-				registerItemRef={() => () => {}}
-				onLoadMore={() => {}}
-				onRetryInitial={() => {}}
-				selectedLaneByKey={Object.fromEntries(
-					filteredItems.map((item) => [
-						feedItemKey(item),
-						defaultLaneForItem(
-							item,
-							pageDefaultLane,
-							allowReleaseItemLaneOverride,
-							selectedLaneByKey[feedItemKey(item)],
-						),
-					]),
-				)}
-				onSelectLane={(item, lane) =>
-					setSelectedLaneByKey((prev) => ({
-						...prev,
-						[feedItemKey(item)]: lane,
-					}))
-				}
-				onTranslateNow={() => {}}
-				onSmartNow={triggerSmartNow}
-				reactionBusyKeys={reactionBusyKeys}
-				reactionErrorByKey={reactionErrorByKey}
-				onToggleReaction={() => {}}
-				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
-				onGenerateBriefForDate={
-					mode === "all" ? generateBriefForDate : undefined
-				}
-			/>
+			<>
+				<StoryNewContentNotice
+					count={storyLiveNotices.feed?.newCount ?? 0}
+					label="动态"
+					onReveal={() =>
+						setStoryLiveNotices((current) => ({ ...current, feed: undefined }))
+					}
+				/>
+				<FeedGroupedList
+					mode={mode}
+					items={filteredItems}
+					currentViewer={STORYBOOK_VIEWER}
+					briefs={storyBriefs}
+					dailyBoundaryLocal={dailyBoundaryLocal}
+					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+					now={now}
+					error={feedError}
+					loadingInitial={loadingInitial}
+					loadingMore={false}
+					hasMore={false}
+					translationInFlightKeys={translationInFlightKeys}
+					smartInFlightKeys={smartInFlightKeys}
+					registerItemRef={() => () => {}}
+					onLoadMore={() => {}}
+					onRetryInitial={() => {}}
+					selectedLaneByKey={Object.fromEntries(
+						filteredItems.map((item) => [
+							feedItemKey(item),
+							defaultLaneForItem(
+								item,
+								pageDefaultLane,
+								allowReleaseItemLaneOverride,
+								selectedLaneByKey[feedItemKey(item)],
+							),
+						]),
+					)}
+					onSelectLane={(item, lane) =>
+						setSelectedLaneByKey((prev) => ({
+							...prev,
+							[feedItemKey(item)]: lane,
+						}))
+					}
+					onTranslateNow={() => {}}
+					onSmartNow={triggerSmartNow}
+					reactionBusyKeys={reactionBusyKeys}
+					reactionErrorByKey={reactionErrorByKey}
+					freshKeys={new Set(freshFeedKeys)}
+					onToggleReaction={() => {}}
+					onOpenReleaseFromBrief={
+						mode === "all" ? openReleaseDetail : undefined
+					}
+					onGenerateBriefForDate={
+						mode === "all" ? generateBriefForDate : undefined
+					}
+				/>
+			</>
 		);
 	};
 
@@ -2347,19 +2413,41 @@ function DashboardPreview(props: {
 								{renderFeedPanel("followers")}
 							</TabsContent>
 							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<StoryNewContentNotice
+									count={storyLiveNotices.briefs?.newCount ?? 0}
+									label="日报"
+									onReveal={() =>
+										setStoryLiveNotices((current) => ({
+											...current,
+											briefs: undefined,
+										}))
+									}
+								/>
 								<ReleaseDailyCard
 									briefs={storyBriefs}
 									selectedId={selectedBriefId}
 									busy={false}
+									freshKeys={new Set(freshBriefKeys)}
 									onGenerate={() => {}}
 									onOpenRelease={openReleaseDetail}
 								/>
 							</TabsContent>
 							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<StoryNewContentNotice
+									count={storyLiveNotices.notifications?.newCount ?? 0}
+									label="Inbox 内容"
+									onReveal={() =>
+										setStoryLiveNotices((current) => ({
+											...current,
+											notifications: undefined,
+										}))
+									}
+								/>
 								<InboxList
 									notifications={notifications}
 									busy={syncingAll}
 									syncing={syncingAll}
+									freshKeys={new Set(freshNotificationKeys)}
 									onSync={tab === "inbox" ? () => {} : undefined}
 								/>
 							</TabsContent>
@@ -2371,12 +2459,16 @@ function DashboardPreview(props: {
 									<BriefListCard
 										briefs={storyBriefs}
 										selectedId={selectedBriefId}
+										freshKeys={new Set(freshBriefKeys)}
 										onSelectId={(id) => setSelectedBriefId(id)}
 									/>
 								) : null}
 								{renderSidebarInbox ? (
 									<div data-dashboard-sidebar-inbox="true">
-										<InboxQuickList notifications={notifications} />
+										<InboxQuickList
+											notifications={notifications}
+											freshKeys={new Set(freshNotificationKeys)}
+										/>
 									</div>
 								) : null}
 							</aside>
@@ -3735,6 +3827,146 @@ export const FeedHotPathReactionRefresh: Story = {
 				story:
 					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton；打开或刷新 Story 后，8 秒内页面保持可用，随后模拟后台同步完成：新增一张最新 release 卡片，同时第一张缓存 release 的 reaction 静默补齐为 live viewer/counts。刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
 			},
+		},
+	},
+};
+
+export const QuasiRealtimeNewFeedBatch: Story = {
+	name: "Live updates / New feed batch",
+	render: () => {
+		const freshKey = "release:feed-hot-path-new-release";
+		return (
+			<DashboardPreview
+				initialTab="releases"
+				feedItems={makeFeedHotPathReactionFeed(true, true)}
+				freshFeedKeys={[freshKey]}
+				liveNotices={{
+					feed: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：后台同步和润色完成后，列表顶部先出现可揭示的新内容提示；点击显示后，新卡片保留克制的 `新` 标记。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("有 1 条新动态")).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
+		await expect(canvas.queryByText("有 1 条新动态")).not.toBeInTheDocument();
+		await expect(
+			canvasElement.querySelector('[data-feed-item-fresh="true"]'),
+		).not.toBeNull();
+	},
+};
+
+export const QuasiRealtimeNewDailyBrief: Story = {
+	name: "Live updates / New daily brief",
+	render: () => {
+		const freshKey = `brief:${mockBriefs[0].id}`;
+		return (
+			<DashboardPreview
+				initialTab="briefs"
+				freshBriefKeys={[freshKey]}
+				liveNotices={{
+					briefs: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：日报同步完成后，Briefs 页先出现新内容提示，日报正文和列表入口用同一套 session-only fresh 标记。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("有 1 条新日报")).toBeVisible();
+		await expect(
+			canvasElement.querySelector('[data-brief-item-fresh="true"]'),
+		).not.toBeNull();
+		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
+		await expect(canvas.queryByText("有 1 条新日报")).not.toBeInTheDocument();
+	},
+};
+
+export const QuasiRealtimeNewInboxThreads: Story = {
+	name: "Live updates / New threads",
+	render: () => {
+		const freshKey = `notification:${mockNotifs[0].thread_id}`;
+		return (
+			<DashboardPreview
+				initialTab="inbox"
+				freshNotificationKeys={[freshKey]}
+				liveNotices={{
+					notifications: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：Inbox 新线程先以顶部提示进入阅读面，揭示后线程卡片保留克制的新内容暗示。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("有 1 条新Inbox 内容")).toBeVisible();
+		await expect(
+			canvasElement.querySelector('[data-inbox-item-fresh="true"]'),
+		).not.toBeNull();
+		await userEvent.click(canvas.getByRole("button", { name: "显示" }));
+		await expect(
+			canvas.queryByText("有 1 条新Inbox 内容"),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const EvidenceQuasiRealtimeNewFeedBatch: Story = {
+	name: "Evidence / Live updates feed batch",
+	render: () => {
+		const freshKey = "release:feed-hot-path-new-release";
+		return (
+			<DashboardPreview
+				initialTab="releases"
+				feedItems={makeFeedHotPathReactionFeed(true, true)}
+				freshFeedKeys={[freshKey]}
+				liveNotices={{
+					feed: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };
