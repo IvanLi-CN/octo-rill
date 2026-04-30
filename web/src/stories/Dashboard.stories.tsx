@@ -779,8 +779,7 @@ function ContinuousLivePushPreview() {
 	}, []);
 
 	const pushedItems = useMemo(() => {
-		const visiblePushCount = Math.min(pushIndex, 5);
-		return Array.from({ length: visiblePushCount }, (_, offset) =>
+		return Array.from({ length: pushIndex }, (_, offset) =>
 			makeContinuousLivePushItem(pushIndex - offset),
 		);
 	}, [pushIndex]);
