@@ -140,6 +140,10 @@
   - `created_at ASC`
 - 访问触发 demand 使用 `priority=interactive`，定时订阅同步使用 `priority=system`。
 - 若系统排队 work item 被访问 demand 命中，则允许升级优先级，但不抢占已 running work item。
+- `deadline_at` 是共享 work item 的硬业务超时：
+  - `interactive` demand 使用 2 分钟 deadline，`system` demand 使用 10 分钟 deadline。
+  - queued / running work item 超过 deadline 后必须标记为 `failed`，清除 runtime lease，并把 pending watcher 标记为 `failed`。
+  - deadline 超时使用 `repo_release_deadline_expired`，不得与进程/owner 租约失效的 `runtime_lease_expired` 混用。
 - 单个 repo 抓取时按“当前仍 star 该 repo 的用户”挑选候选 token，排序规则：
   - `last_active_at DESC`
   - `user_id ASC`
@@ -155,6 +159,7 @@
   - 挂到共享 repo release queue
   - 等待共享 queue 结果
   - 在任务结果里输出 repo 级摘要
+- Release 阶段等待共享 queue 时必须主动收敛已过期 work item；不能因 pending watcher 永久存在而让根 `sync.subscriptions` 长期保持 `running`。
 - Release 结束后继续按 Star 成功用户 fan-out：
   - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
   - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数
