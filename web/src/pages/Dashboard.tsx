@@ -108,8 +108,12 @@ type SidebarBootstrapNotificationsError = {
 	cause: unknown;
 };
 
+type FeedLiveBoundaryNotice = DashboardLiveUpdateNotice & {
+	boundaryId: string;
+};
+
 type DashboardLiveNoticeState = {
-	feed?: Partial<Record<FeedRequestType, DashboardLiveUpdateNotice>>;
+	feed?: Partial<Record<FeedRequestType, FeedLiveBoundaryNotice[]>>;
 	briefs?: DashboardLiveUpdateNotice;
 	notifications?: DashboardLiveUpdateNotice;
 };
@@ -129,6 +133,19 @@ function mergeDashboardLiveNotice(
 	return {
 		...incoming,
 		newCount: latestKeys.length,
+		latestKeys,
+	};
+}
+
+function makeFeedBoundaryNotice(
+	notice: DashboardLiveUpdateNotice,
+	feedType: FeedRequestType,
+): FeedLiveBoundaryNotice {
+	const latestKeys = notice.latestKeys.slice(0, notice.newCount);
+	return {
+		...notice,
+		feedType,
+		boundaryId: `${feedType}:${notice.newCount}:${latestKeys.join("|")}`,
 		latestKeys,
 	};
 }
@@ -576,8 +593,9 @@ export function Dashboard(props: {
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
 	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
-	const activeFeedNotice = liveNotices.feed?.[feedRequestType];
-	const hydratedFeedNoticeRef = useRef<string | null>(null);
+	const activeFeedNotices = liveNotices.feed?.[feedRequestType] ?? [];
+	const activeFeedNotice = activeFeedNotices[0];
+	const hydratedFeedNoticeRef = useRef<Set<string>>(new Set());
 	const [freshBriefKeys, setFreshBriefKeys] = useState<Set<string>>(
 		() => new Set(),
 	);
@@ -854,9 +872,22 @@ export function Dashboard(props: {
 				for (const notice of notices) {
 					if (notice.list === "feed") {
 						const noticeFeedType = notice.feedType ?? feedRequestType;
+						const boundaryNotice = makeFeedBoundaryNotice(
+							notice,
+							noticeFeedType,
+						);
+						const currentFeedNotices = next.feed?.[noticeFeedType] ?? [];
+						if (
+							currentFeedNotices.some(
+								(currentNotice) =>
+									currentNotice.boundaryId === boundaryNotice.boundaryId,
+							)
+						) {
+							continue;
+						}
 						next.feed = {
 							...next.feed,
-							[noticeFeedType]: notice,
+							[noticeFeedType]: [boundaryNotice, ...currentFeedNotices],
 						};
 						continue;
 					}
@@ -897,47 +928,64 @@ export function Dashboard(props: {
 		});
 	}, []);
 
-	const revealFeedUpdates = useCallback(async () => {
-		const notice = activeFeedNotice;
-		if (!notice) return;
-		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
-		const hasHydratedFreshItems = feed.items.some((item) =>
-			freshKeys.includes(feedItemKey(item)),
-		);
-		if (!hasHydratedFreshItems) {
-			const nextFreshKeys = Array.from(
-				new Set([...feed.freshKeys, ...freshKeys]),
-			);
-			await refreshFeed({
-				freshKeys: nextFreshKeys,
-				throwOnError: true,
+	const dismissFeedBoundary = useCallback(
+		(boundaryId: string) => {
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				const nextFeedNotices = currentFeedNotices.filter(
+					(notice) => notice.boundaryId !== boundaryId,
+				);
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: nextFeedNotices,
+					},
+				};
 			});
-		}
-		scrollToFreshFeedTop(freshKeys);
-		setLiveNotices((current) => {
-			const { [feedRequestType]: _removed, ...remainingFeedNotices } =
-				current.feed ?? {};
-			return { ...current, feed: remainingFeedNotices };
-		});
-		await checkDashboardUpdates({ emit: false, include: ["feed"] });
-	}, [
-		activeFeedNotice,
-		checkDashboardUpdates,
-		feed.freshKeys,
-		feed.items,
-		feedRequestType,
-		refreshFeed,
-		scrollToFreshFeedTop,
-	]);
+		},
+		[feedRequestType],
+	);
+
+	const revealFeedUpdates = useCallback(
+		async (notice = activeFeedNotice) => {
+			if (!notice) return;
+			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+			const hasHydratedFreshItems = feed.items.some((item) =>
+				freshKeys.includes(feedItemKey(item)),
+			);
+			if (!hasHydratedFreshItems) {
+				const nextFreshKeys = Array.from(
+					new Set([...feed.freshKeys, ...freshKeys]),
+				);
+				await refreshFeed({
+					freshKeys: nextFreshKeys,
+					throwOnError: true,
+				});
+			}
+			scrollToFreshFeedTop(freshKeys);
+			dismissFeedBoundary(notice.boundaryId);
+			await checkDashboardUpdates({ emit: false, include: ["feed"] });
+		},
+		[
+			activeFeedNotice,
+			checkDashboardUpdates,
+			dismissFeedBoundary,
+			feed.freshKeys,
+			feed.items,
+			refreshFeed,
+			scrollToFreshFeedTop,
+		],
+	);
 
 	useEffect(() => {
 		const notice = activeFeedNotice;
 		if (!notice || feed.loadingInitial) return;
 		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 		if (freshKeys.length === 0) return;
-		const noticeKey = `${feedRequestType}:${notice.newCount}:${freshKeys.join("|")}`;
-		if (hydratedFeedNoticeRef.current === noticeKey) return;
-		hydratedFeedNoticeRef.current = noticeKey;
+		if (hydratedFeedNoticeRef.current.has(notice.boundaryId)) return;
+		hydratedFeedNoticeRef.current.add(notice.boundaryId);
 		const anchor = captureFeedScrollAnchor();
 		const nextFreshKeys = Array.from(
 			new Set([...feed.freshKeys, ...freshKeys]),
@@ -951,7 +999,7 @@ export function Dashboard(props: {
 				void checkDashboardUpdates({ emit: false, include: ["feed"] });
 			})
 			.catch((error) => {
-				hydratedFeedNoticeRef.current = null;
+				hydratedFeedNoticeRef.current.delete(notice.boundaryId);
 				notifyGlobalError(
 					"新动态显示失败",
 					error,
@@ -963,7 +1011,6 @@ export function Dashboard(props: {
 		checkDashboardUpdates,
 		feed.freshKeys,
 		feed.loadingInitial,
-		feedRequestType,
 		notifyGlobalError,
 		refreshFeed,
 	]);
@@ -2087,24 +2134,23 @@ export function Dashboard(props: {
 					onGenerateBriefForDate={
 						mode === "all" ? onGenerateBriefForDate : undefined
 					}
-					newContentBoundary={
-						activeFeedNotice
-							? {
-									count: activeFeedNotice.newCount,
-									label: "动态",
-									latestKeys: activeFeedNotice.latestKeys,
-									onReveal: () => {
-										void revealFeedUpdates().catch((error) => {
-											notifyGlobalError(
-												"新动态显示失败",
-												error,
-												"新动态显示失败，请稍后重试。",
-											);
-										});
-									},
-								}
-							: undefined
-					}
+					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
+						id: notice.boundaryId,
+						count: notice.newCount,
+						label: "动态",
+						latestKeys: notice.latestKeys,
+						isLatest: index === 0,
+						onExitedViewport: dismissFeedBoundary,
+						onReveal: () => {
+							void revealFeedUpdates(notice).catch((error) => {
+								notifyGlobalError(
+									"新动态显示失败",
+									error,
+									"新动态显示失败，请稍后重试。",
+								);
+							});
+						},
+					}))}
 				/>
 			</>
 		);

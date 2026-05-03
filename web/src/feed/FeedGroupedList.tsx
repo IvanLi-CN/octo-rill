@@ -46,9 +46,12 @@ const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
 
 type NewContentBoundary = {
+	id: string;
 	count: number;
 	label: string;
 	latestKeys: string[];
+	isLatest?: boolean;
+	onExitedViewport?: (id: string) => void;
 	onReveal: () => void;
 };
 
@@ -57,14 +60,77 @@ function keyOfFeedItem(item: Pick<FeedItem, "kind" | "id">) {
 }
 
 function FreshContentBoundary(props: NewContentBoundary) {
-	const { count, label, onReveal } = props;
+	const {
+		id,
+		count,
+		label,
+		isLatest = true,
+		onExitedViewport,
+		onReveal,
+	} = props;
+	const boundaryRef = useRef<HTMLButtonElement | null>(null);
+	const hasIntersectedRef = useRef(false);
+
+	useEffect(() => {
+		if (isLatest || !onExitedViewport) return;
+		const element = boundaryRef.current;
+		if (!element) return;
+		if (typeof IntersectionObserver === "undefined") {
+			return undefined;
+		}
+
+		let removed = false;
+		const removeIfOffscreen = () => {
+			if (removed) return;
+			if (!hasIntersectedRef.current) return;
+			const rect = element.getBoundingClientRect();
+			if (rect.bottom > 0 && rect.top < window.innerHeight) return;
+			removed = true;
+			onExitedViewport(id);
+			observer.disconnect();
+		};
+		const observer = new IntersectionObserver((entries) => {
+			const entry = entries[0];
+			if (!entry) return;
+			if (entry.isIntersecting) {
+				hasIntersectedRef.current = true;
+				return;
+			}
+			const wasSeenByObserver = hasIntersectedRef.current;
+			const viewportBottom = entry.rootBounds?.bottom ?? window.innerHeight;
+			const leftViewport =
+				entry.boundingClientRect.bottom <= 0 ||
+				entry.boundingClientRect.top >= viewportBottom;
+			if ((!wasSeenByObserver && !leftViewport) || removed) return;
+			removed = true;
+			onExitedViewport(id);
+			observer.disconnect();
+		});
+
+		observer.observe(element);
+		window.addEventListener("scroll", removeIfOffscreen, { passive: true });
+		return () => {
+			removed = true;
+			window.removeEventListener("scroll", removeIfOffscreen);
+			observer.disconnect();
+		};
+	}, [id, isLatest, onExitedViewport]);
+
+	useEffect(() => {
+		if (!isLatest) return;
+		hasIntersectedRef.current = false;
+	}, [isLatest]);
+
 	if (count <= 0) return null;
 	return (
 		<button
+			ref={boundaryRef}
 			type="button"
 			className="dashboard-new-content-hint dashboard-new-content-boundary group grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-2 text-left"
 			data-dashboard-new-content-notice="true"
 			data-dashboard-new-content-boundary="true"
+			data-dashboard-new-content-boundary-id={id}
+			data-dashboard-new-content-boundary-latest={isLatest ? "true" : "false"}
 			onClick={onReveal}
 		>
 			<span className="dashboard-new-content-rule" aria-hidden="true" />
@@ -77,6 +143,74 @@ function FreshContentBoundary(props: NewContentBoundary) {
 			<span className="dashboard-new-content-rule" aria-hidden="true" />
 		</button>
 	);
+}
+
+function boundaryAfterKey(boundary: NewContentBoundary) {
+	if (boundary.count <= 0) return null;
+	const boundaryKeys = boundary.latestKeys.slice(0, boundary.count);
+	return boundaryKeys.at(-1) ?? null;
+}
+
+function groupBoundariesByAfterKey(boundaries: NewContentBoundary[]) {
+	const byAfterKey = new Map<string, NewContentBoundary[]>();
+	for (const boundary of boundaries) {
+		const afterKey = boundaryAfterKey(boundary);
+		if (!afterKey) continue;
+		const existing = byAfterKey.get(afterKey) ?? [];
+		existing.push(boundary);
+		byAfterKey.set(afterKey, existing);
+	}
+	return byAfterKey;
+}
+
+function renderFeedItemsWithBoundaries(
+	items: FeedItem[],
+	feedCardProps: Omit<FeedCardListProps, "items">,
+	boundariesByAfterKey: Map<string, NewContentBoundary[]>,
+) {
+	if (boundariesByAfterKey.size === 0) {
+		return <FeedItems items={items} {...feedCardProps} />;
+	}
+
+	const nodes: ReactNode[] = [];
+	let chunk: FeedItem[] = [];
+	let chunkStartKey: string | null = null;
+
+	for (const item of items) {
+		if (chunk.length === 0) {
+			chunkStartKey = keyOfFeedItem(item);
+		}
+		chunk.push(item);
+		const itemKey = keyOfFeedItem(item);
+		const boundaries = boundariesByAfterKey.get(itemKey);
+		if (!boundaries?.length) continue;
+
+		nodes.push(
+			<FeedItems
+				key={`items-${chunkStartKey ?? itemKey}-${itemKey}`}
+				items={chunk}
+				{...feedCardProps}
+			/>,
+		);
+		chunk = [];
+		chunkStartKey = null;
+		for (const boundary of boundaries) {
+			nodes.push(<FreshContentBoundary key={boundary.id} {...boundary} />);
+		}
+	}
+
+	if (chunk.length > 0) {
+		const lastKey = keyOfFeedItem(chunk[chunk.length - 1]);
+		nodes.push(
+			<FeedItems
+				key={`items-${chunkStartKey ?? lastKey}-${lastKey}`}
+				items={chunk}
+				{...feedCardProps}
+			/>,
+		);
+	}
+
+	return nodes;
 }
 
 function briefHasSection(markdown: string | undefined, heading: string) {
@@ -363,7 +497,7 @@ export function FeedGroupedList(
 		now?: Date;
 		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
-		newContentBoundary?: NewContentBoundary;
+		newContentBoundaries?: NewContentBoundary[];
 	},
 ) {
 	const {
@@ -382,7 +516,7 @@ export function FeedGroupedList(
 		now,
 		onOpenReleaseFromBrief,
 		onGenerateBriefForDate,
-		newContentBoundary,
+		newContentBoundaries = [],
 		...feedCardProps
 	} = props;
 
@@ -494,22 +628,10 @@ export function FeedGroupedList(
 	}, [groups]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
-	const freshBoundaryIndex = useMemo(() => {
-		if (!newContentBoundary || newContentBoundary.count <= 0) {
-			return -1;
-		}
-		const boundaryKeys = new Set(newContentBoundary.latestKeys);
-		let index = 0;
-		for (const item of items) {
-			if (!boundaryKeys.has(keyOfFeedItem(item))) {
-				break;
-			}
-			index += 1;
-		}
-		return index > 0 ? index : -1;
-	}, [items, newContentBoundary]);
-
-	let itemsSeen = 0;
+	const boundariesByAfterKey = useMemo(
+		() => groupBoundariesByAfterKey(newContentBoundaries),
+		[newContentBoundaries],
+	);
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
@@ -544,13 +666,6 @@ export function FeedGroupedList(
 			) : null}
 
 			{groups.map((group, index) => {
-				const groupStart = itemsSeen;
-				const groupEnd = groupStart + group.items.length;
-				itemsSeen = groupEnd;
-				const boundaryIndexInGroup =
-					freshBoundaryIndex > groupStart && freshBoundaryIndex <= groupEnd
-						? freshBoundaryIndex - groupStart
-						: -1;
 				const brief =
 					(group.briefId ? briefById.get(group.briefId) : null) ??
 					(group.kind === "historical"
@@ -694,26 +809,10 @@ export function FeedGroupedList(
 									action={groupAction}
 									showDivider={showDivider}
 								/>
-								{boundaryIndexInGroup > -1 ? (
-									<>
-										{boundaryIndexInGroup > 0 ? (
-											<FeedItems
-												items={group.items.slice(0, boundaryIndexInGroup)}
-												{...feedCardProps}
-											/>
-										) : null}
-										{newContentBoundary ? (
-											<FreshContentBoundary {...newContentBoundary} />
-										) : null}
-										{boundaryIndexInGroup < group.items.length ? (
-											<FeedItems
-												items={group.items.slice(boundaryIndexInGroup)}
-												{...feedCardProps}
-											/>
-										) : null}
-									</>
-								) : (
-									<FeedItems items={group.items} {...feedCardProps} />
+								{renderFeedItemsWithBoundaries(
+									group.items,
+									feedCardProps,
+									boundariesByAfterKey,
 								)}
 							</>
 						)}

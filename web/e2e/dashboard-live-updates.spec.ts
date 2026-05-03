@@ -31,15 +31,19 @@ function buildReleaseFeedItem(id: string, title: string) {
 	};
 }
 
-test("dashboard live updates only refresh feed after the user reveals a new batch", async ({
+test("dashboard live updates retain feed boundaries until they leave the viewport", async ({
 	page,
 }) => {
 	let feedRequests = 0;
 	let updateRequests = 0;
-	const allFeedUpdateTokens: (string | null)[] = [];
-	let revealFeed = false;
-	let failNextFeedRefresh = false;
-	const oldFeedItem = buildReleaseFeedItem("20001", "Release 20001");
+	let availableFeedItems = 1;
+	const oldFeedItems = [
+		buildReleaseFeedItem("20001", "Release 20001"),
+		buildReleaseFeedItem("19999", "Release 19999"),
+		buildReleaseFeedItem("19998", "Release 19998"),
+		buildReleaseFeedItem("19997", "Release 19997"),
+		buildReleaseFeedItem("19996", "Release 19996"),
+	];
 	const newFeedItem = buildReleaseFeedItem("20002", "Release 20002");
 	const newerFeedItem = buildReleaseFeedItem("20003", "Release 20003");
 
@@ -72,23 +76,13 @@ test("dashboard live updates only refresh feed after the user reveals a new batc
 					next_cursor: null,
 				});
 			}
-			if (failNextFeedRefresh) {
-				failNextFeedRefresh = false;
-				return json(
-					route,
-					{
-						error: {
-							code: "feed_refresh_failed",
-							message: "feed refresh failed",
-						},
-					},
-					500,
-				);
-			}
 			return json(route, {
-				items: revealFeed
-					? [newerFeedItem, newFeedItem, oldFeedItem]
-					: [oldFeedItem],
+				items:
+					availableFeedItems >= 3
+						? [newerFeedItem, newFeedItem, ...oldFeedItems]
+						: availableFeedItems >= 2
+							? [newFeedItem, ...oldFeedItems]
+							: oldFeedItems,
 				next_cursor: null,
 			});
 		}
@@ -97,17 +91,25 @@ test("dashboard live updates only refresh feed after the user reveals a new batc
 			updateRequests += 1;
 			const feedType = url.searchParams.get("feed_type") ?? "all";
 			const token = url.searchParams.get("token");
-			if (feedType === "all" && updateRequests > 1) {
-				allFeedUpdateTokens.push(token);
-			}
 			const changedKeys =
-				feedType === "all" && updateRequests > 1
-					? updateRequests >= 3
-						? ["release:20003", "release:20002"]
-						: ["release:20002"]
-					: [];
+				feedType === "all" && token === "token-baseline"
+					? ["release:20002"]
+					: feedType === "all" && token === "token-after-20002"
+						? ["release:20003"]
+						: [];
+			if (changedKeys.includes("release:20003")) {
+				availableFeedItems = 3;
+			} else if (changedKeys.includes("release:20002")) {
+				availableFeedItems = 2;
+			}
+			const nextToken =
+				token === "token-baseline"
+					? "token-after-20002"
+					: token === "token-after-20002"
+						? "token-after-20003"
+						: "token-baseline";
 			return json(route, {
-				token: `token-${updateRequests}`,
+				token: nextToken,
 				generated_at: "2026-04-30T10:00:00Z",
 				lists: {
 					feed: {
@@ -172,30 +174,23 @@ test("dashboard live updates only refresh feed after the user reveals a new batc
 
 	const feedRequestsBeforeLiveUpdate = feedRequests;
 	await page.evaluate(() => window.dispatchEvent(new Event("online")));
-	await expect(page.getByText("刚刚同步 · 1 条动态")).toBeVisible();
-	await expect.poll(() => allFeedUpdateTokens.length).toBe(1);
-	expect(feedRequests).toBe(feedRequestsBeforeLiveUpdate);
-	await expect(page.getByText("Release 20002")).toHaveCount(0);
-	await page.evaluate(() => window.dispatchEvent(new Event("online")));
-	await expect.poll(() => allFeedUpdateTokens.length).toBe(2);
-	expect(allFeedUpdateTokens.at(-1)).toBe("token-1");
-	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
+	await expect(page.getByText("上方有 1 条新动态")).toBeVisible();
+	await expect.poll(() => feedRequests).toBe(feedRequestsBeforeLiveUpdate + 1);
+	await expect(page.getByText("Release 20002")).toHaveCount(1);
 	await page.getByRole("tab", { name: "加星" }).click();
-	await expect(page.getByText("刚刚同步 · 2 条动态")).toHaveCount(0);
+	await expect(page.getByText("上方有 1 条新动态")).toHaveCount(0);
 	await page.getByRole("tab", { name: "全部" }).click();
-	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
+	await expect(page.getByText("上方有 1 条新动态")).toBeVisible();
 
-	revealFeed = true;
-	failNextFeedRefresh = true;
-	const feedRequestsBeforeFailedReveal = feedRequests;
-	await page.getByRole("button", { name: /刚刚同步/ }).click();
-	await expect(page.getByText("刚刚同步 · 2 条动态")).toBeVisible();
-	expect(feedRequests).toBe(feedRequestsBeforeFailedReveal + 1);
-
-	const feedRequestsBeforeReveal = feedRequests;
-	await page.getByRole("button", { name: /刚刚同步/ }).click();
+	await page.evaluate(() => window.dispatchEvent(new Event("online")));
 	await expect(page.getByText("Release 20003")).toBeVisible();
-	await expect(page.getByText("Release 20002")).toBeVisible();
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary="true"]'),
+	).toHaveCount(2);
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary-latest="false"]'),
+	).toHaveCount(1);
 	await expect(
 		page
 			.locator('[data-feed-item-fresh="true"]')
@@ -206,7 +201,32 @@ test("dashboard live updates only refresh feed after the user reveals a new batc
 			.locator('[data-feed-item-fresh="true"]')
 			.filter({ hasText: "Release 20002" }),
 	).toBeVisible();
-	expect(feedRequests).toBe(feedRequestsBeforeReveal + 1);
+
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary-latest="false"]'),
+	).toBeVisible();
+	await page
+		.locator('[data-dashboard-new-content-boundary-latest="false"]')
+		.evaluate((element) => {
+			element.scrollIntoView({ block: "center", behavior: "instant" });
+		});
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary-latest="false"]'),
+	).toBeVisible();
+	await page
+		.locator('[data-dashboard-new-content-boundary-latest="false"]')
+		.evaluate(async (element) => {
+			await new Promise((resolve) => requestAnimationFrame(resolve));
+			window.scrollBy({
+				top: element.getBoundingClientRect().bottom + 24,
+				behavior: "instant",
+			});
+			window.dispatchEvent(new Event("scroll"));
+			await new Promise((resolve) => requestAnimationFrame(resolve));
+		});
+	await expect(
+		page.locator('[data-dashboard-new-content-boundary="true"]'),
+	).toHaveCount(1);
 });
 
 test("dashboard live updates re-baselines when inbox polling is enabled later", async ({

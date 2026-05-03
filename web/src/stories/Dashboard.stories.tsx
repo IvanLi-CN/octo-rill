@@ -77,9 +77,14 @@ type StoryLiveNotice = {
 	newCount: number;
 	latestKeys: string[];
 };
-type StoryLiveNotices = Partial<
-	Record<"feed" | "briefs" | "notifications", StoryLiveNotice>
->;
+type StoryFeedLiveNotice = StoryLiveNotice & {
+	boundaryId: string;
+};
+type StoryLiveNotices = {
+	feed?: StoryFeedLiveNotice[];
+	briefs?: StoryLiveNotice;
+	notifications?: StoryLiveNotice;
+};
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
 const STORYBOOK_DAILY_BOUNDARY = "08:00";
@@ -827,14 +832,17 @@ function ContinuousLivePushPreview() {
 		);
 	}, [pushIndex]);
 	const freshKeys = pushedItems.map(feedItemKey);
-	const latestBatchKeys = pushedItems[0] ? [feedItemKey(pushedItems[0])] : [];
 	const liveNotice =
-		latestBatchKeys.length > 0
+		pushedItems.length > 0
 			? {
-					feed: {
-						newCount: latestBatchKeys.length,
-						latestKeys: latestBatchKeys,
-					},
+					feed: pushedItems.map((item) => {
+						const key = feedItemKey(item);
+						return {
+							boundaryId: `story-boundary-${key}`,
+							newCount: 1,
+							latestKeys: [key],
+						};
+					}),
 				}
 			: {};
 
@@ -2537,36 +2545,46 @@ function DashboardPreview(props: {
 				onGenerateBriefForDate={
 					mode === "all" ? generateBriefForDate : undefined
 				}
-				newContentBoundary={
-					storyLiveNotices.feed
-						? {
-								count: storyLiveNotices.feed.newCount,
-								label: "动态",
-								latestKeys: storyLiveNotices.feed.latestKeys,
-								onReveal: () => {
-									const freshKey = freshFeedKeys[0];
-									setStoryLiveNotices((current) => ({
-										...current,
-										feed: undefined,
-									}));
-									window.requestAnimationFrame(() => {
-										const itemElements = Array.from(
-											document.querySelectorAll<HTMLElement>(
-												"[data-feed-item-key]",
-											),
-										);
-										const element = itemElements.find(
-											(item) => item.dataset.feedItemKey === freshKey,
-										);
-										element?.scrollIntoView({
-											block: "start",
-											behavior: "smooth",
-										});
-									});
-								},
-							}
-						: undefined
-				}
+				newContentBoundaries={(storyLiveNotices.feed ?? []).map(
+					(notice, index) => ({
+						id: notice.boundaryId,
+						count: notice.newCount,
+						label: "动态",
+						latestKeys: notice.latestKeys,
+						isLatest: index === 0,
+						onExitedViewport: (boundaryId) => {
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.filter(
+									(feedNotice) => feedNotice.boundaryId !== boundaryId,
+								),
+							}));
+						},
+						onReveal: () => {
+							const freshKey = notice.latestKeys[0] ?? freshFeedKeys[0];
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.filter(
+									(feedNotice) => feedNotice.boundaryId !== notice.boundaryId,
+								),
+							}));
+							window.requestAnimationFrame(() => {
+								const itemElements = Array.from(
+									document.querySelectorAll<HTMLElement>(
+										"[data-feed-item-key]",
+									),
+								);
+								const element = itemElements.find(
+									(item) => item.dataset.feedItemKey === freshKey,
+								);
+								element?.scrollIntoView({
+									block: "start",
+									behavior: "smooth",
+								});
+							});
+						},
+					}),
+				)}
 			/>
 		);
 	};
@@ -4080,10 +4098,13 @@ export const QuasiRealtimeNewFeedBatch: Story = {
 				feedItems={makeFeedHotPathReactionFeed(true, true)}
 				freshFeedKeys={[freshKey]}
 				liveNotices={{
-					feed: {
-						newCount: 1,
-						latestKeys: [freshKey],
-					},
+					feed: [
+						{
+							boundaryId: `story-boundary-${freshKey}`,
+							newCount: 1,
+							latestKeys: [freshKey],
+						},
+					],
 				}}
 				showFooter={false}
 			/>
@@ -4153,7 +4174,14 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 				).toBeVisible(),
 			{ timeout: 5200 },
 		);
-		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
+		await expect(
+			canvas.getAllByText("上方有 1 条新动态").length,
+		).toBeGreaterThan(1);
+		expect(
+			canvasElement.querySelectorAll(
+				'[data-dashboard-new-content-boundary="true"]',
+			).length,
+		).toBeGreaterThan(1);
 		expect(
 			canvasElement.querySelectorAll('[data-feed-item-fresh="true"]').length,
 		).toBeGreaterThanOrEqual(2);
@@ -4248,10 +4276,13 @@ export const EvidenceQuasiRealtimeNewFeedBatch: Story = {
 				feedItems={makeFeedHotPathReactionFeed(true, true)}
 				freshFeedKeys={[freshKey]}
 				liveNotices={{
-					feed: {
-						newCount: 1,
-						latestKeys: [freshKey],
-					},
+					feed: [
+						{
+							boundaryId: `story-boundary-${freshKey}`,
+							newCount: 1,
+							latestKeys: [freshKey],
+						},
+					],
 				}}
 				showFooter={false}
 			/>

@@ -57,6 +57,7 @@ Response:
 - Given 用户首次打开 Dashboard，When updates 首次完成，Then 页面不显示新内容提示。
 - Given 后台同步写入新的 release/social/brief/notification，When 下一轮 updates 命中，Then 对应列表显示克制的新内容计数提示。
 - Given 用户位于 Feed 顶部且新动态已自动插入，When 更新完成，Then 新旧内容之间显示“上方有 N 条新动态”分割线，新卡片位于滚动容器更上方且不会强行进入视野。
+- Given 新一轮 Feed 动态在上一条分割线仍处于视口内时到达，When 页面插入新卡片，Then 保留原分割线作为布局锚点，同时在新的新旧内容边界生成新分割线；非最新分割线只在离开视口后清理。
 - Given 用户点击 Feed 新内容分割线，When 滚动完成，Then 页面定位到新卡片顶部，新卡片在时间元信息旁出现 session-only 圆点暗示，旧卡片不丢失 reaction viewer 状态。
 - Given Inbox 在当前视口未加载，When 轮询执行，Then 不主动请求 notifications 更新。
 - Given 显式同步任务完成，When 页面刷新成功，Then silent updates check 刷新 baseline，不重复提示刚同步的内容。
@@ -77,7 +78,7 @@ Response:
 - source_type: storybook_canvas
 - story_id_or_title: Pages/Dashboard / Live updates / Continuous feed push
 - scenario: Dashboard Feed 持续发现新动态并把新卡片插入旧内容上方
-- evidence_note: 验证新旧内容之间的“上方有 N 条新动态”分割线保持在视野内，新内容卡片留在滚动容器更上方；后续推送只保持阅读锚点，不主动滚动到分割线，用户可点击分割线主动滚动到新内容顶部。
+- evidence_note: 验证后续推送会新增新的“上方有 N 条新动态”分割线，原分割线在视口内继续作为布局锚点保留；连续推送只保持阅读锚点，不主动滚动到分割线，用户可点击任一分割线主动滚动到对应新内容顶部。
 - requested_viewport: 1280x720 CSS px
 - viewport_strategy: storybook-iframe
 - capture_scope: browser-viewport
