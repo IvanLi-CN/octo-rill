@@ -23,8 +23,10 @@ import { Route as AdminUsersRouteImport } from './routes/admin/users'
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as AdminJobsIndexRouteImport } from './routes/admin/jobs/index'
 import { Route as AdminJobsTranslationsRouteImport } from './routes/admin/jobs/translations'
+import { Route as AdminJobsSubscriptionsRouteImport } from './routes/admin/jobs/subscriptions'
 import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/scheduled'
 import { Route as AdminJobsLlmRouteImport } from './routes/admin/jobs/llm'
+import { Route as AdminJobsSubscriptionsTaskIdRouteImport } from './routes/admin/jobs/subscriptions/$taskId'
 import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jobs/tasks/$taskId/route'
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
 import { Route as OwnerRepoReleasesTagTagRouteImport } from './routes/$owner/$repo/releases/tag/$tag'
@@ -104,6 +106,13 @@ const AdminJobsTranslationsRoute = AdminJobsTranslationsRouteImport.update({
 } as any).lazy(() =>
   import('./routes/admin/jobs/translations.lazy').then((d) => d.Route),
 )
+const AdminJobsSubscriptionsRoute = AdminJobsSubscriptionsRouteImport.update({
+  id: '/subscriptions',
+  path: '/subscriptions',
+  getParentRoute: () => AdminJobsRouteRoute,
+} as any).lazy(() =>
+  import('./routes/admin/jobs/subscriptions.lazy').then((d) => d.Route),
+)
 const AdminJobsScheduledRoute = AdminJobsScheduledRouteImport.update({
   id: '/scheduled',
   path: '/scheduled',
@@ -118,6 +127,16 @@ const AdminJobsLlmRoute = AdminJobsLlmRouteImport.update({
 } as any).lazy(() =>
   import('./routes/admin/jobs/llm.lazy').then((d) => d.Route),
 )
+const AdminJobsSubscriptionsTaskIdRoute =
+  AdminJobsSubscriptionsTaskIdRouteImport.update({
+    id: '/$taskId',
+    path: '/$taskId',
+    getParentRoute: () => AdminJobsSubscriptionsRoute,
+  } as any).lazy(() =>
+    import('./routes/admin/jobs/subscriptions/$taskId.lazy').then(
+      (d) => d.Route,
+    ),
+  )
 const AdminJobsTasksTaskIdRouteRoute =
   AdminJobsTasksTaskIdRouteRouteImport.update({
     id: '/tasks/$taskId',
@@ -165,9 +184,11 @@ export interface FileRoutesByFullPath {
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
+  '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -185,8 +206,10 @@ export interface FileRoutesByTo {
   '/admin': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
+  '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs': typeof AdminJobsIndexRoute
+  '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -207,9 +230,11 @@ export interface FileRoutesById {
   '/admin/': typeof AdminIndexRoute
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
+  '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
+  '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -231,9 +256,11 @@ export interface FileRouteTypes {
     | '/admin/'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
+    | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
+    | '/admin/jobs/subscriptions/$taskId'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -251,8 +278,10 @@ export interface FileRouteTypes {
     | '/admin'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
+    | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
     | '/admin/jobs'
+    | '/admin/jobs/subscriptions/$taskId'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -272,9 +301,11 @@ export interface FileRouteTypes {
     | '/admin/'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
+    | '/admin/jobs/subscriptions'
     | '/admin/jobs/translations'
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
+    | '/admin/jobs/subscriptions/$taskId'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -393,6 +424,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminJobsTranslationsRouteImport
       parentRoute: typeof AdminJobsRouteRoute
     }
+    '/admin/jobs/subscriptions': {
+      id: '/admin/jobs/subscriptions'
+      path: '/subscriptions'
+      fullPath: '/admin/jobs/subscriptions'
+      preLoaderRoute: typeof AdminJobsSubscriptionsRouteImport
+      parentRoute: typeof AdminJobsRouteRoute
+    }
     '/admin/jobs/scheduled': {
       id: '/admin/jobs/scheduled'
       path: '/scheduled'
@@ -406,6 +444,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/admin/jobs/llm'
       preLoaderRoute: typeof AdminJobsLlmRouteImport
       parentRoute: typeof AdminJobsRouteRoute
+    }
+    '/admin/jobs/subscriptions/$taskId': {
+      id: '/admin/jobs/subscriptions/$taskId'
+      path: '/$taskId'
+      fullPath: '/admin/jobs/subscriptions/$taskId'
+      preLoaderRoute: typeof AdminJobsSubscriptionsTaskIdRouteImport
+      parentRoute: typeof AdminJobsSubscriptionsRoute
     }
     '/admin/jobs/tasks/$taskId': {
       id: '/admin/jobs/tasks/$taskId'
@@ -438,6 +483,20 @@ declare module '@tanstack/react-router' {
   }
 }
 
+interface AdminJobsSubscriptionsRouteChildren {
+  AdminJobsSubscriptionsTaskIdRoute: typeof AdminJobsSubscriptionsTaskIdRoute
+}
+
+const AdminJobsSubscriptionsRouteChildren: AdminJobsSubscriptionsRouteChildren =
+  {
+    AdminJobsSubscriptionsTaskIdRoute: AdminJobsSubscriptionsTaskIdRoute,
+  }
+
+const AdminJobsSubscriptionsRouteWithChildren =
+  AdminJobsSubscriptionsRoute._addFileChildren(
+    AdminJobsSubscriptionsRouteChildren,
+  )
+
 interface AdminJobsTasksTaskIdRouteRouteChildren {
   AdminJobsTasksTaskIdIndexRoute: typeof AdminJobsTasksTaskIdIndexRoute
   AdminJobsTasksTaskIdLlmCallIdRoute: typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -457,6 +516,7 @@ const AdminJobsTasksTaskIdRouteRouteWithChildren =
 interface AdminJobsRouteRouteChildren {
   AdminJobsLlmRoute: typeof AdminJobsLlmRoute
   AdminJobsScheduledRoute: typeof AdminJobsScheduledRoute
+  AdminJobsSubscriptionsRoute: typeof AdminJobsSubscriptionsRouteWithChildren
   AdminJobsTranslationsRoute: typeof AdminJobsTranslationsRoute
   AdminJobsIndexRoute: typeof AdminJobsIndexRoute
   AdminJobsTasksTaskIdRouteRoute: typeof AdminJobsTasksTaskIdRouteRouteWithChildren
@@ -465,6 +525,7 @@ interface AdminJobsRouteRouteChildren {
 const AdminJobsRouteRouteChildren: AdminJobsRouteRouteChildren = {
   AdminJobsLlmRoute: AdminJobsLlmRoute,
   AdminJobsScheduledRoute: AdminJobsScheduledRoute,
+  AdminJobsSubscriptionsRoute: AdminJobsSubscriptionsRouteWithChildren,
   AdminJobsTranslationsRoute: AdminJobsTranslationsRoute,
   AdminJobsIndexRoute: AdminJobsIndexRoute,
   AdminJobsTasksTaskIdRouteRoute: AdminJobsTasksTaskIdRouteRouteWithChildren,

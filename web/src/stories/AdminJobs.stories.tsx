@@ -936,6 +936,7 @@ function AdminJobsPreview({
 		};
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
+			repo_release_worker_concurrency: 12,
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
 				.slice(0, 3)
@@ -1161,8 +1162,8 @@ function AdminJobsPreview({
 								item.task_type,
 							),
 					);
-				} else if (taskType === "brief.daily_slot") {
-					rows = [...scheduledRuns];
+				} else if (taskType) {
+					rows = rows.filter((item) => item.task_type === taskType);
 				}
 				if (excludeTaskType) {
 					rows = rows.filter((item) => item.task_type !== excludeTaskType);
@@ -1277,11 +1278,16 @@ function AdminJobsPreview({
 			) {
 				const body = (await req.json()) as {
 					sync_auto_fetch_interval_minutes?: number;
+					repo_release_worker_concurrency?: number;
 				};
 				syncRuntimeConfig = {
 					...syncRuntimeConfig,
 					sync_auto_fetch_interval_minutes: Number(
 						body.sync_auto_fetch_interval_minutes ?? 60,
+					),
+					repo_release_worker_concurrency: Number(
+						body.repo_release_worker_concurrency ??
+							syncRuntimeConfig.repo_release_worker_concurrency,
 					),
 				};
 				return new Response(JSON.stringify(syncRuntimeConfig), {
@@ -1753,6 +1759,94 @@ export const ScheduledTab: Story = {
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/scheduled",
 			),
+		);
+	},
+};
+
+export const SubscriptionSyncWorkflow: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/subscriptions" />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"订阅同步专用视图，展示 sync.subscriptions 列表、阶段概览与共享 worker 设置入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "订阅同步" }),
+		).toBeVisible();
+		await expect(canvas.getByText("Release workers")).toBeVisible();
+		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
+		await expect(canvas.getByText("Release")).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+		);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "Release worker 数量" }),
+		).toHaveAttribute("aria-valuenow", "12");
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncDetail: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-1430" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"订阅同步独立详情页，按工作流阶段展示整体进度、失败事件与子任务链路。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await expect(body.getByText("Release Queue")).toBeVisible();
+		await expect(body.getByText("octo/private-repo")).toBeVisible();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions/task-subscription-1430",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncSettings: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/subscriptions"
+			syncSettingsDialogDefaultOpen
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"直接展示订阅同步设置面板，覆盖 worker 滑块与数字输入的视觉状态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
+		).toBeVisible();
+		await expect(canvas.getByLabelText("Release worker 数量输入")).toHaveValue(
+			12,
 		);
 	},
 };

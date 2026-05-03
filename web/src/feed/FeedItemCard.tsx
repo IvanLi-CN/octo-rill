@@ -5,6 +5,7 @@ import {
 	Megaphone,
 	RefreshCcw,
 	Star,
+	Tag,
 	UserPlus,
 	UserRound,
 } from "lucide-react";
@@ -549,19 +550,23 @@ function SocialActivityCard(props: {
 	const ActionIcon =
 		item.kind === "announcement"
 			? Megaphone
-			: item.kind === "repo_forked"
-				? GitFork
-				: isRepoStar
-					? Star
-					: UserPlus;
+			: item.kind === "release_update"
+				? Tag
+				: item.kind === "repo_forked"
+					? GitFork
+					: isRepoStar
+						? Star
+						: UserPlus;
 	const actionTitle =
 		item.kind === "announcement"
 			? "公告"
-			: item.kind === "repo_forked"
-				? "Fork"
-				: isRepoStar
-					? "标星"
-					: "关注";
+			: item.kind === "release_update"
+				? "发布"
+				: item.kind === "repo_forked"
+					? "Fork"
+					: isRepoStar
+						? "标星"
+						: "关注";
 	const actorHref = actor.html_url ?? `https://github.com/${actor.login}`;
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`

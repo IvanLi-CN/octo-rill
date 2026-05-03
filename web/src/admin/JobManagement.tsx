@@ -1,10 +1,11 @@
-import { CircleHelp, Settings2 } from "lucide-react";
+import { ArrowLeft, CircleHelp, Settings2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
 import { TranslationWorkerBoard } from "@/admin/TranslationWorkerBoard";
 import {
 	ADMIN_JOBS_BASE_PATH,
+	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	buildAdminJobsRouteUrl,
 	parseAdminJobsRoute,
 	type AdminJobsPrimaryTab,
@@ -28,6 +29,7 @@ import {
 	type AdminTranslationRequestListItem,
 	type AdminTranslationStatusResponse,
 	type AdminSyncRuntimeConfigResponse,
+	type AdminSyncSubscriptionsDiagnostics,
 	type SyncAutoFetchTaskItem,
 	type LocalUserId,
 	ApiError,
@@ -116,6 +118,9 @@ const NUMBER_FORMATTER = new Intl.NumberFormat();
 const SYNC_AUTO_FETCH_INTERVAL_MIN = 1;
 const SYNC_AUTO_FETCH_INTERVAL_MAX = 120;
 const SYNC_AUTO_FETCH_INTERVAL_MARKS = [1, 5, 10, 15, 30, 60, 120];
+const REPO_RELEASE_WORKER_MIN = 1;
+const REPO_RELEASE_WORKER_MAX = 32;
+const REPO_RELEASE_WORKER_MARKS = [1, 5, 10, 16, 24, 32];
 
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
@@ -179,6 +184,13 @@ function clampSyncAutoFetchInterval(value: number) {
 	return Math.min(
 		SYNC_AUTO_FETCH_INTERVAL_MAX,
 		Math.max(SYNC_AUTO_FETCH_INTERVAL_MIN, Math.round(value)),
+	);
+}
+
+function clampRepoReleaseWorkerConcurrency(value: number) {
+	return Math.min(
+		REPO_RELEASE_WORKER_MAX,
+		Math.max(REPO_RELEASE_WORKER_MIN, Math.round(value)),
 	);
 }
 
@@ -705,42 +717,42 @@ function taskStatusTone(status: string): TaskStatusTone {
 	switch (status) {
 		case "queued":
 			return {
-				cardAccentClass: "border-l-amber-500",
+				cardAccentClass: "border-amber-500/45",
 				badgeClass:
 					"border-amber-300 bg-amber-100/90 text-amber-900 dark:border-amber-500/60 dark:bg-amber-500/20 dark:text-amber-100",
 				dotClass: "bg-amber-500",
 			};
 		case "running":
 			return {
-				cardAccentClass: "border-l-sky-500",
+				cardAccentClass: "border-sky-500/45",
 				badgeClass:
 					"border-sky-300 bg-sky-100/90 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100",
 				dotClass: "bg-sky-500",
 			};
 		case "succeeded":
 			return {
-				cardAccentClass: "border-l-emerald-500",
+				cardAccentClass: "border-emerald-500/45",
 				badgeClass:
 					"border-emerald-300 bg-emerald-100/90 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100",
 				dotClass: "bg-emerald-500",
 			};
 		case "failed":
 			return {
-				cardAccentClass: "border-l-red-500",
+				cardAccentClass: "border-red-500/45",
 				badgeClass:
 					"border-red-300 bg-red-100/90 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100",
 				dotClass: "bg-red-500",
 			};
 		case "canceled":
 			return {
-				cardAccentClass: "border-l-slate-500",
+				cardAccentClass: "border-slate-500/45",
 				badgeClass:
 					"border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100",
 				dotClass: "bg-slate-500",
 			};
 		default:
 			return {
-				cardAccentClass: "border-l-border",
+				cardAccentClass: "border-border",
 				badgeClass:
 					"border-border bg-muted/60 text-foreground dark:border-border dark:bg-muted/50 dark:text-foreground",
 				dotClass: "bg-muted-foreground",
@@ -2705,6 +2717,461 @@ function TranslationSchedulerSection(props: {
 	);
 }
 
+type SubscriptionWorkflowStage = {
+	id: string;
+	label: string;
+	description: string;
+	total: number;
+	done: number;
+	failed: number;
+	meta: Array<[string, string]>;
+};
+
+function progressPercent(done: number, total: number) {
+	if (total <= 0) return 0;
+	return Math.min(100, Math.round((done / total) * 100));
+}
+
+function subscriptionStageTone(
+	stage: SubscriptionWorkflowStage,
+): TaskStatusTone {
+	if (stage.failed > 0) return taskStatusTone("failed");
+	if (stage.total > 0 && stage.done >= stage.total) {
+		return taskStatusTone("succeeded");
+	}
+	if (stage.done > 0) return taskStatusTone("running");
+	return taskStatusTone("queued");
+}
+
+function buildSubscriptionWorkflowStages(
+	diagnostics: AdminSyncSubscriptionsDiagnostics | null | undefined,
+): SubscriptionWorkflowStage[] {
+	if (!diagnostics) {
+		return [
+			{
+				id: "collect",
+				label: "Collect",
+				description: "加载任务参数、调度键与目标用户。",
+				total: 0,
+				done: 0,
+				failed: 0,
+				meta: [["状态", "等待诊断数据"]],
+			},
+		];
+	}
+
+	const starDone =
+		diagnostics.star.succeeded_users + diagnostics.star.failed_users;
+	const releaseDone =
+		diagnostics.release.succeeded_repos + diagnostics.release.failed_repos;
+	const socialDone =
+		diagnostics.social.succeeded_users + diagnostics.social.failed_users;
+	const notificationsDone =
+		diagnostics.notifications.succeeded_users +
+		diagnostics.notifications.failed_users;
+
+	return [
+		{
+			id: "collect",
+			label: "Collect",
+			description: "确定触发来源、调度窗口与本轮工作集。",
+			total: diagnostics.star.total_users,
+			done: diagnostics.star.total_users,
+			failed: 0,
+			meta: [
+				["触发", diagnostics.trigger ?? "-"],
+				["调度键", diagnostics.schedule_key ?? "-"],
+				[
+					"跳过",
+					diagnostics.skipped ? (diagnostics.skip_reason ?? "是") : "否",
+				],
+			],
+		},
+		{
+			id: "star",
+			label: "Star",
+			description: "逐用户同步 starred repos，生成可见仓库集合。",
+			total: diagnostics.star.total_users,
+			done: starDone,
+			failed: diagnostics.star.failed_users,
+			meta: [
+				["成功用户", formatCount(diagnostics.star.succeeded_users)],
+				["失败用户", formatCount(diagnostics.star.failed_users)],
+				["可见仓库", formatCount(diagnostics.star.total_repos)],
+			],
+		},
+		{
+			id: "repo",
+			label: "Repo Collect",
+			description: "聚合去重仓库，形成共享 release demand。",
+			total: diagnostics.star.total_repos,
+			done: diagnostics.release.total_repos,
+			failed: 0,
+			meta: [
+				["输入仓库", formatCount(diagnostics.star.total_repos)],
+				["Release demand", formatCount(diagnostics.release.total_repos)],
+			],
+		},
+		{
+			id: "release",
+			label: "Release Queue",
+			description: "由 release workers 抓取仓库 releases，304 可快速完成。",
+			total: diagnostics.release.total_repos,
+			done: releaseDone,
+			failed: diagnostics.release.failed_repos,
+			meta: [
+				["成功仓库", formatCount(diagnostics.release.succeeded_repos)],
+				["失败仓库", formatCount(diagnostics.release.failed_repos)],
+				["候选失败", formatCount(diagnostics.release.candidate_failures)],
+				["写入 Releases", formatCount(diagnostics.releases_written)],
+			],
+		},
+		{
+			id: "social",
+			label: "Social",
+			description: "同步社交事件，ReleaseEvent 会提升对应仓库 release demand。",
+			total: diagnostics.social.total_users,
+			done: socialDone,
+			failed: diagnostics.social.failed_users,
+			meta: [
+				["Repo stars", formatCount(diagnostics.social.repo_stars)],
+				["Followers", formatCount(diagnostics.social.followers)],
+				["Events", formatCount(diagnostics.social.events)],
+			],
+		},
+		{
+			id: "notifications",
+			label: "Notifications",
+			description: "同步 GitHub Inbox 通知线程并修复目标 URL。",
+			total: diagnostics.notifications.total_users,
+			done: notificationsDone,
+			failed: diagnostics.notifications.failed_users,
+			meta: [
+				["成功用户", formatCount(diagnostics.notifications.succeeded_users)],
+				["失败用户", formatCount(diagnostics.notifications.failed_users)],
+				["通知", formatCount(diagnostics.notifications.notifications)],
+			],
+		},
+	];
+}
+
+function SubscriptionWorkflowDetailPage(props: {
+	detail: AdminRealtimeTaskDetailResponse | null;
+	loading: boolean;
+	taskEvents: Array<{
+		event: AdminTaskEventItem;
+		presentation: EventPresentation;
+	}>;
+	runtimeConfig: AdminSyncRuntimeConfigResponse | null;
+	relatedLlmCalls: AdminLlmCallItem[];
+	relatedLlmCallsLoading: boolean;
+	onBack: () => void;
+	onOpenSettings: () => void;
+	onOpenLlmCallDetail: (callId: string) => void;
+}) {
+	const {
+		detail,
+		loading,
+		onBack,
+		onOpenLlmCallDetail,
+		onOpenSettings,
+		relatedLlmCalls,
+		relatedLlmCallsLoading,
+		runtimeConfig,
+		taskEvents,
+	} = props;
+	const diagnostics = detail?.diagnostics?.sync_subscriptions ?? null;
+	const businessOutcome = detail?.diagnostics?.business_outcome ?? null;
+	const stages = buildSubscriptionWorkflowStages(diagnostics);
+	const tone = taskStatusTone(detail?.task.status ?? "");
+	const recentFailures = diagnostics?.recent_events.filter(
+		(event) => event.severity === "error" || event.severity === "warning",
+	);
+
+	if (loading && !detail) {
+		return <LoadingMessage>正在加载订阅同步详情...</LoadingMessage>;
+	}
+
+	if (!detail) {
+		return (
+			<Card>
+				<CardContent className="space-y-3 py-6">
+					<p className="text-muted-foreground text-sm">未找到订阅同步任务。</p>
+					<Button variant="outline" onClick={onBack}>
+						<ArrowLeft className="size-4" />
+						返回列表
+					</Button>
+				</CardContent>
+			</Card>
+		);
+	}
+
+	return (
+		<div className="space-y-4">
+			<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+				<div className="min-w-0 space-y-2">
+					<Button variant="ghost" className="-ml-2 gap-2" onClick={onBack}>
+						<ArrowLeft className="size-4" />
+						返回订阅同步列表
+					</Button>
+					<div className="space-y-1">
+						<div className="flex flex-wrap items-center gap-2">
+							<h2 className="font-semibold text-xl">订阅同步工作流详情</h2>
+							<StatusBadge
+								label={taskStatusLabel(detail.task.status)}
+								tone={tone}
+							/>
+							<Badge variant="outline">sync.subscriptions</Badge>
+						</div>
+						<p className="text-muted-foreground truncate font-mono text-xs">
+							{detail.task.id}
+						</p>
+					</div>
+				</div>
+				<Button
+					type="button"
+					variant="outline"
+					size="icon"
+					aria-label="配置订阅同步 worker 数量"
+					onClick={onOpenSettings}
+					disabled={!runtimeConfig}
+				>
+					<Settings2 />
+				</Button>
+			</div>
+
+			<div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+				<div className="rounded-lg border bg-card/70 p-3">
+					<p className="text-muted-foreground text-xs">业务结果</p>
+					<p className="mt-1 text-sm font-semibold">
+						{businessOutcome?.label ?? "-"}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						{businessOutcome?.message ?? "暂无业务结果"}
+					</p>
+				</div>
+				<div className="rounded-lg border bg-card/70 p-3">
+					<p className="text-muted-foreground text-xs">Release workers</p>
+					<p className="mt-1 text-sm font-semibold">
+						{formatCount(runtimeConfig?.repo_release_worker_concurrency)}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						运行时配置，保存后热生效
+					</p>
+				</div>
+				<div className="rounded-lg border bg-card/70 p-3">
+					<p className="text-muted-foreground text-xs">关键失败</p>
+					<p className="mt-1 text-sm font-semibold">
+						{formatCount(diagnostics?.critical_events)}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						失败/告警事件 {formatCount(recentFailures?.length)}
+					</p>
+				</div>
+				<div className="rounded-lg border bg-card/70 p-3">
+					<p className="text-muted-foreground text-xs">创建 / 完成</p>
+					<p className="mt-1 text-sm font-semibold">
+						{formatLocalHm(detail.task.created_at)} /{" "}
+						{formatLocalHm(detail.task.finished_at)}
+					</p>
+					<p className="text-muted-foreground mt-1 text-xs">
+						来源 {sourceLabel(detail.task.source)}
+					</p>
+				</div>
+			</div>
+
+			<Card>
+				<CardHeader>
+					<CardTitle>阶段总览</CardTitle>
+					<CardDescription>
+						按订阅同步执行顺序展示每个阶段的整体进度与失败分布。
+					</CardDescription>
+				</CardHeader>
+				<CardContent className="space-y-3">
+					{stages.map((stage, index) => {
+						const stageTone = subscriptionStageTone(stage);
+						const percent = progressPercent(stage.done, stage.total);
+						return (
+							<div key={stage.id} className="rounded-lg border bg-card/70 p-3">
+								<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+									<div className="min-w-0 space-y-2">
+										<div className="flex flex-wrap items-center gap-2">
+											<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
+												{String(index + 1).padStart(2, "0")}
+											</span>
+											<p className="font-medium text-sm">{stage.label}</p>
+											<StatusBadge
+												label={
+													stage.failed > 0
+														? "部分失败"
+														: stage.total > 0 && stage.done >= stage.total
+															? "完成"
+															: stage.done > 0
+																? "运行中"
+																: "等待"
+												}
+												tone={stageTone}
+											/>
+										</div>
+										<p className="text-muted-foreground text-xs">
+											{stage.description}
+										</p>
+										<div className="h-2 overflow-hidden rounded-full bg-muted">
+											<div
+												className="h-full rounded-full bg-primary"
+												style={{ width: `${percent}%` }}
+											/>
+										</div>
+										<div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+											{stage.meta.map(([label, value]) => (
+												<div
+													key={label}
+													className="rounded-md border bg-background/70 px-2.5 py-2"
+												>
+													<p className="text-muted-foreground text-[11px]">
+														{label}
+													</p>
+													<p className="mt-0.5 truncate font-mono text-xs font-semibold">
+														{value}
+													</p>
+												</div>
+											))}
+										</div>
+									</div>
+									<div className="min-w-[140px] rounded-md border bg-background/70 p-2 text-xs">
+										<p className="text-muted-foreground">工作项</p>
+										<p className="mt-1 font-mono font-semibold">
+											{formatCount(stage.done)} / {formatCount(stage.total)}
+										</p>
+										<p className="text-muted-foreground mt-1">
+											失败 {formatCount(stage.failed)}
+										</p>
+									</div>
+								</div>
+							</div>
+						);
+					})}
+				</CardContent>
+			</Card>
+
+			<div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+				<Card>
+					<CardHeader>
+						<CardTitle>最近关键事件</CardTitle>
+						<CardDescription>
+							聚焦本轮订阅同步事件，按阶段定位失败主因。
+						</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-2">
+						{diagnostics?.recent_events.length ? (
+							diagnostics.recent_events.map((event) => (
+								<div
+									key={event.id}
+									className="rounded-lg border bg-card/70 p-3"
+								>
+									<div className="flex flex-wrap items-center gap-2">
+										<Badge variant="outline">{event.stage}</Badge>
+										<span className="font-mono text-xs">
+											{event.event_type}
+										</span>
+										<span className="text-muted-foreground text-xs">
+											{formatLocalDateTime(event.created_at)}
+										</span>
+									</div>
+									<p className="mt-1 text-sm">{event.message ?? "-"}</p>
+									<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+										{event.repo_full_name ?? event.user_id ?? "-"} · attempt{" "}
+										{event.attempt} ·{" "}
+										{event.recoverable ? "recoverable" : "terminal"}
+									</p>
+								</div>
+							))
+						) : (
+							<p className="text-muted-foreground text-sm">暂无关键事件。</p>
+						)}
+					</CardContent>
+				</Card>
+
+				<Card>
+					<CardHeader>
+						<CardTitle>子任务 / Worker 关联</CardTitle>
+						<CardDescription>
+							展示当前任务派生出的翻译、润色等后续处理链路。
+						</CardDescription>
+					</CardHeader>
+					<CardContent className="space-y-2">
+						{relatedLlmCallsLoading ? (
+							<LoadingMessage>正在加载关联调用...</LoadingMessage>
+						) : relatedLlmCalls.length === 0 ? (
+							<p className="text-muted-foreground text-sm">
+								暂无关联 LLM 调用。
+							</p>
+						) : (
+							relatedLlmCalls.map((call) => (
+								<div key={call.id} className="rounded-lg border p-3">
+									<div className="flex flex-wrap items-center justify-between gap-2">
+										<div className="min-w-0">
+											<p className="truncate font-medium text-sm">
+												{call.source}
+											</p>
+											<p className="text-muted-foreground mt-1 truncate font-mono text-[11px]">
+												{call.id}
+											</p>
+											<p className="text-muted-foreground mt-1 text-xs">
+												等待 {formatDurationMs(call.scheduler_wait_ms)} · 耗时{" "}
+												{formatDurationMs(call.duration_ms)}
+											</p>
+										</div>
+										<Button
+											variant="outline"
+											size="sm"
+											onClick={() => onOpenLlmCallDetail(call.id)}
+										>
+											详情
+										</Button>
+									</div>
+								</div>
+							))
+						)}
+					</CardContent>
+				</Card>
+			</div>
+
+			<Card>
+				<CardHeader>
+					<CardTitle>执行时间线</CardTitle>
+					<CardDescription>
+						保留原始任务事件，便于核对阶段诊断与后端日志。
+					</CardDescription>
+				</CardHeader>
+				<CardContent className="space-y-2">
+					{taskEvents.length === 0 ? (
+						<p className="text-muted-foreground text-sm">暂无事件日志。</p>
+					) : (
+						taskEvents
+							.slice()
+							.reverse()
+							.map(({ event, presentation }) => (
+								<div
+									key={event.id}
+									className={`rounded-lg border p-3 ${eventLevelClass(presentation.level)}`}
+								>
+									<p className="font-medium text-sm">{presentation.title}</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										{presentation.description}
+									</p>
+									<p className="text-muted-foreground mt-1 font-mono text-[11px]">
+										{event.event_type} · {formatLocalDateTime(event.created_at)}
+									</p>
+								</div>
+							))
+					)}
+				</CardContent>
+			</Card>
+		</div>
+	);
+}
+
 export function JobManagement({
 	currentUserId,
 	routeState: controlledRouteState,
@@ -2741,6 +3208,13 @@ export function JobManagement({
 	const [scheduledRunPage, setScheduledRunPage] = useState(1);
 	const [scheduledRunsLoadPhase, setScheduledRunsLoadPhase] =
 		useState<ListLoadPhase>("idle");
+	const [subscriptionRuns, setSubscriptionRuns] = useState<
+		AdminRealtimeTaskItem[]
+	>([]);
+	const [subscriptionRunTotal, setSubscriptionRunTotal] = useState(0);
+	const [subscriptionRunPage, setSubscriptionRunPage] = useState(1);
+	const [subscriptionRunsLoadPhase, setSubscriptionRunsLoadPhase] =
+		useState<ListLoadPhase>("idle");
 	const [syncRuntimeConfig, setSyncRuntimeConfig] =
 		useState<AdminSyncRuntimeConfigResponse | null>(null);
 	const [syncRuntimeConfigLoading, setSyncRuntimeConfigLoading] =
@@ -2754,6 +3228,10 @@ export function JobManagement({
 	);
 	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
 		useState(60);
+	const [
+		repoReleaseWorkerConcurrencyInput,
+		setRepoReleaseWorkerConcurrencyInput,
+	] = useState(5);
 
 	const [llmStatus, setLlmStatus] =
 		useState<AdminLlmSchedulerStatusResponse | null>(null);
@@ -2806,6 +3284,9 @@ export function JobManagement({
 	const scheduledRunsLoadedOnceRef = useRef(false);
 	const scheduledRunsInitialRequestInFlightRef = useRef(false);
 	const scheduledRunsRequestIdRef = useRef(0);
+	const subscriptionRunsLoadedOnceRef = useRef(false);
+	const subscriptionRunsInitialRequestInFlightRef = useRef(false);
+	const subscriptionRunsRequestIdRef = useRef(0);
 	const syncRuntimeConfigLoadedOnceRef = useRef(false);
 	const syncRuntimeConfigInitialRequestInFlightRef = useRef(false);
 	const syncRuntimeConfigRequestIdRef = useRef(0);
@@ -2834,6 +3315,10 @@ export function JobManagement({
 		() => Math.max(1, Math.ceil(scheduledRunTotal / TASK_PAGE_SIZE)),
 		[scheduledRunTotal],
 	);
+	const subscriptionRunTotalPages = useMemo(
+		() => Math.max(1, Math.ceil(subscriptionRunTotal / TASK_PAGE_SIZE)),
+		[subscriptionRunTotal],
+	);
 	const llmCallTotalPages = useMemo(
 		() => Math.max(1, Math.ceil(llmCallTotal / TASK_PAGE_SIZE)),
 		[llmCallTotal],
@@ -2858,12 +3343,20 @@ export function JobManagement({
 	const translationView = routeState.translationView;
 	const taskDrawerRoute = routeState.taskDrawerRoute;
 	const taskDrawerFromTab = routeState.drawerFromTab;
+	const activeSubscriptionDetailTaskId =
+		routeState.subscriptionDetailTaskId ?? null;
 	const activeTaskDrawerTaskId = taskDrawerRoute?.taskId ?? null;
+	const activeRouteTaskId =
+		activeTaskDrawerTaskId ?? activeSubscriptionDetailTaskId;
 	const activeTaskDrawerLlmCallId = taskDrawerRoute?.llmCallId ?? null;
 	const isTaskDrawerOpen = activeTaskDrawerTaskId !== null;
 	const isTaskDrawerLlmRoute = activeTaskDrawerLlmCallId !== null;
 	const activeTaskDetail =
 		detailTask && detailTask.task.id === activeTaskDrawerTaskId
+			? detailTask
+			: null;
+	const activeSubscriptionDetail =
+		detailTask && detailTask.task.id === activeSubscriptionDetailTaskId
 			? detailTask
 			: null;
 	const detailBusinessOutcome =
@@ -2876,6 +3369,9 @@ export function JobManagement({
 	const scheduledRunsRefreshing = scheduledRunsLoadPhase === "refreshing";
 	const scheduledRunActionsDisabled =
 		detailLoading || scheduledRunsLoadPhase !== "idle";
+	const subscriptionRunsInitialLoading =
+		subscriptionRunsLoadPhase === "initial";
+	const subscriptionRunsRefreshing = subscriptionRunsLoadPhase === "refreshing";
 	const llmCallsInitialLoading = llmCallsLoadPhase === "initial";
 	const llmCallsRefreshing = llmCallsLoadPhase === "refreshing";
 	const llmStatusRefreshing = llmStatusLoading && llmStatus !== null;
@@ -2885,13 +3381,14 @@ export function JobManagement({
 		overviewLoading ||
 		tasksLoadPhase !== "idle" ||
 		scheduledRunsLoadPhase !== "idle" ||
+		subscriptionRunsLoadPhase !== "idle" ||
 		syncRuntimeConfigLoading ||
 		llmStatusLoading ||
 		llmCallsLoadPhase !== "idle";
 
 	useEffect(() => {
-		detailTaskIdRef.current = activeTaskDetail?.task.id ?? null;
-	}, [activeTaskDetail]);
+		detailTaskIdRef.current = activeRouteTaskId;
+	}, [activeRouteTaskId]);
 
 	useEffect(() => {
 		activeTaskDrawerLlmCallIdRef.current = activeTaskDrawerLlmCallId;
@@ -3099,6 +3596,50 @@ export function JobManagement({
 		[scheduledRunPage, scheduledRunStatusFilter],
 	);
 
+	const loadSubscriptionRuns = useCallback(
+		async (options?: LoadOptions) => {
+			if (
+				options?.background &&
+				!subscriptionRunsLoadedOnceRef.current &&
+				subscriptionRunsInitialRequestInFlightRef.current
+			) {
+				return;
+			}
+			const requestId = subscriptionRunsRequestIdRef.current + 1;
+			subscriptionRunsRequestIdRef.current = requestId;
+			subscriptionRunsInitialRequestInFlightRef.current =
+				!subscriptionRunsLoadedOnceRef.current;
+			setSubscriptionRunsLoadPhase(
+				resolveListLoadPhase(subscriptionRunsLoadedOnceRef.current, options),
+			);
+			try {
+				const params = new URLSearchParams();
+				params.set("status", scheduledRunStatusFilter);
+				params.set("task_type", "sync.subscriptions");
+				params.set("page", String(subscriptionRunPage));
+				params.set("page_size", String(TASK_PAGE_SIZE));
+				const res = await apiGetAdminRealtimeTasks(params);
+				if (requestId !== subscriptionRunsRequestIdRef.current) {
+					return;
+				}
+				setSubscriptionRuns(res.items);
+				setSubscriptionRunTotal(res.total);
+				subscriptionRunsLoadedOnceRef.current = true;
+			} catch (err) {
+				if (requestId !== subscriptionRunsRequestIdRef.current) {
+					return;
+				}
+				throw err;
+			} finally {
+				if (requestId === subscriptionRunsRequestIdRef.current) {
+					setSubscriptionRunsLoadPhase("idle");
+					subscriptionRunsInitialRequestInFlightRef.current = false;
+				}
+			}
+		},
+		[scheduledRunStatusFilter, subscriptionRunPage],
+	);
+
 	const loadSyncRuntimeConfig = useCallback(async (options?: LoadOptions) => {
 		if (
 			options?.background &&
@@ -3120,6 +3661,7 @@ export function JobManagement({
 			}
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
 			syncRuntimeConfigLoadedOnceRef.current = true;
 		} catch (err) {
 			if (requestId !== syncRuntimeConfigRequestIdRef.current) {
@@ -3137,17 +3679,23 @@ export function JobManagement({
 
 	const saveSyncRuntimeConfig = useCallback(async () => {
 		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
+		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
+			repoReleaseWorkerConcurrencyInput,
+		);
 		setSyncRuntimeConfigSaving(true);
 		setSyncRuntimeConfigError(null);
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: nextInterval,
+				repo_release_worker_concurrency: nextWorkerConcurrency,
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
 			setSyncSettingsDialogOpen(false);
 			await Promise.all([
 				loadScheduledRuns({ background: true }),
+				loadSubscriptionRuns({ background: true }),
 				loadOverview({ background: true }),
 			]);
 		} catch (err) {
@@ -3155,12 +3703,21 @@ export function JobManagement({
 		} finally {
 			setSyncRuntimeConfigSaving(false);
 		}
-	}, [loadOverview, loadScheduledRuns, syncAutoFetchIntervalInput]);
+	}, [
+		loadOverview,
+		loadScheduledRuns,
+		loadSubscriptionRuns,
+		repoReleaseWorkerConcurrencyInput,
+		syncAutoFetchIntervalInput,
+	]);
 
 	const openSyncSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
 		setSyncAutoFetchIntervalInput(
 			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
+		);
+		setRepoReleaseWorkerConcurrencyInput(
+			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
 		);
 		setSyncSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
@@ -3317,6 +3874,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks(options),
 					loadScheduledRuns(options),
+					loadSubscriptionRuns(options),
 					loadSyncRuntimeConfig(options),
 					loadLlmSchedulerStatus(options),
 					loadLlmCalls(options),
@@ -3329,6 +3887,7 @@ export function JobManagement({
 			loadOverview,
 			loadRealtimeTasks,
 			loadScheduledRuns,
+			loadSubscriptionRuns,
 			loadSyncRuntimeConfig,
 			loadLlmSchedulerStatus,
 			loadLlmCalls,
@@ -3387,6 +3946,7 @@ export function JobManagement({
 					loadOverview({ background: true }),
 					loadRealtimeTasks({ background: true }),
 					loadScheduledRuns({ background: true }),
+					loadSubscriptionRuns({ background: true }),
 					loadSyncRuntimeConfig({ background: true }),
 					loadLlmSchedulerStatus({ background: true }),
 					loadLlmCalls({ background: true }),
@@ -3441,6 +4001,7 @@ export function JobManagement({
 		loadOverview,
 		loadRealtimeTasks,
 		loadScheduledRuns,
+		loadSubscriptionRuns,
 		loadSyncRuntimeConfig,
 		loadLlmSchedulerStatus,
 		loadLlmCalls,
@@ -3509,6 +4070,16 @@ export function JobManagement({
 
 	useEffect(() => {
 		setError(null);
+		const options = subscriptionRunsLoadedOnceRef.current
+			? { background: true }
+			: undefined;
+		void loadSubscriptionRuns(options).catch((err) => {
+			setError(normalizeErrorMessage(err));
+		});
+	}, [loadSubscriptionRuns]);
+
+	useEffect(() => {
+		setError(null);
 		const options = syncRuntimeConfigLoadedOnceRef.current
 			? { background: true }
 			: undefined;
@@ -3534,18 +4105,18 @@ export function JobManagement({
 	}, [loadLlmSchedulerStatus, loadLlmCalls]);
 
 	useEffect(() => {
-		if (!activeTaskDrawerTaskId) {
+		if (!activeRouteTaskId) {
 			setDetailTask(null);
 			setDetailLoading(false);
 			return;
 		}
-		if (detailTask?.task.id === activeTaskDrawerTaskId) {
+		if (detailTask?.task.id === activeRouteTaskId) {
 			return;
 		}
 		let canceled = false;
 		setDetailLoading(true);
 		setError(null);
-		void refreshTaskDetail(activeTaskDrawerTaskId)
+		void refreshTaskDetail(activeRouteTaskId)
 			.catch((err) => {
 				if (!canceled) {
 					setError(normalizeErrorMessage(err));
@@ -3559,17 +4130,17 @@ export function JobManagement({
 		return () => {
 			canceled = true;
 		};
-	}, [activeTaskDrawerTaskId, detailTask?.task.id, refreshTaskDetail]);
+	}, [activeRouteTaskId, detailTask?.task.id, refreshTaskDetail]);
 
 	useEffect(() => {
-		if (!activeTaskDrawerTaskId) {
+		if (!activeRouteTaskId) {
 			setTaskRelatedLlmCalls([]);
 			setTaskRelatedLlmLoading(false);
 			return;
 		}
 		let canceled = false;
 		setTaskRelatedLlmLoading(true);
-		void loadTaskRelatedLlmCalls(activeTaskDrawerTaskId)
+		void loadTaskRelatedLlmCalls(activeRouteTaskId)
 			.catch((err) => {
 				if (!canceled) {
 					setError(normalizeErrorMessage(err));
@@ -3583,7 +4154,7 @@ export function JobManagement({
 		return () => {
 			canceled = true;
 		};
-	}, [activeTaskDrawerTaskId, loadTaskRelatedLlmCalls]);
+	}, [activeRouteTaskId, loadTaskRelatedLlmCalls]);
 
 	useEffect(() => {
 		if (!activeTaskDrawerLlmCallId) {
@@ -3779,11 +4350,22 @@ export function JobManagement({
 		(taskId: string) => {
 			setError(null);
 			setLlmDetail(null);
+			if (tab === "subscriptions") {
+				navigateAdminJobsRoute({
+					primaryTab: "subscriptions",
+					translationView,
+					taskDrawerRoute: null,
+					drawerFromTab: null,
+					subscriptionDetailTaskId: taskId,
+				});
+				return;
+			}
 			navigateAdminJobsRoute({
 				primaryTab: tab,
 				translationView,
 				taskDrawerRoute: { taskId, llmCallId: null },
 				drawerFromTab: tab,
+				subscriptionDetailTaskId: null,
 			});
 		},
 		[navigateAdminJobsRoute, tab, translationView],
@@ -3796,6 +4378,16 @@ export function JobManagement({
 		},
 		[onOpenTaskDetail],
 	);
+
+	const onBackToSubscriptionRuns = useCallback(() => {
+		navigateAdminJobsRoute({
+			primaryTab: "subscriptions",
+			translationView,
+			taskDrawerRoute: null,
+			drawerFromTab: null,
+			subscriptionDetailTaskId: null,
+		});
+	}, [navigateAdminJobsRoute, translationView]);
 
 	const onOpenLlmCallDetail = useCallback(async (callId: string) => {
 		setLlmDetailLoading(true);
@@ -3962,12 +4554,15 @@ export function JobManagement({
 				className="space-y-4"
 			>
 				<div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-					<TabsList className="grid w-full grid-cols-4 sm:inline-flex sm:w-auto">
+					<TabsList className="grid w-full grid-cols-2 sm:grid-cols-5 lg:inline-flex lg:w-auto">
 						<TabsTrigger value="realtime" className="font-mono text-xs">
 							实时异步任务
 						</TabsTrigger>
 						<TabsTrigger value="scheduled" className="font-mono text-xs">
 							定时任务
+						</TabsTrigger>
+						<TabsTrigger value="subscriptions" className="font-mono text-xs">
+							订阅同步
 						</TabsTrigger>
 						<TabsTrigger value="llm" className="font-mono text-xs">
 							LLM调度
@@ -4344,6 +4939,243 @@ export function JobManagement({
 					</Card>
 				</TabsContent>
 
+				<TabsContent value="subscriptions">
+					{activeSubscriptionDetailTaskId ? (
+						<SubscriptionWorkflowDetailPage
+							detail={activeSubscriptionDetail}
+							loading={detailLoading}
+							taskEvents={taskEvents}
+							runtimeConfig={syncRuntimeConfig}
+							relatedLlmCalls={taskRelatedLlmCalls}
+							relatedLlmCallsLoading={taskRelatedLlmLoading}
+							onBack={onBackToSubscriptionRuns}
+							onOpenSettings={openSyncSettingsDialog}
+							onOpenLlmCallDetail={onOpenLlmCallDetail}
+						/>
+					) : (
+						<Card>
+							<CardHeader className="flex flex-row items-start justify-between gap-4">
+								<div className="space-y-1.5">
+									<CardTitle>订阅同步</CardTitle>
+									<CardDescription>
+										按工作流查看 `sync.subscriptions` 的 Star、Release、Social
+										与 Inbox 阶段。
+									</CardDescription>
+								</div>
+								<Button
+									type="button"
+									variant="outline"
+									size="icon"
+									aria-label="配置订阅同步 worker 数量"
+									onClick={openSyncSettingsDialog}
+									disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+								>
+									<Settings2 />
+								</Button>
+							</CardHeader>
+							<CardContent className="space-y-4">
+								<div className="grid gap-3 md:grid-cols-3">
+									<div className="rounded-lg border bg-card/70 p-3">
+										<p className="text-muted-foreground text-xs">
+											Release workers
+										</p>
+										<p className="mt-1 text-xl font-semibold">
+											{formatCount(
+												syncRuntimeConfig?.repo_release_worker_concurrency,
+											)}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											目标并发，保存后热生效
+										</p>
+									</div>
+									<div className="rounded-lg border bg-card/70 p-3">
+										<p className="text-muted-foreground text-xs">
+											自动获取间隔
+										</p>
+										<p className="mt-1 text-xl font-semibold">
+											{formatCount(
+												syncRuntimeConfig?.sync_auto_fetch_interval_minutes,
+											)}{" "}
+											分钟
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											频率保持独立配置
+										</p>
+									</div>
+									<div className="rounded-lg border bg-card/70 p-3">
+										<p className="text-muted-foreground text-xs">最近链路</p>
+										<p className="mt-1 text-xl font-semibold">
+											{formatCount(syncRuntimeConfig?.recent_sync_tasks.length)}
+										</p>
+										<p className="text-muted-foreground mt-1 text-xs">
+											可直接打开任务详情
+										</p>
+									</div>
+								</div>
+
+								{subscriptionRunsRefreshing || syncRuntimeConfigLoading ? (
+									<p className="text-muted-foreground inline-flex items-center gap-2 text-xs">
+										<span className="size-2 rounded-full bg-amber-500/80" />
+										订阅同步列表更新中...
+									</p>
+								) : null}
+
+								<div className="space-y-2">
+									{subscriptionRunsInitialLoading ? (
+										<LoadingMessage>正在加载订阅同步...</LoadingMessage>
+									) : subscriptionRuns.length === 0 ? (
+										<p className="text-muted-foreground text-sm">
+											暂无订阅同步任务。
+										</p>
+									) : (
+										subscriptionRuns.map((task) => {
+											const tone = taskStatusTone(task.status);
+											const diagnostics =
+												task.id === activeTaskDetail?.task.id
+													? activeTaskDetail?.diagnostics?.sync_subscriptions
+													: null;
+											return (
+												<div
+													key={task.id}
+													className={`rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+												>
+													<div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-start">
+														<div className="min-w-0 space-y-4">
+															<div className="flex flex-wrap items-start justify-between gap-3">
+																<div className="min-w-0 space-y-2">
+																	<div className="flex flex-wrap items-center gap-2">
+																		<p className="font-medium text-base">
+																			订阅同步工作流
+																		</p>
+																		<StatusBadge
+																			label={taskStatusLabel(task.status)}
+																			tone={tone}
+																		/>
+																		<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
+																			{sourceLabel(task.source)}
+																		</span>
+																	</div>
+																	<p className="text-muted-foreground truncate font-mono text-[11px]">
+																		ID: {task.id}
+																	</p>
+																</div>
+																<div className="flex flex-wrap gap-1.5 text-xs">
+																	<span className="rounded bg-muted/60 px-2 py-0.5">
+																		创建 {formatLocalHm(task.created_at)}
+																	</span>
+																	<span className="rounded bg-muted/60 px-2 py-0.5">
+																		开始 {formatLocalHm(task.started_at)}
+																	</span>
+																	<span className="rounded bg-muted/60 px-2 py-0.5">
+																		完成 {formatLocalHm(task.finished_at)}
+																	</span>
+																</div>
+															</div>
+															<div className="grid w-full gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
+																{[
+																	["Collect", "用户与调度键"],
+																	[
+																		"Star",
+																		diagnostics
+																			? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
+																			: "-",
+																	],
+																	[
+																		"Repo",
+																		diagnostics
+																			? `${diagnostics.star.total_repos}`
+																			: "-",
+																	],
+																	[
+																		"Release",
+																		diagnostics
+																			? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
+																			: "-",
+																	],
+																	[
+																		"Social",
+																		diagnostics
+																			? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
+																			: "-",
+																	],
+																	[
+																		"Inbox",
+																		diagnostics
+																			? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
+																			: "-",
+																	],
+																].map(([label, value]) => (
+																	<div
+																		key={label}
+																		className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
+																	>
+																		<p className="text-muted-foreground text-xs">
+																			{label}
+																		</p>
+																		<p className="mt-2 font-mono text-sm font-semibold">
+																			{value}
+																		</p>
+																	</div>
+																))}
+															</div>
+														</div>
+														<Button
+															variant="outline"
+															className="xl:mt-1"
+															asChild
+														>
+															<a
+																href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
+															>
+																工作流详情
+															</a>
+														</Button>
+													</div>
+												</div>
+											);
+										})
+									)}
+								</div>
+								<div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3 text-sm">
+									<p className="text-muted-foreground">
+										第 {subscriptionRunPage}/{subscriptionRunTotalPages} 页
+									</p>
+									<div className="flex gap-2">
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												subscriptionRunPage <= 1 ||
+												subscriptionRunsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setSubscriptionRunPage((prev) => Math.max(1, prev - 1))
+											}
+										>
+											上一页
+										</Button>
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={
+												subscriptionRunPage >= subscriptionRunTotalPages ||
+												subscriptionRunsLoadPhase !== "idle"
+											}
+											onClick={() =>
+												setSubscriptionRunPage((prev) =>
+													Math.min(subscriptionRunTotalPages, prev + 1),
+												)
+											}
+										>
+											下一页
+										</Button>
+									</div>
+								</div>
+							</CardContent>
+						</Card>
+					)}
+				</TabsContent>
+
 				<TabsContent value="llm">
 					<Card>
 						<CardHeader className="flex flex-row items-start justify-between gap-4">
@@ -4691,6 +5523,75 @@ export function JobManagement({
 										</button>
 									))}
 								</div>
+							</div>
+							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+								<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+									<Label htmlFor="repo-release-worker-concurrency">
+										Release worker 数量
+									</Label>
+									<div className="flex items-center gap-2">
+										<input
+											id="repo-release-worker-concurrency-input"
+											type="number"
+											min={REPO_RELEASE_WORKER_MIN}
+											max={REPO_RELEASE_WORKER_MAX}
+											value={repoReleaseWorkerConcurrencyInput}
+											onChange={(event) =>
+												setRepoReleaseWorkerConcurrencyInput(
+													clampRepoReleaseWorkerConcurrency(
+														Number(event.target.value),
+													),
+												)
+											}
+											aria-label="Release worker 数量输入"
+											className="h-8 w-20 rounded-md border bg-background px-2 font-mono text-sm"
+										/>
+										<span className="text-muted-foreground text-xs">
+											workers
+										</span>
+									</div>
+								</div>
+								<input
+									id="repo-release-worker-concurrency"
+									type="range"
+									min={REPO_RELEASE_WORKER_MIN}
+									max={REPO_RELEASE_WORKER_MAX}
+									step={1}
+									value={repoReleaseWorkerConcurrencyInput}
+									onChange={(event) =>
+										setRepoReleaseWorkerConcurrencyInput(
+											clampRepoReleaseWorkerConcurrency(
+												Number(event.target.value),
+											),
+										)
+									}
+									aria-label="Release worker 数量"
+									aria-valuemin={REPO_RELEASE_WORKER_MIN}
+									aria-valuemax={REPO_RELEASE_WORKER_MAX}
+									aria-valuenow={repoReleaseWorkerConcurrencyInput}
+									aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 个 Release worker`}
+									className="h-2 w-full cursor-pointer accent-primary"
+								/>
+								<div className="relative h-8 text-[11px] text-muted-foreground">
+									{REPO_RELEASE_WORKER_MARKS.map((mark) => (
+										<button
+											key={mark}
+											type="button"
+											className="-translate-x-1/2 absolute top-0 flex flex-col items-center gap-1 transition-colors hover:text-foreground"
+											style={{
+												left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
+											}}
+											onClick={() => setRepoReleaseWorkerConcurrencyInput(mark)}
+										>
+											<span className="h-1.5 w-px bg-border" />
+											<span>{mark}</span>
+										</button>
+									))}
+								</div>
+								<p className="text-muted-foreground text-xs">
+									只影响共享 repo release
+									队列吞吐；保存后当前进程会按目标数量收敛，不改变定时频率。
+								</p>
 							</div>
 							{syncRuntimeConfigError ? (
 								<p className="text-destructive text-sm">
