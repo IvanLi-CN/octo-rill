@@ -542,6 +542,7 @@ export function Dashboard(props: {
 	const refreshFeed = feed.refresh;
 	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
 	const activeFeedNotice = liveNotices.feed?.[feedRequestType];
+	const hydratedFeedNoticeRef = useRef<string | null>(null);
 	const [freshBriefKeys, setFreshBriefKeys] = useState<Set<string>>(
 		() => new Set(),
 	);
@@ -848,20 +849,95 @@ export function Dashboard(props: {
 		onUpdate: onDashboardLiveUpdate,
 	});
 
+	const scrollToFreshFeedTop = useCallback((keys: string[]) => {
+		window.requestAnimationFrame(() => {
+			const itemElements = Array.from(
+				document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+			);
+			for (const key of keys) {
+				const element = itemElements.find(
+					(item) => item.dataset.feedItemKey === key,
+				);
+				if (!element) continue;
+				element.scrollIntoView({ block: "start", behavior: "smooth" });
+				return;
+			}
+		});
+	}, []);
+
+	const scrollToNewContentBoundary = useCallback((behavior: ScrollBehavior) => {
+		window.requestAnimationFrame(() => {
+			document
+				.querySelector<HTMLElement>(
+					'[data-dashboard-new-content-boundary="true"]',
+				)
+				?.scrollIntoView({ block: "start", behavior });
+		});
+	}, []);
+
 	const revealFeedUpdates = useCallback(async () => {
 		const notice = activeFeedNotice;
 		if (!notice) return;
-		await refreshFeed({
-			freshKeys: notice.latestKeys.slice(0, notice.newCount),
-			throwOnError: true,
-		});
+		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+		const hasHydratedFreshItems = feed.items.some((item) =>
+			freshKeys.includes(feedItemKey(item)),
+		);
+		if (!hasHydratedFreshItems) {
+			await refreshFeed({
+				freshKeys,
+				throwOnError: true,
+			});
+		}
+		scrollToFreshFeedTop(freshKeys);
 		setLiveNotices((current) => {
 			const { [feedRequestType]: _removed, ...remainingFeedNotices } =
 				current.feed ?? {};
 			return { ...current, feed: remainingFeedNotices };
 		});
 		await checkDashboardUpdates({ emit: false, include: ["feed"] });
-	}, [activeFeedNotice, checkDashboardUpdates, feedRequestType, refreshFeed]);
+	}, [
+		activeFeedNotice,
+		checkDashboardUpdates,
+		feed.items,
+		feedRequestType,
+		refreshFeed,
+		scrollToFreshFeedTop,
+	]);
+
+	useEffect(() => {
+		const notice = activeFeedNotice;
+		if (!notice || feed.loadingInitial) return;
+		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+		if (freshKeys.length === 0) return;
+		const noticeKey = `${feedRequestType}:${notice.newCount}:${freshKeys.join("|")}`;
+		if (hydratedFeedNoticeRef.current === noticeKey) return;
+		hydratedFeedNoticeRef.current = noticeKey;
+		const wasAtTop = window.scrollY <= 96;
+		void refreshFeed({
+			freshKeys,
+			throwOnError: true,
+		})
+			.then(() => {
+				if (wasAtTop) {
+					scrollToNewContentBoundary("auto");
+				}
+			})
+			.catch((error) => {
+				hydratedFeedNoticeRef.current = null;
+				notifyGlobalError(
+					"新动态显示失败",
+					error,
+					"新动态显示失败，请稍后重试。",
+				);
+			});
+	}, [
+		activeFeedNotice,
+		feed.loadingInitial,
+		feedRequestType,
+		notifyGlobalError,
+		refreshFeed,
+		scrollToNewContentBoundary,
+	]);
 
 	const revealBriefUpdates = useCallback(async () => {
 		const notice = liveNotices.briefs;
@@ -1937,20 +2013,6 @@ export function Dashboard(props: {
 					</div>
 				) : null}
 
-				<NewContentNotice
-					count={activeFeedNotice?.newCount ?? 0}
-					label="动态"
-					onReveal={() => {
-						void revealFeedUpdates().catch((error) => {
-							notifyGlobalError(
-								"新动态显示失败",
-								error,
-								"新动态显示失败，请稍后重试。",
-							);
-						});
-					}}
-				/>
-
 				<FeedGroupedList
 					mode={mode}
 					items={filteredItems}
@@ -1995,6 +2057,23 @@ export function Dashboard(props: {
 					}
 					onGenerateBriefForDate={
 						mode === "all" ? onGenerateBriefForDate : undefined
+					}
+					newContentBoundary={
+						activeFeedNotice
+							? {
+									count: activeFeedNotice.newCount,
+									label: "动态",
+									onReveal: () => {
+										void revealFeedUpdates().catch((error) => {
+											notifyGlobalError(
+												"新动态显示失败",
+												error,
+												"新动态显示失败，请稍后重试。",
+											);
+										});
+									},
+								}
+							: undefined
 					}
 				/>
 			</>

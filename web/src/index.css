@@ -137,6 +137,10 @@
 		color: color-mix(in oklch, var(--foreground) 62%, var(--muted-foreground));
 	}
 
+	.dashboard-new-content-boundary {
+		scroll-margin-top: 104px;
+	}
+
 	.dashboard-new-content-rule {
 		height: 1px;
 		background: linear-gradient(

@@ -1,4 +1,10 @@
-import { List, LoaderCircle, Newspaper, Sparkles } from "lucide-react";
+import {
+	ArrowUpToLine,
+	List,
+	LoaderCircle,
+	Newspaper,
+	Sparkles,
+} from "lucide-react";
 import {
 	type HTMLAttributes,
 	type ReactNode,
@@ -38,6 +44,39 @@ const FEED_DAY_ACTION_BUTTON_CLASS =
 	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-[14px] font-normal leading-[1.35] tracking-[0.02em] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100 sm:w-full sm:justify-end sm:text-[15px] sm:leading-none sm:tracking-wide";
 const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
+
+type NewContentBoundary = {
+	count: number;
+	label: string;
+	onReveal: () => void;
+};
+
+function keyOfFeedItem(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
+}
+
+function FreshContentBoundary(props: NewContentBoundary) {
+	const { count, label, onReveal } = props;
+	if (count <= 0) return null;
+	return (
+		<button
+			type="button"
+			className="dashboard-new-content-hint dashboard-new-content-boundary group grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-2 text-left"
+			data-dashboard-new-content-notice="true"
+			data-dashboard-new-content-boundary="true"
+			onClick={onReveal}
+		>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
+				<ArrowUpToLine className="size-3.5" />
+				<span>
+					上方有 {count} 条新{label}
+				</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
+	);
+}
 
 function briefHasSection(markdown: string | undefined, heading: string) {
 	if (!markdown) return false;
@@ -323,6 +362,7 @@ export function FeedGroupedList(
 		now?: Date;
 		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
+		newContentBoundary?: NewContentBoundary;
 	},
 ) {
 	const {
@@ -341,6 +381,7 @@ export function FeedGroupedList(
 		now,
 		onOpenReleaseFromBrief,
 		onGenerateBriefForDate,
+		newContentBoundary,
 		...feedCardProps
 	} = props;
 
@@ -452,6 +493,22 @@ export function FeedGroupedList(
 	}, [groups]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
+	const freshKeys = feedCardProps.freshKeys ?? new Set<string>();
+	const freshBoundaryIndex = useMemo(() => {
+		if (!newContentBoundary || newContentBoundary.count <= 0) {
+			return -1;
+		}
+		let index = 0;
+		for (const item of items) {
+			if (!freshKeys.has(keyOfFeedItem(item))) {
+				break;
+			}
+			index += 1;
+		}
+		return index > 0 ? index : -1;
+	}, [freshKeys, items, newContentBoundary]);
+
+	let itemsSeen = 0;
 
 	return (
 		<div className="space-y-3 sm:space-y-4">
@@ -486,6 +543,13 @@ export function FeedGroupedList(
 			) : null}
 
 			{groups.map((group, index) => {
+				const groupStart = itemsSeen;
+				const groupEnd = groupStart + group.items.length;
+				itemsSeen = groupEnd;
+				const boundaryIndexInGroup =
+					freshBoundaryIndex > groupStart && freshBoundaryIndex <= groupEnd
+						? freshBoundaryIndex - groupStart
+						: -1;
 				const brief =
 					(group.briefId ? briefById.get(group.briefId) : null) ??
 					(group.kind === "historical"
@@ -629,7 +693,27 @@ export function FeedGroupedList(
 									action={groupAction}
 									showDivider={showDivider}
 								/>
-								<FeedItems items={group.items} {...feedCardProps} />
+								{boundaryIndexInGroup > -1 ? (
+									<>
+										{boundaryIndexInGroup > 0 ? (
+											<FeedItems
+												items={group.items.slice(0, boundaryIndexInGroup)}
+												{...feedCardProps}
+											/>
+										) : null}
+										{newContentBoundary ? (
+											<FreshContentBoundary {...newContentBoundary} />
+										) : null}
+										{boundaryIndexInGroup < group.items.length ? (
+											<FeedItems
+												items={group.items.slice(boundaryIndexInGroup)}
+												{...feedCardProps}
+											/>
+										) : null}
+									</>
+								) : (
+									<FeedItems items={group.items} {...feedCardProps} />
+								)}
 							</>
 						)}
 					</section>

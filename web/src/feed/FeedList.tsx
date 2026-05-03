@@ -55,7 +55,7 @@ export function FeedItems(props: FeedCardListProps) {
 		const isReactionBusy = reactionBusyKeys.has(key);
 		const reactionError = reactionErrorByKey[key] ?? null;
 		return (
-			<div key={key} ref={registerItemRef(item)}>
+			<div key={key} ref={registerItemRef(item)} data-feed-item-key={key}>
 				<FeedItemCard
 					item={item}
 					currentViewer={currentViewer}

@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { ArrowDownToLine } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
@@ -743,6 +743,7 @@ function makeContinuousLivePushItem(index: number): ReleaseFeedItem {
 	const waveLabel =
 		index > continuousLivePushTemplates.length ? ` · wave ${index}` : "";
 	const minute = String((56 + index * 2) % 60).padStart(2, "0");
+	const smart = template.smart;
 	return {
 		...template,
 		id: `continuous-live-push-${index}`,
@@ -751,18 +752,19 @@ function makeContinuousLivePushItem(index: number): ReleaseFeedItem {
 		body: `${template.body}\n- Story push wave ${index}`,
 		html_url: `${template.html_url}?story_push=${index}`,
 		smart:
-			template.smart.status === "ready"
+			smart?.status === "ready"
 				? {
-						...template.smart,
-						title: `${template.smart.title ?? template.title}${waveLabel}`,
-						summary: `${template.smart.summary ?? template.body}\n- Story push wave ${index}`,
+						...smart,
+						title: `${smart.title ?? template.title}${waveLabel}`,
+						summary: `${smart.summary ?? template.body}\n- Story push wave ${index}`,
 					}
-				: template.smart,
+				: smart,
 	};
 }
 
 function ContinuousLivePushPreview() {
 	const [pushIndex, setPushIndex] = useState(0);
+	const shouldAnchorBoundaryRef = useRef(true);
 
 	useEffect(() => {
 		setPushIndex(0);
@@ -793,6 +795,17 @@ function ContinuousLivePushPreview() {
 					},
 				}
 			: {};
+
+	useLayoutEffect(() => {
+		if (pushIndex <= 0 || !shouldAnchorBoundaryRef.current) return;
+		window.requestAnimationFrame(() => {
+			document
+				.querySelector<HTMLElement>(
+					'[data-dashboard-new-content-boundary="true"]',
+				)
+				?.scrollIntoView({ block: "start", behavior: "auto" });
+		});
+	}, [pushIndex]);
 
 	return (
 		<DashboardPreview
@@ -2441,63 +2454,81 @@ function DashboardPreview(props: {
 				)}
 			</div>
 		) : (
-			<>
-				<StoryNewContentNotice
-					count={storyLiveNotices.feed?.newCount ?? 0}
-					label="动态"
-					onReveal={() =>
-						setStoryLiveNotices((current) => ({ ...current, feed: undefined }))
-					}
-				/>
-				<FeedGroupedList
-					mode={mode}
-					items={filteredItems}
-					currentViewer={STORYBOOK_VIEWER}
-					briefs={storyBriefs}
-					dailyBoundaryLocal={dailyBoundaryLocal}
-					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
-					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-					now={now}
-					error={feedError}
-					loadingInitial={loadingInitial}
-					loadingMore={false}
-					hasMore={false}
-					translationInFlightKeys={translationInFlightKeys}
-					smartInFlightKeys={smartInFlightKeys}
-					registerItemRef={() => () => {}}
-					onLoadMore={() => {}}
-					onRetryInitial={() => {}}
-					selectedLaneByKey={Object.fromEntries(
-						filteredItems.map((item) => [
-							feedItemKey(item),
-							defaultLaneForItem(
-								item,
-								pageDefaultLane,
-								allowReleaseItemLaneOverride,
-								selectedLaneByKey[feedItemKey(item)],
-							),
-						]),
-					)}
-					onSelectLane={(item, lane) =>
-						setSelectedLaneByKey((prev) => ({
-							...prev,
-							[feedItemKey(item)]: lane,
-						}))
-					}
-					onTranslateNow={() => {}}
-					onSmartNow={triggerSmartNow}
-					reactionBusyKeys={reactionBusyKeys}
-					reactionErrorByKey={reactionErrorByKey}
-					freshKeys={new Set(freshFeedKeys)}
-					onToggleReaction={() => {}}
-					onOpenReleaseFromBrief={
-						mode === "all" ? openReleaseDetail : undefined
-					}
-					onGenerateBriefForDate={
-						mode === "all" ? generateBriefForDate : undefined
-					}
-				/>
-			</>
+			<FeedGroupedList
+				mode={mode}
+				items={filteredItems}
+				currentViewer={STORYBOOK_VIEWER}
+				briefs={storyBriefs}
+				dailyBoundaryLocal={dailyBoundaryLocal}
+				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+				now={now}
+				error={feedError}
+				loadingInitial={loadingInitial}
+				loadingMore={false}
+				hasMore={false}
+				translationInFlightKeys={translationInFlightKeys}
+				smartInFlightKeys={smartInFlightKeys}
+				registerItemRef={() => () => {}}
+				onLoadMore={() => {}}
+				onRetryInitial={() => {}}
+				selectedLaneByKey={Object.fromEntries(
+					filteredItems.map((item) => [
+						feedItemKey(item),
+						defaultLaneForItem(
+							item,
+							pageDefaultLane,
+							allowReleaseItemLaneOverride,
+							selectedLaneByKey[feedItemKey(item)],
+						),
+					]),
+				)}
+				onSelectLane={(item, lane) =>
+					setSelectedLaneByKey((prev) => ({
+						...prev,
+						[feedItemKey(item)]: lane,
+					}))
+				}
+				onTranslateNow={() => {}}
+				onSmartNow={triggerSmartNow}
+				reactionBusyKeys={reactionBusyKeys}
+				reactionErrorByKey={reactionErrorByKey}
+				freshKeys={new Set(freshFeedKeys)}
+				onToggleReaction={() => {}}
+				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
+				onGenerateBriefForDate={
+					mode === "all" ? generateBriefForDate : undefined
+				}
+				newContentBoundary={
+					storyLiveNotices.feed
+						? {
+								count: storyLiveNotices.feed.newCount,
+								label: "动态",
+								onReveal: () => {
+									const freshKey = freshFeedKeys[0];
+									setStoryLiveNotices((current) => ({
+										...current,
+										feed: undefined,
+									}));
+									window.requestAnimationFrame(() => {
+										const itemElements = Array.from(
+											document.querySelectorAll<HTMLElement>(
+												"[data-feed-item-key]",
+											),
+										);
+										const element = itemElements.find(
+											(item) => item.dataset.feedItemKey === freshKey,
+										);
+										element?.scrollIntoView({
+											block: "start",
+											behavior: "smooth",
+										});
+									});
+								},
+							}
+						: undefined
+				}
+			/>
 		);
 	};
 
@@ -4023,16 +4054,16 @@ export const QuasiRealtimeNewFeedBatch: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时更新状态：后台同步和润色完成后，阅读流里出现低声量批次痕迹；展开后，新卡片只在时间元信息旁保留持续低声量呼吸的圆点暗示。",
+					"Dashboard 准实时更新状态：后台同步和润色完成后，新卡片进入旧内容上方，阅读流在新旧内容之间出现低声量分割线；点击分割线滚动到新内容顶部。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("刚刚同步 · 1 条动态")).toBeVisible();
-		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
+		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: /上方有/ }));
 		await expect(
-			canvas.queryByText("刚刚同步 · 1 条动态"),
+			canvas.queryByText("上方有 1 条新动态"),
 		).not.toBeInTheDocument();
 		await expect(
 			canvasElement.querySelector('[data-feed-item-fresh="true"]'),
@@ -4047,7 +4078,7 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入阅读流，顶部批次提示递增，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
+					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入旧内容上方，新旧内容之间的分割线递增计数，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
 			},
 		},
 	},
@@ -4068,7 +4099,7 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 				).toBeVisible(),
 			{ timeout: 2400 },
 		);
-		await expect(canvas.getByText("刚刚同步 · 1 条动态")).toBeVisible();
+		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
 		expect(
 			canvasElement.querySelectorAll('[data-dashboard-fresh-cue="true"]')
 				.length,
@@ -4083,7 +4114,7 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 				).toBeVisible(),
 			{ timeout: 5200 },
 		);
-		await expect(canvas.getByText("刚刚同步 · 2 条动态")).toBeVisible();
+		await expect(canvas.getByText("上方有 2 条新动态")).toBeVisible();
 		expect(
 			canvasElement.querySelectorAll('[data-feed-item-fresh="true"]').length,
 		).toBeGreaterThanOrEqual(2);
