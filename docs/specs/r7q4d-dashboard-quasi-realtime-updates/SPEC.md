@@ -77,7 +77,7 @@ Response:
 - source_type: storybook_canvas
 - story_id_or_title: Pages/Dashboard / Live updates / Continuous feed push
 - scenario: Dashboard Feed 持续发现新动态并把新卡片插入旧内容上方
-- evidence_note: 验证新旧内容之间的“上方有 N 条新动态”分割线保持在视野内，新内容卡片留在滚动容器更上方，用户可点击分割线主动滚动到新内容顶部。
+- evidence_note: 验证新旧内容之间的“上方有 N 条新动态”分割线保持在视野内，新内容卡片留在滚动容器更上方；后续推送只保持阅读锚点，不主动滚动到分割线，用户可点击分割线主动滚动到新内容顶部。
 - requested_viewport: 1280x720 CSS px
 - viewport_strategy: storybook-iframe
 - capture_scope: browser-viewport

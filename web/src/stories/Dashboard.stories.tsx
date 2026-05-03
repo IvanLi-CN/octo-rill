@@ -762,17 +762,58 @@ function makeContinuousLivePushItem(index: number): ReleaseFeedItem {
 	};
 }
 
+type StoryFeedScrollAnchor = {
+	key: string;
+	top: number;
+};
+
+function captureStoryFeedScrollAnchor(): StoryFeedScrollAnchor | null {
+	const viewportTop = 88;
+	const viewportBottom = window.innerHeight;
+	const itemElements = Array.from(
+		document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+	);
+	for (const element of itemElements) {
+		const key = element.dataset.feedItemKey;
+		if (!key) continue;
+		const rect = element.getBoundingClientRect();
+		if (rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+		return { key, top: rect.top };
+	}
+	return null;
+}
+
+function restoreStoryFeedScrollAnchor(anchor: StoryFeedScrollAnchor | null) {
+	if (!anchor) return;
+	window.requestAnimationFrame(() => {
+		const itemElements = Array.from(
+			document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+		);
+		const element = itemElements.find(
+			(item) => item.dataset.feedItemKey === anchor.key,
+		);
+		if (!element) return;
+		const delta = element.getBoundingClientRect().top - anchor.top;
+		if (Math.abs(delta) < 0.5) return;
+		window.scrollBy({ top: delta, behavior: "auto" });
+	});
+}
+
 function ContinuousLivePushPreview() {
 	const [pushIndex, setPushIndex] = useState(0);
-	const shouldAnchorBoundaryRef = useRef(true);
+	const pendingAnchorRef = useRef<StoryFeedScrollAnchor | null>(null);
 
 	useEffect(() => {
 		setPushIndex(0);
+		const pushOne = () => {
+			pendingAnchorRef.current = captureStoryFeedScrollAnchor();
+			setPushIndex((current) => current + 1);
+		};
 		const firstPushTimer = window.setTimeout(() => {
-			setPushIndex(1);
+			pushOne();
 		}, 900);
 		const interval = window.setInterval(() => {
-			setPushIndex((current) => current + 1);
+			pushOne();
 		}, 3600);
 		return () => {
 			window.clearTimeout(firstPushTimer);
@@ -786,25 +827,22 @@ function ContinuousLivePushPreview() {
 		);
 	}, [pushIndex]);
 	const freshKeys = pushedItems.map(feedItemKey);
+	const latestBatchKeys = pushedItems[0] ? [feedItemKey(pushedItems[0])] : [];
 	const liveNotice =
-		pushIndex > 0
+		latestBatchKeys.length > 0
 			? {
 					feed: {
-						newCount: pushIndex,
-						latestKeys: freshKeys,
+						newCount: latestBatchKeys.length,
+						latestKeys: latestBatchKeys,
 					},
 				}
 			: {};
 
 	useLayoutEffect(() => {
-		if (pushIndex <= 0 || !shouldAnchorBoundaryRef.current) return;
-		window.requestAnimationFrame(() => {
-			document
-				.querySelector<HTMLElement>(
-					'[data-dashboard-new-content-boundary="true"]',
-				)
-				?.scrollIntoView({ block: "start", behavior: "auto" });
-		});
+		if (pushIndex <= 0) return;
+		const anchor = pendingAnchorRef.current;
+		pendingAnchorRef.current = null;
+		restoreStoryFeedScrollAnchor(anchor);
 	}, [pushIndex]);
 
 	return (
@@ -2504,6 +2542,7 @@ function DashboardPreview(props: {
 						? {
 								count: storyLiveNotices.feed.newCount,
 								label: "动态",
+								latestKeys: storyLiveNotices.feed.latestKeys,
 								onReveal: () => {
 									const freshKey = freshFeedKeys[0];
 									setStoryLiveNotices((current) => ({
@@ -4078,7 +4117,7 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 		docs: {
 			description: {
 				story:
-					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入旧内容上方，新旧内容之间的分割线递增计数，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
+					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入旧内容上方，后续批次会生成新的新旧内容分割线，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
 			},
 		},
 	},
@@ -4114,7 +4153,7 @@ export const QuasiRealtimeContinuousFeedPush: Story = {
 				).toBeVisible(),
 			{ timeout: 5200 },
 		);
-		await expect(canvas.getByText("上方有 2 条新动态")).toBeVisible();
+		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
 		expect(
 			canvasElement.querySelectorAll('[data-feed-item-fresh="true"]').length,
 		).toBeGreaterThanOrEqual(2);

@@ -48,6 +48,7 @@ const FEED_BRIEF_PANEL_CLASS =
 type NewContentBoundary = {
 	count: number;
 	label: string;
+	latestKeys: string[];
 	onReveal: () => void;
 };
 
@@ -493,20 +494,20 @@ export function FeedGroupedList(
 	}, [groups]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
-	const freshKeys = feedCardProps.freshKeys ?? new Set<string>();
 	const freshBoundaryIndex = useMemo(() => {
 		if (!newContentBoundary || newContentBoundary.count <= 0) {
 			return -1;
 		}
+		const boundaryKeys = new Set(newContentBoundary.latestKeys);
 		let index = 0;
 		for (const item of items) {
-			if (!freshKeys.has(keyOfFeedItem(item))) {
+			if (!boundaryKeys.has(keyOfFeedItem(item))) {
 				break;
 			}
 			index += 1;
 		}
 		return index > 0 ? index : -1;
-	}, [freshKeys, items, newContentBoundary]);
+	}, [items, newContentBoundary]);
 
 	let itemsSeen = 0;
 

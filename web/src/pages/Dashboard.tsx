@@ -133,6 +133,41 @@ function mergeDashboardLiveNotice(
 	};
 }
 
+type FeedScrollAnchor = {
+	key: string;
+	top: number;
+};
+
+function captureFeedScrollAnchor(): FeedScrollAnchor | null {
+	if (typeof window === "undefined") return null;
+	const viewportTop = 88;
+	const viewportBottom = window.innerHeight;
+	const itemElements = Array.from(
+		document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+	);
+	for (const element of itemElements) {
+		const key = element.dataset.feedItemKey;
+		if (!key) continue;
+		const rect = element.getBoundingClientRect();
+		if (rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+		return { key, top: rect.top };
+	}
+	return null;
+}
+
+function restoreFeedScrollAnchor(anchor: FeedScrollAnchor | null) {
+	if (!anchor || typeof window === "undefined") return;
+	window.requestAnimationFrame(() => {
+		const element = document.querySelector<HTMLElement>(
+			`[data-feed-item-key="${CSS.escape(anchor.key)}"]`,
+		);
+		if (!element) return;
+		const delta = element.getBoundingClientRect().top - anchor.top;
+		if (Math.abs(delta) < 0.5) return;
+		window.scrollBy({ top: delta, behavior: "auto" });
+	});
+}
+
 function NewContentNotice(props: {
 	count: number;
 	label: string;
@@ -821,10 +856,7 @@ export function Dashboard(props: {
 						const noticeFeedType = notice.feedType ?? feedRequestType;
 						next.feed = {
 							...next.feed,
-							[noticeFeedType]: mergeDashboardLiveNotice(
-								next.feed?.[noticeFeedType],
-								notice,
-							),
+							[noticeFeedType]: notice,
 						};
 						continue;
 					}
@@ -865,16 +897,6 @@ export function Dashboard(props: {
 		});
 	}, []);
 
-	const scrollToNewContentBoundary = useCallback((behavior: ScrollBehavior) => {
-		window.requestAnimationFrame(() => {
-			document
-				.querySelector<HTMLElement>(
-					'[data-dashboard-new-content-boundary="true"]',
-				)
-				?.scrollIntoView({ block: "start", behavior });
-		});
-	}, []);
-
 	const revealFeedUpdates = useCallback(async () => {
 		const notice = activeFeedNotice;
 		if (!notice) return;
@@ -883,8 +905,11 @@ export function Dashboard(props: {
 			freshKeys.includes(feedItemKey(item)),
 		);
 		if (!hasHydratedFreshItems) {
+			const nextFreshKeys = Array.from(
+				new Set([...feed.freshKeys, ...freshKeys]),
+			);
 			await refreshFeed({
-				freshKeys,
+				freshKeys: nextFreshKeys,
 				throwOnError: true,
 			});
 		}
@@ -898,6 +923,7 @@ export function Dashboard(props: {
 	}, [
 		activeFeedNotice,
 		checkDashboardUpdates,
+		feed.freshKeys,
 		feed.items,
 		feedRequestType,
 		refreshFeed,
@@ -912,15 +938,17 @@ export function Dashboard(props: {
 		const noticeKey = `${feedRequestType}:${notice.newCount}:${freshKeys.join("|")}`;
 		if (hydratedFeedNoticeRef.current === noticeKey) return;
 		hydratedFeedNoticeRef.current = noticeKey;
-		const wasAtTop = window.scrollY <= 96;
+		const anchor = captureFeedScrollAnchor();
+		const nextFreshKeys = Array.from(
+			new Set([...feed.freshKeys, ...freshKeys]),
+		);
 		void refreshFeed({
-			freshKeys,
+			freshKeys: nextFreshKeys,
 			throwOnError: true,
 		})
 			.then(() => {
-				if (wasAtTop) {
-					scrollToNewContentBoundary("auto");
-				}
+				restoreFeedScrollAnchor(anchor);
+				void checkDashboardUpdates({ emit: false, include: ["feed"] });
 			})
 			.catch((error) => {
 				hydratedFeedNoticeRef.current = null;
@@ -932,11 +960,12 @@ export function Dashboard(props: {
 			});
 	}, [
 		activeFeedNotice,
+		checkDashboardUpdates,
+		feed.freshKeys,
 		feed.loadingInitial,
 		feedRequestType,
 		notifyGlobalError,
 		refreshFeed,
-		scrollToNewContentBoundary,
 	]);
 
 	const revealBriefUpdates = useCallback(async () => {
@@ -2063,6 +2092,7 @@ export function Dashboard(props: {
 							? {
 									count: activeFeedNotice.newCount,
 									label: "动态",
+									latestKeys: activeFeedNotice.latestKeys,
 									onReveal: () => {
 										void revealFeedUpdates().catch((error) => {
 											notifyGlobalError(
