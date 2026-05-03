@@ -79,12 +79,41 @@ type StoryLiveNotice = {
 };
 type StoryFeedLiveNotice = StoryLiveNotice & {
 	boundaryId: string;
+	afterKey?: string | null;
+	sealed?: boolean;
 };
 type StoryLiveNotices = {
 	feed?: StoryFeedLiveNotice[];
 	briefs?: StoryLiveNotice;
 	notifications?: StoryLiveNotice;
 };
+
+function mergeStoryFeedNotice(
+	currentNotices: StoryFeedLiveNotice[],
+	incoming: StoryFeedLiveNotice,
+) {
+	if (
+		currentNotices.some((notice) => notice.boundaryId === incoming.boundaryId)
+	) {
+		return currentNotices;
+	}
+	const latestNotice = currentNotices[0];
+	if (latestNotice && !latestNotice.sealed) {
+		const latestKeys = Array.from(
+			new Set([...incoming.latestKeys, ...latestNotice.latestKeys]),
+		);
+		return [
+			{
+				...latestNotice,
+				afterKey: undefined,
+				newCount: latestKeys.length,
+				latestKeys,
+			},
+			...currentNotices.slice(1),
+		];
+	}
+	return [incoming, ...currentNotices];
+}
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
 const STORYBOOK_DAILY_BOUNDARY = "08:00";
@@ -806,13 +835,29 @@ function restoreStoryFeedScrollAnchor(anchor: StoryFeedScrollAnchor | null) {
 
 function ContinuousLivePushPreview() {
 	const [pushIndex, setPushIndex] = useState(0);
+	const [liveNotice, setLiveNotice] = useState<StoryLiveNotices>({});
 	const pendingAnchorRef = useRef<StoryFeedScrollAnchor | null>(null);
 
 	useEffect(() => {
 		setPushIndex(0);
+		setLiveNotice({});
 		const pushOne = () => {
 			pendingAnchorRef.current = captureStoryFeedScrollAnchor();
-			setPushIndex((current) => current + 1);
+			setPushIndex((current) => {
+				const nextIndex = current + 1;
+				const item = makeContinuousLivePushItem(nextIndex);
+				const key = feedItemKey(item);
+				const notice = {
+					boundaryId: `story-boundary-${key}`,
+					newCount: 1,
+					latestKeys: [key],
+				};
+				setLiveNotice((currentNotice) => ({
+					...currentNotice,
+					feed: mergeStoryFeedNotice(currentNotice.feed ?? [], notice),
+				}));
+				return nextIndex;
+			});
 		};
 		const firstPushTimer = window.setTimeout(() => {
 			pushOne();
@@ -832,19 +877,6 @@ function ContinuousLivePushPreview() {
 		);
 	}, [pushIndex]);
 	const freshKeys = pushedItems.map(feedItemKey);
-	const liveNotice =
-		pushedItems.length > 0
-			? {
-					feed: pushedItems.map((item) => {
-						const key = feedItemKey(item);
-						return {
-							boundaryId: `story-boundary-${key}`,
-							newCount: 1,
-							latestKeys: [key],
-						};
-					}),
-				}
-			: {};
 
 	useLayoutEffect(() => {
 		if (pushIndex <= 0) return;
@@ -859,6 +891,32 @@ function ContinuousLivePushPreview() {
 			feedItems={[...pushedItems, ...makeFeedHotPathReactionFeed(true, false)]}
 			freshFeedKeys={freshKeys}
 			liveNotices={liveNotice}
+			onFeedBoundaryEntered={(boundaryId) => {
+				setLiveNotice((current) => ({
+					...current,
+					feed: current.feed?.map((notice) =>
+						notice.boundaryId === boundaryId
+							? { ...notice, sealed: true }
+							: notice,
+					),
+				}));
+			}}
+			onFeedBoundaryResolved={(boundaryId, afterKey) => {
+				setLiveNotice((current) => ({
+					...current,
+					feed:
+						afterKey === null
+							? current.feed?.filter(
+									(notice) => notice.boundaryId !== boundaryId,
+								)
+							: current.feed?.map((notice) =>
+									notice.boundaryId === boundaryId &&
+									notice.afterKey === undefined
+										? { ...notice, afterKey }
+										: notice,
+								),
+				}));
+			}}
 			showFooter={false}
 		/>
 	);
@@ -2224,6 +2282,11 @@ function DashboardPreview(props: {
 	feedError?: FeedLoadError | null;
 	reactionErrorByKey?: Record<string, string>;
 	liveNotices?: StoryLiveNotices;
+	onFeedBoundaryEntered?: (boundaryId: string) => void;
+	onFeedBoundaryResolved?: (
+		boundaryId: string,
+		afterKey: string | null,
+	) => void;
 	freshFeedKeys?: string[];
 	freshBriefKeys?: string[];
 	freshNotificationKeys?: string[];
@@ -2251,6 +2314,8 @@ function DashboardPreview(props: {
 		feedError = null,
 		reactionErrorByKey = {},
 		liveNotices = {},
+		onFeedBoundaryEntered,
+		onFeedBoundaryResolved,
 		freshFeedKeys = [],
 		freshBriefKeys = [],
 		freshNotificationKeys = [],
@@ -2551,13 +2616,43 @@ function DashboardPreview(props: {
 						count: notice.newCount,
 						label: "动态",
 						latestKeys: notice.latestKeys,
+						afterKey: notice.afterKey,
 						isLatest: index === 0,
+						isSealed: notice.sealed,
 						onExitedViewport: (boundaryId) => {
 							setStoryLiveNotices((current) => ({
 								...current,
 								feed: current.feed?.filter(
 									(feedNotice) => feedNotice.boundaryId !== boundaryId,
 								),
+							}));
+						},
+						onFreshAreaEntered: (boundaryId) => {
+							onFeedBoundaryEntered?.(boundaryId);
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.map((feedNotice) =>
+									feedNotice.boundaryId === boundaryId
+										? { ...feedNotice, sealed: true }
+										: feedNotice,
+								),
+							}));
+						},
+						onResolveAfterKey: (boundaryId, afterKey) => {
+							onFeedBoundaryResolved?.(boundaryId, afterKey);
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed:
+									afterKey === null
+										? current.feed?.filter(
+												(feedNotice) => feedNotice.boundaryId !== boundaryId,
+											)
+										: current.feed?.map((feedNotice) =>
+												feedNotice.boundaryId === boundaryId &&
+												feedNotice.afterKey === undefined
+													? { ...feedNotice, afterKey }
+													: feedNotice,
+											),
 							}));
 						},
 						onReveal: () => {

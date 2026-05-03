@@ -110,6 +110,10 @@ type SidebarBootstrapNotificationsError = {
 
 type FeedLiveBoundaryNotice = DashboardLiveUpdateNotice & {
 	boundaryId: string;
+	boundaryKeys: string[];
+	boundaryAfterKey?: string | null;
+	hydrated?: boolean;
+	sealed?: boolean;
 };
 
 type DashboardLiveNoticeState = {
@@ -146,8 +150,43 @@ function makeFeedBoundaryNotice(
 		...notice,
 		feedType,
 		boundaryId: `${feedType}:${notice.newCount}:${latestKeys.join("|")}`,
+		boundaryKeys: latestKeys,
 		latestKeys,
 	};
+}
+
+function mergeFeedBoundaryNotices(
+	currentFeedNotices: FeedLiveBoundaryNotice[],
+	incoming: FeedLiveBoundaryNotice,
+) {
+	if (
+		currentFeedNotices.some(
+			(currentNotice) => currentNotice.boundaryId === incoming.boundaryId,
+		)
+	) {
+		return currentFeedNotices;
+	}
+	const latestNotice = currentFeedNotices[0];
+	if (latestNotice && !latestNotice.sealed) {
+		const latestKeys = Array.from(
+			new Set([...incoming.latestKeys, ...latestNotice.latestKeys]),
+		);
+		const boundaryKeys = Array.from(
+			new Set([...incoming.boundaryKeys, ...latestNotice.boundaryKeys]),
+		);
+		return [
+			{
+				...latestNotice,
+				boundaryKeys,
+				boundaryAfterKey: undefined,
+				hydrated: true,
+				newCount: latestKeys.length,
+				latestKeys,
+			},
+			...currentFeedNotices.slice(1),
+		];
+	}
+	return [incoming, ...currentFeedNotices];
 }
 
 type FeedScrollAnchor = {
@@ -595,7 +634,7 @@ export function Dashboard(props: {
 	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
 	const activeFeedNotices = liveNotices.feed?.[feedRequestType] ?? [];
 	const activeFeedNotice = activeFeedNotices[0];
-	const hydratedFeedNoticeRef = useRef<Set<string>>(new Set());
+	const hydratedFeedNoticeRef = useRef<Map<string, string>>(new Map());
 	const [freshBriefKeys, setFreshBriefKeys] = useState<Set<string>>(
 		() => new Set(),
 	);
@@ -877,17 +916,12 @@ export function Dashboard(props: {
 							noticeFeedType,
 						);
 						const currentFeedNotices = next.feed?.[noticeFeedType] ?? [];
-						if (
-							currentFeedNotices.some(
-								(currentNotice) =>
-									currentNotice.boundaryId === boundaryNotice.boundaryId,
-							)
-						) {
-							continue;
-						}
 						next.feed = {
 							...next.feed,
-							[noticeFeedType]: [boundaryNotice, ...currentFeedNotices],
+							[noticeFeedType]: mergeFeedBoundaryNotices(
+								currentFeedNotices,
+								boundaryNotice,
+							),
 						};
 						continue;
 					}
@@ -930,6 +964,7 @@ export function Dashboard(props: {
 
 	const dismissFeedBoundary = useCallback(
 		(boundaryId: string) => {
+			hydratedFeedNoticeRef.current.delete(boundaryId);
 			setLiveNotices((current) => {
 				const feedByType = current.feed ?? {};
 				const currentFeedNotices = feedByType[feedRequestType] ?? [];
@@ -941,6 +976,75 @@ export function Dashboard(props: {
 					feed: {
 						...feedByType,
 						[feedRequestType]: nextFeedNotices,
+					},
+				};
+			});
+		},
+		[feedRequestType],
+	);
+
+	const sealFeedBoundary = useCallback(
+		(boundaryId: string) => {
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				let changed = false;
+				const nextFeedNotices = currentFeedNotices.map((notice) => {
+					if (notice.boundaryId !== boundaryId || notice.sealed) {
+						return notice;
+					}
+					changed = true;
+					return { ...notice, sealed: true };
+				});
+				if (!changed) return current;
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: nextFeedNotices,
+					},
+				};
+			});
+		},
+		[feedRequestType],
+	);
+
+	const resolveFeedBoundary = useCallback(
+		(boundaryId: string, boundaryAfterKey: string | null) => {
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				const target = currentFeedNotices.find(
+					(notice) => notice.boundaryId === boundaryId,
+				);
+				if (
+					!target ||
+					!target.hydrated ||
+					target.boundaryAfterKey !== undefined
+				) {
+					return current;
+				}
+				if (boundaryAfterKey === null) {
+					hydratedFeedNoticeRef.current.delete(boundaryId);
+					return {
+						...current,
+						feed: {
+							...feedByType,
+							[feedRequestType]: currentFeedNotices.filter(
+								(notice) => notice.boundaryId !== boundaryId,
+							),
+						},
+					};
+				}
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: currentFeedNotices.map((notice) =>
+							notice.boundaryId === boundaryId
+								? { ...notice, boundaryAfterKey }
+								: notice,
+						),
 					},
 				};
 			});
@@ -984,8 +1088,11 @@ export function Dashboard(props: {
 		if (!notice || feed.loadingInitial) return;
 		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
 		if (freshKeys.length === 0) return;
-		if (hydratedFeedNoticeRef.current.has(notice.boundaryId)) return;
-		hydratedFeedNoticeRef.current.add(notice.boundaryId);
+		const hydratedKey = freshKeys.join("|");
+		if (hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey) {
+			return;
+		}
+		hydratedFeedNoticeRef.current.set(notice.boundaryId, hydratedKey);
 		const anchor = captureFeedScrollAnchor();
 		const nextFreshKeys = Array.from(
 			new Set([...feed.freshKeys, ...freshKeys]),
@@ -996,10 +1103,33 @@ export function Dashboard(props: {
 		})
 			.then(() => {
 				restoreFeedScrollAnchor(anchor);
+				if (notice.boundaryKeys.length === 0) {
+					dismissFeedBoundary(notice.boundaryId);
+				} else {
+					setLiveNotices((current) => {
+						const feedByType = current.feed ?? {};
+						const currentFeedNotices = feedByType[feedRequestType] ?? [];
+						return {
+							...current,
+							feed: {
+								...feedByType,
+								[feedRequestType]: currentFeedNotices.map((item) =>
+									item.boundaryId === notice.boundaryId
+										? { ...item, hydrated: true }
+										: item,
+								),
+							},
+						};
+					});
+				}
 				void checkDashboardUpdates({ emit: false, include: ["feed"] });
 			})
 			.catch((error) => {
-				hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+				if (
+					hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey
+				) {
+					hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+				}
 				notifyGlobalError(
 					"新动态显示失败",
 					error,
@@ -1009,8 +1139,10 @@ export function Dashboard(props: {
 	}, [
 		activeFeedNotice,
 		checkDashboardUpdates,
+		dismissFeedBoundary,
 		feed.freshKeys,
 		feed.loadingInitial,
+		feedRequestType,
 		notifyGlobalError,
 		refreshFeed,
 	]);
@@ -2136,11 +2268,15 @@ export function Dashboard(props: {
 					}
 					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
 						id: notice.boundaryId,
-						count: notice.newCount,
+						count: notice.boundaryKeys.length,
 						label: "动态",
-						latestKeys: notice.latestKeys,
+						latestKeys: notice.boundaryKeys,
+						afterKey: notice.boundaryAfterKey,
 						isLatest: index === 0,
+						isSealed: notice.sealed,
 						onExitedViewport: dismissFeedBoundary,
+						onFreshAreaEntered: sealFeedBoundary,
+						onResolveAfterKey: resolveFeedBoundary,
 						onReveal: () => {
 							void revealFeedUpdates(notice).catch((error) => {
 								notifyGlobalError(
