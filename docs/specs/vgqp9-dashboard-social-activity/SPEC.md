@@ -91,7 +91,7 @@
 - 用户切到 `加星` tab 时，只看到“谁给哪个个人仓库加了星”的记录列表；release 与 follower 记录不会出现。
 - 用户切到 `关注` tab 时，只看到“谁关注了当前登录账号”的记录列表，且卡片不显示时间文案。
 - 用户点击顶部 `同步` 时，系统继续沿用既有 `starred -> releases -> notifications` 主体验，并在 release 同步完成后补跑社交活动 diff，再刷新页面。
-- access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab；GitHub received events 中的 ReleaseEvent / ForkEvent 会分别落为 `announcement` / `repo_forked`，只显示在 `全部`。
+- access refresh 在服务端拿到首次或增量 social snapshot 后，会把 follower / repo stargazer 写入 append-only event，并在下次 `/api/feed` 返回时显示到 `全部` 与对应筛选 tab；GitHub received events 中的 ForkEvent 会落为 `repo_forked`，GitHub Discussions Announcements 分类中的 discussion 会落为 `announcement`，二者只显示在 `全部`。ReleaseEvent 不映射为 `announcement`，release feed 仍只来自 `repo_releases`。
 - 若账号在升级前已经持有 `follower_current_members` 或 `repo_star_current_members`，但历史 `social_activity_events` 为空，则下一次正常 social sync 必须自动把当前快照补齐成可见事件。
 
 ### Edge cases / errors
@@ -127,7 +127,7 @@
 ```
 
 - `translated` / `smart` / `reactions` 仅对 `kind=release` 返回有效内容；非 release 记录固定为 `null`。
-- `announcement` / `repo_forked` 可通过 `title`、`body`、`html_url` 暴露目标公告或 fork 仓库的展示信息。
+- `announcement` / `repo_forked` 可通过 `title`、`body`、`html_url` 暴露目标 discussion 公告或 fork 仓库的展示信息。
 
 ### 社交活动持久化
 

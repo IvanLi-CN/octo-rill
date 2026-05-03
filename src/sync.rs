@@ -39,6 +39,8 @@ const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
 const SMART_PREHEAT_RECENT_RELEASE_LIMIT: usize = 30;
 const SOCIAL_STARGAZER_FETCH_CONCURRENCY: usize = 4;
+const DISCUSSION_ANNOUNCEMENT_REPO_BATCH_SIZE: usize = 20;
+const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
 const REPO_RELEASE_DEADLINE_EXPIRED_ERROR: &str = "repo_release_deadline_expired";
@@ -469,17 +471,7 @@ struct GitHubEventRepo {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct GitHubActivityPayload {
-    action: Option<String>,
-    release: Option<GitHubEventRelease>,
     forkee: Option<GitHubEventRepoTarget>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubEventRelease {
-    name: Option<String>,
-    tag_name: Option<String>,
-    body: Option<String>,
-    html_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -549,6 +541,24 @@ struct GitHubReleaseReactions {
     hooray: i64,
     rocket: i64,
     eyes: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DiscussionAnnouncementRepo {
+    repo_id: i64,
+    full_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct DiscussionAnnouncement {
+    event_id: String,
+    repo_id: i64,
+    repo_full_name: String,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    actor: GitHubActor,
+    occurred_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -979,6 +989,7 @@ pub async fn sync_social_activity(
     let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
     let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
     let mut feed_events_by_id = HashMap::<String, FeedActivityEventSnapshot>::new();
+    let announcement_repos = load_user_discussion_announcement_repos(state, user_id).await?;
 
     for connection in connections {
         match fetch_owned_repo_snapshot(state, &connection.access_token).await {
@@ -1049,6 +1060,34 @@ pub async fn sync_social_activity(
                 );
                 source_errors.push(format!(
                     "feed_events(@{}, {}): {}",
+                    connection.login, err.reason_code, err.message
+                ));
+            }
+        }
+
+        match fetch_discussion_announcement_events_snapshot(
+            state,
+            &connection.access_token,
+            &announcement_repos,
+        )
+        .await
+        {
+            Ok(events) => {
+                for event in events {
+                    feed_events_by_id
+                        .entry(event.event_id.clone())
+                        .or_insert(event);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync social activity: skip discussion announcements snapshot"
+                );
+                source_errors.push(format!(
+                    "discussion_announcements(@{}, {}): {}",
                     connection.login, err.reason_code, err.message
                 ));
             }
@@ -5237,6 +5276,377 @@ async fn fetch_feed_activity_events_snapshot(
     Ok(events)
 }
 
+async fn load_user_discussion_announcement_repos(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<DiscussionAnnouncementRepo>> {
+    sqlx::query_as::<_, ReleaseVisibleRepoRow>(
+        r#"
+        SELECT repo_id, full_name
+        FROM user_release_visible_repos
+        WHERE user_id = ?
+        ORDER BY
+          CASE WHEN stargazed_at IS NULL THEN 1 ELSE 0 END ASC,
+          stargazed_at DESC,
+          full_name ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query discussion announcement repos")
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| DiscussionAnnouncementRepo {
+                repo_id: row.repo_id,
+                full_name: row.full_name,
+            })
+            .collect()
+    })
+}
+
+async fn fetch_discussion_announcement_events_snapshot(
+    state: &AppState,
+    access_token: &str,
+    repos: &[DiscussionAnnouncementRepo],
+) -> Result<Vec<FeedActivityEventSnapshot>, SyncRequestError> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut events = Vec::new();
+    for chunk in repos.chunks(DISCUSSION_ANNOUNCEMENT_REPO_BATCH_SIZE.max(1)) {
+        let announcements = fetch_discussion_announcement_batch(state, access_token, chunk).await?;
+        events.extend(
+            announcements
+                .into_iter()
+                .map(|announcement| FeedActivityEventSnapshot {
+                    kind: "announcement",
+                    event_id: announcement.event_id.clone(),
+                    repo_id: Some(announcement.repo_id),
+                    repo_full_name: Some(announcement.repo_full_name),
+                    title: Some(announcement.title),
+                    body: announcement.body,
+                    html_url: Some(announcement.html_url),
+                    github_event_id: Some(announcement.event_id),
+                    actor: announcement.actor,
+                    occurred_at: announcement.occurred_at,
+                }),
+        );
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(events)
+}
+
+async fn fetch_discussion_announcement_batch(
+    state: &AppState,
+    access_token: &str,
+    repos: &[DiscussionAnnouncementRepo],
+) -> Result<Vec<DiscussionAnnouncement>, SyncRequestError> {
+    let mut query = String::from("query {");
+    let mut alias_repos = Vec::new();
+    for (index, repo) in repos.iter().enumerate() {
+        let Some((owner, name)) = repo.full_name.split_once('/') else {
+            continue;
+        };
+        alias_repos.push((format!("r{index}"), repo));
+        query.push_str(&format!(
+            r#"
+            r{index}: repository(owner: {}, name: {}) {{
+              databaseId
+              nameWithOwner
+              discussionCategories(first: 25) {{
+                nodes {{
+                  id
+                  name
+                  slug
+                }}
+              }}
+            }}
+            "#,
+            graphql_string_literal(owner),
+            graphql_string_literal(name),
+        ));
+    }
+    query.push('}');
+
+    if alias_repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operation = "sync discussion announcement categories graphql";
+    let payload = with_subscription_timeout(operation, async {
+        let response = state
+            .http
+            .post(GRAPHQL_URL)
+            .bearer_auth(access_token)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .json(&json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(operation, err))?;
+
+        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+    })
+    .await?;
+
+    if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+        return Err(classify_graphql_errors(operation, errors));
+    }
+
+    let Some(Value::Object(data)) = payload.data else {
+        return Err(SyncRequestError::non_retryable(
+            "graphql_missing_data",
+            "sync discussion announcement categories graphql: missing graphql data",
+            None,
+        ));
+    };
+
+    let mut announcement_categories = Vec::new();
+    for (alias, fallback_repo) in alias_repos {
+        let Some(repo_value) = data.get(&alias) else {
+            continue;
+        };
+        if repo_value.is_null() {
+            continue;
+        }
+        let Some(category_id) = announcement_category_id_from_repo_value(repo_value) else {
+            continue;
+        };
+        announcement_categories.push((fallback_repo, category_id));
+    }
+    fetch_discussion_announcement_category_discussions(
+        state,
+        access_token,
+        &announcement_categories,
+    )
+    .await
+}
+
+fn graphql_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+async fn fetch_discussion_announcement_category_discussions(
+    state: &AppState,
+    access_token: &str,
+    repos: &[(&DiscussionAnnouncementRepo, String)],
+) -> Result<Vec<DiscussionAnnouncement>, SyncRequestError> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from("query {");
+    let mut alias_repos = Vec::new();
+    for (index, (repo, category_id)) in repos.iter().enumerate() {
+        let Some((owner, name)) = repo.full_name.split_once('/') else {
+            continue;
+        };
+        alias_repos.push((format!("r{index}"), *repo));
+        query.push_str(&format!(
+            r#"
+            r{index}: repository(owner: {}, name: {}) {{
+              databaseId
+              nameWithOwner
+              discussions(first: {}, categoryId: {}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                nodes {{
+                  id
+                  title
+                  bodyText
+                  url
+                  createdAt
+                  updatedAt
+                  author {{
+                    login
+                    avatarUrl
+                    url
+                    ... on User {{ databaseId }}
+                  }}
+                }}
+              }}
+            }}
+            "#,
+            graphql_string_literal(owner),
+            graphql_string_literal(name),
+            DISCUSSION_ANNOUNCEMENT_PAGE_SIZE,
+            graphql_string_literal(category_id),
+        ));
+    }
+    query.push('}');
+
+    if alias_repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operation = "sync discussion announcements graphql";
+    let payload = with_subscription_timeout(operation, async {
+        let response = state
+            .http
+            .post(GRAPHQL_URL)
+            .bearer_auth(access_token)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .json(&json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(operation, err))?;
+
+        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+    })
+    .await?;
+
+    if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+        return Err(classify_graphql_errors(operation, errors));
+    }
+
+    let Some(Value::Object(data)) = payload.data else {
+        return Err(SyncRequestError::non_retryable(
+            "graphql_missing_data",
+            "sync discussion announcements graphql: missing graphql data",
+            None,
+        ));
+    };
+
+    let mut announcements = Vec::new();
+    for (alias, fallback_repo) in alias_repos {
+        let Some(repo_value) = data.get(&alias) else {
+            continue;
+        };
+        if repo_value.is_null() {
+            continue;
+        }
+        announcements.extend(discussion_announcements_from_repo_value(
+            repo_value,
+            fallback_repo,
+        ));
+    }
+    Ok(announcements)
+}
+
+fn announcement_category_id_from_repo_value(repo_value: &Value) -> Option<String> {
+    repo_value
+        .get("discussionCategories")
+        .and_then(|value| value.get("nodes"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|category| {
+            let slug = category
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = category
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            is_announcement_discussion_category(slug, name)
+                .then(|| {
+                    category
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+}
+
+fn discussion_announcements_from_repo_value(
+    repo_value: &Value,
+    fallback_repo: &DiscussionAnnouncementRepo,
+) -> Vec<DiscussionAnnouncement> {
+    let repo_id = repo_value
+        .get("databaseId")
+        .and_then(Value::as_i64)
+        .unwrap_or(fallback_repo.repo_id);
+    let repo_full_name = repo_value
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_repo.full_name.as_str())
+        .to_owned();
+    let nodes = repo_value
+        .get("discussions")
+        .and_then(|value| value.get("nodes"))
+        .and_then(Value::as_array);
+    let Some(nodes) = nodes else {
+        return Vec::new();
+    };
+
+    nodes
+        .iter()
+        .filter_map(|node| discussion_announcement_from_node(node, repo_id, &repo_full_name))
+        .collect()
+}
+
+fn discussion_announcement_from_node(
+    node: &Value,
+    repo_id: i64,
+    repo_full_name: &str,
+) -> Option<DiscussionAnnouncement> {
+    let event_id = node.get("id")?.as_str()?.to_owned();
+    let title = node.get("title")?.as_str()?.to_owned();
+    let html_url = node.get("url")?.as_str()?.to_owned();
+    let occurred_at = node
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .or_else(|| node.get("createdAt").and_then(Value::as_str))?
+        .to_owned();
+    let actor = discussion_author_from_node(node.get("author"));
+    Some(DiscussionAnnouncement {
+        event_id,
+        repo_id,
+        repo_full_name: repo_full_name.to_owned(),
+        title,
+        body: node
+            .get("bodyText")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        html_url,
+        actor,
+        occurred_at,
+    })
+}
+
+fn is_announcement_discussion_category(slug: &str, name: &str) -> bool {
+    let slug = slug.trim().to_ascii_lowercase();
+    let name = name.trim().to_ascii_lowercase();
+    matches!(slug.as_str(), "announcement" | "announcements")
+        || matches!(name.as_str(), "announcement" | "announcements")
+}
+
+fn discussion_author_from_node(author: Option<&Value>) -> GitHubActor {
+    let login = author
+        .and_then(|value| value.get("login"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("ghost")
+        .to_owned();
+    GitHubActor {
+        id: author
+            .and_then(|value| value.get("databaseId"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        avatar_url: author
+            .and_then(|value| value.get("avatarUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        html_url: author
+            .and_then(|value| value.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| Some(format!("{GITHUB_WEB_BASE}/{login}"))),
+        login,
+    }
+}
+
 fn feed_activity_event_from_github(
     event: GitHubActivityEvent,
 ) -> Option<FeedActivityEventSnapshot> {
@@ -5265,31 +5675,6 @@ fn feed_activity_event_from_github(
                 title: forkee.as_ref().and_then(|repo| repo.full_name.clone()),
                 body: forkee.and_then(|repo| repo.description),
                 html_url,
-                github_event_id: Some(github_event_id),
-                actor: event.actor,
-                occurred_at: event.created_at,
-            })
-        }
-        "ReleaseEvent" => {
-            if !matches!(event.payload.action.as_deref(), Some("published") | None) {
-                return None;
-            }
-            let release = event.payload.release?;
-            let title = release
-                .name
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .or(release.tag_name);
-            let github_event_id = event.id;
-            Some(FeedActivityEventSnapshot {
-                kind: "announcement",
-                event_id: github_event_id.clone(),
-                repo_id: event.repo.id,
-                repo_full_name: event.repo.name,
-                title,
-                body: release.body,
-                html_url: release.html_url,
                 github_event_id: Some(github_event_id),
                 actor: event.actor,
                 occurred_at: event.created_at,
@@ -6316,23 +6701,26 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActor,
-        GitHubNotification, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
-        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
-        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
-        OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoStargazerSnapshot,
-        SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
+        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActivityEvent,
+        GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification,
+        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
+        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+        ReleaseDemandRepo, RepoOwner, RepoReleaseOrigin, RepoReleaseWorkItemRow,
+        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
+        SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        announcement_category_id_from_repo_value, apply_social_activity_snapshot,
         apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
         attach_release_demand, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, expire_repo_release_deadlines,
-        fail_repo_release_work_item, insert_feed_activity_events, insert_social_activity_event_tx,
-        is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
-        process_repo_release_work_item, recover_repo_release_runtime_state_on_startup,
-        repo_release_deadline_at, resolve_notification_open_url,
-        subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, insert_feed_activity_events,
+        insert_social_activity_event_tx, is_terminal_notification_thread_error,
+        owned_repo_snapshot_from_node, process_repo_release_work_item,
+        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
+        resolve_notification_open_url, subscription_event_counts_as_critical,
+        subscription_timeout_error, sync_notifications_with_fetch,
+        sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -8844,9 +9232,9 @@ mod tests {
 
         let actor = GitHubActor {
             id: 501,
-            login: "release-cat".to_owned(),
-            avatar_url: Some("https://avatars.example/release-cat.png".to_owned()),
-            html_url: Some("https://github.com/release-cat".to_owned()),
+            login: "maintainer-cat".to_owned(),
+            avatar_url: Some("https://avatars.example/maintainer-cat.png".to_owned()),
+            html_url: Some("https://github.com/maintainer-cat".to_owned()),
         };
         let occurred_at = "2026-03-06T12:00:00Z".to_owned();
         let events = vec![
@@ -8856,9 +9244,9 @@ mod tests {
                 github_event_id: Some("evt-1".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
-                title: Some("Alpha release".to_owned()),
+                title: Some("Alpha roadmap announcement".to_owned()),
                 body: Some("First announcement body".to_owned()),
-                html_url: Some("https://github.com/octo/alpha/releases/tag/v1".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/discussions/1".to_owned()),
                 actor: actor.clone(),
                 occurred_at: occurred_at.clone(),
             },
@@ -8868,9 +9256,9 @@ mod tests {
                 github_event_id: Some("evt-2".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
-                title: Some("Beta release".to_owned()),
+                title: Some("Beta migration announcement".to_owned()),
                 body: Some("Second announcement body".to_owned()),
-                html_url: Some("https://github.com/octo/alpha/releases/tag/v2".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/discussions/2".to_owned()),
                 actor,
                 occurred_at,
             },
@@ -8904,16 +9292,100 @@ mod tests {
             vec![
                 (
                     "evt-1".to_owned(),
-                    "Alpha release".to_owned(),
+                    "Alpha roadmap announcement".to_owned(),
                     Some("First announcement body".to_owned()),
                 ),
                 (
                     "evt-2".to_owned(),
-                    "Beta release".to_owned(),
+                    "Beta migration announcement".to_owned(),
                     Some("Second announcement body".to_owned()),
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn release_event_does_not_generate_announcement_activity() {
+        let event = GitHubActivityEvent {
+            id: "release-event-1".to_owned(),
+            event_type: "ReleaseEvent".to_owned(),
+            actor: GitHubActor {
+                id: 42,
+                login: "maintainer".to_owned(),
+                avatar_url: Some("https://avatars.example/maintainer.png".to_owned()),
+                html_url: Some("https://github.com/maintainer".to_owned()),
+            },
+            repo: GitHubEventRepo {
+                id: Some(1001),
+                name: Some("octo/alpha".to_owned()),
+            },
+            payload: GitHubActivityPayload::default(),
+            created_at: "2026-03-06T12:00:00Z".to_owned(),
+        };
+
+        assert!(feed_activity_event_from_github(event).is_none());
+    }
+
+    #[test]
+    fn discussion_announcement_node_maps_to_activity_fields() {
+        let node = json!({
+            "id": "D_kwDOALPHA4",
+            "title": "Pinned maintainer announcement",
+            "bodyText": "The project roadmap has moved to Discussions.",
+            "url": "https://github.com/octo/alpha/discussions/44",
+            "createdAt": "2026-03-05T10:00:00Z",
+            "updatedAt": "2026-03-06T12:00:00Z",
+            "author": {
+                "databaseId": 501,
+                "login": "maintainer",
+                "avatarUrl": "https://avatars.example/maintainer.png",
+                "url": "https://github.com/maintainer"
+            }
+        });
+
+        let announcement =
+            discussion_announcement_from_node(&node, 1001, "octo/alpha").expect("announcement");
+
+        assert_eq!(announcement.event_id, "D_kwDOALPHA4");
+        assert_eq!(announcement.repo_id, 1001);
+        assert_eq!(announcement.repo_full_name, "octo/alpha");
+        assert_eq!(announcement.title, "Pinned maintainer announcement");
+        assert_eq!(
+            announcement.body.as_deref(),
+            Some("The project roadmap has moved to Discussions.")
+        );
+        assert_eq!(
+            announcement.html_url,
+            "https://github.com/octo/alpha/discussions/44"
+        );
+        assert_eq!(announcement.actor.login, "maintainer");
+        assert_eq!(announcement.occurred_at, "2026-03-06T12:00:00Z");
+    }
+
+    #[test]
+    fn announcement_category_detection_requires_announcement_slug_or_name() {
+        let repo = json!({
+            "discussionCategories": {
+                "nodes": [
+                    { "id": "DIC_general", "name": "General", "slug": "general" },
+                    { "id": "DIC_announcements", "name": "Announcements", "slug": "announcements" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            announcement_category_id_from_repo_value(&repo).as_deref(),
+            Some("DIC_announcements")
+        );
+
+        let no_announcement = json!({
+            "discussionCategories": {
+                "nodes": [
+                    { "id": "DIC_general", "name": "General", "slug": "general" }
+                ]
+            }
+        });
+        assert!(announcement_category_id_from_repo_value(&no_announcement).is_none());
     }
 
     #[tokio::test]
