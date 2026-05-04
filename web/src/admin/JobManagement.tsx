@@ -3709,7 +3709,7 @@ export function JobManagement({
 			);
 			try {
 				const params = new URLSearchParams();
-				params.set("status", scheduledRunStatusFilter);
+				params.set("status", "all");
 				params.set("task_type", "sync.subscriptions");
 				params.set("page", String(subscriptionRunPage));
 				params.set("page_size", String(TASK_PAGE_SIZE));
@@ -3732,7 +3732,7 @@ export function JobManagement({
 				}
 			}
 		},
-		[scheduledRunStatusFilter, subscriptionRunPage],
+		[subscriptionRunPage],
 	);
 
 	const loadSyncRuntimeConfig = useCallback(async (options?: LoadOptions) => {

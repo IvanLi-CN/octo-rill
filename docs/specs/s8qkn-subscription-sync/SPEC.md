@@ -332,11 +332,12 @@ capture_scope=element
 requested_viewport=default
 viewport_strategy=storybook-viewport
 sensitive_exclusion=N/A
-submission_gate=pending-owner-approval
 story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Running
 state=subscription-sync-detail-running
+submission_gate=approved
 evidence_note=验证运行中的订阅同步详情页按真实工作流推进：Collect、Star、Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。
 
+PR: include
 ![Subscription sync detail running](./assets/admin-sync-subscriptions-detail-running.png)
 
 source_type=storybook_canvas
