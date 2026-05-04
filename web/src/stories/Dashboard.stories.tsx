@@ -299,6 +299,53 @@ function StoryNewContentNotice(props: {
 	);
 }
 
+function expectDashboardLaneSelectorPolish(controlBand: HTMLElement | null) {
+	expect(controlBand).not.toBeNull();
+	if (!controlBand) {
+		throw new Error("Expected Dashboard secondary controls");
+	}
+
+	expectNoHorizontalOverflow(controlBand);
+	const laneSelector = controlBand.querySelector<HTMLElement>(
+		"[data-feed-page-lane-selector='true']",
+	);
+	const adminEntry = controlBand.querySelector<HTMLElement>("a[href='/admin']");
+	expect(laneSelector).not.toBeNull();
+	expect(adminEntry).not.toBeNull();
+	if (!laneSelector || !adminEntry) {
+		throw new Error("Expected lane selector and admin entry in control band");
+	}
+
+	const selectorRect = laneSelector.getBoundingClientRect();
+	const adminRect = adminEntry.getBoundingClientRect();
+	expect(Math.abs(selectorRect.height - adminRect.height)).toBeLessThanOrEqual(
+		1,
+	);
+	expect(
+		Math.abs(
+			selectorRect.top +
+				selectorRect.height / 2 -
+				(adminRect.top + adminRect.height / 2),
+		),
+	).toBeLessThanOrEqual(1);
+	expect(Math.round(selectorRect.height)).toBe(32);
+
+	const selectorStyles = window.getComputedStyle(laneSelector);
+	const adminStyles = window.getComputedStyle(adminEntry);
+	expect(parseFloat(selectorStyles.borderRadius)).toBeLessThanOrEqual(14);
+	expect(parseFloat(adminStyles.borderRadius)).toBeLessThanOrEqual(14);
+	expect(selectorStyles.boxShadow).toBe("none");
+
+	const activeLane = laneSelector.querySelector<HTMLElement>(
+		"[aria-pressed='true']",
+	);
+	expect(activeLane).not.toBeNull();
+	if (!activeLane) {
+		throw new Error("Expected an active page lane option");
+	}
+	expect(Math.round(activeLane.getBoundingClientRect().height)).toBe(24);
+}
+
 function makeBrief(
 	brief: Omit<
 		BriefItem,
@@ -1155,13 +1202,13 @@ function buildAnnouncementItem(
 		id,
 		repo_full_name: PROJECT_REPO_FULL_NAME,
 		repo_visual: repoVisualFixtures.social,
-		title: "v2.64.0 发布公告",
-		body: "- 新增信息流公告入口\n- 修复移动端卡片节奏",
+		title: "路线图公告：信息流语义订正",
+		body: "- 公告来源改为 Discussions Announcements\n- Release 继续使用独立发布卡片",
 		body_truncated: false,
 		subtitle: "仓库公告",
 		reason: null,
-		subject_type: "release",
-		html_url: "https://github.com/acme/rocket/releases/tag/v2.64.0",
+		subject_type: "discussion",
+		html_url: "https://github.com/acme/rocket/discussions/64",
 		unread: null,
 		actor: {
 			login: "maintainer",
@@ -1364,17 +1411,19 @@ function makeAnnouncementAndForkFocusFeed(): FeedItem[] {
 			ts: "2026-04-04T16:30:00+08:00",
 			title: "公告以内容卡片进入全部流",
 			body: [
-				"这条 Story 专门展示本次变更的核心：公告不是社交桥接卡。",
+				"这条 Story 专门展示 Discussions Announcements 公告卡。",
 				"",
 				"- 公告用内容卡片展示标题与正文",
+				"- Release 仍使用独立发布卡片",
 				"- Fork 仍用活动卡展示 actor → action → repo",
 				"- 二者只出现在 `全部` tab，不新增独立 tab",
 			].join("\n"),
 			actor: {
-				login: "release-captain",
-				avatar_url: githubAvatarUrl("release-captain"),
-				html_url: "https://github.com/release-captain",
+				login: "discussion-maintainer",
+				avatar_url: githubAvatarUrl("discussion-maintainer"),
+				html_url: "https://github.com/discussion-maintainer",
 			},
+			html_url: "https://github.com/acme/rocket/discussions/128",
 		}),
 		buildForkItem("fork-focus", {
 			ts: "2026-04-04T16:10:00+08:00",
@@ -2724,7 +2773,7 @@ function DashboardPreview(props: {
 					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
 						<DashboardTabsList />
 						<div
-							className="flex items-center gap-2"
+							className="flex min-h-8 items-center gap-2 self-center"
 							data-dashboard-secondary-controls
 						>
 							{tab === "all" || tab === "releases" ? (
@@ -2741,7 +2790,7 @@ function DashboardPreview(props: {
 								asChild
 								variant="outline"
 								size="sm"
-								className="font-mono text-xs"
+								className="h-8 rounded-lg border-border/60 bg-muted/35 px-3 font-mono text-xs text-foreground/75 shadow-none hover:bg-muted/60 hover:text-foreground"
 							>
 								<InternalLink href="/admin" to="/admin">
 									管理员面板
@@ -2944,6 +2993,9 @@ export const Default: Story = {
 			"[data-dashboard-secondary-controls]",
 		);
 		expect(secondaryControls).not.toBeNull();
+		expectDashboardLaneSelectorPolish(
+			secondaryControls instanceof HTMLElement ? secondaryControls : null,
+		);
 		await expect(
 			canvas.getByRole("button", { name: SYNC_ALL_LABEL }),
 		).toBeVisible();
@@ -3008,6 +3060,11 @@ export const EvidenceTabletHeaderInline: Story = {
 				"[data-dashboard-secondary-controls]",
 			),
 		});
+		expectDashboardLaneSelectorPolish(
+			canvasElement.querySelector<HTMLElement>(
+				"[data-dashboard-secondary-controls]",
+			),
+		);
 		expect(
 			canvasElement.querySelector("[data-dashboard-sidebar-inbox='true']"),
 		).toBeNull();
@@ -3019,6 +3076,46 @@ export const EvidenceTabletHeaderInline: Story = {
 					"平板 853x1280 证据入口：Dashboard 页头主行保持品牌 / utility actions 同排，tabs 与次级控制区继续作为后续控制带落在下一行，同时 feed 页不再额外显示 Inbox 快捷侧栏列。",
 			},
 		},
+	},
+};
+
+export const EvidenceDesktopDarkLaneSelector: Story = {
+	name: "Evidence / Desktop Dark Lane Selector",
+	args: {
+		initialTab: "releases",
+		showFooter: false,
+	},
+	globals: {
+		theme: "dark",
+	},
+	parameters: {
+		backgrounds: {
+			default: "night-ink",
+		},
+		docs: {
+			description: {
+				story:
+					"暗色桌面证据入口：页面级阅读模式切换器和管理员入口保持同高、同基线、低阴影，并继续支持原文 / 翻译 / 润色即时切换。",
+			},
+		},
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const secondaryControls = canvasElement.querySelector<HTMLElement>(
+			"[data-dashboard-secondary-controls]",
+		);
+		expectDashboardLaneSelectorPolish(secondaryControls);
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "翻译" }));
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0（稳定版）" }),
+		).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "润色" }));
+		await expect(
+			canvas.getByRole("heading", { name: "v2.63.0 · 版本变化" }),
+		).toBeVisible();
 	},
 };
 

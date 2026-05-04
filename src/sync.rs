@@ -39,8 +39,11 @@ const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
 const SMART_PREHEAT_RECENT_RELEASE_LIMIT: usize = 30;
 const SOCIAL_STARGAZER_FETCH_CONCURRENCY: usize = 4;
+const DISCUSSION_ANNOUNCEMENT_REPO_BATCH_SIZE: usize = 20;
+const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
+const REPO_RELEASE_DEADLINE_EXPIRED_ERROR: &str = "repo_release_deadline_expired";
 const GITHUB_WEB_BASE: &str = "https://github.com";
 const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
 const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
@@ -265,6 +268,7 @@ struct RepoReleaseWorkItemRow {
     has_new_repo_watchers: i64,
     deadline_at: String,
     last_success_at: Option<String>,
+    started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -467,17 +471,7 @@ struct GitHubEventRepo {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct GitHubActivityPayload {
-    action: Option<String>,
-    release: Option<GitHubEventRelease>,
     forkee: Option<GitHubEventRepoTarget>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubEventRelease {
-    name: Option<String>,
-    tag_name: Option<String>,
-    body: Option<String>,
-    html_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -547,6 +541,24 @@ struct GitHubReleaseReactions {
     hooray: i64,
     rocket: i64,
     eyes: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DiscussionAnnouncementRepo {
+    repo_id: i64,
+    full_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct DiscussionAnnouncement {
+    event_id: String,
+    repo_id: i64,
+    repo_full_name: String,
+    title: String,
+    body: Option<String>,
+    html_url: String,
+    actor: GitHubActor,
+    occurred_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -977,6 +989,7 @@ pub async fn sync_social_activity(
     let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
     let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
     let mut feed_events_by_id = HashMap::<String, FeedActivityEventSnapshot>::new();
+    let announcement_repos = load_user_discussion_announcement_repos(state, user_id).await?;
 
     for connection in connections {
         match fetch_owned_repo_snapshot(state, &connection.access_token).await {
@@ -1047,6 +1060,34 @@ pub async fn sync_social_activity(
                 );
                 source_errors.push(format!(
                     "feed_events(@{}, {}): {}",
+                    connection.login, err.reason_code, err.message
+                ));
+            }
+        }
+
+        match fetch_discussion_announcement_events_snapshot(
+            state,
+            &connection.access_token,
+            &announcement_repos,
+        )
+        .await
+        {
+            Ok(events) => {
+                for event in events {
+                    feed_events_by_id
+                        .entry(event.event_id.clone())
+                        .or_insert(event);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    user_id,
+                    login = connection.login.as_str(),
+                    "sync social activity: skip discussion announcements snapshot"
+                );
+                source_errors.push(format!(
+                    "discussion_announcements(@{}, {}): {}",
                     connection.login, err.reason_code, err.message
                 ));
             }
@@ -2555,6 +2596,8 @@ async fn attach_release_demand(
         return Ok(result);
     }
 
+    expire_repo_release_deadlines(state).await?;
+
     let now = Utc::now();
     let now_rfc3339 = now.to_rfc3339();
     let deadline_at = repo_release_deadline_at(now, origin);
@@ -2577,7 +2620,8 @@ async fn attach_release_demand(
               priority,
               has_new_repo_watchers,
               deadline_at,
-              last_success_at
+              last_success_at,
+              started_at
             FROM repo_release_work_items
             WHERE repo_id = ?
             LIMIT 1
@@ -2610,8 +2654,13 @@ async fn attach_release_demand(
                 } else {
                     0
                 };
-            let next_deadline =
-                earlier_timestamp(existing.deadline_at.as_str(), deadline_at.as_str());
+            let next_deadline = if existing.status == jobs::STATUS_QUEUED
+                || existing.status == jobs::STATUS_RUNNING
+            {
+                earlier_timestamp(existing.deadline_at.as_str(), deadline_at.as_str())
+            } else {
+                deadline_at.clone()
+            };
 
             if is_fresh && existing.status == jobs::STATUS_SUCCEEDED {
                 if let Some(task_id) = task_id {
@@ -2845,6 +2894,25 @@ async fn wait_for_release_demand(
     }
 
     loop {
+        let expired =
+            expire_repo_release_work_items_for_wait(state, task_id, work_item_ids).await?;
+        if expired > 0
+            && let Some(task_id) = task_id
+        {
+            jobs::append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "release_deadline_expired",
+                    "expired_work_items": expired,
+                    "error": REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+                }),
+            )
+            .await?;
+        }
+
         if let Some(task_id) = task_id
             && is_job_cancel_requested(state, task_id).await?
         {
@@ -4151,7 +4219,7 @@ async fn claim_next_repo_release_work_item(
         UPDATE repo_release_work_items
         SET
           status = ?,
-          started_at = COALESCE(started_at, ?),
+          started_at = ?,
           runtime_owner_id = ?,
           lease_heartbeat_at = ?,
           updated_at = ?
@@ -4187,7 +4255,8 @@ async fn claim_next_repo_release_work_item(
           priority,
           has_new_repo_watchers,
           deadline_at,
-          last_success_at
+          last_success_at,
+          started_at
         FROM repo_release_work_items
         WHERE id = ?
         LIMIT 1
@@ -4206,6 +4275,19 @@ async fn process_repo_release_work_item(
     state: Arc<AppState>,
     work_item: RepoReleaseWorkItemRow,
 ) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    if fail_repo_release_work_item(
+        state.as_ref(),
+        work_item.id.as_str(),
+        REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+        now.as_str(),
+        true,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     let heartbeat = runtime::spawn_lease_heartbeat(
         "repo_release_work_items",
         runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL,
@@ -4227,9 +4309,21 @@ async fn process_repo_release_work_item(
     heartbeat.stop().await;
 
     let now = Utc::now().to_rfc3339();
+    if fail_repo_release_work_item(
+        state.as_ref(),
+        work_item.id.as_str(),
+        REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+        now.as_str(),
+        true,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     match result {
         Ok((release_count, candidate_failures)) => {
-            sqlx::query(
+            let updated = sqlx::query(
                 r#"
                 UPDATE repo_release_work_items
                 SET
@@ -4246,6 +4340,10 @@ async fn process_repo_release_work_item(
                   runtime_owner_id = NULL,
                   lease_heartbeat_at = NULL
                 WHERE id = ?
+                  AND status = ?
+                  AND runtime_owner_id = ?
+                  AND started_at = ?
+                  AND julianday(deadline_at) > julianday(?)
                 "#,
             )
             .bind(jobs::STATUS_SUCCEEDED)
@@ -4256,17 +4354,22 @@ async fn process_repo_release_work_item(
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(&work_item.id)
+            .bind(jobs::STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
+            .bind(work_item.started_at.as_deref().unwrap_or_default())
+            .bind(now.as_str())
             .execute(&state.pool)
             .await
-            .with_context(|| {
-                format!("failed to finalize repo release work item {}", work_item.id)
-            })?;
-            mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
-                .await?;
+            .with_context(|| format!("failed to finalize repo release work item {}", work_item.id))?
+            .rows_affected();
+            if updated > 0 {
+                mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
+                    .await?;
+            }
         }
         Err(err) => {
             let error_message = err.to_string();
-            sqlx::query(
+            let updated = sqlx::query(
                 r#"
                 UPDATE repo_release_work_items
                 SET
@@ -4280,6 +4383,10 @@ async fn process_repo_release_work_item(
                   runtime_owner_id = NULL,
                   lease_heartbeat_at = NULL
                 WHERE id = ?
+                  AND status = ?
+                  AND runtime_owner_id = ?
+                  AND started_at = ?
+                  AND julianday(deadline_at) > julianday(?)
                 "#,
             )
             .bind(jobs::STATUS_FAILED)
@@ -4288,17 +4395,24 @@ async fn process_repo_release_work_item(
             .bind(now.as_str())
             .bind(now.as_str())
             .bind(&work_item.id)
+            .bind(jobs::STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
+            .bind(work_item.started_at.as_deref().unwrap_or_default())
+            .bind(now.as_str())
             .execute(&state.pool)
             .await
-            .with_context(|| format!("failed to fail repo release work item {}", work_item.id))?;
-            mark_repo_release_watchers(
-                state.as_ref(),
-                &work_item.id,
-                "failed",
-                Some(error_message.as_str()),
-                &now,
-            )
-            .await?;
+            .with_context(|| format!("failed to fail repo release work item {}", work_item.id))?
+            .rows_affected();
+            if updated > 0 {
+                mark_repo_release_watchers(
+                    state.as_ref(),
+                    &work_item.id,
+                    "failed",
+                    Some(error_message.as_str()),
+                    &now,
+                )
+                .await?;
+            }
         }
     }
 
@@ -4536,10 +4650,148 @@ pub async fn recover_repo_release_runtime_state(state: &AppState) -> Result<()> 
     recover_repo_release_runtime_state_with_mode(state, runtime::RuntimeRecoveryMode::Sweep).await
 }
 
+async fn fail_repo_release_work_item(
+    state: &AppState,
+    work_item_id: &str,
+    error_text: &str,
+    now: &str,
+    require_expired_deadline: bool,
+) -> Result<bool> {
+    let require_expired_deadline = if require_expired_deadline {
+        1_i64
+    } else {
+        0_i64
+    };
+    let updated = sqlx::query(
+        r#"
+        UPDATE repo_release_work_items
+        SET
+          status = ?,
+          priority = 0,
+          has_new_repo_watchers = 0,
+          deadline_at = ?,
+          error_text = ?,
+          finished_at = ?,
+          updated_at = ?,
+          runtime_owner_id = NULL,
+          lease_heartbeat_at = NULL
+        WHERE id = ?
+          AND status IN (?, ?)
+          AND (? = 0 OR julianday(deadline_at) <= julianday(?))
+        "#,
+    )
+    .bind(jobs::STATUS_FAILED)
+    .bind(now)
+    .bind(error_text)
+    .bind(now)
+    .bind(now)
+    .bind(work_item_id)
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .bind(require_expired_deadline)
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .with_context(|| format!("failed to fail repo release work item {work_item_id}"))?
+    .rows_affected();
+
+    if updated > 0 {
+        mark_repo_release_watchers(state, work_item_id, "failed", Some(error_text), now).await?;
+    }
+
+    Ok(updated > 0)
+}
+
+async fn expire_repo_release_work_item_ids(
+    state: &AppState,
+    work_item_ids: Vec<String>,
+) -> Result<usize> {
+    if work_item_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let mut expired = 0usize;
+    for work_item_id in work_item_ids {
+        if fail_repo_release_work_item(
+            state,
+            work_item_id.as_str(),
+            REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+            now.as_str(),
+            true,
+        )
+        .await?
+        {
+            expired += 1;
+        }
+    }
+    Ok(expired)
+}
+
+async fn expire_repo_release_work_items_for_wait(
+    state: &AppState,
+    task_id: Option<&str>,
+    work_item_ids: &[String],
+) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let work_item_ids = if let Some(task_id) = task_id {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT wi.id
+            FROM repo_release_watchers rw
+            JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+            WHERE rw.task_id = ?
+              AND rw.status = 'pending'
+              AND wi.status IN (?, ?)
+              AND julianday(wi.deadline_at) <= julianday(?)
+            ORDER BY wi.deadline_at ASC, wi.created_at ASC
+            "#,
+        )
+        .bind(task_id)
+        .bind(jobs::STATUS_QUEUED)
+        .bind(jobs::STATUS_RUNNING)
+        .bind(now.as_str())
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to load expired repo release work items for task")?
+    } else {
+        if work_item_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id FROM repo_release_work_items WHERE status IN (",
+        );
+        {
+            let mut statuses = builder.separated(", ");
+            statuses.push_bind(jobs::STATUS_QUEUED);
+            statuses.push_bind(jobs::STATUS_RUNNING);
+        }
+        builder.push(") AND julianday(deadline_at) <= julianday(");
+        builder.push_bind(now.as_str());
+        builder.push(") AND id IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for work_item_id in work_item_ids {
+                separated.push_bind(work_item_id);
+            }
+        }
+        builder.push(") ORDER BY deadline_at ASC, created_at ASC");
+        builder
+            .build_query_scalar::<String>()
+            .fetch_all(&state.pool)
+            .await
+            .context("failed to load expired repo release work items")?
+    };
+
+    expire_repo_release_work_item_ids(state, work_item_ids).await
+}
+
 async fn recover_repo_release_runtime_state_with_mode(
     state: &AppState,
     mode: runtime::RuntimeRecoveryMode,
 ) -> Result<()> {
+    expire_repo_release_deadlines(state).await?;
+
     let cutoff = runtime::stale_cutoff_timestamp(Utc::now());
     let stale_rows = match mode {
         runtime::RuntimeRecoveryMode::Startup => {
@@ -4596,42 +4848,38 @@ async fn recover_repo_release_runtime_state_with_mode(
 
     let now = Utc::now().to_rfc3339();
     for row in stale_rows {
-        sqlx::query(
-            r#"
-            UPDATE repo_release_work_items
-            SET
-              status = ?,
-              priority = 0,
-              has_new_repo_watchers = 0,
-              deadline_at = ?,
-              error_text = ?,
-              finished_at = ?,
-              updated_at = ?,
-              runtime_owner_id = NULL,
-              lease_heartbeat_at = NULL
-            WHERE id = ?
-            "#,
-        )
-        .bind(jobs::STATUS_FAILED)
-        .bind(now.as_str())
-        .bind(runtime::RUNTIME_LEASE_EXPIRED_ERROR)
-        .bind(now.as_str())
-        .bind(now.as_str())
-        .bind(&row.id)
-        .execute(&state.pool)
-        .await
-        .with_context(|| format!("failed to recover stale repo release work item {}", row.id))?;
-        mark_repo_release_watchers(
+        fail_repo_release_work_item(
             state,
-            &row.id,
-            "failed",
-            Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR),
-            &now,
+            row.id.as_str(),
+            runtime::RUNTIME_LEASE_EXPIRED_ERROR,
+            now.as_str(),
+            false,
         )
         .await?;
     }
 
     Ok(())
+}
+
+async fn expire_repo_release_deadlines(state: &AppState) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let work_item_ids = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT id
+        FROM repo_release_work_items
+        WHERE status IN (?, ?)
+          AND julianday(deadline_at) <= julianday(?)
+        ORDER BY deadline_at ASC, created_at ASC
+        "#,
+    )
+    .bind(jobs::STATUS_QUEUED)
+    .bind(jobs::STATUS_RUNNING)
+    .bind(now.as_str())
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load expired repo release work items")?;
+
+    expire_repo_release_work_item_ids(state, work_item_ids).await
 }
 
 fn cmp_last_active_desc(left: Option<&str>, right: Option<&str>) -> Ordering {
@@ -5028,6 +5276,377 @@ async fn fetch_feed_activity_events_snapshot(
     Ok(events)
 }
 
+async fn load_user_discussion_announcement_repos(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Vec<DiscussionAnnouncementRepo>> {
+    sqlx::query_as::<_, ReleaseVisibleRepoRow>(
+        r#"
+        SELECT repo_id, full_name
+        FROM user_release_visible_repos
+        WHERE user_id = ?
+        ORDER BY
+          CASE WHEN stargazed_at IS NULL THEN 1 ELSE 0 END ASC,
+          stargazed_at DESC,
+          full_name ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query discussion announcement repos")
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| DiscussionAnnouncementRepo {
+                repo_id: row.repo_id,
+                full_name: row.full_name,
+            })
+            .collect()
+    })
+}
+
+async fn fetch_discussion_announcement_events_snapshot(
+    state: &AppState,
+    access_token: &str,
+    repos: &[DiscussionAnnouncementRepo],
+) -> Result<Vec<FeedActivityEventSnapshot>, SyncRequestError> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut events = Vec::new();
+    for chunk in repos.chunks(DISCUSSION_ANNOUNCEMENT_REPO_BATCH_SIZE.max(1)) {
+        let announcements = fetch_discussion_announcement_batch(state, access_token, chunk).await?;
+        events.extend(
+            announcements
+                .into_iter()
+                .map(|announcement| FeedActivityEventSnapshot {
+                    kind: "announcement",
+                    event_id: announcement.event_id.clone(),
+                    repo_id: Some(announcement.repo_id),
+                    repo_full_name: Some(announcement.repo_full_name),
+                    title: Some(announcement.title),
+                    body: announcement.body,
+                    html_url: Some(announcement.html_url),
+                    github_event_id: Some(announcement.event_id),
+                    actor: announcement.actor,
+                    occurred_at: announcement.occurred_at,
+                }),
+        );
+    }
+
+    events.sort_by(|left, right| {
+        right
+            .occurred_at
+            .cmp(&left.occurred_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    events.dedup_by(|left, right| left.event_id == right.event_id);
+    Ok(events)
+}
+
+async fn fetch_discussion_announcement_batch(
+    state: &AppState,
+    access_token: &str,
+    repos: &[DiscussionAnnouncementRepo],
+) -> Result<Vec<DiscussionAnnouncement>, SyncRequestError> {
+    let mut query = String::from("query {");
+    let mut alias_repos = Vec::new();
+    for (index, repo) in repos.iter().enumerate() {
+        let Some((owner, name)) = repo.full_name.split_once('/') else {
+            continue;
+        };
+        alias_repos.push((format!("r{index}"), repo));
+        query.push_str(&format!(
+            r#"
+            r{index}: repository(owner: {}, name: {}) {{
+              databaseId
+              nameWithOwner
+              discussionCategories(first: 25) {{
+                nodes {{
+                  id
+                  name
+                  slug
+                }}
+              }}
+            }}
+            "#,
+            graphql_string_literal(owner),
+            graphql_string_literal(name),
+        ));
+    }
+    query.push('}');
+
+    if alias_repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operation = "sync discussion announcement categories graphql";
+    let payload = with_subscription_timeout(operation, async {
+        let response = state
+            .http
+            .post(GRAPHQL_URL)
+            .bearer_auth(access_token)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .json(&json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(operation, err))?;
+
+        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+    })
+    .await?;
+
+    if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+        return Err(classify_graphql_errors(operation, errors));
+    }
+
+    let Some(Value::Object(data)) = payload.data else {
+        return Err(SyncRequestError::non_retryable(
+            "graphql_missing_data",
+            "sync discussion announcement categories graphql: missing graphql data",
+            None,
+        ));
+    };
+
+    let mut announcement_categories = Vec::new();
+    for (alias, fallback_repo) in alias_repos {
+        let Some(repo_value) = data.get(&alias) else {
+            continue;
+        };
+        if repo_value.is_null() {
+            continue;
+        }
+        let Some(category_id) = announcement_category_id_from_repo_value(repo_value) else {
+            continue;
+        };
+        announcement_categories.push((fallback_repo, category_id));
+    }
+    fetch_discussion_announcement_category_discussions(
+        state,
+        access_token,
+        &announcement_categories,
+    )
+    .await
+}
+
+fn graphql_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+async fn fetch_discussion_announcement_category_discussions(
+    state: &AppState,
+    access_token: &str,
+    repos: &[(&DiscussionAnnouncementRepo, String)],
+) -> Result<Vec<DiscussionAnnouncement>, SyncRequestError> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = String::from("query {");
+    let mut alias_repos = Vec::new();
+    for (index, (repo, category_id)) in repos.iter().enumerate() {
+        let Some((owner, name)) = repo.full_name.split_once('/') else {
+            continue;
+        };
+        alias_repos.push((format!("r{index}"), *repo));
+        query.push_str(&format!(
+            r#"
+            r{index}: repository(owner: {}, name: {}) {{
+              databaseId
+              nameWithOwner
+              discussions(first: {}, categoryId: {}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                nodes {{
+                  id
+                  title
+                  bodyText
+                  url
+                  createdAt
+                  updatedAt
+                  author {{
+                    login
+                    avatarUrl
+                    url
+                    ... on User {{ databaseId }}
+                  }}
+                }}
+              }}
+            }}
+            "#,
+            graphql_string_literal(owner),
+            graphql_string_literal(name),
+            DISCUSSION_ANNOUNCEMENT_PAGE_SIZE,
+            graphql_string_literal(category_id),
+        ));
+    }
+    query.push('}');
+
+    if alias_repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let operation = "sync discussion announcements graphql";
+    let payload = with_subscription_timeout(operation, async {
+        let response = state
+            .http
+            .post(GRAPHQL_URL)
+            .bearer_auth(access_token)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .json(&json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(operation, err))?;
+
+        fetch_json_response::<GraphQlResponse<Value>>(response, operation).await
+    })
+    .await?;
+
+    if let Some(errors) = payload.errors.as_ref().filter(|items| !items.is_empty()) {
+        return Err(classify_graphql_errors(operation, errors));
+    }
+
+    let Some(Value::Object(data)) = payload.data else {
+        return Err(SyncRequestError::non_retryable(
+            "graphql_missing_data",
+            "sync discussion announcements graphql: missing graphql data",
+            None,
+        ));
+    };
+
+    let mut announcements = Vec::new();
+    for (alias, fallback_repo) in alias_repos {
+        let Some(repo_value) = data.get(&alias) else {
+            continue;
+        };
+        if repo_value.is_null() {
+            continue;
+        }
+        announcements.extend(discussion_announcements_from_repo_value(
+            repo_value,
+            fallback_repo,
+        ));
+    }
+    Ok(announcements)
+}
+
+fn announcement_category_id_from_repo_value(repo_value: &Value) -> Option<String> {
+    repo_value
+        .get("discussionCategories")
+        .and_then(|value| value.get("nodes"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find_map(|category| {
+            let slug = category
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = category
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            is_announcement_discussion_category(slug, name)
+                .then(|| {
+                    category
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+}
+
+fn discussion_announcements_from_repo_value(
+    repo_value: &Value,
+    fallback_repo: &DiscussionAnnouncementRepo,
+) -> Vec<DiscussionAnnouncement> {
+    let repo_id = repo_value
+        .get("databaseId")
+        .and_then(Value::as_i64)
+        .unwrap_or(fallback_repo.repo_id);
+    let repo_full_name = repo_value
+        .get("nameWithOwner")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_repo.full_name.as_str())
+        .to_owned();
+    let nodes = repo_value
+        .get("discussions")
+        .and_then(|value| value.get("nodes"))
+        .and_then(Value::as_array);
+    let Some(nodes) = nodes else {
+        return Vec::new();
+    };
+
+    nodes
+        .iter()
+        .filter_map(|node| discussion_announcement_from_node(node, repo_id, &repo_full_name))
+        .collect()
+}
+
+fn discussion_announcement_from_node(
+    node: &Value,
+    repo_id: i64,
+    repo_full_name: &str,
+) -> Option<DiscussionAnnouncement> {
+    let event_id = node.get("id")?.as_str()?.to_owned();
+    let title = node.get("title")?.as_str()?.to_owned();
+    let html_url = node.get("url")?.as_str()?.to_owned();
+    let occurred_at = node
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .or_else(|| node.get("createdAt").and_then(Value::as_str))?
+        .to_owned();
+    let actor = discussion_author_from_node(node.get("author"));
+    Some(DiscussionAnnouncement {
+        event_id,
+        repo_id,
+        repo_full_name: repo_full_name.to_owned(),
+        title,
+        body: node
+            .get("bodyText")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        html_url,
+        actor,
+        occurred_at,
+    })
+}
+
+fn is_announcement_discussion_category(slug: &str, name: &str) -> bool {
+    let slug = slug.trim().to_ascii_lowercase();
+    let name = name.trim().to_ascii_lowercase();
+    matches!(slug.as_str(), "announcement" | "announcements")
+        || matches!(name.as_str(), "announcement" | "announcements")
+}
+
+fn discussion_author_from_node(author: Option<&Value>) -> GitHubActor {
+    let login = author
+        .and_then(|value| value.get("login"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("ghost")
+        .to_owned();
+    GitHubActor {
+        id: author
+            .and_then(|value| value.get("databaseId"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        avatar_url: author
+            .and_then(|value| value.get("avatarUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        html_url: author
+            .and_then(|value| value.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| Some(format!("{GITHUB_WEB_BASE}/{login}"))),
+        login,
+    }
+}
+
 fn feed_activity_event_from_github(
     event: GitHubActivityEvent,
 ) -> Option<FeedActivityEventSnapshot> {
@@ -5056,31 +5675,6 @@ fn feed_activity_event_from_github(
                 title: forkee.as_ref().and_then(|repo| repo.full_name.clone()),
                 body: forkee.and_then(|repo| repo.description),
                 html_url,
-                github_event_id: Some(github_event_id),
-                actor: event.actor,
-                occurred_at: event.created_at,
-            })
-        }
-        "ReleaseEvent" => {
-            if !matches!(event.payload.action.as_deref(), Some("published") | None) {
-                return None;
-            }
-            let release = event.payload.release?;
-            let title = release
-                .name
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-                .or(release.tag_name);
-            let github_event_id = event.id;
-            Some(FeedActivityEventSnapshot {
-                kind: "announcement",
-                event_id: github_event_id.clone(),
-                repo_id: event.repo.id,
-                repo_full_name: event.repo.name,
-                title,
-                body: release.body,
-                html_url: release.html_url,
                 github_event_id: Some(github_event_id),
                 actor: event.actor,
                 occurred_at: event.created_at,
@@ -6107,26 +6701,31 @@ mod tests {
     use url::Url;
 
     use super::{
-        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActor,
-        GitHubNotification, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
-        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
-        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
-        OwnedRepoSnapshot, ReleaseDemandRepo, RepoOwner, RepoReleaseOrigin, RepoStargazerSnapshot,
-        SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, apply_social_activity_snapshot,
+        EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActivityEvent,
+        GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification,
+        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
+        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
+        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+        ReleaseDemandRepo, RepoOwner, RepoReleaseOrigin, RepoReleaseWorkItemRow,
+        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
+        SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        announcement_category_id_from_repo_value, apply_social_activity_snapshot,
         apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
         attach_release_demand, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, insert_feed_activity_events,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, is_terminal_notification_thread_error,
-        owned_repo_snapshot_from_node, recover_repo_release_runtime_state_on_startup,
-        repo_release_deadline_at, resolve_notification_open_url,
-        subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, wait_for_release_demand,
+        owned_repo_snapshot_from_node, process_repo_release_work_item,
+        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
+        resolve_notification_open_url, subscription_event_counts_as_critical,
+        subscription_timeout_error, sync_notifications_with_fetch,
+        sync_starred_for_user_with_fetch, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
         crypto::EncryptionKey,
-        jobs, local_id,
+        jobs, local_id, runtime,
         state::{AppState, build_oauth_client},
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -8633,9 +9232,9 @@ mod tests {
 
         let actor = GitHubActor {
             id: 501,
-            login: "release-cat".to_owned(),
-            avatar_url: Some("https://avatars.example/release-cat.png".to_owned()),
-            html_url: Some("https://github.com/release-cat".to_owned()),
+            login: "maintainer-cat".to_owned(),
+            avatar_url: Some("https://avatars.example/maintainer-cat.png".to_owned()),
+            html_url: Some("https://github.com/maintainer-cat".to_owned()),
         };
         let occurred_at = "2026-03-06T12:00:00Z".to_owned();
         let events = vec![
@@ -8645,9 +9244,9 @@ mod tests {
                 github_event_id: Some("evt-1".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
-                title: Some("Alpha release".to_owned()),
+                title: Some("Alpha roadmap announcement".to_owned()),
                 body: Some("First announcement body".to_owned()),
-                html_url: Some("https://github.com/octo/alpha/releases/tag/v1".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/discussions/1".to_owned()),
                 actor: actor.clone(),
                 occurred_at: occurred_at.clone(),
             },
@@ -8657,9 +9256,9 @@ mod tests {
                 github_event_id: Some("evt-2".to_owned()),
                 repo_id: Some(42),
                 repo_full_name: Some("octo/alpha".to_owned()),
-                title: Some("Beta release".to_owned()),
+                title: Some("Beta migration announcement".to_owned()),
                 body: Some("Second announcement body".to_owned()),
-                html_url: Some("https://github.com/octo/alpha/releases/tag/v2".to_owned()),
+                html_url: Some("https://github.com/octo/alpha/discussions/2".to_owned()),
                 actor,
                 occurred_at,
             },
@@ -8693,16 +9292,100 @@ mod tests {
             vec![
                 (
                     "evt-1".to_owned(),
-                    "Alpha release".to_owned(),
+                    "Alpha roadmap announcement".to_owned(),
                     Some("First announcement body".to_owned()),
                 ),
                 (
                     "evt-2".to_owned(),
-                    "Beta release".to_owned(),
+                    "Beta migration announcement".to_owned(),
                     Some("Second announcement body".to_owned()),
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn release_event_does_not_generate_announcement_activity() {
+        let event = GitHubActivityEvent {
+            id: "release-event-1".to_owned(),
+            event_type: "ReleaseEvent".to_owned(),
+            actor: GitHubActor {
+                id: 42,
+                login: "maintainer".to_owned(),
+                avatar_url: Some("https://avatars.example/maintainer.png".to_owned()),
+                html_url: Some("https://github.com/maintainer".to_owned()),
+            },
+            repo: GitHubEventRepo {
+                id: Some(1001),
+                name: Some("octo/alpha".to_owned()),
+            },
+            payload: GitHubActivityPayload::default(),
+            created_at: "2026-03-06T12:00:00Z".to_owned(),
+        };
+
+        assert!(feed_activity_event_from_github(event).is_none());
+    }
+
+    #[test]
+    fn discussion_announcement_node_maps_to_activity_fields() {
+        let node = json!({
+            "id": "D_kwDOALPHA4",
+            "title": "Pinned maintainer announcement",
+            "bodyText": "The project roadmap has moved to Discussions.",
+            "url": "https://github.com/octo/alpha/discussions/44",
+            "createdAt": "2026-03-05T10:00:00Z",
+            "updatedAt": "2026-03-06T12:00:00Z",
+            "author": {
+                "databaseId": 501,
+                "login": "maintainer",
+                "avatarUrl": "https://avatars.example/maintainer.png",
+                "url": "https://github.com/maintainer"
+            }
+        });
+
+        let announcement =
+            discussion_announcement_from_node(&node, 1001, "octo/alpha").expect("announcement");
+
+        assert_eq!(announcement.event_id, "D_kwDOALPHA4");
+        assert_eq!(announcement.repo_id, 1001);
+        assert_eq!(announcement.repo_full_name, "octo/alpha");
+        assert_eq!(announcement.title, "Pinned maintainer announcement");
+        assert_eq!(
+            announcement.body.as_deref(),
+            Some("The project roadmap has moved to Discussions.")
+        );
+        assert_eq!(
+            announcement.html_url,
+            "https://github.com/octo/alpha/discussions/44"
+        );
+        assert_eq!(announcement.actor.login, "maintainer");
+        assert_eq!(announcement.occurred_at, "2026-03-06T12:00:00Z");
+    }
+
+    #[test]
+    fn announcement_category_detection_requires_announcement_slug_or_name() {
+        let repo = json!({
+            "discussionCategories": {
+                "nodes": [
+                    { "id": "DIC_general", "name": "General", "slug": "general" },
+                    { "id": "DIC_announcements", "name": "Announcements", "slug": "announcements" }
+                ]
+            }
+        });
+
+        assert_eq!(
+            announcement_category_id_from_repo_value(&repo).as_deref(),
+            Some("DIC_announcements")
+        );
+
+        let no_announcement = json!({
+            "discussionCategories": {
+                "nodes": [
+                    { "id": "DIC_general", "name": "General", "slug": "general" }
+                ]
+            }
+        });
+        assert!(announcement_category_id_from_repo_value(&no_announcement).is_none());
     }
 
     #[tokio::test]
@@ -9430,6 +10113,513 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_release_demand_expires_pending_watchers_past_deadline() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-deadline").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-expired-wait",
+                repo_id: 43,
+                repo_full_name: "octo/deadline",
+                status: jobs::STATUS_QUEUED,
+                deadline_at: "2000-01-01T00:00:00Z",
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-expired-wait",
+            "repo-work-expired-wait",
+            "task-release-deadline",
+        )
+        .await;
+
+        let result = wait_for_release_demand(
+            state.as_ref(),
+            Some("task-release-deadline"),
+            &["repo-work-expired-wait".to_owned()],
+        )
+        .await
+        .expect("wait for expired release demand");
+
+        assert_eq!(result.failed, 1);
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+            r#"
+            SELECT status, error_text, finished_at, runtime_owner_id
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-expired-wait")
+        .fetch_one(&pool)
+        .await
+        .expect("load expired work item");
+        assert_eq!(row.0, jobs::STATUS_FAILED);
+        assert_eq!(row.1.as_deref(), Some(REPO_RELEASE_DEADLINE_EXPIRED_ERROR));
+        assert!(row.2.is_some());
+        assert!(row.3.is_none());
+
+        let watcher = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT status, error_text
+            FROM repo_release_watchers
+            WHERE id = ?
+            "#,
+        )
+        .bind("watch-expired-wait")
+        .fetch_one(&pool)
+        .await
+        .expect("load expired watcher");
+        assert_eq!(watcher.0, "failed");
+        assert_eq!(
+            watcher.1.as_deref(),
+            Some(REPO_RELEASE_DEADLINE_EXPIRED_ERROR)
+        );
+
+        let event_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'release_deadline_expired'
+              AND json_extract(payload_json, '$.expired_work_items') = 1
+            "#,
+        )
+        .bind("task-release-deadline")
+        .fetch_one(&pool)
+        .await
+        .expect("count deadline progress event");
+        assert_eq!(event_count, 1);
+    }
+
+    #[tokio::test]
+    async fn repo_release_deadline_recovery_expires_live_running_work_items() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-running-deadline").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-running-expired",
+                repo_id: 44,
+                repo_full_name: "octo/live-expired",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: "2000-01-01T00:00:00Z",
+                runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+                lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-running-expired",
+            "repo-work-running-expired",
+            "task-release-running-deadline",
+        )
+        .await;
+
+        let expired = expire_repo_release_deadlines(state.as_ref())
+            .await
+            .expect("expire release deadlines");
+        assert_eq!(expired, 1);
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            r#"
+            SELECT status, error_text, lease_heartbeat_at
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-running-expired")
+        .fetch_one(&pool)
+        .await
+        .expect("load expired running work item");
+        assert_eq!(row.0, jobs::STATUS_FAILED);
+        assert_eq!(row.1.as_deref(), Some(REPO_RELEASE_DEADLINE_EXPIRED_ERROR));
+        assert!(row.2.is_none());
+    }
+
+    #[tokio::test]
+    async fn repo_release_worker_finalization_enforces_expired_deadline() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-finalize-deadline").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-finalize-expired",
+                repo_id: 48,
+                repo_full_name: "octo/finalize-expired",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: "2000-01-01T00:00:00Z",
+                runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+                lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-finalize-expired",
+            "repo-work-finalize-expired",
+            "task-release-finalize-deadline",
+        )
+        .await;
+
+        process_repo_release_work_item(
+            state.clone(),
+            RepoReleaseWorkItemRow {
+                id: "repo-work-finalize-expired".to_owned(),
+                repo_id: 48,
+                repo_full_name: "octo/finalize-expired".to_owned(),
+                status: jobs::STATUS_RUNNING.to_owned(),
+                request_origin: RepoReleaseOrigin::System.as_str().to_owned(),
+                priority: RepoReleaseOrigin::System.priority(),
+                has_new_repo_watchers: 0,
+                deadline_at: "2000-01-01T00:00:00Z".to_owned(),
+                last_success_at: None,
+                started_at: Some("2026-03-06T00:00:00Z".to_owned()),
+            },
+        )
+        .await
+        .expect("process expired work item");
+
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT status, error_text
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-finalize-expired")
+        .fetch_one(&pool)
+        .await
+        .expect("load finalized expired work item");
+        assert_eq!(row.0, jobs::STATUS_FAILED);
+        assert_eq!(row.1.as_deref(), Some(REPO_RELEASE_DEADLINE_EXPIRED_ERROR));
+    }
+
+    #[tokio::test]
+    async fn repo_release_worker_finalization_ignores_later_claim_generation() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-generation",
+                repo_id: 50,
+                repo_full_name: "octo/new-generation",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: future_deadline.as_str(),
+                runtime_owner_id: Some(state.runtime_owner_id.as_str()),
+                lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET started_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind("2026-03-06T00:00:01Z")
+        .bind("repo-work-new-generation")
+        .execute(&pool)
+        .await
+        .expect("seed later claim generation");
+
+        process_repo_release_work_item(
+            state.clone(),
+            RepoReleaseWorkItemRow {
+                id: "repo-work-new-generation".to_owned(),
+                repo_id: 50,
+                repo_full_name: "octo/new-generation".to_owned(),
+                status: jobs::STATUS_RUNNING.to_owned(),
+                request_origin: RepoReleaseOrigin::System.as_str().to_owned(),
+                priority: RepoReleaseOrigin::System.priority(),
+                has_new_repo_watchers: 0,
+                deadline_at: future_deadline,
+                last_success_at: None,
+                started_at: Some("2026-03-06T00:00:00Z".to_owned()),
+            },
+        )
+        .await
+        .expect("stale worker finalization should be ignored");
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            r#"
+            SELECT status, error_text, started_at
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-new-generation")
+        .fetch_one(&pool)
+        .await
+        .expect("load later claim generation");
+        assert_eq!(row.0, jobs::STATUS_RUNNING);
+        assert!(row.1.is_none());
+        assert_eq!(row.2.as_deref(), Some("2026-03-06T00:00:01Z"));
+    }
+
+    #[tokio::test]
+    async fn repo_release_deadline_recovery_skips_refreshed_deadlines() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-refreshed-deadline",
+                repo_id: 47,
+                repo_full_name: "octo/refreshed-deadline",
+                status: jobs::STATUS_QUEUED,
+                deadline_at: future_deadline.as_str(),
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+
+        let expired = fail_repo_release_work_item(
+            state.as_ref(),
+            "repo-work-refreshed-deadline",
+            REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
+            chrono::Utc::now().to_rfc3339().as_str(),
+            true,
+        )
+        .await
+        .expect("skip refreshed deadline");
+        assert!(!expired);
+
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT status, error_text
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-refreshed-deadline")
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed deadline work item");
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert!(row.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_lease_recovery_keeps_runtime_lease_error_for_non_expired_work_items() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-stale-lease",
+                repo_id: 45,
+                repo_full_name: "octo/stale-lease",
+                status: jobs::STATUS_RUNNING,
+                deadline_at: future_deadline.as_str(),
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+
+        recover_repo_release_runtime_state_on_startup(state.as_ref())
+            .await
+            .expect("recover stale lease");
+
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            r#"
+            SELECT status, error_text
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-stale-lease")
+        .fetch_one(&pool)
+        .await
+        .expect("load stale lease work item");
+        assert_eq!(row.0, jobs::STATUS_FAILED);
+        assert_eq!(row.1.as_deref(), Some(runtime::RUNTIME_LEASE_EXPIRED_ERROR));
+    }
+
+    #[tokio::test]
+    async fn attach_release_demand_resets_terminal_deadline_when_requeueing_stale_cache() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let old = "2000-01-01T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-terminal-old-deadline")
+        .bind(46_i64)
+        .bind("octo/stale-cache")
+        .bind(jobs::STATUS_SUCCEEDED)
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind(0_i64)
+        .bind(old)
+        .bind(1_i64)
+        .bind(0_i64)
+        .bind(Some(old))
+        .bind(Option::<String>::None)
+        .bind(old)
+        .bind(Some(old))
+        .bind(Some(old))
+        .bind(old)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("seed terminal work item");
+
+        let attached = attach_release_demand(
+            state.as_ref(),
+            None,
+            None,
+            &[ReleaseDemandRepo {
+                repo_id: 46,
+                full_name: "octo/stale-cache".to_owned(),
+                is_new_repo: false,
+            }],
+            RepoReleaseOrigin::System,
+            "test",
+        )
+        .await
+        .expect("attach stale terminal demand");
+        assert_eq!(attached.queued, 1);
+
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT status, deadline_at
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-terminal-old-deadline")
+        .fetch_one(&pool)
+        .await
+        .expect("load requeued work item");
+
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert!(
+            row.1.as_str() > old,
+            "terminal work item should receive a fresh deadline when requeued"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_release_demand_expires_stale_queue_before_new_watcher() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-old-expired").await;
+        seed_sync_task(&state, "task-release-new-demand").await;
+        let old = "2000-01-01T00:00:00Z";
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-attach-expired",
+                repo_id: 49,
+                repo_full_name: "octo/attach-expired",
+                status: jobs::STATUS_QUEUED,
+                deadline_at: old,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-attach-old-expired",
+            "repo-work-attach-expired",
+            "task-release-old-expired",
+        )
+        .await;
+
+        let attached = attach_release_demand(
+            state.as_ref(),
+            Some("task-release-new-demand"),
+            None,
+            &[ReleaseDemandRepo {
+                repo_id: 49,
+                full_name: "octo/attach-expired".to_owned(),
+                is_new_repo: false,
+            }],
+            RepoReleaseOrigin::Interactive,
+            "test",
+        )
+        .await
+        .expect("attach new demand after expired queue");
+
+        assert_eq!(attached.queued, 1);
+        let row = sqlx::query_as::<_, (String, String, Option<String>)>(
+            r#"
+            SELECT status, deadline_at, error_text
+            FROM repo_release_work_items
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-attach-expired")
+        .fetch_one(&pool)
+        .await
+        .expect("load requeued work item");
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert!(row.1.as_str() > old);
+        assert!(row.2.is_none());
+
+        let watchers = sqlx::query_as::<_, (String, String, Option<String>)>(
+            r#"
+            SELECT task_id, status, error_text
+            FROM repo_release_watchers
+            WHERE work_item_id = ?
+            ORDER BY task_id ASC
+            "#,
+        )
+        .bind("repo-work-attach-expired")
+        .fetch_all(&pool)
+        .await
+        .expect("load watchers");
+        assert_eq!(watchers.len(), 2);
+        assert_eq!(watchers[0].0, "task-release-new-demand");
+        assert_eq!(watchers[0].1, "pending");
+        assert!(watchers[0].2.is_none());
+        assert_eq!(watchers[1].0, "task-release-old-expired");
+        assert_eq!(watchers[1].1, "failed");
+        assert_eq!(
+            watchers[1].2.as_deref(),
+            Some(REPO_RELEASE_DEADLINE_EXPIRED_ERROR)
+        );
+    }
+
+    #[tokio::test]
     async fn attach_and_wait_release_demand_reuses_fresh_cache_and_emits_progress() {
         let pool = setup_pool().await;
         let user_id = test_user_id("9");
@@ -9868,6 +11058,107 @@ mod tests {
                 "summary".to_owned(),
             ]
         );
+    }
+
+    struct RepoReleaseWorkSeed<'a> {
+        id: &'a str,
+        repo_id: i64,
+        repo_full_name: &'a str,
+        status: &'a str,
+        deadline_at: &'a str,
+        runtime_owner_id: Option<&'a str>,
+        lease_heartbeat_at: Option<&'a str>,
+    }
+
+    async fn seed_repo_release_work_item(pool: &SqlitePool, seed: RepoReleaseWorkSeed<'_>) {
+        let now = "2026-03-06T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id,
+              repo_id,
+              repo_full_name,
+              status,
+              request_origin,
+              priority,
+              has_new_repo_watchers,
+              deadline_at,
+              last_release_count,
+              last_candidate_failures,
+              last_success_at,
+              error_text,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              runtime_owner_id,
+              lease_heartbeat_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(seed.id)
+        .bind(seed.repo_id)
+        .bind(seed.repo_full_name)
+        .bind(seed.status)
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind(0_i64)
+        .bind(seed.deadline_at)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind((seed.status == jobs::STATUS_RUNNING).then_some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(seed.runtime_owner_id)
+        .bind(seed.lease_heartbeat_at)
+        .execute(pool)
+        .await
+        .expect("seed repo release work item");
+    }
+
+    async fn seed_repo_release_watcher(
+        pool: &SqlitePool,
+        watcher_id: &str,
+        work_item_id: &str,
+        task_id: &str,
+    ) {
+        let now = "2026-03-06T00:00:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_watchers (
+              id,
+              work_item_id,
+              task_id,
+              user_id,
+              origin,
+              priority,
+              reason,
+              is_new_repo,
+              status,
+              error_text,
+              created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(watcher_id)
+        .bind(work_item_id)
+        .bind(task_id)
+        .bind(Option::<String>::None)
+        .bind(RepoReleaseOrigin::System.as_str())
+        .bind(RepoReleaseOrigin::System.priority())
+        .bind("test")
+        .bind(0_i64)
+        .bind("pending")
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("seed repo release watcher");
     }
 
     async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {

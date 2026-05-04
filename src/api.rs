@@ -7657,7 +7657,7 @@ async fn fetch_feed_items(
             END AS subtitle,
             NULL AS reason,
             CASE e.kind
-              WHEN 'announcement' THEN 'release'
+              WHEN 'announcement' THEN 'discussion'
               WHEN 'repo_forked' THEN 'repository'
               ELSE NULL
             END AS subject_type,
@@ -18657,9 +18657,9 @@ line two",
                 repo_owner_avatar_url: None,
                 repo_open_graph_image_url: None,
                 repo_uses_custom_open_graph_image: None,
-                title: Some("Release v2.0.0"),
-                body: Some("- dashboard announcement"),
-                html_url: Some("https://github.com/openai/codex/releases/tag/v2.0.0"),
+                title: Some("Roadmap discussion announcement"),
+                body: Some("- dashboard discussion announcement"),
+                html_url: Some("https://github.com/openai/codex/discussions/42"),
                 actor_login: "maintainer",
                 occurred_at: "2026-02-23T11:00:00Z",
             },
@@ -18713,10 +18713,14 @@ line two",
                 "release",
             ]
         );
-        assert_eq!(feed.items[0].title.as_deref(), Some("Release v2.0.0"));
+        assert_eq!(
+            feed.items[0].title.as_deref(),
+            Some("Roadmap discussion announcement")
+        );
+        assert_eq!(feed.items[0].subject_type.as_deref(), Some("discussion"));
         assert_eq!(
             feed.items[0].html_url.as_deref(),
-            Some("https://github.com/openai/codex/releases/tag/v2.0.0")
+            Some("https://github.com/openai/codex/discussions/42")
         );
         assert_eq!(
             feed.items[0]
@@ -18796,6 +18800,18 @@ line two",
         .expect("list releases feed");
         assert_eq!(releases_only.items.len(), 1);
         assert_eq!(releases_only.items[0].kind, "release");
+
+        let announcements_only = list_feed(
+            State(state.clone()),
+            setup_session(1).await,
+            Query(FeedQuery {
+                cursor: None,
+                limit: Some(30),
+                types: Some("announcements".to_owned()),
+            }),
+        )
+        .await;
+        assert!(announcements_only.is_err());
     }
 
     #[tokio::test]
