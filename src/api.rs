@@ -828,6 +828,7 @@ pub struct SyncAutoFetchTaskItem {
     id: String,
     status: String,
     source: String,
+    skipped: bool,
     duration_ms: Option<i64>,
     created_at: String,
     started_at: Option<String>,
@@ -853,11 +854,13 @@ async fn load_recent_sync_auto_fetch_tasks(
             id,
             status,
             source,
+            result_json,
             created_at,
             started_at,
             finished_at
           FROM job_tasks
           WHERE task_type = ?
+            AND COALESCE(json_extract(result_json, '$.skipped'), 0) != 1
           ORDER BY created_at DESC, id DESC
           LIMIT 3
         ),
@@ -885,10 +888,11 @@ async fn load_recent_sync_auto_fetch_tasks(
           GROUP BY root_id
         )
         SELECT
-          root.id,
-          root.status,
-          root.source,
-          CASE
+            root.id,
+            root.status,
+            root.source,
+            COALESCE(json_extract(root.result_json, '$.skipped'), 0) = 1 AS skipped,
+            CASE
             WHEN rollup.unfinished_count = 0 AND rollup.chain_finished_at IS NOT NULL
               THEN CAST((julianday(rollup.chain_finished_at) - julianday(root.created_at)) * 86400000 AS INTEGER)
             ELSE NULL
@@ -2681,6 +2685,7 @@ pub struct AdminRealtimeTaskItem {
     task_type: String,
     status: String,
     source: String,
+    skipped: bool,
     requested_by: Option<String>,
     parent_task_id: Option<String>,
     cancel_requested: bool,
@@ -2774,6 +2779,7 @@ pub async fn admin_list_realtime_tasks(
           task_type,
           status,
           source,
+          COALESCE(json_extract(result_json, '$.skipped'), 0) = 1 AS skipped,
           requested_by,
           parent_task_id,
           cancel_requested,
@@ -14838,10 +14844,35 @@ mod tests {
             .execute(&pool)
             .await
             .expect("promote seeded user to admin");
-        for (task_id, status, created_at) in [
-            ("task-old-running", "running", "2026-02-26T01:00:00Z"),
-            ("task-new-failed", "failed", "2026-02-26T05:00:00Z"),
-            ("task-mid-succeeded", "succeeded", "2026-02-26T03:00:00Z"),
+        for (task_id, status, task_type, result_json, created_at) in [
+            (
+                "task-old-running",
+                "running",
+                "sync.releases",
+                "{}",
+                "2026-02-26T01:00:00Z",
+            ),
+            (
+                "task-new-failed",
+                "failed",
+                "sync.releases",
+                "{}",
+                "2026-02-26T05:00:00Z",
+            ),
+            (
+                "task-mid-succeeded",
+                "succeeded",
+                "sync.releases",
+                "{}",
+                "2026-02-26T03:00:00Z",
+            ),
+            (
+                "task-skipped-subscriptions",
+                "succeeded",
+                jobs::TASK_SYNC_SUBSCRIPTIONS,
+                r#"{"skipped":true,"skip_reason":"previous_run_active"}"#,
+                "2026-02-26T04:00:00Z",
+            ),
         ] {
             sqlx::query(
                 r#"
@@ -14861,12 +14892,14 @@ mod tests {
                   finished_at,
                   updated_at
                 )
-                VALUES (?, 'sync.releases', ?, 'tests', ?, NULL, '{}', '{}', NULL, 0, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'tests', ?, NULL, '{}', ?, NULL, 0, ?, ?, ?, ?)
                 "#,
             )
             .bind(task_id)
+            .bind(task_type)
             .bind(status)
             .bind(test_user_id(1))
+            .bind(result_json)
             .bind(created_at)
             .bind(created_at)
             .bind(created_at)
@@ -14902,8 +14935,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["task-new-failed", "task-mid-succeeded", "task-old-running"]
+            vec![
+                "task-new-failed",
+                "task-skipped-subscriptions",
+                "task-mid-succeeded",
+                "task-old-running"
+            ]
         );
+        let skipped_item = resp
+            .items
+            .iter()
+            .find(|item| item.id == "task-skipped-subscriptions")
+            .expect("skipped subscription task item");
+        assert!(skipped_item.skipped);
     }
 
     #[tokio::test]
@@ -21037,6 +21081,39 @@ echo should_not_be_in_excerpt
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
 
+        let skipped_task_id = crate::local_id::test_local_id("subscription-history-skipped");
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at
+            )
+            VALUES (?, ?, 'succeeded', 'scheduler', NULL, NULL, '{}', ?, NULL, 0, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(skipped_task_id.as_str())
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(r#"{"skipped":true,"skip_reason":"previous_run_active"}"#)
+        .bind("2026-04-27T08:40:00Z")
+        .bind("2026-04-27T08:40:01Z")
+        .bind("2026-04-27T08:40:01Z")
+        .bind("2026-04-27T08:40:01Z")
+        .execute(&pool)
+        .await
+        .expect("seed skipped subscription sync history");
+
         for (idx, task_id, started_at, finished_at) in [
             (
                 1,
@@ -21150,6 +21227,13 @@ echo should_not_be_in_excerpt
             .expect("load sync settings");
 
         assert_eq!(settings.recent_sync_tasks.len(), 3);
+        assert!(
+            settings
+                .recent_sync_tasks
+                .iter()
+                .all(|task| task.id != skipped_task_id)
+        );
+        assert!(settings.recent_sync_tasks.iter().all(|task| !task.skipped));
         assert_eq!(settings.recent_sync_tasks[0].id, newest_task_id);
         let duration_ms = settings.recent_sync_tasks[0].duration_ms.expect("duration");
         assert!((399_999..=400_000).contains(&duration_ms));

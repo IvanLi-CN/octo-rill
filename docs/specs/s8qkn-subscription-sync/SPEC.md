@@ -112,6 +112,7 @@
 - 该配置保存在 `admin_runtime_settings`，仅影响全局 `sync.subscriptions` 定时拉取，不影响账号访问状态。
 - 同一区域展示最近三次全局 `sync.subscriptions` 任务：
   - 来源为 `job_tasks.task_type = sync.subscriptions`
+  - 排除 `result_json.skipped = true` 的跳过记录
   - 不按用户过滤
   - 显示任务状态、链路完成时间、链路用时
   - 链路用时从根 `sync.subscriptions` 创建时间开始，到根任务及其直接触发的 `translate.release.batch` / `summarize.release.smart.batch` 子任务全部完成时结束
@@ -136,6 +137,7 @@
   - Inbox；
   - translation / smart preheat child tasks。
 - 每个阶段至少展示整体状态、完成/总量、最近关键事件；Release 阶段还应展示 worker 目标并发、成功/失败 repo、candidate failures 与超时/退避线索。
+- 当 `sync.subscriptions` 的业务结果为 `skipped=true` 时，详情页展示状态为“已跳过”；各阶段展示“已跳过/未执行”语义和跳过原因，不把 0/0 误判为“等待”。
 
 ### `sync.access_refresh`
 
@@ -231,7 +233,7 @@
 
 - Given 系统已有最近三次 `sync.subscriptions` 历史
   When 打开 Admin Jobs 定时任务页
-  Then 页面展示最近三次链路用时；点击用时项会打开对应的订阅同步详情页面。
+  Then 页面展示最近三次非跳过链路用时；点击用时项会打开对应的订阅同步详情页面。
 
 - Given 用户已经有旧缓存 Release
   When `sync.access_refresh` 发出 `star_refreshed`
@@ -272,6 +274,10 @@
 - Given 管理员打开 `/admin/jobs/subscriptions`
   When 页面加载完成
   Then 只展示订阅同步任务列表，且可从列表打开工作流详情并使用相同设置入口调整 Release worker 数量。
+
+- Given 某轮 `sync.subscriptions` 因上一轮仍在执行而被跳过
+  When 管理员打开该任务详情
+  Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时也不展示该跳过记录。
 
 ## Visual Evidence
 
@@ -353,3 +359,42 @@ evidence_note=验证列表页和详情语义共用的设置面板包含 Release 
 
 PR: include
 ![Subscription sync settings](./assets/subscription-sync-settings.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=default
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Skipped
+state=subscription-sync-detail-skipped
+evidence_note=验证被跳过的订阅同步详情页顶部与阶段总览均显示“已跳过”，不再把 0/0 阶段误标为“等待”。
+
+![Subscription sync skipped detail](./assets/subscription-sync-skipped-detail.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=default
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-settings-filtered-history
+evidence_note=验证配置弹窗最近链路用时只展示非跳过记录，被跳过记录不再作为左侧配置参考。
+
+![Subscription sync settings filtered history](./assets/subscription-sync-settings-filtered.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1440x1200
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Workflow
+state=subscription-sync-list-skipped-status
+evidence_note=验证订阅同步列表中底层 succeeded 但 `skipped=true` 的任务显示“已跳过”，不再显示“成功”。
+
+![Subscription sync list skipped status](./assets/subscription-sync-list-skipped-status.png)

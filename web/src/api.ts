@@ -247,6 +247,7 @@ export type SyncAutoFetchTaskItem = {
 	id: string;
 	status: string;
 	source: string;
+	skipped?: boolean;
 	duration_ms: number | null;
 	created_at: string;
 	started_at: string | null;
@@ -498,6 +499,7 @@ export type AdminRealtimeTaskItem = {
 	task_type: string;
 	status: string;
 	source: string;
+	skipped?: boolean;
 	requested_by: LocalUserId | null;
 	parent_task_id: string | null;
 	cancel_requested: boolean;

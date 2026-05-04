@@ -120,6 +120,20 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		updated_at: "2026-02-27T14:37:18Z",
 	},
 	{
+		id: "task-subscription-skipped",
+		task_type: "sync.subscriptions",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:25:00Z",
+		started_at: "2026-02-27T14:25:01Z",
+		finished_at: "2026-02-27T14:25:01Z",
+		updated_at: "2026-02-27T14:25:01Z",
+	},
+	{
 		id: "task-subscription-1420",
 		task_type: "sync.subscriptions",
 		status: "succeeded",
@@ -599,6 +613,114 @@ function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
 	if (task.task_type === "sync.subscriptions") {
+		if (task.id === "task-subscription-skipped") {
+			return {
+				task: {
+					...task,
+					payload_json: JSON.stringify({
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:25",
+					}),
+					result_json: JSON.stringify({
+						skipped: true,
+						skip_reason: "previous_run_active",
+						star: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							total_repos: 0,
+						},
+						release: {
+							total_repos: 0,
+							succeeded_repos: 0,
+							failed_repos: 0,
+							candidate_failures: 0,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 0,
+						critical_events: 0,
+					}),
+				},
+				events: [
+					{
+						id: "evt-task-skipped-1",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({
+							stage: "skipped",
+							schedule_key: "2026-02-27T14:25",
+							skip_reason: "previous_run_active",
+						}),
+						created_at: task.started_at ?? task.created_at,
+					},
+					{
+						id: "evt-task-skipped-2",
+						event_type: "task.completed",
+						payload_json: JSON.stringify({
+							status: task.status,
+							skipped: true,
+						}),
+						created_at: task.finished_at ?? task.updated_at,
+					},
+				],
+				diagnostics: {
+					business_outcome: {
+						code: "disabled",
+						label: "已跳过",
+						message: "上一轮订阅同步仍在执行，本轮仅记录跳过结果。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:25",
+						skipped: true,
+						skip_reason: "previous_run_active",
+						log_available: false,
+						log_download_path: null,
+						star: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							total_repos: 0,
+						},
+						release: {
+							total_repos: 0,
+							succeeded_repos: 0,
+							failed_repos: 0,
+							candidate_failures: 0,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 0,
+						critical_events: 0,
+						recent_events: [],
+					},
+				},
+			};
+		}
 		if (task.status === "running") {
 			return {
 				task: {
@@ -1123,12 +1245,14 @@ function AdminJobsPreview({
 			repo_release_worker_concurrency: 12,
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
+				.filter((item) => item.id !== "task-subscription-skipped")
 				.slice(0, 3)
 				.map((item) => ({
 					...item,
 					id: item.id,
 					status: item.status,
 					source: item.source,
+					skipped: item.id === "task-subscription-skipped",
 					duration_ms: syncSubscriptionChainFinishedAt[item.id]
 						? new Date(syncSubscriptionChainFinishedAt[item.id]).getTime() -
 							new Date(item.created_at).getTime()
@@ -1356,7 +1480,10 @@ function AdminJobsPreview({
 				const { pageItems, total } = paginate(rows, page, pageSize);
 				return new Response(
 					JSON.stringify({
-						items: pageItems,
+						items: pageItems.map((item) => ({
+							...item,
+							skipped: item.id === "task-subscription-skipped",
+						})),
 						page: Number(page ?? "1") || 1,
 						page_size: Number(pageSize ?? "20") || 20,
 						total,
@@ -1957,6 +2084,15 @@ export const SubscriptionSyncWorkflow: Story = {
 		).toBeVisible();
 		await expect(canvas.getByText("Release workers")).toBeVisible();
 		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
+		const skippedWorkflowCard = canvas
+			.getByText("ID: task-subscription-skipped")
+			.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+		await expect(
+			skippedWorkflowCard.locator("[data-slot='badge']").getByText("已跳过"),
+		).toBeVisible();
+		await expect(
+			skippedWorkflowCard.locator("[data-slot='badge']").getByText("成功"),
+		).toHaveCount(0);
 		await expect(canvas.getByText("Release")).toBeVisible();
 		await userEvent.click(
 			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
@@ -1997,6 +2133,37 @@ export const SubscriptionSyncDetail: Story = {
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/subscriptions/task-subscription-1430",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncDetailSkipped: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-skipped" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"被调度器跳过的订阅同步详情页：底层任务仍以 succeeded 收口，但页面显示为已跳过，阶段总览不再误标等待。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await expect(body.getAllByText("已跳过").length).toBeGreaterThanOrEqual(6);
+		await expect(body.getByText("上一轮仍在执行")).toBeVisible();
+		await expect(
+			body.queryByText("成功", { selector: "[data-slot='badge']" }),
+		).not.toBeInTheDocument();
+		await expect(body.queryByText("等待")).not.toBeInTheDocument();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions/task-subscription-skipped",
 			),
 		);
 	},
