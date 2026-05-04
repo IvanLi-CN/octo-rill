@@ -2086,13 +2086,13 @@ export const SubscriptionSyncWorkflow: Story = {
 		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
 		const skippedWorkflowCard = canvas
 			.getByText("ID: task-subscription-skipped")
-			.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
-		await expect(
-			skippedWorkflowCard.locator("[data-slot='badge']").getByText("已跳过"),
-		).toBeVisible();
-		await expect(
-			skippedWorkflowCard.locator("[data-slot='badge']").getByText("成功"),
-		).toHaveCount(0);
+			.closest("div.rounded-xl");
+		expect(skippedWorkflowCard).not.toBeNull();
+		const skippedWorkflowCardScope = within(skippedWorkflowCard as HTMLElement);
+		await expect(skippedWorkflowCardScope.getByText("已跳过")).toBeVisible();
+		expect(
+			skippedWorkflowCardScope.queryByText("成功"),
+		).not.toBeInTheDocument();
 		await expect(canvas.getByText("Release")).toBeVisible();
 		await userEvent.click(
 			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
