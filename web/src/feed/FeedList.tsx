@@ -27,6 +27,7 @@ export type FeedCardListProps = {
 	reactionBusyKeys: Set<string>;
 	reactionErrorByKey: Record<string, string>;
 	onToggleReaction: (item: FeedItem, content: ReactionContent) => void;
+	freshKeys?: Set<string>;
 };
 
 export function FeedItems(props: FeedCardListProps) {
@@ -43,6 +44,7 @@ export function FeedItems(props: FeedCardListProps) {
 		reactionBusyKeys,
 		reactionErrorByKey,
 		onToggleReaction,
+		freshKeys = new Set<string>(),
 	} = props;
 
 	return items.map((item) => {
@@ -53,7 +55,7 @@ export function FeedItems(props: FeedCardListProps) {
 		const isReactionBusy = reactionBusyKeys.has(key);
 		const reactionError = reactionErrorByKey[key] ?? null;
 		return (
-			<div key={key} ref={registerItemRef(item)}>
+			<div key={key} ref={registerItemRef(item)} data-feed-item-key={key}>
 				<FeedItemCard
 					item={item}
 					currentViewer={currentViewer}
@@ -62,6 +64,7 @@ export function FeedItems(props: FeedCardListProps) {
 					isSmartGenerating={isSmartGenerating}
 					isReactionBusy={isReactionBusy}
 					reactionError={reactionError}
+					isFresh={freshKeys.has(key)}
 					onSelectLane={(lane) => onSelectLane(item, lane)}
 					onTranslateNow={() => onTranslateNow(item)}
 					onSmartNow={() => onSmartNow(item)}
@@ -92,6 +95,7 @@ export function FeedList(
 		translationInFlightKeys,
 		smartInFlightKeys,
 		registerItemRef,
+		freshKeys,
 		onLoadMore,
 		onRetryInitial,
 		...feedCardProps
@@ -158,6 +162,7 @@ export function FeedList(
 				translationInFlightKeys={translationInFlightKeys}
 				smartInFlightKeys={smartInFlightKeys}
 				registerItemRef={registerItemRef}
+				freshKeys={freshKeys}
 				{...feedCardProps}
 			/>
 

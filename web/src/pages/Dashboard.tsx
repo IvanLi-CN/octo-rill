@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDownToLine } from "lucide-react";
 
 import { type MeResponse, ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import {
@@ -55,6 +56,10 @@ import {
 	type DashboardRouteState,
 } from "@/dashboard/routeState";
 import {
+	type DashboardLiveUpdateNotice,
+	useDashboardLiveUpdates,
+} from "@/dashboard/useDashboardLiveUpdates";
+import {
 	DashboardMobileControlBand,
 	type DashboardTab as Tab,
 	DashboardTabsList,
@@ -103,8 +108,145 @@ type SidebarBootstrapNotificationsError = {
 	cause: unknown;
 };
 
+type FeedLiveBoundaryNotice = DashboardLiveUpdateNotice & {
+	boundaryId: string;
+	boundaryKeys: string[];
+	boundaryAfterKey?: string | null;
+	hydrated?: boolean;
+	sealed?: boolean;
+};
+
+type DashboardLiveNoticeState = {
+	feed?: Partial<Record<FeedRequestType, FeedLiveBoundaryNotice[]>>;
+	briefs?: DashboardLiveUpdateNotice;
+	notifications?: DashboardLiveUpdateNotice;
+};
+
 function feedItemKey(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
+}
+
+function mergeDashboardLiveNotice(
+	current: DashboardLiveUpdateNotice | undefined,
+	incoming: DashboardLiveUpdateNotice,
+) {
+	if (!current) return incoming;
+	const latestKeys = Array.from(
+		new Set([...incoming.latestKeys, ...current.latestKeys]),
+	);
+	return {
+		...incoming,
+		newCount: latestKeys.length,
+		latestKeys,
+	};
+}
+
+function makeFeedBoundaryNotice(
+	notice: DashboardLiveUpdateNotice,
+	feedType: FeedRequestType,
+): FeedLiveBoundaryNotice {
+	const latestKeys = notice.latestKeys.slice(0, notice.newCount);
+	return {
+		...notice,
+		feedType,
+		boundaryId: `${feedType}:${notice.newCount}:${latestKeys.join("|")}`,
+		boundaryKeys: latestKeys,
+		latestKeys,
+	};
+}
+
+function mergeFeedBoundaryNotices(
+	currentFeedNotices: FeedLiveBoundaryNotice[],
+	incoming: FeedLiveBoundaryNotice,
+) {
+	if (
+		currentFeedNotices.some(
+			(currentNotice) => currentNotice.boundaryId === incoming.boundaryId,
+		)
+	) {
+		return currentFeedNotices;
+	}
+	const latestNotice = currentFeedNotices[0];
+	if (latestNotice && !latestNotice.sealed) {
+		const latestKeys = Array.from(
+			new Set([...incoming.latestKeys, ...latestNotice.latestKeys]),
+		);
+		const boundaryKeys = Array.from(
+			new Set([...incoming.boundaryKeys, ...latestNotice.boundaryKeys]),
+		);
+		return [
+			{
+				...latestNotice,
+				boundaryKeys,
+				boundaryAfterKey: undefined,
+				hydrated: true,
+				newCount: latestKeys.length,
+				latestKeys,
+			},
+			...currentFeedNotices.slice(1),
+		];
+	}
+	return [incoming, ...currentFeedNotices];
+}
+
+type FeedScrollAnchor = {
+	key: string;
+	top: number;
+};
+
+function captureFeedScrollAnchor(): FeedScrollAnchor | null {
+	if (typeof window === "undefined") return null;
+	const viewportTop = 88;
+	const viewportBottom = window.innerHeight;
+	const itemElements = Array.from(
+		document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+	);
+	for (const element of itemElements) {
+		const key = element.dataset.feedItemKey;
+		if (!key) continue;
+		const rect = element.getBoundingClientRect();
+		if (rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+		return { key, top: rect.top };
+	}
+	return null;
+}
+
+function restoreFeedScrollAnchor(anchor: FeedScrollAnchor | null) {
+	if (!anchor || typeof window === "undefined") return;
+	window.requestAnimationFrame(() => {
+		const element = document.querySelector<HTMLElement>(
+			`[data-feed-item-key="${CSS.escape(anchor.key)}"]`,
+		);
+		if (!element) return;
+		const delta = element.getBoundingClientRect().top - anchor.top;
+		if (Math.abs(delta) < 0.5) return;
+		window.scrollBy({ top: delta, behavior: "auto" });
+	});
+}
+
+function NewContentNotice(props: {
+	count: number;
+	label: string;
+	onReveal: () => void;
+}) {
+	const { count, label, onReveal } = props;
+	if (count <= 0) return null;
+	const countLabel = `${count} 条${label}`;
+	return (
+		<button
+			type="button"
+			className="dashboard-new-content-hint group mb-3 grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-1.5 text-left"
+			data-dashboard-new-content-notice="true"
+			onClick={onReveal}
+		>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
+				<ArrowDownToLine className="size-3.5" />
+				<span>刚刚同步 · {countLabel}</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
+	);
 }
 
 function resolveLaneForItem(
@@ -489,6 +631,16 @@ export function Dashboard(props: {
 	});
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
+	const [liveNotices, setLiveNotices] = useState<DashboardLiveNoticeState>({});
+	const activeFeedNotices = liveNotices.feed?.[feedRequestType] ?? [];
+	const activeFeedNotice = activeFeedNotices[0];
+	const hydratedFeedNoticeRef = useRef<Map<string, string>>(new Map());
+	const [freshBriefKeys, setFreshBriefKeys] = useState<Set<string>>(
+		() => new Set(),
+	);
+	const [freshNotificationKeys, setFreshNotificationKeys] = useState<
+		Set<string>
+	>(() => new Set());
 
 	const [selectedLaneByKey, setSelectedLaneByKey] = useState<
 		Record<string, FeedLane>
@@ -656,6 +808,7 @@ export function Dashboard(props: {
 		async (options?: {
 			background?: boolean;
 			includeNotifications?: boolean;
+			preferredBriefId?: string | null;
 		}) => {
 			if (!options?.background) {
 				setSidebarLoading(true);
@@ -689,6 +842,12 @@ export function Dashboard(props: {
 				const b = briefsResult.value;
 				setBriefs(b);
 				setSelectedBriefId((prev) => {
+					if (
+						options?.preferredBriefId &&
+						b.some((x) => x.id === options.preferredBriefId)
+					) {
+						return options.preferredBriefId;
+					}
 					if (prev && b.some((x) => x.id === prev)) return prev;
 					return b[0]?.id ?? null;
 				});
@@ -737,10 +896,290 @@ export function Dashboard(props: {
 		await Promise.all([
 			refreshFeed(),
 			refreshSidebar({
-				includeNotifications: hasDesktopSidebarInbox || tab === "inbox",
+				includeNotifications:
+					hasDesktopSidebarInbox ||
+					tab === "inbox" ||
+					notificationsBootstrapCompletedRef.current,
 			}),
 		]);
 	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, tab]);
+
+	const onDashboardLiveUpdate = useCallback(
+		(notices: DashboardLiveUpdateNotice[]) => {
+			setLiveNotices((current) => {
+				const next = { ...current };
+				for (const notice of notices) {
+					if (notice.list === "feed") {
+						const noticeFeedType = notice.feedType ?? feedRequestType;
+						const boundaryNotice = makeFeedBoundaryNotice(
+							notice,
+							noticeFeedType,
+						);
+						const currentFeedNotices = next.feed?.[noticeFeedType] ?? [];
+						next.feed = {
+							...next.feed,
+							[noticeFeedType]: mergeFeedBoundaryNotices(
+								currentFeedNotices,
+								boundaryNotice,
+							),
+						};
+						continue;
+					}
+					next[notice.list] = mergeDashboardLiveNotice(
+						next[notice.list],
+						notice,
+					);
+				}
+				return next;
+			});
+		},
+		[feedRequestType],
+	);
+	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
+		enabled: shellHydrated && !feed.loadingInitial,
+		feedType: feedRequestType,
+		includeBriefs: true,
+		includeNotifications:
+			hasDesktopSidebarInbox ||
+			tab === "inbox" ||
+			notificationsBootstrapCompletedRef.current,
+		onUpdate: onDashboardLiveUpdate,
+	});
+
+	const scrollToFreshFeedTop = useCallback((keys: string[]) => {
+		window.requestAnimationFrame(() => {
+			const itemElements = Array.from(
+				document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+			);
+			for (const key of keys) {
+				const element = itemElements.find(
+					(item) => item.dataset.feedItemKey === key,
+				);
+				if (!element) continue;
+				element.scrollIntoView({ block: "start", behavior: "smooth" });
+				return;
+			}
+		});
+	}, []);
+
+	const dismissFeedBoundary = useCallback(
+		(boundaryId: string) => {
+			hydratedFeedNoticeRef.current.delete(boundaryId);
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				const nextFeedNotices = currentFeedNotices.filter(
+					(notice) => notice.boundaryId !== boundaryId,
+				);
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: nextFeedNotices,
+					},
+				};
+			});
+		},
+		[feedRequestType],
+	);
+
+	const sealFeedBoundary = useCallback(
+		(boundaryId: string) => {
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				let changed = false;
+				const nextFeedNotices = currentFeedNotices.map((notice) => {
+					if (notice.boundaryId !== boundaryId || notice.sealed) {
+						return notice;
+					}
+					changed = true;
+					return { ...notice, sealed: true };
+				});
+				if (!changed) return current;
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: nextFeedNotices,
+					},
+				};
+			});
+		},
+		[feedRequestType],
+	);
+
+	const resolveFeedBoundary = useCallback(
+		(boundaryId: string, boundaryAfterKey: string | null) => {
+			setLiveNotices((current) => {
+				const feedByType = current.feed ?? {};
+				const currentFeedNotices = feedByType[feedRequestType] ?? [];
+				const target = currentFeedNotices.find(
+					(notice) => notice.boundaryId === boundaryId,
+				);
+				if (
+					!target ||
+					!target.hydrated ||
+					target.boundaryAfterKey !== undefined
+				) {
+					return current;
+				}
+				if (boundaryAfterKey === null) {
+					hydratedFeedNoticeRef.current.delete(boundaryId);
+					return {
+						...current,
+						feed: {
+							...feedByType,
+							[feedRequestType]: currentFeedNotices.filter(
+								(notice) => notice.boundaryId !== boundaryId,
+							),
+						},
+					};
+				}
+				return {
+					...current,
+					feed: {
+						...feedByType,
+						[feedRequestType]: currentFeedNotices.map((notice) =>
+							notice.boundaryId === boundaryId
+								? { ...notice, boundaryAfterKey }
+								: notice,
+						),
+					},
+				};
+			});
+		},
+		[feedRequestType],
+	);
+
+	const revealFeedUpdates = useCallback(
+		async (notice = activeFeedNotice) => {
+			if (!notice) return;
+			const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+			const hasHydratedFreshItems = feed.items.some((item) =>
+				freshKeys.includes(feedItemKey(item)),
+			);
+			if (!hasHydratedFreshItems) {
+				const nextFreshKeys = Array.from(
+					new Set([...feed.freshKeys, ...freshKeys]),
+				);
+				await refreshFeed({
+					freshKeys: nextFreshKeys,
+					throwOnError: true,
+				});
+			}
+			scrollToFreshFeedTop(freshKeys);
+			dismissFeedBoundary(notice.boundaryId);
+			await checkDashboardUpdates({ emit: false, include: ["feed"] });
+		},
+		[
+			activeFeedNotice,
+			checkDashboardUpdates,
+			dismissFeedBoundary,
+			feed.freshKeys,
+			feed.items,
+			refreshFeed,
+			scrollToFreshFeedTop,
+		],
+	);
+
+	useEffect(() => {
+		const notice = activeFeedNotice;
+		if (!notice || feed.loadingInitial) return;
+		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+		if (freshKeys.length === 0) return;
+		const hydratedKey = freshKeys.join("|");
+		if (hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey) {
+			return;
+		}
+		hydratedFeedNoticeRef.current.set(notice.boundaryId, hydratedKey);
+		const anchor = captureFeedScrollAnchor();
+		const nextFreshKeys = Array.from(
+			new Set([...feed.freshKeys, ...freshKeys]),
+		);
+		void refreshFeed({
+			freshKeys: nextFreshKeys,
+			throwOnError: true,
+		})
+			.then(() => {
+				restoreFeedScrollAnchor(anchor);
+				if (notice.boundaryKeys.length === 0) {
+					dismissFeedBoundary(notice.boundaryId);
+				} else {
+					setLiveNotices((current) => {
+						const feedByType = current.feed ?? {};
+						const currentFeedNotices = feedByType[feedRequestType] ?? [];
+						return {
+							...current,
+							feed: {
+								...feedByType,
+								[feedRequestType]: currentFeedNotices.map((item) =>
+									item.boundaryId === notice.boundaryId
+										? { ...item, hydrated: true }
+										: item,
+								),
+							},
+						};
+					});
+				}
+				void checkDashboardUpdates({ emit: false, include: ["feed"] });
+			})
+			.catch((error) => {
+				if (
+					hydratedFeedNoticeRef.current.get(notice.boundaryId) === hydratedKey
+				) {
+					hydratedFeedNoticeRef.current.delete(notice.boundaryId);
+				}
+				notifyGlobalError(
+					"新动态显示失败",
+					error,
+					"新动态显示失败，请稍后重试。",
+				);
+			});
+	}, [
+		activeFeedNotice,
+		checkDashboardUpdates,
+		dismissFeedBoundary,
+		feed.freshKeys,
+		feed.loadingInitial,
+		feedRequestType,
+		notifyGlobalError,
+		refreshFeed,
+	]);
+
+	const revealBriefUpdates = useCallback(async () => {
+		const notice = liveNotices.briefs;
+		if (!notice) return;
+		const freshKeys = notice.latestKeys.slice(0, notice.newCount);
+		const preferredBriefId =
+			freshKeys
+				.find((key) => key.startsWith("brief:"))
+				?.replace(/^brief:/, "") ?? null;
+		await refreshSidebar({
+			background: true,
+			includeNotifications: false,
+			preferredBriefId,
+		});
+		setFreshBriefKeys(new Set(freshKeys));
+		setLiveNotices((current) => ({ ...current, briefs: undefined }));
+		await checkDashboardUpdates({ emit: false, include: ["briefs"] });
+	}, [checkDashboardUpdates, liveNotices.briefs, refreshSidebar]);
+
+	const revealNotificationUpdates = useCallback(async () => {
+		const notice = liveNotices.notifications;
+		if (!notice) return;
+		await refreshNotifications({ background: true });
+		setFreshNotificationKeys(
+			new Set(notice.latestKeys.slice(0, notice.newCount)),
+		);
+		setLiveNotices((current) => ({ ...current, notifications: undefined }));
+		await checkDashboardUpdates({ emit: false, include: ["notifications"] });
+	}, [checkDashboardUpdates, liveNotices.notifications, refreshNotifications]);
+	const clearDashboardLiveNotices = useCallback(() => {
+		setLiveNotices({});
+		setFreshBriefKeys(new Set());
+		setFreshNotificationKeys(new Set());
+	}, []);
 
 	const ensureTaskWaiter = useCallback((taskId: string) => {
 		const existing = taskWaitersRef.current.get(taskId);
@@ -1114,6 +1553,8 @@ export function Dashboard(props: {
 				if (payload.status === "succeeded") {
 					try {
 						await refreshAll();
+						clearDashboardLiveNotices();
+						await checkDashboardUpdates({ emit: false });
 					} catch (error) {
 						const resolvedError =
 							error instanceof Error ? error : new Error(String(error));
@@ -1164,6 +1605,8 @@ export function Dashboard(props: {
 		};
 	}, [
 		accessTaskStream,
+		checkDashboardUpdates,
+		clearDashboardLiveNotices,
 		notifyGlobalError,
 		pushErrorToast,
 		refreshAll,
@@ -1219,6 +1662,8 @@ export function Dashboard(props: {
 					if (payload.status === "succeeded") {
 						try {
 							await refreshAll();
+							clearDashboardLiveNotices();
+							await checkDashboardUpdates({ emit: false });
 						} catch (error) {
 							const resolvedError =
 								error instanceof Error ? error : new Error(String(error));
@@ -1259,6 +1704,8 @@ export function Dashboard(props: {
 		pushErrorToast,
 		refreshTaskStreams,
 		refreshAll,
+		checkDashboardUpdates,
+		clearDashboardLiveNotices,
 		settleTaskWaiter,
 	]);
 
@@ -1575,13 +2022,15 @@ export function Dashboard(props: {
 			async () => {
 				await apiPost<BriefGenerateResponse>("/api/briefs/generate");
 				await refreshSidebar();
+				setLiveNotices((current) => ({ ...current, briefs: undefined }));
+				await checkDashboardUpdates({ emit: false, include: ["briefs"] });
 			},
 			{
 				errorTitle: "日报生成失败",
 				fallback: "日报生成失败，请稍后重试。",
 			},
 		);
-	}, [refreshSidebar, run]);
+	}, [checkDashboardUpdates, refreshSidebar, run]);
 	const onGenerateBriefForDate = useCallback(
 		async (date: string) => {
 			try {
@@ -1589,12 +2038,14 @@ export function Dashboard(props: {
 					date,
 				});
 				await refreshSidebar();
+				setLiveNotices((current) => ({ ...current, briefs: undefined }));
+				await checkDashboardUpdates({ emit: false, include: ["briefs"] });
 			} catch (error) {
 				notifyGlobalError("日报生成失败", error, "日报生成失败，请稍后重试。");
 				throw error;
 			}
 		},
-		[notifyGlobalError, refreshSidebar],
+		[checkDashboardUpdates, notifyGlobalError, refreshSidebar],
 	);
 	const onSyncInbox = useCallback(() => {
 		void run(
@@ -1807,6 +2258,7 @@ export function Dashboard(props: {
 					onSmartNow={onSmartNow}
 					reactionBusyKeys={reactionBusyKeys}
 					reactionErrorByKey={reactionErrorByKey}
+					freshKeys={feed.freshKeys}
 					onToggleReaction={onToggleReaction}
 					onOpenReleaseFromBrief={
 						mode === "all" ? onOpenReleaseDetail : undefined
@@ -1814,6 +2266,27 @@ export function Dashboard(props: {
 					onGenerateBriefForDate={
 						mode === "all" ? onGenerateBriefForDate : undefined
 					}
+					newContentBoundaries={activeFeedNotices.map((notice, index) => ({
+						id: notice.boundaryId,
+						count: notice.boundaryKeys.length,
+						label: "动态",
+						latestKeys: notice.boundaryKeys,
+						afterKey: notice.boundaryAfterKey,
+						isLatest: index === 0,
+						isSealed: notice.sealed,
+						onExitedViewport: dismissFeedBoundary,
+						onFreshAreaEntered: sealFeedBoundary,
+						onResolveAfterKey: resolveFeedBoundary,
+						onReveal: () => {
+							void revealFeedUpdates(notice).catch((error) => {
+								notifyGlobalError(
+									"新动态显示失败",
+									error,
+									"新动态显示失败，请稍后重试。",
+								);
+							});
+						},
+					}))}
 				/>
 			</>
 		);
@@ -2015,10 +2488,24 @@ export function Dashboard(props: {
 								{renderFeedPanel("followers")}
 							</TabsContent>
 							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<NewContentNotice
+									count={liveNotices.briefs?.newCount ?? 0}
+									label="日报"
+									onReveal={() => {
+										void revealBriefUpdates().catch((error) => {
+											notifyGlobalError(
+												"新日报显示失败",
+												error,
+												"新日报显示失败，请稍后重试。",
+											);
+										});
+									}}
+								/>
 								<ReleaseDailyCard
 									briefs={briefs}
 									selectedId={selectedBriefId}
 									busy={busy === "Generate brief"}
+									freshKeys={freshBriefKeys}
 									error={
 										briefsError?.phase === "initial"
 											? briefsError.message
@@ -2035,11 +2522,25 @@ export function Dashboard(props: {
 								/>
 							</TabsContent>
 							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<NewContentNotice
+									count={liveNotices.notifications?.newCount ?? 0}
+									label="Inbox 内容"
+									onReveal={() => {
+										void revealNotificationUpdates().catch((error) => {
+											notifyGlobalError(
+												"Inbox 新内容显示失败",
+												error,
+												"Inbox 新内容显示失败，请稍后重试。",
+											);
+										});
+									}}
+								/>
 								<InboxList
 									notifications={notifications}
 									loading={notificationsLoading}
 									busy={Boolean(busy)}
 									syncing={syncingInbox}
+									freshKeys={freshNotificationKeys}
 									error={
 										notificationsError?.phase === "initial"
 											? notificationsError.message
@@ -2059,12 +2560,31 @@ export function Dashboard(props: {
 									<BriefListCard
 										briefs={briefs}
 										selectedId={selectedBriefId}
+										freshKeys={freshBriefKeys}
 										onSelectId={(id) => setSelectedBriefId(id)}
 									/>
 								) : null}
 								{renderSidebarInbox ? (
 									<div data-dashboard-sidebar-inbox="true">
-										<InboxQuickList notifications={notifications} />
+										{tab !== "inbox" ? (
+											<NewContentNotice
+												count={liveNotices.notifications?.newCount ?? 0}
+												label="Inbox 内容"
+												onReveal={() => {
+													void revealNotificationUpdates().catch((error) => {
+														notifyGlobalError(
+															"Inbox 新内容显示失败",
+															error,
+															"Inbox 新内容显示失败，请稍后重试。",
+														);
+													});
+												}}
+											/>
+										) : null}
+										<InboxQuickList
+											notifications={notifications}
+											freshKeys={freshNotificationKeys}
+										/>
 									</div>
 								) : null}
 							</aside>
