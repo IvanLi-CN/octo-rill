@@ -2722,25 +2722,70 @@ type SubscriptionWorkflowStage = {
 	label: string;
 	description: string;
 	total: number;
+	succeeded: number;
 	done: number;
 	failed: number;
 	meta: Array<[string, string]>;
 };
 
-function progressPercent(done: number, total: number) {
-	if (total <= 0) return 0;
-	return Math.min(100, Math.round((done / total) * 100));
+const SUBSCRIPTION_PROGRESS_SEGMENT_TONES = {
+	succeeded: taskStatusTone("succeeded").dotClass,
+	failed: taskStatusTone("failed").dotClass,
+	pending: "bg-muted-foreground/35",
+} as const;
+
+function subscriptionProgressSegments(stage: SubscriptionWorkflowStage) {
+	if (stage.total <= 0) return [];
+	const succeeded = Math.max(0, Math.min(stage.succeeded, stage.total));
+	const failed = Math.max(0, Math.min(stage.failed, stage.total - succeeded));
+	const pending = Math.max(0, stage.total - succeeded - failed);
+	return [
+		{
+			key: "succeeded",
+			label: "成功",
+			value: succeeded,
+			className: SUBSCRIPTION_PROGRESS_SEGMENT_TONES.succeeded,
+		},
+		{
+			key: "failed",
+			label: "失败",
+			value: failed,
+			className: SUBSCRIPTION_PROGRESS_SEGMENT_TONES.failed,
+		},
+		{
+			key: "pending",
+			label: "剩余",
+			value: pending,
+			className: SUBSCRIPTION_PROGRESS_SEGMENT_TONES.pending,
+		},
+	].filter((segment) => segment.value > 0);
+}
+
+function subscriptionProgressSummary(stage: SubscriptionWorkflowStage) {
+	const segments = subscriptionProgressSegments(stage);
+	if (segments.length === 0) return `${stage.label} 阶段暂无结果数据`;
+	return `${stage.label} 阶段结果分布：${segments
+		.map((segment) => `${segment.label} ${formatCount(segment.value)}`)
+		.join("，")}`;
 }
 
 function subscriptionStageTone(
 	stage: SubscriptionWorkflowStage,
 ): TaskStatusTone {
-	if (stage.failed > 0) return taskStatusTone("failed");
 	if (stage.total > 0 && stage.done >= stage.total) {
+		if (stage.failed > 0) return taskStatusTone("failed");
 		return taskStatusTone("succeeded");
 	}
 	if (stage.done > 0) return taskStatusTone("running");
+	if (stage.failed > 0) return taskStatusTone("failed");
 	return taskStatusTone("queued");
+}
+
+function subscriptionStageStatusLabel(stage: SubscriptionWorkflowStage) {
+	if (stage.total > 0 && stage.done >= stage.total) return "完成";
+	if (stage.done > 0) return "运行中";
+	if (stage.failed > 0) return "部分失败";
+	return "等待";
 }
 
 function buildSubscriptionWorkflowStages(
@@ -2753,6 +2798,7 @@ function buildSubscriptionWorkflowStages(
 				label: "Collect",
 				description: "加载任务参数、调度键与目标用户。",
 				total: 0,
+				succeeded: 0,
 				done: 0,
 				failed: 0,
 				meta: [["状态", "等待诊断数据"]],
@@ -2776,6 +2822,7 @@ function buildSubscriptionWorkflowStages(
 			label: "Collect",
 			description: "确定触发来源、调度窗口与本轮工作集。",
 			total: diagnostics.star.total_users,
+			succeeded: diagnostics.star.total_users,
 			done: diagnostics.star.total_users,
 			failed: 0,
 			meta: [
@@ -2792,6 +2839,7 @@ function buildSubscriptionWorkflowStages(
 			label: "Star",
 			description: "逐用户同步 starred repos，生成可见仓库集合。",
 			total: diagnostics.star.total_users,
+			succeeded: diagnostics.star.succeeded_users,
 			done: starDone,
 			failed: diagnostics.star.failed_users,
 			meta: [
@@ -2803,13 +2851,14 @@ function buildSubscriptionWorkflowStages(
 		{
 			id: "repo",
 			label: "Repo Collect",
-			description: "聚合去重仓库，形成共享 release demand。",
-			total: diagnostics.star.total_repos,
+			description: "聚合去重仓库，形成共享 Release 抓取队列。",
+			total: diagnostics.release.total_repos,
+			succeeded: diagnostics.release.total_repos,
 			done: diagnostics.release.total_repos,
 			failed: 0,
 			meta: [
 				["输入仓库", formatCount(diagnostics.star.total_repos)],
-				["Release demand", formatCount(diagnostics.release.total_repos)],
+				["待抓取仓库", formatCount(diagnostics.release.total_repos)],
 			],
 		},
 		{
@@ -2817,20 +2866,23 @@ function buildSubscriptionWorkflowStages(
 			label: "Release Queue",
 			description: "由 release workers 抓取仓库 releases，304 可快速完成。",
 			total: diagnostics.release.total_repos,
+			succeeded: diagnostics.release.succeeded_repos,
 			done: releaseDone,
 			failed: diagnostics.release.failed_repos,
 			meta: [
 				["成功仓库", formatCount(diagnostics.release.succeeded_repos)],
 				["失败仓库", formatCount(diagnostics.release.failed_repos)],
-				["候选失败", formatCount(diagnostics.release.candidate_failures)],
+				["候选异常", formatCount(diagnostics.release.candidate_failures)],
 				["写入 Releases", formatCount(diagnostics.releases_written)],
 			],
 		},
 		{
 			id: "social",
 			label: "Social",
-			description: "同步社交事件，ReleaseEvent 会提升对应仓库 release demand。",
+			description:
+				"同步社交事件，ReleaseEvent 会优先触发对应仓库的 Release 抓取。",
 			total: diagnostics.social.total_users,
+			succeeded: diagnostics.social.succeeded_users,
 			done: socialDone,
 			failed: diagnostics.social.failed_users,
 			meta: [
@@ -2844,6 +2896,7 @@ function buildSubscriptionWorkflowStages(
 			label: "Notifications",
 			description: "同步 GitHub Inbox 通知线程并修复目标 URL。",
 			total: diagnostics.notifications.total_users,
+			succeeded: diagnostics.notifications.succeeded_users,
 			done: notificationsDone,
 			failed: diagnostics.notifications.failed_users,
 			meta: [
@@ -2887,6 +2940,7 @@ function SubscriptionWorkflowDetailPage(props: {
 	const recentFailures = diagnostics?.recent_events.filter(
 		(event) => event.severity === "error" || event.severity === "warning",
 	);
+	const failedStages = stages.filter((stage) => stage.failed > 0);
 
 	if (loading && !detail) {
 		return <LoadingMessage>正在加载订阅同步详情...</LoadingMessage>;
@@ -2980,6 +3034,33 @@ function SubscriptionWorkflowDetailPage(props: {
 				</div>
 			</div>
 
+			{failedStages.length > 0 ? (
+				<div className="rounded-lg border bg-card/70 px-3 py-2">
+					<div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+						<div className="min-w-0">
+							<p className="font-medium text-sm">失败焦点</p>
+							<p className="text-muted-foreground text-xs">
+								优先检查这些阶段的失败项与关键事件。
+							</p>
+						</div>
+						<div className="flex flex-wrap gap-2">
+							{failedStages.map((stage) => (
+								<a
+									key={stage.id}
+									href={`#subscription-stage-${stage.id}`}
+									className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs transition-colors hover:bg-muted"
+								>
+									<span>{stage.label}</span>
+									<span className="font-mono font-semibold">
+										{formatCount(stage.failed)}
+									</span>
+								</a>
+							))}
+						</div>
+					</div>
+				</div>
+			) : null}
+
 			<Card>
 				<CardHeader>
 					<CardTitle>阶段总览</CardTitle>
@@ -2990,62 +3071,76 @@ function SubscriptionWorkflowDetailPage(props: {
 				<CardContent className="space-y-3">
 					{stages.map((stage, index) => {
 						const stageTone = subscriptionStageTone(stage);
-						const percent = progressPercent(stage.done, stage.total);
+						const segments = subscriptionProgressSegments(stage);
+						const progressSummary = subscriptionProgressSummary(stage);
+						const stageMetrics = [
+							...stage.meta,
+							[
+								"工作项",
+								`${formatCount(stage.done)} / ${formatCount(stage.total)}`,
+							],
+							["失败", formatCount(stage.failed)],
+						] satisfies Array<[string, string]>;
 						return (
-							<div key={stage.id} className="rounded-lg border bg-card/70 p-3">
-								<div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+							<div
+								id={`subscription-stage-${stage.id}`}
+								key={stage.id}
+								className="scroll-mt-4 rounded-lg border bg-card/70 p-4"
+							>
+								<div className="grid gap-4 xl:grid-cols-[minmax(180px,220px)_minmax(0,1fr)]">
 									<div className="min-w-0 space-y-2">
 										<div className="flex flex-wrap items-center gap-2">
 											<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
 												{String(index + 1).padStart(2, "0")}
 											</span>
-											<p className="font-medium text-sm">{stage.label}</p>
 											<StatusBadge
-												label={
-													stage.failed > 0
-														? "部分失败"
-														: stage.total > 0 && stage.done >= stage.total
-															? "完成"
-															: stage.done > 0
-																? "运行中"
-																: "等待"
-												}
+												label={subscriptionStageStatusLabel(stage)}
 												tone={stageTone}
 											/>
 										</div>
-										<p className="text-muted-foreground text-xs">
-											{stage.description}
-										</p>
-										<div className="h-2 overflow-hidden rounded-full bg-muted">
-											<div
-												className="h-full rounded-full bg-primary"
-												style={{ width: `${percent}%` }}
-											/>
+										<div className="space-y-1">
+											<p className="font-medium text-sm">{stage.label}</p>
+											<p className="text-muted-foreground text-xs leading-relaxed">
+												{stage.description}
+											</p>
 										</div>
-										<div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-											{stage.meta.map(([label, value]) => (
+									</div>
+									<div className="min-w-0 space-y-3">
+										<div
+											className="flex h-2 overflow-hidden rounded-full bg-muted"
+											role="img"
+											aria-label={progressSummary}
+										>
+											{segments.length > 0 ? (
+												segments.map((segment) => (
+													<div
+														key={segment.key}
+														className={`h-full ${segment.className}`}
+														style={{
+															flexBasis: `${(segment.value / stage.total) * 100}%`,
+														}}
+														title={`${segment.label}: ${formatCount(segment.value)}`}
+													/>
+												))
+											) : (
+												<div className="h-full w-full bg-muted-foreground/20" />
+											)}
+										</div>
+										<div className="grid gap-2 [grid-template-columns:repeat(auto-fit,minmax(132px,1fr))]">
+											{stageMetrics.map(([label, value]) => (
 												<div
 													key={label}
-													className="rounded-md border bg-background/70 px-2.5 py-2"
+													className="grid min-h-12 content-between rounded-md bg-background/55 px-3 py-2"
 												>
 													<p className="text-muted-foreground text-[11px]">
 														{label}
 													</p>
-													<p className="mt-0.5 truncate font-mono text-xs font-semibold">
+													<p className="truncate font-mono text-xs font-semibold">
 														{value}
 													</p>
 												</div>
 											))}
 										</div>
-									</div>
-									<div className="min-w-[140px] rounded-md border bg-background/70 p-2 text-xs">
-										<p className="text-muted-foreground">工作项</p>
-										<p className="mt-1 font-mono font-semibold">
-											{formatCount(stage.done)} / {formatCount(stage.total)}
-										</p>
-										<p className="text-muted-foreground mt-1">
-											失败 {formatCount(stage.failed)}
-										</p>
 									</div>
 								</div>
 							</div>
@@ -4651,7 +4746,7 @@ export function JobManagement({
 										return (
 											<div
 												key={task.id}
-												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
 											>
 												<div className="min-w-0">
 													<div className="flex flex-wrap items-center gap-2">
@@ -4766,23 +4861,13 @@ export function JobManagement({
 
 				<TabsContent value="scheduled">
 					<Card>
-						<CardHeader className="flex flex-row items-start justify-between gap-4">
+						<CardHeader>
 							<div className="space-y-1.5">
 								<CardTitle>定时任务</CardTitle>
 								<CardDescription>
 									查看 `brief.daily_slot` 与 `sync.subscriptions` 运行记录。
 								</CardDescription>
 							</div>
-							<Button
-								type="button"
-								variant="outline"
-								size="icon"
-								aria-label="配置全局自动获取间隔"
-								onClick={openSyncSettingsDialog}
-								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
-							>
-								<Settings2 />
-							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -4822,7 +4907,7 @@ export function JobManagement({
 										return (
 											<div
 												key={task.id}
-												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
 											>
 												<div className="min-w-0">
 													<div className="flex flex-wrap items-center gap-2">
@@ -5037,28 +5122,28 @@ export function JobManagement({
 											return (
 												<div
 													key={task.id}
-													className={`rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90 ${tone.cardAccentClass}`}
+													className="rounded-xl border bg-card/70 p-5 transition-colors duration-200 hover:bg-card/90"
 												>
-													<div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-start">
-														<div className="min-w-0 space-y-4">
-															<div className="flex flex-wrap items-start justify-between gap-3">
-																<div className="min-w-0 space-y-2">
-																	<div className="flex flex-wrap items-center gap-2">
-																		<p className="font-medium text-base">
-																			订阅同步工作流
-																		</p>
-																		<StatusBadge
-																			label={taskStatusLabel(task.status)}
-																			tone={tone}
-																		/>
-																		<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
-																			{sourceLabel(task.source)}
-																		</span>
-																	</div>
-																	<p className="text-muted-foreground truncate font-mono text-[11px]">
-																		ID: {task.id}
+													<div className="grid gap-4">
+														<div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-start">
+															<div className="min-w-0 space-y-2">
+																<div className="flex flex-wrap items-center gap-2">
+																	<p className="font-medium text-base">
+																		订阅同步工作流
 																	</p>
+																	<StatusBadge
+																		label={taskStatusLabel(task.status)}
+																		tone={tone}
+																	/>
+																	<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
+																		{sourceLabel(task.source)}
+																	</span>
 																</div>
+																<p className="text-muted-foreground truncate font-mono text-[11px]">
+																	ID: {task.id}
+																</p>
+															</div>
+															<div className="flex flex-wrap items-center gap-2 lg:justify-end">
 																<div className="flex flex-wrap gap-1.5 text-xs">
 																	<span className="rounded bg-muted/60 px-2 py-0.5">
 																		创建 {formatLocalHm(task.created_at)}
@@ -5070,66 +5155,62 @@ export function JobManagement({
 																		完成 {formatLocalHm(task.finished_at)}
 																	</span>
 																</div>
-															</div>
-															<div className="grid w-full gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-6">
-																{[
-																	["Collect", "用户与调度键"],
-																	[
-																		"Star",
-																		diagnostics
-																			? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
-																			: "-",
-																	],
-																	[
-																		"Repo",
-																		diagnostics
-																			? `${diagnostics.star.total_repos}`
-																			: "-",
-																	],
-																	[
-																		"Release",
-																		diagnostics
-																			? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
-																			: "-",
-																	],
-																	[
-																		"Social",
-																		diagnostics
-																			? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
-																			: "-",
-																	],
-																	[
-																		"Inbox",
-																		diagnostics
-																			? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
-																			: "-",
-																	],
-																].map(([label, value]) => (
-																	<div
-																		key={label}
-																		className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
+																<Button variant="outline" asChild>
+																	<a
+																		href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
 																	>
-																		<p className="text-muted-foreground text-xs">
-																			{label}
-																		</p>
-																		<p className="mt-2 font-mono text-sm font-semibold">
-																			{value}
-																		</p>
-																	</div>
-																))}
+																		工作流详情
+																	</a>
+																</Button>
 															</div>
 														</div>
-														<Button
-															variant="outline"
-															className="xl:mt-1"
-															asChild
-														>
-															<a
-																href={`${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(task.id)}`}
-															>
-																工作流详情
-															</a>
-														</Button>
+														<div className="grid w-full grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+															{[
+																["Collect", "用户与调度键"],
+																[
+																	"Star",
+																	diagnostics
+																		? `${diagnostics.star.succeeded_users}/${diagnostics.star.total_users}`
+																		: "-",
+																],
+																[
+																	"Repo",
+																	diagnostics
+																		? `${diagnostics.star.total_repos}`
+																		: "-",
+																],
+																[
+																	"Release",
+																	diagnostics
+																		? `${diagnostics.release.succeeded_repos}/${diagnostics.release.total_repos}`
+																		: "-",
+																],
+																[
+																	"Social",
+																	diagnostics
+																		? `${diagnostics.social.succeeded_users}/${diagnostics.social.total_users}`
+																		: "-",
+																],
+																[
+																	"Inbox",
+																	diagnostics
+																		? `${diagnostics.notifications.succeeded_users}/${diagnostics.notifications.total_users}`
+																		: "-",
+																],
+															].map(([label, value]) => (
+																<div
+																	key={label}
+																	className="min-h-[74px] rounded-lg border bg-background/70 px-4 py-3"
+																>
+																	<p className="text-muted-foreground text-xs">
+																		{label}
+																	</p>
+																	<p className="mt-2 font-mono text-sm font-semibold">
+																		{value}
+																	</p>
+																</div>
+															))}
+														</div>
 													</div>
 												</div>
 											);
@@ -5294,7 +5375,7 @@ export function JobManagement({
 										return (
 											<div
 												key={call.id}
-												className={`bg-card/70 flex flex-col gap-3 rounded-lg border border-l-4 p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between ${tone.cardAccentClass}`}
+												className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 transition-colors duration-200 hover:bg-card/90 lg:flex-row lg:items-center lg:justify-between"
 											>
 												<div className="min-w-0">
 													<div className="flex flex-wrap items-center gap-2">
@@ -5415,7 +5496,7 @@ export function JobManagement({
 				>
 					<DialogHeader>
 						<div className="flex items-center gap-2">
-							<DialogTitle>配置全局自动获取间隔</DialogTitle>
+							<DialogTitle>配置订阅同步</DialogTitle>
 							<Tooltip open={syncSettingsHelpTooltipsOpen ? true : undefined}>
 								<TooltipTrigger asChild>
 									<Button
@@ -5425,7 +5506,7 @@ export function JobManagement({
 										className="text-muted-foreground size-7 rounded-full"
 									>
 										<CircleHelp className="size-4" />
-										<span className="sr-only">全局自动获取间隔说明</span>
+										<span className="sr-only">订阅同步配置说明</span>
 									</Button>
 								</TooltipTrigger>
 								<TooltipContent
@@ -5444,8 +5525,8 @@ export function JobManagement({
 							</Tooltip>
 						</div>
 						<DialogDescription className="sr-only">
-							保存后立即生效；该间隔只控制 `sync.subscriptions`
-							定时拉取，不关联账号访问状态。
+							保存后立即生效；配置只作用于 `sync.subscriptions` 的定时拉取间隔与
+							release worker 数量。
 						</DialogDescription>
 					</DialogHeader>
 
@@ -5509,16 +5590,16 @@ export function JobManagement({
 									aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
 									className="h-2 w-full cursor-pointer accent-primary"
 								/>
-								<div className="relative h-8 text-[11px] text-muted-foreground">
+								<div className="relative h-11 text-[11px] text-muted-foreground">
 									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
 										<button
 											key={mark}
 											type="button"
-											className="-translate-x-1/2 absolute top-0 flex flex-col items-center gap-1 transition-colors hover:text-foreground"
+											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
 											style={{ left: syncIntervalMarkPosition(mark) }}
 											onClick={() => setSyncAutoFetchIntervalInput(mark)}
 										>
-											<span className="h-1.5 w-px bg-border" />
+											<span className="mt-1 h-1.5 w-px bg-border" />
 											<span>{mark}</span>
 										</button>
 									))}
@@ -5572,18 +5653,18 @@ export function JobManagement({
 									aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 个 Release worker`}
 									className="h-2 w-full cursor-pointer accent-primary"
 								/>
-								<div className="relative h-8 text-[11px] text-muted-foreground">
+								<div className="relative h-11 text-[11px] text-muted-foreground">
 									{REPO_RELEASE_WORKER_MARKS.map((mark) => (
 										<button
 											key={mark}
 											type="button"
-											className="-translate-x-1/2 absolute top-0 flex flex-col items-center gap-1 transition-colors hover:text-foreground"
+											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
 											style={{
 												left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
 											}}
 											onClick={() => setRepoReleaseWorkerConcurrencyInput(mark)}
 										>
-											<span className="h-1.5 w-px bg-border" />
+											<span className="mt-1 h-1.5 w-px bg-border" />
 											<span>{mark}</span>
 										</button>
 									))}
