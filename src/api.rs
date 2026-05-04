@@ -1037,21 +1037,28 @@ pub async fn me_patch_profile(
 #[derive(Debug, Serialize)]
 pub struct SyncRuntimeConfigResponse {
     sync_auto_fetch_interval_minutes: i64,
+    repo_release_worker_concurrency: usize,
     recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SyncRuntimeConfigPatchRequest {
     sync_auto_fetch_interval_minutes: i64,
+    repo_release_worker_concurrency: Option<i64>,
 }
 
 async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigResponse, ApiError> {
     let interval = admin_runtime::load_sync_auto_fetch_interval_minutes(&state.pool)
         .await
         .map_err(ApiError::internal)?;
+    let repo_release_worker_concurrency =
+        admin_runtime::load_repo_release_worker_concurrency(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
 
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
+        repo_release_worker_concurrency,
         recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
     })
 }
@@ -1065,6 +1072,13 @@ async fn persist_sync_runtime_config(
             "sync_auto_fetch_interval_minutes must be between 1 and 120",
         ));
     }
+    if let Some(concurrency) = req.repo_release_worker_concurrency
+        && !(1..=32).contains(&concurrency)
+    {
+        return Err(ApiError::bad_request(
+            "repo_release_worker_concurrency must be between 1 and 32",
+        ));
+    }
 
     admin_runtime::update_sync_auto_fetch_interval_minutes(
         &state.pool,
@@ -1072,6 +1086,11 @@ async fn persist_sync_runtime_config(
     )
     .await
     .map_err(ApiError::internal)?;
+    if let Some(concurrency) = req.repo_release_worker_concurrency {
+        admin_runtime::update_repo_release_worker_concurrency(&state.pool, concurrency)
+            .await
+            .map_err(ApiError::internal)?;
+    }
 
     load_sync_runtime_config(state).await
 }
@@ -7184,6 +7203,7 @@ fn parse_cursor(cursor: &str) -> Result<(String, i64, String), ApiError> {
 fn feed_kind_rank(kind: &str) -> Option<i64> {
     match kind {
         "release" => Some(5),
+        "release_update" => Some(4),
         "announcement" => Some(4),
         "repo_forked" => Some(3),
         "repo_star_received" => Some(2),
@@ -7629,6 +7649,7 @@ async fn fetch_feed_items(
             e.kind AS kind,
             CASE e.kind
               WHEN 'announcement' THEN 4
+              WHEN 'release_update' THEN 4
               WHEN 'repo_forked' THEN 3
               WHEN 'repo_star_received' THEN 2
               WHEN 'follower_received' THEN 1
@@ -7652,12 +7673,14 @@ async fn fetch_feed_items(
             e.title AS title,
             CASE e.kind
               WHEN 'announcement' THEN '仓库公告'
+              WHEN 'release_update' THEN 'Release'
               WHEN 'repo_forked' THEN 'Fork'
               ELSE NULL
             END AS subtitle,
             NULL AS reason,
             CASE e.kind
               WHEN 'announcement' THEN 'discussion'
+              WHEN 'release_update' THEN 'release'
               WHEN 'repo_forked' THEN 'repository'
               ELSE NULL
             END AS subject_type,
@@ -7720,7 +7743,7 @@ async fn fetch_feed_items(
           (? = 1 AND i.kind = 'release')
           OR (? = 1 AND i.kind = 'repo_star_received')
           OR (? = 1 AND i.kind = 'follower_received')
-          OR (? = 1 AND i.kind IN ('announcement', 'repo_forked'))
+          OR (? = 1 AND i.kind IN ('announcement', 'release_update', 'repo_forked'))
         )
           AND (
             ? = 0
@@ -20911,25 +20934,28 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: 10,
+                repo_release_worker_concurrency: Some(12),
             },
         )
         .await
         .expect("sync settings update should succeed");
 
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
+        assert_eq!(settings.repo_release_worker_concurrency, 12);
 
-        let interval = sqlx::query_scalar::<_, i64>(
+        let row = sqlx::query_as::<_, (i64, i64)>(
             r#"
-            SELECT sync_auto_fetch_interval_minutes
+            SELECT sync_auto_fetch_interval_minutes, repo_release_worker_concurrency
             FROM admin_runtime_settings
             WHERE id = 1
             "#,
         )
         .fetch_one(&pool)
         .await
-        .expect("load sync auto fetch interval");
+        .expect("load sync runtime config");
 
-        assert_eq!(interval, 10);
+        assert_eq!(row.0, 10);
+        assert_eq!(row.1, 12);
     }
 
     #[tokio::test]
@@ -20942,6 +20968,7 @@ echo should_not_be_in_excerpt
                 state.as_ref(),
                 super::SyncRuntimeConfigPatchRequest {
                     sync_auto_fetch_interval_minutes: interval,
+                    repo_release_worker_concurrency: None,
                 },
             )
             .await
@@ -20953,6 +20980,44 @@ echo should_not_be_in_excerpt
                     .contains("sync_auto_fetch_interval_minutes must be between 1 and 120")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn persist_sync_runtime_config_rejects_worker_concurrency_without_partial_update() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let err = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: 10,
+                repo_release_worker_concurrency: Some(33),
+            },
+        )
+        .await
+        .expect_err("sync settings update should reject invalid worker count");
+
+        assert_eq!(err.code(), "bad_request");
+        assert!(
+            err.to_string()
+                .contains("repo_release_worker_concurrency must be between 1 and 32")
+        );
+
+        let row = sqlx::query_as::<_, (i64, i64)>(
+            r#"
+            SELECT sync_auto_fetch_interval_minutes, repo_release_worker_concurrency
+            FROM admin_runtime_settings
+            WHERE id = 1
+            "#,
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("load sync runtime config");
+
+        assert!(
+            row.is_none(),
+            "invalid patch must not seed or mutate settings"
+        );
     }
 
     #[tokio::test]

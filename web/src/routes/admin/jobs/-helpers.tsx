@@ -11,6 +11,7 @@ import {
 	ADMIN_JOBS_BASE_PATH,
 	ADMIN_JOBS_LLM_PATH,
 	ADMIN_JOBS_SCHEDULED_PATH,
+	ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	ADMIN_JOBS_TRANSLATIONS_PATH,
 } from "@/admin/jobsRouteState";
 import { AdminJobs } from "@/pages/AdminJobs";
@@ -69,8 +70,10 @@ export function AdminJobsRoutePage(props: {
 	search: AdminJobsSearchInput;
 	taskId?: string;
 	llmCallId?: string;
+	subscriptionDetailTaskId?: string;
 }) {
-	const { primaryTab, search, taskId, llmCallId } = props;
+	const { primaryTab, search, taskId, llmCallId, subscriptionDetailTaskId } =
+		props;
 	const auth = useAuthBootstrap();
 	const me = useRequiredAdmin();
 	const router = useRouter();
@@ -81,8 +84,9 @@ export function AdminJobsRoutePage(props: {
 				search,
 				taskId,
 				llmCallId,
+				subscriptionDetailTaskId,
 			}),
-		[llmCallId, primaryTab, search, taskId],
+		[llmCallId, primaryTab, search, subscriptionDetailTaskId, taskId],
 	);
 	const canonicalSearch = useMemo(
 		() => buildAdminJobsCanonicalSearch(routeState),
@@ -143,6 +147,7 @@ export function AdminJobsRoutePage(props: {
 export const ADMIN_JOBS_ROUTE_PATHS = {
 	realtime: ADMIN_JOBS_BASE_PATH,
 	scheduled: ADMIN_JOBS_SCHEDULED_PATH,
+	subscriptions: ADMIN_JOBS_SUBSCRIPTIONS_PATH,
 	llm: ADMIN_JOBS_LLM_PATH,
 	translations: ADMIN_JOBS_TRANSLATIONS_PATH,
 } as const;

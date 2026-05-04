@@ -1568,6 +1568,7 @@ test("admin can manage jobs center", async ({ page }) => {
 
 	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
 	const scheduledTab = page.getByRole("tab", { name: "定时任务" });
+	const subscriptionsTab = page.getByRole("tab", { name: "订阅同步" });
 	const llmTab = page.getByRole("tab", { name: "LLM调度" });
 
 	await expect(page).toHaveURL(/\/admin\/jobs$/);
@@ -1647,7 +1648,6 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
 	await expect(page.getByText("定时日报")).toBeVisible();
-	await expect(page.getByText("订阅同步")).toBeVisible();
 	await expect(
 		page.getByText("sync.subscriptions", { exact: true }),
 	).toBeVisible();
@@ -1657,6 +1657,7 @@ test("admin can manage jobs center", async ({ page }) => {
 	const subscriptionTaskCard = page
 		.getByText("ID: task-subscriptions-1")
 		.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
+	await expect(subscriptionTaskCard.getByText("订阅同步")).toBeVisible();
 	await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
 	await expect(
 		page.getByText("task-subscriptions-1", { exact: true }),
@@ -1673,6 +1674,33 @@ test("admin can manage jobs center", async ({ page }) => {
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/scheduled$/);
 	await expect(page.getByText("执行时间配置（24小时槽）")).toHaveCount(0);
+
+	await subscriptionsTab.click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
+	await expect(subscriptionsTab).toHaveAttribute("aria-selected", "true");
+	const subscriptionWorkflowCard = page
+		.getByText("ID: task-subscriptions-1")
+		.locator("xpath=ancestor::div[.//a[normalize-space()='工作流详情']][1]");
+	await subscriptionWorkflowCard
+		.getByRole("link", { name: "工作流详情" })
+		.click();
+	await expect(page).toHaveURL(
+		/\/admin\/jobs\/subscriptions\/task-subscriptions-1$/,
+	);
+	await expect(
+		page.getByRole("heading", { name: "订阅同步工作流详情" }),
+	).toBeVisible();
+	await expect(
+		page.locator("#subscription-stage-release").getByText("Release Queue"),
+	).toBeVisible();
+	await expect(
+		page.getByText("octo/private-repo · attempt 1 · terminal"),
+	).toBeVisible();
+	await expect(
+		page.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+	).toBeVisible();
+	await page.getByRole("button", { name: "返回订阅同步列表" }).click();
+	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
 
 	await llmTab.click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/llm$/);
@@ -2362,22 +2390,16 @@ test.describe("localized admin diagnostics timestamps", () => {
 		page,
 	}) => {
 		await installAdminJobsMocks(page);
-		await page.goto("/admin/jobs");
+		await page.goto("/admin/jobs/subscriptions/task-subscriptions-1");
 
-		const scheduledTab = page.getByRole("tab", { name: "定时任务" });
-		await scheduledTab.click();
-		await expect(scheduledTab).toHaveAttribute("aria-selected", "true");
-
-		const subscriptionTaskCard = page
-			.getByText("ID: task-subscriptions-1")
-			.locator("xpath=ancestor::div[.//button[normalize-space()='详情']][1]");
-		await subscriptionTaskCard.getByRole("button", { name: "详情" }).click();
-
+		await expect(
+			page.getByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
 		await expect(page.getByText("最近关键事件", { exact: true })).toBeVisible();
+		await expect(page.getByText("02/26, 22:31:40")).toBeVisible();
 		await expect(
 			page.getByText(
-				"2026-02-26 22:31:40 · 用户 #4h6p9s3t5z8e2x4c · octo/private-repo · attempt 1",
-				{ exact: true },
+				"release sync candidate failed for octo/private-repo with user #4h6p9s3t5z8e2x4c",
 			),
 		).toBeVisible();
 	});

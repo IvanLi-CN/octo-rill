@@ -37,6 +37,7 @@ Response shape:
 ```json
 {
   "sync_auto_fetch_interval_minutes": 10,
+  "repo_release_worker_concurrency": 5,
   "recent_sync_tasks": [
     {
       "id": "task_xxx",
@@ -54,6 +55,8 @@ Response shape:
 Notes:
 
 - `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`.
+- `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
+- `repo_release_worker_concurrency` controls active shared repo release worker slots only; it does not change `sync.subscriptions` scheduler cadence.
 - `recent_sync_tasks` returns the newest three `sync.subscriptions` tasks.
 - `duration_ms` is the chain duration from the root `sync.subscriptions.created_at` to the latest finished time among the root task and direct child `translate.release.batch` / `summarize.release.smart.batch` tasks.
 - `finished_at` is the same chain completion time; `duration_ms` and `finished_at` are `null` until the root and those direct child tasks all have `finished_at`.
@@ -64,16 +67,43 @@ Request shape:
 
 ```json
 {
-  "sync_auto_fetch_interval_minutes": 10
+  "sync_auto_fetch_interval_minutes": 10,
+  "repo_release_worker_concurrency": 16
 }
 ```
 
 Behavior:
 
 - `sync_auto_fetch_interval_minutes` must be between `1` and `120`.
+- `repo_release_worker_concurrency`, when present, must be between `1` and `32`.
 - The response uses the same shape as `GET /api/admin/jobs/sync/runtime-config`.
 - Task detail links reuse `GET /api/admin/jobs/realtime/{task_id}`.
 - Response shape matches the admin realtime task detail contract used by Admin Jobs.
+
+## `GET /api/admin/jobs/realtime?task_type=sync.subscriptions`
+
+Behavior:
+
+- Admin only.
+- Returns the existing paginated task list shape, filtered to `sync.subscriptions`.
+- Used by `/admin/jobs/subscriptions` to show all subscription sync runs regardless of scheduler/manual/retry source.
+
+## `/admin/jobs/subscriptions`
+
+Route behavior:
+
+- Admin-only SPA route.
+- Shows `sync.subscriptions` runs as a workflow list.
+- Links each run to `/admin/jobs/subscriptions/{task_id}`.
+- Shares `GET/PATCH /api/admin/jobs/sync/runtime-config` with the scheduled tab for the settings button.
+
+## `/admin/jobs/subscriptions/{task_id}`
+
+Route behavior:
+
+- Admin-only SPA route.
+- Uses `GET /api/admin/jobs/realtime/{task_id}` for the workflow detail data.
+- Renders a full-page workflow view with stage progress, worker/work-item summaries, failure causes, recent events, related child/LLM work, and the same runtime settings entry as the list page.
 
 ## `GET /api/tasks/{task_id}/events`
 

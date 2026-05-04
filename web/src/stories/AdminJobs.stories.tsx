@@ -92,6 +92,20 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		updated_at: "2026-02-27T06:03:24Z",
 	},
 	{
+		id: "task-subscription-1440",
+		task_type: "sync.subscriptions",
+		status: "running",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:40:00Z",
+		started_at: "2026-02-27T14:40:02Z",
+		finished_at: null,
+		updated_at: "2026-02-27T14:42:45Z",
+	},
+	{
 		id: "task-subscription-1430",
 		task_type: "sync.subscriptions",
 		status: "succeeded",
@@ -585,6 +599,176 @@ function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
 	if (task.task_type === "sync.subscriptions") {
+		if (task.status === "running") {
+			return {
+				task: {
+					...task,
+					payload_json: JSON.stringify({
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:40",
+					}),
+					result_json: JSON.stringify({
+						skipped: false,
+						skip_reason: null,
+						star: {
+							total_users: 12,
+							succeeded_users: 11,
+							failed_users: 1,
+							total_repos: 340,
+						},
+						release: {
+							total_repos: 128,
+							succeeded_repos: 58,
+							failed_repos: 2,
+							candidate_failures: 3,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 680,
+						critical_events: 2,
+					}),
+				},
+				events: [
+					{
+						id: "evt-task-1440-1",
+						event_type: "task.created",
+						payload_json: JSON.stringify({ source: task.source }),
+						created_at: task.created_at,
+					},
+					{
+						id: "evt-task-1440-2",
+						event_type: "task.running",
+						payload_json: JSON.stringify({}),
+						created_at: task.started_at ?? task.created_at,
+					},
+					{
+						id: "evt-task-1440-3",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({ stage: "collect", total_users: 12 }),
+						created_at: "2026-02-27T14:40:03Z",
+					},
+					{
+						id: "evt-task-1440-4",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({
+							stage: "star_summary",
+							total_users: 12,
+							succeeded_users: 11,
+							failed_users: 1,
+							total_repos: 340,
+						}),
+						created_at: "2026-02-27T14:40:39Z",
+					},
+					{
+						id: "evt-task-1440-5",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({
+							stage: "repo_collect",
+							total_repos: 128,
+						}),
+						created_at: "2026-02-27T14:40:45Z",
+					},
+					{
+						id: "evt-task-1440-6",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({
+							stage: "release_attached",
+							total_repos: 128,
+							succeeded_repos: 58,
+							failed_repos: 2,
+							releases_written: 680,
+						}),
+						created_at: "2026-02-27T14:42:45Z",
+					},
+				],
+				diagnostics: {
+					business_outcome: {
+						code: "unknown",
+						label: "处理中",
+						message: "任务正在 Release Queue 阶段执行，后续阶段尚未开始。",
+					},
+					sync_subscriptions: {
+						trigger: "schedule",
+						schedule_key: "2026-02-27T14:40",
+						skipped: false,
+						skip_reason: null,
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-subscription-1440/log",
+						star: {
+							total_users: 12,
+							succeeded_users: 11,
+							failed_users: 1,
+							total_repos: 340,
+						},
+						release: {
+							total_repos: 128,
+							succeeded_repos: 58,
+							failed_repos: 2,
+							candidate_failures: 3,
+						},
+						social: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							repo_stars: 0,
+							followers: 0,
+							events: 0,
+						},
+						notifications: {
+							total_users: 0,
+							succeeded_users: 0,
+							failed_users: 0,
+							notifications: 0,
+						},
+						releases_written: 680,
+						critical_events: 2,
+						recent_events: [
+							{
+								id: "evt-sync-1440-2",
+								stage: "release",
+								event_type: "github_timeout",
+								severity: "warning",
+								recoverable: true,
+								attempt: 1,
+								user_id: RECENT_EVENT_USER_ID,
+								repo_id: 9020,
+								repo_full_name: "octo/slow-release-repo",
+								message:
+									"release sync candidate timed out for octo/slow-release-repo",
+								created_at: "2026-02-27T14:42:20Z",
+							},
+							{
+								id: "evt-sync-1440-1",
+								stage: "release",
+								event_type: "release_attached",
+								severity: "info",
+								recoverable: true,
+								attempt: 1,
+								user_id: null,
+								repo_id: null,
+								repo_full_name: null,
+								message:
+									"128 repositories attached to shared Release Queue; Social and Notifications are waiting",
+								created_at: "2026-02-27T14:40:45Z",
+							},
+						],
+					},
+				},
+			};
+		}
 		return {
 			task: {
 				...task,
@@ -642,7 +826,7 @@ function buildTaskDetail(
 					id: "evt-task-1003",
 					event_type: "task.progress",
 					payload_json: JSON.stringify({ stage: "collect", total_users: 12 }),
-					created_at: task.started_at ?? task.created_at,
+					created_at: "2026-02-27T14:30:03Z",
 				},
 				{
 					id: "evt-task-1004",
@@ -653,7 +837,7 @@ function buildTaskDetail(
 						succeeded_users: 11,
 						failed_users: 1,
 					}),
-					created_at: task.started_at ?? task.created_at,
+					created_at: "2026-02-27T14:30:36Z",
 				},
 				{
 					id: "evt-task-1005",
@@ -662,7 +846,7 @@ function buildTaskDetail(
 						stage: "repo_collect",
 						total_repos: 128,
 					}),
-					created_at: task.updated_at,
+					created_at: "2026-02-27T14:30:42Z",
 				},
 				{
 					id: "evt-task-1006",
@@ -674,7 +858,7 @@ function buildTaskDetail(
 						failed_repos: 5,
 						releases_written: 1840,
 					}),
-					created_at: task.updated_at,
+					created_at: "2026-02-27T14:34:55Z",
 				},
 				{
 					id: "evt-task-1007",
@@ -688,7 +872,7 @@ function buildTaskDetail(
 						followers: 19,
 						events: 67,
 					}),
-					created_at: task.updated_at,
+					created_at: "2026-02-27T14:36:28Z",
 				},
 				{
 					id: "evt-task-1008",
@@ -700,7 +884,7 @@ function buildTaskDetail(
 						failed_users: 1,
 						notifications: 192,
 					}),
-					created_at: task.updated_at,
+					created_at: "2026-02-27T14:37:16Z",
 				},
 				{
 					id: "evt-task-1009",
@@ -936,6 +1120,7 @@ function AdminJobsPreview({
 		};
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
+			repo_release_worker_concurrency: 12,
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
 				.slice(0, 3)
@@ -1161,8 +1346,8 @@ function AdminJobsPreview({
 								item.task_type,
 							),
 					);
-				} else if (taskType === "brief.daily_slot") {
-					rows = [...scheduledRuns];
+				} else if (taskType) {
+					rows = rows.filter((item) => item.task_type === taskType);
 				}
 				if (excludeTaskType) {
 					rows = rows.filter((item) => item.task_type !== excludeTaskType);
@@ -1277,11 +1462,16 @@ function AdminJobsPreview({
 			) {
 				const body = (await req.json()) as {
 					sync_auto_fetch_interval_minutes?: number;
+					repo_release_worker_concurrency?: number;
 				};
 				syncRuntimeConfig = {
 					...syncRuntimeConfig,
 					sync_auto_fetch_interval_minutes: Number(
 						body.sync_auto_fetch_interval_minutes ?? 60,
+					),
+					repo_release_worker_concurrency: Number(
+						body.repo_release_worker_concurrency ??
+							syncRuntimeConfig.repo_release_worker_concurrency,
 					),
 				};
 				return new Response(JSON.stringify(syncRuntimeConfig), {
@@ -1739,20 +1929,129 @@ export const ScheduledTab: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "定时任务" }),
 		).toBeVisible();
-		await userEvent.click(
-			canvas.getByRole("button", { name: "配置全局自动获取间隔" }),
-		);
 		await expect(
-			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
-		).toBeVisible();
-		await expect(canvas.getByText("最近三次链路用时")).toBeVisible();
-		await expect(
-			canvas.getByRole("slider", { name: "自动获取间隔（分钟）" }),
-		).toHaveAttribute("aria-valuenow", "10");
+			canvas.queryByRole("button", { name: "配置订阅同步 worker 数量" }),
+		).not.toBeInTheDocument();
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
 				"/admin/jobs/scheduled",
 			),
+		);
+	},
+};
+
+export const SubscriptionSyncWorkflow: Story = {
+	render: () => <AdminJobsPreview routeUrl="/admin/jobs/subscriptions" />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"订阅同步专用视图，展示 sync.subscriptions 列表、阶段概览与共享 worker 设置入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", { name: "订阅同步" }),
+		).toBeVisible();
+		await expect(canvas.getByText("Release workers")).toBeVisible();
+		await expect(canvas.getAllByText("订阅同步工作流")[0]).toBeVisible();
+		await expect(canvas.getByText("Release")).toBeVisible();
+		await userEvent.click(
+			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
+		);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "Release worker 数量" }),
+		).toHaveAttribute("aria-valuenow", "12");
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncDetail: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-1430" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"订阅同步独立详情页，按工作流阶段展示整体进度、失败事件与子任务链路。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await expect(body.getByText("Release Queue")).toBeVisible();
+		await expect(body.getByText("octo/private-repo")).toBeVisible();
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions/task-subscription-1430",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncDetailRunning: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-1440" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"运行中的订阅同步详情页：Star 与 Repo Collect 已完成，Release Queue 正在处理，Social 与 Notifications 等待上游阶段结束。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await expect(body.getByText("Release Queue")).toBeVisible();
+		await expect(body.getByText("octo/slow-release-repo")).toBeVisible();
+		await expect(body.getAllByText("等待").length).toBeGreaterThanOrEqual(2);
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions/task-subscription-1440",
+			),
+		);
+	},
+};
+
+export const SubscriptionSyncSettings: Story = {
+	render: () => (
+		<AdminJobsPreview
+			routeUrl="/admin/jobs/subscriptions"
+			syncSettingsDialogDefaultOpen
+		/>
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"直接展示订阅同步设置面板，覆盖 worker 滑块与数字输入的视觉状态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
+		).toBeVisible();
+		await expect(canvas.getByLabelText("Release worker 数量输入")).toHaveValue(
+			12,
 		);
 	},
 };
@@ -1769,7 +2068,7 @@ export const SyncSettingsTooltipDemo: Story = {
 		docs: {
 			description: {
 				story:
-					"演示全局自动获取间隔弹窗中的三个帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
+					"演示订阅同步配置弹窗中的三个帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
 			},
 		},
 	},
@@ -1777,7 +2076,7 @@ export const SyncSettingsTooltipDemo: Story = {
 		const canvas = within(canvasElement);
 		const screen = within(canvasElement.ownerDocument.body);
 		await expect(
-			await canvas.findByRole("dialog", { name: "配置全局自动获取间隔" }),
+			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
 		).toBeVisible();
 		await waitFor(() => {
 			const tooltipText = screen

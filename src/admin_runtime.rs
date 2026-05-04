@@ -19,12 +19,75 @@ pub struct AdminRuntimeSettingsSnapshot {
     pub ai_model_context_limit: Option<u32>,
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
+    pub repo_release_worker_concurrency: usize,
 }
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
+pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 5;
+pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
+}
+
+pub fn normalize_repo_release_worker_concurrency(value: i64) -> usize {
+    usize::try_from(value.clamp(
+        1,
+        i64::try_from(MAX_REPO_RELEASE_WORKER_CONCURRENCY).unwrap_or(32),
+    ))
+    .unwrap_or(DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY)
+}
+
+pub async fn load_repo_release_worker_concurrency(pool: &SqlitePool) -> Result<usize> {
+    let concurrency = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT repo_release_worker_concurrency
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(i64::try_from(DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY).unwrap_or(5));
+
+    Ok(normalize_repo_release_worker_concurrency(concurrency))
+}
+
+pub async fn update_repo_release_worker_concurrency(
+    pool: &SqlitePool,
+    concurrency: i64,
+) -> Result<usize> {
+    let concurrency = normalize_repo_release_worker_concurrency(concurrency);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          repo_release_worker_concurrency,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          repo_release_worker_concurrency = excluded.repo_release_worker_concurrency,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(i64::try_from(concurrency).unwrap_or(5))
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_repo_release_worker_concurrency(pool).await
 }
 
 pub async fn load_sync_auto_fetch_interval_minutes(pool: &SqlitePool) -> Result<i64> {
@@ -146,6 +209,7 @@ pub async fn load_or_seed_runtime_settings(
         ai_model_context_limit: None,
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+        repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
     };
     let now = Utc::now().to_rfc3339();
     sqlx::query(
@@ -157,10 +221,11 @@ pub async fn load_or_seed_runtime_settings(
           ai_model_context_limit_migrated_at,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
+          repo_release_worker_concurrency,
           created_at,
           updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         "#,
     )
@@ -169,6 +234,7 @@ pub async fn load_or_seed_runtime_settings(
     .bind(Option::<&str>::None)
     .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
+    .bind(i64::try_from(snapshot.repo_release_worker_concurrency).unwrap_or(i64::MAX))
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(pool)
@@ -268,7 +334,8 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
           llm_max_concurrency,
           ai_model_context_limit,
           translation_general_worker_concurrency,
-          translation_dedicated_worker_concurrency
+          translation_dedicated_worker_concurrency,
+          repo_release_worker_concurrency
         FROM admin_runtime_settings
         WHERE id = 1
         LIMIT 1
@@ -290,6 +357,9 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
             row.get::<i64, _>("translation_dedicated_worker_concurrency"),
         )
         .unwrap_or(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY),
+        repo_release_worker_concurrency: normalize_repo_release_worker_concurrency(
+            row.get::<i64, _>("repo_release_worker_concurrency"),
+        ),
     }))
 }
 

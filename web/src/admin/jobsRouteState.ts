@@ -1,6 +1,7 @@
 export type AdminJobsPrimaryTab =
 	| "realtime"
 	| "scheduled"
+	| "subscriptions"
 	| "llm"
 	| "translations";
 
@@ -21,16 +22,20 @@ export type AdminJobsRouteState = {
 	translationView: TranslationViewTab;
 	taskDrawerRoute: TaskDrawerRoute | null;
 	drawerFromTab: AdminJobsPrimaryTab | null;
+	subscriptionDetailTaskId?: string | null;
 };
 
 export const ADMIN_JOBS_BASE_PATH = "/admin/jobs";
 export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
+export const ADMIN_JOBS_SUBSCRIPTIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/subscriptions`;
 export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
 export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
 
 const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
 const TASK_DRAWER_ROUTE_PATTERN =
 	/^\/admin\/jobs\/tasks\/([^/]+?)(?:\/llm\/([^/]+))?$/;
+const SUBSCRIPTION_DETAIL_ROUTE_PATTERN =
+	/^\/admin\/jobs\/subscriptions\/([^/]+?)$/;
 
 function normalizePathname(pathname: string) {
 	return pathname.replace(/\/+$/, "") || "/";
@@ -42,6 +47,7 @@ function isPrimaryTab(
 	return (
 		value === "realtime" ||
 		value === "scheduled" ||
+		value === "subscriptions" ||
 		value === "llm" ||
 		value === "translations"
 	);
@@ -61,6 +67,8 @@ export function buildAdminJobsBasePath(primaryTab: AdminJobsPrimaryTab) {
 	switch (primaryTab) {
 		case "scheduled":
 			return ADMIN_JOBS_SCHEDULED_PATH;
+		case "subscriptions":
+			return ADMIN_JOBS_SUBSCRIPTIONS_PATH;
 		case "llm":
 			return ADMIN_JOBS_LLM_PATH;
 		case "translations":
@@ -108,13 +116,31 @@ export function parseAdminJobsRoute(
 			translationView,
 			taskDrawerRoute,
 			drawerFromTab,
+			subscriptionDetailTaskId: null,
 		};
 	}
 
 	const normalizedPath = normalizePathname(pathname);
+	const subscriptionDetailMatch = normalizedPath.match(
+		SUBSCRIPTION_DETAIL_ROUTE_PATTERN,
+	);
+	if (subscriptionDetailMatch) {
+		return {
+			primaryTab: "subscriptions",
+			translationView,
+			taskDrawerRoute: null,
+			drawerFromTab: null,
+			subscriptionDetailTaskId: decodeURIComponent(
+				subscriptionDetailMatch[1] ?? "",
+			),
+		};
+	}
+
 	let primaryTab: AdminJobsPrimaryTab = "realtime";
 	if (normalizedPath === ADMIN_JOBS_SCHEDULED_PATH) {
 		primaryTab = "scheduled";
+	} else if (normalizedPath === ADMIN_JOBS_SUBSCRIPTIONS_PATH) {
+		primaryTab = "subscriptions";
 	} else if (normalizedPath === ADMIN_JOBS_LLM_PATH) {
 		primaryTab = "llm";
 	} else if (normalizedPath === ADMIN_JOBS_TRANSLATIONS_PATH) {
@@ -126,6 +152,7 @@ export function parseAdminJobsRoute(
 		translationView,
 		taskDrawerRoute: null,
 		drawerFromTab: null,
+		subscriptionDetailTaskId: null,
 	};
 }
 
@@ -134,12 +161,16 @@ export function buildAdminJobsRouteUrl(
 	currentSearch = "",
 ) {
 	const searchParams = new URLSearchParams(currentSearch);
-	const pathname = route.taskDrawerRoute
-		? buildTaskDrawerPath(
-				route.taskDrawerRoute.taskId,
-				route.taskDrawerRoute.llmCallId,
-			)
-		: buildAdminJobsBasePath(route.primaryTab);
+	const pathname = route.subscriptionDetailTaskId
+		? `${ADMIN_JOBS_SUBSCRIPTIONS_PATH}/${encodeURIComponent(
+				route.subscriptionDetailTaskId,
+			)}`
+		: route.taskDrawerRoute
+			? buildTaskDrawerPath(
+					route.taskDrawerRoute.taskId,
+					route.taskDrawerRoute.llmCallId,
+				)
+			: buildAdminJobsBasePath(route.primaryTab);
 
 	for (const key of ADMIN_JOBS_ROUTE_QUERY_KEYS) {
 		searchParams.delete(key);
@@ -165,6 +196,7 @@ export function buildAdminJobsRouteState(input: {
 	search: AdminJobsSearchInput;
 	taskId?: string;
 	llmCallId?: string;
+	subscriptionDetailTaskId?: string;
 }): AdminJobsRouteState {
 	const translationView = parseTranslationView(input.search.view);
 	const drawerFromTab = isPrimaryTab(input.search.from)
@@ -180,14 +212,18 @@ export function buildAdminJobsRouteState(input: {
 				llmCallId: input.llmCallId ?? null,
 			},
 			drawerFromTab,
+			subscriptionDetailTaskId: null,
 		};
 	}
 
 	return {
-		primaryTab: input.primaryTab,
+		primaryTab: input.subscriptionDetailTaskId
+			? "subscriptions"
+			: input.primaryTab,
 		translationView,
 		taskDrawerRoute: null,
 		drawerFromTab: null,
+		subscriptionDetailTaskId: input.subscriptionDetailTaskId ?? null,
 	};
 }
 

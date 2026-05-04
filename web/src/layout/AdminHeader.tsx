@@ -138,6 +138,7 @@ export function AdminHeader({ user, activeNav }: AdminHeaderProps) {
 							>
 								<BrandLogo
 									variant="wordmark"
+									theme="light"
 									className={cn(
 										"h-5",
 										!disableHeaderMotion &&

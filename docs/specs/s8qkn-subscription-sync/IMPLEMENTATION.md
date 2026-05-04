@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Implementation: 已交付
-- Last: 2026-05-02
-- Summary: 已交付；PR #41; shared repo release cache + access refresh + scheduler social/inbox sync；Admin Jobs 支持全局自动获取间隔和最近定时任务链路用时详情；repo release deadline 现在会硬收敛 queued/running work item，避免 `sync.subscriptions` 长期 running 后导致后续计划任务持续 skipped
+- Last: 2026-05-03
+- Summary: 已交付；PR #41; shared repo release cache + access refresh + scheduler social/inbox sync；Admin Jobs 支持全局自动获取间隔和最近定时任务链路用时详情；repo release deadline 现在会硬收敛 queued/running work item；订阅同步提速追加 Release worker 热配置、GitHub release conditional request、ReleaseEvent 快速 demand、`/admin/jobs/subscriptions` 列表页和 `/admin/jobs/subscriptions/{task_id}` 工作流详情页
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
