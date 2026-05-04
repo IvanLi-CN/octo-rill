@@ -1,7 +1,14 @@
-import { List, LoaderCircle, Newspaper, Sparkles } from "lucide-react";
+import {
+	ArrowUpToLine,
+	List,
+	LoaderCircle,
+	Newspaper,
+	Sparkles,
+} from "lucide-react";
 import {
 	type HTMLAttributes,
 	type ReactNode,
+	useCallback,
 	useEffect,
 	useMemo,
 	useRef,
@@ -38,6 +45,261 @@ const FEED_DAY_ACTION_BUTTON_CLASS =
 	"h-auto min-h-0 w-auto justify-end gap-1 rounded-none px-0 py-0 font-mono text-[14px] font-normal leading-[1.35] tracking-[0.02em] text-foreground/82 shadow-none hover:bg-transparent hover:text-foreground/82 focus-visible:border-transparent focus-visible:ring-0 disabled:text-foreground/82 disabled:opacity-100 sm:w-full sm:justify-end sm:text-[15px] sm:leading-none sm:tracking-wide";
 const FEED_BRIEF_PANEL_CLASS =
 	"bg-card/58 overflow-hidden rounded-[22px] shadow-sm ring-1 ring-inset ring-border/60 sm:rounded-[24px]";
+
+type NewContentBoundary = {
+	id: string;
+	count: number;
+	label: string;
+	latestKeys: string[];
+	afterKey?: string | null;
+	isLatest?: boolean;
+	isSealed?: boolean;
+	onExitedViewport?: (id: string) => void;
+	onFreshAreaEntered?: (id: string) => void;
+	onResolveAfterKey?: (id: string, afterKey: string | null) => void;
+	onReveal: () => void;
+};
+
+function keyOfFeedItem(item: Pick<FeedItem, "kind" | "id">) {
+	return `${item.kind}:${item.id}`;
+}
+
+function isBoundaryOutsideViewport(element: HTMLElement) {
+	const rect = element.getBoundingClientRect();
+	const viewportTop = 0;
+	const viewportBottom = window.innerHeight;
+	return rect.bottom <= viewportTop || rect.top >= viewportBottom;
+}
+
+function FreshContentBoundary(props: NewContentBoundary) {
+	const {
+		id,
+		count,
+		label,
+		isLatest = true,
+		isSealed = false,
+		onExitedViewport,
+		onFreshAreaEntered,
+		onReveal,
+	} = props;
+	const boundaryRef = useRef<HTMLButtonElement | null>(null);
+	const hasIntersectedRef = useRef(false);
+	const hasSealedRef = useRef(isSealed);
+	const lastScrollYRef = useRef(0);
+	const removeAfterExitAnimation = useCallback(() => {
+		const element = boundaryRef.current;
+		if (!element) {
+			onExitedViewport?.(id);
+			return;
+		}
+		if (
+			typeof window === "undefined" ||
+			window.matchMedia("(prefers-reduced-motion: reduce)").matches
+		) {
+			onExitedViewport?.(id);
+			return;
+		}
+		void element
+			.animate(
+				[
+					{ opacity: 1, transform: "translateY(0) scaleY(1)" },
+					{ opacity: 0, transform: "translateY(-5px) scaleY(0.92)" },
+				],
+				{
+					duration: 150,
+					easing: "cubic-bezier(0.25, 1, 0.5, 1)",
+					fill: "forwards",
+				},
+			)
+			.finished.catch(() => undefined)
+			.then(() => onExitedViewport?.(id));
+	}, [id, onExitedViewport]);
+
+	useEffect(() => {
+		hasSealedRef.current = isSealed;
+	}, [isSealed]);
+
+	useEffect(() => {
+		if (!isLatest || isSealed || !onFreshAreaEntered) return;
+		const element = boundaryRef.current;
+		if (!element) return;
+		lastScrollYRef.current = window.scrollY;
+
+		const sealIfFreshAreaEntered = () => {
+			if (hasSealedRef.current) return;
+			const currentScrollY = window.scrollY;
+			const scrollingTowardFresh = currentScrollY < lastScrollYRef.current - 1;
+			lastScrollYRef.current = currentScrollY;
+			if (!scrollingTowardFresh) return;
+			const rect = element.getBoundingClientRect();
+			if (rect.bottom <= 0 || rect.top >= window.innerHeight) return;
+			hasSealedRef.current = true;
+			onFreshAreaEntered(id);
+		};
+
+		window.addEventListener("scroll", sealIfFreshAreaEntered, {
+			passive: true,
+		});
+		return () => {
+			window.removeEventListener("scroll", sealIfFreshAreaEntered);
+		};
+	}, [id, isLatest, isSealed, onFreshAreaEntered]);
+
+	useEffect(() => {
+		if (isLatest || !onExitedViewport) return;
+		const element = boundaryRef.current;
+		if (!element) return;
+		if (typeof IntersectionObserver === "undefined") {
+			return undefined;
+		}
+
+		let removed = false;
+		const removeIfOffscreen = () => {
+			if (removed) return;
+			if (!hasIntersectedRef.current) return;
+			if (!isBoundaryOutsideViewport(element)) return;
+			removed = true;
+			removeAfterExitAnimation();
+			observer.disconnect();
+		};
+		const observer = new IntersectionObserver((entries) => {
+			const entry = entries[0];
+			if (!entry) return;
+			if (entry.isIntersecting) {
+				hasIntersectedRef.current = true;
+				return;
+			}
+			const wasSeenByObserver = hasIntersectedRef.current;
+			const leftViewport = isBoundaryOutsideViewport(element);
+			if ((!wasSeenByObserver && !leftViewport) || removed) return;
+			if (!leftViewport) return;
+			removed = true;
+			removeAfterExitAnimation();
+			observer.disconnect();
+		});
+
+		observer.observe(element);
+		window.addEventListener("scroll", removeIfOffscreen, { passive: true });
+		return () => {
+			removed = true;
+			window.removeEventListener("scroll", removeIfOffscreen);
+			observer.disconnect();
+		};
+	}, [isLatest, onExitedViewport, removeAfterExitAnimation]);
+
+	useEffect(() => {
+		if (!isLatest) return;
+		hasIntersectedRef.current = false;
+	}, [isLatest]);
+
+	if (count <= 0) return null;
+	return (
+		<button
+			ref={boundaryRef}
+			type="button"
+			className="dashboard-new-content-hint dashboard-new-content-boundary group grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-2 text-left"
+			data-dashboard-new-content-notice="true"
+			data-dashboard-new-content-boundary="true"
+			data-dashboard-new-content-boundary-id={id}
+			data-dashboard-new-content-boundary-latest={isLatest ? "true" : "false"}
+			data-dashboard-new-content-boundary-sealed={isSealed ? "true" : "false"}
+			onClick={onReveal}
+		>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
+				<ArrowUpToLine className="size-3.5" />
+				<span>
+					上方有 {count} 条新{label}
+				</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
+	);
+}
+
+function groupBoundariesByAfterKey(
+	items: FeedItem[],
+	boundaries: NewContentBoundary[],
+) {
+	const itemKeys = items.map(keyOfFeedItem);
+	const byAfterKey = new Map<string, NewContentBoundary[]>();
+	for (const boundary of boundaries) {
+		if (boundary.count <= 0) continue;
+		const boundaryKeys = boundary.latestKeys.slice(0, boundary.count);
+		let normalizedBoundary = boundary;
+		let afterKey = boundary.afterKey;
+		if (afterKey === undefined) {
+			const boundaryKeySet = new Set(boundaryKeys);
+			const topBoundaryKeys: string[] = [];
+			for (const itemKey of itemKeys) {
+				if (!boundaryKeySet.has(itemKey)) break;
+				topBoundaryKeys.push(itemKey);
+			}
+			afterKey = topBoundaryKeys.at(-1) ?? null;
+			boundary.onResolveAfterKey?.(boundary.id, afterKey);
+			normalizedBoundary = {
+				...boundary,
+				count: topBoundaryKeys.length,
+				latestKeys: topBoundaryKeys,
+			};
+		}
+		if (!afterKey) continue;
+		const existing = byAfterKey.get(afterKey) ?? [];
+		existing.push(normalizedBoundary);
+		byAfterKey.set(afterKey, existing);
+	}
+	return byAfterKey;
+}
+
+function renderFeedItemsWithBoundaries(
+	items: FeedItem[],
+	feedCardProps: Omit<FeedCardListProps, "items">,
+	boundariesByAfterKey: Map<string, NewContentBoundary[]>,
+) {
+	if (boundariesByAfterKey.size === 0) {
+		return <FeedItems items={items} {...feedCardProps} />;
+	}
+
+	const nodes: ReactNode[] = [];
+	let chunk: FeedItem[] = [];
+	let chunkStartKey: string | null = null;
+
+	for (const item of items) {
+		if (chunk.length === 0) {
+			chunkStartKey = keyOfFeedItem(item);
+		}
+		chunk.push(item);
+		const itemKey = keyOfFeedItem(item);
+		const boundaries = boundariesByAfterKey.get(itemKey);
+		if (!boundaries?.length) continue;
+
+		nodes.push(
+			<FeedItems
+				key={`items-${chunkStartKey ?? itemKey}-${itemKey}`}
+				items={chunk}
+				{...feedCardProps}
+			/>,
+		);
+		chunk = [];
+		chunkStartKey = null;
+		for (const boundary of boundaries) {
+			nodes.push(<FreshContentBoundary key={boundary.id} {...boundary} />);
+		}
+	}
+
+	if (chunk.length > 0) {
+		const lastKey = keyOfFeedItem(chunk[chunk.length - 1]);
+		nodes.push(
+			<FeedItems
+				key={`items-${chunkStartKey ?? lastKey}-${lastKey}`}
+				items={chunk}
+				{...feedCardProps}
+			/>,
+		);
+	}
+
+	return nodes;
+}
 
 function briefHasSection(markdown: string | undefined, heading: string) {
 	if (!markdown) return false;
@@ -323,6 +585,7 @@ export function FeedGroupedList(
 		now?: Date;
 		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
+		newContentBoundaries?: NewContentBoundary[];
 	},
 ) {
 	const {
@@ -341,6 +604,7 @@ export function FeedGroupedList(
 		now,
 		onOpenReleaseFromBrief,
 		onGenerateBriefForDate,
+		newContentBoundaries = [],
 		...feedCardProps
 	} = props;
 
@@ -452,7 +716,10 @@ export function FeedGroupedList(
 	}, [groups]);
 
 	const skeletons = useMemo(() => Array.from({ length: 6 }, (_, i) => i), []);
-
+	const boundariesByAfterKey = useMemo(
+		() => groupBoundariesByAfterKey(items, newContentBoundaries),
+		[items, newContentBoundaries],
+	);
 	return (
 		<div className="space-y-3 sm:space-y-4">
 			{blockingError ? (
@@ -629,7 +896,11 @@ export function FeedGroupedList(
 									action={groupAction}
 									showDivider={showDivider}
 								/>
-								<FeedItems items={group.items} {...feedCardProps} />
+								{renderFeedItemsWithBoundaries(
+									group.items,
+									feedCardProps,
+									boundariesByAfterKey,
+								)}
 							</>
 						)}
 					</section>

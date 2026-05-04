@@ -180,6 +180,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::get_release_detail_by_repo_tag),
         )
         .route("/notifications", get(api::list_notifications))
+        .route("/dashboard/updates", get(api::dashboard_updates))
         .route("/feed", get(api::list_feed))
         .route("/feed/reactions/refresh", post(api::refresh_feed_reactions))
         .route("/admin/users", get(api::admin_list_users))
