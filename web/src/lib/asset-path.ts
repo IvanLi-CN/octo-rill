@@ -4,9 +4,5 @@ const normalizedBaseUrl = import.meta.env.BASE_URL.endsWith("/")
 
 export function withBaseAssetPath(path: string) {
 	const assetPath = path.replace(/^\/+/, "");
-	if (normalizedBaseUrl === "./") {
-		return `/${assetPath}`;
-	}
-
 	return `${normalizedBaseUrl}${assetPath}`;
 }
