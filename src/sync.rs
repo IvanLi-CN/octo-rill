@@ -4261,6 +4261,13 @@ async fn claim_next_repo_release_work_item(
         SELECT id
         FROM repo_release_work_items
         WHERE status = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM repo_release_sync_state state
+            WHERE state.repo_id = repo_release_work_items.repo_id
+              AND state.backoff_until IS NOT NULL
+              AND julianday(state.backoff_until) > julianday(?)
+          )
         ORDER BY
           priority DESC,
           has_new_repo_watchers DESC,
@@ -4270,6 +4277,7 @@ async fn claim_next_repo_release_work_item(
         "#,
     )
     .bind(jobs::STATUS_QUEUED)
+    .bind(Utc::now().to_rfc3339())
     .fetch_optional(&mut *tx)
     .await
     .context("select queued repo release work item")?;
@@ -4491,12 +4499,6 @@ async fn execute_repo_release_work_item(
     state: &AppState,
     work_item: &RepoReleaseWorkItemRow,
 ) -> Result<(usize, usize)> {
-    if is_repo_release_backing_off(state, work_item.repo_id).await? {
-        return Err(anyhow!(
-            "repo release sync is backing off for {}",
-            work_item.repo_full_name
-        ));
-    }
     let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
         r#"
         SELECT DISTINCT u.id AS user_id, u.last_active_at
@@ -4566,25 +4568,6 @@ async fn execute_repo_release_work_item(
         "all candidate users failed to sync {}",
         work_item.repo_full_name
     ))
-}
-
-async fn is_repo_release_backing_off(state: &AppState, repo_id: i64) -> Result<bool> {
-    let backoff_until = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT backoff_until
-        FROM repo_release_sync_state
-        WHERE repo_id = ?
-          AND backoff_until IS NOT NULL
-          AND julianday(backoff_until) > julianday(?)
-        LIMIT 1
-        "#,
-    )
-    .bind(repo_id)
-    .bind(Utc::now().to_rfc3339())
-    .fetch_optional(&state.pool)
-    .await
-    .context("failed to query repo release backoff")?;
-    Ok(backoff_until.is_some())
 }
 
 async fn load_repo_release_sync_state(
@@ -7006,10 +6989,11 @@ mod tests {
         SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
         SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        attach_and_wait_for_user_release_demand, attach_release_demand, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
+        attach_and_wait_for_user_release_demand, attach_release_demand,
+        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, is_terminal_notification_thread_error,
         owned_repo_snapshot_from_node, process_repo_release_work_item,
         recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
@@ -10671,6 +10655,73 @@ mod tests {
         assert_eq!(row.0, jobs::STATUS_RUNNING);
         assert!(row.1.is_none());
         assert_eq!(row.2.as_deref(), Some("2026-03-06T00:00:01Z"));
+    }
+
+    #[tokio::test]
+    async fn repo_release_claim_skips_backing_off_work_item_without_failing_watchers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-backoff").await;
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let backoff_until = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-backoff",
+                repo_id: 51,
+                repo_full_name: "octo/backoff",
+                status: jobs::STATUS_QUEUED,
+                deadline_at: future_deadline.as_str(),
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-release-backoff",
+            "repo-work-backoff",
+            "task-release-backoff",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_sync_state (
+              repo_id, last_attempt_at, last_error_text, backoff_until, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(51_i64)
+        .bind("2026-03-06T00:00:00Z")
+        .bind("timeout: GitHub request timed out")
+        .bind(backoff_until.as_str())
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed repo release backoff");
+
+        let claimed = claim_next_repo_release_work_item(state.as_ref())
+            .await
+            .expect("claim skips backoff");
+        assert!(claimed.is_none());
+
+        let row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+            r#"
+            SELECT item.status, watcher.status, watcher.error_text, item.runtime_owner_id
+            FROM repo_release_work_items item
+            JOIN repo_release_watchers watcher ON watcher.work_item_id = item.id
+            WHERE item.id = ?
+            "#,
+        )
+        .bind("repo-work-backoff")
+        .fetch_one(&pool)
+        .await
+        .expect("load backoff work item and watcher");
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert_eq!(row.1, "pending");
+        assert!(row.2.is_none());
+        assert!(row.3.is_none());
     }
 
     #[tokio::test]
