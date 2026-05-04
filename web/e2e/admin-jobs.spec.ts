@@ -1690,7 +1690,9 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("heading", { name: "订阅同步工作流详情" }),
 	).toBeVisible();
-	await expect(page.getByText("Release Queue")).toBeVisible();
+	await expect(
+		page.locator("#subscription-stage-release").getByText("Release Queue"),
+	).toBeVisible();
 	await expect(
 		page.getByText("octo/private-repo · attempt 1 · terminal"),
 	).toBeVisible();
