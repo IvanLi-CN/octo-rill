@@ -15,14 +15,16 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use reqwest::{
     Response,
-    header::{ACCEPT, HeaderMap, USER_AGENT},
+    header::{
+        ACCEPT, ETAG, HeaderMap, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT,
+    },
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::Row;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
-use crate::{jobs, local_id, runtime, state::AppState};
+use crate::{admin_runtime, jobs, local_id, runtime, state::AppState};
 
 const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
@@ -33,7 +35,7 @@ const SUBSCRIPTION_NOTIFICATION_WORKERS: usize = 5;
 const SUBSCRIPTION_RETRY_LIMIT: usize = 3;
 const SUBSCRIPTION_RETRY_BACKOFF_MS: [u64; 3] = [500, 1_000, 2_000];
 const SUBSCRIPTION_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-const REPO_RELEASE_WORKERS: usize = 5;
+const REPO_RELEASE_WORKERS_MAX: usize = admin_runtime::MAX_REPO_RELEASE_WORKER_CONCURRENCY;
 const REPO_RELEASE_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(450);
 const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -157,10 +159,22 @@ fn repo_release_claim_lock() -> &'static tokio::sync::Mutex<()> {
 }
 
 pub fn spawn_repo_release_workers(state: Arc<AppState>) {
-    for _ in 0..REPO_RELEASE_WORKERS.max(1) {
+    for worker_index in 0..REPO_RELEASE_WORKERS_MAX.max(1) {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
+                match admin_runtime::load_repo_release_worker_concurrency(&state.pool).await {
+                    Ok(target) if worker_index >= target => {
+                        tokio::time::sleep(REPO_RELEASE_QUEUE_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "repo release worker: load concurrency failed");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    _ => {}
+                }
                 match claim_next_repo_release_work_item(state.as_ref()).await {
                     Ok(Some(work_item)) => {
                         if let Err(err) =
@@ -269,6 +283,23 @@ struct RepoReleaseWorkItemRow {
     deadline_at: String,
     last_success_at: Option<String>,
     started_at: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RepoReleaseSyncStateRow {
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+enum RepoReleaseFetchOutcome {
+    Updated(Vec<GitHubRelease>, RepoReleaseHttpState),
+    NotModified(RepoReleaseHttpState),
+}
+
+#[derive(Default)]
+struct RepoReleaseHttpState {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -472,6 +503,15 @@ struct GitHubEventRepo {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct GitHubActivityPayload {
     forkee: Option<GitHubEventRepoTarget>,
+    release: Option<GitHubReleaseEventPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubReleaseEventPayload {
+    name: Option<String>,
+    tag_name: Option<String>,
+    html_url: Option<String>,
+    body: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1118,6 +1158,34 @@ pub async fn sync_social_activity(
             .then_with(|| left.kind.cmp(right.kind))
             .then_with(|| left.event_id.cmp(&right.event_id))
     });
+    let release_update_repos = feed_events
+        .iter()
+        .filter(|event| event.kind == "release_update")
+        .filter_map(|event| {
+            Some(ReleaseDemandRepo {
+                repo_id: event.repo_id?,
+                full_name: event.repo_full_name.clone()?,
+                is_new_repo: true,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !release_update_repos.is_empty()
+        && let Err(err) = attach_release_demand(
+            state,
+            None,
+            Some(user_id),
+            &release_update_repos,
+            RepoReleaseOrigin::Interactive,
+            "received_release_event",
+        )
+        .await
+    {
+        tracing::warn!(
+            ?err,
+            user_id,
+            "sync social activity: attach release event demand failed"
+        );
+    }
 
     let mut events = match (
         (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
@@ -4193,6 +4261,13 @@ async fn claim_next_repo_release_work_item(
         SELECT id
         FROM repo_release_work_items
         WHERE status = ?
+          AND NOT EXISTS (
+            SELECT 1
+            FROM repo_release_sync_state state
+            WHERE state.repo_id = repo_release_work_items.repo_id
+              AND state.backoff_until IS NOT NULL
+              AND julianday(state.backoff_until) > julianday(?)
+          )
         ORDER BY
           priority DESC,
           has_new_repo_watchers DESC,
@@ -4202,6 +4277,7 @@ async fn claim_next_repo_release_work_item(
         "#,
     )
     .bind(jobs::STATUS_QUEUED)
+    .bind(Utc::now().to_rfc3339())
     .fetch_optional(&mut *tx)
     .await
     .context("select queued repo release work item")?;
@@ -4459,14 +4535,22 @@ async fn execute_repo_release_work_item(
             match fetch_repo_releases_for_user(
                 state,
                 candidate.user_id.as_str(),
+                work_item.repo_id,
                 work_item.repo_full_name.as_str(),
             )
             .await
             {
-                Ok(releases) => {
+                Ok(RepoReleaseFetchOutcome::Updated(releases, http_state)) => {
                     let release_count =
                         upsert_repo_releases(state, work_item.repo_id, &releases).await?;
+                    record_repo_release_sync_success(state, work_item.repo_id, http_state, false)
+                        .await?;
                     return Ok((release_count, candidate_failures));
+                }
+                Ok(RepoReleaseFetchOutcome::NotModified(http_state)) => {
+                    record_repo_release_sync_success(state, work_item.repo_id, http_state, true)
+                        .await?;
+                    return Ok((0, candidate_failures));
                 }
                 Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
                     candidate_failures += 1;
@@ -4484,6 +4568,102 @@ async fn execute_repo_release_work_item(
         "all candidate users failed to sync {}",
         work_item.repo_full_name
     ))
+}
+
+async fn load_repo_release_sync_state(
+    state: &AppState,
+    repo_id: i64,
+) -> Result<Option<RepoReleaseSyncStateRow>> {
+    sqlx::query_as::<_, RepoReleaseSyncStateRow>(
+        r#"
+        SELECT etag, last_modified
+        FROM repo_release_sync_state
+        WHERE repo_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to load repo release sync state")
+}
+
+async fn record_repo_release_sync_success(
+    state: &AppState,
+    repo_id: i64,
+    http_state: RepoReleaseHttpState,
+    not_modified: bool,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO repo_release_sync_state (
+          repo_id, etag, last_modified, last_success_at, last_attempt_at,
+          last_not_modified_at, last_error_text, backoff_until, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+        ON CONFLICT(repo_id) DO UPDATE SET
+          etag = COALESCE(excluded.etag, repo_release_sync_state.etag),
+          last_modified = COALESCE(excluded.last_modified, repo_release_sync_state.last_modified),
+          last_success_at = excluded.last_success_at,
+          last_attempt_at = excluded.last_attempt_at,
+          last_not_modified_at = CASE
+            WHEN excluded.last_not_modified_at IS NOT NULL THEN excluded.last_not_modified_at
+            ELSE repo_release_sync_state.last_not_modified_at
+          END,
+          last_error_text = NULL,
+          backoff_until = NULL,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(repo_id)
+    .bind(http_state.etag)
+    .bind(http_state.last_modified)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind(not_modified.then_some(now.as_str()))
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to record repo release sync success")?;
+    Ok(())
+}
+
+async fn record_repo_release_sync_failure(
+    state: &AppState,
+    repo_id: i64,
+    error: &SyncRequestError,
+) -> Result<()> {
+    let now = Utc::now();
+    let backoff_until = if error.retryable {
+        Some((now + chrono::Duration::minutes(10)).to_rfc3339())
+    } else {
+        None
+    };
+    let now = now.to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO repo_release_sync_state (
+          repo_id, etag, last_modified, last_success_at, last_attempt_at,
+          last_not_modified_at, last_error_text, backoff_until, updated_at
+        )
+        VALUES (?, NULL, NULL, NULL, ?, NULL, ?, ?, ?)
+        ON CONFLICT(repo_id) DO UPDATE SET
+          last_attempt_at = excluded.last_attempt_at,
+          last_error_text = excluded.last_error_text,
+          backoff_until = excluded.backoff_until,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(repo_id)
+    .bind(now.as_str())
+    .bind(format!("{}: {}", error.reason_code, error.message))
+    .bind(backoff_until.as_deref())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .context("failed to record repo release sync failure")?;
+    Ok(())
 }
 
 async fn upsert_repo_releases(
@@ -5680,6 +5860,45 @@ fn feed_activity_event_from_github(
                 occurred_at: event.created_at,
             })
         }
+        "ReleaseEvent" => {
+            let release = event.payload.release;
+            let repo_full_name = event.repo.name.clone();
+            let repo_id = event.repo.id;
+            let title = release
+                .as_ref()
+                .and_then(|release| release.name.clone())
+                .or_else(|| {
+                    release
+                        .as_ref()
+                        .and_then(|release| release.tag_name.clone())
+                })
+                .or_else(|| {
+                    repo_full_name
+                        .as_ref()
+                        .map(|name| format!("{name} released"))
+                });
+            let html_url = release
+                .as_ref()
+                .and_then(|release| release.html_url.clone())
+                .or_else(|| {
+                    repo_full_name
+                        .as_ref()
+                        .map(|name| format!("{GITHUB_WEB_BASE}/{name}/releases"))
+                });
+            let github_event_id = event.id;
+            Some(FeedActivityEventSnapshot {
+                kind: "release_update",
+                event_id: github_event_id.clone(),
+                repo_id,
+                repo_full_name,
+                title,
+                body: release.and_then(|release| release.body),
+                html_url,
+                github_event_id: Some(github_event_id),
+                actor: event.actor,
+                occurred_at: event.created_at,
+            })
+        }
         _ => None,
     }
 }
@@ -6015,15 +6234,41 @@ async fn replace_starred_repos(
 async fn fetch_repo_releases_for_user(
     state: &AppState,
     user_id: &str,
+    repo_id: i64,
     repo_full_name: &str,
-) -> Result<Vec<GitHubRelease>, SyncRequestError> {
+) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
     let connections = load_sync_github_connections(state, user_id).await?;
+    let sync_state = load_repo_release_sync_state(state, repo_id)
+        .await
+        .map_err(|err| {
+            SyncRequestError::non_retryable(
+                "sync_state_error",
+                format!("load repo release sync state: {err}"),
+                None,
+            )
+        })?;
     let mut last_error: Option<SyncRequestError> = None;
     for connection in connections {
-        match fetch_repo_releases_with_token(state, &connection.access_token, repo_full_name).await
+        match fetch_repo_releases_with_token(
+            state,
+            &connection.access_token,
+            repo_full_name,
+            sync_state.as_ref(),
+        )
+        .await
         {
-            Ok(releases) => return Ok(releases),
+            Ok(outcome) => return Ok(outcome),
             Err(err) => {
+                if let Err(record_err) =
+                    record_repo_release_sync_failure(state, repo_id, &err).await
+                {
+                    tracing::warn!(
+                        ?record_err,
+                        repo_id,
+                        repo = repo_full_name,
+                        "sync releases: record repo release failure failed"
+                    );
+                }
                 tracing::warn!(
                     ?err,
                     user_id,
@@ -6048,27 +6293,60 @@ async fn fetch_repo_releases_with_token(
     state: &AppState,
     token: &str,
     repo_full_name: &str,
-) -> Result<Vec<GitHubRelease>, SyncRequestError> {
+    sync_state: Option<&RepoReleaseSyncStateRow>,
+) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
     let mut page = 1usize;
     let mut releases = Vec::new();
+    let mut http_state = RepoReleaseHttpState::default();
     loop {
         let url =
             format!("{REST_API_BASE}/repos/{repo_full_name}/releases?per_page=100&page={page}");
         let operation = format!("sync releases {repo_full_name}");
-        let page_releases = with_subscription_timeout(operation.as_str(), async {
-            let response = state
+        let page_result = with_subscription_timeout(operation.as_str(), async {
+            let mut request = state
                 .http
                 .get(url)
                 .bearer_auth(token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", API_VERSION)
+                .header("X-GitHub-Api-Version", API_VERSION);
+            if page == 1 {
+                if let Some(etag) = sync_state.and_then(|state| state.etag.as_deref()) {
+                    request = request.header(IF_NONE_MATCH, etag);
+                }
+                if let Some(last_modified) =
+                    sync_state.and_then(|state| state.last_modified.as_deref())
+                {
+                    request = request.header(IF_MODIFIED_SINCE, last_modified);
+                }
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|err| classify_reqwest_error(operation.as_str(), err))?;
-            fetch_json_response::<Vec<GitHubRelease>>(response, operation.as_str()).await
+            let status = response.status();
+            let headers = response.headers().clone();
+            if page == 1 {
+                http_state.etag = headers
+                    .get(ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                http_state.last_modified = headers
+                    .get(LAST_MODIFIED)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+            }
+            if status == StatusCode::NOT_MODIFIED {
+                return Ok(None);
+            }
+            fetch_json_response::<Vec<GitHubRelease>>(response, operation.as_str())
+                .await
+                .map(Some)
         })
         .await?;
+        let Some(page_releases) = page_result else {
+            return Ok(RepoReleaseFetchOutcome::NotModified(http_state));
+        };
         if page_releases.is_empty() {
             break;
         }
@@ -6078,7 +6356,7 @@ async fn fetch_repo_releases_with_token(
         }
         page += 1;
     }
-    Ok(releases)
+    Ok(RepoReleaseFetchOutcome::Updated(releases, http_state))
 }
 
 pub async fn sync_notifications(
@@ -6703,15 +6981,16 @@ mod tests {
     use super::{
         EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActivityEvent,
         GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification,
-        NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE, NOTIFICATION_OPEN_URL_REPAIR_KEY,
-        NOTIFICATION_OPEN_URL_REPAIR_PENDING, NOTIFICATIONS_SINCE_KEY, NotificationRepo,
-        NotificationSubject, OwnedRepoNode, OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR,
-        ReleaseDemandRepo, RepoOwner, RepoReleaseOrigin, RepoReleaseWorkItemRow,
-        RepoStargazerSnapshot, SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot,
-        SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        announcement_category_id_from_repo_value, apply_social_activity_snapshot,
-        apply_social_activity_snapshot_partial, attach_and_wait_for_user_release_demand,
-        attach_release_demand, classify_github_http_error, cmp_last_active_desc,
+        GitHubReleaseEventPayload, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
+        NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
+        NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
+        OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
+        RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoStargazerSnapshot,
+        SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
+        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
+        attach_and_wait_for_user_release_demand, attach_release_demand,
+        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
         collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
         expire_repo_release_deadlines, fail_repo_release_work_item,
         feed_activity_event_from_github, insert_feed_activity_events,
@@ -9305,7 +9584,7 @@ mod tests {
     }
 
     #[test]
-    fn release_event_does_not_generate_announcement_activity() {
+    fn release_event_generates_release_update_not_announcement_activity() {
         let event = GitHubActivityEvent {
             id: "release-event-1".to_owned(),
             event_type: "ReleaseEvent".to_owned(),
@@ -9319,11 +9598,22 @@ mod tests {
                 id: Some(1001),
                 name: Some("octo/alpha".to_owned()),
             },
-            payload: GitHubActivityPayload::default(),
+            payload: GitHubActivityPayload {
+                release: Some(GitHubReleaseEventPayload {
+                    name: Some("v1.2.3".to_owned()),
+                    tag_name: Some("v1.2.3".to_owned()),
+                    html_url: Some("https://github.com/octo/alpha/releases/tag/v1.2.3".to_owned()),
+                    body: Some("Release notes".to_owned()),
+                }),
+                ..GitHubActivityPayload::default()
+            },
             created_at: "2026-03-06T12:00:00Z".to_owned(),
         };
 
-        assert!(feed_activity_event_from_github(event).is_none());
+        let mapped = feed_activity_event_from_github(event).expect("release event");
+        assert_eq!(mapped.kind, "release_update");
+        assert_eq!(mapped.title.as_deref(), Some("v1.2.3"));
+        assert_eq!(mapped.body.as_deref(), Some("Release notes"));
     }
 
     #[test]
@@ -10365,6 +10655,73 @@ mod tests {
         assert_eq!(row.0, jobs::STATUS_RUNNING);
         assert!(row.1.is_none());
         assert_eq!(row.2.as_deref(), Some("2026-03-06T00:00:01Z"));
+    }
+
+    #[tokio::test]
+    async fn repo_release_claim_skips_backing_off_work_item_without_failing_watchers() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-backoff").await;
+        let future_deadline = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let backoff_until = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-backoff",
+                repo_id: 51,
+                repo_full_name: "octo/backoff",
+                status: jobs::STATUS_QUEUED,
+                deadline_at: future_deadline.as_str(),
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-release-backoff",
+            "repo-work-backoff",
+            "task-release-backoff",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_sync_state (
+              repo_id, last_attempt_at, last_error_text, backoff_until, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(51_i64)
+        .bind("2026-03-06T00:00:00Z")
+        .bind("timeout: GitHub request timed out")
+        .bind(backoff_until.as_str())
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed repo release backoff");
+
+        let claimed = claim_next_repo_release_work_item(state.as_ref())
+            .await
+            .expect("claim skips backoff");
+        assert!(claimed.is_none());
+
+        let row = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+            r#"
+            SELECT item.status, watcher.status, watcher.error_text, item.runtime_owner_id
+            FROM repo_release_work_items item
+            JOIN repo_release_watchers watcher ON watcher.work_item_id = item.id
+            WHERE item.id = ?
+            "#,
+        )
+        .bind("repo-work-backoff")
+        .fetch_one(&pool)
+        .await
+        .expect("load backoff work item and watcher");
+        assert_eq!(row.0, jobs::STATUS_QUEUED);
+        assert_eq!(row.1, "pending");
+        assert!(row.2.is_none());
+        assert!(row.3.is_none());
     }
 
     #[tokio::test]

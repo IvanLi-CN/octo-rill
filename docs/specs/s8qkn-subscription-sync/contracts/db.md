@@ -105,12 +105,37 @@ Notes:
 Additional global sync runtime setting:
 
 - `sync_auto_fetch_interval_minutes INTEGER NOT NULL DEFAULT 60`
+- `repo_release_worker_concurrency INTEGER NOT NULL DEFAULT 5`
 
 Notes:
 
 - Valid range is `1-120`.
 - The value controls global `sync.subscriptions` scheduler cadence.
 - The setting is not user- or account-scoped.
+- `repo_release_worker_concurrency` valid range is `1-32`.
+- `repo_release_worker_concurrency` controls active shared repo release worker slots and must not affect scheduler cadence.
+
+### `repo_release_sync_state`
+
+Repo-level GitHub release request state.
+
+Key columns:
+
+- `repo_id INTEGER PRIMARY KEY`
+- `etag TEXT NULL`
+- `last_modified TEXT NULL`
+- `last_success_at TEXT NULL`
+- `last_attempt_at TEXT NULL`
+- `last_not_modified_at TEXT NULL`
+- `last_error_text TEXT NULL`
+- `backoff_until TEXT NULL`
+- `updated_at TEXT NOT NULL`
+
+Notes:
+
+- `etag` / `last_modified` are used for conditional release requests.
+- `304 Not Modified` updates `last_success_at` / `last_not_modified_at` and satisfies waiting watchers.
+- retryable timeout/network failures may set `backoff_until` so one slow repo does not consume repeated worker slots in the same short window.
 
 ### `releases`
 

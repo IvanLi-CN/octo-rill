@@ -36,6 +36,7 @@ export type FeedItemKind =
 	| "repo_star_received"
 	| "follower_received"
 	| "announcement"
+	| "release_update"
 	| "repo_forked";
 
 export type FeedActor = {
@@ -107,6 +108,7 @@ export type SocialFeedItem = FeedItemBase & {
 		| "repo_star_received"
 		| "follower_received"
 		| "announcement"
+		| "release_update"
 		| "repo_forked";
 	actor: FeedActor;
 	translated: null;
@@ -125,6 +127,7 @@ export function isSocialFeedItem(item: FeedItem): item is SocialFeedItem {
 		item.kind === "repo_star_received" ||
 		item.kind === "follower_received" ||
 		item.kind === "announcement" ||
+		item.kind === "release_update" ||
 		item.kind === "repo_forked"
 	);
 }

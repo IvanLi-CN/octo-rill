@@ -254,10 +254,12 @@ export type SyncAutoFetchTaskItem = {
 };
 export type AdminSyncRuntimeConfigResponse = {
 	sync_auto_fetch_interval_minutes: number;
+	repo_release_worker_concurrency: number;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
 };
 export type AdminSyncRuntimeConfigUpdateRequest = {
 	sync_auto_fetch_interval_minutes: number;
+	repo_release_worker_concurrency?: number;
 };
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_local_time: string;
