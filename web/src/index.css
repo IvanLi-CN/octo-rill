@@ -131,3 +131,200 @@
 		display: none;
 	}
 }
+
+@layer components {
+	.dashboard-new-content-hint {
+		color: color-mix(in oklch, var(--foreground) 62%, var(--muted-foreground));
+	}
+
+	.dashboard-new-content-boundary {
+		scroll-margin-top: 104px;
+		transform-origin: center top;
+	}
+
+	.dashboard-new-content-rule {
+		height: 1px;
+		background: linear-gradient(
+			90deg,
+			transparent,
+			color-mix(in oklch, var(--primary) 14%, var(--border)),
+			transparent
+		);
+	}
+
+	.dashboard-new-content-chip {
+		border-color: color-mix(in oklch, var(--primary) 12%, var(--border));
+		background: color-mix(in oklch, var(--background) 82%, var(--card));
+		box-shadow: 0 1px 0 oklch(1 0 0 / 0.48) inset;
+		transition:
+			border-color 180ms ease-out,
+			background-color 180ms ease-out,
+			color 180ms ease-out,
+			box-shadow 180ms ease-out;
+	}
+
+	.dashboard-new-content-hint:hover .dashboard-new-content-chip,
+	.dashboard-new-content-hint:focus-visible .dashboard-new-content-chip {
+		border-color: color-mix(in oklch, var(--primary) 22%, var(--border));
+		background: color-mix(in oklch, var(--card) 88%, var(--primary));
+		color: var(--foreground);
+		box-shadow:
+			0 1px 0 oklch(1 0 0 / 0.5) inset,
+			0 8px 18px oklch(0.18 0.02 70 / 0.05);
+	}
+
+	.dashboard-fresh-surface {
+		border-color: color-mix(in oklch, var(--primary) 18%, var(--border));
+		background:
+			radial-gradient(
+				260px circle at 20% 0,
+				oklch(0.91 0.035 98 / 0.16),
+				transparent 70%
+			),
+			color-mix(in oklch, var(--card) 78%, var(--background));
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, var(--primary) 6%, transparent),
+			0 8px 20px oklch(0.18 0.02 70 / 0.035);
+	}
+
+	@media (prefers-reduced-motion: no-preference) {
+		.dashboard-fresh-surface {
+			animation: dashboard-fresh-surface-arrive 180ms
+				cubic-bezier(0.22, 1, 0.36, 1);
+		}
+	}
+
+	@keyframes dashboard-fresh-surface-arrive {
+		0% {
+			opacity: 0.94;
+			filter: saturate(0.96);
+		}
+
+		100% {
+			opacity: 1;
+			filter: saturate(1);
+		}
+	}
+
+	.dark .dashboard-fresh-surface {
+		background:
+			radial-gradient(
+				260px circle at 20% 0,
+				oklch(0.74 0.04 112 / 0.08),
+				transparent 70%
+			),
+			color-mix(in oklch, var(--card) 78%, var(--background));
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, var(--primary) 8%, transparent),
+			0 10px 24px oklch(0 0 0 / 0.14);
+	}
+
+	.dashboard-fresh-cue {
+		isolation: isolate;
+		position: relative;
+		background:
+			radial-gradient(
+				circle at 34% 28%,
+				oklch(0.97 0.045 188 / 0.95) 0 13%,
+				transparent 16%
+			),
+			linear-gradient(
+				145deg,
+				oklch(0.82 0.12 188 / 0.96),
+				oklch(0.55 0.155 206 / 0.94)
+			);
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, var(--background) 88%, transparent),
+			0 0 0 3px oklch(0.76 0.12 194 / 0.18),
+			0 2px 8px oklch(0.28 0.05 205 / 0.16);
+	}
+
+	.dashboard-fresh-cue::before {
+		position: absolute;
+		inset: -6px;
+		border: 1px solid oklch(0.68 0.15 198 / 0.42);
+		border-radius: inherit;
+		background: oklch(0.77 0.12 192 / 0.1);
+		opacity: 0;
+		transform: scale(0.68);
+		animation: dashboard-fresh-cue-breathe 1800ms cubic-bezier(0.22, 1, 0.36, 1)
+			infinite;
+		content: "";
+		will-change: opacity, transform;
+	}
+
+	.dashboard-fresh-cue::after {
+		position: absolute;
+		top: 1px;
+		left: 1px;
+		width: 3px;
+		height: 3px;
+		border-radius: inherit;
+		background: oklch(0.99 0.028 180 / 0.9);
+		animation: dashboard-fresh-cue-spark 1800ms ease-in-out infinite;
+		content: "";
+		will-change: opacity, transform;
+	}
+
+	.dark .dashboard-fresh-cue {
+		background:
+			radial-gradient(
+				circle at 34% 28%,
+				oklch(0.94 0.05 188 / 0.9) 0 13%,
+				transparent 16%
+			),
+			linear-gradient(
+				145deg,
+				oklch(0.76 0.13 188 / 0.96),
+				oklch(0.54 0.16 206 / 0.96)
+			);
+		box-shadow:
+			0 0 0 1px color-mix(in oklch, var(--background) 84%, transparent),
+			0 0 0 3px oklch(0.72 0.13 194 / 0.2),
+			0 0 16px oklch(0.72 0.14 198 / 0.22);
+	}
+
+	@keyframes dashboard-fresh-cue-breathe {
+		0% {
+			opacity: 0;
+			transform: scale(0.68);
+		}
+
+		36% {
+			opacity: 0.68;
+			transform: scale(1.04);
+		}
+
+		100% {
+			opacity: 0;
+			transform: scale(1.85);
+		}
+	}
+
+	@keyframes dashboard-fresh-cue-spark {
+		0%,
+		100% {
+			opacity: 0.48;
+			transform: scale(0.86);
+		}
+
+		42% {
+			opacity: 1;
+			transform: scale(1.08);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.dashboard-fresh-cue::before {
+			animation: none;
+			opacity: 0.34;
+			transform: scale(1);
+		}
+
+		.dashboard-fresh-cue::after {
+			animation: none;
+			opacity: 0.72;
+			transform: none;
+		}
+	}
+}

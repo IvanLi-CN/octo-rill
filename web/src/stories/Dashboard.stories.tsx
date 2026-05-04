@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { ArrowDownToLine } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
@@ -72,6 +73,47 @@ type FeedMode =
 	| "smart-loading"
 	| "smart-retry-error"
 	| "smart-insufficient";
+type StoryLiveNotice = {
+	newCount: number;
+	latestKeys: string[];
+};
+type StoryFeedLiveNotice = StoryLiveNotice & {
+	boundaryId: string;
+	afterKey?: string | null;
+	sealed?: boolean;
+};
+type StoryLiveNotices = {
+	feed?: StoryFeedLiveNotice[];
+	briefs?: StoryLiveNotice;
+	notifications?: StoryLiveNotice;
+};
+
+function mergeStoryFeedNotice(
+	currentNotices: StoryFeedLiveNotice[],
+	incoming: StoryFeedLiveNotice,
+) {
+	if (
+		currentNotices.some((notice) => notice.boundaryId === incoming.boundaryId)
+	) {
+		return currentNotices;
+	}
+	const latestNotice = currentNotices[0];
+	if (latestNotice && !latestNotice.sealed) {
+		const latestKeys = Array.from(
+			new Set([...incoming.latestKeys, ...latestNotice.latestKeys]),
+		);
+		return [
+			{
+				...latestNotice,
+				afterKey: undefined,
+				newCount: latestKeys.length,
+				latestKeys,
+			},
+			...currentNotices.slice(1),
+		];
+	}
+	return [incoming, ...currentNotices];
+}
 const SYNC_ALL_LABEL = "同步";
 const LONG_BRIEF_RELEASE_ID = "777001";
 const STORYBOOK_DAILY_BOUNDARY = "08:00";
@@ -230,6 +272,31 @@ function expectTabletInlineHeaderLayout(options: {
 		mainRect.left + mainRect.width * 0.5,
 	);
 	expect(controlBandRect.top).toBeGreaterThanOrEqual(mainRect.bottom - 1);
+}
+
+function StoryNewContentNotice(props: {
+	count: number;
+	label: string;
+	onReveal: () => void;
+}) {
+	const { count, label, onReveal } = props;
+	if (count <= 0) return null;
+	const countLabel = `${count} 条${label}`;
+	return (
+		<button
+			type="button"
+			className="dashboard-new-content-hint group mb-3 grid w-full grid-cols-[minmax(20px,1fr)_auto_minmax(20px,1fr)] items-center gap-3 py-1.5 text-left"
+			data-dashboard-new-content-notice="true"
+			onClick={onReveal}
+		>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+			<span className="dashboard-new-content-chip inline-flex items-center gap-2 rounded-full border px-3 py-1 font-mono text-[11px] font-medium">
+				<ArrowDownToLine className="size-3.5" />
+				<span>刚刚同步 · {countLabel}</span>
+			</span>
+			<span className="dashboard-new-content-rule" aria-hidden="true" />
+		</button>
+	);
 }
 
 function expectDashboardLaneSelectorPolish(controlBand: HTMLElement | null) {
@@ -641,6 +708,265 @@ function makeFeedHotPathReactionFeed(
 		}),
 		...cachedItems,
 	];
+}
+
+const continuousLivePushTemplates: ReleaseFeedItem[] = [
+	buildFeedItem("continuous-live-push-1", {
+		ts: "2026-04-04T16:58:00+08:00",
+		repo_full_name: "IvanLi-CN/octo-rill",
+		repo_visual: repoVisualFixtures.social,
+		title: "v2.65.0 · live update lane",
+		body: "- Dashboard update token advanced\n- The release card appeared without a full page reload\n- The fresh cue keeps breathing while the session is active",
+		html_url: `${PROJECT_REPO_URL}/releases/tag/v2.65.0`,
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "v2.65.0 · live update lane",
+			summary:
+				"- Dashboard update token advanced\n- A new release card appeared in-place\n- The session-only cue stays visible after insertion",
+		},
+		reactions: {
+			counts: {
+				plus1: 3,
+				laugh: 0,
+				heart: 2,
+				hooray: 1,
+				rocket: 2,
+				eyes: 0,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+	buildFeedItem("continuous-live-push-2", {
+		ts: "2026-04-04T16:59:30+08:00",
+		repo_full_name: "acme/realtime-kit",
+		repo_visual: repoVisualFixtures.avatar,
+		title: "sync worker batch complete",
+		body: "- Background worker finished enrichment\n- Translation and polish were committed together\n- The list reflects the completed batch as new",
+		html_url:
+			"https://github.com/acme/realtime-kit/releases/tag/sync-worker-batch-complete",
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "sync worker batch complete",
+			summary:
+				"- Background worker finished enrichment\n- Translation and polish arrived together\n- The list marks the completed batch as fresh",
+		},
+		reactions: {
+			counts: {
+				plus1: 1,
+				laugh: 1,
+				heart: 1,
+				hooray: 2,
+				rocket: 3,
+				eyes: 1,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+	buildFeedItem("continuous-live-push-3", {
+		ts: "2026-04-04T17:01:00+08:00",
+		repo_full_name: "openai/codex",
+		repo_visual: repoVisualFixtures.avatar,
+		title: "0.127.0-alpha.1",
+		body: "- New alpha release detected\n- Dashboard keeps the reader at their current context\n- Fresh metadata separates this card from older content",
+		html_url: "https://github.com/openai/codex/releases/tag/0.127.0-alpha.1",
+		smart: {
+			lang: "zh-CN",
+			status: "ready",
+			title: "0.127.0-alpha.1",
+			summary:
+				"- New alpha release detected\n- The reader stays in context while the feed updates\n- Fresh metadata separates this card from older content",
+		},
+		reactions: {
+			counts: {
+				plus1: 5,
+				laugh: 0,
+				heart: 2,
+				hooray: 1,
+				rocket: 4,
+				eyes: 2,
+			},
+			viewer: {
+				plus1: false,
+				laugh: false,
+				heart: false,
+				hooray: false,
+				rocket: false,
+				eyes: false,
+			},
+			status: "ready",
+		},
+	}),
+];
+
+function makeContinuousLivePushItem(index: number): ReleaseFeedItem {
+	const template =
+		continuousLivePushTemplates[
+			(index - 1) % continuousLivePushTemplates.length
+		] ?? continuousLivePushTemplates[0];
+	const waveLabel =
+		index > continuousLivePushTemplates.length ? ` · wave ${index}` : "";
+	const minute = String((56 + index * 2) % 60).padStart(2, "0");
+	const smart = template.smart;
+	return {
+		...template,
+		id: `continuous-live-push-${index}`,
+		ts: `2026-04-04T17:${minute}:00+08:00`,
+		title: `${template.title}${waveLabel}`,
+		body: `${template.body}\n- Story push wave ${index}`,
+		html_url: `${template.html_url}?story_push=${index}`,
+		smart:
+			smart?.status === "ready"
+				? {
+						...smart,
+						title: `${smart.title ?? template.title}${waveLabel}`,
+						summary: `${smart.summary ?? template.body}\n- Story push wave ${index}`,
+					}
+				: smart,
+	};
+}
+
+type StoryFeedScrollAnchor = {
+	key: string;
+	top: number;
+};
+
+function captureStoryFeedScrollAnchor(): StoryFeedScrollAnchor | null {
+	const viewportTop = 88;
+	const viewportBottom = window.innerHeight;
+	const itemElements = Array.from(
+		document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+	);
+	for (const element of itemElements) {
+		const key = element.dataset.feedItemKey;
+		if (!key) continue;
+		const rect = element.getBoundingClientRect();
+		if (rect.bottom <= viewportTop || rect.top >= viewportBottom) continue;
+		return { key, top: rect.top };
+	}
+	return null;
+}
+
+function restoreStoryFeedScrollAnchor(anchor: StoryFeedScrollAnchor | null) {
+	if (!anchor) return;
+	window.requestAnimationFrame(() => {
+		const itemElements = Array.from(
+			document.querySelectorAll<HTMLElement>("[data-feed-item-key]"),
+		);
+		const element = itemElements.find(
+			(item) => item.dataset.feedItemKey === anchor.key,
+		);
+		if (!element) return;
+		const delta = element.getBoundingClientRect().top - anchor.top;
+		if (Math.abs(delta) < 0.5) return;
+		window.scrollBy({ top: delta, behavior: "auto" });
+	});
+}
+
+function ContinuousLivePushPreview() {
+	const [pushIndex, setPushIndex] = useState(0);
+	const [liveNotice, setLiveNotice] = useState<StoryLiveNotices>({});
+	const pendingAnchorRef = useRef<StoryFeedScrollAnchor | null>(null);
+
+	useEffect(() => {
+		setPushIndex(0);
+		setLiveNotice({});
+		const pushOne = () => {
+			pendingAnchorRef.current = captureStoryFeedScrollAnchor();
+			setPushIndex((current) => {
+				const nextIndex = current + 1;
+				const item = makeContinuousLivePushItem(nextIndex);
+				const key = feedItemKey(item);
+				const notice = {
+					boundaryId: `story-boundary-${key}`,
+					newCount: 1,
+					latestKeys: [key],
+				};
+				setLiveNotice((currentNotice) => ({
+					...currentNotice,
+					feed: mergeStoryFeedNotice(currentNotice.feed ?? [], notice),
+				}));
+				return nextIndex;
+			});
+		};
+		const firstPushTimer = window.setTimeout(() => {
+			pushOne();
+		}, 900);
+		const interval = window.setInterval(() => {
+			pushOne();
+		}, 3600);
+		return () => {
+			window.clearTimeout(firstPushTimer);
+			window.clearInterval(interval);
+		};
+	}, []);
+
+	const pushedItems = useMemo(() => {
+		return Array.from({ length: pushIndex }, (_, offset) =>
+			makeContinuousLivePushItem(pushIndex - offset),
+		);
+	}, [pushIndex]);
+	const freshKeys = pushedItems.map(feedItemKey);
+
+	useLayoutEffect(() => {
+		if (pushIndex <= 0) return;
+		const anchor = pendingAnchorRef.current;
+		pendingAnchorRef.current = null;
+		restoreStoryFeedScrollAnchor(anchor);
+	}, [pushIndex]);
+
+	return (
+		<DashboardPreview
+			initialTab="releases"
+			feedItems={[...pushedItems, ...makeFeedHotPathReactionFeed(true, false)]}
+			freshFeedKeys={freshKeys}
+			liveNotices={liveNotice}
+			onFeedBoundaryEntered={(boundaryId) => {
+				setLiveNotice((current) => ({
+					...current,
+					feed: current.feed?.map((notice) =>
+						notice.boundaryId === boundaryId
+							? { ...notice, sealed: true }
+							: notice,
+					),
+				}));
+			}}
+			onFeedBoundaryResolved={(boundaryId, afterKey) => {
+				setLiveNotice((current) => ({
+					...current,
+					feed:
+						afterKey === null
+							? current.feed?.filter(
+									(notice) => notice.boundaryId !== boundaryId,
+								)
+							: current.feed?.map((notice) =>
+									notice.boundaryId === boundaryId &&
+									notice.afterKey === undefined
+										? { ...notice, afterKey }
+										: notice,
+								),
+				}));
+			}}
+			showFooter={false}
+		/>
+	);
 }
 
 function FeedHotPathReactionRefreshPreview(props: {
@@ -2004,6 +2330,15 @@ function DashboardPreview(props: {
 	deferredFeedLoadDelayMs?: number;
 	feedError?: FeedLoadError | null;
 	reactionErrorByKey?: Record<string, string>;
+	liveNotices?: StoryLiveNotices;
+	onFeedBoundaryEntered?: (boundaryId: string) => void;
+	onFeedBoundaryResolved?: (
+		boundaryId: string,
+		afterKey: string | null,
+	) => void;
+	freshFeedKeys?: string[];
+	freshBriefKeys?: string[];
+	freshNotificationKeys?: string[];
 }) {
 	const {
 		initialTab = "all",
@@ -2027,15 +2362,27 @@ function DashboardPreview(props: {
 		deferredFeedLoadDelayMs = 1400,
 		feedError = null,
 		reactionErrorByKey = {},
+		liveNotices = {},
+		onFeedBoundaryEntered,
+		onFeedBoundaryResolved,
+		freshFeedKeys = [],
+		freshBriefKeys = [],
+		freshNotificationKeys = [],
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail, {
 		smartResolveMode: releaseDetailSmartResolveMode,
 	});
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
+	const [storyLiveNotices, setStoryLiveNotices] =
+		useState<StoryLiveNotices>(liveNotices);
 
 	useEffect(() => {
 		setStoryBriefs(briefs);
 	}, [briefs]);
+
+	useEffect(() => {
+		setStoryLiveNotices(liveNotices);
+	}, [liveNotices]);
 
 	const seededReleaseTarget = useMemo(() => {
 		const locator = releaseDetail
@@ -2306,11 +2653,82 @@ function DashboardPreview(props: {
 				onSmartNow={triggerSmartNow}
 				reactionBusyKeys={reactionBusyKeys}
 				reactionErrorByKey={reactionErrorByKey}
+				freshKeys={new Set(freshFeedKeys)}
 				onToggleReaction={() => {}}
 				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
 				onGenerateBriefForDate={
 					mode === "all" ? generateBriefForDate : undefined
 				}
+				newContentBoundaries={(storyLiveNotices.feed ?? []).map(
+					(notice, index) => ({
+						id: notice.boundaryId,
+						count: notice.newCount,
+						label: "动态",
+						latestKeys: notice.latestKeys,
+						afterKey: notice.afterKey,
+						isLatest: index === 0,
+						isSealed: notice.sealed,
+						onExitedViewport: (boundaryId) => {
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.filter(
+									(feedNotice) => feedNotice.boundaryId !== boundaryId,
+								),
+							}));
+						},
+						onFreshAreaEntered: (boundaryId) => {
+							onFeedBoundaryEntered?.(boundaryId);
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.map((feedNotice) =>
+									feedNotice.boundaryId === boundaryId
+										? { ...feedNotice, sealed: true }
+										: feedNotice,
+								),
+							}));
+						},
+						onResolveAfterKey: (boundaryId, afterKey) => {
+							onFeedBoundaryResolved?.(boundaryId, afterKey);
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed:
+									afterKey === null
+										? current.feed?.filter(
+												(feedNotice) => feedNotice.boundaryId !== boundaryId,
+											)
+										: current.feed?.map((feedNotice) =>
+												feedNotice.boundaryId === boundaryId &&
+												feedNotice.afterKey === undefined
+													? { ...feedNotice, afterKey }
+													: feedNotice,
+											),
+							}));
+						},
+						onReveal: () => {
+							const freshKey = notice.latestKeys[0] ?? freshFeedKeys[0];
+							setStoryLiveNotices((current) => ({
+								...current,
+								feed: current.feed?.filter(
+									(feedNotice) => feedNotice.boundaryId !== notice.boundaryId,
+								),
+							}));
+							window.requestAnimationFrame(() => {
+								const itemElements = Array.from(
+									document.querySelectorAll<HTMLElement>(
+										"[data-feed-item-key]",
+									),
+								);
+								const element = itemElements.find(
+									(item) => item.dataset.feedItemKey === freshKey,
+								);
+								element?.scrollIntoView({
+									block: "start",
+									behavior: "smooth",
+								});
+							});
+						},
+					}),
+				)}
 			/>
 		);
 	};
@@ -2396,19 +2814,41 @@ function DashboardPreview(props: {
 								{renderFeedPanel("followers")}
 							</TabsContent>
 							<TabsContent value="briefs" className="mt-0 min-w-0">
+								<StoryNewContentNotice
+									count={storyLiveNotices.briefs?.newCount ?? 0}
+									label="日报"
+									onReveal={() =>
+										setStoryLiveNotices((current) => ({
+											...current,
+											briefs: undefined,
+										}))
+									}
+								/>
 								<ReleaseDailyCard
 									briefs={storyBriefs}
 									selectedId={selectedBriefId}
 									busy={false}
+									freshKeys={new Set(freshBriefKeys)}
 									onGenerate={() => {}}
 									onOpenRelease={openReleaseDetail}
 								/>
 							</TabsContent>
 							<TabsContent value="inbox" className="mt-0 min-w-0">
+								<StoryNewContentNotice
+									count={storyLiveNotices.notifications?.newCount ?? 0}
+									label="Inbox 内容"
+									onReveal={() =>
+										setStoryLiveNotices((current) => ({
+											...current,
+											notifications: undefined,
+										}))
+									}
+								/>
 								<InboxList
 									notifications={notifications}
 									busy={syncingAll}
 									syncing={syncingAll}
+									freshKeys={new Set(freshNotificationKeys)}
 									onSync={tab === "inbox" ? () => {} : undefined}
 								/>
 							</TabsContent>
@@ -2420,12 +2860,16 @@ function DashboardPreview(props: {
 									<BriefListCard
 										briefs={storyBriefs}
 										selectedId={selectedBriefId}
+										freshKeys={new Set(freshBriefKeys)}
 										onSelectId={(id) => setSelectedBriefId(id)}
 									/>
 								) : null}
 								{renderSidebarInbox ? (
 									<div data-dashboard-sidebar-inbox="true">
-										<InboxQuickList notifications={notifications} />
+										<InboxQuickList
+											notifications={notifications}
+											freshKeys={new Set(freshNotificationKeys)}
+										/>
 									</div>
 								) : null}
 							</aside>
@@ -3832,6 +4276,213 @@ export const FeedHotPathReactionRefresh: Story = {
 				story:
 					"本次 `/api/feed` 热路径优化的可视化验收：Feed 先用缓存内容结束首屏 skeleton；打开或刷新 Story 后，8 秒内页面保持可用，随后模拟后台同步完成：新增一张最新 release 卡片，同时第一张缓存 release 的 reaction 静默补齐为 live viewer/counts。刷新期间不增加 toast、不改 skeleton，也不阻止用户点击 reaction。",
 			},
+		},
+	},
+};
+
+export const QuasiRealtimeNewFeedBatch: Story = {
+	name: "Live updates / New feed batch",
+	render: () => {
+		const freshKey = "release:feed-hot-path-new-release";
+		return (
+			<DashboardPreview
+				initialTab="releases"
+				feedItems={makeFeedHotPathReactionFeed(true, true)}
+				freshFeedKeys={[freshKey]}
+				liveNotices={{
+					feed: [
+						{
+							boundaryId: `story-boundary-${freshKey}`,
+							newCount: 1,
+							latestKeys: [freshKey],
+						},
+					],
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：后台同步和润色完成后，新卡片进入旧内容上方，阅读流在新旧内容之间出现低声量分割线；点击分割线滚动到新内容顶部。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: /上方有/ }));
+		await expect(
+			canvas.queryByText("上方有 1 条新动态"),
+		).not.toBeInTheDocument();
+		await expect(
+			canvasElement.querySelector('[data-feed-item-fresh="true"]'),
+		).not.toBeNull();
+	},
+};
+
+export const QuasiRealtimeContinuousFeedPush: Story = {
+	name: "Live updates / Continuous feed push",
+	render: () => <ContinuousLivePushPreview />,
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时连续推送状态：Storybook 用固定 release 队列模拟后台多轮同步完成，新卡片按节奏进入旧内容上方，后续批次会生成新的新旧内容分割线，已进入的新卡片保留持续呼吸的青蓝圆点暗示。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(
+			canvas.getByRole("heading", {
+				name: "v2.63.0 · cached feed hot path",
+			}),
+		).toBeVisible();
+
+		await waitFor(
+			() =>
+				expect(
+					canvas.getByRole("heading", {
+						name: "v2.65.0 · live update lane",
+					}),
+				).toBeVisible(),
+			{ timeout: 2400 },
+		);
+		await expect(canvas.getByText("上方有 1 条新动态")).toBeVisible();
+		expect(
+			canvasElement.querySelectorAll('[data-dashboard-fresh-cue="true"]')
+				.length,
+		).toBeGreaterThanOrEqual(1);
+
+		await waitFor(
+			() =>
+				expect(
+					canvas.getByRole("heading", {
+						name: "sync worker batch complete",
+					}),
+				).toBeVisible(),
+			{ timeout: 5200 },
+		);
+		await expect(
+			canvas.getAllByText("上方有 1 条新动态").length,
+		).toBeGreaterThan(1);
+		expect(
+			canvasElement.querySelectorAll(
+				'[data-dashboard-new-content-boundary="true"]',
+			).length,
+		).toBeGreaterThan(1);
+		expect(
+			canvasElement.querySelectorAll('[data-feed-item-fresh="true"]').length,
+		).toBeGreaterThanOrEqual(2);
+	},
+};
+
+export const QuasiRealtimeNewDailyBrief: Story = {
+	name: "Live updates / New daily brief",
+	render: () => {
+		const freshKey = `brief:${mockBriefs[0].id}`;
+		return (
+			<DashboardPreview
+				initialTab="briefs"
+				freshBriefKeys={[freshKey]}
+				liveNotices={{
+					briefs: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：日报同步完成后，Briefs 页先出现低声量批次痕迹，日报正文和列表入口用同一套 session-only fresh 标记。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("刚刚同步 · 1 条日报")).toBeVisible();
+		await expect(
+			canvasElement.querySelector('[data-brief-item-fresh="true"]'),
+		).not.toBeNull();
+		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
+		await expect(
+			canvas.queryByText("刚刚同步 · 1 条日报"),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const QuasiRealtimeNewInboxThreads: Story = {
+	name: "Live updates / New threads",
+	render: () => {
+		const freshKey = `notification:${mockNotifs[0].thread_id}`;
+		return (
+			<DashboardPreview
+				initialTab="inbox"
+				freshNotificationKeys={[freshKey]}
+				liveNotices={{
+					notifications: {
+						newCount: 1,
+						latestKeys: [freshKey],
+					},
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"Dashboard 准实时更新状态：Inbox 新线程先以列表内的低声量批次痕迹进入阅读面，揭示后线程卡片保留克制的新内容暗示。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("刚刚同步 · 1 条Inbox 内容")).toBeVisible();
+		await expect(
+			canvasElement.querySelector('[data-inbox-item-fresh="true"]'),
+		).not.toBeNull();
+		await userEvent.click(canvas.getByRole("button", { name: /刚刚同步/ }));
+		await expect(
+			canvas.queryByText("刚刚同步 · 1 条Inbox 内容"),
+		).not.toBeInTheDocument();
+	},
+};
+
+export const EvidenceQuasiRealtimeNewFeedBatch: Story = {
+	name: "Evidence / Live updates feed batch",
+	render: () => {
+		const freshKey = "release:feed-hot-path-new-release";
+		return (
+			<DashboardPreview
+				initialTab="releases"
+				feedItems={makeFeedHotPathReactionFeed(true, true)}
+				freshFeedKeys={[freshKey]}
+				liveNotices={{
+					feed: [
+						{
+							boundaryId: `story-boundary-${freshKey}`,
+							newCount: 1,
+							latestKeys: [freshKey],
+						},
+					],
+				}}
+				showFooter={false}
+			/>
+		);
+	},
+	parameters: {
+		docs: {
+			disable: true,
 		},
 	},
 };

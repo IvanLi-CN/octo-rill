@@ -537,11 +537,28 @@ function SocialActionBridge(props: {
 	);
 }
 
+function FreshContentCue(props: { className?: string }) {
+	return (
+		<span
+			className={cn("inline-flex items-center align-middle", props.className)}
+			title="刚刚同步"
+		>
+			<span
+				className="dashboard-fresh-cue inline-flex size-2.5 rounded-full"
+				data-dashboard-fresh-cue="true"
+				aria-hidden="true"
+			/>
+			<span className="sr-only">刚刚同步</span>
+		</span>
+	);
+}
+
 function SocialActivityCard(props: {
 	item: SocialFeedItem;
 	currentViewer?: FeedViewer | null;
+	isFresh?: boolean;
 }) {
-	const { item, currentViewer } = props;
+	const { item, currentViewer, isFresh = false } = props;
 	const actor = item.actor;
 	const isRepoStar = item.kind === "repo_star_received";
 	const isFollower = item.kind === "follower_received";
@@ -689,6 +706,7 @@ function SocialActivityCard(props: {
 					>
 						{formatIsoShortLocal(item.ts)}
 					</p>
+					{isFresh ? <FreshContentCue className="shrink-0" /> : null}
 					{item.kind === "announcement" || item.kind === "repo_forked" ? (
 						<p className="min-w-0 truncate text-[11px] leading-none font-medium text-foreground/70 sm:text-xs">
 							{item.title ?? actionTitle}
@@ -953,8 +971,11 @@ function SocialActivityCard(props: {
 	);
 }
 
-function AnnouncementContentCard(props: { item: SocialFeedItem }) {
-	const { item } = props;
+function AnnouncementContentCard(props: {
+	item: SocialFeedItem;
+	isFresh?: boolean;
+}) {
+	const { item, isFresh = false } = props;
 	const title = item.title?.trim() || item.repo_full_name || "仓库公告";
 	const subtitleBits = [
 		item.subtitle || "仓库公告",
@@ -992,6 +1013,7 @@ function AnnouncementContentCard(props: { item: SocialFeedItem }) {
 								</CardTitle>
 								<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
 									{formatIsoShortLocal(item.ts)}
+									{isFresh ? <FreshContentCue className="ml-2" /> : null}
 									{subtitle ? ` · ${subtitle}` : ""}
 								</p>
 							</div>
@@ -1055,6 +1077,7 @@ function ReleaseFeedCard(props: {
 	isSmartGenerating: boolean;
 	isReactionBusy: boolean;
 	reactionError: string | null;
+	isFresh?: boolean;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
@@ -1067,6 +1090,7 @@ function ReleaseFeedCard(props: {
 		isSmartGenerating,
 		isReactionBusy,
 		reactionError,
+		isFresh = false,
 		onSelectLane,
 		onTranslateNow,
 		onSmartNow,
@@ -1121,6 +1145,7 @@ function ReleaseFeedCard(props: {
 							</CardTitle>
 							<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
 								{formatIsoShortLocal(item.ts)}
+								{isFresh ? <FreshContentCue className="ml-2" /> : null}
 								{subtitle ? ` · ${subtitle}` : ""}
 							</p>
 						</div>
@@ -1307,24 +1332,40 @@ export function FeedItemCard(props: {
 	isSmartGenerating: boolean;
 	isReactionBusy: boolean;
 	reactionError: string | null;
+	isFresh?: boolean;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
 }) {
-	const { item, currentViewer } = props;
+	const { item, currentViewer, isFresh = false } = props;
+	let card: ReactNode = null;
 
 	if (item.kind === "announcement") {
-		return <AnnouncementContentCard item={item} />;
-	}
-
-	if (isSocialFeedItem(item)) {
-		return <SocialActivityCard item={item} currentViewer={currentViewer} />;
-	}
-
-	if (!isReleaseFeedItem(item)) {
+		card = <AnnouncementContentCard item={item} isFresh={isFresh} />;
+	} else if (isSocialFeedItem(item)) {
+		card = (
+			<SocialActivityCard
+				item={item}
+				currentViewer={currentViewer}
+				isFresh={isFresh}
+			/>
+		);
+	} else if (isReleaseFeedItem(item)) {
+		card = <ReleaseFeedCard {...props} item={item} />;
+	} else {
 		return null;
 	}
 
-	return <ReleaseFeedCard {...props} item={item} />;
+	return (
+		<div
+			className={cn(
+				"relative rounded-[24px] transition-[background-color,border-color,box-shadow] duration-200 ease-out",
+				isFresh && "dashboard-fresh-surface",
+			)}
+			data-feed-item-fresh={isFresh ? "true" : "false"}
+		>
+			{card}
+		</div>
+	);
 }

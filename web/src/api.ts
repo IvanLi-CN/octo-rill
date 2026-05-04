@@ -215,6 +215,20 @@ export type MeResponse = {
 		daily_boundary_utc_offset_minutes: number;
 	};
 };
+export type DashboardUpdateList = {
+	changed: boolean;
+	new_count: number;
+	latest_keys: string[];
+};
+export type DashboardUpdatesResponse = {
+	token: string;
+	generated_at: string;
+	lists: {
+		feed?: DashboardUpdateList;
+		briefs?: DashboardUpdateList;
+		notifications?: DashboardUpdateList;
+	};
+};
 export type AdminUserProfileResponse = {
 	user_id: LocalUserId;
 	daily_brief_local_time: string;
