@@ -7,7 +7,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -46,6 +46,7 @@ const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
 const REPO_RELEASE_PRIORITY_INTERACTIVE: i64 = 2;
 const REPO_RELEASE_DEADLINE_EXPIRED_ERROR: &str = "repo_release_deadline_expired";
+const SUBSCRIPTION_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_secs(2);
 const GITHUB_WEB_BASE: &str = "https://github.com";
 const GITHUB_NOTIFICATIONS_PAGE_SIZE: usize = 50;
 const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
@@ -1531,6 +1532,61 @@ struct WaitReleaseDemandResult {
     candidate_failures: usize,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReleaseDemandProgress {
+    total_repos: usize,
+    succeeded_repos: usize,
+    failed_repos: usize,
+    pending_repos: usize,
+    candidate_failures: usize,
+    releases_written: usize,
+}
+
+struct SubscriptionProgressEmitter {
+    stage: &'static str,
+    last_payload: Option<Value>,
+    last_emitted_at: Option<Instant>,
+}
+
+impl SubscriptionProgressEmitter {
+    fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            last_payload: None,
+            last_emitted_at: None,
+        }
+    }
+
+    async fn emit_if_changed(
+        &mut self,
+        state: &AppState,
+        task_id: &str,
+        mut payload: Value,
+        force: bool,
+    ) -> Result<()> {
+        if let Value::Object(object) = &mut payload {
+            object.insert("task_id".to_owned(), Value::String(task_id.to_owned()));
+            object.insert("stage".to_owned(), Value::String(self.stage.to_owned()));
+        }
+        let changed = self.last_payload.as_ref() != Some(&payload);
+        if !changed && !force {
+            return Ok(());
+        }
+        let elapsed = self
+            .last_emitted_at
+            .map(|last| last.elapsed() >= SUBSCRIPTION_PROGRESS_EMIT_INTERVAL)
+            .unwrap_or(true);
+        if !force && !elapsed {
+            return Ok(());
+        }
+
+        jobs::append_task_event(state, task_id, "task.progress", payload.clone()).await?;
+        self.last_payload = Some(payload);
+        self.last_emitted_at = Some(Instant::now());
+        Ok(())
+    }
+}
+
 struct RepoReleaseWatcherUpsert<'a> {
     work_item_id: &'a str,
     task_id: &'a str,
@@ -2637,7 +2693,13 @@ async fn attach_and_wait_for_user_release_demand(
         .await?;
     }
 
-    let waited = wait_for_release_demand(state, task_id, &attached.work_item_ids).await?;
+    let waited = wait_for_release_demand(
+        state,
+        task_id,
+        &attached.work_item_ids,
+        Some(attached.repos),
+    )
+    .await?;
     Ok(SharedReleaseDemandResult {
         repos: attached.repos,
         releases: waited.releases,
@@ -2956,11 +3018,13 @@ async fn wait_for_release_demand(
     state: &AppState,
     task_id: Option<&str>,
     work_item_ids: &[String],
+    total_repos: Option<usize>,
 ) -> Result<WaitReleaseDemandResult> {
     if work_item_ids.is_empty() {
         return Ok(WaitReleaseDemandResult::default());
     }
 
+    let mut progress = SubscriptionProgressEmitter::new("release_progress");
     loop {
         let expired =
             expire_repo_release_work_items_for_wait(state, task_id, work_item_ids).await?;
@@ -2985,6 +3049,30 @@ async fn wait_for_release_demand(
             && is_job_cancel_requested(state, task_id).await?
         {
             break;
+        }
+
+        if let Some(task_id) = task_id {
+            let snapshot = load_release_demand_progress(
+                state,
+                task_id,
+                total_repos.unwrap_or(work_item_ids.len()),
+            )
+            .await?;
+            progress
+                .emit_if_changed(
+                    state,
+                    task_id,
+                    json!({
+                        "total_repos": snapshot.total_repos,
+                        "succeeded_repos": snapshot.succeeded_repos,
+                        "failed_repos": snapshot.failed_repos,
+                        "pending_repos": snapshot.pending_repos,
+                        "candidate_failures": snapshot.candidate_failures,
+                        "releases_written": snapshot.releases_written,
+                    }),
+                    false,
+                )
+                .await?;
         }
 
         let pending = if let Some(task_id) = task_id {
@@ -3023,6 +3111,27 @@ async fn wait_for_release_demand(
     }
 
     if let Some(task_id) = task_id {
+        let snapshot = load_release_demand_progress(
+            state,
+            task_id,
+            total_repos.unwrap_or(work_item_ids.len()),
+        )
+        .await?;
+        progress
+            .emit_if_changed(
+                state,
+                task_id,
+                json!({
+                    "total_repos": snapshot.total_repos,
+                    "succeeded_repos": snapshot.succeeded_repos,
+                    "failed_repos": snapshot.failed_repos,
+                    "pending_repos": snapshot.pending_repos,
+                    "candidate_failures": snapshot.candidate_failures,
+                    "releases_written": snapshot.releases_written,
+                }),
+                true,
+            )
+            .await?;
         let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"
             SELECT
@@ -3074,6 +3183,39 @@ async fn wait_for_release_demand(
         failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
         candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
             .unwrap_or_default(),
+    })
+}
+
+async fn load_release_demand_progress(
+    state: &AppState,
+    task_id: &str,
+    total_repos: usize,
+) -> Result<ReleaseDemandProgress> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+        FROM repo_release_watchers rw
+        JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+        WHERE rw.task_id = ?
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to load release demand progress")?;
+    Ok(ReleaseDemandProgress {
+        total_repos,
+        succeeded_repos: usize::try_from(row.get::<i64, _>("succeeded_count")).unwrap_or_default(),
+        failed_repos: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
+        pending_repos: usize::try_from(row.get::<i64, _>("pending_count")).unwrap_or_default(),
+        candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
+            .unwrap_or_default(),
+        releases_written: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
     })
 }
 
@@ -3425,6 +3567,7 @@ async fn run_star_phase(
         total_users: users.len(),
         ..SyncSubscriptionStarSummary::default()
     };
+    let mut progress = SubscriptionProgressEmitter::new("star_progress");
 
     for user in users {
         while join_set.len() >= SUBSCRIPTION_STAR_WORKERS {
@@ -3433,6 +3576,7 @@ async fn run_star_phase(
                 &mut successful_users,
                 &mut summary,
             )?;
+            emit_star_progress(context, &mut progress, &summary, false).await?;
             if context.is_cancel_requested().await? {
                 context
                     .log(
@@ -3474,6 +3618,7 @@ async fn run_star_phase(
             &mut successful_users,
             &mut summary,
         )?;
+        emit_star_progress(context, &mut progress, &summary, false).await?;
         if context.is_cancel_requested().await? {
             context
                 .log(
@@ -3491,7 +3636,29 @@ async fn run_star_phase(
         }
     }
 
+    emit_star_progress(context, &mut progress, &summary, true).await?;
     Ok((successful_users, summary))
+}
+
+async fn emit_star_progress(
+    context: &SubscriptionRunContext,
+    progress: &mut SubscriptionProgressEmitter,
+    summary: &SyncSubscriptionStarSummary,
+    force: bool,
+) -> Result<()> {
+    progress
+        .emit_if_changed(
+            context.state.as_ref(),
+            context.task_id.as_str(),
+            json!({
+                "total_users": summary.total_users,
+                "succeeded_users": summary.succeeded_users,
+                "failed_users": summary.failed_users,
+                "total_repos": summary.total_repos,
+            }),
+            force,
+        )
+        .await
 }
 
 fn collect_star_result(
@@ -3796,6 +3963,7 @@ async fn run_release_phase(
         context.state.as_ref(),
         Some(context.task_id.as_str()),
         &attached.work_item_ids,
+        Some(attached.repos),
     )
     .await?;
 
@@ -3819,6 +3987,7 @@ async fn run_social_phase(
         total_users: users.len(),
         ..SyncSubscriptionSocialSummary::default()
     };
+    let mut progress = SubscriptionProgressEmitter::new("social_progress");
 
     context
         .log(
@@ -3835,6 +4004,7 @@ async fn run_social_phase(
     for user in users {
         while join_set.len() >= SUBSCRIPTION_SOCIAL_WORKERS {
             collect_social_result(join_set.join_next().await, &mut summary)?;
+            emit_social_progress(context, &mut progress, &summary, false).await?;
             if context.is_cancel_requested().await? {
                 context
                     .log(
@@ -3873,6 +4043,7 @@ async fn run_social_phase(
 
     while !join_set.is_empty() {
         collect_social_result(join_set.join_next().await, &mut summary)?;
+        emit_social_progress(context, &mut progress, &summary, false).await?;
         if context.is_cancel_requested().await? {
             context
                 .log(
@@ -3890,6 +4061,7 @@ async fn run_social_phase(
         }
     }
 
+    emit_social_progress(context, &mut progress, &summary, true).await?;
     context
         .log(
             "info",
@@ -3901,6 +4073,29 @@ async fn run_social_phase(
         .await?;
 
     Ok(summary)
+}
+
+async fn emit_social_progress(
+    context: &SubscriptionRunContext,
+    progress: &mut SubscriptionProgressEmitter,
+    summary: &SyncSubscriptionSocialSummary,
+    force: bool,
+) -> Result<()> {
+    progress
+        .emit_if_changed(
+            context.state.as_ref(),
+            context.task_id.as_str(),
+            json!({
+                "total_users": summary.total_users,
+                "succeeded_users": summary.succeeded_users,
+                "failed_users": summary.failed_users,
+                "repo_stars": summary.repo_stars,
+                "followers": summary.followers,
+                "events": summary.events,
+            }),
+            force,
+        )
+        .await
 }
 
 fn collect_social_result(
@@ -4063,6 +4258,7 @@ async fn run_notifications_phase(
         total_users: users.len(),
         ..SyncSubscriptionNotificationsSummary::default()
     };
+    let mut progress = SubscriptionProgressEmitter::new("notifications_progress");
 
     context
         .log(
@@ -4079,6 +4275,7 @@ async fn run_notifications_phase(
     for user in users {
         while join_set.len() >= SUBSCRIPTION_NOTIFICATION_WORKERS {
             collect_notification_result(join_set.join_next().await, &mut summary)?;
+            emit_notifications_progress(context, &mut progress, &summary, false).await?;
             if context.is_cancel_requested().await? {
                 context
                     .log(
@@ -4117,6 +4314,7 @@ async fn run_notifications_phase(
 
     while !join_set.is_empty() {
         collect_notification_result(join_set.join_next().await, &mut summary)?;
+        emit_notifications_progress(context, &mut progress, &summary, false).await?;
         if context.is_cancel_requested().await? {
             context
                 .log(
@@ -4134,6 +4332,7 @@ async fn run_notifications_phase(
         }
     }
 
+    emit_notifications_progress(context, &mut progress, &summary, true).await?;
     context
         .log(
             "info",
@@ -4145,6 +4344,27 @@ async fn run_notifications_phase(
         .await?;
 
     Ok(summary)
+}
+
+async fn emit_notifications_progress(
+    context: &SubscriptionRunContext,
+    progress: &mut SubscriptionProgressEmitter,
+    summary: &SyncSubscriptionNotificationsSummary,
+    force: bool,
+) -> Result<()> {
+    progress
+        .emit_if_changed(
+            context.state.as_ref(),
+            context.task_id.as_str(),
+            json!({
+                "total_users": summary.total_users,
+                "succeeded_users": summary.succeeded_users,
+                "failed_users": summary.failed_users,
+                "notifications": summary.notifications,
+            }),
+            force,
+        )
+        .await
 }
 
 fn collect_notification_result(
@@ -10392,10 +10612,14 @@ mod tests {
         .await
         .expect("seed failed repo release work item");
 
-        let result =
-            wait_for_release_demand(state.as_ref(), None, &["repo-work-failed-1".to_owned()])
-                .await
-                .expect("wait for release demand");
+        let result = wait_for_release_demand(
+            state.as_ref(),
+            None,
+            &["repo-work-failed-1".to_owned()],
+            Some(1),
+        )
+        .await
+        .expect("wait for release demand");
 
         assert_eq!(result.failed, 1);
         assert_eq!(result.releases, 0);
@@ -10415,6 +10639,8 @@ mod tests {
                 repo_full_name: "octo/deadline",
                 status: jobs::STATUS_QUEUED,
                 deadline_at: "2000-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: None,
                 lease_heartbeat_at: None,
             },
@@ -10432,6 +10658,7 @@ mod tests {
             state.as_ref(),
             Some("task-release-deadline"),
             &["repo-work-expired-wait".to_owned()],
+            Some(1),
         )
         .await
         .expect("wait for expired release demand");
@@ -10487,6 +10714,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_release_demand_emits_release_progress_summary() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-progress").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-progress-ok",
+                repo_id: 143,
+                repo_full_name: "octo/progress-ok",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 9,
+                last_candidate_failures: 2,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-progress-failed",
+                repo_id: 144,
+                repo_full_name: "octo/progress-failed",
+                status: jobs::STATUS_FAILED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 7,
+                last_candidate_failures: 5,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-progress-ok",
+            "repo-work-progress-ok",
+            "task-release-progress",
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-progress-failed",
+            "repo-work-progress-failed",
+            "task-release-progress",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_watchers
+            SET status = CASE work_item_id
+              WHEN 'repo-work-progress-ok' THEN 'succeeded'
+              ELSE 'failed'
+            END
+            WHERE task_id = ?
+            "#,
+        )
+        .bind("task-release-progress")
+        .execute(&pool)
+        .await
+        .expect("set watcher statuses");
+
+        let result = wait_for_release_demand(
+            state.as_ref(),
+            Some("task-release-progress"),
+            &[
+                "repo-work-progress-ok".to_owned(),
+                "repo-work-progress-failed".to_owned(),
+            ],
+            Some(2),
+        )
+        .await
+        .expect("wait for release progress");
+
+        assert_eq!(result.releases, 9);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.candidate_failures, 2);
+        let payload_json: String = sqlx::query_scalar(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'release_progress'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind("task-release-progress")
+        .fetch_one(&pool)
+        .await
+        .expect("load release progress event");
+        let payload: Value = serde_json::from_str(&payload_json).expect("parse payload");
+        assert_eq!(payload.get("total_repos").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            payload.get("succeeded_repos").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(payload.get("failed_repos").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            payload.get("releases_written").and_then(Value::as_u64),
+            Some(9)
+        );
+    }
+
+    #[tokio::test]
     async fn repo_release_deadline_recovery_expires_live_running_work_items() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -10499,6 +10832,8 @@ mod tests {
                 repo_full_name: "octo/live-expired",
                 status: jobs::STATUS_RUNNING,
                 deadline_at: "2000-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: Some(state.runtime_owner_id.as_str()),
                 lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
             },
@@ -10546,6 +10881,8 @@ mod tests {
                 repo_full_name: "octo/finalize-expired",
                 status: jobs::STATUS_RUNNING,
                 deadline_at: "2000-01-01T00:00:00Z",
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: Some(state.runtime_owner_id.as_str()),
                 lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
             },
@@ -10605,6 +10942,8 @@ mod tests {
                 repo_full_name: "octo/new-generation",
                 status: jobs::STATUS_RUNNING,
                 deadline_at: future_deadline.as_str(),
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: Some(state.runtime_owner_id.as_str()),
                 lease_heartbeat_at: Some("2999-01-01T00:00:00Z"),
             },
@@ -10672,6 +11011,8 @@ mod tests {
                 repo_full_name: "octo/backoff",
                 status: jobs::STATUS_QUEUED,
                 deadline_at: future_deadline.as_str(),
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: None,
                 lease_heartbeat_at: None,
             },
@@ -10737,6 +11078,8 @@ mod tests {
                 repo_full_name: "octo/refreshed-deadline",
                 status: jobs::STATUS_QUEUED,
                 deadline_at: future_deadline.as_str(),
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: None,
                 lease_heartbeat_at: None,
             },
@@ -10782,6 +11125,8 @@ mod tests {
                 repo_full_name: "octo/stale-lease",
                 status: jobs::STATUS_RUNNING,
                 deadline_at: future_deadline.as_str(),
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: None,
                 lease_heartbeat_at: None,
             },
@@ -10908,6 +11253,8 @@ mod tests {
                 repo_full_name: "octo/attach-expired",
                 status: jobs::STATUS_QUEUED,
                 deadline_at: old,
+                last_release_count: 0,
+                last_candidate_failures: 0,
                 runtime_owner_id: None,
                 lease_heartbeat_at: None,
             },
@@ -11106,6 +11453,7 @@ mod tests {
             SELECT payload_json
             FROM job_task_events
             WHERE task_id = ? AND event_type = 'task.progress'
+              AND json_extract(payload_json, '$.stage') = 'release_attached'
             ORDER BY rowid DESC
             LIMIT 1
             "#,
@@ -11407,10 +11755,13 @@ mod tests {
             stages,
             vec![
                 "collect".to_owned(),
+                "star_progress".to_owned(),
                 "star_summary".to_owned(),
                 "repo_collect".to_owned(),
                 "release_summary".to_owned(),
+                "social_progress".to_owned(),
                 "social_summary".to_owned(),
+                "notifications_progress".to_owned(),
                 "notifications_summary".to_owned(),
                 "summary".to_owned(),
             ]
@@ -11423,6 +11774,8 @@ mod tests {
         repo_full_name: &'a str,
         status: &'a str,
         deadline_at: &'a str,
+        last_release_count: i64,
+        last_candidate_failures: i64,
         runtime_owner_id: Option<&'a str>,
         lease_heartbeat_at: Option<&'a str>,
     }
@@ -11461,8 +11814,8 @@ mod tests {
         .bind(RepoReleaseOrigin::System.priority())
         .bind(0_i64)
         .bind(seed.deadline_at)
-        .bind(0_i64)
-        .bind(0_i64)
+        .bind(seed.last_release_count)
+        .bind(seed.last_candidate_failures)
         .bind(Option::<String>::None)
         .bind(Option::<String>::None)
         .bind(now)

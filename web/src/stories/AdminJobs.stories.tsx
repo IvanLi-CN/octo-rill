@@ -6,6 +6,7 @@ import type {
 	AdminLlmCallDetailResponse,
 	AdminRealtimeTaskDetailResponse,
 	AdminRealtimeTaskItem,
+	AdminSyncSubscriptionsDiagnostics,
 } from "@/api";
 import { AdminJobs } from "@/pages/AdminJobs";
 
@@ -16,6 +17,40 @@ const RUNNING_WORKER_UPDATED_AT = new Date(
 	STORYBOOK_NOW - 75_000,
 ).toISOString();
 const ERROR_WORKER_UPDATED_AT = new Date(STORYBOOK_NOW - 30_000).toISOString();
+
+const runningSubscriptionInitialRelease = {
+	succeeded_repos: 58,
+	failed_repos: 2,
+	candidate_failures: 3,
+	releases_written: 680,
+};
+const runningSubscriptionLiveRelease = {
+	succeeded_repos: 79,
+	failed_repos: 4,
+	candidate_failures: 5,
+	releases_written: 924,
+};
+
+function applyRunningSubscriptionReleaseProgress(
+	detail: AdminRealtimeTaskDetailResponse,
+	progress: typeof runningSubscriptionInitialRelease,
+) {
+	detail.task.updated_at =
+		progress.releases_written ===
+		runningSubscriptionLiveRelease.releases_written
+			? "2026-02-27T14:43:15Z"
+			: "2026-02-27T14:42:45Z";
+	detail.task.result_json = null;
+	const sync = detail.diagnostics?.sync_subscriptions as
+		| AdminSyncSubscriptionsDiagnostics
+		| null
+		| undefined;
+	if (!sync) return;
+	sync.release.succeeded_repos = progress.succeeded_repos;
+	sync.release.failed_repos = progress.failed_repos;
+	sync.release.candidate_failures = progress.candidate_failures;
+	sync.releases_written = progress.releases_written;
+}
 
 const realtimeTasksSeed: AdminRealtimeTaskItem[] = [
 	{
@@ -729,38 +764,7 @@ function buildTaskDetail(
 						trigger: "schedule",
 						schedule_key: "2026-02-27T14:40",
 					}),
-					result_json: JSON.stringify({
-						skipped: false,
-						skip_reason: null,
-						star: {
-							total_users: 12,
-							succeeded_users: 11,
-							failed_users: 1,
-							total_repos: 340,
-						},
-						release: {
-							total_repos: 128,
-							succeeded_repos: 58,
-							failed_repos: 2,
-							candidate_failures: 3,
-						},
-						social: {
-							total_users: 0,
-							succeeded_users: 0,
-							failed_users: 0,
-							repo_stars: 0,
-							followers: 0,
-							events: 0,
-						},
-						notifications: {
-							total_users: 0,
-							succeeded_users: 0,
-							failed_users: 0,
-							notifications: 0,
-						},
-						releases_written: 680,
-						critical_events: 2,
-					}),
+					result_json: null,
 				},
 				events: [
 					{
@@ -808,10 +812,13 @@ function buildTaskDetail(
 						payload_json: JSON.stringify({
 							stage: "release_summary",
 							total_repos: 128,
-							succeeded_repos: 58,
-							failed_repos: 2,
-							candidate_failures: 3,
-							releases_written: 680,
+							succeeded_repos:
+								runningSubscriptionInitialRelease.succeeded_repos,
+							failed_repos: runningSubscriptionInitialRelease.failed_repos,
+							candidate_failures:
+								runningSubscriptionInitialRelease.candidate_failures,
+							releases_written:
+								runningSubscriptionInitialRelease.releases_written,
 						}),
 						created_at: "2026-02-27T14:42:45Z",
 					},
@@ -838,9 +845,11 @@ function buildTaskDetail(
 						},
 						release: {
 							total_repos: 128,
-							succeeded_repos: 58,
-							failed_repos: 2,
-							candidate_failures: 3,
+							succeeded_repos:
+								runningSubscriptionInitialRelease.succeeded_repos,
+							failed_repos: runningSubscriptionInitialRelease.failed_repos,
+							candidate_failures:
+								runningSubscriptionInitialRelease.candidate_failures,
 						},
 						social: {
 							total_users: 0,
@@ -856,7 +865,8 @@ function buildTaskDetail(
 							failed_users: 0,
 							notifications: 0,
 						},
-						releases_written: 680,
+						releases_written:
+							runningSubscriptionInitialRelease.releases_written,
 						critical_events: 2,
 						recent_events: [
 							{
@@ -1528,7 +1538,17 @@ function AdminJobsPreview({
 						},
 					);
 				}
-				return new Response(JSON.stringify(buildTaskDetail(task)), {
+				const detail = buildTaskDetail(task);
+				if (taskId === "task-subscription-1440") {
+					const hasLiveProgress = task.updated_at === "2026-02-27T14:43:15Z";
+					applyRunningSubscriptionReleaseProgress(
+						detail,
+						hasLiveProgress
+							? runningSubscriptionLiveRelease
+							: runningSubscriptionInitialRelease,
+					);
+				}
+				return new Response(JSON.stringify(detail), {
 					status: 200,
 					headers: { "content-type": "application/json" },
 				});
@@ -1894,6 +1914,41 @@ function AdminJobsPreview({
 					});
 				}, 1600);
 				this.timers.push(llmUpdateTimer);
+				const subscriptionProgressTimer = window.setTimeout(() => {
+					const target = scheduledRuns.find(
+						(item) => item.id === "task-subscription-1440",
+					);
+					if (!target) return;
+					target.updated_at = "2026-02-27T14:43:15Z";
+					const detail = buildTaskDetail(target);
+					detail.events.push({
+						id: "evt-task-1440-7",
+						event_type: "task.progress",
+						payload_json: JSON.stringify({
+							stage: "release_progress",
+							total_repos: 128,
+							succeeded_repos: runningSubscriptionLiveRelease.succeeded_repos,
+							failed_repos: runningSubscriptionLiveRelease.failed_repos,
+							pending_repos:
+								128 -
+								runningSubscriptionLiveRelease.succeeded_repos -
+								runningSubscriptionLiveRelease.failed_repos,
+							candidate_failures:
+								runningSubscriptionLiveRelease.candidate_failures,
+							releases_written: runningSubscriptionLiveRelease.releases_written,
+						}),
+						created_at: target.updated_at,
+					});
+					this.emit("job.event", {
+						event_id: "evt-stream-subscription-1440-7",
+						task_id: target.id,
+						task_type: target.task_type,
+						status: target.status,
+						event_type: "task.progress",
+						created_at: target.updated_at,
+					});
+				}, 900);
+				this.timers.push(subscriptionProgressTimer);
 			}
 
 			close() {
@@ -2129,7 +2184,7 @@ export const SubscriptionSyncDetail: Story = {
 		await expect(
 			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
 		).toBeVisible();
-		await expect(body.getByText("Release Queue")).toBeVisible();
+		await expect(body.getAllByText("Release Queue").at(0)).toBeVisible();
 		await expect(body.getByText("octo/private-repo")).toBeVisible();
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
@@ -2191,6 +2246,8 @@ export const SubscriptionSyncDetailRunning: Story = {
 		await expect(body.getByText("octo/slow-release-repo")).toBeVisible();
 		await expect(body.getByText("58")).toBeVisible();
 		await expect(body.getByText("680")).toBeVisible();
+		await waitFor(() => expect(body.getByText("79")).toBeVisible());
+		await expect(body.getByText("924")).toBeVisible();
 		await expect(body.getAllByText("等待").length).toBeGreaterThanOrEqual(2);
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(

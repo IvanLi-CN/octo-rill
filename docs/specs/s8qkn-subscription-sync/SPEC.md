@@ -353,6 +353,20 @@ PR: include
 
 source_type=storybook_canvas
 target_program=mock-only
+capture_scope=browser-viewport
+requested_viewport=default
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Running
+state=subscription-sync-detail-running-live-progress
+evidence_note=验证运行中的订阅同步详情页在 SSE 触发详情刷新后，Release Queue 阶段内进度从实时 diagnostics 更新为 79 个成功仓库、4 个失败仓库与 924 条写入 Releases。
+
+PR: include
+![Subscription sync detail running live progress](./assets/admin-sync-subscriptions-stage-live-progress.png)
+
+source_type=storybook_canvas
+target_program=mock-only
 capture_scope=element
 requested_viewport=default
 viewport_strategy=storybook-viewport

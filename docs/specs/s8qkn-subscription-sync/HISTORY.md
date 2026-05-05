@@ -8,6 +8,7 @@
 ## 历史摘要
 
 - 2026-05-03: 订阅同步提速方向冻结为“不降频、不扩大 freshness window”；Release 阶段新增 worker 热配置、repo 级 conditional request 状态和 timeout 退避，`ReleaseEvent` 仅作为快速发现信号提升 repo demand，Discussions Announcements 继续独立表示仓库公告；Admin Jobs 新增订阅同步列表页和独立工作流详情页。
+- 2026-05-05: `sync.subscriptions` 的 Star、Release Queue、Social、Notifications 长阶段新增节流后的根任务 `task.progress` 阶段内进度事件；详情 diagnostics 识别 `release_progress` 等增量事件，前端通过既有 SSE 后刷新详情链路显示阶段内实时成功、失败与 Release 写入数。
 - 2026-05-05: Admin Jobs 订阅同步详情的运行中阶段总览改为在 `result_json` 尚未写入时从当前 `task.progress` 事件派生 Star、repo collect、Release queue、social 与 Inbox 统计，避免执行时间线已有进展但阶段卡片仍显示等待或零值。
 - 2026-05-04: 明确跳过的订阅同步记录不进入设置弹窗最近链路用时；跳过任务详情展示“已跳过”与未执行阶段语义。
 - 2026-05-02: repo release work item 的 `deadline_at` 升级为硬业务超时；订阅同步等待 shared release queue 时会主动收敛过期 pending watcher，避免根任务长期 running 后让后续计划任务持续跳过。
