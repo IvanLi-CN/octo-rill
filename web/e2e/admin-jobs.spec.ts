@@ -107,6 +107,20 @@ async function installAdminJobsMocks(
 			finished_at: "2026-02-26T14:38:10Z",
 			updated_at: "2026-02-26T14:38:10Z",
 		},
+		{
+			id: "task-subscriptions-skipped",
+			task_type: "sync.subscriptions",
+			status: "succeeded",
+			source: "scheduler",
+			requested_by: null,
+			parent_task_id: null,
+			cancel_requested: false,
+			error_message: null,
+			created_at: "2026-02-26T14:40:00Z",
+			started_at: "2026-02-26T14:40:01Z",
+			finished_at: "2026-02-26T14:40:01Z",
+			updated_at: "2026-02-26T14:40:01Z",
+		},
 	];
 
 	const llmCalls = [
@@ -228,11 +242,13 @@ async function installAdminJobsMocks(
 		sync_auto_fetch_interval_minutes: 10,
 		recent_sync_tasks: tasks
 			.filter((task) => task.task_type === "sync.subscriptions")
+			.filter((task) => task.id !== "task-subscriptions-skipped")
 			.slice(0, 3)
 			.map((task) => ({
 				id: task.id,
 				status: task.status,
 				source: task.source,
+				skipped: task.id === "task-subscriptions-skipped",
 				duration_ms: syncSubscriptionChainFinishedAt[task.id]
 					? new Date(syncSubscriptionChainFinishedAt[task.id]).getTime() -
 						new Date(task.created_at).getTime()
@@ -807,7 +823,10 @@ async function installAdminJobsMocks(
 				return true;
 			});
 			return json(route, {
-				items: filtered,
+				items: filtered.map((task) => ({
+					...task,
+					skipped: task.id === "task-subscriptions-skipped",
+				})),
 				page: 1,
 				page_size: 20,
 				total: filtered.length,
@@ -1249,6 +1268,120 @@ async function installAdminJobsMocks(
 				});
 			}
 
+			if (taskId === "task-subscriptions-skipped") {
+				return json(route, {
+					task: {
+						...task,
+						payload_json: JSON.stringify({
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:40",
+						}),
+						result_json: JSON.stringify({
+							skipped: true,
+							skip_reason: "previous_run_active",
+							star: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								total_repos: 0,
+							},
+							release: {
+								total_repos: 0,
+								succeeded_repos: 0,
+								failed_repos: 0,
+								candidate_failures: 0,
+							},
+							social: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								repo_stars: 0,
+								followers: 0,
+								events: 0,
+							},
+							notifications: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								notifications: 0,
+							},
+							releases_written: 0,
+							critical_events: 0,
+						}),
+					},
+					event_meta: {
+						returned: 2,
+						total: 2,
+						limit: 200,
+						truncated: false,
+					},
+					diagnostics: {
+						business_outcome: {
+							code: "disabled",
+							label: "已跳过",
+							message: "上一轮订阅同步仍在执行，本轮仅记录跳过结果。",
+						},
+						sync_subscriptions: {
+							trigger: "schedule",
+							schedule_key: "2026-02-26T14:40",
+							skipped: true,
+							skip_reason: "previous_run_active",
+							log_available: false,
+							log_download_path: null,
+							star: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								total_repos: 0,
+							},
+							release: {
+								total_repos: 0,
+								succeeded_repos: 0,
+								failed_repos: 0,
+								candidate_failures: 0,
+							},
+							social: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								repo_stars: 0,
+								followers: 0,
+								events: 0,
+							},
+							notifications: {
+								total_users: 0,
+								succeeded_users: 0,
+								failed_users: 0,
+								notifications: 0,
+							},
+							releases_written: 0,
+							critical_events: 0,
+							recent_events: [],
+						},
+					},
+					events: [
+						{
+							id: "evt-skipped-1",
+							event_type: "task.progress",
+							payload_json: JSON.stringify({
+								stage: "skipped",
+								skip_reason: "previous_run_active",
+							}),
+							created_at: "2026-02-26T14:40:01Z",
+						},
+						{
+							id: "evt-skipped-2",
+							event_type: "task.completed",
+							payload_json: JSON.stringify({
+								status: "succeeded",
+								skipped: true,
+							}),
+							created_at: "2026-02-26T14:40:01Z",
+						},
+					],
+				});
+			}
+
 			return json(route, {
 				task: {
 					...task,
@@ -1649,10 +1782,10 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(page.getByRole("heading", { name: "定时任务" })).toBeVisible();
 	await expect(page.getByText("定时日报")).toBeVisible();
 	await expect(
-		page.getByText("sync.subscriptions", { exact: true }),
+		page.getByText("sync.subscriptions", { exact: true }).first(),
 	).toBeVisible();
 	await expect(
-		page.getByText("brief.daily_slot", { exact: true }),
+		page.getByText("brief.daily_slot", { exact: true }).first(),
 	).toBeVisible();
 	const subscriptionTaskCard = page
 		.getByText("ID: task-subscriptions-1")
@@ -1699,6 +1832,19 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.getByRole("button", { name: "配置订阅同步 worker 数量" }),
 	).toBeVisible();
+	await page.getByRole("button", { name: "配置订阅同步 worker 数量" }).click();
+	const syncSettingsDialog = page.getByRole("dialog", {
+		name: "配置订阅同步",
+	});
+	await expect(syncSettingsDialog).toBeVisible();
+	await expect(
+		syncSettingsDialog.getByText("task-subscriptions-1"),
+	).toBeVisible();
+	await expect(
+		syncSettingsDialog.getByText("task-subscriptions-skipped"),
+	).toHaveCount(0);
+	await syncSettingsDialog.getByRole("button", { name: "取消" }).click();
+	await expect(syncSettingsDialog).toHaveCount(0);
 	await page.getByRole("button", { name: "返回订阅同步列表" }).click();
 	await expect(page).toHaveURL(/\/admin\/jobs\/subscriptions$/);
 
@@ -2381,6 +2527,45 @@ test("admin translation scheduler falls back to single-line mobile lists", async
 	await expect(
 		page.locator("[data-app-meta-footer-hidden='false']"),
 	).toHaveCount(1);
+});
+
+test("skipped subscription workflow renders skipped semantics", async ({
+	page,
+}) => {
+	await installAdminJobsMocks(page);
+	await page.goto("/admin/jobs/subscriptions");
+
+	const skippedWorkflowCard = page
+		.getByText("ID: task-subscriptions-skipped")
+		.locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]");
+	await expect(
+		skippedWorkflowCard.locator("[data-slot='badge']").getByText("已跳过"),
+	).toBeVisible();
+	await expect(
+		skippedWorkflowCard.locator("[data-slot='badge']").getByText("成功"),
+	).toHaveCount(0);
+
+	await page.goto("/admin/jobs/subscriptions/task-subscriptions-skipped");
+
+	await expect(
+		page.getByRole("heading", { name: "订阅同步工作流详情" }),
+	).toBeVisible();
+	await expect(
+		page.locator("[data-slot='badge']").getByText("已跳过"),
+	).toHaveCount(7);
+	await expect(page.getByText("业务结果")).toBeVisible();
+	await expect(
+		page.getByText("上一轮订阅同步仍在执行，本轮仅记录跳过结果。"),
+	).toBeVisible();
+	await expect(
+		page.locator("#subscription-stage-collect").getByText("上一轮仍在执行", {
+			exact: true,
+		}),
+	).toBeVisible();
+	await expect(page.getByText("等待")).toHaveCount(0);
+	await expect(
+		page.locator("[data-slot='badge']").getByText("成功"),
+	).toHaveCount(0);
 });
 
 test.describe("localized admin diagnostics timestamps", () => {
