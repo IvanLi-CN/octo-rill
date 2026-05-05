@@ -2840,7 +2840,7 @@ pub async fn admin_list_realtime_tasks(
     }))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Clone, Debug, Serialize, sqlx::FromRow)]
 pub struct AdminTaskEventItem {
     id: String,
     event_type: String,
@@ -3951,6 +3951,7 @@ fn map_sync_subscription_event(
 
 fn build_sync_subscriptions_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
     recent_events: &[AdminSyncSubscriptionEventItem],
 ) -> (AdminBusinessOutcome, AdminSyncSubscriptionsDiagnostics) {
     let payload_value = parse_json_value(Some(task.payload_json.as_str()));
@@ -3968,19 +3969,19 @@ fn build_sync_subscriptions_diagnostics(
     let skip_reason = json_object_get_string(result_object, "skip_reason");
     let trigger = json_object_get_string(payload_object, "trigger");
     let schedule_key = json_object_get_string(payload_object, "schedule_key");
-    let star = AdminSyncSubscriptionStarDiagnostics {
+    let mut star = AdminSyncSubscriptionStarDiagnostics {
         total_users: json_object_get_i64(star_object, "total_users").unwrap_or(0),
         succeeded_users: json_object_get_i64(star_object, "succeeded_users").unwrap_or(0),
         failed_users: json_object_get_i64(star_object, "failed_users").unwrap_or(0),
         total_repos: json_object_get_i64(star_object, "total_repos").unwrap_or(0),
     };
-    let release = AdminSyncSubscriptionReleaseDiagnostics {
+    let mut release = AdminSyncSubscriptionReleaseDiagnostics {
         total_repos: json_object_get_i64(release_object, "total_repos").unwrap_or(0),
         succeeded_repos: json_object_get_i64(release_object, "succeeded_repos").unwrap_or(0),
         failed_repos: json_object_get_i64(release_object, "failed_repos").unwrap_or(0),
         candidate_failures: json_object_get_i64(release_object, "candidate_failures").unwrap_or(0),
     };
-    let social = AdminSyncSubscriptionSocialDiagnostics {
+    let mut social = AdminSyncSubscriptionSocialDiagnostics {
         total_users: json_object_get_i64(social_object, "total_users").unwrap_or(0),
         succeeded_users: json_object_get_i64(social_object, "succeeded_users").unwrap_or(0),
         failed_users: json_object_get_i64(social_object, "failed_users").unwrap_or(0),
@@ -3988,14 +3989,28 @@ fn build_sync_subscriptions_diagnostics(
         followers: json_object_get_i64(social_object, "followers").unwrap_or(0),
         events: json_object_get_i64(social_object, "events").unwrap_or(0),
     };
-    let notifications = AdminSyncSubscriptionNotificationsDiagnostics {
+    let mut notifications = AdminSyncSubscriptionNotificationsDiagnostics {
         total_users: json_object_get_i64(notifications_object, "total_users").unwrap_or(0),
         succeeded_users: json_object_get_i64(notifications_object, "succeeded_users").unwrap_or(0),
         failed_users: json_object_get_i64(notifications_object, "failed_users").unwrap_or(0),
         notifications: json_object_get_i64(notifications_object, "notifications").unwrap_or(0),
     };
-    let releases_written = json_object_get_i64(result_object, "releases_written").unwrap_or(0);
+    let mut releases_written = json_object_get_i64(result_object, "releases_written").unwrap_or(0);
     let critical_events = json_object_get_i64(result_object, "critical_events").unwrap_or(0);
+    apply_sync_subscription_progress_events(
+        events,
+        result_object.is_none(),
+        star_object.is_none(),
+        release_object.is_none(),
+        social_object.is_none(),
+        notifications_object.is_none(),
+        json_object_get_i64(result_object, "releases_written").is_none(),
+        &mut star,
+        &mut release,
+        &mut social,
+        &mut notifications,
+        &mut releases_written,
+    );
     let log_available = task
         .log_file_path
         .as_deref()
@@ -4083,6 +4098,120 @@ fn build_sync_subscriptions_diagnostics(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_sync_subscription_progress_events(
+    events: &[AdminTaskEventItem],
+    fill_all: bool,
+    fill_star: bool,
+    fill_release: bool,
+    fill_social: bool,
+    fill_notifications: bool,
+    fill_releases_written: bool,
+    star: &mut AdminSyncSubscriptionStarDiagnostics,
+    release: &mut AdminSyncSubscriptionReleaseDiagnostics,
+    social: &mut AdminSyncSubscriptionSocialDiagnostics,
+    notifications: &mut AdminSyncSubscriptionNotificationsDiagnostics,
+    releases_written: &mut i64,
+) {
+    for event in task_events_for_diagnostics(events) {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let Some(stage) = json_object_get_string(payload_object, "stage") else {
+            continue;
+        };
+
+        match stage.as_str() {
+            "collect" => {
+                if (fill_all || fill_star)
+                    && let Some(total_users) = json_object_get_i64(payload_object, "total_users")
+                {
+                    star.total_users = total_users;
+                }
+            }
+            "star_summary" => {
+                if fill_all || fill_star {
+                    star.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(star.total_users);
+                    star.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
+                        .unwrap_or(star.succeeded_users);
+                    star.failed_users = json_object_get_i64(payload_object, "failed_users")
+                        .unwrap_or(star.failed_users);
+                    star.total_repos = json_object_get_i64(payload_object, "total_repos")
+                        .unwrap_or(star.total_repos);
+                }
+            }
+            "repo_collect" => {
+                if (fill_all || fill_release)
+                    && let Some(total_repos) = json_object_get_i64(payload_object, "total_repos")
+                {
+                    release.total_repos = total_repos;
+                }
+            }
+            "release_attached" => {
+                if fill_all || fill_release {
+                    release.total_repos =
+                        json_object_get_i64(payload_object, "repos").unwrap_or(release.total_repos);
+                }
+            }
+            "release_summary" => {
+                if fill_all || fill_release {
+                    release.total_repos = json_object_get_i64(payload_object, "total_repos")
+                        .unwrap_or(release.total_repos);
+                    release.succeeded_repos =
+                        json_object_get_i64(payload_object, "succeeded_repos")
+                            .unwrap_or(release.succeeded_repos);
+                    release.failed_repos = json_object_get_i64(payload_object, "failed_repos")
+                        .unwrap_or(release.failed_repos);
+                    release.candidate_failures =
+                        json_object_get_i64(payload_object, "candidate_failures")
+                            .unwrap_or(release.candidate_failures);
+                }
+                if fill_all || fill_releases_written {
+                    *releases_written = json_object_get_i64(payload_object, "releases_written")
+                        .unwrap_or(*releases_written);
+                }
+            }
+            "social_summary" => {
+                if fill_all || fill_social {
+                    social.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(social.total_users);
+                    social.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
+                        .unwrap_or(social.succeeded_users);
+                    social.failed_users = json_object_get_i64(payload_object, "failed_users")
+                        .unwrap_or(social.failed_users);
+                    social.repo_stars = json_object_get_i64(payload_object, "repo_stars")
+                        .unwrap_or(social.repo_stars);
+                    social.followers = json_object_get_i64(payload_object, "followers")
+                        .unwrap_or(social.followers);
+                    social.events =
+                        json_object_get_i64(payload_object, "events").unwrap_or(social.events);
+                }
+            }
+            "notifications_summary" => {
+                if fill_all || fill_notifications {
+                    notifications.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(notifications.total_users);
+                    notifications.succeeded_users =
+                        json_object_get_i64(payload_object, "succeeded_users")
+                            .unwrap_or(notifications.succeeded_users);
+                    notifications.failed_users =
+                        json_object_get_i64(payload_object, "failed_users")
+                            .unwrap_or(notifications.failed_users);
+                    notifications.notifications =
+                        json_object_get_i64(payload_object, "notifications")
+                            .unwrap_or(notifications.notifications);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn build_task_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
@@ -4154,7 +4283,7 @@ fn build_task_diagnostics(
         }
         jobs::TASK_SYNC_SUBSCRIPTIONS => {
             let (business_outcome, diagnostics) =
-                build_sync_subscriptions_diagnostics(task, subscription_events);
+                build_sync_subscriptions_diagnostics(task, events, subscription_events);
             Some(AdminTaskDiagnostics {
                 business_outcome,
                 translate_release_batch: None,
@@ -4281,7 +4410,35 @@ async fn load_realtime_task_detail_response(
         Vec::new()
     };
 
-    let diagnostics = build_task_diagnostics(&task, &events, &subscription_events);
+    let diagnostic_events = if task.task_type == jobs::TASK_SYNC_SUBSCRIPTIONS {
+        sqlx::query_as::<_, AdminTaskEventItem>(
+            r#"
+            SELECT id, event_type, payload_json, created_at
+            FROM job_task_events
+            WHERE task_id = ?
+              AND event_type = 'task.progress'
+              AND json_valid(payload_json)
+              AND json_extract(payload_json, '$.stage') IN (
+                'collect',
+                'star_summary',
+                'repo_collect',
+                'release_attached',
+                'release_summary',
+                'social_summary',
+                'notifications_summary'
+              )
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        events.clone()
+    };
+
+    let diagnostics = build_task_diagnostics(&task, &diagnostic_events, &subscription_events);
 
     Ok(AdminRealtimeTaskDetailResponse {
         task,
@@ -17154,6 +17311,96 @@ mod tests {
     }
 
     #[test]
+    fn task_diagnostics_sync_subscriptions_running_uses_progress_events() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777954200"}"#,
+            None,
+            None,
+        );
+        let events = vec![
+            test_task_event(
+                5,
+                "task.progress",
+                r#"{"stage":"release_summary","total_repos":12255,"succeeded_repos":4482,"failed_repos":7773,"candidate_failures":6,"releases_written":102599}"#,
+            ),
+            test_task_event(
+                3,
+                "task.progress",
+                r#"{"stage":"star_summary","total_users":13,"succeeded_users":13,"failed_users":0,"total_repos":13801}"#,
+            ),
+            test_task_event(
+                4,
+                "task.progress",
+                r#"{"stage":"repo_collect","total_repos":12255}"#,
+            ),
+            test_task_event(
+                1,
+                "task.progress",
+                r#"{"stage":"collect","total_users":13}"#,
+            ),
+            test_task_event(2, "task.running", r#"{"status":"running"}"#),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
+        assert_eq!(diagnostics.business_outcome.code, "unknown");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.trigger.as_deref(), Some("schedule"));
+        assert_eq!(
+            sync_diag.schedule_key.as_deref(),
+            Some("interval:10:1777954200")
+        );
+        assert_eq!(sync_diag.star.total_users, 13);
+        assert_eq!(sync_diag.star.succeeded_users, 13);
+        assert_eq!(sync_diag.star.total_repos, 13801);
+        assert_eq!(sync_diag.release.total_repos, 12255);
+        assert_eq!(sync_diag.release.succeeded_repos, 4482);
+        assert_eq!(sync_diag.release.failed_repos, 7773);
+        assert_eq!(sync_diag.release.candidate_failures, 6);
+        assert_eq!(sync_diag.releases_written, 102599);
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_running_uses_release_attached_progress() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777954800"}"#,
+            None,
+            None,
+        );
+        let events = vec![
+            test_task_event(
+                3,
+                "task.progress",
+                r#"{"stage":"release_attached","repos":128,"queued":68,"reused_running":2,"reused_fresh":58}"#,
+            ),
+            test_task_event(
+                2,
+                "task.progress",
+                r#"{"stage":"repo_collect","total_repos":128}"#,
+            ),
+            test_task_event(
+                1,
+                "task.progress",
+                r#"{"stage":"star_summary","total_users":12,"succeeded_users":11,"failed_users":1,"total_repos":340}"#,
+            ),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.release.total_repos, 128);
+        assert_eq!(sync_diag.release.succeeded_repos, 0);
+        assert_eq!(sync_diag.release.failed_repos, 0);
+        assert_eq!(sync_diag.releases_written, 0);
+    }
+
+    #[test]
     fn task_diagnostics_sync_subscriptions_surfaces_recent_events_and_log_download() {
         let log_dir = std::env::temp_dir().join(format!(
             "octo-rill-sync-diagnostics-{}",
@@ -17853,6 +18100,126 @@ mod tests {
         );
         assert_eq!(sync.social.events, 3);
         assert_eq!(sync.notifications.notifications, 4);
+    }
+
+    #[tokio::test]
+    async fn admin_get_realtime_task_detail_reads_truncated_sync_progress_for_diagnostics() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 2, "admin", 1, 0).await;
+        let state = setup_state(pool.clone());
+        let session = setup_session(2).await;
+        let task_id = crate::local_id::test_local_id("sync-detail-truncated-progress");
+        let now = "2026-03-06T14:30:00Z";
+        sqlx::query(
+            r#"
+            INSERT INTO job_tasks (
+              id,
+              task_type,
+              status,
+              source,
+              requested_by,
+              parent_task_id,
+              payload_json,
+              result_json,
+              error_message,
+              cancel_requested,
+              created_at,
+              started_at,
+              finished_at,
+              updated_at,
+              log_file_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(jobs::STATUS_RUNNING)
+        .bind("tests")
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(r#"{"trigger":"schedule","schedule_key":"interval:10:1777954800"}"#)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(0_i64)
+        .bind(now)
+        .bind(Some(now))
+        .bind(Option::<String>::None)
+        .bind(now)
+        .bind(Option::<String>::None)
+        .execute(&pool)
+        .await
+        .expect("insert task row");
+
+        let early_events = [
+            (
+                "3333333333333331",
+                r#"{"stage":"star_summary","total_users":12,"succeeded_users":11,"failed_users":1,"total_repos":340}"#,
+                "2026-03-06T14:30:01Z",
+            ),
+            (
+                "3333333333333332",
+                r#"{"stage":"repo_collect","total_repos":128}"#,
+                "2026-03-06T14:30:02Z",
+            ),
+            (
+                "3333333333333333",
+                r#"{"stage":"release_attached","repos":128,"queued":68,"reused_running":2,"reused_fresh":58}"#,
+                "2026-03-06T14:30:03Z",
+            ),
+        ];
+        for (event_id, payload, created_at) in early_events {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(event_id)
+            .bind(task_id.as_str())
+            .bind(payload)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert early progress event");
+        }
+
+        for idx in 0..ADMIN_TASK_DETAIL_EVENT_LIMIT {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, 'task.progress', ?, ?)
+                "#,
+            )
+            .bind(fixed_local_id('y', idx as usize).as_str())
+            .bind(task_id.as_str())
+            .bind(format!(r#"{{"stage":"heartbeat","sequence":{idx}}}"#))
+            .bind(indexed_created_at((idx + 60) as usize))
+            .execute(&pool)
+            .await
+            .expect("insert later noise event");
+        }
+
+        let response = admin_get_realtime_task_detail(State(state), session, Path(task_id))
+            .await
+            .expect("task detail")
+            .0;
+
+        assert!(response.event_meta.truncated);
+        assert!(
+            !response
+                .events
+                .iter()
+                .any(|event| event.payload_json.contains("star_summary"))
+        );
+        let sync = response
+            .diagnostics
+            .expect("diagnostics")
+            .sync_subscriptions
+            .expect("sync diagnostics");
+        assert_eq!(sync.star.total_users, 12);
+        assert_eq!(sync.star.succeeded_users, 11);
+        assert_eq!(sync.release.total_repos, 128);
+        assert_eq!(sync.release.succeeded_repos, 0);
     }
 
     #[tokio::test]

@@ -806,10 +806,11 @@ function buildTaskDetail(
 						id: "evt-task-1440-6",
 						event_type: "task.progress",
 						payload_json: JSON.stringify({
-							stage: "release_attached",
+							stage: "release_summary",
 							total_repos: 128,
 							succeeded_repos: 58,
 							failed_repos: 2,
+							candidate_failures: 3,
 							releases_written: 680,
 						}),
 						created_at: "2026-02-27T14:42:45Z",
@@ -2188,6 +2189,8 @@ export const SubscriptionSyncDetailRunning: Story = {
 		).toBeVisible();
 		await expect(body.getByText("Release Queue")).toBeVisible();
 		await expect(body.getByText("octo/slow-release-repo")).toBeVisible();
+		await expect(body.getByText("58")).toBeVisible();
+		await expect(body.getByText("680")).toBeVisible();
 		await expect(body.getAllByText("等待").length).toBeGreaterThanOrEqual(2);
 		await waitFor(() =>
 			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
