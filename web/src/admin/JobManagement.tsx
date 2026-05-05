@@ -220,6 +220,7 @@ function SyncTaskDurationButton(props: {
 	onOpen: (taskId: string) => void;
 }) {
 	const { task, disabled, onOpen } = props;
+	const displayStatus = task.skipped ? "skipped" : task.status;
 	return (
 		<button
 			type="button"
@@ -233,7 +234,7 @@ function SyncTaskDurationButton(props: {
 					{task.id}
 				</span>
 				<span className="mt-1 block text-xs text-muted-foreground">
-					{taskStatusLabel(task.status)} · 链路完成{" "}
+					{taskStatusLabel(displayStatus)} · 链路完成{" "}
 					{formatLocalDateTime(task.finished_at)}
 				</span>
 			</span>
@@ -661,6 +662,8 @@ function taskStatusLabel(status: string) {
 			return "失败";
 		case "canceled":
 			return "已取消";
+		case "skipped":
+			return "已跳过";
 		default:
 			return status;
 	}
@@ -750,6 +753,13 @@ function taskStatusTone(status: string): TaskStatusTone {
 					"border-slate-300 bg-slate-100/90 text-slate-900 dark:border-slate-500/60 dark:bg-slate-500/20 dark:text-slate-100",
 				dotClass: "bg-slate-500",
 			};
+		case "skipped":
+			return {
+				cardAccentClass: "border-zinc-500/45",
+				badgeClass:
+					"border-zinc-300 bg-zinc-100/90 text-zinc-900 dark:border-zinc-500/60 dark:bg-zinc-500/20 dark:text-zinc-100",
+				dotClass: "bg-zinc-500",
+			};
 		default:
 			return {
 				cardAccentClass: "border-border",
@@ -758,6 +768,12 @@ function taskStatusTone(status: string): TaskStatusTone {
 				dotClass: "bg-muted-foreground",
 			};
 	}
+}
+
+function realtimeTaskDisplayStatus(task: AdminRealtimeTaskItem) {
+	return task.task_type === "sync.subscriptions" && task.skipped
+		? "skipped"
+		: task.status;
 }
 
 type BadgeTone = Pick<TaskStatusTone, "badgeClass" | "dotClass">;
@@ -2721,6 +2737,7 @@ type SubscriptionWorkflowStage = {
 	id: string;
 	label: string;
 	description: string;
+	skipped?: boolean;
 	total: number;
 	succeeded: number;
 	done: number;
@@ -2762,6 +2779,7 @@ function subscriptionProgressSegments(stage: SubscriptionWorkflowStage) {
 }
 
 function subscriptionProgressSummary(stage: SubscriptionWorkflowStage) {
+	if (stage.skipped) return `${stage.label} 阶段已跳过，未产生工作项`;
 	const segments = subscriptionProgressSegments(stage);
 	if (segments.length === 0) return `${stage.label} 阶段暂无结果数据`;
 	return `${stage.label} 阶段结果分布：${segments
@@ -2772,6 +2790,7 @@ function subscriptionProgressSummary(stage: SubscriptionWorkflowStage) {
 function subscriptionStageTone(
 	stage: SubscriptionWorkflowStage,
 ): TaskStatusTone {
+	if (stage.skipped) return taskStatusTone("skipped");
 	if (stage.total > 0 && stage.done >= stage.total) {
 		if (stage.failed > 0) return taskStatusTone("failed");
 		return taskStatusTone("succeeded");
@@ -2782,6 +2801,7 @@ function subscriptionStageTone(
 }
 
 function subscriptionStageStatusLabel(stage: SubscriptionWorkflowStage) {
+	if (stage.skipped) return "已跳过";
 	if (stage.total > 0 && stage.done >= stage.total) return "完成";
 	if (stage.done > 0) return "运行中";
 	if (stage.failed > 0) return "部分失败";
@@ -2803,6 +2823,49 @@ function buildSubscriptionWorkflowStages(
 				failed: 0,
 				meta: [["状态", "等待诊断数据"]],
 			},
+		];
+	}
+
+	const skipReason =
+		diagnostics.skip_reason === "previous_run_active"
+			? "上一轮仍在执行"
+			: (diagnostics.skip_reason ?? "本轮未执行");
+	if (diagnostics.skipped) {
+		const skippedStage = (
+			id: string,
+			label: string,
+			description: string,
+			meta: Array<[string, string]> = [],
+		): SubscriptionWorkflowStage => ({
+			id,
+			label,
+			description,
+			skipped: true,
+			total: 0,
+			succeeded: 0,
+			done: 0,
+			failed: 0,
+			meta: [["跳过原因", skipReason], ...meta],
+		});
+		return [
+			skippedStage(
+				"collect",
+				"Collect",
+				"调度器检测到上一轮仍在执行，本轮仅记录跳过结果。",
+				[
+					["触发", diagnostics.trigger ?? "-"],
+					["调度键", diagnostics.schedule_key ?? "-"],
+				],
+			),
+			skippedStage("star", "Star", "本轮未同步 starred repos。"),
+			skippedStage("repo", "Repo Collect", "本轮未聚合可见仓库。"),
+			skippedStage("release", "Release Queue", "本轮未派发 release workers。"),
+			skippedStage("social", "Social", "本轮未同步社交事件。"),
+			skippedStage(
+				"notifications",
+				"Notifications",
+				"本轮未同步 GitHub Inbox。",
+			),
 		];
 	}
 
@@ -2936,7 +2999,10 @@ function SubscriptionWorkflowDetailPage(props: {
 	const diagnostics = detail?.diagnostics?.sync_subscriptions ?? null;
 	const businessOutcome = detail?.diagnostics?.business_outcome ?? null;
 	const stages = buildSubscriptionWorkflowStages(diagnostics);
-	const tone = taskStatusTone(detail?.task.status ?? "");
+	const displayStatus = diagnostics?.skipped
+		? "skipped"
+		: (detail?.task.status ?? "");
+	const tone = taskStatusTone(displayStatus);
 	const recentFailures = diagnostics?.recent_events.filter(
 		(event) => event.severity === "error" || event.severity === "warning",
 	);
@@ -2971,10 +3037,7 @@ function SubscriptionWorkflowDetailPage(props: {
 					<div className="space-y-1">
 						<div className="flex flex-wrap items-center gap-2">
 							<h2 className="font-semibold text-xl">订阅同步工作流详情</h2>
-							<StatusBadge
-								label={taskStatusLabel(detail.task.status)}
-								tone={tone}
-							/>
+							<StatusBadge label={taskStatusLabel(displayStatus)} tone={tone} />
 							<Badge variant="outline">sync.subscriptions</Badge>
 						</div>
 						<p className="text-muted-foreground truncate font-mono text-xs">
@@ -4742,7 +4805,8 @@ export function JobManagement({
 								) : (
 									tasks.map((task) => {
 										const busy = taskActionBusyId === task.id;
-										const tone = taskStatusTone(task.status);
+										const displayStatus = realtimeTaskDisplayStatus(task);
+										const tone = taskStatusTone(displayStatus);
 										return (
 											<div
 												key={task.id}
@@ -4754,7 +4818,7 @@ export function JobManagement({
 															{taskTypeLabel(task.task_type)}
 														</p>
 														<StatusBadge
-															label={taskStatusLabel(task.status)}
+															label={taskStatusLabel(displayStatus)}
 															tone={tone}
 														/>
 														{task.cancel_requested ? (
@@ -4903,7 +4967,8 @@ export function JobManagement({
 								) : (
 									scheduledRuns.map((task) => {
 										const busy = taskActionBusyId === task.id;
-										const tone = taskStatusTone(task.status);
+										const displayStatus = realtimeTaskDisplayStatus(task);
+										const tone = taskStatusTone(displayStatus);
 										return (
 											<div
 												key={task.id}
@@ -4915,7 +4980,7 @@ export function JobManagement({
 															{taskTypeLabel(task.task_type)}
 														</p>
 														<StatusBadge
-															label={taskStatusLabel(task.status)}
+															label={taskStatusLabel(displayStatus)}
 															tone={tone}
 														/>
 														{task.cancel_requested ? (
@@ -5114,7 +5179,8 @@ export function JobManagement({
 										</p>
 									) : (
 										subscriptionRuns.map((task) => {
-											const tone = taskStatusTone(task.status);
+											const displayStatus = realtimeTaskDisplayStatus(task);
+											const tone = taskStatusTone(displayStatus);
 											const diagnostics =
 												task.id === activeTaskDetail?.task.id
 													? activeTaskDetail?.diagnostics?.sync_subscriptions
@@ -5132,7 +5198,7 @@ export function JobManagement({
 																		订阅同步工作流
 																	</p>
 																	<StatusBadge
-																		label={taskStatusLabel(task.status)}
+																		label={taskStatusLabel(displayStatus)}
 																		tone={tone}
 																	/>
 																	<span className="rounded-md border bg-background px-2 py-0.5 font-mono text-[11px]">
