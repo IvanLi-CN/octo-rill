@@ -263,6 +263,7 @@ Response changes for `task_type=sync.subscriptions` remain under `diagnostics.sy
 Notes:
 
 - Existing admin diagnostics stay compatible while adding `social` and `notifications` sections.
+- When `result_json` is not available yet for a running `sync.subscriptions` task, `diagnostics.sync_subscriptions` is derived from the task's current `task.progress` events so the workflow detail can show live stage totals before completion.
 - `sync.access_refresh` currently reuses generic task detail rendering.
 
 ## `GET /api/admin/jobs/realtime/{task_id}/log`

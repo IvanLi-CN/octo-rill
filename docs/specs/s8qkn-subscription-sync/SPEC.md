@@ -138,6 +138,7 @@
   - translation / smart preheat child tasks。
 - 每个阶段至少展示整体状态、完成/总量、最近关键事件；Release 阶段还应展示 worker 目标并发、成功/失败 repo、candidate failures 与超时/退避线索。
 - 当 `sync.subscriptions` 的业务结果为 `skipped=true` 时，详情页展示状态为“已跳过”；各阶段展示“已跳过/未执行”语义和跳过原因，不把 0/0 误判为“等待”。
+- 运行中的 `sync.subscriptions` 任务在 `result_json` 尚未写入前，详情 API 必须从当前任务的 `task.progress` 事件派生 `diagnostics.sync_subscriptions`，让阶段总览实时展示已经完成的 Star、repo collect、Release queue、social 和 Inbox 摘要。
 
 ### `sync.access_refresh`
 
@@ -278,6 +279,10 @@
 - Given 某轮 `sync.subscriptions` 因上一轮仍在执行而被跳过
   When 管理员打开该任务详情
   Then 顶部状态和业务结果显示“已跳过”，阶段总览不显示“等待”，设置弹窗最近链路用时也不展示该跳过记录。
+
+- Given 管理员打开运行中的 `/admin/jobs/subscriptions/{task_id}`
+  When 该任务已经发出 `star_summary`、`repo_collect` 或 `release_summary` 事件但 `result_json` 仍为空
+  Then 阶段总览从事件派生实时统计，不应把已完成阶段显示为等待或 `0 / 0`。
 
 ## Visual Evidence
 
