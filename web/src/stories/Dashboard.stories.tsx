@@ -124,6 +124,7 @@ const STORYBOOK_VERSION_STATE = {
 	loadedVersion: "v2.4.6",
 	availableVersion: null,
 	hasUpdate: false,
+	hasServiceWorkerUpdate: false,
 	refreshPage: () => {},
 } as const;
 const RAW_GITHUB_PULL_URL =
