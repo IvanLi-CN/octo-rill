@@ -30,6 +30,7 @@ type AdminJobsMockOptions = {
 	emitStreamEvents?: boolean;
 	emitLlmSchedulerEvents?: boolean;
 	emitTranslationEvents?: boolean;
+	emitSubscriptionProgressEvents?: boolean;
 	currentUserLogin?: string;
 };
 
@@ -514,6 +515,9 @@ async function installAdminJobsMocks(
 	let translationEventDelivered = !emitTranslationEvents;
 	const emitLlmSchedulerEvents = options.emitLlmSchedulerEvents ?? false;
 	let llmSchedulerEventDelivered = !emitLlmSchedulerEvents;
+	const emitSubscriptionProgressEvents =
+		options.emitSubscriptionProgressEvents ?? false;
+	let subscriptionProgressEventDelivered = !emitSubscriptionProgressEvents;
 	const translationViewResponseCounts = new Map<string, number>();
 
 	function shouldServeCompletedTranslationView(key: string) {
@@ -945,6 +949,34 @@ async function installAdminJobsMocks(
 				);
 			}
 
+			if (
+				emitSubscriptionProgressEvents &&
+				!subscriptionProgressEventDelivered
+			) {
+				await sleep(200);
+				subscriptionProgressEventDelivered = true;
+				const subscription = tasks.find(
+					(task) => task.id === "task-subscriptions-1",
+				);
+				if (subscription) {
+					subscription.status = "running";
+					subscription.finished_at = null;
+					subscription.updated_at = "2026-02-26T14:37:30Z";
+				}
+				streamBody.push(
+					"event: job.event",
+					`data: ${JSON.stringify({
+						event_id: "evt-stream-subscription-progress-1",
+						task_id: "task-subscriptions-1",
+						task_type: "sync.subscriptions",
+						status: "running",
+						event_type: "task.progress",
+						created_at: "2026-02-26T14:37:30Z",
+					})}`,
+					"",
+				);
+			}
+
 			streamBody.push("");
 			return route.fulfill({
 				status: 200,
@@ -1065,45 +1097,53 @@ async function installAdminJobsMocks(
 			}
 
 			if (taskId === "task-subscriptions-1") {
+				const liveSubscriptionProgress = subscriptionProgressEventDelivered;
 				return json(route, {
 					task: {
 						...task,
+						status: liveSubscriptionProgress ? "running" : task.status,
+						finished_at: liveSubscriptionProgress ? null : task.finished_at,
+						updated_at: liveSubscriptionProgress
+							? "2026-02-26T14:37:30Z"
+							: task.updated_at,
 						payload_json: JSON.stringify({
 							trigger: "schedule",
 							schedule_key: "2026-02-26T14:30",
 						}),
-						result_json: JSON.stringify({
-							skipped: false,
-							skip_reason: null,
-							star: {
-								total_users: 12,
-								succeeded_users: 11,
-								failed_users: 1,
-								total_repos: 340,
-							},
-							release: {
-								total_repos: 128,
-								succeeded_repos: 123,
-								failed_repos: 5,
-								candidate_failures: 7,
-							},
-							social: {
-								total_users: 11,
-								succeeded_users: 9,
-								failed_users: 2,
-								repo_stars: 48,
-								followers: 19,
-								events: 67,
-							},
-							notifications: {
-								total_users: 11,
-								succeeded_users: 10,
-								failed_users: 1,
-								notifications: 192,
-							},
-							releases_written: 1840,
-							critical_events: 6,
-						}),
+						result_json: liveSubscriptionProgress
+							? null
+							: JSON.stringify({
+									skipped: false,
+									skip_reason: null,
+									star: {
+										total_users: 12,
+										succeeded_users: 11,
+										failed_users: 1,
+										total_repos: 340,
+									},
+									release: {
+										total_repos: 128,
+										succeeded_repos: 123,
+										failed_repos: 5,
+										candidate_failures: 7,
+									},
+									social: {
+										total_users: 11,
+										succeeded_users: 9,
+										failed_users: 2,
+										repo_stars: 48,
+										followers: 19,
+										events: 67,
+									},
+									notifications: {
+										total_users: 11,
+										succeeded_users: 10,
+										failed_users: 1,
+										notifications: 192,
+									},
+									releases_written: 1840,
+									critical_events: 6,
+								}),
 					},
 					event_meta: {
 						returned: 4,
@@ -1133,9 +1173,9 @@ async function installAdminJobsMocks(
 							},
 							release: {
 								total_repos: 128,
-								succeeded_repos: 123,
-								failed_repos: 5,
-								candidate_failures: 7,
+								succeeded_repos: liveSubscriptionProgress ? 79 : 123,
+								failed_repos: liveSubscriptionProgress ? 4 : 5,
+								candidate_failures: liveSubscriptionProgress ? 5 : 7,
 							},
 							social: {
 								total_users: 11,
@@ -1151,7 +1191,7 @@ async function installAdminJobsMocks(
 								failed_users: 1,
 								notifications: 192,
 							},
-							releases_written: 1840,
+							releases_written: liveSubscriptionProgress ? 924 : 1840,
 							critical_events: 6,
 							recent_events: [
 								{
@@ -1224,13 +1264,18 @@ async function installAdminJobsMocks(
 							id: "evt-task-33",
 							event_type: "task.progress",
 							payload_json: JSON.stringify({
-								stage: "release_summary",
+								stage: liveSubscriptionProgress
+									? "release_progress"
+									: "release_summary",
 								total_repos: 128,
-								succeeded_repos: 123,
-								failed_repos: 5,
-								releases_written: 1840,
+								succeeded_repos: liveSubscriptionProgress ? 79 : 123,
+								failed_repos: liveSubscriptionProgress ? 4 : 5,
+								pending_repos: liveSubscriptionProgress ? 45 : 0,
+								releases_written: liveSubscriptionProgress ? 924 : 1840,
 							}),
-							created_at: "2026-02-26T14:37:59Z",
+							created_at: liveSubscriptionProgress
+								? "2026-02-26T14:37:30Z"
+								: "2026-02-26T14:37:59Z",
 						},
 						{
 							id: "evt-task-34",
@@ -1696,7 +1741,7 @@ async function installAdminJobsMocks(
 
 test("admin can manage jobs center", async ({ page }) => {
 	test.slow();
-	await installAdminJobsMocks(page);
+	await installAdminJobsMocks(page, { emitSubscriptionProgressEvents: true });
 	await page.goto("/admin/jobs", { waitUntil: "domcontentloaded" });
 
 	const realtimeTab = page.getByRole("tab", { name: "实时异步任务" });
@@ -1826,6 +1871,8 @@ test("admin can manage jobs center", async ({ page }) => {
 	await expect(
 		page.locator("#subscription-stage-release").getByText("Release Queue"),
 	).toBeVisible();
+	await expect(page.getByText("79")).toBeVisible();
+	await expect(page.getByText("924")).toBeVisible();
 	await expect(
 		page.getByText("octo/private-repo · attempt 1 · terminal"),
 	).toBeVisible();
