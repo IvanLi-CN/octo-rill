@@ -4133,6 +4133,18 @@ fn apply_sync_subscription_progress_events(
                     star.total_users = total_users;
                 }
             }
+            "star_progress" => {
+                if fill_all || fill_star {
+                    star.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(star.total_users);
+                    star.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
+                        .unwrap_or(star.succeeded_users);
+                    star.failed_users = json_object_get_i64(payload_object, "failed_users")
+                        .unwrap_or(star.failed_users);
+                    star.total_repos = json_object_get_i64(payload_object, "total_repos")
+                        .unwrap_or(star.total_repos);
+                }
+            }
             "star_summary" => {
                 if fill_all || fill_star {
                     star.total_users = json_object_get_i64(payload_object, "total_users")
@@ -4158,6 +4170,24 @@ fn apply_sync_subscription_progress_events(
                         json_object_get_i64(payload_object, "repos").unwrap_or(release.total_repos);
                 }
             }
+            "release_progress" => {
+                if fill_all || fill_release {
+                    release.total_repos = json_object_get_i64(payload_object, "total_repos")
+                        .unwrap_or(release.total_repos);
+                    release.succeeded_repos =
+                        json_object_get_i64(payload_object, "succeeded_repos")
+                            .unwrap_or(release.succeeded_repos);
+                    release.failed_repos = json_object_get_i64(payload_object, "failed_repos")
+                        .unwrap_or(release.failed_repos);
+                    release.candidate_failures =
+                        json_object_get_i64(payload_object, "candidate_failures")
+                            .unwrap_or(release.candidate_failures);
+                }
+                if fill_all || fill_releases_written {
+                    *releases_written = json_object_get_i64(payload_object, "releases_written")
+                        .unwrap_or(*releases_written);
+                }
+            }
             "release_summary" => {
                 if fill_all || fill_release {
                     release.total_repos = json_object_get_i64(payload_object, "total_repos")
@@ -4176,6 +4206,22 @@ fn apply_sync_subscription_progress_events(
                         .unwrap_or(*releases_written);
                 }
             }
+            "social_progress" => {
+                if fill_all || fill_social {
+                    social.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(social.total_users);
+                    social.succeeded_users = json_object_get_i64(payload_object, "succeeded_users")
+                        .unwrap_or(social.succeeded_users);
+                    social.failed_users = json_object_get_i64(payload_object, "failed_users")
+                        .unwrap_or(social.failed_users);
+                    social.repo_stars = json_object_get_i64(payload_object, "repo_stars")
+                        .unwrap_or(social.repo_stars);
+                    social.followers = json_object_get_i64(payload_object, "followers")
+                        .unwrap_or(social.followers);
+                    social.events =
+                        json_object_get_i64(payload_object, "events").unwrap_or(social.events);
+                }
+            }
             "social_summary" => {
                 if fill_all || fill_social {
                     social.total_users = json_object_get_i64(payload_object, "total_users")
@@ -4190,6 +4236,21 @@ fn apply_sync_subscription_progress_events(
                         .unwrap_or(social.followers);
                     social.events =
                         json_object_get_i64(payload_object, "events").unwrap_or(social.events);
+                }
+            }
+            "notifications_progress" => {
+                if fill_all || fill_notifications {
+                    notifications.total_users = json_object_get_i64(payload_object, "total_users")
+                        .unwrap_or(notifications.total_users);
+                    notifications.succeeded_users =
+                        json_object_get_i64(payload_object, "succeeded_users")
+                            .unwrap_or(notifications.succeeded_users);
+                    notifications.failed_users =
+                        json_object_get_i64(payload_object, "failed_users")
+                            .unwrap_or(notifications.failed_users);
+                    notifications.notifications =
+                        json_object_get_i64(payload_object, "notifications")
+                            .unwrap_or(notifications.notifications);
                 }
             }
             "notifications_summary" => {
@@ -4420,11 +4481,15 @@ async fn load_realtime_task_detail_response(
               AND json_valid(payload_json)
               AND json_extract(payload_json, '$.stage') IN (
                 'collect',
+                'star_progress',
                 'star_summary',
                 'repo_collect',
                 'release_attached',
+                'release_progress',
                 'release_summary',
+                'social_progress',
                 'social_summary',
+                'notifications_progress',
                 'notifications_summary'
               )
             ORDER BY rowid ASC
@@ -17398,6 +17463,71 @@ mod tests {
         assert_eq!(sync_diag.release.succeeded_repos, 0);
         assert_eq!(sync_diag.release.failed_repos, 0);
         assert_eq!(sync_diag.releases_written, 0);
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_running_uses_release_progress() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_RUNNING,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777955400"}"#,
+            None,
+            None,
+        );
+        let events = vec![
+            test_task_event(
+                1,
+                "task.progress",
+                r#"{"stage":"star_summary","total_users":12,"succeeded_users":11,"failed_users":1,"total_repos":340}"#,
+            ),
+            test_task_event(
+                2,
+                "task.progress",
+                r#"{"stage":"repo_collect","total_repos":128}"#,
+            ),
+            test_task_event(
+                3,
+                "task.progress",
+                r#"{"stage":"release_progress","total_repos":128,"succeeded_repos":58,"failed_repos":2,"pending_repos":68,"candidate_failures":3,"releases_written":680}"#,
+            ),
+        ];
+
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.release.total_repos, 128);
+        assert_eq!(sync_diag.release.succeeded_repos, 58);
+        assert_eq!(sync_diag.release.failed_repos, 2);
+        assert_eq!(sync_diag.release.candidate_failures, 3);
+        assert_eq!(sync_diag.releases_written, 680);
+    }
+
+    #[test]
+    fn task_diagnostics_sync_subscriptions_result_overrides_stale_release_progress() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_SUBSCRIPTIONS,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"trigger":"schedule","schedule_key":"interval:10:1777956000"}"#,
+            Some(
+                r#"{"skipped":false,"star":{"total_users":12,"succeeded_users":12,"failed_users":0,"total_repos":340},"release":{"total_repos":128,"succeeded_repos":120,"failed_repos":8,"candidate_failures":4},"social":{"total_users":12,"succeeded_users":12,"failed_users":0,"repo_stars":20,"followers":5,"events":44},"notifications":{"total_users":12,"succeeded_users":11,"failed_users":1,"notifications":17},"releases_written":900,"critical_events":0}"#,
+            ),
+            None,
+        );
+        let events = vec![test_task_event(
+            1,
+            "task.progress",
+            r#"{"stage":"release_progress","total_repos":128,"succeeded_repos":58,"failed_repos":2,"pending_repos":68,"candidate_failures":3,"releases_written":680}"#,
+        )];
+
+        let diagnostics = build_task_diagnostics(&task, &events, &[]).expect("diagnostics");
+        let sync_diag = diagnostics
+            .sync_subscriptions
+            .expect("sync subscriptions diagnostics");
+        assert_eq!(sync_diag.release.succeeded_repos, 120);
+        assert_eq!(sync_diag.release.failed_repos, 8);
+        assert_eq!(sync_diag.release.candidate_failures, 4);
+        assert_eq!(sync_diag.releases_written, 900);
     }
 
     #[test]
