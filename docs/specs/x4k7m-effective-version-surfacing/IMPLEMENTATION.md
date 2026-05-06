@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-03-03
-- Last: 2026-04-15
-- Summary: 已交付；PR #20；新增 /api/version，health/version 同源，footer 回退 health；release web-builder fallback + build gate docker smoke + historical backfill overlay
+- Last: 2026-05-07
+- Summary: 已交付；PR #20；新增 /api/version，health/version 同源，footer 回退 health；release web-builder fallback + build gate docker smoke + historical backfill overlay；footer 版本号链接到内部 Release 详情页
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -16,3 +16,4 @@
 - [x] M2: 前端 footer 双端点回退逻辑完成。
 - [x] M3: Docker/release 注入链路校验与自动化测试完成。
 - [x] M4: 前端 `vite.config.ts` fallback 容错与 CI Docker smoke 完成。
+- [x] M5: Footer 版本号内部详情链接与移动端 Storybook 视觉证据完成。

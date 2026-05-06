@@ -1,4 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
 import { expect, within } from "storybook/test";
 
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
@@ -13,6 +14,19 @@ type FooterPreviewProps = {
 	availableVersion: string | null;
 	hasUpdate: boolean;
 };
+
+const FOOTER_RELEASE_HREF = "/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
+const APP_META_FOOTER_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	footerMobile390: {
+		name: "Footer mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+} as const;
 
 function FooterPreview(props: FooterPreviewProps) {
 	const value: VersionMonitorValue = {
@@ -42,6 +56,9 @@ const meta = {
 	tags: ["autodocs"],
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: APP_META_FOOTER_VIEWPORTS,
+		},
 		docs: {
 			description: {
 				component:
@@ -50,7 +67,7 @@ const meta = {
 		},
 	},
 	args: {
-		loadedVersion: "v0.1.0",
+		loadedVersion: "v2.29.0",
 		availableVersion: null,
 		hasUpdate: false,
 	},
@@ -73,7 +90,11 @@ type Story = StoryObj<typeof meta>;
 export const Default: Story = {
 	play: async ({ canvasElement }) => {
 		const storyRoot = within(canvasElement.ownerDocument.body);
-		await expect(storyRoot.getByText("Version v0.1.0")).toBeVisible();
+		const versionLink = storyRoot.getByRole("link", {
+			name: "Version v2.29.0",
+		});
+		await expect(versionLink).toBeVisible();
+		await expect(versionLink).toHaveAttribute("href", FOOTER_RELEASE_HREF);
 		await expect(storyRoot.getByRole("link", { name: "GitHub" })).toBeVisible();
 	},
 	parameters: {
@@ -82,6 +103,28 @@ export const Default: Story = {
 				story: "正常稳态：footer 直接显示当前已加载前端构建版本。",
 			},
 		},
+	},
+};
+
+export const MobileVersionLink: Story = {
+	parameters: {
+		viewport: {
+			defaultViewport: "footerMobile390",
+		},
+		docs: {
+			description: {
+				story:
+					"移动端稳态：footer 在窄屏换行后仍展示可点击版本号，链接到 OctoRill 自身公开 Release 详情页。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const storyRoot = within(canvasElement.ownerDocument.body);
+		const versionLink = storyRoot.getByRole("link", {
+			name: "Version v2.29.0",
+		});
+		await expect(versionLink).toBeVisible();
+		await expect(versionLink).toHaveAttribute("href", FOOTER_RELEASE_HREF);
 	},
 };
 
@@ -94,6 +137,13 @@ export const BuildMetadataVersion: Story = {
 export const UnknownFallback: Story = {
 	args: {
 		loadedVersion: VERSION_UNKNOWN,
+	},
+	play: async ({ canvasElement }) => {
+		const storyRoot = within(canvasElement.ownerDocument.body);
+		await expect(storyRoot.getByText("Version unknown")).toBeVisible();
+		await expect(
+			storyRoot.queryByRole("link", { name: "Version unknown" }),
+		).not.toBeInTheDocument();
 	},
 	parameters: {
 		docs: {

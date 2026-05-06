@@ -1,12 +1,14 @@
 import { Github } from "lucide-react";
 
 import { useAppShellChrome } from "@/layout/AppShell";
+import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
 import { useVersionMonitor } from "@/version/versionMonitor";
 
 const REPOSITORY_URL = "https://github.com/IvanLi-CN/octo-rill";
 
 export function AppMetaFooter() {
 	const { loadedVersion } = useVersionMonitor();
+	const versionReleaseHref = buildVersionReleaseHref(loadedVersion);
 	const {
 		footerHidden,
 		mobileChromeEnabled,
@@ -47,9 +49,18 @@ export function AppMetaFooter() {
 						<Github className="size-3.5" aria-hidden="true" />
 						GitHub
 					</a>
-					<span className="text-muted-foreground font-mono">
-						Version {loadedVersion}
-					</span>
+					{versionReleaseHref ? (
+						<a
+							className="text-muted-foreground hover:text-foreground font-mono underline-offset-4 hover:underline"
+							href={versionReleaseHref}
+						>
+							Version {loadedVersion}
+						</a>
+					) : (
+						<span className="text-muted-foreground font-mono">
+							Version {loadedVersion}
+						</span>
+					)}
 				</div>
 			</div>
 		</footer>
