@@ -31,6 +31,8 @@ import {
 } from "@/components/ui/card";
 import { FeedPageLaneSelector } from "@/feed/FeedPageLaneSelector";
 import type { FeedLane, ReleaseFeedItem } from "@/feed/types";
+import { buildVersionReleaseHref } from "@/version/versionReleaseLink";
+import { useVersionMonitor } from "@/version/versionMonitor";
 
 const ReleaseFeedCard = lazy(async () => {
 	const module = await import("@/feed/FeedItemCard");
@@ -253,19 +255,33 @@ export function PublicReleasePage(props: {
 function PublicReleaseFooter(props: { owner: string; repo: string }) {
 	const year = new Date().getFullYear();
 	const repositoryHref = `https://github.com/${props.owner}/${props.repo}`;
+	const { loadedVersion } = useVersionMonitor();
+	const versionReleaseHref = buildVersionReleaseHref(loadedVersion);
 
 	return (
 		<footer className="mt-auto flex flex-wrap items-center justify-between gap-3 border-t pt-4 pb-1 font-mono text-[11px] text-muted-foreground">
 			<span>© {year} Ivan Li</span>
-			<a
-				href={repositoryHref}
-				target="_blank"
-				rel="noreferrer"
-				className="inline-flex items-center gap-1.5 underline-offset-4 hover:text-foreground hover:underline"
-			>
-				<AuthProviderIcon provider="github" className="size-3" />
-				GitHub
-			</a>
+			<div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1">
+				<a
+					href={repositoryHref}
+					target="_blank"
+					rel="noreferrer"
+					className="inline-flex items-center gap-1.5 underline-offset-4 hover:text-foreground hover:underline"
+				>
+					<AuthProviderIcon provider="github" className="size-3" />
+					GitHub
+				</a>
+				{versionReleaseHref ? (
+					<a
+						href={versionReleaseHref}
+						className="underline-offset-4 hover:text-foreground hover:underline"
+					>
+						Version {loadedVersion}
+					</a>
+				) : (
+					<span>Version {loadedVersion}</span>
+				)}
+			</div>
 		</footer>
 	);
 }

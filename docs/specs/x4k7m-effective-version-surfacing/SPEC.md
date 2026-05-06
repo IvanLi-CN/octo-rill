@@ -12,6 +12,7 @@
 - 新增稳定版本接口 `GET /api/version`，便于排障与前端直连。
 - 保持 `GET /api/health` 响应兼容，沿用相同有效版本来源。
 - 前端 footer 优先读取 `/api/version`，失败回退 `/api/health`。
+- 前端 footer 中的版本号链接到 OctoRill 自身公开 Release 详情页：`/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`。
 - 打通 Docker 构建注入闭环并增加 release 保护校验。
 - 前端构建阶段嵌入版本优先消费 `APP_EFFECTIVE_VERSION`，仅在 env 缺失时回退仓库根 `Cargo.toml`，且缺失时不得崩溃。
 - 普通 CI 在既有 `Build (Release)` gate 内增加 Docker smoke，提前覆盖 release `web-builder` 构建路径。
@@ -28,7 +29,7 @@
 
 - `src/version.rs`：统一版本来源解析。
 - `src/server.rs`：新增 `/api/version`，更新 `/api/health` 版本来源。
-- `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑。
+- `web/src/layout/AppMetaFooter.tsx`：双端点读取与回退逻辑，并把有效 `loadedVersion` 渲染为内部 Release 详情链接。
 - `web/vite.config.ts` / `web/build/embeddedVersion.ts`：前端构建期版本解析改为 env 优先、Cargo 可选兜底、缺省不崩。
 - `Dockerfile`：web / Rust 构建阶段都消费 `APP_EFFECTIVE_VERSION`，且 web-builder 在完整仓库上下文里保留 `Cargo.toml` 兜底来源。
 - `.github/workflows/ci.yml`：在既有 `Build (Release)` gate 内加入 Docker smoke 覆盖 release `web-builder` 路径。
@@ -98,3 +99,20 @@
 - Given `/api/version` 与 `/api/health` 都失败
   When 前端 footer 拉取版本
   Then 显示 `Version unknown`。
+
+- Given 前端构建已加载版本为 `v2.29.0`
+  When 用户查看桌面或移动端 footer
+  Then 显示 `Version v2.29.0`，且链接到 `/IvanLi-CN/octo-rill/releases/tag/v2.29.0`。
+
+- Given 前端构建版本不可解析并显示 `Version unknown`
+  When 用户查看 footer
+  Then 版本号保持纯文本，不渲染错误的详情链接。
+
+## Visual Evidence
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `layout-app-meta-footer--mobile-version-link`
+  state: `footer-version-release-link-mobile`
+  evidence_note: 验证 390px 移动端 footer 仍显示 `Version v2.29.0`，并作为内部链接指向 OctoRill 自身公开 Release 详情页；GitHub 入口与版权信息在窄屏共存。
+  image:
+  ![Footer 移动端版本详情链接](./assets/footer-version-release-link-mobile.png)
