@@ -22,6 +22,7 @@
 
 | ID | Title | Lifecycle | Spec | Companion docs | Implementation |
 | --- | --- | --- | --- | --- | --- |
+| p8r3l | 公开仓库 Release 外链与 API | active | [SPEC.md](./p8r3l-public-release-endpoints/SPEC.md) | [IMPLEMENTATION.md](./p8r3l-public-release-endpoints/IMPLEMENTATION.md) / [HISTORY.md](./p8r3l-public-release-endpoints/HISTORY.md) | 实现中；fast-track / public release pages + REST API + admin registry |
 | fvh8d | Release 失败 Telegram 告警接入 | active | [SPEC.md](./fvh8d-release-failure-telegram-alerts/SPEC.md) | [IMPLEMENTATION.md](./fvh8d-release-failure-telegram-alerts/IMPLEMENTATION.md) / [HISTORY.md](./fvh8d-release-failure-telegram-alerts/HISTORY.md) | 已交付；fast-track / shared github-workflows notifier rollout / smoke test target |
 | apras | 翻译请求单条记录制重建 | active | [SPEC.md](./apras-translation-request-single-record/SPEC.md) | [IMPLEMENTATION.md](./apras-translation-request-single-record/IMPLEMENTATION.md) / [HISTORY.md](./apras-translation-request-single-record/HISTORY.md) | 已交付；PR #35; checks green; review-loop clear; single-request contract live |
 | nbz5z | Translation worker board follow-up | active | [SPEC.md](./nbz5z-translation-worker-board/SPEC.md) | [IMPLEMENTATION.md](./nbz5z-translation-worker-board/IMPLEMENTATION.md) / [HISTORY.md](./nbz5z-translation-worker-board/HISTORY.md) | 已交付；PR #32, PR #38; 3 general + 1 user_dedicated worker board + runtime lease recovery |

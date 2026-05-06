@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { RepoVisual } from "@/lib/repoVisual";
@@ -10,6 +11,7 @@ export function RepoIdentity(props: {
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
+	children?: ReactNode;
 }) {
 	const {
 		repoFullName,
@@ -17,6 +19,7 @@ export function RepoIdentity(props: {
 		className,
 		labelClassName,
 		visualClassName,
+		children,
 	} = props;
 
 	if (!repoFullName) return null;
@@ -36,7 +39,9 @@ export function RepoIdentity(props: {
 			className={className}
 			labelClassName={labelClassName}
 			visualClassName={visualClassName}
-		/>
+		>
+			{children}
+		</RepoIdentityContent>
 	);
 }
 
@@ -46,6 +51,7 @@ function RepoIdentityContent(props: {
 	className?: string;
 	labelClassName?: string;
 	visualClassName?: string;
+	children?: ReactNode;
 }) {
 	const {
 		repoFullName,
@@ -53,6 +59,7 @@ function RepoIdentityContent(props: {
 		className,
 		labelClassName,
 		visualClassName,
+		children,
 	} = props;
 	const candidates = useMemo(
 		() => resolveRepoVisualCandidates(repoVisual),
@@ -101,22 +108,27 @@ function RepoIdentityContent(props: {
 		candidates.find(
 			(entry) => !failedCandidateKeys.has(`${entry.kind}:${entry.src}`),
 		) ?? null;
-	const kind = candidate?.kind ?? "text_only";
+	const kind = candidate?.kind ?? "fallback";
+	const repoNameParts = repoFullName.split("/").filter((part) => part.trim());
+	const fallbackSource =
+		repoNameParts.length > 0
+			? repoNameParts[repoNameParts.length - 1].trim()
+			: repoFullName.trim();
+	const fallbackLabel = fallbackSource.slice(0, 1).toUpperCase() || "?";
 
 	return (
 		<div
 			className={cn("inline-flex min-w-0 items-center gap-2.5", className)}
 			data-repo-visual-kind={kind}
 		>
-			{candidate ? (
-				<span
-					className={cn(
-						"relative shrink-0 overflow-hidden border border-border/60 bg-muted/35 shadow-sm",
-						candidate.kind === "owner_avatar" ? "rounded-full" : "rounded-md",
-						visualClassName ?? "size-5",
-					)}
-					data-repo-visual-slot={candidate.kind}
-				>
+			<span
+				className={cn(
+					"relative inline-flex shrink-0 items-center justify-center overflow-hidden rounded-full border border-border/60 bg-muted/35 font-mono text-[0.72em] font-semibold uppercase text-muted-foreground shadow-sm",
+					visualClassName ?? "size-5",
+				)}
+				data-repo-visual-slot={kind}
+			>
+				{candidate ? (
 					<img
 						src={candidate.src}
 						alt=""
@@ -135,12 +147,15 @@ function RepoIdentityContent(props: {
 							});
 						}}
 					/>
-				</span>
-			) : null}
-			<span className="flex min-w-0 self-stretch items-center">
+				) : (
+					<span aria-hidden="true">{fallbackLabel}</span>
+				)}
+			</span>
+			<span className="flex min-w-0 flex-col justify-center">
 				<span className={cn("block truncate", labelClassName)}>
 					{repoFullName}
 				</span>
+				{children}
 			</span>
 		</div>
 	);

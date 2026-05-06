@@ -258,6 +258,42 @@ export type AdminSyncRuntimeConfigResponse = {
 	repo_release_worker_concurrency: number;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
 };
+export type AdminPublicReleaseRepoItem = {
+	id: string;
+	repo_id: number | null;
+	full_name: string;
+	first_registered_at: string;
+	last_requested_at: string;
+	last_list_requested_at: string | null;
+	last_detail_requested_at: string | null;
+	api_list_requests: number;
+	api_detail_requests: number;
+	page_list_requests: number;
+	page_detail_requests: number;
+	last_sync_status: "pending" | "ready" | "failed" | "inaccessible";
+	last_sync_error: string | null;
+	release_count: number;
+	translated_ready_count: number;
+	translated_missing_count: number;
+	polished_ready_count: number;
+	polished_missing_count: number;
+	created_at: string;
+	updated_at: string;
+};
+export type AdminPublicReleaseCacheCleanup = {
+	repo_id: number | null;
+	full_name: string;
+	deleted_release_count: number;
+	deleted_ai_cache_count: number;
+	skipped_reason: string | null;
+};
+export type AdminPublicReleaseReposResponse = {
+	items: AdminPublicReleaseRepoItem[];
+	page: number;
+	page_size: number;
+	total: number;
+	cache_cleanup?: AdminPublicReleaseCacheCleanup | null;
+};
 export type AdminSyncRuntimeConfigUpdateRequest = {
 	sync_auto_fetch_interval_minutes: number;
 	repo_release_worker_concurrency?: number;
@@ -926,6 +962,20 @@ export async function apiGetAdminSyncRuntimeConfig(): Promise<AdminSyncRuntimeCo
 		"/api/admin/jobs/sync/runtime-config",
 	);
 }
+export async function apiGetAdminPublicReleaseRepos(
+	params: URLSearchParams,
+): Promise<AdminPublicReleaseReposResponse> {
+	return apiGet<AdminPublicReleaseReposResponse>(
+		`/api/admin/public-release-repos?${params.toString()}`,
+	);
+}
+export async function apiDeleteAdminPublicReleaseRepo(
+	usageId: string,
+): Promise<AdminPublicReleaseReposResponse> {
+	return apiDeleteJson<AdminPublicReleaseReposResponse>(
+		`/api/admin/public-release-repos/${encodeURIComponent(usageId)}`,
+	);
+}
 export async function apiPatchAdminSyncRuntimeConfig(
 	body: AdminSyncRuntimeConfigUpdateRequest,
 ): Promise<AdminSyncRuntimeConfigResponse> {
@@ -1009,6 +1059,83 @@ export async function apiGetReleaseDetailByRepoTag(input: {
 	return apiGet<ReleaseDetailResponse>(
 		`/api/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}/detail`,
 	);
+}
+export type PublicReleaseListItem = {
+	release_id: string;
+	repo_full_name: string;
+	repo_visual: RepoVisual | null;
+	tag_name: string;
+	previous_tag_name: string | null;
+	name: string | null;
+	body: string | null;
+	html_url: string;
+	published_at: string | null;
+	is_prerelease: number;
+	is_draft: number;
+	translated: ReleaseDetailTranslated | null;
+	smart: ReleaseDetailSmart | null;
+};
+export type PublicReleaseListResponse = {
+	status: "ready";
+	repo_full_name: string;
+	next_cursor: string | null;
+	items: PublicReleaseListItem[];
+};
+export type PublicReleasePendingResponse = {
+	status: "pending_sync";
+	message: string;
+	reason: string;
+	retry_after_seconds: number;
+	repo_full_name: string;
+	last_requested_at: string;
+};
+export type PublicReleaseResponse =
+	| PublicReleaseListResponse
+	| PublicReleasePendingResponse;
+export async function apiGetPublicRepoReleases(input: {
+	owner: string;
+	repo: string;
+	source?: "page";
+	limit?: number;
+	cursor?: string | null;
+}): Promise<PublicReleaseResponse> {
+	const params = new URLSearchParams();
+	params.set("content", "all");
+	params.set("lang", "zh-CN");
+	if (input.source) params.set("source", input.source);
+	if (input.limit) params.set("limit", String(input.limit));
+	if (input.cursor) params.set("cursor", input.cursor);
+	try {
+		return await apiGet<PublicReleaseResponse>(
+			`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
+		);
+	} catch (err) {
+		if (err instanceof ApiError && err.status === 202) {
+			const res = await fetch(
+				`/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases?${params.toString()}`,
+				{ credentials: "include" },
+			);
+			return (await res.json()) as PublicReleasePendingResponse;
+		}
+		throw err;
+	}
+}
+export async function apiGetPublicRepoReleaseDetail(input: {
+	owner: string;
+	repo: string;
+	tag: string;
+	source?: "page";
+}): Promise<ReleaseDetailResponse | PublicReleasePendingResponse> {
+	const params = new URLSearchParams();
+	params.set("content", "all");
+	params.set("lang", "zh-CN");
+	if (input.source) params.set("source", input.source);
+	const path = `/api/public/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}/releases/tag/${encodeURIComponent(input.tag)}?${params.toString()}`;
+	const res = await fetch(path, { credentials: "include" });
+	const body = (await res.json()) as unknown;
+	if (res.status === 202) return body as PublicReleasePendingResponse;
+	if (!res.ok) throw toApiError(res, body);
+	return body as ReleaseDetailResponse;
 }
 export type TranslationSourceBlock = {
 	slot: "title" | "excerpt" | "body_markdown" | "metadata";

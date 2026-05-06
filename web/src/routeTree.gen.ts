@@ -20,12 +20,15 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AdminIndexRouteImport } from './routes/admin/index'
 import { Route as BindGithubRouteImport } from './routes/bind/github'
 import { Route as AdminUsersRouteImport } from './routes/admin/users'
+import { Route as AdminPublicReleasesRouteImport } from './routes/admin/public-releases'
 import { Route as AdminJobsRouteRouteImport } from './routes/admin/jobs/route'
 import { Route as AdminJobsIndexRouteImport } from './routes/admin/jobs/index'
 import { Route as AdminJobsTranslationsRouteImport } from './routes/admin/jobs/translations'
 import { Route as AdminJobsSubscriptionsRouteImport } from './routes/admin/jobs/subscriptions'
 import { Route as AdminJobsScheduledRouteImport } from './routes/admin/jobs/scheduled'
 import { Route as AdminJobsLlmRouteImport } from './routes/admin/jobs/llm'
+import { Route as OwnerRepoReleasesRouteImport } from './routes/$owner/$repo/releases'
+import { Route as OwnerRepoReleasesIndexRouteImport } from './routes/$owner/$repo/releases/index'
 import { Route as AdminJobsSubscriptionsTaskIdRouteImport } from './routes/admin/jobs/subscriptions/$taskId'
 import { Route as AdminJobsTasksTaskIdRouteRouteImport } from './routes/admin/jobs/tasks/$taskId/route'
 import { Route as AdminJobsTasksTaskIdIndexRouteImport } from './routes/admin/jobs/tasks/$taskId/index'
@@ -87,6 +90,13 @@ const AdminUsersRoute = AdminUsersRouteImport.update({
   path: '/users',
   getParentRoute: () => AdminRouteRoute,
 } as any).lazy(() => import('./routes/admin/users.lazy').then((d) => d.Route))
+const AdminPublicReleasesRoute = AdminPublicReleasesRouteImport.update({
+  id: '/public-releases',
+  path: '/public-releases',
+  getParentRoute: () => AdminRouteRoute,
+} as any).lazy(() =>
+  import('./routes/admin/public-releases.lazy').then((d) => d.Route),
+)
 const AdminJobsRouteRoute = AdminJobsRouteRouteImport.update({
   id: '/jobs',
   path: '/jobs',
@@ -127,6 +137,20 @@ const AdminJobsLlmRoute = AdminJobsLlmRouteImport.update({
 } as any).lazy(() =>
   import('./routes/admin/jobs/llm.lazy').then((d) => d.Route),
 )
+const OwnerRepoReleasesRoute = OwnerRepoReleasesRouteImport.update({
+  id: '/$owner/$repo/releases',
+  path: '/$owner/$repo/releases',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() =>
+  import('./routes/$owner/$repo/releases.lazy').then((d) => d.Route),
+)
+const OwnerRepoReleasesIndexRoute = OwnerRepoReleasesIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => OwnerRepoReleasesRoute,
+} as any).lazy(() =>
+  import('./routes/$owner/$repo/releases/index.lazy').then((d) => d.Route),
+)
 const AdminJobsSubscriptionsTaskIdRoute =
   AdminJobsSubscriptionsTaskIdRouteImport.update({
     id: '/$taskId',
@@ -152,9 +176,9 @@ const AdminJobsTasksTaskIdIndexRoute =
     import('./routes/admin/jobs/tasks/$taskId/index.lazy').then((d) => d.Route),
   )
 const OwnerRepoReleasesTagTagRoute = OwnerRepoReleasesTagTagRouteImport.update({
-  id: '/$owner/$repo/releases/tag/$tag',
-  path: '/$owner/$repo/releases/tag/$tag',
-  getParentRoute: () => rootRouteImport,
+  id: '/tag/$tag',
+  path: '/tag/$tag',
+  getParentRoute: () => OwnerRepoReleasesRoute,
 } as any).lazy(() =>
   import('./routes/$owner/$repo/releases/tag/$tag.lazy').then((d) => d.Route),
 )
@@ -179,9 +203,11 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
+  '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/admin/': typeof AdminIndexRoute
+  '/$owner/$repo/releases': typeof OwnerRepoReleasesRouteWithChildren
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
@@ -189,6 +215,7 @@ export interface FileRoutesByFullPath {
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
+  '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -201,6 +228,7 @@ export interface FileRoutesByTo {
   '/releases': typeof ReleasesRoute
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
+  '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/admin': typeof AdminIndexRoute
@@ -210,6 +238,7 @@ export interface FileRoutesByTo {
   '/admin/jobs/translations': typeof AdminJobsTranslationsRoute
   '/admin/jobs': typeof AdminJobsIndexRoute
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
+  '/$owner/$repo/releases': typeof OwnerRepoReleasesIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -225,9 +254,11 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRoute
   '/stars': typeof StarsRoute
   '/admin/jobs': typeof AdminJobsRouteRouteWithChildren
+  '/admin/public-releases': typeof AdminPublicReleasesRoute
   '/admin/users': typeof AdminUsersRoute
   '/bind/github': typeof BindGithubRoute
   '/admin/': typeof AdminIndexRoute
+  '/$owner/$repo/releases': typeof OwnerRepoReleasesRouteWithChildren
   '/admin/jobs/llm': typeof AdminJobsLlmRoute
   '/admin/jobs/scheduled': typeof AdminJobsScheduledRoute
   '/admin/jobs/subscriptions': typeof AdminJobsSubscriptionsRouteWithChildren
@@ -235,6 +266,7 @@ export interface FileRoutesById {
   '/admin/jobs/': typeof AdminJobsIndexRoute
   '/admin/jobs/tasks/$taskId': typeof AdminJobsTasksTaskIdRouteRouteWithChildren
   '/admin/jobs/subscriptions/$taskId': typeof AdminJobsSubscriptionsTaskIdRoute
+  '/$owner/$repo/releases/': typeof OwnerRepoReleasesIndexRoute
   '/$owner/$repo/releases/tag/$tag': typeof OwnerRepoReleasesTagTagRoute
   '/admin/jobs/tasks/$taskId/': typeof AdminJobsTasksTaskIdIndexRoute
   '/admin/jobs/tasks/$taskId/llm/$callId': typeof AdminJobsTasksTaskIdLlmCallIdRoute
@@ -251,9 +283,11 @@ export interface FileRouteTypes {
     | '/settings'
     | '/stars'
     | '/admin/jobs'
+    | '/admin/public-releases'
     | '/admin/users'
     | '/bind/github'
     | '/admin/'
+    | '/$owner/$repo/releases'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
@@ -261,6 +295,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
     | '/admin/jobs/subscriptions/$taskId'
+    | '/$owner/$repo/releases/'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -273,6 +308,7 @@ export interface FileRouteTypes {
     | '/releases'
     | '/settings'
     | '/stars'
+    | '/admin/public-releases'
     | '/admin/users'
     | '/bind/github'
     | '/admin'
@@ -282,6 +318,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/translations'
     | '/admin/jobs'
     | '/admin/jobs/subscriptions/$taskId'
+    | '/$owner/$repo/releases'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -296,9 +333,11 @@ export interface FileRouteTypes {
     | '/settings'
     | '/stars'
     | '/admin/jobs'
+    | '/admin/public-releases'
     | '/admin/users'
     | '/bind/github'
     | '/admin/'
+    | '/$owner/$repo/releases'
     | '/admin/jobs/llm'
     | '/admin/jobs/scheduled'
     | '/admin/jobs/subscriptions'
@@ -306,6 +345,7 @@ export interface FileRouteTypes {
     | '/admin/jobs/'
     | '/admin/jobs/tasks/$taskId'
     | '/admin/jobs/subscriptions/$taskId'
+    | '/$owner/$repo/releases/'
     | '/$owner/$repo/releases/tag/$tag'
     | '/admin/jobs/tasks/$taskId/'
     | '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -321,7 +361,7 @@ export interface RootRouteChildren {
   SettingsRoute: typeof SettingsRoute
   StarsRoute: typeof StarsRoute
   BindGithubRoute: typeof BindGithubRoute
-  OwnerRepoReleasesTagTagRoute: typeof OwnerRepoReleasesTagTagRoute
+  OwnerRepoReleasesRoute: typeof OwnerRepoReleasesRouteWithChildren
 }
 
 declare module '@tanstack/react-router' {
@@ -403,6 +443,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminUsersRouteImport
       parentRoute: typeof AdminRouteRoute
     }
+    '/admin/public-releases': {
+      id: '/admin/public-releases'
+      path: '/public-releases'
+      fullPath: '/admin/public-releases'
+      preLoaderRoute: typeof AdminPublicReleasesRouteImport
+      parentRoute: typeof AdminRouteRoute
+    }
     '/admin/jobs': {
       id: '/admin/jobs'
       path: '/jobs'
@@ -445,6 +492,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminJobsLlmRouteImport
       parentRoute: typeof AdminJobsRouteRoute
     }
+    '/$owner/$repo/releases': {
+      id: '/$owner/$repo/releases'
+      path: '/$owner/$repo/releases'
+      fullPath: '/$owner/$repo/releases'
+      preLoaderRoute: typeof OwnerRepoReleasesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/$owner/$repo/releases/': {
+      id: '/$owner/$repo/releases/'
+      path: '/'
+      fullPath: '/$owner/$repo/releases/'
+      preLoaderRoute: typeof OwnerRepoReleasesIndexRouteImport
+      parentRoute: typeof OwnerRepoReleasesRoute
+    }
     '/admin/jobs/subscriptions/$taskId': {
       id: '/admin/jobs/subscriptions/$taskId'
       path: '/$taskId'
@@ -468,10 +529,10 @@ declare module '@tanstack/react-router' {
     }
     '/$owner/$repo/releases/tag/$tag': {
       id: '/$owner/$repo/releases/tag/$tag'
-      path: '/$owner/$repo/releases/tag/$tag'
+      path: '/tag/$tag'
       fullPath: '/$owner/$repo/releases/tag/$tag'
       preLoaderRoute: typeof OwnerRepoReleasesTagTagRouteImport
-      parentRoute: typeof rootRouteImport
+      parentRoute: typeof OwnerRepoReleasesRoute
     }
     '/admin/jobs/tasks/$taskId/llm/$callId': {
       id: '/admin/jobs/tasks/$taskId/llm/$callId'
@@ -537,12 +598,14 @@ const AdminJobsRouteRouteWithChildren = AdminJobsRouteRoute._addFileChildren(
 
 interface AdminRouteRouteChildren {
   AdminJobsRouteRoute: typeof AdminJobsRouteRouteWithChildren
+  AdminPublicReleasesRoute: typeof AdminPublicReleasesRoute
   AdminUsersRoute: typeof AdminUsersRoute
   AdminIndexRoute: typeof AdminIndexRoute
 }
 
 const AdminRouteRouteChildren: AdminRouteRouteChildren = {
   AdminJobsRouteRoute: AdminJobsRouteRouteWithChildren,
+  AdminPublicReleasesRoute: AdminPublicReleasesRoute,
   AdminUsersRoute: AdminUsersRoute,
   AdminIndexRoute: AdminIndexRoute,
 }
@@ -550,6 +613,19 @@ const AdminRouteRouteChildren: AdminRouteRouteChildren = {
 const AdminRouteRouteWithChildren = AdminRouteRoute._addFileChildren(
   AdminRouteRouteChildren,
 )
+
+interface OwnerRepoReleasesRouteChildren {
+  OwnerRepoReleasesIndexRoute: typeof OwnerRepoReleasesIndexRoute
+  OwnerRepoReleasesTagTagRoute: typeof OwnerRepoReleasesTagTagRoute
+}
+
+const OwnerRepoReleasesRouteChildren: OwnerRepoReleasesRouteChildren = {
+  OwnerRepoReleasesIndexRoute: OwnerRepoReleasesIndexRoute,
+  OwnerRepoReleasesTagTagRoute: OwnerRepoReleasesTagTagRoute,
+}
+
+const OwnerRepoReleasesRouteWithChildren =
+  OwnerRepoReleasesRoute._addFileChildren(OwnerRepoReleasesRouteChildren)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -561,7 +637,7 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsRoute: SettingsRoute,
   StarsRoute: StarsRoute,
   BindGithubRoute: BindGithubRoute,
-  OwnerRepoReleasesTagTagRoute: OwnerRepoReleasesTagTagRoute,
+  OwnerRepoReleasesRoute: OwnerRepoReleasesRouteWithChildren,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
