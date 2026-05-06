@@ -10,11 +10,13 @@
 - [x] M4: 完成自动化验证与视觉证据。
 - [x] M5: 完成 review-loop。
 - [ ] M6: 完成 PR 收敛。
+- [x] M7: 公开页面页脚版本号链接与移动端视觉证据完成。
 
 ## Current Notes
 
 - 管理后台删除公开登记记录后，若该仓库不再被其他公开登记、登录用户 release 可见性或历史 brief membership 使用，会清理对应共享 `repo_releases`、release AI 缓存与 release sync state；仍被使用时保留缓存。
 - 公开列表页默认展示原文正文，但列表态会截断超长正文，详情页仍展示完整正文。
+- 公开 Release 页脚与全站 footer 保持一致：有效 `loadedVersion` 链接到 OctoRill 自身公开 Release 详情页，`unknown` 保持纯文本。
 
 ## Verification
 
@@ -24,3 +26,5 @@
 - `cargo test --all-targets`
 - `cd web && bun run storybook:build`
 - `cd web && PLAYWRIGHT_WEB_PORT=36830 bun run e2e -- public-release-page.spec.ts`
+- `cd web && npm run storybook:build`
+- `cd web && npm run e2e -- public-release-page.spec.ts`

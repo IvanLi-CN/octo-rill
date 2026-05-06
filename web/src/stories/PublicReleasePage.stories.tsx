@@ -1,7 +1,32 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useEffect } from "react";
+import { INITIAL_VIEWPORTS } from "storybook/viewport";
+import { expect, within } from "storybook/test";
 
 import { PublicReleasePage } from "@/pages/PublicReleasePage";
+import {
+	type VersionMonitorValue,
+	VersionMonitorStateProvider,
+} from "@/version/versionMonitor";
+
+const PUBLIC_RELEASE_VERSION_HREF = "/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
+const PUBLIC_RELEASE_VIEWPORTS = {
+	...INITIAL_VIEWPORTS,
+	publicReleaseMobile390: {
+		name: "Public Release mobile 390x844",
+		styles: {
+			height: "844px",
+			width: "390px",
+		},
+		type: "mobile",
+	},
+} as const;
+const publicReleaseVersionState: VersionMonitorValue = {
+	loadedVersion: "v2.29.0",
+	availableVersion: null,
+	hasUpdate: false,
+	refreshPage: () => undefined,
+};
 
 const repoAvatarDataUrl =
 	"data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'%3E%3Crect width='96' height='96' rx='48' fill='%234f6a98'/%3E%3Ctext x='48' y='58' font-family='Inter,Arial,sans-serif' font-size='34' font-weight='700' text-anchor='middle' fill='white'%3EOR%3C/text%3E%3C/svg%3E";
@@ -265,20 +290,41 @@ function PublicReleaseStory(props: { mode: PublicReleaseStoryMode }) {
 	}, []);
 
 	return (
-		<PublicReleasePage
-			owner="octo-rill"
-			repo={
-				props.mode === "detail-long"
-					? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
-					: "example"
-			}
-			tag={
-				props.mode === "detail" || props.mode === "detail-long"
-					? "v2.7.0"
-					: null
-			}
-		/>
+		<VersionMonitorStateProvider value={publicReleaseVersionState}>
+			<PublicReleasePage
+				owner="octo-rill"
+				repo={
+					props.mode === "detail-long"
+						? "example-repository-name-that-is-intentionally-long-for-mobile-layout-proof"
+						: "example"
+				}
+				tag={
+					props.mode === "detail" || props.mode === "detail-long"
+						? "v2.7.0"
+						: null
+				}
+			/>
+		</VersionMonitorStateProvider>
 	);
+}
+
+async function expectPublicReleaseFooterVersion(canvasElement: HTMLElement) {
+	const canvas = within(canvasElement);
+	const versionLink = await canvas.findByRole("link", {
+		name: "Version v2.29.0",
+	});
+	await expect(versionLink).toBeVisible();
+	await expect(versionLink).toHaveAttribute(
+		"href",
+		PUBLIC_RELEASE_VERSION_HREF,
+	);
+	expect(
+		canvas.getAllByRole("link", { name: "GitHub" }).length,
+	).toBeGreaterThan(0);
+	expect(
+		canvasElement.ownerDocument.documentElement.scrollWidth -
+			canvasElement.ownerDocument.documentElement.clientWidth,
+	).toBeLessThanOrEqual(1);
 }
 
 const meta = {
@@ -286,6 +332,9 @@ const meta = {
 	component: PublicReleaseStory,
 	parameters: {
 		layout: "fullscreen",
+		viewport: {
+			options: PUBLIC_RELEASE_VIEWPORTS,
+		},
 	},
 } satisfies Meta<typeof PublicReleaseStory>;
 
@@ -295,16 +344,38 @@ type Story = StoryObj<typeof meta>;
 
 export const PendingSync: Story = {
 	args: { mode: "pending" },
+	parameters: {
+		viewport: {
+			defaultViewport: "publicReleaseMobile390",
+		},
+	},
+	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
 };
 
 export const ReleaseList: Story = {
 	args: { mode: "list" },
+	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
 };
 
 export const ReleaseDetail: Story = {
 	args: { mode: "detail" },
+	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
 };
 
 export const LongRepoAndTagDetail: Story = {
 	args: { mode: "detail-long" },
+	parameters: {
+		viewport: {
+			defaultViewport: "publicReleaseMobile390",
+		},
+	},
+	play: async ({ canvasElement }) => {
+		await expectPublicReleaseFooterVersion(canvasElement);
+	},
 };

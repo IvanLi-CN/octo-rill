@@ -10,6 +10,7 @@
 
 - 提供未登录可访问的公开 Release 列表页与详情页。
 - 提供未登录 REST API：公开仓库 Release 列表与 tag 详情。
+- 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身公开 Release 详情页。
 - 首次访问仅登记仓库 usage；API 返回可重试 pending 响应，网页显示等待界面并轮询。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
@@ -57,6 +58,10 @@
   When 仓库尚未缓存
   Then 页面展示等待同步状态并自动重试。
 
+- Given 未登录用户在移动端访问公开 Release 列表或详情页
+  When 页脚可见
+  Then 页脚展示 `Version <loadedVersion>`，有效版本号链接到 `/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`，且页面无横向溢出。
+
 - Given 第三方调用公开 API 且仓库尚未缓存
   When 请求到达服务端
   Then 响应为 `202 Accepted`，包含 `Retry-After` 与 pending JSON。
@@ -102,6 +107,13 @@
   evidence_note: 验证 390px 移动端公开详情页的最终布局：页头 LOGO 高度为 24px，右上角 GitHub 按钮使用外链图标打开仓库 Releases 页面；正文区把头像、项目名、时间/tag 作为仓库信息组，超长 repo full name 与超长 tag 单行省略，仓库名与日期行无额外垂直空隙；右侧小尺寸原文/翻译/润色选择器固定尺寸且右端对齐，短内容时页脚贴底并保留指向仓库根路径的 GitHub 入口，全页无横向溢出。
   image:
   ![公开 Release 详情页移动端极端文本](./assets/public-release-evidence-detail-mobile-edge-v8.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `public-publicreleasepage--long-repo-and-tag-detail`
+  state: `public-release-footer-version-link-mobile`
+  evidence_note: 验证 390px 移动端公开详情页的页脚在超长 repo/tag 场景下仍展示 GitHub 入口与 `Version v2.29.0`，版本号链接到 OctoRill 自身公开 Release 详情页，且全页无横向溢出。
+  image:
+  ![公开 Release 页脚版本详情链接](./assets/public-release-footer-version-link-mobile.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-publicreleaserepomanagement--default`
