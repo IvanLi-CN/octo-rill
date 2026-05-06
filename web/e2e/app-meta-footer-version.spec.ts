@@ -8,6 +8,7 @@ type VersionApiMockOptions = {
 };
 
 const EMBEDDED_FRONTEND_VERSION = "v0.1.0";
+const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
 
 async function accelerateVersionPolling(page: Page) {
 	await page.addInitScript(() => {
@@ -111,9 +112,14 @@ test("footer shows the embedded frontend build version in steady state", async (
 		getVersion: () => "0.1.0",
 	});
 	await page.goto("/");
-	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+	const versionLink = page.getByRole("link", {
+		name: `Version ${EMBEDDED_FRONTEND_VERSION}`,
+	});
+	await expect(versionLink).toBeVisible();
+	await expect(versionLink).toHaveAttribute(
+		"href",
+		EMBEDDED_FRONTEND_VERSION_RELEASE_HREF,
+	);
 	await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
 });
 
@@ -127,8 +133,8 @@ test("footer keeps the embedded version when /api/version fails and /api/health 
 	});
 	await page.goto("/");
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 	await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
 });
 
@@ -141,8 +147,8 @@ test("footer keeps the embedded version when version polling endpoints fail", as
 	});
 	await page.goto("/");
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 	await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
 });
 
@@ -158,8 +164,8 @@ test("app shell shows an update notice when backend version differs from the emb
 	});
 	await page.goto("/");
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 	await expect(page.locator("[data-version-update-notice]")).toHaveCount(0);
 
 	currentVersion = "0.1.1";
@@ -168,8 +174,8 @@ test("app shell shows an update notice when backend version differs from the emb
 		"检测到新版本 v0.1.1",
 	);
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 });
 
 test("app shell can detect updates via /api/health fallback polling", async ({
@@ -184,8 +190,8 @@ test("app shell can detect updates via /api/health fallback polling", async ({
 	});
 	await page.goto("/");
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 
 	healthVersion = "0.1.1";
 
@@ -193,6 +199,6 @@ test("app shell can detect updates via /api/health fallback polling", async ({
 		"检测到新版本 v0.1.1",
 	);
 	await expect(
-		page.getByText(`Version ${EMBEDDED_FRONTEND_VERSION}`),
-	).toBeVisible();
+		page.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` }),
+	).toHaveAttribute("href", EMBEDDED_FRONTEND_VERSION_RELEASE_HREF);
 });
