@@ -5884,6 +5884,951 @@ pub async fn get_release_detail_by_repo_tag(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PublicReleaseQuery {
+    content: Option<String>,
+    lang: Option<String>,
+    source: Option<String>,
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicReleaseListItem {
+    release_id: String,
+    repo_full_name: String,
+    repo_visual: Option<RepoVisual>,
+    tag_name: String,
+    previous_tag_name: Option<String>,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    translated: Option<TranslatedItem>,
+    smart: Option<SmartItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicReleaseListResponse {
+    status: String,
+    repo_full_name: String,
+    next_cursor: Option<String>,
+    items: Vec<PublicReleaseListItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicReleasePendingResponse {
+    status: &'static str,
+    message: &'static str,
+    reason: &'static str,
+    retry_after_seconds: i64,
+    repo_full_name: String,
+    last_requested_at: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PublicReleaseUsageRow {
+    repo_id: Option<i64>,
+    full_name: String,
+    last_requested_at: String,
+    last_sync_status: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PublicReleaseRow {
+    release_id: i64,
+    sort_ts: String,
+    repo_full_name: String,
+    owner_avatar_url: Option<String>,
+    open_graph_image_url: Option<String>,
+    uses_custom_open_graph_image: Option<i64>,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    previous_tag_name: Option<String>,
+    trans_source_hash: Option<String>,
+    trans_status: Option<String>,
+    trans_title: Option<String>,
+    trans_summary: Option<String>,
+    trans_error_text: Option<String>,
+    smart_source_hash: Option<String>,
+    smart_status: Option<String>,
+    smart_title: Option<String>,
+    smart_summary: Option<String>,
+    smart_error_text: Option<String>,
+}
+
+#[derive(Debug)]
+struct PublicReleaseCursor {
+    sort_ts: String,
+    release_id: i64,
+}
+
+fn validate_public_release_query(query: &PublicReleaseQuery) -> Result<(), ApiError> {
+    let lang = query.lang.as_deref().unwrap_or("zh-CN");
+    if lang != "zh-CN" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_language",
+            "only zh-CN is supported",
+        ));
+    }
+
+    let content = query.content.as_deref().unwrap_or("all");
+    if !matches!(content, "original" | "translated" | "polished" | "all") {
+        return Err(ApiError::bad_request(
+            "content must be original, translated, polished, or all",
+        ));
+    }
+
+    Ok(())
+}
+
+fn public_source_is_page(query: &PublicReleaseQuery) -> bool {
+    query.source.as_deref() == Some("page")
+}
+
+fn parse_public_release_cursor(raw: &str) -> Result<PublicReleaseCursor, ApiError> {
+    let trimmed = raw.trim();
+    let Some((sort_ts, release_id_raw)) = trimmed.rsplit_once('|') else {
+        return Err(ApiError::bad_request("invalid cursor"));
+    };
+    let sort_ts = sort_ts.trim();
+    if sort_ts.is_empty() {
+        return Err(ApiError::bad_request("invalid cursor"));
+    }
+    let release_id = release_id_raw
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    Ok(PublicReleaseCursor {
+        sort_ts: sort_ts.to_owned(),
+        release_id,
+    })
+}
+
+fn public_release_cursor(row: &PublicReleaseRow) -> String {
+    format!("{}|{}", row.sort_ts, row.release_id)
+}
+
+fn normalize_public_repo_path(owner: String, repo: String) -> Result<(String, String), ApiError> {
+    let owner = owner.trim();
+    let repo = repo.trim();
+    let valid = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 100
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    if !valid(owner) || !valid(repo) {
+        return Err(ApiError::bad_request("invalid repository path"));
+    }
+    Ok((owner.to_owned(), repo.to_owned()))
+}
+
+async fn upsert_public_release_usage(
+    state: &AppState,
+    owner: String,
+    repo: String,
+    detail: bool,
+    page_source: bool,
+) -> Result<PublicReleaseUsageRow, ApiError> {
+    let (owner, repo) = normalize_public_repo_path(owner, repo)?;
+    let full_name = format!("{owner}/{repo}");
+    let full_name_lower = full_name.to_ascii_lowercase();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let (api_list_inc, api_detail_inc, page_list_inc, page_detail_inc) = match (detail, page_source)
+    {
+        (false, false) => (1_i64, 0_i64, 0_i64, 0_i64),
+        (true, false) => (0_i64, 1_i64, 0_i64, 0_i64),
+        (false, true) => (0_i64, 0_i64, 1_i64, 0_i64),
+        (true, true) => (0_i64, 0_i64, 0_i64, 1_i64),
+    };
+
+    sqlx::query(
+        r#"
+        INSERT INTO public_repo_release_usage (
+          id, owner_login, repo_name, full_name, full_name_lower,
+          first_registered_at, last_requested_at, last_list_requested_at,
+          last_detail_requested_at, api_list_requests, api_detail_requests,
+          page_list_requests, page_detail_requests, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(full_name_lower) DO UPDATE SET
+          last_requested_at = excluded.last_requested_at,
+          last_list_requested_at = COALESCE(excluded.last_list_requested_at, public_repo_release_usage.last_list_requested_at),
+          last_detail_requested_at = COALESCE(excluded.last_detail_requested_at, public_repo_release_usage.last_detail_requested_at),
+          api_list_requests = public_repo_release_usage.api_list_requests + excluded.api_list_requests,
+          api_detail_requests = public_repo_release_usage.api_detail_requests + excluded.api_detail_requests,
+          page_list_requests = public_repo_release_usage.page_list_requests + excluded.page_list_requests,
+          page_detail_requests = public_repo_release_usage.page_detail_requests + excluded.page_detail_requests,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(local_id::generate_local_id())
+    .bind(owner.as_str())
+    .bind(repo.as_str())
+    .bind(full_name.as_str())
+    .bind(full_name_lower.as_str())
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .bind((!detail).then_some(now.as_str()))
+    .bind(detail.then_some(now.as_str()))
+    .bind(api_list_inc)
+    .bind(api_detail_inc)
+    .bind(page_list_inc)
+    .bind(page_detail_inc)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    sqlx::query_as::<_, PublicReleaseUsageRow>(
+        r#"
+        SELECT repo_id, full_name, last_requested_at, last_sync_status
+        FROM public_repo_release_usage
+        WHERE full_name_lower = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(full_name_lower.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)
+}
+
+fn public_pending_response(row: &PublicReleaseUsageRow) -> Response {
+    let retry_after_seconds = 60_i64;
+    let body = Json(PublicReleasePendingResponse {
+        status: "pending_sync",
+        message: "Release data is being prepared. Retry after the suggested delay.",
+        reason: if row.repo_id.is_none() {
+            "repository_registered_metadata_pending"
+        } else {
+            "repository_registered_release_sync_pending"
+        },
+        retry_after_seconds,
+        repo_full_name: row.full_name.clone(),
+        last_requested_at: row.last_requested_at.clone(),
+    });
+    let mut response = (StatusCode::ACCEPTED, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+    response
+}
+
+fn ensure_public_release_usage_accessible(row: &PublicReleaseUsageRow) -> Result<(), ApiError> {
+    if row.last_sync_status == "inaccessible" {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "repository_inaccessible",
+            "repository is not publicly accessible",
+        ));
+    }
+    Ok(())
+}
+
+fn public_release_usage_should_retry_without_rows(row: &PublicReleaseUsageRow) -> bool {
+    row.last_sync_status == "pending" || row.last_sync_status == "failed"
+}
+
+fn public_translation_item(row: &PublicReleaseRow, content: &str) -> Option<TranslatedItem> {
+    if content == "original" || content == "polished" {
+        return None;
+    }
+    let original_title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let original_body = row.body.clone().unwrap_or_default();
+    let source_hash =
+        release_detail_source_hash(&row.repo_full_name, &original_title, &original_body);
+    if row.trans_source_hash.as_deref() != Some(source_hash.as_str()) {
+        return Some(translated_missing_item(true));
+    }
+    match row.trans_status.as_deref() {
+        Some("ready") => {
+            translated_ready_item(row.trans_title.clone(), row.trans_summary.clone(), None)
+                .or_else(|| Some(translated_missing_item(true)))
+        }
+        Some(status) => translated_terminal_item(status, row.trans_error_text.as_deref()),
+        None => Some(translated_missing_item(true)),
+    }
+}
+
+fn public_smart_item(row: &PublicReleaseRow, content: &str) -> Option<SmartItem> {
+    if content == "original" || content == "translated" {
+        return None;
+    }
+    let original_title = row
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&row.tag_name)
+        .to_owned();
+    let smart_body = release_feed_body(row.body.as_deref());
+    let source_hash = crate::translations::release_smart_feed_source_hash(
+        row.release_id.to_string().as_str(),
+        &row.repo_full_name,
+        &original_title,
+        smart_body.as_deref(),
+        &row.tag_name,
+        row.previous_tag_name.as_deref(),
+    );
+    if row.smart_source_hash.as_deref() != Some(source_hash.as_str()) {
+        return Some(smart_missing_item(None));
+    }
+    match row.smart_status.as_deref() {
+        Some("ready") => smart_ready_item(row.smart_title.clone(), row.smart_summary.clone(), None)
+            .or_else(|| Some(smart_missing_item(None))),
+        Some(status) => smart_terminal_item(status, row.smart_error_text.as_deref()),
+        None => Some(smart_missing_item(None)),
+    }
+}
+
+fn public_list_item_from_row(row: PublicReleaseRow, content: &str) -> PublicReleaseListItem {
+    let translated = public_translation_item(&row, content);
+    let smart = public_smart_item(&row, content);
+    let repo_visual = repo_visual_from_parts(
+        row.owner_avatar_url.clone(),
+        row.open_graph_image_url.clone(),
+        row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
+    PublicReleaseListItem {
+        release_id: row.release_id.to_string(),
+        repo_full_name: row.repo_full_name,
+        repo_visual,
+        tag_name: row.tag_name,
+        previous_tag_name: row.previous_tag_name,
+        name: row.name,
+        body: if content == "translated" || content == "polished" {
+            None
+        } else {
+            row.body
+        },
+        html_url: row.html_url,
+        published_at: row.published_at,
+        is_prerelease: row.is_prerelease,
+        is_draft: row.is_draft,
+        translated,
+        smart,
+    }
+}
+
+async fn load_public_release_rows(
+    state: &AppState,
+    repo_id: i64,
+    tag: Option<&str>,
+    cursor: Option<&PublicReleaseCursor>,
+    limit: i64,
+) -> Result<Vec<PublicReleaseRow>, ApiError> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          r.release_id,
+          COALESCE(r.published_at, r.created_at, r.updated_at, '') AS sort_ts,
+          COALESCE(pu.full_name, printf('unknown/%d', r.repo_id)) AS repo_full_name,
+          COALESCE(sr.owner_avatar_url, ob.owner_avatar_url) AS owner_avatar_url,
+          COALESCE(sr.open_graph_image_url, ob.open_graph_image_url) AS open_graph_image_url,
+          COALESCE(sr.uses_custom_open_graph_image, ob.uses_custom_open_graph_image, 0) AS uses_custom_open_graph_image,
+          r.tag_name,
+          r.name,
+          r.body,
+          r.html_url,
+          r.published_at,
+          r.is_prerelease,
+          r.is_draft,
+          rp.previous_tag_name,
+          t.source_hash AS trans_source_hash,
+          t.status AS trans_status,
+          t.title AS trans_title,
+          t.summary AS trans_summary,
+          t.error_text AS trans_error_text,
+          s.source_hash AS smart_source_hash,
+          s.status AS smart_status,
+          s.title AS smart_title,
+          s.summary AS smart_summary,
+          s.error_text AS smart_error_text
+        FROM repo_releases r
+        JOIN public_repo_release_usage pu
+          ON pu.repo_id = r.repo_id
+        LEFT JOIN (
+          SELECT
+            repo_id,
+            MAX(owner_avatar_url) AS owner_avatar_url,
+            MAX(open_graph_image_url) AS open_graph_image_url,
+            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
+          FROM starred_repos
+          WHERE is_private = 0
+          GROUP BY repo_id
+        ) sr
+          ON sr.repo_id = r.repo_id
+        LEFT JOIN (
+          SELECT
+            repo_id,
+            MAX(owner_avatar_url) AS owner_avatar_url,
+            MAX(open_graph_image_url) AS open_graph_image_url,
+            MAX(uses_custom_open_graph_image) AS uses_custom_open_graph_image
+          FROM owned_repo_star_baselines
+          GROUP BY repo_id
+        ) ob
+          ON ob.repo_id = r.repo_id
+        LEFT JOIN (
+          SELECT
+            release_id,
+            LAG(tag_name) OVER (
+              PARTITION BY repo_id
+              ORDER BY COALESCE(published_at, created_at, updated_at) ASC, release_id ASC
+            ) AS previous_tag_name
+          FROM repo_releases
+        ) rp
+          ON rp.release_id = r.release_id
+        LEFT JOIN ai_translations t
+          ON t.id = (
+            SELECT t2.id
+            FROM ai_translations t2
+            WHERE t2.entity_type = 'release_detail'
+              AND t2.entity_id = CAST(r.release_id AS TEXT)
+              AND t2.lang = 'zh-CN'
+              AND t2.status IN ('ready', 'disabled', 'missing', 'error')
+            ORDER BY CASE WHEN t2.status = 'ready' THEN 0 ELSE 1 END, t2.updated_at DESC
+            LIMIT 1
+          )
+        LEFT JOIN ai_translations s
+          ON s.id = (
+            SELECT s2.id
+            FROM ai_translations s2
+            WHERE s2.entity_type = 'release_smart'
+              AND s2.entity_id = CAST(r.release_id AS TEXT)
+              AND s2.lang = 'zh-CN'
+              AND s2.status IN ('ready', 'disabled', 'missing', 'error')
+            ORDER BY CASE WHEN s2.status = 'ready' THEN 0 ELSE 1 END, s2.updated_at DESC
+            LIMIT 1
+          )
+        WHERE r.repo_id =
+        "#,
+    );
+    query.push_bind(repo_id);
+    query.push(" AND r.is_draft = 0");
+    if let Some(tag) = tag {
+        query.push(" AND r.tag_name = ");
+        query.push_bind(tag);
+    }
+    if let Some(cursor) = cursor {
+        query.push(" AND (COALESCE(r.published_at, r.created_at, r.updated_at, '') < ");
+        query.push_bind(cursor.sort_ts.as_str());
+        query.push(" OR (COALESCE(r.published_at, r.created_at, r.updated_at, '') = ");
+        query.push_bind(cursor.sort_ts.as_str());
+        query.push(" AND r.release_id < ");
+        query.push_bind(cursor.release_id);
+        query.push("))");
+    }
+    query.push(
+        " ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at, '') DESC, r.release_id DESC LIMIT ",
+    );
+    query.push_bind(limit);
+    query
+        .build_query_as()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::internal)
+}
+
+pub async fn public_list_repo_releases(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo)): Path<(String, String)>,
+    Query(query): Query<PublicReleaseQuery>,
+) -> Result<Response, ApiError> {
+    validate_public_release_query(&query)?;
+    let usage = upsert_public_release_usage(
+        state.as_ref(),
+        owner,
+        repo,
+        false,
+        public_source_is_page(&query),
+    )
+    .await?;
+    ensure_public_release_usage_accessible(&usage)?;
+    let Some(repo_id) = usage.repo_id else {
+        return Ok(public_pending_response(&usage));
+    };
+    let limit = query.limit.unwrap_or(6).clamp(1, 30);
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(parse_public_release_cursor)
+        .transpose()?;
+    let mut rows = load_public_release_rows(
+        state.as_ref(),
+        repo_id,
+        None,
+        cursor.as_ref(),
+        limit.saturating_add(1),
+    )
+    .await?;
+    if rows.is_empty() && public_release_usage_should_retry_without_rows(&usage) {
+        return Ok(public_pending_response(&usage));
+    }
+    let content = query.content.as_deref().unwrap_or("all");
+    let next_cursor = if rows.len() > limit as usize {
+        let next = rows
+            .get(limit.saturating_sub(1) as usize)
+            .map(public_release_cursor);
+        rows.truncate(limit as usize);
+        next
+    } else {
+        None
+    };
+    Ok(Json(PublicReleaseListResponse {
+        status: "ready".to_owned(),
+        repo_full_name: usage.full_name,
+        next_cursor,
+        items: rows
+            .into_iter()
+            .map(|row| public_list_item_from_row(row, content))
+            .collect(),
+    })
+    .into_response())
+}
+
+pub async fn public_get_repo_release_detail(
+    State(state): State<Arc<AppState>>,
+    Path((owner, repo, tag)): Path<(String, String, String)>,
+    Query(query): Query<PublicReleaseQuery>,
+) -> Result<Response, ApiError> {
+    validate_public_release_query(&query)?;
+    let usage = upsert_public_release_usage(
+        state.as_ref(),
+        owner,
+        repo,
+        true,
+        public_source_is_page(&query),
+    )
+    .await?;
+    ensure_public_release_usage_accessible(&usage)?;
+    let Some(repo_id) = usage.repo_id else {
+        return Ok(public_pending_response(&usage));
+    };
+    let mut rows =
+        load_public_release_rows(state.as_ref(), repo_id, Some(tag.as_str()), None, 1).await?;
+    let Some(row) = rows.pop() else {
+        if public_release_usage_should_retry_without_rows(&usage) {
+            return Ok(public_pending_response(&usage));
+        }
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "release_not_found_or_not_cached",
+            "release not found or not cached",
+        ));
+    };
+    let content = query.content.as_deref().unwrap_or("all");
+    let translated = public_translation_item(&row, content);
+    let smart = public_smart_item(&row, content);
+    let repo_visual = repo_visual_from_parts(
+        row.owner_avatar_url.clone(),
+        row.open_graph_image_url.clone(),
+        row.uses_custom_open_graph_image.unwrap_or(0) != 0,
+    );
+    Ok(Json(ReleaseDetailResponse {
+        release_id: row.release_id.to_string(),
+        repo_full_name: Some(row.repo_full_name),
+        repo_visual,
+        tag_name: row.tag_name,
+        previous_tag_name: row.previous_tag_name,
+        name: row.name,
+        body: if content == "translated" || content == "polished" {
+            None
+        } else {
+            row.body
+        },
+        html_url: row.html_url,
+        published_at: row.published_at,
+        is_prerelease: row.is_prerelease,
+        is_draft: row.is_draft,
+        translated,
+        smart,
+    })
+    .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminPublicReposQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+    query: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminPublicRepoItem {
+    id: String,
+    repo_id: Option<i64>,
+    full_name: String,
+    first_registered_at: String,
+    last_requested_at: String,
+    last_list_requested_at: Option<String>,
+    last_detail_requested_at: Option<String>,
+    api_list_requests: i64,
+    api_detail_requests: i64,
+    page_list_requests: i64,
+    page_detail_requests: i64,
+    last_sync_status: String,
+    last_sync_error: Option<String>,
+    release_count: i64,
+    translated_ready_count: i64,
+    translated_missing_count: i64,
+    polished_ready_count: i64,
+    polished_missing_count: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminPublicReposResponse {
+    items: Vec<AdminPublicRepoItem>,
+    page: i64,
+    page_size: i64,
+    total: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_cleanup: Option<AdminPublicRepoCacheCleanup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminPublicRepoCacheCleanup {
+    repo_id: Option<i64>,
+    full_name: String,
+    deleted_release_count: i64,
+    deleted_ai_cache_count: u64,
+    skipped_reason: Option<String>,
+}
+
+pub async fn admin_list_public_release_repos(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Query(query): Query<AdminPublicReposQuery>,
+) -> Result<Json<AdminPublicReposResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let page = query.page.unwrap_or(1);
+    if page < 1 {
+        return Err(ApiError::bad_request("page must be >= 1"));
+    }
+    let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
+    let offset = admin_users_offset(page, page_size)?;
+    let query_text = query.query.unwrap_or_default().trim().to_ascii_lowercase();
+    let query_like = format!("%{query_text}%");
+
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM public_repo_release_usage
+        WHERE ? = '' OR full_name_lower LIKE ?
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let items = sqlx::query_as::<_, AdminPublicRepoItem>(
+        r#"
+        SELECT
+          pu.id,
+          pu.repo_id,
+          pu.full_name,
+          pu.first_registered_at,
+          pu.last_requested_at,
+          pu.last_list_requested_at,
+          pu.last_detail_requested_at,
+          pu.api_list_requests,
+          pu.api_detail_requests,
+          pu.page_list_requests,
+          pu.page_detail_requests,
+          pu.last_sync_status,
+          pu.last_sync_error,
+          COUNT(DISTINCT r.release_id) AS release_count,
+          COUNT(DISTINCT CASE WHEN td.status = 'ready' THEN r.release_id END) AS translated_ready_count,
+          COUNT(DISTINCT CASE WHEN COALESCE(td.status, 'missing') != 'ready' THEN r.release_id END) AS translated_missing_count,
+          COUNT(DISTINCT CASE WHEN sm.status = 'ready' THEN r.release_id END) AS polished_ready_count,
+          COUNT(DISTINCT CASE WHEN COALESCE(sm.status, 'missing') != 'ready' THEN r.release_id END) AS polished_missing_count,
+          pu.created_at,
+          pu.updated_at
+        FROM public_repo_release_usage pu
+        LEFT JOIN repo_releases r
+          ON r.repo_id = pu.repo_id
+        LEFT JOIN ai_translations td
+          ON td.id = (
+            SELECT td2.id
+            FROM ai_translations td2
+            WHERE td2.entity_type = 'release_detail'
+              AND td2.entity_id = CAST(r.release_id AS TEXT)
+              AND td2.lang = 'zh-CN'
+            ORDER BY CASE WHEN td2.status = 'ready' THEN 0 ELSE 1 END, td2.updated_at DESC
+            LIMIT 1
+          )
+        LEFT JOIN ai_translations sm
+          ON sm.id = (
+            SELECT sm2.id
+            FROM ai_translations sm2
+            WHERE sm2.entity_type = 'release_smart'
+              AND sm2.entity_id = CAST(r.release_id AS TEXT)
+              AND sm2.lang = 'zh-CN'
+            ORDER BY CASE WHEN sm2.status = 'ready' THEN 0 ELSE 1 END, sm2.updated_at DESC
+            LIMIT 1
+          )
+        WHERE ? = '' OR pu.full_name_lower LIKE ?
+        GROUP BY pu.id
+        ORDER BY pu.last_requested_at DESC, pu.full_name ASC
+        LIMIT ? OFFSET ?
+        "#,
+    )
+    .bind(query_text.as_str())
+    .bind(query_like.as_str())
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    Ok(Json(AdminPublicReposResponse {
+        items,
+        page,
+        page_size,
+        total,
+        cache_cleanup: None,
+    }))
+}
+
+pub async fn admin_delete_public_release_repo(
+    State(state): State<Arc<AppState>>,
+    session: Session,
+    Path(usage_id): Path<String>,
+) -> Result<Json<AdminPublicReposResponse>, ApiError> {
+    let _acting_user_id = require_admin_user_id(state.as_ref(), &session).await?;
+    let usage_id = parse_local_id_param(usage_id, "public_repo_usage_id")?;
+
+    let deleted_usage = sqlx::query_as::<_, (Option<i64>, String)>(
+        r#"
+        SELECT repo_id, full_name
+        FROM public_repo_release_usage
+        WHERE id = ?
+        "#,
+    )
+    .bind(usage_id.as_str())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some((repo_id, full_name)) = deleted_usage else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "public repo usage not found",
+        ));
+    };
+
+    let deleted = sqlx::query(
+        r#"
+        DELETE FROM public_repo_release_usage
+        WHERE id = ?
+        "#,
+    )
+    .bind(usage_id.as_str())
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
+    if deleted == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "public repo usage not found",
+        ));
+    }
+
+    let cache_cleanup =
+        cleanup_public_release_repo_cache_if_unused(state.as_ref(), repo_id, full_name).await?;
+
+    let Json(mut response) = admin_list_public_release_repos(
+        State(state),
+        session,
+        Query(AdminPublicReposQuery {
+            page: Some(1),
+            page_size: Some(20),
+            query: None,
+        }),
+    )
+    .await?;
+    response.cache_cleanup = Some(cache_cleanup);
+    Ok(Json(response))
+}
+
+async fn cleanup_public_release_repo_cache_if_unused(
+    state: &AppState,
+    repo_id: Option<i64>,
+    full_name: String,
+) -> Result<AdminPublicRepoCacheCleanup, ApiError> {
+    let Some(repo_id) = repo_id else {
+        return Ok(AdminPublicRepoCacheCleanup {
+            repo_id,
+            full_name,
+            deleted_release_count: 0,
+            deleted_ai_cache_count: 0,
+            skipped_reason: Some("repo_not_resolved".to_owned()),
+        });
+    };
+
+    let remaining_public_usage = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM public_repo_release_usage
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if remaining_public_usage > 0 {
+        return Ok(AdminPublicRepoCacheCleanup {
+            repo_id: Some(repo_id),
+            full_name,
+            deleted_release_count: 0,
+            deleted_ai_cache_count: 0,
+            skipped_reason: Some("still_used_by_public_endpoint".to_owned()),
+        });
+    }
+
+    let user_visible_usage = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM user_release_visible_repos
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if user_visible_usage > 0 {
+        return Ok(AdminPublicRepoCacheCleanup {
+            repo_id: Some(repo_id),
+            full_name,
+            deleted_release_count: 0,
+            deleted_ai_cache_count: 0,
+            skipped_reason: Some("still_used_by_user_release_visibility".to_owned()),
+        });
+    }
+
+    let brief_usage = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM brief_release_memberships m
+        JOIN repo_releases r ON r.release_id = m.release_id
+        WHERE r.repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    if brief_usage > 0 {
+        return Ok(AdminPublicRepoCacheCleanup {
+            repo_id: Some(repo_id),
+            full_name,
+            deleted_release_count: 0,
+            deleted_ai_cache_count: 0,
+            skipped_reason: Some("still_used_by_brief_membership".to_owned()),
+        });
+    }
+
+    let release_ids = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT release_id
+        FROM repo_releases
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut deleted_ai_cache_count = 0u64;
+    let mut deleted_release_count = 0i64;
+    for release_id in release_ids {
+        let release_id_text = release_id.to_string();
+        deleted_ai_cache_count += sqlx::query(
+            r#"
+            DELETE FROM ai_translations
+            WHERE entity_type IN ('release_detail', 'release_smart')
+              AND entity_id = ?
+            "#,
+        )
+        .bind(release_id_text.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?
+        .rows_affected();
+        deleted_release_count += sqlx::query(
+            r#"
+            DELETE FROM repo_releases
+            WHERE release_id = ?
+            "#,
+        )
+        .bind(release_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?
+        .rows_affected() as i64;
+    }
+    sqlx::query(
+        r#"
+        DELETE FROM repo_release_work_items
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    sqlx::query(
+        r#"
+        DELETE FROM repo_release_sync_state
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(repo_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    Ok(AdminPublicRepoCacheCleanup {
+        repo_id: Some(repo_id),
+        full_name,
+        deleted_release_count,
+        deleted_ai_cache_count,
+        skipped_reason: None,
+    })
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct NotificationItem {
     thread_id: String,
@@ -13371,9 +14316,10 @@ mod tests {
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, DashboardUpdatesQuery, DashboardUpdatesToken,
         FeedQuery, FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit,
         GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, RELEASE_FEED_BODY_MAX_CHARS, ReturnModeQuery,
-        SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow, TranslationUpsert,
-        admin_dashboard, admin_download_realtime_task_log, admin_get_llm_call_detail,
+        LLM_CALL_ORDER_BY_CREATED_DESC, PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS,
+        ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow,
+        TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
+        admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
         admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
@@ -13394,14 +14340,14 @@ mod tests {
         parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
         parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
         parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
-        prepare_release_batch, preserve_chunk_edge_newlines, refresh_admin_dashboard_rollups,
-        refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
-        release_detail_translation_ready, release_excerpt, release_feed_body,
-        release_reactions_status, require_active_user_id, resolve_release_full_name,
-        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
-        sync_all, sync_notifications, sync_releases, sync_starred,
-        translate_release_detail_for_user, translate_releases_batch_for_user,
-        translate_response_from_batch_item, upsert_translation,
+        prepare_release_batch, preserve_chunk_edge_newlines, public_get_repo_release_detail,
+        public_list_repo_releases, refresh_admin_dashboard_rollups, refresh_feed_reactions,
+        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
+        release_excerpt, release_feed_body, release_reactions_status, require_active_user_id,
+        resolve_release_full_name, should_retry_public_compare_without_auth,
+        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
+        sync_releases, sync_starred, translate_release_detail_for_user,
+        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -14357,6 +15303,43 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed shared repo release");
+    }
+
+    async fn seed_public_release_usage(
+        pool: &SqlitePool,
+        repo_id: Option<i64>,
+        status: &str,
+    ) -> String {
+        let now = "2026-02-23T00:00:00Z";
+        let usage_id = crate::local_id::test_local_id("public-release-usage");
+        sqlx::query(
+            r#"
+            INSERT INTO public_repo_release_usage (
+              id, repo_id, owner_login, repo_name, full_name, full_name_lower,
+              first_registered_at, last_requested_at, created_at, updated_at,
+              last_sync_status
+            )
+            VALUES (?, ?, 'openai', 'codex', 'openai/codex', 'openai/codex', ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(usage_id.as_str())
+        .bind(repo_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed public release usage");
+        usage_id
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&body).expect("parse response json")
     }
 
     async fn seed_star(pool: &SqlitePool, repo_id: i64) {
@@ -19881,6 +20864,456 @@ line two",
             detail.html_url,
             "https://github.com/openai/codex/releases/tag/v1.2.3"
         );
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_returns_retryable_pending() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("public list pending");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("60"))
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("pending_sync"));
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_rejects_unsupported_language() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+
+        let err = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: Some("en-US".to_owned()),
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect_err("unsupported language should fail");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], json!("unsupported_language"));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_failed_initial_sync_stays_retryable() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "failed").await;
+        let state = setup_state(pool);
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("failed initial sync should remain retryable");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&header::HeaderValue::from_static("60"))
+        );
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("pending_sync"));
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_release_sync_pending")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_release_list_uses_cursor_pagination_without_total_count() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        for idx in 0..4_i64 {
+            let release_id = 120 + idx;
+            let tag = format!("v1.2.{idx}");
+            let published_at = format!("2026-02-2{}T00:00:00Z", 3 - idx);
+            sqlx::query(
+                r#"
+                INSERT INTO repo_releases (
+                  id, repo_id, release_id, node_id, tag_name, name, body,
+                  html_url, published_at, created_at, is_prerelease, is_draft,
+                  updated_at, react_plus1, react_laugh, react_heart,
+                  react_hooray, react_rocket, react_eyes
+                )
+                VALUES (?, 42, ?, ?, ?, ?, '- item', ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+                "#,
+            )
+            .bind(format!("repo-release-42-{release_id}"))
+            .bind(release_id)
+            .bind(format!("node-{release_id}"))
+            .bind(tag.as_str())
+            .bind(format!("Release {tag}"))
+            .bind(format!(
+                "https://github.com/openai/codex/releases/tag/{tag}"
+            ))
+            .bind(published_at.as_str())
+            .bind(published_at.as_str())
+            .bind(published_at.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed public release page item");
+        }
+        let state = setup_state(pool);
+
+        let first = public_list_repo_releases(
+            State(state.clone()),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("first public page");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["items"].as_array().unwrap().len(), 2);
+        assert!(first_body.get("total").is_none());
+        let cursor = first_body["next_cursor"]
+            .as_str()
+            .expect("first page cursor")
+            .to_owned();
+
+        let second = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: Some(cursor),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("second public page");
+        let second_body = response_json(second).await;
+        assert_eq!(second_body["items"].as_array().unwrap().len(), 2);
+        assert_eq!(second_body["next_cursor"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn public_release_detail_reads_shared_repo_releases_cache() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let response = public_get_repo_release_detail(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned(), "v1.2.3".to_owned())),
+            Query(PublicReleaseQuery {
+                content: Some("all".to_owned()),
+                lang: Some("zh-CN".to_owned()),
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("public detail");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["release_id"], json!("120"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(body["tag_name"], json!("v1.2.3"));
+        assert_eq!(body["body"], json!("- item"));
+    }
+
+    #[tokio::test]
+    async fn public_release_detail_excludes_draft_release_cache() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query("UPDATE repo_releases SET is_draft = 1 WHERE release_id = 120")
+            .execute(&pool)
+            .await
+            .expect("mark draft release");
+        let state = setup_state(pool);
+
+        let err = public_get_repo_release_detail(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned(), "v1.2.3".to_owned())),
+            Query(PublicReleaseQuery {
+                content: Some("all".to_owned()),
+                lang: Some("zh-CN".to_owned()),
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect_err("draft release must not be publicly returned");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["error"]["code"],
+            json!("release_not_found_or_not_cached")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_release_list_blocks_inaccessible_repo_even_with_cache() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, Some(42), "inaccessible").await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let err = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect_err("inaccessible public repo should not serve cached releases");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], json!("repository_inaccessible"));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_blocks_unresolved_inaccessible_repo() {
+        let pool = setup_pool().await;
+        seed_public_release_usage(&pool, None, "inaccessible").await;
+        let state = setup_state(pool);
+
+        let err = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect_err("unresolved inaccessible public repo should not stay pending");
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], json!("repository_inaccessible"));
+    }
+
+    #[tokio::test]
+    async fn admin_delete_public_release_usage_cleans_cache_when_repo_is_unused() {
+        let pool = setup_pool().await;
+        let usage_id = seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            INSERT INTO ai_translations (
+              id, user_id, entity_type, entity_id, lang, source_hash,
+              title, summary, created_at, updated_at, status
+            )
+            VALUES
+              ('translation-release-detail-120', ?, 'release_detail', '120', 'zh-CN', 'hash', '标题', '摘要', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z', 'ready'),
+              ('translation-release-smart-120', ?, 'release_smart', '120', 'zh-CN', 'hash', '标题', '摘要', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z', 'ready')
+            "#,
+        )
+        .bind(test_user_id(1))
+        .bind(test_user_id(1))
+        .execute(&pool)
+        .await
+        .expect("seed ai translations");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_sync_state (
+              repo_id, etag, last_modified, last_success_at, last_attempt_at,
+              last_not_modified_at, last_error_text, backoff_until, updated_at
+            )
+            VALUES (42, 'etag-stale', 'Mon, 23 Feb 2026 00:00:00 GMT', '2026-02-23T00:00:00Z', '2026-02-23T00:00:00Z', NULL, NULL, NULL, '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed release sync state");
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("mark user admin");
+        let state = setup_state(pool.clone());
+
+        let Json(list) =
+            admin_delete_public_release_repo(State(state), setup_session(1).await, Path(usage_id))
+                .await
+                .expect("delete public release usage");
+
+        assert_eq!(list.total, 0);
+        assert_eq!(
+            list.cache_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.deleted_release_count),
+            Some(1)
+        );
+        assert_eq!(
+            list.cache_cleanup
+                .as_ref()
+                .map(|cleanup| cleanup.deleted_ai_cache_count),
+            Some(2)
+        );
+        let release_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_releases WHERE release_id = 120",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count repo releases");
+        assert_eq!(release_count, 0);
+        let ai_cache_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ai_translations WHERE entity_id = '120'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count ai cache");
+        assert_eq!(ai_cache_count, 0);
+        let sync_state_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_release_sync_state WHERE repo_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count release sync state");
+        assert_eq!(sync_state_count, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_delete_public_release_usage_keeps_cache_when_user_visibility_uses_repo() {
+        let pool = setup_pool().await;
+        let usage_id = seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_star(&pool, 42).await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("mark user admin");
+        let state = setup_state(pool.clone());
+
+        let Json(list) =
+            admin_delete_public_release_repo(State(state), setup_session(1).await, Path(usage_id))
+                .await
+                .expect("delete public release usage");
+
+        assert_eq!(list.total, 0);
+        assert_eq!(
+            list.cache_cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.skipped_reason.as_deref()),
+            Some("still_used_by_user_release_visibility")
+        );
+        let release_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_releases WHERE release_id = 120",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count repo releases");
+        assert_eq!(release_count, 1);
+    }
+
+    #[tokio::test]
+    async fn admin_delete_public_release_usage_keeps_cache_when_brief_uses_release() {
+        let pool = setup_pool().await;
+        let usage_id = seed_public_release_usage(&pool, Some(42), "ready").await;
+        seed_repo_release(&pool, 42, 120).await;
+        seed_brief(&pool, test_user_id(1).as_str(), "2026-02-23", "brief").await;
+        sqlx::query(
+            r#"
+            INSERT INTO brief_release_memberships (
+              brief_id, release_id, release_ts_utc, ordinal, created_at
+            )
+            VALUES ('brief-2026-02-23', 120, '2026-02-23T00:00:00Z', 0, '2026-02-23T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed brief release membership");
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("mark user admin");
+        let state = setup_state(pool.clone());
+
+        let Json(list) =
+            admin_delete_public_release_repo(State(state), setup_session(1).await, Path(usage_id))
+                .await
+                .expect("delete public release usage");
+
+        assert_eq!(list.total, 0);
+        assert_eq!(
+            list.cache_cleanup
+                .as_ref()
+                .and_then(|cleanup| cleanup.skipped_reason.as_deref()),
+            Some("still_used_by_brief_membership")
+        );
+        let release_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM repo_releases WHERE release_id = 120",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count repo releases");
+        assert_eq!(release_count, 1);
+        let membership_count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM brief_release_memberships WHERE release_id = 120",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count brief memberships");
+        assert_eq!(membership_count, 1);
     }
 
     #[tokio::test]

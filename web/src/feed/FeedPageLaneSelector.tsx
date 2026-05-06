@@ -25,8 +25,8 @@ export function FeedPageLaneSelector(props: {
 			aria-disabled={disabled}
 			className={cn(
 				distributed
-					? "flex h-8 w-full items-center gap-1 rounded-lg border border-border/60 bg-muted/55 p-1"
-					: "inline-flex h-8 items-center gap-1 rounded-lg border border-border/60 bg-muted/55 p-1",
+					? "flex h-10 w-full items-center gap-1 rounded-lg border border-border/60 bg-muted/55 p-0.5 sm:h-9"
+					: "inline-flex h-10 items-center gap-1 rounded-lg border border-border/60 bg-muted/55 p-0.5 sm:h-9",
 				"transition-colors dark:border-border/70 dark:bg-muted/35",
 				disabled && "opacity-60",
 				className,
@@ -48,8 +48,8 @@ export function FeedPageLaneSelector(props: {
 						disabled={disabled}
 						className={cn(
 							distributed
-								? "h-6 min-w-0 flex-1 justify-center rounded-md px-0 text-xs font-medium shadow-none transition-colors"
-								: "h-6 rounded-md px-2.5 text-[13px] font-medium shadow-none transition-colors sm:px-3",
+								? "h-9 min-w-0 flex-1 justify-center rounded-md px-0 text-xs font-medium shadow-none transition-colors sm:h-8"
+								: "h-9 rounded-md px-2.5 text-[13px] font-medium shadow-none transition-colors sm:h-8 sm:px-3",
 							active
 								? "border border-border/70 bg-background text-foreground shadow-xs hover:bg-background dark:border-border/80 dark:bg-background/80"
 								: "border border-transparent bg-transparent text-foreground/55 hover:bg-background/45 hover:text-foreground/80 dark:text-foreground/50 dark:hover:bg-background/25 dark:hover:text-foreground/80",
