@@ -1,5 +1,8 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
 
+const EMBEDDED_FRONTEND_VERSION = "v0.1.0";
+const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
+
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
 		status,
@@ -110,6 +113,15 @@ async function expectPublicChrome(page: Page, owner: string, repo: string) {
 		footerLink.locator('[data-auth-provider-icon="github"]'),
 	).toHaveCount(1);
 	await expect(footerLink.locator(".lucide-external-link")).toHaveCount(0);
+
+	const versionLink = page.getByRole("link", {
+		name: `Version ${EMBEDDED_FRONTEND_VERSION}`,
+	});
+	await expect(versionLink).toBeVisible();
+	await expect(versionLink).toHaveAttribute(
+		"href",
+		EMBEDDED_FRONTEND_VERSION_RELEASE_HREF,
+	);
 }
 
 async function expectNoHorizontalOverflow(page: Page) {
