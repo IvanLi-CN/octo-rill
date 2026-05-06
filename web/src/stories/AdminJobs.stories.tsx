@@ -127,6 +127,34 @@ const scheduledRunsSeed: AdminRealtimeTaskItem[] = [
 		updated_at: "2026-02-27T06:03:24Z",
 	},
 	{
+		id: "task-retry-recent-failures",
+		task_type: "retry.recent_failures",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:50:00Z",
+		started_at: "2026-02-27T14:50:01Z",
+		finished_at: "2026-02-27T14:51:12Z",
+		updated_at: "2026-02-27T14:51:12Z",
+	},
+	{
+		id: "task-retry-recent-failures-skipped",
+		task_type: "retry.recent_failures",
+		status: "succeeded",
+		source: "scheduler",
+		requested_by: null,
+		parent_task_id: null,
+		cancel_requested: false,
+		error_message: null,
+		created_at: "2026-02-27T14:45:00Z",
+		started_at: "2026-02-27T14:45:01Z",
+		finished_at: "2026-02-27T14:45:01Z",
+		updated_at: "2026-02-27T14:45:01Z",
+	},
+	{
 		id: "task-subscription-1440",
 		task_type: "sync.subscriptions",
 		status: "running",
@@ -647,6 +675,91 @@ const translationBatchDetailFailedSeed = {
 function buildTaskDetail(
 	task: AdminRealtimeTaskItem,
 ): AdminRealtimeTaskDetailResponse {
+	if (task.task_type === "retry.recent_failures") {
+		const skipped = task.id.endsWith("skipped");
+		return {
+			task: {
+				...task,
+				payload_json: JSON.stringify({
+					trigger: "schedule",
+					schedule_key: "interval:10:1772184300",
+					interval_minutes: 10,
+					lookback_hours: 24,
+					max_items_per_kind: 100,
+					kind_timeout_seconds: 600,
+					order: "updated_at DESC, created_at DESC, id DESC",
+				}),
+				result_json: JSON.stringify({
+					skipped,
+					skip_reason: skipped ? "previous_run_active" : null,
+					schedule_key: "interval:10:1772184300",
+					interval_minutes: 10,
+					daily_brief: {
+						kind: "daily_brief",
+						total: skipped ? 0 : 4,
+						processed: skipped ? 0 : 4,
+						succeeded: skipped ? 0 : 3,
+						failed: skipped ? 0 : 1,
+						skipped: 0,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 18300,
+						current_id: skipped ? null : "brief-failed-newest",
+						last_error: skipped ? null : "AI response missing content",
+					},
+					polish: {
+						kind: "polish",
+						total: skipped ? 0 : 2,
+						processed: skipped ? 0 : 2,
+						succeeded: skipped ? 0 : 2,
+						failed: 0,
+						skipped: 0,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 120,
+						current_id: skipped ? null : "work-smart-newest",
+						last_error: null,
+					},
+					translation: {
+						kind: "translation",
+						total: skipped ? 0 : 3,
+						processed: skipped ? 0 : 2,
+						succeeded: skipped ? 0 : 2,
+						failed: 0,
+						skipped: skipped ? 0 : 1,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 140,
+						current_id: skipped ? null : "work-translation-newest",
+						last_error: null,
+					},
+				}),
+			},
+			events: [
+				{
+					id: `${task.id}-event-1`,
+					event_type: "task.progress",
+					payload_json: JSON.stringify(
+						skipped
+							? {
+									stage: "skipped",
+									schedule_key: "interval:10:1772184300",
+									skip_reason: "previous_run_active",
+								}
+							: {
+									stage: "summary",
+									daily_brief: { processed: 4, succeeded: 3, failed: 1 },
+									polish: { processed: 2, succeeded: 2, failed: 0 },
+									translation: {
+										processed: 2,
+										succeeded: 2,
+										failed: 0,
+										skipped: 1,
+									},
+								},
+					),
+					created_at: task.finished_at ?? task.updated_at,
+				},
+			],
+		};
+	}
 	if (task.task_type === "sync.subscriptions") {
 		if (task.id === "task-subscription-skipped") {
 			return {
@@ -1253,6 +1366,7 @@ function AdminJobsPreview({
 		};
 		let syncRuntimeConfig = {
 			sync_auto_fetch_interval_minutes: 10,
+			retry_recent_failures_interval_minutes: 10,
 			repo_release_worker_concurrency: 12,
 			recent_sync_tasks: scheduledRuns
 				.filter((item) => item.task_type === "sync.subscriptions")
@@ -1472,14 +1586,20 @@ function AdminJobsPreview({
 				let rows = [...realtimeTasks, ...scheduledRuns];
 				if (taskGroup === "scheduled") {
 					rows = rows.filter((item) =>
-						["brief.daily_slot", "sync.subscriptions"].includes(item.task_type),
+						[
+							"brief.daily_slot",
+							"sync.subscriptions",
+							"retry.recent_failures",
+						].includes(item.task_type),
 					);
 				} else if (taskGroup === "realtime") {
 					rows = rows.filter(
 						(item) =>
-							!["brief.daily_slot", "sync.subscriptions"].includes(
-								item.task_type,
-							),
+							![
+								"brief.daily_slot",
+								"sync.subscriptions",
+								"retry.recent_failures",
+							].includes(item.task_type),
 					);
 				} else if (taskType) {
 					rows = rows.filter((item) => item.task_type === taskType);
@@ -1610,12 +1730,17 @@ function AdminJobsPreview({
 			) {
 				const body = (await req.json()) as {
 					sync_auto_fetch_interval_minutes?: number;
+					retry_recent_failures_interval_minutes?: number;
 					repo_release_worker_concurrency?: number;
 				};
 				syncRuntimeConfig = {
 					...syncRuntimeConfig,
 					sync_auto_fetch_interval_minutes: Number(
 						body.sync_auto_fetch_interval_minutes ?? 60,
+					),
+					retry_recent_failures_interval_minutes: Number(
+						body.retry_recent_failures_interval_minutes ??
+							syncRuntimeConfig.retry_recent_failures_interval_minutes,
 					),
 					repo_release_worker_concurrency: Number(
 						body.repo_release_worker_concurrency ??
@@ -2113,6 +2238,10 @@ export const ScheduledTab: Story = {
 			canvas.getByRole("heading", { name: "定时任务" }),
 		).toBeVisible();
 		await expect(
+			canvas.getByRole("button", { name: "配置定时任务间隔" }),
+		).toBeVisible();
+		await expect(canvas.getByText("失败数据重试")).toBeVisible();
+		await expect(
 			canvas.queryByRole("button", { name: "配置订阅同步 worker 数量" }),
 		).not.toBeInTheDocument();
 		await waitFor(() =>
@@ -2154,7 +2283,7 @@ export const SubscriptionSyncWorkflow: Story = {
 			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
 		);
 		await expect(
-			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
+			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
 		await expect(
 			canvas.getByRole("slider", { name: "Release worker 数量" }),
@@ -2164,6 +2293,30 @@ export const SubscriptionSyncWorkflow: Story = {
 				"/admin/jobs/subscriptions",
 			),
 		);
+	},
+};
+
+export const RetryRecentFailuresDetail: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/tasks/task-retry-recent-failures" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"失败数据重试任务详情，展示日报、润色、翻译三类从新到旧重试后的摘要。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "失败数据重试详情页" }),
+		).toBeVisible();
+		await expect(body.getByText("日报 成功/处理/总计")).toBeVisible();
+		await expect(body.getByText("润色 成功/处理/总计")).toBeVisible();
+		await expect(body.getByText("翻译 成功/处理/总计")).toBeVisible();
+		await expect(body.getByText("3/4/4")).toBeVisible();
 	},
 };
 
@@ -2268,15 +2421,18 @@ export const SubscriptionSyncSettings: Story = {
 		docs: {
 			description: {
 				story:
-					"直接展示订阅同步设置面板，覆盖 worker 滑块与数字输入的视觉状态。",
+					"直接展示任务间隔设置面板，覆盖订阅同步间隔、失败数据重试默认 10 分钟与 worker 滑块。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
 		await expect(
-			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
+			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
+		await expect(
+			canvas.getByRole("slider", { name: "失败数据重试间隔（分钟）" }),
+		).toHaveAttribute("aria-valuenow", "10");
 		await expect(canvas.getByLabelText("Release worker 数量输入")).toHaveValue(
 			12,
 		);
@@ -2295,7 +2451,7 @@ export const SyncSettingsTooltipDemo: Story = {
 		docs: {
 			description: {
 				story:
-					"演示订阅同步配置弹窗中的三个帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
+					"演示任务间隔设置弹窗中的帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
 			},
 		},
 	},
@@ -2303,7 +2459,7 @@ export const SyncSettingsTooltipDemo: Story = {
 		const canvas = within(canvasElement);
 		const screen = within(canvasElement.ownerDocument.body);
 		await expect(
-			await canvas.findByRole("dialog", { name: "配置订阅同步" }),
+			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
 		await waitFor(() => {
 			const tooltipText = screen

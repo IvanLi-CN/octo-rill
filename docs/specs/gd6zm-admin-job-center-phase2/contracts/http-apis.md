@@ -99,6 +99,7 @@
 ```
 
 `payload_json` 与 `result_json` 由前端任务详情页用于按 `task_type` 渲染专属业务信息，不再依赖单一通用文案。对于 `translate.release.batch` / `summarize.release.smart.batch`，后端应优先写入带 `items[]` 的 summary-enriched superset；读取端仍需兼容仅有 `items[]` 的 legacy 行。
+`retry.recent_failures` 同样依赖该专属详情路径展示三类重试摘要、跳过原因与调度信息。
 
 ### `GET /api/admin/jobs/translations/status` response
 

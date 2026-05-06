@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -41,13 +41,18 @@ pub const TASK_BRIEF_GENERATE: &str = "brief.generate";
 pub const TASK_BRIEF_DAILY_SLOT: &str = "brief.daily_slot";
 pub const TASK_BRIEF_HISTORY_RECOMPUTE: &str = "brief.history_recompute";
 pub const TASK_BRIEF_REFRESH_CONTENT: &str = "brief.refresh_content";
+pub const TASK_RETRY_RECENT_FAILURES: &str = "retry.recent_failures";
 pub const TASK_TRANSLATE_RELEASE: &str = "translate.release";
 pub const TASK_TRANSLATE_RELEASE_BATCH: &str = "translate.release.batch";
 pub const TASK_SUMMARIZE_RELEASE_SMART_BATCH: &str = "summarize.release.smart.batch";
 pub const TASK_TRANSLATE_RELEASE_DETAIL: &str = "translate.release_detail";
 pub const TASK_TRANSLATE_NOTIFICATION: &str = "translate.notification";
 
-pub const SCHEDULED_TASK_TYPES: &[&str] = &[TASK_BRIEF_DAILY_SLOT, TASK_SYNC_SUBSCRIPTIONS];
+pub const SCHEDULED_TASK_TYPES: &[&str] = &[
+    TASK_BRIEF_DAILY_SLOT,
+    TASK_SYNC_SUBSCRIPTIONS,
+    TASK_RETRY_RECENT_FAILURES,
+];
 
 #[derive(Debug, Clone)]
 pub struct NewTask {
@@ -117,7 +122,12 @@ struct DueDailySlotUser {
 }
 
 const SUBSCRIPTION_SCHEDULE_NAME: &str = "sync.subscriptions";
+const RETRY_RECENT_FAILURES_SCHEDULE_NAME: &str = "retry.recent_failures";
 const ADMIN_DASHBOARD_ROLLUP_SCHEDULER_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND: i64 = 100;
+const RETRY_RECENT_FAILURES_KIND_BUDGET: Duration = Duration::from_secs(10 * 60);
+#[cfg(test)]
+const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
 static TASK_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static TASK_SINGLETON_ENQUEUE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -194,6 +204,21 @@ pub fn spawn_subscription_scheduler(state: Arc<AppState>) {
             let now = Utc::now();
             if let Err(err) = enqueue_subscription_run_if_due(state.as_ref(), now).await {
                 tracing::warn!(?err, "subscription scheduler: enqueue due run failed");
+            }
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        }
+    });
+}
+
+pub fn spawn_recent_failures_retry_scheduler(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let now = Utc::now();
+            if let Err(err) = enqueue_recent_failures_retry_if_due(state.as_ref(), now).await {
+                tracing::warn!(
+                    ?err,
+                    "recent failures retry scheduler: enqueue due run failed"
+                );
             }
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
@@ -337,7 +362,77 @@ pub async fn enqueue_subscription_run_if_due(
         .await?
     };
 
-    upsert_dispatch_state(state, &schedule_key, &task.task_id).await?;
+    upsert_dispatch_state(
+        state,
+        SUBSCRIPTION_SCHEDULE_NAME,
+        &schedule_key,
+        &task.task_id,
+    )
+    .await?;
+    Ok(Some(task.task_id))
+}
+
+pub async fn enqueue_recent_failures_retry_if_due(
+    state: &AppState,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let interval_minutes =
+        admin_runtime::load_retry_recent_failures_interval_minutes(&state.pool).await?;
+    let schedule_key = current_recent_failures_retry_schedule_key(now, interval_minutes);
+    let row = sqlx::query_as::<_, DispatchStateRow>(
+        r#"
+        SELECT last_dispatch_key
+        FROM scheduled_task_dispatch_state
+        WHERE schedule_name = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(RETRY_RECENT_FAILURES_SCHEDULE_NAME)
+    .fetch_optional(&state.pool)
+    .await
+    .context("failed to query recent failures retry dispatch state")?;
+
+    if row
+        .as_ref()
+        .and_then(|current| current.last_dispatch_key.as_deref())
+        == Some(schedule_key.as_str())
+    {
+        return Ok(None);
+    }
+
+    let payload = json!({
+        "trigger": "schedule",
+        "schedule_key": schedule_key,
+        "interval_minutes": interval_minutes,
+        "lookback_hours": 24,
+        "max_items_per_kind": RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND,
+        "kind_timeout_seconds": RETRY_RECENT_FAILURES_KIND_BUDGET.as_secs(),
+        "order": "updated_at DESC, created_at DESC, id DESC",
+    });
+
+    let task = if task_type_run_in_flight(state, TASK_RETRY_RECENT_FAILURES).await? {
+        record_skipped_recent_failures_retry(state, payload).await?
+    } else {
+        enqueue_task(
+            state,
+            NewTask {
+                task_type: TASK_RETRY_RECENT_FAILURES.to_owned(),
+                payload,
+                source: "scheduler".to_owned(),
+                requested_by: None,
+                parent_task_id: None,
+            },
+        )
+        .await?
+    };
+
+    upsert_dispatch_state(
+        state,
+        RETRY_RECENT_FAILURES_SCHEDULE_NAME,
+        &schedule_key,
+        &task.task_id,
+    )
+    .await?;
     Ok(Some(task.task_id))
 }
 
@@ -399,6 +494,16 @@ pub(crate) fn current_subscription_schedule_key(
     format!("interval:{interval_minutes}:{bucket_start}")
 }
 
+pub(crate) fn current_recent_failures_retry_schedule_key(
+    now: DateTime<Utc>,
+    interval_minutes: i64,
+) -> String {
+    let interval_minutes =
+        admin_runtime::normalize_retry_recent_failures_interval_minutes(interval_minutes);
+    let bucket_start = now.timestamp().div_euclid(interval_minutes * 60) * interval_minutes * 60;
+    format!("interval:{interval_minutes}:{bucket_start}")
+}
+
 async fn subscription_run_in_flight(state: &AppState) -> Result<bool> {
     let count = sqlx::query_scalar::<_, i64>(
         r#"
@@ -418,7 +523,31 @@ async fn subscription_run_in_flight(state: &AppState) -> Result<bool> {
     Ok(count > 0)
 }
 
-async fn upsert_dispatch_state(state: &AppState, schedule_key: &str, task_id: &str) -> Result<()> {
+async fn task_type_run_in_flight(state: &AppState, task_type: &str) -> Result<bool> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM job_tasks
+        WHERE task_type = ?
+          AND status IN (?, ?)
+        "#,
+    )
+    .bind(task_type)
+    .bind(STATUS_QUEUED)
+    .bind(STATUS_RUNNING)
+    .fetch_one(&state.pool)
+    .await
+    .with_context(|| format!("failed to query in-flight {task_type} runs"))?;
+
+    Ok(count > 0)
+}
+
+async fn upsert_dispatch_state(
+    state: &AppState,
+    schedule_name: &str,
+    schedule_key: &str,
+    task_id: &str,
+) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
@@ -434,7 +563,7 @@ async fn upsert_dispatch_state(state: &AppState, schedule_key: &str, task_id: &s
           updated_at = excluded.updated_at
         "#,
     )
-    .bind(SUBSCRIPTION_SCHEDULE_NAME)
+    .bind(schedule_name)
     .bind(schedule_key)
     .bind(task_id)
     .bind(now.as_str())
@@ -498,6 +627,76 @@ async fn record_skipped_subscription_run(state: &AppState, payload: Value) -> Re
             &schedule_key,
             "previous_run_active",
         )),
+        None,
+    )
+    .await?;
+    append_task_event(
+        state,
+        &task.task_id,
+        "task.completed",
+        json!({
+            "task_id": task.task_id,
+            "status": STATUS_SUCCEEDED,
+            "skipped": true,
+        }),
+    )
+    .await?;
+
+    Ok(task)
+}
+
+async fn record_skipped_recent_failures_retry(
+    state: &AppState,
+    payload: Value,
+) -> Result<EnqueuedTask> {
+    let schedule_key = payload
+        .get("schedule_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let interval_minutes = payload
+        .get("interval_minutes")
+        .and_then(Value::as_i64)
+        .map(admin_runtime::normalize_retry_recent_failures_interval_minutes)
+        .unwrap_or(admin_runtime::DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES);
+    let task = start_inline_task(
+        state,
+        NewTask {
+            task_type: TASK_RETRY_RECENT_FAILURES.to_owned(),
+            payload,
+            source: "scheduler".to_owned(),
+            requested_by: None,
+            parent_task_id: None,
+        },
+    )
+    .await?;
+
+    append_task_event(
+        state,
+        &task.task_id,
+        "task.progress",
+        json!({
+            "task_id": task.task_id,
+            "stage": "skipped",
+            "schedule_key": schedule_key,
+            "skip_reason": "previous_run_active",
+        }),
+    )
+    .await?;
+
+    complete_task(
+        state,
+        &task.task_id,
+        STATUS_SUCCEEDED,
+        Some(json!({
+            "skipped": true,
+            "skip_reason": "previous_run_active",
+            "schedule_key": schedule_key,
+            "interval_minutes": interval_minutes,
+            "daily_brief": retry_kind_empty_summary("daily_brief"),
+            "polish": retry_kind_empty_summary("polish"),
+            "translation": retry_kind_empty_summary("translation"),
+        })),
         None,
     )
     .await?;
@@ -1432,11 +1631,11 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
         FROM job_tasks
         WHERE status = ?
           AND (
-            task_type != ?
+            task_type NOT IN (?, ?)
             OR NOT EXISTS (
               SELECT 1
               FROM job_tasks running
-              WHERE running.task_type = ?
+              WHERE running.task_type = job_tasks.task_type
                 AND running.status = ?
             )
           )
@@ -1446,7 +1645,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     )
     .bind(STATUS_QUEUED)
     .bind(TASK_SYNC_SUBSCRIPTIONS)
-    .bind(TASK_SYNC_SUBSCRIPTIONS)
+    .bind(TASK_RETRY_RECENT_FAILURES)
     .bind(STATUS_RUNNING)
     .fetch_optional(&mut *tx)
     .await
@@ -1663,6 +1862,9 @@ async fn execute_task(
         TASK_BRIEF_DAILY_SLOT => execute_daily_slot_task(state, task_id, payload).await,
         TASK_BRIEF_HISTORY_RECOMPUTE => execute_brief_history_recompute_task(state, task_id).await,
         TASK_BRIEF_REFRESH_CONTENT => execute_brief_refresh_content_task(state, task_id).await,
+        TASK_RETRY_RECENT_FAILURES => {
+            execute_recent_failures_retry_task(state, task_id, payload).await
+        }
         TASK_TRANSLATE_RELEASE => {
             let user_id = payload_local_id(payload, "user_id")?;
             let release_id = payload_string(payload, "release_id")?;
@@ -2481,6 +2683,631 @@ async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> 
     }))
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RetryKindSummary {
+    kind: String,
+    total: i64,
+    processed: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    timed_out: bool,
+    canceled: bool,
+    duration_ms: i64,
+    current_id: Option<String>,
+    last_error: Option<String>,
+}
+
+fn retry_kind_empty_summary(kind: &str) -> Value {
+    json!({
+        "kind": kind,
+        "total": 0,
+        "processed": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "timed_out": false,
+        "canceled": false,
+        "duration_ms": 0,
+        "current_id": null,
+        "last_error": null,
+    })
+}
+
+impl RetryKindSummary {
+    fn new(kind: &str, total: usize) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            total: i64::try_from(total).unwrap_or(i64::MAX),
+            processed: 0,
+            succeeded: 0,
+            failed: 0,
+            skipped: 0,
+            timed_out: false,
+            canceled: false,
+            duration_ms: 0,
+            current_id: None,
+            last_error: None,
+        }
+    }
+}
+
+async fn recent_failures_retry_cancel_requested(
+    state: &AppState,
+    task_id: &str,
+    kind: &str,
+) -> Result<bool> {
+    if !is_task_cancel_requested(state, task_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "canceled",
+            "kind": kind,
+        }),
+    )
+    .await?;
+    Ok(true)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RetryBriefCandidateRow {
+    id: String,
+    user_id: String,
+    date: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RetryTranslationCandidateRow {
+    id: String,
+    scope_user_id: String,
+    kind: String,
+    variant: String,
+    entity_id: String,
+    target_lang: String,
+    source_hash: String,
+    source_blocks_json: String,
+    target_slots_json: String,
+    result_status: Option<String>,
+    error_text: Option<String>,
+}
+
+async fn load_recent_failed_brief_retry_candidates(
+    state: &AppState,
+) -> Result<Vec<RetryBriefCandidateRow>> {
+    sqlx::query_as::<_, RetryBriefCandidateRow>(
+        r#"
+        SELECT id, user_id, date
+        FROM briefs
+        WHERE generation_source = 'content_refresh_failed'
+          AND window_start_utc IS NOT NULL
+          AND window_end_utc IS NOT NULL
+          AND effective_time_zone IS NOT NULL
+          AND effective_local_boundary IS NOT NULL
+          AND datetime(updated_at) >= datetime('now', '-1 day')
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT ?
+        "#,
+    )
+    .bind(RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to load recent failed brief retry candidates")
+}
+
+async fn load_recent_failed_translation_retry_candidates(
+    state: &AppState,
+    kinds: &[&str],
+) -> Result<Vec<RetryTranslationCandidateRow>> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        SELECT
+          id,
+          scope_user_id,
+          kind,
+          variant,
+          entity_id,
+          target_lang,
+          source_hash,
+          source_blocks_json,
+          target_slots_json,
+          result_status,
+          error_text
+        FROM translation_work_items
+        WHERE kind IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for kind in kinds {
+            separated.push_bind(*kind);
+        }
+    }
+    query.push(
+        r#")
+          AND status IN ('completed', 'failed')
+          AND result_status IN ('error', 'missing')
+          AND datetime(updated_at) >= datetime('now', '-1 day')
+          AND (
+            (result_status = 'missing' AND error_text IS NULL)
+            OR (
+              result_status = 'error'
+              AND error_text IS NOT NULL
+              AND (
+                lower(error_text) LIKE '%runtime_lease_expired%'
+                OR lower(error_text) LIKE '%repo scope required; re-login via github oauth%'
+                OR lower(error_text) LIKE '%database is locked%'
+                OR lower(error_text) LIKE '%busy%'
+                OR lower(error_text) LIKE '%timed out%'
+                OR lower(error_text) LIKE '%timeout%'
+                OR lower(error_text) LIKE '%temporarily unavailable%'
+                OR lower(error_text) LIKE '%connection reset%'
+                OR lower(error_text) LIKE '%connection refused%'
+              )
+            )
+          )
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT "#,
+    );
+    query.push_bind(RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND);
+
+    query
+        .build_query_as::<RetryTranslationCandidateRow>()
+        .fetch_all(&state.pool)
+        .await
+        .context("failed to load recent failed translation retry candidates")
+}
+
+fn retry_candidate_is_retryable(row: &RetryTranslationCandidateRow) -> bool {
+    match row.result_status.as_deref() {
+        Some("error") => translations::translation_error_is_retryable(row.error_text.as_deref()),
+        Some("missing") => row.error_text.is_none(),
+        _ => false,
+    }
+}
+
+fn retry_candidate_request_item(
+    row: &RetryTranslationCandidateRow,
+) -> Result<translations::TranslationRequestItemInput> {
+    let source_blocks = serde_json::from_str::<Vec<translations::TranslationSourceBlock>>(
+        row.source_blocks_json.as_str(),
+    )
+    .with_context(|| format!("invalid source_blocks_json for {}", row.id))?;
+    let target_slots = serde_json::from_str::<Vec<String>>(row.target_slots_json.as_str())
+        .with_context(|| format!("invalid target_slots_json for {}", row.id))?;
+    Ok(translations::TranslationRequestItemInput {
+        producer_ref: format!("retry.recent_failures:{}", row.id),
+        kind: row.kind.clone(),
+        variant: row.variant.clone(),
+        entity_id: row.entity_id.clone(),
+        target_lang: row.target_lang.clone(),
+        max_wait_ms: 0,
+        source_blocks,
+        target_slots,
+    })
+}
+
+async fn retry_candidate_source_is_stale(
+    state: &AppState,
+    row: &RetryTranslationCandidateRow,
+) -> Result<bool> {
+    let item = retry_candidate_request_item(row)?;
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("failed to begin translation stale-source check tx")?;
+    let current_hash = translations::current_server_source_hash_for_item(
+        &mut tx,
+        row.scope_user_id.as_str(),
+        &item,
+    )
+    .await
+    .map_err(|err| anyhow!("failed to check current translation source hash: {}", err))?;
+    tx.commit()
+        .await
+        .context("failed to commit translation stale-source check tx")?;
+    Ok(current_hash.is_some_and(|hash| hash != row.source_hash))
+}
+
+fn translation_state_entity_type(kind: &str, variant: &str) -> Option<&'static str> {
+    if kind == "release_detail" || matches!((kind, variant), ("release_summary", "feed_body")) {
+        return Some("release_detail");
+    }
+    match kind {
+        "release_summary" => Some("release"),
+        "release_smart" => Some("release_smart"),
+        "notification" => Some("notification"),
+        _ => None,
+    }
+}
+
+async fn reset_translation_work_item_for_retry(
+    state: &AppState,
+    row: &RetryTranslationCandidateRow,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .context("failed to begin translation retry reset tx")?;
+
+    sqlx::query(
+        r#"
+        UPDATE translation_work_items
+        SET status = 'queued',
+            batch_id = NULL,
+            result_status = NULL,
+            title_zh = NULL,
+            summary_md = NULL,
+            body_md = NULL,
+            error_text = NULL,
+            started_at = NULL,
+            finished_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(row.id.as_str())
+    .execute(&mut *tx)
+    .await
+    .context("failed to reset translation work item for retry")?;
+
+    if let Some(entity_type) =
+        translation_state_entity_type(row.kind.as_str(), row.variant.as_str())
+    {
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'queued',
+                title = NULL,
+                summary = NULL,
+                error_text = NULL,
+                active_work_item_id = ?,
+                updated_at = ?
+            WHERE user_id = ?
+              AND entity_type = ?
+              AND entity_id = ?
+              AND lang = ?
+              AND status IN ('error', 'missing')
+            "#,
+        )
+        .bind(row.id.as_str())
+        .bind(now.as_str())
+        .bind(row.scope_user_id.as_str())
+        .bind(entity_type)
+        .bind(row.entity_id.as_str())
+        .bind(row.target_lang.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("failed to reset translation state for retry")?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit translation retry reset")?;
+    Ok(())
+}
+
+async fn retry_recent_failed_briefs(state: &AppState, task_id: &str) -> Result<RetryKindSummary> {
+    let rows = load_recent_failed_brief_retry_candidates(state).await?;
+    let started = Instant::now();
+    let mut summary = RetryKindSummary::new("daily_brief", rows.len());
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "collect",
+            "kind": summary.kind,
+            "total": summary.total,
+            "order": "updated_at DESC, created_at DESC, id DESC",
+        }),
+    )
+    .await?;
+
+    for (index, row) in rows.iter().enumerate() {
+        if recent_failures_retry_cancel_requested(state, task_id, summary.kind.as_str()).await? {
+            summary.canceled = true;
+            break;
+        }
+        if started.elapsed() >= RETRY_RECENT_FAILURES_KIND_BUDGET {
+            summary.timed_out = true;
+            break;
+        }
+        summary.processed += 1;
+        summary.current_id = Some(row.id.clone());
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "retry",
+                "kind": summary.kind,
+                "index": index + 1,
+                "total": summary.total,
+                "brief_id": row.id,
+                "user_id": row.user_id,
+                "date": row.date,
+            }),
+        )
+        .await?;
+
+        match ai::refresh_existing_brief_snapshot_content(state, row.id.as_str(), "retry_recent")
+            .await
+        {
+            Ok(snapshot) => {
+                summary.succeeded += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "item_succeeded",
+                        "kind": summary.kind,
+                        "brief_id": snapshot.id,
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                summary.failed += 1;
+                summary.last_error = Some(err.to_string());
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "item_failed",
+                        "kind": summary.kind,
+                        "brief_id": row.id,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await?;
+            }
+        }
+    }
+
+    summary.duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    Ok(summary)
+}
+
+async fn retry_recent_failed_translation_kind(
+    state: &AppState,
+    task_id: &str,
+    kind_name: &str,
+    work_kinds: &[&str],
+) -> Result<RetryKindSummary> {
+    let rows = load_recent_failed_translation_retry_candidates(state, work_kinds).await?;
+    let started = Instant::now();
+    let mut summary = RetryKindSummary::new(kind_name, rows.len());
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "collect",
+            "kind": summary.kind,
+            "total": summary.total,
+            "order": "updated_at DESC, created_at DESC, id DESC",
+        }),
+    )
+    .await?;
+
+    for (index, row) in rows.iter().enumerate() {
+        if recent_failures_retry_cancel_requested(state, task_id, summary.kind.as_str()).await? {
+            summary.canceled = true;
+            break;
+        }
+        if started.elapsed() >= RETRY_RECENT_FAILURES_KIND_BUDGET {
+            summary.timed_out = true;
+            break;
+        }
+        summary.current_id = Some(row.id.clone());
+        if !retry_candidate_is_retryable(row) {
+            summary.skipped += 1;
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "item_skipped",
+                    "kind": summary.kind,
+                    "work_item_id": row.id,
+                    "skip_reason": "non_retryable_terminal_state",
+                    "result_status": row.result_status,
+                    "error": row.error_text,
+                }),
+            )
+            .await?;
+            continue;
+        }
+        if retry_candidate_source_is_stale(state, row).await? {
+            summary.skipped += 1;
+            append_task_event(
+                state,
+                task_id,
+                "task.progress",
+                json!({
+                    "task_id": task_id,
+                    "stage": "item_skipped",
+                    "kind": summary.kind,
+                    "work_item_id": row.id,
+                    "skip_reason": "stale_source_hash",
+                    "source_hash": row.source_hash,
+                }),
+            )
+            .await?;
+            continue;
+        }
+        summary.processed += 1;
+        append_task_event(
+            state,
+            task_id,
+            "task.progress",
+            json!({
+                "task_id": task_id,
+                "stage": "retry",
+                "kind": summary.kind,
+                "index": index + 1,
+                "total": summary.total,
+                "work_item_id": row.id,
+                "item_kind": row.kind,
+                "variant": row.variant,
+                "entity_id": row.entity_id,
+            }),
+        )
+        .await?;
+
+        match reset_translation_work_item_for_retry(state, row).await {
+            Ok(()) => {
+                summary.succeeded += 1;
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "item_succeeded",
+                        "kind": summary.kind,
+                        "work_item_id": row.id,
+                    }),
+                )
+                .await?;
+            }
+            Err(err) => {
+                summary.failed += 1;
+                summary.last_error = Some(err.to_string());
+                append_task_event(
+                    state,
+                    task_id,
+                    "task.progress",
+                    json!({
+                        "task_id": task_id,
+                        "stage": "item_failed",
+                        "kind": summary.kind,
+                        "work_item_id": row.id,
+                        "error": err.to_string(),
+                    }),
+                )
+                .await?;
+            }
+        }
+    }
+
+    summary.duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+    Ok(summary)
+}
+
+async fn execute_recent_failures_retry_task(
+    state: &AppState,
+    task_id: &str,
+    payload: &Value,
+) -> Result<Value> {
+    let schedule_key = payload
+        .get("schedule_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let interval_minutes = payload
+        .get("interval_minutes")
+        .and_then(Value::as_i64)
+        .unwrap_or(admin_runtime::DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES);
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "start",
+            "schedule_key": schedule_key,
+            "interval_minutes": interval_minutes,
+            "order": "daily_brief -> polish -> translation",
+        }),
+    )
+    .await?;
+
+    let daily_brief = retry_recent_failed_briefs(state, task_id).await?;
+    let canceled = daily_brief.canceled
+        || is_task_cancel_requested(state, task_id)
+            .await
+            .unwrap_or(false);
+    let polish = if canceled {
+        RetryKindSummary::new("polish", 0)
+    } else {
+        retry_recent_failed_translation_kind(state, task_id, "polish", &["release_smart"]).await?
+    };
+    let canceled = canceled
+        || polish.canceled
+        || is_task_cancel_requested(state, task_id)
+            .await
+            .unwrap_or(false);
+    let translation = if canceled {
+        RetryKindSummary::new("translation", 0)
+    } else {
+        retry_recent_failed_translation_kind(
+            state,
+            task_id,
+            "translation",
+            &["release_summary", "release_detail", "notification"],
+        )
+        .await?
+    };
+    let canceled = canceled
+        || translation.canceled
+        || is_task_cancel_requested(state, task_id)
+            .await
+            .unwrap_or(false);
+
+    append_task_event(
+        state,
+        task_id,
+        "task.progress",
+        json!({
+            "task_id": task_id,
+            "stage": "summary",
+            "daily_brief": daily_brief,
+            "polish": polish,
+            "translation": translation,
+            "canceled": canceled,
+        }),
+    )
+    .await?;
+
+    Ok(json!({
+        "skipped": false,
+        "trigger": payload.get("trigger").and_then(Value::as_str).unwrap_or("schedule"),
+        "schedule_key": schedule_key,
+        "interval_minutes": interval_minutes,
+        "lookback_hours": 24,
+        "max_items_per_kind": RETRY_RECENT_FAILURES_MAX_ITEMS_PER_KIND,
+        "kind_timeout_seconds": RETRY_RECENT_FAILURES_KIND_BUDGET.as_secs(),
+        "order": "daily_brief -> polish -> translation",
+        "canceled": canceled,
+        "daily_brief": daily_brief,
+        "polish": polish,
+        "translation": translation,
+    }))
+}
+
 async fn finalize_task(
     state: &AppState,
     task_id: &str,
@@ -2796,19 +3623,22 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT,
-        TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
-        TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL, TASK_SYNC_RELEASES,
-        TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor, claim_next_queued_task,
+        SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING,
+        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
+        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
+        TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
+        claim_next_queued_task, current_recent_failures_retry_schedule_key,
         current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        execute_brief_history_recompute_task, execute_brief_refresh_content_task,
-        execute_daily_slot_task, execute_sync_all_task_with, is_scheduled_task_type,
-        load_due_daily_slot_users, load_translation_stream_cursor, load_translation_stream_rows,
+        enqueue_recent_failures_retry_if_due, execute_brief_history_recompute_task,
+        execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
+        is_scheduled_task_type, load_due_daily_slot_users,
+        load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
+        load_translation_stream_cursor, load_translation_stream_rows,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
-        recover_runtime_state, recover_runtime_state_on_startup,
+        recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
     };
-    use chrono::{TimeZone, Utc};
+    use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
         Row, SqlitePool,
@@ -2841,6 +3671,23 @@ mod tests {
         assert_eq!(
             current_subscription_schedule_key(on_the_half_hour, 10),
             "interval:10:1772808000"
+        );
+    }
+
+    #[test]
+    fn current_recent_failures_retry_schedule_key_uses_configured_minute_buckets() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 14, 15, 59)
+            .single()
+            .expect("valid datetime");
+
+        assert_eq!(
+            current_recent_failures_retry_schedule_key(now, 10),
+            "interval:10:1772806200"
+        );
+        assert_eq!(
+            current_recent_failures_retry_schedule_key(now, 0),
+            "interval:1:1772806500"
         );
     }
 
@@ -3158,8 +4005,89 @@ mod tests {
     fn scheduled_task_types_include_subscription_sync() {
         assert!(is_scheduled_task_type(TASK_BRIEF_DAILY_SLOT));
         assert!(is_scheduled_task_type(TASK_SYNC_SUBSCRIPTIONS));
+        assert!(is_scheduled_task_type(TASK_RETRY_RECENT_FAILURES));
         assert!(!is_scheduled_task_type("translate.release"));
         assert!(!is_scheduled_task_type(TASK_SUMMARIZE_RELEASE_SMART_BATCH));
+    }
+
+    #[tokio::test]
+    async fn enqueue_recent_failures_retry_skips_when_previous_run_is_active() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 6, 14, 15, 59)
+            .single()
+            .expect("valid datetime");
+
+        seed_task(
+            &pool,
+            "retry-running",
+            TASK_RETRY_RECENT_FAILURES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+
+        let task_id = enqueue_recent_failures_retry_if_due(state.as_ref(), now)
+            .await
+            .expect("enqueue retry task")
+            .expect("skipped task id");
+
+        let row = sqlx::query(
+            r#"
+            SELECT status, payload_json, result_json
+            FROM job_tasks
+            WHERE id = ?
+            "#,
+        )
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load skipped retry task");
+        assert_eq!(row.get::<String, _>("status"), super::STATUS_SUCCEEDED);
+
+        let payload: Value =
+            serde_json::from_str(&row.get::<String, _>("payload_json")).expect("parse payload");
+        assert_eq!(payload["interval_minutes"], json!(10));
+        assert_eq!(payload["max_items_per_kind"], json!(100));
+        assert_eq!(payload["kind_timeout_seconds"], json!(600));
+        assert_eq!(
+            payload["order"],
+            json!("updated_at DESC, created_at DESC, id DESC")
+        );
+
+        let result: Value = serde_json::from_str(
+            row.get::<Option<String>, _>("result_json")
+                .as_deref()
+                .expect("result json"),
+        )
+        .expect("parse result");
+        assert_eq!(result["skipped"], json!(true));
+        assert_eq!(result["skip_reason"], json!("previous_run_active"));
+        assert_eq!(result["interval_minutes"], json!(10));
+        assert_eq!(result["daily_brief"]["kind"], json!("daily_brief"));
+        assert_eq!(result["polish"]["kind"], json!("polish"));
+        assert_eq!(result["translation"]["kind"], json!("translation"));
+
+        let schedule_key = current_recent_failures_retry_schedule_key(now, 10);
+        let dispatch = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT last_dispatch_key, last_task_id
+            FROM scheduled_task_dispatch_state
+            WHERE schedule_name = ?
+            "#,
+        )
+        .bind(super::RETRY_RECENT_FAILURES_SCHEDULE_NAME)
+        .fetch_one(&pool)
+        .await
+        .expect("load retry dispatch state");
+        assert_eq!(dispatch.0, schedule_key);
+        assert_eq!(dispatch.1, task_id);
+
+        let duplicate = enqueue_recent_failures_retry_if_due(state.as_ref(), now)
+            .await
+            .expect("dedupe retry task");
+        assert!(duplicate.is_none());
     }
 
     #[test]
@@ -3275,6 +4203,44 @@ mod tests {
             &pool,
             "sync-queued",
             TASK_SYNC_SUBSCRIPTIONS,
+            STATUS_QUEUED,
+            1,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "brief-queued",
+            TASK_BRIEF_DAILY_SLOT,
+            STATUS_QUEUED,
+            2,
+        )
+        .await;
+
+        let claimed = claim_next_queued_task(state.as_ref())
+            .await
+            .expect("claim queued task")
+            .expect("task claimed");
+        assert_eq!(claimed.id, "brief-queued");
+        assert_eq!(claimed.task_type, TASK_BRIEF_DAILY_SLOT);
+    }
+
+    #[tokio::test]
+    async fn claim_next_queued_task_defers_recent_failures_retry_when_one_is_running() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        seed_task(
+            &pool,
+            "retry-running",
+            TASK_RETRY_RECENT_FAILURES,
+            STATUS_RUNNING,
+            0,
+        )
+        .await;
+        seed_task(
+            &pool,
+            "retry-queued",
+            TASK_RETRY_RECENT_FAILURES,
             STATUS_QUEUED,
             1,
         )
@@ -3868,6 +4834,397 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed task");
+    }
+
+    #[tokio::test]
+    async fn recent_failed_brief_retry_candidates_are_newest_first_and_limited() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_001, "brief-retry-user").await;
+        let now = Utc::now();
+
+        for index in 0..105 {
+            let updated_at = (now - Duration::seconds(index)).to_rfc3339();
+            let created_at = (now - Duration::seconds(index + 1)).to_rfc3339();
+            let window_start = (now - Duration::days(index + 1)).to_rfc3339();
+            let window_end = (now - Duration::days(index)).to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO briefs (
+                  id, user_id, date, window_start_utc, window_end_utc,
+                  effective_time_zone, effective_local_boundary, generation_source,
+                  content_markdown, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("brief-{index:03}"))
+            .bind("90001")
+            .bind(format!("2026-03-{day:02}", day = 1 + (index % 28)))
+            .bind(window_start.as_str())
+            .bind(window_end.as_str())
+            .bind("Asia/Shanghai")
+            .bind("08:00")
+            .bind("content_refresh_failed")
+            .bind("failed fallback")
+            .bind(created_at.as_str())
+            .bind(updated_at.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed failed brief");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary, generation_source,
+              content_markdown, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-not-failed")
+        .bind("90001")
+        .bind("2026-04-01")
+        .bind("2026-04-01T00:00:00Z")
+        .bind("2026-04-02T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("history_recompute")
+        .bind("ready")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed non failed brief");
+
+        let rows = load_recent_failed_brief_retry_candidates(state.as_ref())
+            .await
+            .expect("load failed brief candidates");
+
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].id, "brief-000");
+        assert_eq!(rows[99].id, "brief-099");
+    }
+
+    #[tokio::test]
+    async fn recent_failed_translation_retry_candidates_are_retryable_newest_first_and_limited() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_002, "translation-retry-user").await;
+        let now = Utc::now();
+
+        for index in 0..105 {
+            let updated_at = (now - Duration::seconds(index)).to_rfc3339();
+            let created_at = (now - Duration::seconds(index + 1)).to_rfc3339();
+            let result_status = if index % 2 == 0 { "error" } else { "missing" };
+            sqlx::query(
+                r#"
+                INSERT INTO translation_work_items (
+                  id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+                  protocol_version, model_profile, source_hash, source_blocks_json,
+                  target_slots_json, token_estimate, deadline_at, status, result_status,
+                  error_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("work-{index:03}"))
+            .bind(format!("dedupe-{index:03}"))
+            .bind("90002")
+            .bind("release_smart")
+            .bind("default")
+            .bind(format!("release-{index:03}"))
+            .bind("zh-CN")
+            .bind("v1")
+            .bind("default")
+            .bind(format!("hash-{index:03}"))
+            .bind("[]")
+            .bind("[]")
+            .bind(128_i64)
+            .bind((now + Duration::hours(1)).to_rfc3339())
+            .bind("failed")
+            .bind(result_status)
+            .bind(if result_status == "error" {
+                Some("timed out")
+            } else {
+                None
+            })
+            .bind(created_at.as_str())
+            .bind(updated_at.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed failed translation work item");
+        }
+
+        for index in 0..105 {
+            let updated_at = (now + Duration::seconds(index + 1)).to_rfc3339();
+            let created_at = (now + Duration::seconds(index)).to_rfc3339();
+            sqlx::query(
+                r#"
+                INSERT INTO translation_work_items (
+                  id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+                  protocol_version, model_profile, source_hash, source_blocks_json,
+                  target_slots_json, token_estimate, deadline_at, status, result_status,
+                  error_text, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(format!("work-nonretryable-{index:03}"))
+            .bind(format!("dedupe-nonretryable-{index:03}"))
+            .bind("90002")
+            .bind("release_smart")
+            .bind("default")
+            .bind(format!("release-nonretryable-{index:03}"))
+            .bind("zh-CN")
+            .bind("v1")
+            .bind("default")
+            .bind(format!("hash-nonretryable-{index:03}"))
+            .bind("[]")
+            .bind("[]")
+            .bind(128_i64)
+            .bind((now + Duration::hours(1)).to_rfc3339())
+            .bind("failed")
+            .bind("missing")
+            .bind(SMART_NO_VALUABLE_VERSION_INFO)
+            .bind(created_at.as_str())
+            .bind(updated_at.as_str())
+            .execute(&pool)
+            .await
+            .expect("seed nonretryable translation work item");
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-disabled")
+        .bind("dedupe-disabled")
+        .bind("90002")
+        .bind("release_smart")
+        .bind("default")
+        .bind("release-disabled")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("hash-disabled")
+        .bind("[]")
+        .bind("[]")
+        .bind(128_i64)
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind("completed")
+        .bind("disabled")
+        .bind(Option::<&str>::None)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed disabled translation work item");
+
+        let rows =
+            load_recent_failed_translation_retry_candidates(state.as_ref(), &["release_smart"])
+                .await
+                .expect("load failed translation candidates");
+
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows[0].id, "work-000");
+        assert_eq!(rows[99].id, "work-099");
+        assert!(retry_candidate_is_retryable(&rows[0]));
+        assert!(retry_candidate_is_retryable(&rows[99]));
+    }
+
+    #[tokio::test]
+    async fn recent_failures_retry_loop_stops_when_cancel_requested() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_003, "retry-cancel-user").await;
+        seed_task(
+            &pool,
+            "task-retry-canceled",
+            TASK_RETRY_RECENT_FAILURES,
+            STATUS_RUNNING,
+            1,
+        )
+        .await;
+        sqlx::query("UPDATE job_tasks SET cancel_requested = 1 WHERE id = ?")
+            .bind("task-retry-canceled")
+            .execute(&pool)
+            .await
+            .expect("request cancellation");
+
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-cancel")
+        .bind("dedupe-cancel")
+        .bind("90003")
+        .bind("release_smart")
+        .bind("default")
+        .bind("release-cancel")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("hash-cancel")
+        .bind("[]")
+        .bind("[]")
+        .bind(128_i64)
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind("failed")
+        .bind("error")
+        .bind("timed out")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed canceled retry candidate");
+
+        let summary = super::retry_recent_failed_translation_kind(
+            state.as_ref(),
+            "task-retry-canceled",
+            "polish",
+            &["release_smart"],
+        )
+        .await
+        .expect("retry loop handles cancellation");
+
+        assert!(summary.canceled);
+        assert_eq!(summary.processed, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind("work-cancel")
+                .fetch_one(&pool)
+                .await
+                .expect("load work status");
+        assert_eq!(status, "failed");
+    }
+
+    #[tokio::test]
+    async fn recent_failures_retry_skips_stale_translation_source_hash() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_004, "retry-stale-user").await;
+        seed_task(
+            &pool,
+            "task-retry-stale",
+            TASK_RETRY_RECENT_FAILURES,
+            STATUS_RUNNING,
+            2,
+        )
+        .await;
+
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name,
+              description, html_url, stargazed_at, is_private, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("star-retry-stale")
+        .bind("90004")
+        .bind(42_i64)
+        .bind("octo/retry-stale")
+        .bind("octo")
+        .bind("retry-stale")
+        .bind("stale retry test")
+        .bind("https://github.com/octo/retry-stale")
+        .bind(now.to_rfc3339())
+        .bind(0_i64)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed visible repo");
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id, repo_id, release_id, node_id, tag_name, name, body, html_url,
+              published_at, created_at, is_prerelease, is_draft, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("repo-release-retry-stale")
+        .bind(42_i64)
+        .bind(900_040_i64)
+        .bind("node-retry-stale")
+        .bind("v2.0.0")
+        .bind("Fresh release title")
+        .bind("Fresh release body")
+        .bind("https://github.com/octo/retry-stale/releases/tag/v2.0.0")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed current release");
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-stale")
+        .bind("dedupe-stale")
+        .bind("90004")
+        .bind("release_smart")
+        .bind("feed_card")
+        .bind("900040")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("stale-source-hash")
+        .bind(
+            r#"[{"slot":"title","text":"Old release title"},{"slot":"body_markdown","text":"Old body"}]"#,
+        )
+        .bind(r#"["title_zh","body_md"]"#)
+        .bind(128_i64)
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind("failed")
+        .bind("error")
+        .bind("timed out")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed stale retry candidate");
+
+        let summary = super::retry_recent_failed_translation_kind(
+            state.as_ref(),
+            "task-retry-stale",
+            "polish",
+            &["release_smart"],
+        )
+        .await
+        .expect("retry loop handles stale source");
+
+        assert_eq!(summary.processed, 0);
+        assert_eq!(summary.skipped, 1);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind("work-stale")
+                .fetch_one(&pool)
+                .await
+                .expect("load work status");
+        assert_eq!(status, "failed");
     }
 
     #[tokio::test]

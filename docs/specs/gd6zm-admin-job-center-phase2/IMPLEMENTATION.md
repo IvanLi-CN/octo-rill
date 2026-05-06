@@ -19,3 +19,4 @@
 - [x] M5: 任务类型专属详情页与 Storybook 分类型示例补齐。
 - [x] M6: 翻译任务中心补齐 `clean completed / completed with issues / failed`、`result_summary` 与 `business_outcome` 可视化。
 - [x] M7: 任务详情诊断兼容 legacy `result_json.items[]`，即使缺少聚合 summary 字段也能稳定给出 `business_outcome` 与 item 列表。
+- [x] M8: 定时任务页共享设置入口补齐失败数据重试间隔，并为 `retry.recent_failures` 增加专属详情与 Storybook 证据。

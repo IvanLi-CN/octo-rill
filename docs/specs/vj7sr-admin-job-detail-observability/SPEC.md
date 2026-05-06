@@ -17,6 +17,7 @@
 - 将“任务运行状态”与“业务结果状态”分开展示，减少误判。
 - 为任务详情接口增加 `event_meta` 与 `diagnostics`，支持结构化展示。
 - 强化 `translate.release.batch` 与 `brief.daily_slot` 的事件与结果可观测性。
+- 继续为新增的 `retry.recent_failures` 任务类型提供专属摘要、跳过状态与错误诊断展示。
 - 任务详情抽屉升级为路由出口，支持在同一抽屉内切换“任务详情”与“LLM 调用详情”。
 - 保持旧接口兼容：新增字段可选，前端具备回退逻辑。
 
@@ -36,6 +37,7 @@
 - `brief.daily_slot` 事件新增 `stage=user_succeeded` 与 `stage=summary`。
 - 前端任务详情面板改造：结构化业务结果、分项明细、截断提示、业务结果警示。
 - 翻译 worker / batch 详情对齐分类后的 `error_code`、`error_summary`、`error_detail` 展示，避免管理员只看到裸 `translation failed`。
+- `retry.recent_failures` 详情页展示三类重试摘要、调度键、间隔与最后错误，跳过记录需明确显示 `previous_run_active`。
 - 任务详情抽屉支持路由态：`/admin/jobs/tasks/:taskId` 与 `/admin/jobs/tasks/:taskId/llm/:callId`。
 - Storybook 与自动化测试补齐。
 
