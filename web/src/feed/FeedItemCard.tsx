@@ -94,6 +94,10 @@ const REACTION_ITEMS: Array<{
 	},
 ];
 
+const RELEASE_TOOL_HEIGHT_CLASS = "h-9";
+const RELEASE_TOOL_BUTTON_CLASS = "h-9";
+const RELEASE_TOOL_ICON_BUTTON_CLASS = "size-8";
+
 function reactionAriaLabel(label: string, count: number) {
 	return count > 0 ? `${label} ${count}` : label;
 }
@@ -252,11 +256,26 @@ function FeedCardLaneTabs(props: {
 	activeLane: FeedLane;
 	isTranslating: boolean;
 	isSmartGenerating: boolean;
+	size?: "default" | "compact";
+	className?: string;
 }) {
-	const { activeLane, isTranslating, isSmartGenerating } = props;
+	const {
+		activeLane,
+		isTranslating,
+		isSmartGenerating,
+		size = "default",
+		className,
+	} = props;
+	const compact = size === "compact";
 
 	return (
-		<TabsList className="h-7 shrink-0 gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm sm:h-8">
+		<TabsList
+			className={cn(
+				compact ? "h-8" : RELEASE_TOOL_HEIGHT_CLASS,
+				"shrink-0 gap-0.5 rounded-full border border-border/45 bg-muted/45 p-0.5 shadow-sm",
+				className,
+			)}
+		>
 			{FEED_LANE_OPTIONS.map((option) => {
 				const Icon = option.icon;
 				const active = option.lane === activeLane;
@@ -278,14 +297,15 @@ function FeedCardLaneTabs(props: {
 								data-active={active ? "true" : "false"}
 								data-feed-lane-loading={isLoading ? "true" : "false"}
 								className={cn(
-									"h-7 w-7 flex-none rounded-full border px-0 shadow-none transition-all",
+									compact ? "size-7" : RELEASE_TOOL_ICON_BUTTON_CLASS,
+									"flex-none rounded-full border px-0 shadow-none transition-all",
 									active
 										? "border-foreground bg-foreground text-background shadow-sm hover:bg-foreground hover:text-background"
 										: "border-transparent text-foreground/30 hover:text-foreground/60",
 									loadingClass,
 								)}
 							>
-								<Icon className="size-3.25" />
+								<Icon className={compact ? "size-3" : "size-3.25"} />
 								<span className="sr-only">{option.label}</span>
 							</TabsTrigger>
 						</TooltipTrigger>
@@ -1011,7 +1031,7 @@ function AnnouncementContentCard(props: {
 								<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
 									{title}
 								</CardTitle>
-								<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
+								<p className="mt-0.5 font-mono text-[11px] text-muted-foreground sm:text-xs">
 									{formatIsoShortLocal(item.ts)}
 									{isFresh ? <FreshContentCue className="ml-2" /> : null}
 									{subtitle ? ` · ${subtitle}` : ""}
@@ -1070,7 +1090,7 @@ function AnnouncementContentCard(props: {
 	);
 }
 
-function ReleaseFeedCard(props: {
+export function ReleaseFeedCard(props: {
 	item: ReleaseFeedItem;
 	activeLane: FeedLane;
 	isTranslating: boolean;
@@ -1078,6 +1098,9 @@ function ReleaseFeedCard(props: {
 	isReactionBusy: boolean;
 	reactionError: string | null;
 	isFresh?: boolean;
+	showReactions?: boolean;
+	surface?: "card" | "article";
+	titleHref?: string | null;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
@@ -1091,6 +1114,9 @@ function ReleaseFeedCard(props: {
 		isReactionBusy,
 		reactionError,
 		isFresh = false,
+		showReactions = true,
+		surface = "card",
+		titleHref = null,
 		onSelectLane,
 		onTranslateNow,
 		onSmartNow,
@@ -1101,8 +1127,9 @@ function ReleaseFeedCard(props: {
 		item.subject_type ? item.subject_type : null,
 	].filter(Boolean);
 	const subtitle = subtitleBits.join(" · ");
-	const reactions = item.reactions;
+	const reactions = showReactions ? item.reactions : null;
 	const isVersionOnly = item.smart?.status === "insufficient";
+	const isArticleSurface = surface === "article";
 	const displayTitle = displayTitleForLane(item, activeLane);
 	const [reactionBubbleOpen, setReactionBubbleOpen] = useState(false);
 
@@ -1115,7 +1142,9 @@ function ReleaseFeedCard(props: {
 	const header = (
 		<CardHeader
 			className={cn(
-				"px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6",
+				isArticleSurface
+					? "px-0 pb-4 pt-0 sm:px-0 sm:pb-5 sm:pt-0"
+					: "px-4 pb-3 pt-4 sm:px-6 sm:pb-4 sm:pt-6",
 				isVersionOnly && "pb-4 sm:pb-5",
 			)}
 		>
@@ -1141,7 +1170,13 @@ function ReleaseFeedCard(props: {
 							</div>
 
 							<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
-								{displayTitle}
+								{titleHref ? (
+									<a href={titleHref} className="hover:underline">
+										{displayTitle}
+									</a>
+								) : (
+									displayTitle
+								)}
 							</CardTitle>
 							<p className="mt-1 font-mono text-[11px] text-muted-foreground sm:text-xs">
 								{formatIsoShortLocal(item.ts)}
@@ -1150,18 +1185,28 @@ function ReleaseFeedCard(props: {
 							</p>
 						</div>
 
-						<a
-							href={item.html_url ?? "#"}
-							target="_blank"
-							rel="noreferrer"
-							aria-label="GitHub"
-							title="GitHub"
-							data-feed-mobile-github-link="true"
-							className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 sm:hidden"
-						>
-							<ArrowUpRight className="size-4" />
-							<span className="sr-only">GitHub</span>
-						</a>
+						<div className="flex shrink-0 items-center gap-1 sm:hidden">
+							{isVersionOnly || !isArticleSurface ? null : (
+								<FeedCardLaneTabs
+									activeLane={activeLane}
+									isTranslating={isTranslating}
+									isSmartGenerating={isSmartGenerating}
+									size="compact"
+								/>
+							)}
+							<a
+								href={item.html_url ?? "#"}
+								target="_blank"
+								rel="noreferrer"
+								aria-label="GitHub"
+								title="GitHub"
+								data-feed-mobile-github-link="true"
+								className="text-muted-foreground hover:text-foreground focus-visible:ring-ring inline-flex size-8 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
+							>
+								<ArrowUpRight className="size-4" />
+								<span className="sr-only">GitHub</span>
+							</a>
+						</div>
 					</div>
 				</div>
 
@@ -1171,6 +1216,7 @@ function ReleaseFeedCard(props: {
 							activeLane={activeLane}
 							isTranslating={isTranslating}
 							isSmartGenerating={isSmartGenerating}
+							size={isArticleSurface ? "compact" : "default"}
 						/>
 					)}
 
@@ -1178,7 +1224,10 @@ function ReleaseFeedCard(props: {
 						asChild
 						variant="outline"
 						size="sm"
-						className="h-8 shrink-0 px-3 font-mono text-xs"
+						className={cn(
+							RELEASE_TOOL_BUTTON_CLASS,
+							"shrink-0 rounded-full px-3.5 font-mono text-xs",
+						)}
 					>
 						<a href={item.html_url ?? "#"} target="_blank" rel="noreferrer">
 							<ArrowUpRight className="size-4" />
@@ -1284,10 +1333,75 @@ function ReleaseFeedCard(props: {
 		</CardFooter>
 	) : null;
 
+	if (isArticleSurface && !isVersionOnly) {
+		return (
+			<Card className="group border-0 bg-transparent shadow-none">
+				<Tabs
+					value={activeLane}
+					onValueChange={(value) => onSelectLane(value as FeedLane)}
+					className="gap-0"
+				>
+					<CardHeader className="px-0 pb-2 pt-0 sm:px-0 sm:pb-3 sm:pt-0">
+						<div
+							className="flex items-center justify-between gap-3"
+							data-public-release-action-row="true"
+						>
+							<div className="min-w-0 flex-1">
+								<RepoIdentity
+									repoFullName={item.repo_full_name}
+									repoVisual={item.repo_visual}
+									className="min-h-8 w-full min-w-0"
+									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+									visualClassName="size-8"
+								>
+									<span className="block truncate font-mono text-[11px] text-muted-foreground sm:text-xs">
+										{formatIsoShortLocal(item.ts)}
+										{isFresh ? <FreshContentCue className="ml-2" /> : null}
+										{subtitle ? ` · ${subtitle}` : ""}
+									</span>
+								</RepoIdentity>
+							</div>
+							<FeedCardLaneTabs
+								activeLane={activeLane}
+								isTranslating={isTranslating}
+								isSmartGenerating={isSmartGenerating}
+								size="compact"
+								className="shrink-0 self-center"
+							/>
+						</div>
+					</CardHeader>
+
+					<CardContent className="px-0 pb-0 pt-0 sm:px-0 sm:pb-0">
+						<h1 className="mb-4 text-balance text-[1.35rem] font-semibold leading-tight tracking-tight sm:text-lg">
+							{displayTitle}
+						</h1>
+						<TabsContent value="original" className="mt-0">
+							<OriginalLane item={item} />
+						</TabsContent>
+						<TabsContent value="translated" className="mt-0">
+							<TranslatedLane item={item} onTranslateNow={onTranslateNow} />
+						</TabsContent>
+						<TabsContent value="smart" className="mt-0">
+							<SmartLane
+								item={item}
+								onSmartNow={onSmartNow}
+								isSmartGenerating={isSmartGenerating}
+							/>
+						</TabsContent>
+					</CardContent>
+				</Tabs>
+
+				{reactionsFooter}
+			</Card>
+		);
+	}
+
 	return (
 		<Card
 			className={cn(
-				"group bg-card/80 shadow-sm transition-shadow hover:shadow-md",
+				isArticleSurface
+					? "group border-0 bg-transparent shadow-none"
+					: "group bg-card/80 shadow-sm transition-shadow hover:shadow-md",
 				isVersionOnly && "border-dashed",
 			)}
 		>
@@ -1301,7 +1415,13 @@ function ReleaseFeedCard(props: {
 				>
 					{header}
 
-					<CardContent className="px-4 pb-4 pt-0 sm:px-6 sm:pb-6">
+					<CardContent
+						className={cn(
+							isArticleSurface
+								? "px-0 pb-0 pt-0 sm:px-0 sm:pb-0"
+								: "px-4 pb-4 pt-0 sm:px-6 sm:pb-6",
+						)}
+					>
 						<TabsContent value="original" className="mt-0">
 							<OriginalLane item={item} />
 						</TabsContent>

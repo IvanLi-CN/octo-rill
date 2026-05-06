@@ -584,6 +584,15 @@ struct GitHubReleaseReactions {
     eyes: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubPublicRepo {
+    id: i64,
+    full_name: String,
+    name: String,
+    owner: RepoOwner,
+    private: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DiscussionAnnouncementRepo {
     repo_id: i64,
@@ -3917,6 +3926,36 @@ async fn aggregate_release_visible_repos(
         }
     }
 
+    if let Err(err) = refresh_public_release_usage_repo_metadata(context.state.as_ref()).await {
+        tracing::warn!(
+            ?err,
+            "sync.subscriptions: refresh public repo release metadata failed"
+        );
+    }
+
+    let public_repos = sqlx::query_as::<_, ReleaseVisibleRepoAggregationRow>(
+        r#"
+        SELECT repo_id, full_name, 0 AS is_private
+        FROM public_repo_release_usage
+        WHERE repo_id IS NOT NULL
+          AND last_sync_status != 'inaccessible'
+        ORDER BY last_requested_at DESC, full_name ASC
+        "#,
+    )
+    .fetch_all(&context.state.pool)
+    .await
+    .context("failed to query public release usage repos for aggregation")?;
+    for repo in public_repos {
+        grouped
+            .entry(repo.repo_id)
+            .or_insert_with(|| AggregatedRepo {
+                repo_id: repo.repo_id,
+                full_name: repo.full_name,
+                is_private: false,
+                related_users: Vec::new(),
+            });
+    }
+
     let mut repos = grouped.into_values().collect::<Vec<_>>();
     sort_aggregated_repos(&mut repos);
     Ok(repos)
@@ -4719,6 +4758,7 @@ async fn execute_repo_release_work_item(
     state: &AppState,
     work_item: &RepoReleaseWorkItemRow,
 ) -> Result<(usize, usize)> {
+    let public_usage_repo = public_release_usage_repo_exists(state, work_item.repo_id).await?;
     let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
         r#"
         SELECT DISTINCT u.id AS user_id, u.last_active_at
@@ -4742,7 +4782,7 @@ async fn execute_repo_release_work_item(
         )
     })?;
 
-    if candidates.is_empty() {
+    if candidates.is_empty() && !public_usage_repo {
         return Err(anyhow!(
             "no active candidate users remain for {}",
             work_item.repo_full_name
@@ -4750,7 +4790,8 @@ async fn execute_repo_release_work_item(
     }
 
     let mut candidate_failures = 0usize;
-    for candidate in candidates {
+    let mut authenticated_release_count = None;
+    'candidate_users: for candidate in candidates {
         for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
             match fetch_repo_releases_for_user(
                 state,
@@ -4765,11 +4806,19 @@ async fn execute_repo_release_work_item(
                         upsert_repo_releases(state, work_item.repo_id, &releases).await?;
                     record_repo_release_sync_success(state, work_item.repo_id, http_state, false)
                         .await?;
+                    if public_usage_repo {
+                        authenticated_release_count = Some(release_count);
+                        break 'candidate_users;
+                    }
                     return Ok((release_count, candidate_failures));
                 }
                 Ok(RepoReleaseFetchOutcome::NotModified(http_state)) => {
                     record_repo_release_sync_success(state, work_item.repo_id, http_state, true)
                         .await?;
+                    if public_usage_repo {
+                        authenticated_release_count = Some(0);
+                        break 'candidate_users;
+                    }
                     return Ok((0, candidate_failures));
                 }
                 Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
@@ -4784,10 +4833,118 @@ async fn execute_repo_release_work_item(
         }
     }
 
+    if public_usage_repo {
+        match fetch_repo_releases_public(
+            state,
+            work_item.repo_id,
+            work_item.repo_full_name.as_str(),
+        )
+        .await
+        {
+            Ok(RepoReleaseFetchOutcome::Updated(releases, http_state)) => {
+                let release_count =
+                    upsert_repo_releases(state, work_item.repo_id, &releases).await?;
+                record_repo_release_sync_success(state, work_item.repo_id, http_state, false)
+                    .await?;
+                mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+                let release_count = release_count.max(authenticated_release_count.unwrap_or(0));
+                return Ok((release_count, candidate_failures));
+            }
+            Ok(RepoReleaseFetchOutcome::NotModified(http_state)) => {
+                record_repo_release_sync_success(state, work_item.repo_id, http_state, true)
+                    .await?;
+                mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
+                return Ok((authenticated_release_count.unwrap_or(0), candidate_failures));
+            }
+            Err(err) => {
+                if authenticated_release_count.is_none()
+                    && let Err(record_err) =
+                        record_repo_release_sync_failure(state, work_item.repo_id, &err).await
+                {
+                    tracing::warn!(
+                        ?record_err,
+                        repo_id = work_item.repo_id,
+                        repo = work_item.repo_full_name.as_str(),
+                        "sync releases: record public repo release failure failed"
+                    );
+                }
+                mark_public_release_usage_sync_failure(state, work_item.repo_id, &err).await?;
+                if let Some(release_count) = authenticated_release_count {
+                    return Ok((release_count, candidate_failures));
+                }
+            }
+        }
+    }
+
     Err(anyhow!(
         "all candidate users failed to sync {}",
         work_item.repo_full_name
     ))
+}
+
+async fn public_release_usage_repo_exists(state: &AppState, repo_id: i64) -> Result<bool> {
+    let count = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM public_repo_release_usage
+        WHERE repo_id = ?
+          AND last_sync_status != 'inaccessible'
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .context("failed to query public release usage repo")?;
+    Ok(count > 0)
+}
+
+async fn mark_public_release_usage_sync_success(state: &AppState, repo_id: i64) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE public_repo_release_usage
+        SET last_sync_status = 'ready',
+            last_sync_error = NULL,
+            updated_at = ?
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(now.as_str())
+    .bind(repo_id)
+    .execute(&state.pool)
+    .await
+    .context("failed to mark public release usage sync success")?;
+    Ok(())
+}
+
+async fn mark_public_release_usage_sync_failure(
+    state: &AppState,
+    repo_id: i64,
+    err: &SyncRequestError,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let status = if err.reason_code == "repo_inaccessible" {
+        "inaccessible"
+    } else {
+        "failed"
+    };
+    sqlx::query(
+        r#"
+        UPDATE public_repo_release_usage
+        SET last_sync_status = ?,
+            last_sync_error = ?,
+            updated_at = ?
+        WHERE repo_id = ?
+        "#,
+    )
+    .bind(status)
+    .bind(format!("{}: {}", err.reason_code, err.message))
+    .bind(now.as_str())
+    .bind(repo_id)
+    .execute(&state.pool)
+    .await
+    .context("failed to mark public release usage sync failure")?;
+    Ok(())
 }
 
 async fn load_repo_release_sync_state(
@@ -5480,6 +5637,143 @@ async fn fetch_github_rest_page<T: DeserializeOwned>(
         fetch_json_response::<T>(response, operation).await
     })
     .await
+}
+
+async fn fetch_github_public_rest<T: DeserializeOwned>(
+    state: &AppState,
+    url: &str,
+    operation: &str,
+) -> Result<T, SyncRequestError> {
+    with_subscription_timeout(operation, async {
+        let response = state
+            .http
+            .get(url)
+            .header(USER_AGENT, "OctoRill")
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .send()
+            .await
+            .map_err(|err| classify_reqwest_error(operation, err))?;
+
+        fetch_json_response::<T>(response, operation).await
+    })
+    .await
+}
+
+async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<()> {
+    #[derive(Debug, sqlx::FromRow)]
+    struct PendingPublicRepoRow {
+        owner_login: String,
+        repo_name: String,
+        full_name: String,
+    }
+
+    let pending = sqlx::query_as::<_, PendingPublicRepoRow>(
+        r#"
+        SELECT owner_login, repo_name, full_name
+        FROM public_repo_release_usage
+        WHERE repo_id IS NULL
+          AND last_sync_status != 'inaccessible'
+        ORDER BY last_requested_at DESC, created_at ASC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query pending public release repos")?;
+
+    for repo in pending {
+        let now = Utc::now().to_rfc3339();
+        let url = format!(
+            "{REST_API_BASE}/repos/{}/{}",
+            urlencoding::encode(repo.owner_login.as_str()),
+            urlencoding::encode(repo.repo_name.as_str())
+        );
+        let operation = format!("sync public repo metadata {}", repo.full_name);
+        match fetch_github_public_rest::<GitHubPublicRepo>(state, &url, operation.as_str()).await {
+            Ok(public_repo) if !public_repo.private => {
+                let full_name_lower = public_repo.full_name.to_ascii_lowercase();
+                let owner_login = public_repo.owner.login;
+                sqlx::query(
+                    r#"
+                    UPDATE public_repo_release_usage
+                    SET repo_id = ?,
+                        owner_login = ?,
+                        repo_name = ?,
+                        full_name = ?,
+                        full_name_lower = ?,
+                        last_sync_status = 'pending',
+                        last_sync_error = NULL,
+                        updated_at = ?
+                    WHERE lower(full_name) = lower(?)
+                    "#,
+                )
+                .bind(public_repo.id)
+                .bind(owner_login.as_str())
+                .bind(public_repo.name.as_str())
+                .bind(public_repo.full_name.as_str())
+                .bind(full_name_lower.as_str())
+                .bind(now.as_str())
+                .bind(repo.full_name.as_str())
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to update public repo metadata for {}",
+                        repo.full_name
+                    )
+                })?;
+            }
+            Ok(_) => {
+                sqlx::query(
+                    r#"
+                    UPDATE public_repo_release_usage
+                    SET last_sync_status = 'inaccessible',
+                        last_sync_error = 'repository is private',
+                        updated_at = ?
+                    WHERE lower(full_name) = lower(?)
+                    "#,
+                )
+                .bind(now.as_str())
+                .bind(repo.full_name.as_str())
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!("failed to mark private public repo {}", repo.full_name)
+                })?;
+            }
+            Err(err) => {
+                let status = if err.reason_code == "repo_inaccessible" {
+                    "inaccessible"
+                } else {
+                    "failed"
+                };
+                sqlx::query(
+                    r#"
+                    UPDATE public_repo_release_usage
+                    SET last_sync_status = ?,
+                        last_sync_error = ?,
+                        updated_at = ?
+                    WHERE lower(full_name) = lower(?)
+                    "#,
+                )
+                .bind(status)
+                .bind(format!("{}: {}", err.reason_code, err.message))
+                .bind(now.as_str())
+                .bind(repo.full_name.as_str())
+                .execute(&state.pool)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to mark public repo metadata error for {}",
+                        repo.full_name
+                    )
+                })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn fetch_owned_repo_snapshot(
@@ -6509,9 +6803,35 @@ async fn fetch_repo_releases_for_user(
     }))
 }
 
+async fn fetch_repo_releases_public(
+    state: &AppState,
+    repo_id: i64,
+    repo_full_name: &str,
+) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
+    let sync_state = load_repo_release_sync_state(state, repo_id)
+        .await
+        .map_err(|err| {
+            SyncRequestError::non_retryable(
+                "sync_state_error",
+                format!("load repo release sync state: {err}"),
+                None,
+            )
+        })?;
+    fetch_repo_releases_with_optional_token(state, None, repo_full_name, sync_state.as_ref()).await
+}
+
 async fn fetch_repo_releases_with_token(
     state: &AppState,
     token: &str,
+    repo_full_name: &str,
+    sync_state: Option<&RepoReleaseSyncStateRow>,
+) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
+    fetch_repo_releases_with_optional_token(state, Some(token), repo_full_name, sync_state).await
+}
+
+async fn fetch_repo_releases_with_optional_token(
+    state: &AppState,
+    token: Option<&str>,
     repo_full_name: &str,
     sync_state: Option<&RepoReleaseSyncStateRow>,
 ) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
@@ -6526,10 +6846,12 @@ async fn fetch_repo_releases_with_token(
             let mut request = state
                 .http
                 .get(url)
-                .bearer_auth(token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", API_VERSION);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
             if page == 1 {
                 if let Some(etag) = sync_state.and_then(|state| state.etag.as_deref()) {
                     request = request.header(IF_NONE_MATCH, etag);

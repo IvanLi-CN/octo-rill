@@ -20,7 +20,7 @@ type AdminHeaderUser = {
 };
 
 type AdminNavItem = {
-	key: "dashboard" | "users" | "jobs";
+	key: "dashboard" | "users" | "jobs" | "public-releases";
 	label: string;
 	href: string;
 };
@@ -34,6 +34,11 @@ const ADMIN_NAV_ITEMS: AdminNavItem[] = [
 	{ key: "dashboard", label: "仪表盘", href: "/admin" },
 	{ key: "users", label: "用户管理", href: "/admin/users" },
 	{ key: "jobs", label: "任务中心", href: "/admin/jobs" },
+	{
+		key: "public-releases",
+		label: "公开 Release",
+		href: "/admin/public-releases",
+	},
 ];
 
 function clearStartupCacheBeforeLogout() {
