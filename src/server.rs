@@ -179,6 +179,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             "/repos/{owner}/{repo}/releases/tag/{tag}/detail",
             get(api::get_release_detail_by_repo_tag),
         )
+        .route(
+            "/public/repos/{owner}/{repo}/releases",
+            get(api::public_list_repo_releases),
+        )
+        .route(
+            "/public/repos/{owner}/{repo}/releases/tag/{tag}",
+            get(api::public_get_repo_release_detail),
+        )
         .route("/notifications", get(api::list_notifications))
         .route("/dashboard/updates", get(api::dashboard_updates))
         .route("/feed", get(api::list_feed))
@@ -190,6 +198,14 @@ pub async fn serve(config: AppConfig) -> Result<()> {
             get(api::admin_get_user_profile).patch(api::admin_patch_user_profile),
         )
         .route("/admin/dashboard", get(api::admin_dashboard))
+        .route(
+            "/admin/public-release-repos",
+            get(api::admin_list_public_release_repos),
+        )
+        .route(
+            "/admin/public-release-repos/{usage_id}",
+            axum::routing::delete(api::admin_delete_public_release_repo),
+        )
         .route("/admin/jobs/overview", get(api::admin_jobs_overview))
         .route("/admin/jobs/events", get(api::admin_jobs_events_sse))
         .route("/admin/jobs/realtime", get(api::admin_list_realtime_tasks))
