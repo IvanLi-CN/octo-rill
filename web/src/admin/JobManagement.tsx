@@ -118,6 +118,7 @@ const NUMBER_FORMATTER = new Intl.NumberFormat();
 const SYNC_AUTO_FETCH_INTERVAL_MIN = 1;
 const SYNC_AUTO_FETCH_INTERVAL_MAX = 120;
 const SYNC_AUTO_FETCH_INTERVAL_MARKS = [1, 5, 10, 15, 30, 60, 120];
+const RETRY_RECENT_FAILURES_INTERVAL_DEFAULT = 10;
 const REPO_RELEASE_WORKER_MIN = 1;
 const REPO_RELEASE_WORKER_MAX = 32;
 const REPO_RELEASE_WORKER_MARKS = [1, 5, 10, 16, 24, 32];
@@ -899,6 +900,8 @@ function taskTypeLabel(taskType: string) {
 			return "定时日报";
 		case "sync.subscriptions":
 			return "订阅同步";
+		case "retry.recent_failures":
+			return "失败数据重试";
 		case "brief.generate":
 			return "日报生成";
 		case "brief.refresh_content":
@@ -1263,6 +1266,7 @@ const TASK_PAGE_SIZE = 20;
 const SCHEDULED_TASK_TYPES = new Set([
 	"brief.daily_slot",
 	"sync.subscriptions",
+	"retry.recent_failures",
 ]);
 const STREAM_REFRESH_DELAY_MS = 600;
 const STREAM_RECONNECT_DELAY_MS = 1500;
@@ -3387,6 +3391,10 @@ export function JobManagement({
 	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
 		useState(60);
 	const [
+		retryRecentFailuresIntervalInput,
+		setRetryRecentFailuresIntervalInput,
+	] = useState(RETRY_RECENT_FAILURES_INTERVAL_DEFAULT);
+	const [
 		repoReleaseWorkerConcurrencyInput,
 		setRepoReleaseWorkerConcurrencyInput,
 	] = useState(5);
@@ -3819,6 +3827,10 @@ export function JobManagement({
 			}
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setRetryRecentFailuresIntervalInput(
+				res.retry_recent_failures_interval_minutes ??
+					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
+			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
 			syncRuntimeConfigLoadedOnceRef.current = true;
 		} catch (err) {
@@ -3837,6 +3849,9 @@ export function JobManagement({
 
 	const saveSyncRuntimeConfig = useCallback(async () => {
 		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
+		const nextRetryInterval = clampSyncAutoFetchInterval(
+			retryRecentFailuresIntervalInput,
+		);
 		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
 			repoReleaseWorkerConcurrencyInput,
 		);
@@ -3845,10 +3860,15 @@ export function JobManagement({
 		try {
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: nextInterval,
+				retry_recent_failures_interval_minutes: nextRetryInterval,
 				repo_release_worker_concurrency: nextWorkerConcurrency,
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setRetryRecentFailuresIntervalInput(
+				res.retry_recent_failures_interval_minutes ??
+					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
+			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
 			setSyncSettingsDialogOpen(false);
 			await Promise.all([
@@ -3866,6 +3886,7 @@ export function JobManagement({
 		loadScheduledRuns,
 		loadSubscriptionRuns,
 		repoReleaseWorkerConcurrencyInput,
+		retryRecentFailuresIntervalInput,
 		syncAutoFetchIntervalInput,
 	]);
 
@@ -3873,6 +3894,10 @@ export function JobManagement({
 		setSyncRuntimeConfigError(null);
 		setSyncAutoFetchIntervalInput(
 			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
+		);
+		setRetryRecentFailuresIntervalInput(
+			syncRuntimeConfig?.retry_recent_failures_interval_minutes ??
+				RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 		);
 		setRepoReleaseWorkerConcurrencyInput(
 			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
@@ -4925,13 +4950,24 @@ export function JobManagement({
 
 				<TabsContent value="scheduled">
 					<Card>
-						<CardHeader>
+						<CardHeader className="flex flex-row items-start justify-between gap-4">
 							<div className="space-y-1.5">
 								<CardTitle>定时任务</CardTitle>
 								<CardDescription>
-									查看 `brief.daily_slot` 与 `sync.subscriptions` 运行记录。
+									查看 `brief.daily_slot`、`sync.subscriptions` 与
+									`retry.recent_failures` 运行记录。
 								</CardDescription>
 							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="icon"
+								aria-label="配置定时任务间隔"
+								onClick={openSyncSettingsDialog}
+								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
+							>
+								<Settings2 />
+							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
 							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -5562,7 +5598,7 @@ export function JobManagement({
 				>
 					<DialogHeader>
 						<div className="flex items-center gap-2">
-							<DialogTitle>配置订阅同步</DialogTitle>
+							<DialogTitle>任务间隔设置</DialogTitle>
 							<Tooltip open={syncSettingsHelpTooltipsOpen ? true : undefined}>
 								<TooltipTrigger asChild>
 									<Button
@@ -5585,14 +5621,13 @@ export function JobManagement({
 									side={syncSettingsHelpTooltipsOpen ? "top" : "bottom"}
 									sideOffset={6}
 								>
-									保存后立即生效；该间隔只控制 `sync.subscriptions`
-									定时拉取，不关联账号访问状态。
+									保存后立即生效；间隔分别控制 `sync.subscriptions` 与
+									`retry.recent_failures` 的定时触发。
 								</TooltipContent>
 							</Tooltip>
 						</div>
 						<DialogDescription className="sr-only">
-							保存后立即生效；配置只作用于 `sync.subscriptions` 的定时拉取间隔与
-							release worker 数量。
+							保存后立即生效；配置作用于定时任务间隔与 release worker 数量。
 						</DialogDescription>
 					</DialogHeader>
 
@@ -5670,6 +5705,55 @@ export function JobManagement({
 										</button>
 									))}
 								</div>
+							</div>
+							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+								<div className="flex items-center justify-between gap-3">
+									<Label htmlFor="retry-recent-failures-interval">
+										失败数据重试间隔
+									</Label>
+									<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+										{retryRecentFailuresIntervalInput} 分钟
+									</span>
+								</div>
+								<input
+									id="retry-recent-failures-interval"
+									type="range"
+									min={0}
+									max={100}
+									step={1}
+									value={syncIntervalToSliderPosition(
+										retryRecentFailuresIntervalInput,
+									)}
+									onChange={(event) =>
+										setRetryRecentFailuresIntervalInput(
+											syncSliderPositionToInterval(Number(event.target.value)),
+										)
+									}
+									aria-label="失败数据重试间隔（分钟）"
+									aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+									aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+									aria-valuenow={retryRecentFailuresIntervalInput}
+									aria-valuetext={`${retryRecentFailuresIntervalInput} 分钟`}
+									className="h-2 w-full cursor-pointer accent-primary"
+								/>
+								<div className="relative h-11 text-[11px] text-muted-foreground">
+									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+										<button
+											key={mark}
+											type="button"
+											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+											style={{ left: syncIntervalMarkPosition(mark) }}
+											onClick={() => setRetryRecentFailuresIntervalInput(mark)}
+										>
+											<span className="mt-1 h-1.5 w-px bg-border" />
+											<span>{mark}</span>
+										</button>
+									))}
+								</div>
+								<p className="text-muted-foreground text-xs">
+									任务会按日报、润色、翻译顺序处理最近 24
+									小时失败数据；上一轮未完成时下一轮自动跳过。
+								</p>
 							</div>
 							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
 								<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">

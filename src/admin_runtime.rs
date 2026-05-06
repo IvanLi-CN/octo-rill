@@ -23,10 +23,15 @@ pub struct AdminRuntimeSettingsSnapshot {
 }
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
+pub const DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES: i64 = 10;
 pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 5;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
+    value.clamp(1, 120)
+}
+
+pub fn normalize_retry_recent_failures_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
 }
 
@@ -138,6 +143,58 @@ pub async fn update_sync_auto_fetch_interval_minutes(
     .await?;
 
     load_sync_auto_fetch_interval_minutes(pool).await
+}
+
+pub async fn load_retry_recent_failures_interval_minutes(pool: &SqlitePool) -> Result<i64> {
+    let interval = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT retry_recent_failures_interval_minutes
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES);
+
+    Ok(normalize_retry_recent_failures_interval_minutes(interval))
+}
+
+pub async fn update_retry_recent_failures_interval_minutes(
+    pool: &SqlitePool,
+    interval_minutes: i64,
+) -> Result<i64> {
+    let interval_minutes = normalize_retry_recent_failures_interval_minutes(interval_minutes);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          retry_recent_failures_interval_minutes,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          retry_recent_failures_interval_minutes = excluded.retry_recent_failures_interval_minutes,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(interval_minutes)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_retry_recent_failures_interval_minutes(pool).await
 }
 
 fn load_legacy_ai_model_context_limit_from_env() -> Result<Option<u32>> {
@@ -427,6 +484,18 @@ mod tests {
         assert_eq!(
             stored.translation_dedicated_worker_concurrency,
             DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
+        );
+    }
+
+    #[tokio::test]
+    async fn load_retry_recent_failures_interval_defaults_to_ten_minutes() {
+        let pool = setup_pool().await;
+
+        assert_eq!(
+            load_retry_recent_failures_interval_minutes(&pool)
+                .await
+                .expect("load retry interval"),
+            DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES,
         );
     }
 

@@ -37,6 +37,7 @@ Response shape:
 ```json
 {
   "sync_auto_fetch_interval_minutes": 10,
+  "retry_recent_failures_interval_minutes": 10,
   "repo_release_worker_concurrency": 5,
   "recent_sync_tasks": [
     {
@@ -55,6 +56,7 @@ Response shape:
 Notes:
 
 - `sync_auto_fetch_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `60`.
+- `retry_recent_failures_interval_minutes` is global, admin-only, and clamped by validation to `1-120`, defaulting to `10`.
 - `repo_release_worker_concurrency` is global, admin-only, clamped by validation to `1-32`, and defaults to `5`.
 - `repo_release_worker_concurrency` controls active shared repo release worker slots only; it does not change `sync.subscriptions` scheduler cadence.
 - `recent_sync_tasks` returns the newest three `sync.subscriptions` tasks.
@@ -68,6 +70,7 @@ Request shape:
 ```json
 {
   "sync_auto_fetch_interval_minutes": 10,
+  "retry_recent_failures_interval_minutes": 10,
   "repo_release_worker_concurrency": 16
 }
 ```
@@ -75,6 +78,7 @@ Request shape:
 Behavior:
 
 - `sync_auto_fetch_interval_minutes` must be between `1` and `120`.
+- `retry_recent_failures_interval_minutes`, when present, must be between `1` and `120`.
 - `repo_release_worker_concurrency`, when present, must be between `1` and `32`.
 - The response uses the same shape as `GET /api/admin/jobs/sync/runtime-config`.
 - Task detail links reuse `GET /api/admin/jobs/realtime/{task_id}`.
@@ -96,6 +100,7 @@ Route behavior:
 - Shows `sync.subscriptions` runs as a workflow list.
 - Links each run to `/admin/jobs/subscriptions/{task_id}`.
 - Shares `GET/PATCH /api/admin/jobs/sync/runtime-config` with the scheduled tab for the settings button.
+- The shared settings dialog groups `sync.subscriptions` and `retry.recent_failures` intervals separately.
 
 ## `/admin/jobs/subscriptions/{task_id}`
 
