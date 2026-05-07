@@ -456,6 +456,74 @@ function buildTaskDetailPageModel(
 				),
 			};
 		}
+		case "retry.recent_failures": {
+			const diagnostics = detail.diagnostics?.retry_recent_failures ?? null;
+			const daily = diagnostics?.daily_brief;
+			const polish = diagnostics?.polish;
+			const translation = diagnostics?.translation;
+			const scheduleKey =
+				diagnostics?.schedule_key ?? readString(payload, "schedule_key");
+			const intervalMinutes =
+				diagnostics?.interval_minutes ??
+				readNumber(payload, "interval_minutes");
+			const runState = diagnostics?.skipped
+				? "已跳过"
+				: diagnostics?.canceled
+					? "已取消"
+					: task.status === "queued" || task.status === "running"
+						? "进行中"
+						: diagnostics
+							? "已执行"
+							: null;
+			return {
+				pageTitle: "失败数据重试详情页",
+				pageSummary:
+					"按日报、润色、翻译顺序展示最近 24 小时失败业务数据的定时重试结果。",
+				fields: buildFields(
+					field("本轮状态", runState),
+					field("跳过原因", diagnostics?.skip_reason),
+					field("调度键", scheduleKey),
+					field(
+						"任务间隔",
+						intervalMinutes !== null && intervalMinutes !== undefined
+							? `${intervalMinutes} 分钟`
+							: null,
+					),
+					field(
+						"日报 成功/处理/总计",
+						daily
+							? `${daily.succeeded}/${daily.processed}/${daily.total}`
+							: null,
+					),
+					field(
+						"润色 成功/处理/总计",
+						polish
+							? `${polish.succeeded}/${polish.processed}/${polish.total}`
+							: null,
+					),
+					field(
+						"翻译 成功/处理/总计",
+						translation
+							? `${translation.succeeded}/${translation.processed}/${translation.total}`
+							: null,
+					),
+					field(
+						"超时类别",
+						[
+							daily?.timed_out ? "日报" : null,
+							polish?.timed_out ? "润色" : null,
+							translation?.timed_out ? "翻译" : null,
+						]
+							.filter(Boolean)
+							.join("、") || null,
+					),
+					field(
+						"最后错误",
+						translation?.last_error ?? polish?.last_error ?? daily?.last_error,
+					),
+				),
+			};
+		}
 		case "sync.subscriptions": {
 			const diagnostics = detail.diagnostics?.sync_subscriptions ?? null;
 			const skipped = diagnostics?.skipped ?? readBoolean(result, "skipped");

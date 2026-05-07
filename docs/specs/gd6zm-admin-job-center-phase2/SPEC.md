@@ -18,6 +18,7 @@
 - 在用户管理中补齐新增字段可视化：`last_active_at` 列表展示、`daily_brief_utc_time` 详情抽屉展示（只读）。
 - 任务详情按 `task_type` 提供专属详情页，并在 Storybook 为各类任务提供独立示例。
 - 翻译任务中心必须额外展示 `clean completed / completed with issues / failed`，并在批次历史与详情中同时展示 raw 状态、`business_outcome` 与 `result_summary`。
+- 定时任务页的共享设置入口需要同时覆盖 `sync.subscriptions` 与 `retry.recent_failures`，并提供失败数据重试任务的独立运行记录与详情。
 
 ### Non-goals
 
@@ -37,6 +38,7 @@
 - 管理员 API：任务总览、实时任务列表/详情、重试、取消、定时槽位查询与启停。
 - 管理员翻译 API：runtime status、request 列表 / 详情、batch 列表 / 详情，以及带 `business_outcome` / `result_summary` 的状态聚合。
 - 前端 `/admin/jobs` 页面与用户管理字段展示补齐；任务详情区按 `task_type` 渲染专属信息卡片与说明。
+- 定时任务页卡片右上角提供统一“任务间隔设置”入口，支持 `sync.subscriptions` 与 `retry.recent_failures` 的间隔分组展示。
 - 翻译任务中心状态卡拆分“干净完成 / 带问题完成 / 失败”，批次历史与详情抽屉显示 raw 状态 + `business_outcome` + item 结果汇总。
 - 管理端统一页头组件：账号信息、管理员导航、返回仪表盘与登出操作。
 - Storybook 覆盖任务详情页：为每类任务提供单独故事条目，便于视觉回归与需求对齐。
@@ -58,6 +60,7 @@
 | `GET /api/admin/jobs/overview` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/realtime` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/realtime/{task_id}` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
+| `GET /api/admin/jobs/realtime?task_type=retry.recent_failures` | HTTP API | external | Modify | `./contracts/http-apis.md` | backend | web-admin |
 | `POST /api/admin/jobs/realtime/{task_id}/retry` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `POST /api/admin/jobs/realtime/{task_id}/cancel` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
 | `GET /api/admin/jobs/scheduled` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
@@ -118,6 +121,10 @@
   When 任务详情抽屉打开
   Then 根据该任务 `task_type` 展示对应专属详情页（包含业务字段与语义化说明），不使用单一通用模板替代。
 
+- Given 管理员查看 `retry.recent_failures` 任务
+  When 任务详情抽屉打开
+  Then 页面展示三类重试摘要、跳过原因、调度键、间隔与最后错误，并区分“已跳过”与“正常完成”。
+
 - Given Storybook 打开 `Admin/TaskTypeDetailPage`
   When 查看故事列表
   Then 各任务类型均有独立 story，覆盖任务详情页的专属展示分支。
@@ -142,6 +149,50 @@
 ## Visual Evidence
 
 ![管理员翻译批次业务结果详情](./assets/admin-jobs-translation-business-outcome.png)
+
+### 最近失败数据重试定时任务
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- requested_viewport: `1440x1100`
+- viewport_strategy: `storybook-viewport`
+- sensitive_exclusion: `N/A`
+- submission_gate: `approved`
+- story_id_or_title: `admin-admin-jobs--scheduled-tab`
+- state: `scheduled-tab-retry-recent-failures`
+- evidence_note: 验证“定时任务”卡片右上角存在任务间隔设置按钮，列表包含 `retry.recent_failures` 运行记录。
+
+PR: include
+![定时任务页失败数据重试入口](./assets/admin-jobs-scheduled-retry-intervals.png)
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- requested_viewport: `1440x1100`
+- viewport_strategy: `storybook-viewport`
+- sensitive_exclusion: `N/A`
+- submission_gate: `approved`
+- story_id_or_title: `admin-admin-jobs--task-interval-settings-clean-dialog`
+- state: `task-interval-settings-clean-dialog`
+- evidence_note: 验证“任务间隔设置”弹窗只包含订阅同步与失败数据重试间隔，默认 10 分钟，不包含 worker 配置或最近链路用时。
+
+PR: include
+![任务间隔设置弹窗](./assets/admin-jobs-task-interval-settings.png)
+
+- source_type: `storybook_canvas`
+- target_program: `mock-only`
+- capture_scope: `element`
+- requested_viewport: `1440x1100`
+- viewport_strategy: `storybook-viewport`
+- sensitive_exclusion: `N/A`
+- submission_gate: `approved`
+- story_id_or_title: `admin-admin-jobs--retry-recent-failures-detail`
+- state: `retry-recent-failures-detail`
+- evidence_note: 验证 `retry.recent_failures` 详情展示日报、润色、翻译三类重试摘要、任务间隔、调度键与最后错误。
+
+PR: include
+![失败数据重试详情](./assets/admin-jobs-retry-recent-failures-detail.png)
 
 ## 参考（References）
 

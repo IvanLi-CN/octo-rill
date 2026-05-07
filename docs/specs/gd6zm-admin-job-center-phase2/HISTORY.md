@@ -15,3 +15,4 @@
 - 2026-03-08: 对齐 Admin Jobs / Admin Users 相关 Playwright 断言与合并门禁证据，保持浏览器时区语义回归覆盖稳定。
 - 2026-04-24: 扩展翻译任务中心观测口径，补齐 `completed_with_issues`、批次 `result_summary` / `business_outcome` 与 Storybook 视觉证据。
 - 2026-04-27: 热修复 release-batch 诊断兼容 legacy `result_json.items[]`，避免后台任务详情把真实失败误判成“结果未知”。
+- 2026-05-06: 为定时任务页补齐失败数据重试间隔设置，并新增 `retry.recent_failures` 任务的运行记录与详情展示。
