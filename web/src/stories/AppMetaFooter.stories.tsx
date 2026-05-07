@@ -16,6 +16,8 @@ type FooterPreviewProps = {
 };
 
 const FOOTER_RELEASE_HREF = "/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
+const FOOTER_RAW_SEMVER_RELEASE_HREF =
+	"/IvanLi-CN/octo-rill/releases/tag/v2.30.0";
 const APP_META_FOOTER_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
 	footerMobile390: {
@@ -150,6 +152,31 @@ export const UnknownFallback: Story = {
 			description: {
 				story:
 					"极端降级态：只有在构建版本本身不可解析时，footer 才退回 unknown。正常轮询失败不会再显示 loading。",
+			},
+		},
+	},
+};
+
+export const RawSemverReleaseTag: Story = {
+	args: {
+		loadedVersion: "2.30.0",
+	},
+	play: async ({ canvasElement }) => {
+		const storyRoot = within(canvasElement.ownerDocument.body);
+		const versionLink = storyRoot.getByRole("link", {
+			name: "Version 2.30.0",
+		});
+		await expect(versionLink).toBeVisible();
+		await expect(versionLink).toHaveAttribute(
+			"href",
+			FOOTER_RAW_SEMVER_RELEASE_HREF,
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"兼容 release 流程输出的无 v 前缀有效版本：展示文本保持当前版本值，跳转 tag 规范化为真实 GitHub Release tag。",
 			},
 		},
 	},
