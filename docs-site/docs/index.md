@@ -11,6 +11,7 @@ OctoRill 是一个面向个人 GitHub 动态的阅读工作区：把发布更新
 
 - **我要先跑起来**：看 [快速开始](/quick-start)。
 - **我要配置 OAuth、AI 或运行参数**：看 [配置参考](/config)。
+- **我要展示某个 GitHub 仓库的 Releases**：看 [公开 Release 接入](/public-releases)。
 - **我要先理解产品在解决什么问题**：看 [产品说明](/product)。
 - **我要核对页面状态或组件外观**：直接打开 [Storybook](/storybook.html)。
 
@@ -18,6 +19,7 @@ OctoRill 是一个面向个人 GitHub 动态的阅读工作区：把发布更新
 
 - 本地启动路径与常用验证入口。
 - 运行配置、默认值与文档站/Storybook 相关环境变量。
+- 公开 GitHub 仓库 Release 页面与 API 接入方式。
 - 产品定位、主要界面和权限边界。
 - 指向 Storybook 与仓库源码的直接入口。
 
