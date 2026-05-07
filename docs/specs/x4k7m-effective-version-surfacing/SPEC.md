@@ -12,7 +12,7 @@
 - 新增稳定版本接口 `GET /api/version`，便于排障与前端直连。
 - 保持 `GET /api/health` 响应兼容，沿用相同有效版本来源。
 - 前端 footer 优先读取 `/api/version`，失败回退 `/api/health`。
-- 前端 footer 中的版本号链接到 OctoRill 自身公开 Release 详情页：`/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`。
+- 前端 footer 中的版本号链接到 OctoRill 自身 public-only Release 详情页：`/public/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`，不得被登录态切换到 Dashboard。
 - 打通 Docker 构建注入闭环并增加 release 保护校验。
 - 前端构建阶段嵌入版本优先消费 `APP_EFFECTIVE_VERSION`，仅在 env 缺失时回退仓库根 `Cargo.toml`，且缺失时不得崩溃。
 - 普通 CI 在既有 `Build (Release)` gate 内增加 Docker smoke，提前覆盖 release `web-builder` 构建路径。
@@ -102,7 +102,7 @@
 
 - Given 前端构建已加载版本为 `v2.29.0`
   When 用户查看桌面或移动端 footer
-  Then 显示 `Version v2.29.0`，且链接到 `/IvanLi-CN/octo-rill/releases/tag/v2.29.0`。
+  Then 显示 `Version v2.29.0`，且链接到 `/public/IvanLi-CN/octo-rill/releases/tag/v2.29.0`。
 
 - Given 前端构建版本不可解析并显示 `Version unknown`
   When 用户查看 footer
@@ -113,6 +113,6 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `layout-app-meta-footer--mobile-version-link`
   state: `footer-version-release-link-mobile`
-  evidence_note: 验证 390px 移动端 footer 仍显示 `Version v2.29.0`，并作为内部链接指向 OctoRill 自身公开 Release 详情页；GitHub 入口与版权信息在窄屏共存。
+  evidence_note: 验证 390px 移动端 footer 仍显示 `Version v2.29.0`，并作为内部链接指向 OctoRill 自身 public-only Release 详情页；GitHub 入口与版权信息在窄屏共存。
   image:
   ![Footer 移动端版本详情链接](./assets/footer-version-release-link-mobile.png)

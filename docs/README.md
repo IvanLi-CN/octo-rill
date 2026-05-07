@@ -6,6 +6,7 @@
 
 - **先理解项目现在做什么**：看 [`product.md`](./product.md)
 - **先理解系统怎么拼起来**：看 [`architecture.md`](./architecture.md)
+- **先核对仓库合并与 GitHub 保护规则**：看 [`repository-governance.md`](./repository-governance.md)
 - **先在本地跑起来**：看 [`../docs-site/docs/quick-start.md`](../docs-site/docs/quick-start.md)
 - **先核对运行配置**：看 [`../docs-site/docs/config.md`](../docs-site/docs/config.md)
 - **要接入公开仓库 Release 展示**：看 [`../docs-site/docs/public-releases.md`](../docs-site/docs/public-releases.md)
@@ -28,6 +29,7 @@
 
 - [`product.md`](./product.md)：产品语义、界面职责、权限与数据边界
 - [`architecture.md`](./architecture.md)：系统组成、运行边界、模块职责与排查入口
+- [`repository-governance.md`](./repository-governance.md)：GitHub 仓库保护、PR 门禁与质量规则事实源
 - 适合回答“项目现在怎么工作、从哪里改、谁是事实源”
 
 ### Agent memory / 长期工程记忆
@@ -44,6 +46,7 @@
 - **OAuth / Passkey / LinuxDO 登录链路在哪里**：看 [`architecture.md`](./architecture.md) 的认证边界，再看 `src/auth.rs`、`src/passkeys.rs`、`src/linuxdo.rs`
 - **日报 / 翻译 / 后台任务为什么这样运作**：先看 [`product.md`](./product.md) 与 [`architecture.md`](./architecture.md)，再看相关 spec 与 `src/briefs.rs`、`src/translations.rs`、`src/ai.rs`、`src/jobs.rs`
 - **UI 改动应该从哪里验证**：先看 [`../web/README.md`](../web/README.md)，优先用 Storybook 和现有 e2e / story 入口
+- **PR 合并、GitHub ruleset 与 required checks 怎么维护**：看 [`repository-governance.md`](./repository-governance.md)，再看 `.github/quality-gates.json`
 
 ## 维护约定
 
