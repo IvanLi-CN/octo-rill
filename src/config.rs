@@ -93,6 +93,7 @@ pub struct AppConfig {
     pub bind_addr: SocketAddr,
     pub public_base_url: Url,
     pub database_url: String,
+    pub sqlite_pool_max_connections: usize,
     pub static_dir: Option<PathBuf>,
     pub task_log_dir: PathBuf,
     pub job_worker_concurrency: usize,
@@ -162,6 +163,10 @@ impl fmt::Debug for AppConfig {
             .field("bind_addr", &self.bind_addr)
             .field("public_base_url", &self.public_base_url)
             .field("database_url", &self.database_url)
+            .field(
+                "sqlite_pool_max_connections",
+                &self.sqlite_pool_max_connections,
+            )
             .field("static_dir", &self.static_dir)
             .field("task_log_dir", &self.task_log_dir)
             .field("job_worker_concurrency", &self.job_worker_concurrency)
@@ -195,6 +200,15 @@ impl AppConfig {
 
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:./.data/octo-rill.db".to_owned());
+        let sqlite_pool_max_connections =
+            parse_bounded_positive_usize_env("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", false, 32)?
+                .unwrap_or_else(|| {
+                    if database_url == "sqlite::memory:" {
+                        1
+                    } else {
+                        8
+                    }
+                });
 
         let task_log_dir = env::var("OCTORILL_TASK_LOG_DIR")
             .ok()
@@ -308,6 +322,7 @@ impl AppConfig {
             bind_addr,
             public_base_url,
             database_url,
+            sqlite_pool_max_connections,
             static_dir,
             task_log_dir,
             job_worker_concurrency,
@@ -351,7 +366,9 @@ mod tests {
             env::remove_var("AI_API_KEY");
             env::remove_var("AI_MAX_CONCURRENCY");
             env::remove_var("APP_DEFAULT_TIME_ZONE");
+            env::remove_var("DATABASE_URL");
             env::remove_var("OCTORILL_TASK_WORKERS");
+            env::remove_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS");
             env::remove_var("LINUXDO_CLIENT_ID");
             env::remove_var("LINUXDO_CLIENT_SECRET");
             env::remove_var("LINUXDO_OAUTH_REDIRECT_URL");
@@ -366,6 +383,68 @@ mod tests {
         let config = AppConfig::from_env().expect("build config");
 
         assert_eq!(config.ai_max_concurrency, 1);
+    }
+
+    #[test]
+    fn from_env_defaults_sqlite_pool_max_connections_to_eight() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.sqlite_pool_max_connections, 8);
+    }
+
+    #[test]
+    fn from_env_defaults_in_memory_sqlite_pool_max_connections_to_one() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("DATABASE_URL", "sqlite::memory:");
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.sqlite_pool_max_connections, 1);
+    }
+
+    #[test]
+    fn from_env_accepts_sqlite_pool_max_connections_override() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "1");
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.sqlite_pool_max_connections, 1);
+
+        unsafe {
+            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "16");
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.sqlite_pool_max_connections, 16);
+    }
+
+    #[test]
+    fn from_env_rejects_invalid_sqlite_pool_max_connections() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS", "33");
+        }
+
+        let err = AppConfig::from_env().expect_err("out-of-range sqlite pool should fail");
+
+        assert!(
+            err.to_string().contains(
+                "invalid OCTORILL_SQLITE_POOL_MAX_CONNECTIONS (expected positive integer <= 32)"
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

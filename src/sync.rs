@@ -2719,6 +2719,28 @@ async fn attach_and_wait_for_user_release_demand(
     })
 }
 
+pub async fn enqueue_public_repo_release_sync(
+    state: &AppState,
+    repo_id: i64,
+    full_name: &str,
+) -> Result<bool> {
+    let repos = [ReleaseDemandRepo {
+        repo_id,
+        full_name: full_name.to_owned(),
+        is_new_repo: false,
+    }];
+    let attached = attach_release_demand(
+        state,
+        None,
+        None,
+        &repos,
+        RepoReleaseOrigin::Interactive,
+        "public_release_access",
+    )
+    .await?;
+    Ok(attached.reused_fresh > 0)
+}
+
 async fn attach_release_demand(
     state: &AppState,
     task_id: Option<&str>,
@@ -12271,6 +12293,7 @@ mod tests {
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-sync-tests"),
             job_worker_concurrency: 4,
