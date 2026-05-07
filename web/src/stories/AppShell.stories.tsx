@@ -29,6 +29,7 @@ function makeVersionState(
 				loadedVersion: "v2.4.6",
 				availableVersion: "v2.5.0",
 				hasUpdate: true,
+				hasServiceWorkerUpdate: false,
 				refreshPage: onRefresh,
 			};
 		case "unknown":
@@ -36,6 +37,7 @@ function makeVersionState(
 				loadedVersion: VERSION_UNKNOWN,
 				availableVersion: null,
 				hasUpdate: false,
+				hasServiceWorkerUpdate: false,
 				refreshPage: onRefresh,
 			};
 		default:
@@ -43,6 +45,7 @@ function makeVersionState(
 				loadedVersion: "v2.4.6",
 				availableVersion: null,
 				hasUpdate: false,
+				hasServiceWorkerUpdate: false,
 				refreshPage: onRefresh,
 			};
 	}
