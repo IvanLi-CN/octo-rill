@@ -3348,7 +3348,7 @@ export const AllHistoryFallbackToReleaseCards: Story = {
 	},
 	play: async ({ canvasElement, step }) => {
 		const canvas = within(canvasElement);
-		await expect(canvas.getByText("2026-04-02")).toBeVisible();
+		await expect(canvas.getByText("2026-04-03")).toBeVisible();
 		await expect(canvas.getByText(FALLBACK_RAW_MARKER)).toBeVisible();
 		await step("start generating fallback brief", async () => {
 			await canvas.getByRole("button", { name: "生成日报" }).click();
