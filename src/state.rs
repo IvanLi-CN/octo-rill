@@ -605,6 +605,7 @@ mod tests {
                 .expect("parse bind addr"),
             public_base_url: Url::parse(public_base_url).expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: PathBuf::from("/tmp/octo-rill-state-tests"),
             job_worker_concurrency: 1,
