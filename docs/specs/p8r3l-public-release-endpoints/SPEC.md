@@ -10,7 +10,7 @@
 
 - 提供未登录可访问的公开 Release 列表页与详情页。
 - 提供未登录 REST API：公开仓库 Release 列表与 tag 详情。
-- 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身公开 Release 详情页。
+- 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
 - 首次访问仅登记仓库 usage；API 返回可重试 pending 响应，网页显示等待界面并轮询。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
@@ -60,7 +60,11 @@
 
 - Given 未登录用户在移动端访问公开 Release 列表或详情页
   When 页脚可见
-  Then 页脚展示 `Version <loadedVersion>`，有效版本号链接到 `/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`，且页面无横向溢出。
+  Then 页脚展示 `Version <loadedVersion>`，有效版本号链接到 `/public/IvanLi-CN/octo-rill/releases/tag/<loadedVersion>`，且页面无横向溢出。
+
+- Given 已登录用户点击页脚版本号
+  When 跳转到 OctoRill 自身 Release 详情
+  Then 页面必须使用 public-only URL 与公开 REST API，不进入 Dashboard release detail。
 
 - Given 第三方调用公开 API 且仓库尚未缓存
   When 请求到达服务端
@@ -111,7 +115,7 @@
 - source_type: `storybook_canvas`
   story_id_or_title: `public-publicreleasepage--long-repo-and-tag-detail`
   state: `public-release-footer-version-link-mobile`
-  evidence_note: 验证 390px 移动端公开详情页的页脚在超长 repo/tag 场景下仍展示 GitHub 入口与 `Version v2.29.0`，版本号链接到 OctoRill 自身公开 Release 详情页，且全页无横向溢出。
+  evidence_note: 验证 390px 移动端公开详情页的页脚在超长 repo/tag 场景下仍展示 GitHub 入口与 `Version v2.29.0`，版本号链接到 OctoRill 自身 public-only Release 详情页，且全页无横向溢出。
   image:
   ![公开 Release 页脚版本详情链接](./assets/public-release-footer-version-link-mobile.png)
 

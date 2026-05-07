@@ -1,7 +1,8 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { buildMockMeResponse } from "./mockApi";
 
 const EMBEDDED_FRONTEND_VERSION = "v0.1.0";
-const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
+const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/public/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
 
 function json(route: Route, payload: unknown, status = 200) {
 	return route.fulfill({
@@ -58,6 +59,7 @@ function releaseItem(index: number, overrides: Record<string, unknown> = {}) {
 async function installBaseApiMocks(
 	page: Page,
 	publicHandler: (route: Route, url: URL) => Promise<void> | void,
+	options: { authenticated?: boolean } = {},
 ) {
 	await page.route("**/api/**", async (route) => {
 		const req = route.request();
@@ -69,6 +71,20 @@ async function installBaseApiMocks(
 		}
 
 		if (req.method() === "GET" && pathname === "/api/me") {
+			if (options.authenticated) {
+				return json(
+					route,
+					buildMockMeResponse({
+						id: "public-route-auth-user",
+						github_user_id: 4242,
+						login: "octo",
+						name: "Octo",
+						avatar_url: null,
+						email: null,
+						is_admin: false,
+					}),
+				);
+			}
 			return json(
 				route,
 				{ error: { code: "unauthorized", message: "unauthorized" } },
@@ -239,4 +255,72 @@ test("public release detail keeps the shared chrome stable", async ({
 	await expect(page.getByRole("tab", { name: "润色" })).toBeVisible();
 	await expectPublicChrome(page, "octo-rill", "example");
 	await expectNoHorizontalOverflow(page);
+});
+
+test("authenticated footer version link opens the public-only release page", async ({
+	page,
+}) => {
+	const publicRequests: string[] = [];
+	const privateDetailRequests: string[] = [];
+	await installBaseApiMocks(
+		page,
+		(route, url) => {
+			publicRequests.push(`${url.pathname}${url.search}`);
+			return json(route, {
+				...releaseItem(0, {
+					repo_full_name: "IvanLi-CN/octo-rill",
+					tag_name: EMBEDDED_FRONTEND_VERSION,
+					name: "Footer public release target",
+					translated: {
+						lang: "zh-CN",
+						status: "ready",
+						title: "Footer public release target",
+						summary: "Footer version links must stay on the public page.",
+					},
+					smart: {
+						lang: "zh-CN",
+						status: "ready",
+						title: "Footer public release target",
+						summary: "Footer version links must stay on the public page.",
+					},
+				}),
+			});
+		},
+		{ authenticated: true },
+	);
+	await page.route("**/api/repos/**/releases/tag/**/detail", async (route) => {
+		privateDetailRequests.push(route.request().url());
+		return json(
+			route,
+			{
+				error: {
+					code: "unexpected_private_detail_request",
+					message: "footer version link should not open dashboard detail",
+				},
+			},
+			500,
+		);
+	});
+
+	await page.goto("/public/octo-rill/example/releases/tag/v2.7.0");
+	await page
+		.getByRole("link", { name: `Version ${EMBEDDED_FRONTEND_VERSION}` })
+		.click();
+
+	await expect(page).toHaveURL(
+		new RegExp(
+			`/public/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}$`,
+		),
+	);
+	await expect(
+		page.getByRole("heading", { name: "Footer public release target" }),
+	).toBeVisible();
+	expect(
+		publicRequests.some((request) =>
+			request.startsWith(
+				`/api/public/repos/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`,
+			),
+		),
+	).toBe(true);
+	expect(privateDetailRequests).toEqual([]);
 });
