@@ -346,7 +346,7 @@ export function groupFeedItemsByDay(
 			{
 				kind: historicalBrief ? "historical" : "raw",
 				id: groupId,
-				displayDate: historicalBrief?.date ?? windowStartKey,
+				displayDate: historicalBrief?.date ?? briefDate,
 				briefDate: historicalBrief?.date ?? briefDate,
 				briefId: historicalBrief?.id ?? null,
 				items: [],

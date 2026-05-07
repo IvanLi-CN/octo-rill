@@ -81,6 +81,7 @@
 
 - `cargo check`
 - `cargo test`
+- `cd web && npm run test:day-groups`
 - `cd web && npm run build`
 - `cd web && npm run storybook:build`
 - 重点视觉场景：
@@ -108,6 +109,9 @@
 
 - Dashboard `全部` tab：未命中 snapshot memberships 时，保留 raw release fallback
 ![Dashboard 历史 release raw fallback](./assets/dashboard-evidence-all-history-fallback-to-release-cards.png)
+
+- Dashboard `全部` tab：08:00 边界前的本地次日 raw release 显示窗口结束日
+![Dashboard 早晨 raw release 分组日期](./assets/dashboard-early-morning-raw-group-date.png)
 
 - Dashboard `日报` tab：brief 头部直接展示落库快照窗口与 effective time zone
 ![Dashboard 日报 tab 中的快照窗口与时区](./assets/dashboard-briefs-focused.png)
