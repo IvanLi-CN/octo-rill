@@ -758,6 +758,61 @@ function buildTaskDetail(
 					created_at: task.finished_at ?? task.updated_at,
 				},
 			],
+			diagnostics: {
+				business_outcome: {
+					code: skipped ? "disabled" : "partial",
+					label: skipped ? "已跳过" : "部分成功",
+					message: skipped
+						? "上一轮失败数据重试仍在执行，本轮仅记录跳过结果。"
+						: "失败数据重试已完成，日报、润色、翻译摘要可用于定位残留失败。",
+				},
+				retry_recent_failures: {
+					skipped,
+					skip_reason: skipped ? "previous_run_active" : null,
+					schedule_key: "interval:10:1772184300",
+					interval_minutes: 10,
+					lookback_hours: 24,
+					max_items_per_kind: 100,
+					kind_timeout_seconds: 600,
+					canceled: false,
+					daily_brief: {
+						kind: "daily_brief",
+						total: skipped ? 0 : 4,
+						processed: skipped ? 0 : 4,
+						succeeded: skipped ? 0 : 3,
+						failed: skipped ? 0 : 1,
+						skipped: 0,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 18300,
+						current_id: skipped ? null : "brief-failed-newest",
+						last_error: skipped ? null : "AI response missing content",
+					},
+					polish: {
+						kind: "polish",
+						total: skipped ? 0 : 2,
+						processed: skipped ? 0 : 2,
+						succeeded: skipped ? 0 : 2,
+						failed: 0,
+						skipped: 0,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 120,
+						current_id: skipped ? null : "work-smart-newest",
+						last_error: null,
+					},
+					translation: {
+						kind: "translation",
+						total: skipped ? 0 : 3,
+						processed: skipped ? 0 : 2,
+						succeeded: skipped ? 0 : 2,
+						failed: 0,
+						skipped: skipped ? 0 : 1,
+						timed_out: false,
+						duration_ms: skipped ? 0 : 140,
+						current_id: skipped ? null : "work-translation-newest",
+						last_error: null,
+					},
+				},
+			},
 		};
 	}
 	if (task.task_type === "sync.subscriptions") {
