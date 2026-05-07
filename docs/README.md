@@ -8,6 +8,7 @@
 - **先理解系统怎么拼起来**：看 [`architecture.md`](./architecture.md)
 - **先在本地跑起来**：看 [`../docs-site/docs/quick-start.md`](../docs-site/docs/quick-start.md)
 - **先核对运行配置**：看 [`../docs-site/docs/config.md`](../docs-site/docs/config.md)
+- **要接入公开仓库 Release 展示**：看 [`../docs-site/docs/public-releases.md`](../docs-site/docs/public-releases.md)
 - **先做前端 / Storybook 改动**：看 [`../web/README.md`](../web/README.md)
 - **要追某个主题的规格、实现与演进原因**：看 [`specs/README.md`](./specs/README.md)
 
