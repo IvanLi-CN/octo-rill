@@ -79,13 +79,15 @@ GET {OCTORILL_ORIGIN}/api/public/repos/{owner}/{repo}/releases/tag/{tag}
 ```json
 {
   "status": "pending_sync",
-  "message": "public release sync is pending",
-  "reason": "repo_not_cached",
+  "message": "Release data is being prepared. Retry after the suggested delay.",
+  "reason": "repository_registered_metadata_pending",
   "retry_after_seconds": 60,
   "repo_full_name": "IvanLi-CN/octo-rill",
   "last_requested_at": "2026-05-06T16:56:44Z"
 }
 ```
+
+`reason` 可能是 `repository_registered_metadata_pending` 或 `repository_registered_release_sync_pending`。接入方通常只需要按 `status=pending_sync` 和重试时间处理，不应把具体 reason 当作稳定业务分支。
 
 接入方应按 `retry_after_seconds` 或 `Retry-After` 延迟重试，不要在等待期内高频轮询。
 

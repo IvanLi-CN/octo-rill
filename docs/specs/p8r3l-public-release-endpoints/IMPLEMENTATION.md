@@ -17,7 +17,7 @@
 - 管理后台删除公开登记记录后，若该仓库不再被其他公开登记、登录用户 release 可见性或历史 brief membership 使用，会清理对应共享 `repo_releases`、release AI 缓存与 release sync state；仍被使用时保留缓存。
 - 公开列表页默认展示原文正文，但列表态会截断超长正文，详情页仍展示完整正文。
 - 公开 Release 页脚与全站 footer 保持一致：有效 `loadedVersion` 链接到 OctoRill 自身公开 Release 详情页，`unknown` 保持纯文本。
-- 公开文档站已提供面向接入方的 `公开 Release 接入` 页面，覆盖公开页面 URL、REST API、pending retry、分页参数与部署前检查。
+- 公开文档站已提供面向接入方的 `公开 Release 接入` 页面，覆盖公开页面 URL、REST API、pending retry、真实 pending reason 枚举、分页参数与部署前检查。
 
 ## Verification
 
