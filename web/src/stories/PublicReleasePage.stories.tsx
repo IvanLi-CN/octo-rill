@@ -9,7 +9,8 @@ import {
 	VersionMonitorStateProvider,
 } from "@/version/versionMonitor";
 
-const PUBLIC_RELEASE_VERSION_HREF = "/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
+const PUBLIC_RELEASE_VERSION_HREF =
+	"/public/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
 const PUBLIC_RELEASE_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
 	publicReleaseMobile390: {

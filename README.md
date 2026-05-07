@@ -15,6 +15,7 @@ OctoRill 把与“我”相关的 GitHub 动态整理成一个更适合持续阅
 - 公开产品说明：[`docs-site/docs/product.md`](./docs-site/docs/product.md)
 - 内部文档入口：[`docs/README.md`](./docs/README.md)
 - 系统概览：[`docs/architecture.md`](./docs/architecture.md)
+- 仓库治理与 GitHub 保护规则：[`docs/repository-governance.md`](./docs/repository-governance.md)
 - 内部产品参考：[`docs/product.md`](./docs/product.md)
 - 前端与 Storybook 贡献说明：[`web/README.md`](./web/README.md)
 
@@ -82,5 +83,6 @@ cargo check --locked --all-targets --all-features
 
 - 变更代码时同步更新文档；不要让 README、docs-site 与行为实现分叉。
 - 合到 `main` 的 PR 需要且只能有一个 `type:*` 标签和一个 `channel:*` 标签；文档改动通常使用 `type:docs`。
+- `main` 的 GitHub 保护规则、required checks 与 PR 合并门禁维护在 [`docs/repository-governance.md`](./docs/repository-governance.md) 与 `.github/quality-gates.json`。
 - LinuxDO 绑定、自托管 callback 与 AI 配置的细项统一写在 [`docs-site/docs/config.md`](./docs-site/docs/config.md)，不要再把 README 扩写成部署手册。
 - 如果改动影响页面或 Storybook 文档入口，先验证 docs-site build、Storybook build 与 assembled Pages smoke check。
