@@ -30,7 +30,7 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::session_store::ExpiredDeletion;
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::state::AppState;
@@ -39,7 +39,6 @@ use crate::{
     version,
 };
 
-const SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 const STATIC_ASSET_EXTENSIONS: &[&str] = &[
     "avif",
@@ -75,7 +74,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
 
     let connect_opts = build_sqlite_connect_options(&config.database_url)?;
 
-    let pool = build_sqlite_pool_options()
+    let pool = build_sqlite_pool_options(config.sqlite_pool_max_connections)
         .connect_with(connect_opts)
         .await
         .context("failed to open sqlite database")?;
@@ -98,9 +97,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         journal_mode = %pragmas.journal_mode,
         busy_timeout_ms = pragmas.busy_timeout_ms,
         synchronous = pragmas.synchronous,
-        pool_max_connections = SQLITE_POOL_MAX_CONNECTIONS,
+        pool_max_connections = config.sqlite_pool_max_connections,
         "sqlite runtime pragmas active"
     );
+    warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
 
     let session_store = SqliteStore::new(pool.clone());
     session_store
@@ -517,14 +517,42 @@ fn build_sqlite_connect_options(database_url: &str) -> Result<SqliteConnectOptio
     Ok(connect_opts)
 }
 
-fn build_sqlite_pool_options() -> SqlitePoolOptions {
-    // OctoRill runs against a single local SQLite file. Multiple pool connections inside the same
-    // process increase self-contention because SQLite still serializes writes. Keeping one shared
-    // connection avoids reintroducing `database is locked` during background workers + lease
-    // heartbeats, while retryable smart failures are now re-queued by the translation layer.
+fn build_sqlite_pool_options(max_connections: usize) -> SqlitePoolOptions {
+    // OctoRill uses WAL mode so readers can make progress while write-heavy workers run. Keep this
+    // pool configurable: production needs enough connections for HTTP requests and schedulers, while
+    // local/debug deployments can still force a single connection if they need serialized access.
+    let max_connections = u32::try_from(max_connections).unwrap_or(32).clamp(1, 32);
     SqlitePoolOptions::new()
-        .max_connections(SQLITE_POOL_MAX_CONNECTIONS)
+        .max_connections(max_connections)
         .min_connections(1)
+}
+
+fn warn_if_runtime_concurrency_exceeds_sqlite_pool(
+    config: &AppConfig,
+    runtime_settings: &admin_runtime::AdminRuntimeSettingsSnapshot,
+) {
+    let pool = config.sqlite_pool_max_connections;
+    let translation_workers = runtime_settings.translation_general_worker_concurrency
+        + runtime_settings.translation_dedicated_worker_concurrency;
+    let background_workers = config.job_worker_concurrency
+        + runtime_settings.repo_release_worker_concurrency
+        + translation_workers;
+    if runtime_settings.repo_release_worker_concurrency > pool
+        || translation_workers > pool.saturating_mul(2)
+        || background_workers > pool.saturating_mul(4)
+    {
+        warn!(
+            sqlite_pool_max_connections = pool,
+            job_worker_concurrency = config.job_worker_concurrency,
+            repo_release_worker_concurrency = runtime_settings.repo_release_worker_concurrency,
+            translation_general_worker_concurrency =
+                runtime_settings.translation_general_worker_concurrency,
+            translation_dedicated_worker_concurrency =
+                runtime_settings.translation_dedicated_worker_concurrency,
+            llm_max_concurrency = runtime_settings.llm_max_concurrency,
+            "runtime worker concurrency exceeds sqlite pool budget"
+        );
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -774,11 +802,10 @@ fn session_inactivity_expiry() -> Expiry {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SQLITE_POOL_MAX_CONNECTIONS, SameSite,
-        accepts_html_document, api_health, api_version, apply_no_store_headers,
-        attach_static_site_routes, build_session_cookie_name, build_sqlite_connect_options,
-        build_sqlite_pool_options, looks_like_static_asset_path, read_sqlite_runtime_pragmas,
-        session_inactivity_expiry, should_serve_spa_shell,
+        AppConfig, SESSION_COOKIE_MAX_AGE_SECS, SameSite, accepts_html_document, api_health,
+        api_version, apply_no_store_headers, attach_static_site_routes, build_session_cookie_name,
+        build_sqlite_connect_options, build_sqlite_pool_options, looks_like_static_asset_path,
+        read_sqlite_runtime_pragmas, session_inactivity_expiry, should_serve_spa_shell,
     };
     use axum::{
         Router,
@@ -948,6 +975,7 @@ mod tests {
             bind_addr: "127.0.0.1:58090".parse().expect("parse bind addr"),
             public_base_url: url::Url::parse(public_base_url).expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-server-tests"),
             job_worker_concurrency: 1,
@@ -1058,7 +1086,7 @@ mod tests {
             crate::local_id::generate_local_id(),
         ));
         let database_url = format!("sqlite:{}", database_path.display());
-        let pool = build_sqlite_pool_options()
+        let pool = build_sqlite_pool_options(8)
             .connect_with(
                 build_sqlite_connect_options(&database_url).expect("build sqlite connect options"),
             )
@@ -1075,9 +1103,9 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_pool_uses_single_connection_to_avoid_self_contention() {
-        let _ = build_sqlite_pool_options();
-        assert_eq!(SQLITE_POOL_MAX_CONNECTIONS, 1);
+    fn sqlite_pool_accepts_configurable_connection_budget() {
+        let _ = build_sqlite_pool_options(8);
+        let _ = build_sqlite_pool_options(1);
     }
 
     #[test]

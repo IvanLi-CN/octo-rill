@@ -6099,6 +6099,14 @@ struct PublicReleaseUsageRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct PublicReleaseLocalRepoRow {
+    repo_id: i64,
+    full_name: String,
+    is_private: i64,
+    metadata_updated_at: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
 struct PublicReleaseRow {
     release_id: i64,
     sort_ts: String,
@@ -6254,7 +6262,7 @@ async fn upsert_public_release_usage(
     .await
     .map_err(ApiError::internal)?;
 
-    sqlx::query_as::<_, PublicReleaseUsageRow>(
+    let row = sqlx::query_as::<_, PublicReleaseUsageRow>(
         r#"
         SELECT repo_id, full_name, last_requested_at, last_sync_status
         FROM public_repo_release_usage
@@ -6265,6 +6273,148 @@ async fn upsert_public_release_usage(
     .bind(full_name_lower.as_str())
     .fetch_one(&state.pool)
     .await
+    .map_err(ApiError::internal)?;
+
+    if row.repo_id.is_none()
+        && row.last_sync_status != "inaccessible"
+        && let Some(resolved) =
+            resolve_public_release_usage_from_local_metadata(state, full_name_lower.as_str())
+                .await?
+    {
+        return Ok(resolved);
+    }
+
+    Ok(row)
+}
+
+fn split_public_repo_full_name(full_name: &str) -> Option<(&str, &str)> {
+    let (owner, repo) = full_name.split_once('/')?;
+    let owner = owner.trim();
+    let repo = repo.trim();
+    (!owner.is_empty() && !repo.is_empty()).then_some((owner, repo))
+}
+
+fn public_local_metadata_is_fresh(updated_at: Option<&str>) -> bool {
+    const PUBLIC_LOCAL_METADATA_MAX_AGE_HOURS: i64 = 24;
+    let Some(updated_at) = updated_at else {
+        return false;
+    };
+    let Ok(updated_at) = chrono::DateTime::parse_from_rfc3339(updated_at) else {
+        return false;
+    };
+    chrono::Utc::now().signed_duration_since(updated_at.with_timezone(&chrono::Utc))
+        <= chrono::Duration::hours(PUBLIC_LOCAL_METADATA_MAX_AGE_HOURS)
+}
+
+async fn resolve_public_release_usage_from_local_metadata(
+    state: &AppState,
+    full_name_lower: &str,
+) -> Result<Option<PublicReleaseUsageRow>, ApiError> {
+    let Some(repo) = sqlx::query_as::<_, PublicReleaseLocalRepoRow>(
+        r#"
+        SELECT repo_id, full_name, is_private, updated_at AS metadata_updated_at
+        FROM starred_repos
+        WHERE lower(full_name) = ?
+        ORDER BY updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(full_name_lower)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    else {
+        return Ok(None);
+    };
+    if repo.is_private != 0 {
+        return Ok(None);
+    }
+    if !public_local_metadata_is_fresh(repo.metadata_updated_at.as_deref()) {
+        return Ok(None);
+    }
+
+    let release_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM repo_releases
+        WHERE repo_id = ?
+          AND is_draft = 0
+        "#,
+    )
+    .bind(repo.repo_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let Some((owner, repo_name)) = split_public_repo_full_name(repo.full_name.as_str()) else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let next_status = if release_count > 0 {
+        "ready"
+    } else {
+        "pending"
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE public_repo_release_usage
+        SET repo_id = ?,
+            owner_login = ?,
+            repo_name = ?,
+            full_name = ?,
+            full_name_lower = ?,
+            last_sync_status = ?,
+            last_sync_error = NULL,
+            updated_at = ?
+        WHERE full_name_lower = ?
+        "#,
+    )
+    .bind(repo.repo_id)
+    .bind(owner)
+    .bind(repo_name)
+    .bind(repo.full_name.as_str())
+    .bind(full_name_lower)
+    .bind(next_status)
+    .bind(now.as_str())
+    .bind(full_name_lower)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    if release_count == 0
+        && sync::enqueue_public_repo_release_sync(state, repo.repo_id, repo.full_name.as_str())
+            .await
+            .map_err(ApiError::internal)?
+    {
+        sqlx::query(
+            r#"
+            UPDATE public_repo_release_usage
+            SET last_sync_status = 'ready',
+                last_sync_error = NULL,
+                updated_at = ?
+            WHERE full_name_lower = ?
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(full_name_lower)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+
+    sqlx::query_as::<_, PublicReleaseUsageRow>(
+        r#"
+        SELECT repo_id, full_name, last_requested_at, last_sync_status
+        FROM public_repo_release_usage
+        WHERE full_name_lower = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(full_name_lower)
+    .fetch_one(&state.pool)
+    .await
+    .map(Some)
     .map_err(ApiError::internal)
 }
 
@@ -14705,6 +14855,7 @@ mod tests {
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
             job_worker_concurrency: 4,
@@ -14751,6 +14902,7 @@ mod tests {
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-task-logs-tests"),
             job_worker_concurrency: 4,
@@ -15505,7 +15657,20 @@ mod tests {
     }
 
     async fn seed_star(pool: &SqlitePool, repo_id: i64) {
-        let now = "2026-02-23T00:00:00Z";
+        seed_star_for_user_with_privacy(pool, 1, repo_id, false).await;
+    }
+
+    async fn seed_star_with_privacy(pool: &SqlitePool, repo_id: i64, is_private: bool) {
+        seed_star_for_user_with_privacy(pool, 1, repo_id, is_private).await;
+    }
+
+    async fn seed_star_for_user_with_privacy(
+        pool: &SqlitePool,
+        user_index: i64,
+        repo_id: i64,
+        is_private: bool,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
             r#"
             INSERT INTO starred_repos (
@@ -15513,19 +15678,20 @@ mod tests {
               description, html_url, stargazed_at, is_private, updated_at,
               owner_avatar_url, open_graph_image_url, uses_custom_open_graph_image
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(format!("star-{repo_id}"))
-        .bind(test_user_id(1))
+        .bind(format!("star-{user_index}-{repo_id}"))
+        .bind(test_user_id(user_index))
         .bind(repo_id)
         .bind("openai/codex")
         .bind("openai")
         .bind("codex")
         .bind("octo rill test")
         .bind("https://github.com/openai/codex")
-        .bind(now)
-        .bind(now)
+        .bind(now.as_str())
+        .bind(if is_private { 1_i64 } else { 0_i64 })
+        .bind(now.as_str())
         .bind("https://avatars.githubusercontent.com/u/14957082")
         .bind("https://repository-images.githubusercontent.com/14957082/codex")
         .bind(1_i64)
@@ -21062,6 +21228,389 @@ line two",
     }
 
     #[tokio::test]
+    async fn public_release_list_first_access_reuses_public_release_cache() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: Some("page".to_owned()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("public list ready from cache");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["release_id"], json!("120"));
+
+        let row: (Option<i64>, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status, last_sync_error
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, Some(42));
+        assert_eq!(row.1, "ready");
+        assert_eq!(row.2, None);
+    }
+
+    #[tokio::test]
+    async fn public_release_detail_first_access_reuses_public_release_cache() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool);
+
+        let response = public_get_repo_release_detail(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned(), "v1.2.3".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: Some("page".to_owned()),
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("public detail ready from cache");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["release_id"], json!("120"));
+        assert_eq!(body["repo_full_name"], json!("openai/codex"));
+        assert_eq!(body["tag_name"], json!("v1.2.3"));
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_with_public_metadata_queues_release_sync() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("public list release pending");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_release_sync_pending")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, Some(42));
+        assert_eq!(row.1, "pending");
+
+        let work_item: (i64, String, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, status, request_origin
+            FROM repo_release_work_items
+            WHERE repo_id = 42
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("repo release work item");
+        assert_eq!(work_item.0, 42);
+        assert_eq!(work_item.1, jobs::STATUS_QUEUED);
+        assert_eq!(work_item.2, "interactive");
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_marks_fresh_empty_release_cache_ready() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            r#"
+            INSERT INTO repo_release_work_items (
+              id, repo_id, repo_full_name, status, request_origin, priority,
+              has_new_repo_watchers, deadline_at, last_release_count,
+              last_candidate_failures, last_success_at, created_at, updated_at
+            )
+            VALUES (
+              'repo-release-work-empty', 42, 'openai/codex', 'succeeded',
+              'system', 0, 0, ?, 0, 0, ?, ?, ?
+            )
+            "#,
+        )
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .bind(now.as_str())
+        .execute(&pool)
+        .await
+        .expect("seed fresh empty release work item");
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("fresh empty release cache should be ready");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], json!("ready"));
+        assert_eq!(body["items"].as_array().unwrap().len(), 0);
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, Some(42));
+        assert_eq!(row.1, "ready");
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_does_not_reuse_private_metadata() {
+        let pool = setup_pool().await;
+        seed_star_with_privacy(&pool, 42, true).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("private metadata should remain metadata pending");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_does_not_reuse_stale_public_metadata() {
+        let pool = setup_pool().await;
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
+        sqlx::query(
+            r#"
+            UPDATE starred_repos
+            SET updated_at = '2026-02-23T00:00:00Z'
+            WHERE repo_id = 42
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("stale starred metadata");
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("stale metadata should remain metadata pending");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_uses_newest_privacy_metadata() {
+        let pool = setup_pool().await;
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, github_user_id, login, created_at, updated_at)
+            VALUES (?, 30215106, 'second-user', ?, ?)
+            "#,
+        )
+        .bind(test_user_id(2))
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed second user");
+        seed_star_for_user_with_privacy(&pool, 2, 42, false).await;
+        sqlx::query(
+            r#"
+            UPDATE starred_repos
+            SET updated_at = '2026-02-23T00:00:00Z'
+            WHERE user_id = ? AND repo_id = 42
+            "#,
+        )
+        .bind(test_user_id(2))
+        .execute(&pool)
+        .await
+        .expect("make public metadata older");
+        seed_star_with_privacy(&pool, 42, true).await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("newer private metadata should win");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
+    async fn public_release_list_first_access_does_not_reuse_owned_only_baseline() {
+        let pool = setup_pool().await;
+        set_include_own_releases(&pool, true).await;
+        seed_owned_repo_baseline(&pool, 42, "openai/codex").await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+
+        let response = public_list_repo_releases(
+            State(state),
+            Path(("openai".to_owned(), "codex".to_owned())),
+            Query(PublicReleaseQuery {
+                content: None,
+                lang: None,
+                source: None,
+                cursor: None,
+                limit: None,
+            }),
+        )
+        .await
+        .expect("owned-only baseline should not prove public visibility");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["reason"],
+            json!("repository_registered_metadata_pending")
+        );
+        let row: (Option<i64>, String) = sqlx::query_as(
+            r#"
+            SELECT repo_id, last_sync_status
+            FROM public_repo_release_usage
+            WHERE full_name_lower = 'openai/codex'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("public usage row");
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, "pending");
+    }
+
+    #[tokio::test]
     async fn public_release_list_rejects_unsupported_language() {
         let pool = setup_pool().await;
         let state = setup_state(pool);
@@ -21289,6 +21838,8 @@ line two",
     async fn public_release_list_blocks_unresolved_inaccessible_repo() {
         let pool = setup_pool().await;
         seed_public_release_usage(&pool, None, "inaccessible").await;
+        seed_star(&pool, 42).await;
+        seed_repo_release(&pool, 42, 120).await;
         let state = setup_state(pool);
 
         let err = public_list_repo_releases(
