@@ -4,11 +4,24 @@ import { Button } from "@/components/ui/button";
 import { useVersionMonitor } from "@/version/versionMonitor";
 
 export function VersionUpdateNotice() {
-	const { availableVersion, hasUpdate, refreshPage } = useVersionMonitor();
+	const { availableVersion, hasServiceWorkerUpdate, hasUpdate, refreshPage } =
+		useVersionMonitor();
 
-	if (!hasUpdate || !availableVersion) {
+	if (!hasUpdate && !hasServiceWorkerUpdate) {
 		return null;
 	}
+
+	const message = availableVersion ? (
+		<>
+			检测到新版本{" "}
+			<span className="font-mono font-medium">{availableVersion}</span>
+			，按需刷新即可。
+		</>
+	) : hasServiceWorkerUpdate ? (
+		"检测到新前端版本，按需刷新即可。"
+	) : (
+		"检测到新版本，按需刷新即可。"
+	);
 
 	return (
 		<div
@@ -17,9 +30,7 @@ export function VersionUpdateNotice() {
 		>
 			<div className="mx-auto flex min-h-10 max-w-6xl items-center justify-between gap-3 px-6 py-2">
 				<p className="text-[13px] text-amber-950/85 dark:text-amber-100/90 sm:text-sm">
-					检测到新版本{" "}
-					<span className="font-mono font-medium">{availableVersion}</span>
-					，按需刷新即可。
+					{message}
 				</p>
 				<Button
 					type="button"

@@ -652,21 +652,17 @@ async fn version_no_store_cache(req: Request, next: Next) -> Response {
 
 fn attach_static_site_routes(app: Router, static_dir: PathBuf) -> Router {
     let index = static_dir.join("index.html");
-    let spa_shell = ServeFile::new(index.clone());
     let spa_static = Arc::new(SpaStaticPaths {
         static_dir,
         index_path: index,
     });
 
-    app.route_service("/", spa_shell.clone())
-        .route_service("/admin", spa_shell.clone())
-        .route_service("/admin/{*path}", spa_shell)
-        .fallback({
-            move |request: Request| {
-                let spa_static = Arc::clone(&spa_static);
-                async move { spa_document_fallback_handler(request, spa_static).await }
-            }
-        })
+    app.fallback({
+        move |request: Request| {
+            let spa_static = Arc::clone(&spa_static);
+            async move { spa_document_fallback_handler(request, spa_static).await }
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -679,22 +675,44 @@ async fn spa_document_fallback_handler(
     request: Request,
     spa_static: Arc<SpaStaticPaths>,
 ) -> Response {
-    if looks_like_static_asset_path(request.uri().path()) {
+    if looks_like_static_asset_path(request.uri().path())
+        && !is_admin_app_path(request.uri().path())
+    {
+        let request_path = request.uri().path().to_owned();
         return match ServeDir::new(spa_static.static_dir.clone())
             .oneshot(request)
             .await
         {
-            Ok(response) => into_axum_body(response),
+            Ok(response) => {
+                let mut response = into_axum_body(response);
+                apply_static_site_cache_headers(
+                    &request_path,
+                    false,
+                    response.status(),
+                    response.headers_mut(),
+                );
+                response
+            }
             Err(err) => match err {},
         };
     }
 
     if should_serve_spa_shell(request.method(), request.uri(), request.headers()) {
+        let request_path = request.uri().path().to_owned();
         return match ServeFile::new(spa_static.index_path.clone())
             .oneshot(request)
             .await
         {
-            Ok(response) => into_axum_body(response),
+            Ok(response) => {
+                let mut response = into_axum_body(response);
+                apply_static_site_cache_headers(
+                    &request_path,
+                    true,
+                    response.status(),
+                    response.headers_mut(),
+                );
+                response
+            }
             Err(err) => match err {},
         };
     }
@@ -716,12 +734,42 @@ where
 fn should_serve_spa_shell(method: &Method, uri: &Uri, headers: &HeaderMap) -> bool {
     matches!(*method, Method::GET | Method::HEAD)
         && !is_reserved_backend_path(uri.path())
-        && !looks_like_static_asset_path(uri.path())
-        && accepts_html_document(headers)
+        && (!looks_like_static_asset_path(uri.path()) || is_admin_app_path(uri.path()))
+        && (is_spa_entry_path(uri.path()) || accepts_html_document(headers))
 }
 
 fn is_reserved_backend_path(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/auth" || path.starts_with("/auth/")
+}
+
+fn is_admin_app_path(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
+}
+
+fn is_spa_entry_path(path: &str) -> bool {
+    path == "/" || path == "/admin"
+}
+
+fn apply_static_site_cache_headers(
+    path: &str,
+    spa_shell: bool,
+    status: StatusCode,
+    headers: &mut HeaderMap,
+) {
+    let cache_control: &'static str = if spa_shell || path == "/sw.js" {
+        "no-store, no-cache, must-revalidate"
+    } else if path == "/manifest.webmanifest" {
+        "no-cache"
+    } else if status.is_success() && path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
 }
 
 fn looks_like_static_asset_path(path: &str) -> bool {
@@ -1194,6 +1242,13 @@ mod tests {
             "console.log('asset-ok');",
         )
         .expect("write asset file");
+        fs::write(fixture_root.join("sw.js"), "self.__OCTORILL_SW = true;")
+            .expect("write service worker");
+        fs::write(
+            fixture_root.join("manifest.webmanifest"),
+            r#"{"name":"OctoRill"}"#,
+        )
+        .expect("write manifest");
 
         let app = attach_static_site_routes(
             Router::new()
@@ -1215,6 +1270,20 @@ mod tests {
 
         let client = reqwest::Client::new();
 
+        let root_response = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect("request root");
+        assert_eq!(root_response.status(), StatusCode::OK);
+        assert!(
+            root_response
+                .text()
+                .await
+                .expect("read root body")
+                .contains("spa-shell")
+        );
+
         let settings_response = client
             .get(format!("http://{addr}/settings?section=github-pat"))
             .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
@@ -1222,6 +1291,13 @@ mod tests {
             .await
             .expect("request settings");
         assert_eq!(settings_response.status(), StatusCode::OK);
+        assert_eq!(
+            settings_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, no-cache, must-revalidate")
+        );
         assert!(
             settings_response
                 .text()
@@ -1262,6 +1338,21 @@ mod tests {
                 .contains("spa-shell")
         );
 
+        let dotted_admin_asset_like_route = client
+            .get(format!("http://{addr}/admin/jobs/tasks/task-sync.json"))
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .send()
+            .await
+            .expect("request asset-like dotted admin route");
+        assert_eq!(dotted_admin_asset_like_route.status(), StatusCode::OK);
+        assert!(
+            dotted_admin_asset_like_route
+                .text()
+                .await
+                .expect("read asset-like dotted admin route body")
+                .contains("spa-shell")
+        );
+
         let asset_response = client
             .get(format!("http://{addr}/assets/app.js"))
             .send()
@@ -1269,8 +1360,43 @@ mod tests {
             .expect("request asset");
         assert_eq!(asset_response.status(), StatusCode::OK);
         assert_eq!(
+            asset_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
             asset_response.text().await.expect("read asset body"),
             "console.log('asset-ok');"
+        );
+
+        let sw_response = client
+            .get(format!("http://{addr}/sw.js"))
+            .send()
+            .await
+            .expect("request service worker");
+        assert_eq!(sw_response.status(), StatusCode::OK);
+        assert_eq!(
+            sw_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, no-cache, must-revalidate")
+        );
+
+        let manifest_response = client
+            .get(format!("http://{addr}/manifest.webmanifest"))
+            .send()
+            .await
+            .expect("request manifest");
+        assert_eq!(manifest_response.status(), StatusCode::OK);
+        assert_eq!(
+            manifest_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
         );
 
         let missing_asset_response = client
@@ -1280,6 +1406,13 @@ mod tests {
             .await
             .expect("request missing asset");
         assert_eq!(missing_asset_response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_asset_response
+                .headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
 
         let missing_api_response = client
             .get(format!("http://{addr}/api/missing"))

@@ -296,6 +296,7 @@ function SettingsStoryScene(args: SettingsStoryArgs) {
 					loadedVersion: "v2.4.6",
 					availableVersion: null,
 					hasUpdate: false,
+					hasServiceWorkerUpdate: false,
 					refreshPage: () => {},
 				}}
 			>
