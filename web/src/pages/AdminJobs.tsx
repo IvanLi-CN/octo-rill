@@ -15,14 +15,14 @@ export function AdminJobs(props: {
 			replace?: boolean;
 		},
 	) => void;
-	syncSettingsDialogDefaultOpen?: boolean;
+	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 }) {
 	const {
 		me,
 		routeState,
 		onNavigateRoute,
-		syncSettingsDialogDefaultOpen,
+		taskIntervalSettingsDialogDefaultOpen,
 		syncSettingsHelpTooltipsOpen,
 	} = props;
 
@@ -37,7 +37,9 @@ export function AdminJobs(props: {
 				currentUserId={me.user.id}
 				routeState={routeState}
 				onNavigateRoute={onNavigateRoute}
-				syncSettingsDialogDefaultOpen={syncSettingsDialogDefaultOpen}
+				taskIntervalSettingsDialogDefaultOpen={
+					taskIntervalSettingsDialogDefaultOpen
+				}
 				syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 			/>
 		</AppShell>
