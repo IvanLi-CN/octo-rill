@@ -11,7 +11,7 @@
 - 提供未登录可访问的公开 Release 列表页与详情页。
 - 提供未登录 REST API：公开仓库 Release 列表与 tag 详情。
 - 公开 Release 页面页脚展示当前 OctoRill 前端加载版本，并链接到 OctoRill 自身 public-only Release 详情页，登录态不得把该链接切到 Dashboard。
-- 首次访问仅登记仓库 usage；API 返回可重试 pending 响应，网页显示等待界面并轮询。
+- 首次访问先登记仓库 usage；若本地已有近期刷新且明确公开的仓库 metadata 与非草稿 Release 缓存，则直接复用共享缓存返回 ready；若只有近期公开 metadata 但尚无 Release 缓存，则回填 `repo_id` 并返回可重试 pending 响应；若本地无法确认近期公开 metadata，则返回 metadata pending。
 - 公开端点与登录用户视图复用同一份仓库级 `repo_releases` 主数据。
 - 管理后台展示公开端点登记仓库、访问统计、同步状态、共享缓存数据量，并允许删除登记记录。
 
@@ -69,6 +69,10 @@
 - Given 第三方调用公开 API 且仓库尚未缓存
   When 请求到达服务端
   Then 响应为 `202 Accepted`，包含 `Retry-After` 与 pending JSON。
+
+- Given 第三方首次调用公开 API 且本地已有近期公开仓库 metadata 与共享 Release 缓存
+  When 请求到达服务端
+  Then 响应为 `200 OK`，并将公开 usage 回填到已知 `repo_id`。
 
 - Given 公开仓库同步完成
   When 未登录页面/API 与登录用户视图读取同一 Release

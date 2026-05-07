@@ -658,6 +658,7 @@ mod tests {
                 .expect("parse bind addr"),
             public_base_url: Url::parse("http://127.0.0.1:58090").expect("parse public base url"),
             database_url: "sqlite::memory:".to_owned(),
+            sqlite_pool_max_connections: 8,
             static_dir: None,
             task_log_dir: std::env::temp_dir().join("octo-rill-admin-runtime-tests"),
             job_worker_concurrency: 2,
