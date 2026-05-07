@@ -163,6 +163,7 @@
 - state: `scheduled-tab-retry-recent-failures`
 - evidence_note: 验证“定时任务”卡片右上角存在任务间隔设置按钮，列表包含 `retry.recent_failures` 运行记录。
 
+PR: include
 ![定时任务页失败数据重试入口](./assets/admin-jobs-scheduled-retry-intervals.png)
 
 - source_type: `storybook_canvas`
@@ -176,6 +177,7 @@
 - state: `task-interval-settings-clean-dialog`
 - evidence_note: 验证“任务间隔设置”弹窗只包含订阅同步与失败数据重试间隔，默认 10 分钟，不包含 worker 配置或最近链路用时。
 
+PR: include
 ![任务间隔设置弹窗](./assets/admin-jobs-task-interval-settings.png)
 
 - source_type: `storybook_canvas`
@@ -189,6 +191,7 @@
 - state: `retry-recent-failures-detail`
 - evidence_note: 验证 `retry.recent_failures` 详情展示日报、润色、翻译三类重试摘要、任务间隔、调度键与最后错误。
 
+PR: include
 ![失败数据重试详情](./assets/admin-jobs-retry-recent-failures-detail.png)
 
 ## 参考（References）
