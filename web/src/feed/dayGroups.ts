@@ -179,6 +179,7 @@ export function groupFeedItemsByDay(
 	dailyBoundaryUtcOffsetMinutes: number | null | undefined,
 	briefs: BriefSnapshotCandidate[] = [],
 	now = new Date(),
+	displayHistoricalRawGroupsByBriefDate = false,
 ) {
 	const boundary = parseDailyBoundaryLocal(dailyBoundaryLocal);
 	const currentWindowStartKey = resolveWindowStartDateKey(
@@ -346,7 +347,12 @@ export function groupFeedItemsByDay(
 			{
 				kind: historicalBrief ? "historical" : "raw",
 				id: groupId,
-				displayDate: historicalBrief?.date ?? windowStartKey,
+				displayDate:
+					historicalBrief?.date ??
+					(displayHistoricalRawGroupsByBriefDate &&
+					rawGroupId !== currentGroupId
+						? briefDate
+						: windowStartKey),
 				briefDate: historicalBrief?.date ?? briefDate,
 				briefId: historicalBrief?.id ?? null,
 				items: [],

@@ -1530,7 +1530,7 @@ test.describe("mobile dashboard shell", () => {
 		const reactionFooter = page
 			.locator('[data-reaction-footer="true"]')
 			.first();
-		const dayLabel = page.getByText(/^2026-04-08 · 1 条 Release$/);
+		const dayLabel = page.getByText(/^2026-04-09 · 1 条 Release$/);
 		const dayHeader = dayLabel.locator(
 			"xpath=ancestor::*[@data-feed-day-header='true'][1]",
 		);
