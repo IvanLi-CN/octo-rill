@@ -13,4 +13,4 @@
 - 2026-03-03: 关联 PR #20，CI Pipeline 全绿。
 - 2026-04-15: 修复 `web-builder` 对仓库根 `Cargo.toml` 的强依赖；前端构建改为 env 优先、Cargo 可选兜底、缺省回退 `"unknown"`，Docker 全仓库构建仍保留 Cargo fallback，并把 Docker smoke 并入既有 `Build (Release)` CI 门禁。
 - 2026-04-15: 补齐历史 release backfill：当补跑旧 `release_head_sha` 时，`docker-release` 叠加当前 workflow revision 的 Docker/web 构建基础设施修复，避免旧源码再次触发已修复的 `Cargo.toml` 构建断链。
-- 2026-05-07: Footer 的有效版本号改为指向 OctoRill 自身公开 Release 详情页；`unknown` 降级态继续保持纯文本，避免生成无效内部链接。
+- 2026-05-07: Footer 的有效版本号改为指向 OctoRill 自身 public-only Release 详情页；`unknown` 降级态继续保持纯文本，避免生成无效内部链接。

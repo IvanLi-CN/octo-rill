@@ -9,7 +9,7 @@ export function buildVersionReleaseHref(version: string): string | null {
 		return null;
 	}
 
-	return `/${PROJECT_RELEASE_OWNER}/${PROJECT_RELEASE_REPO}/releases/tag/${encodeURIComponent(tag)}`;
+	return `/public/${PROJECT_RELEASE_OWNER}/${PROJECT_RELEASE_REPO}/releases/tag/${encodeURIComponent(tag)}`;
 }
 
 export function buildVersionReleaseTag(version: string): string | null {
