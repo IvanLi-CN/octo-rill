@@ -9,24 +9,18 @@ const REPOSITORY_URL = "https://github.com/IvanLi-CN/octo-rill";
 export function AppMetaFooter() {
 	const { loadedVersion } = useVersionMonitor();
 	const versionReleaseHref = buildVersionReleaseHref(loadedVersion);
-	const {
-		footerHidden,
-		mobileChromeEnabled,
-		isMobileViewport,
-		viewportBottomInset,
-	} = useAppShellChrome();
+	const { footerHidden, mobileChromeEnabled, isMobileViewport } =
+		useAppShellChrome();
 	const currentYear = new Date().getFullYear();
 
 	return (
 		<footer
-			className={`supports-[backdrop-filter]:bg-background/70 bg-background/95 fixed inset-x-0 bottom-0 z-30 border-t backdrop-blur transition-transform duration-200 ease-out ${
-				footerHidden ? "translate-y-full pointer-events-none" : "translate-y-0"
-			}`}
+			className="supports-[backdrop-filter]:bg-background/70 bg-background/95 border-t backdrop-blur"
 			data-app-meta-footer-hidden={footerHidden ? "true" : "false"}
 			style={
 				mobileChromeEnabled && isMobileViewport
 					? {
-							bottom: `calc(env(safe-area-inset-bottom, 0px) + ${viewportBottomInset}px)`,
+							paddingBottom: "env(safe-area-inset-bottom, 0px)",
 						}
 					: undefined
 			}
