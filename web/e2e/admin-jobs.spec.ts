@@ -1887,11 +1887,11 @@ test("admin can manage jobs center", async ({ page }) => {
 	).toBeVisible();
 	await page.getByRole("button", { name: "配置订阅同步 worker 数量" }).click();
 	const syncSettingsDialog = page.getByRole("dialog", {
-		name: "任务间隔设置",
+		name: "订阅同步设置",
 	});
 	await expect(syncSettingsDialog).toBeVisible();
 	await expect(
-		syncSettingsDialog.getByText("task-subscriptions-1"),
+		syncSettingsDialog.getByRole("slider", { name: "Release worker 数量" }),
 	).toBeVisible();
 	await expect(
 		syncSettingsDialog.getByText("task-subscriptions-skipped"),

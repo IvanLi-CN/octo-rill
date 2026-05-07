@@ -1298,7 +1298,7 @@ type AdminJobsPreviewProps = {
 	autoOpenConversation?: boolean;
 	llmSourceFilter?: string;
 	translationState?: "default" | "busy" | "recovered" | "failed";
-	syncSettingsDialogDefaultOpen?: boolean;
+	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
@@ -1335,7 +1335,7 @@ function AdminJobsPreview({
 	autoOpenConversation = false,
 	llmSourceFilter = "",
 	translationState = "default",
-	syncSettingsDialogDefaultOpen = false,
+	taskIntervalSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltipsOpen = false,
 }: AdminJobsPreviewProps) {
 	const [ready, setReady] = useState(false);
@@ -2187,7 +2187,9 @@ function AdminJobsPreview({
 					daily_boundary_utc_offset_minutes: 480,
 				},
 			}}
-			syncSettingsDialogDefaultOpen={syncSettingsDialogDefaultOpen}
+			taskIntervalSettingsDialogDefaultOpen={
+				taskIntervalSettingsDialogDefaultOpen
+			}
 			syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 		/>
 	);
@@ -2283,7 +2285,7 @@ export const SubscriptionSyncWorkflow: Story = {
 			canvas.getByRole("button", { name: "配置订阅同步 worker 数量" }),
 		);
 		await expect(
-			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
+			await canvas.findByRole("dialog", { name: "订阅同步设置" }),
 		).toBeVisible();
 		await expect(
 			canvas.getByRole("slider", { name: "Release worker 数量" }),
@@ -2410,18 +2412,18 @@ export const SubscriptionSyncDetailRunning: Story = {
 	},
 };
 
-export const SubscriptionSyncSettings: Story = {
+export const ScheduledTaskIntervalSettings: Story = {
 	render: () => (
 		<AdminJobsPreview
-			routeUrl="/admin/jobs/subscriptions"
-			syncSettingsDialogDefaultOpen
+			routeUrl="/admin/jobs/scheduled"
+			taskIntervalSettingsDialogDefaultOpen
 		/>
 	),
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"直接展示任务间隔设置面板，覆盖订阅同步间隔、失败数据重试默认 10 分钟与 worker 滑块。",
+					"直接展示定时任务间隔设置面板，只覆盖订阅同步间隔与失败数据重试默认 10 分钟。",
 			},
 		},
 	},
@@ -2433,43 +2435,33 @@ export const SubscriptionSyncSettings: Story = {
 		await expect(
 			canvas.getByRole("slider", { name: "失败数据重试间隔（分钟）" }),
 		).toHaveAttribute("aria-valuenow", "10");
-		await expect(canvas.getByLabelText("Release worker 数量输入")).toHaveValue(
-			12,
-		);
+		expect(canvas.queryByLabelText("Release worker 数量输入")).toBeNull();
+		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
 	},
 };
 
-export const SyncSettingsTooltipDemo: Story = {
+export const TaskIntervalSettingsCleanDialog: Story = {
 	render: () => (
 		<AdminJobsPreview
 			routeUrl="/admin/jobs/scheduled"
-			syncSettingsDialogDefaultOpen
-			syncSettingsHelpTooltipsOpen
+			taskIntervalSettingsDialogDefaultOpen
 		/>
 	),
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"演示任务间隔设置弹窗中的帮助提示同时展开，用于截图验收说明信息的位置与遮罩裁切。",
+					"用于视觉验收：任务间隔设置弹窗不得包含 worker 配置或最近链路用时。",
 			},
 		},
 	},
 	play: async ({ canvasElement }) => {
 		const canvas = within(canvasElement);
-		const screen = within(canvasElement.ownerDocument.body);
 		await expect(
 			await canvas.findByRole("dialog", { name: "任务间隔设置" }),
 		).toBeVisible();
-		await waitFor(() => {
-			const tooltipText = screen
-				.getAllByRole("tooltip")
-				.map((element) => element.textContent ?? "")
-				.join("\n");
-			expect(tooltipText).toContain("保存后立即生效");
-			expect(tooltipText).toContain("刻度按非线性分布");
-			expect(tooltipText).toContain("用时从定时触发开始");
-		});
+		expect(canvas.queryByText("Release worker 数量")).toBeNull();
+		expect(canvas.queryByText("最近三次链路用时")).toBeNull();
 	},
 };
 

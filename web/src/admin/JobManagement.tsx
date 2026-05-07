@@ -1286,7 +1286,7 @@ type JobManagementProps = {
 			replace?: boolean;
 		},
 	) => void;
-	syncSettingsDialogDefaultOpen?: boolean;
+	taskIntervalSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 };
 
@@ -3338,12 +3338,10 @@ export function JobManagement({
 	currentUserId,
 	routeState: controlledRouteState,
 	onNavigateRoute,
-	syncSettingsDialogDefaultOpen = false,
+	taskIntervalSettingsDialogDefaultOpen = false,
 	syncSettingsHelpTooltipsOpen = false,
 }: JobManagementProps) {
 	const isRouteControlled = controlledRouteState !== undefined;
-	const tooltipDemoContentClass =
-		"w-60 max-w-60 whitespace-normal break-words text-left leading-relaxed";
 	const [uncontrolledRouteState, setUncontrolledRouteState] =
 		useState<AdminJobsRouteState>(() =>
 			parseAdminJobsRoute(window.location.pathname, window.location.search),
@@ -3385,9 +3383,12 @@ export function JobManagement({
 	const [syncRuntimeConfigError, setSyncRuntimeConfigError] = useState<
 		string | null
 	>(null);
-	const [syncSettingsDialogOpen, setSyncSettingsDialogOpen] = useState(
-		syncSettingsDialogDefaultOpen,
-	);
+	const [taskIntervalSettingsDialogOpen, setTaskIntervalSettingsDialogOpen] =
+		useState(taskIntervalSettingsDialogDefaultOpen);
+	const [
+		subscriptionSyncSettingsDialogOpen,
+		setSubscriptionSyncSettingsDialogOpen,
+	] = useState(false);
 	const [syncAutoFetchIntervalInput, setSyncAutoFetchIntervalInput] =
 		useState(60);
 	const [
@@ -3847,13 +3848,10 @@ export function JobManagement({
 		}
 	}, []);
 
-	const saveSyncRuntimeConfig = useCallback(async () => {
+	const saveTaskIntervalSettings = useCallback(async () => {
 		const nextInterval = clampSyncAutoFetchInterval(syncAutoFetchIntervalInput);
 		const nextRetryInterval = clampSyncAutoFetchInterval(
 			retryRecentFailuresIntervalInput,
-		);
-		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
-			repoReleaseWorkerConcurrencyInput,
 		);
 		setSyncRuntimeConfigSaving(true);
 		setSyncRuntimeConfigError(null);
@@ -3861,7 +3859,6 @@ export function JobManagement({
 			const res = await apiPatchAdminSyncRuntimeConfig({
 				sync_auto_fetch_interval_minutes: nextInterval,
 				retry_recent_failures_interval_minutes: nextRetryInterval,
-				repo_release_worker_concurrency: nextWorkerConcurrency,
 			});
 			setSyncRuntimeConfig(res);
 			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
@@ -3870,7 +3867,7 @@ export function JobManagement({
 					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
 			);
 			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
-			setSyncSettingsDialogOpen(false);
+			setTaskIntervalSettingsDialogOpen(false);
 			await Promise.all([
 				loadScheduledRuns({ background: true }),
 				loadSubscriptionRuns({ background: true }),
@@ -3885,12 +3882,51 @@ export function JobManagement({
 		loadOverview,
 		loadScheduledRuns,
 		loadSubscriptionRuns,
-		repoReleaseWorkerConcurrencyInput,
 		retryRecentFailuresIntervalInput,
 		syncAutoFetchIntervalInput,
 	]);
 
-	const openSyncSettingsDialog = useCallback(() => {
+	const saveSubscriptionSyncSettings = useCallback(async () => {
+		const currentInterval = clampSyncAutoFetchInterval(
+			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ??
+				syncAutoFetchIntervalInput,
+		);
+		const nextWorkerConcurrency = clampRepoReleaseWorkerConcurrency(
+			repoReleaseWorkerConcurrencyInput,
+		);
+		setSyncRuntimeConfigSaving(true);
+		setSyncRuntimeConfigError(null);
+		try {
+			const res = await apiPatchAdminSyncRuntimeConfig({
+				sync_auto_fetch_interval_minutes: currentInterval,
+				repo_release_worker_concurrency: nextWorkerConcurrency,
+			});
+			setSyncRuntimeConfig(res);
+			setSyncAutoFetchIntervalInput(res.sync_auto_fetch_interval_minutes);
+			setRetryRecentFailuresIntervalInput(
+				res.retry_recent_failures_interval_minutes ??
+					RETRY_RECENT_FAILURES_INTERVAL_DEFAULT,
+			);
+			setRepoReleaseWorkerConcurrencyInput(res.repo_release_worker_concurrency);
+			setSubscriptionSyncSettingsDialogOpen(false);
+			await Promise.all([
+				loadSubscriptionRuns({ background: true }),
+				loadOverview({ background: true }),
+			]);
+		} catch (err) {
+			setSyncRuntimeConfigError(normalizeErrorMessage(err));
+		} finally {
+			setSyncRuntimeConfigSaving(false);
+		}
+	}, [
+		loadOverview,
+		loadSubscriptionRuns,
+		repoReleaseWorkerConcurrencyInput,
+		syncAutoFetchIntervalInput,
+		syncRuntimeConfig,
+	]);
+
+	const openTaskIntervalSettingsDialog = useCallback(() => {
 		setSyncRuntimeConfigError(null);
 		setSyncAutoFetchIntervalInput(
 			syncRuntimeConfig?.sync_auto_fetch_interval_minutes ?? 60,
@@ -3902,7 +3938,15 @@ export function JobManagement({
 		setRepoReleaseWorkerConcurrencyInput(
 			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
 		);
-		setSyncSettingsDialogOpen(true);
+		setTaskIntervalSettingsDialogOpen(true);
+	}, [syncRuntimeConfig]);
+
+	const openSubscriptionSyncSettingsDialog = useCallback(() => {
+		setSyncRuntimeConfigError(null);
+		setRepoReleaseWorkerConcurrencyInput(
+			syncRuntimeConfig?.repo_release_worker_concurrency ?? 5,
+		);
+		setSubscriptionSyncSettingsDialogOpen(true);
 	}, [syncRuntimeConfig]);
 
 	const loadLlmSchedulerStatus = useCallback(async (options?: LoadOptions) => {
@@ -4556,7 +4600,7 @@ export function JobManagement({
 
 	const onOpenSyncTaskDetailFromSettings = useCallback(
 		(taskId: string) => {
-			setSyncSettingsDialogOpen(false);
+			setSubscriptionSyncSettingsDialogOpen(false);
 			window.setTimeout(() => onOpenTaskDetail(taskId), 150);
 		},
 		[onOpenTaskDetail],
@@ -4963,7 +5007,7 @@ export function JobManagement({
 								variant="outline"
 								size="icon"
 								aria-label="配置定时任务间隔"
-								onClick={openSyncSettingsDialog}
+								onClick={openTaskIntervalSettingsDialog}
 								disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
 							>
 								<Settings2 />
@@ -5135,7 +5179,7 @@ export function JobManagement({
 							relatedLlmCalls={taskRelatedLlmCalls}
 							relatedLlmCallsLoading={taskRelatedLlmLoading}
 							onBack={onBackToSubscriptionRuns}
-							onOpenSettings={openSyncSettingsDialog}
+							onOpenSettings={openSubscriptionSyncSettingsDialog}
 							onOpenLlmCallDetail={onOpenLlmCallDetail}
 						/>
 					) : (
@@ -5153,7 +5197,7 @@ export function JobManagement({
 									variant="outline"
 									size="icon"
 									aria-label="配置订阅同步 worker 数量"
-									onClick={openSyncSettingsDialog}
+									onClick={openSubscriptionSyncSettingsDialog}
 									disabled={!syncRuntimeConfig || syncRuntimeConfigSaving}
 								>
 									<Settings2 />
@@ -5579,9 +5623,165 @@ export function JobManagement({
 			</Tabs>
 
 			<Dialog
-				open={syncSettingsDialogOpen}
+				open={taskIntervalSettingsDialogOpen}
 				onOpenChange={(open) => {
-					setSyncSettingsDialogOpen(open);
+					setTaskIntervalSettingsDialogOpen(open);
+					if (!open) {
+						setSyncRuntimeConfigError(null);
+					}
+				}}
+			>
+				<DialogContent
+					className="sm:max-w-2xl"
+					onOpenAutoFocus={(event) => {
+						event.preventDefault();
+						window.requestAnimationFrame(() => {
+							document
+								.getElementById("retry-recent-failures-interval")
+								?.focus();
+						});
+					}}
+				>
+					<DialogHeader>
+						<div className="flex items-center gap-2">
+							<DialogTitle>任务间隔设置</DialogTitle>
+						</div>
+						<DialogDescription>
+							只调整定时任务触发间隔；保存后立即生效。
+						</DialogDescription>
+					</DialogHeader>
+
+					<div className="space-y-3">
+						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<Label htmlFor="sync-auto-fetch-interval">订阅同步间隔</Label>
+									<Badge variant="outline">sync.subscriptions</Badge>
+								</div>
+								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+									{syncAutoFetchIntervalInput} 分钟
+								</span>
+							</div>
+							<input
+								id="sync-auto-fetch-interval"
+								type="range"
+								min={0}
+								max={100}
+								step={1}
+								value={syncIntervalToSliderPosition(syncAutoFetchIntervalInput)}
+								onChange={(event) =>
+									setSyncAutoFetchIntervalInput(
+										syncSliderPositionToInterval(Number(event.target.value)),
+									)
+								}
+								aria-label="订阅同步间隔（分钟）"
+								aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+								aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+								aria-valuenow={syncAutoFetchIntervalInput}
+								aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
+								className="h-2 w-full cursor-pointer accent-primary"
+							/>
+							<div className="relative h-11 text-[11px] text-muted-foreground">
+								{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+									<button
+										key={mark}
+										type="button"
+										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+										style={{ left: syncIntervalMarkPosition(mark) }}
+										onClick={() => setSyncAutoFetchIntervalInput(mark)}
+									>
+										<span className="mt-1 h-1.5 w-px bg-border" />
+										<span>{mark}</span>
+									</button>
+								))}
+							</div>
+							<p className="text-muted-foreground text-xs">
+								控制 `sync.subscriptions` 的定时触发频率。
+							</p>
+						</div>
+						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+							<div className="flex items-center justify-between gap-3">
+								<div className="flex items-center gap-2">
+									<Label htmlFor="retry-recent-failures-interval">
+										失败数据重试间隔
+									</Label>
+									<Badge variant="outline">retry.recent_failures</Badge>
+								</div>
+								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
+									{retryRecentFailuresIntervalInput} 分钟
+								</span>
+							</div>
+							<input
+								id="retry-recent-failures-interval"
+								type="range"
+								min={0}
+								max={100}
+								step={1}
+								value={syncIntervalToSliderPosition(
+									retryRecentFailuresIntervalInput,
+								)}
+								onChange={(event) =>
+									setRetryRecentFailuresIntervalInput(
+										syncSliderPositionToInterval(Number(event.target.value)),
+									)
+								}
+								aria-label="失败数据重试间隔（分钟）"
+								aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
+								aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
+								aria-valuenow={retryRecentFailuresIntervalInput}
+								aria-valuetext={`${retryRecentFailuresIntervalInput} 分钟`}
+								className="h-2 w-full cursor-pointer accent-primary"
+							/>
+							<div className="relative h-11 text-[11px] text-muted-foreground">
+								{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
+									<button
+										key={mark}
+										type="button"
+										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+										style={{ left: syncIntervalMarkPosition(mark) }}
+										onClick={() => setRetryRecentFailuresIntervalInput(mark)}
+									>
+										<span className="mt-1 h-1.5 w-px bg-border" />
+										<span>{mark}</span>
+									</button>
+								))}
+							</div>
+							<p className="text-muted-foreground text-xs">
+								按日报、润色、翻译顺序重试最近 24
+								小时失败数据；上一轮未完成时下一轮自动跳过。
+							</p>
+						</div>
+						{syncRuntimeConfigError ? (
+							<p className="text-destructive text-sm">
+								{syncRuntimeConfigError}
+							</p>
+						) : null}
+					</div>
+
+					<DialogFooter>
+						<Button
+							type="button"
+							variant="outline"
+							onClick={() => setTaskIntervalSettingsDialogOpen(false)}
+							disabled={syncRuntimeConfigSaving}
+						>
+							取消
+						</Button>
+						<Button
+							type="button"
+							onClick={() => void saveTaskIntervalSettings()}
+							disabled={syncRuntimeConfigSaving}
+						>
+							{syncRuntimeConfigSaving ? "保存中…" : "保存设置"}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+
+			<Dialog
+				open={subscriptionSyncSettingsDialogOpen}
+				onOpenChange={(open) => {
+					setSubscriptionSyncSettingsDialogOpen(open);
 					if (!open) {
 						setSyncRuntimeConfigError(null);
 					}
@@ -5592,13 +5792,15 @@ export function JobManagement({
 					onOpenAutoFocus={(event) => {
 						event.preventDefault();
 						window.requestAnimationFrame(() => {
-							document.getElementById("sync-auto-fetch-interval")?.focus();
+							document
+								.getElementById("repo-release-worker-concurrency-input")
+								?.focus();
 						});
 					}}
 				>
 					<DialogHeader>
 						<div className="flex items-center gap-2">
-							<DialogTitle>任务间隔设置</DialogTitle>
+							<DialogTitle>订阅同步设置</DialogTitle>
 							<Tooltip open={syncSettingsHelpTooltipsOpen ? true : undefined}>
 								<TooltipTrigger asChild>
 									<Button
@@ -5621,209 +5823,83 @@ export function JobManagement({
 									side={syncSettingsHelpTooltipsOpen ? "top" : "bottom"}
 									sideOffset={6}
 								>
-									保存后立即生效；间隔分别控制 `sync.subscriptions` 与
-									`retry.recent_failures` 的定时触发。
+									只调整 `sync.subscriptions` 的 Release worker
+									数量，并保留最近三次链路记录。
 								</TooltipContent>
 							</Tooltip>
 						</div>
 						<DialogDescription className="sr-only">
-							保存后立即生效；配置作用于定时任务间隔与 release worker 数量。
+							保存后立即生效；配置作用于订阅同步 worker 数量与运行记录查看。
 						</DialogDescription>
 					</DialogHeader>
 
 					<div className="grid gap-4 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-						<div className="space-y-2">
-							<div className="flex items-center justify-between gap-3">
+						<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
+							<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								<Label htmlFor="repo-release-worker-concurrency">
+									Release worker 数量
+								</Label>
 								<div className="flex items-center gap-2">
-									<Label htmlFor="sync-auto-fetch-interval">自动获取间隔</Label>
-									<Tooltip
-										open={syncSettingsHelpTooltipsOpen ? true : undefined}
+									<input
+										id="repo-release-worker-concurrency-input"
+										type="number"
+										min={REPO_RELEASE_WORKER_MIN}
+										max={REPO_RELEASE_WORKER_MAX}
+										value={repoReleaseWorkerConcurrencyInput}
+										onChange={(event) =>
+											setRepoReleaseWorkerConcurrencyInput(
+												clampRepoReleaseWorkerConcurrency(
+													Number(event.target.value),
+												),
+											)
+										}
+										aria-label="Release worker 数量输入"
+										className="h-8 w-20 rounded-md border bg-background px-2 font-mono text-sm"
+									/>
+									<span className="text-muted-foreground text-xs">workers</span>
+								</div>
+							</div>
+							<input
+								id="repo-release-worker-concurrency"
+								type="range"
+								min={REPO_RELEASE_WORKER_MIN}
+								max={REPO_RELEASE_WORKER_MAX}
+								step={1}
+								value={repoReleaseWorkerConcurrencyInput}
+								onChange={(event) =>
+									setRepoReleaseWorkerConcurrencyInput(
+										clampRepoReleaseWorkerConcurrency(
+											Number(event.target.value),
+										),
+									)
+								}
+								aria-label="Release worker 数量"
+								aria-valuemin={REPO_RELEASE_WORKER_MIN}
+								aria-valuemax={REPO_RELEASE_WORKER_MAX}
+								aria-valuenow={repoReleaseWorkerConcurrencyInput}
+								aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 个 Release worker`}
+								className="h-2 w-full cursor-pointer accent-primary"
+							/>
+							<div className="relative h-11 text-[11px] text-muted-foreground">
+								{REPO_RELEASE_WORKER_MARKS.map((mark) => (
+									<button
+										key={mark}
+										type="button"
+										className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+										style={{
+											left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
+										}}
+										onClick={() => setRepoReleaseWorkerConcurrencyInput(mark)}
 									>
-										<TooltipTrigger asChild>
-											<Button
-												type="button"
-												variant="ghost"
-												size="icon"
-												className="text-muted-foreground size-6 rounded-full"
-											>
-												<CircleHelp className="size-3.5" />
-												<span className="sr-only">自动获取间隔刻度说明</span>
-											</Button>
-										</TooltipTrigger>
-										<TooltipContent
-											align={syncSettingsHelpTooltipsOpen ? "start" : "end"}
-											className={
-												syncSettingsHelpTooltipsOpen
-													? tooltipDemoContentClass
-													: "max-w-72"
-											}
-											side="bottom"
-											sideOffset={6}
-										>
-											刻度按非线性分布：短间隔更容易细调，长间隔可快速拉到
-											60/120 分钟。
-										</TooltipContent>
-									</Tooltip>
-								</div>
-								<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
-									{syncAutoFetchIntervalInput} 分钟
-								</span>
+										<span className="mt-1 h-1.5 w-px bg-border" />
+										<span>{mark}</span>
+									</button>
+								))}
 							</div>
-							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
-								<input
-									id="sync-auto-fetch-interval"
-									type="range"
-									min={0}
-									max={100}
-									step={1}
-									value={syncIntervalToSliderPosition(
-										syncAutoFetchIntervalInput,
-									)}
-									onChange={(event) =>
-										setSyncAutoFetchIntervalInput(
-											syncSliderPositionToInterval(Number(event.target.value)),
-										)
-									}
-									aria-label="自动获取间隔（分钟）"
-									aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
-									aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
-									aria-valuenow={syncAutoFetchIntervalInput}
-									aria-valuetext={`${syncAutoFetchIntervalInput} 分钟`}
-									className="h-2 w-full cursor-pointer accent-primary"
-								/>
-								<div className="relative h-11 text-[11px] text-muted-foreground">
-									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
-										<button
-											key={mark}
-											type="button"
-											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-											style={{ left: syncIntervalMarkPosition(mark) }}
-											onClick={() => setSyncAutoFetchIntervalInput(mark)}
-										>
-											<span className="mt-1 h-1.5 w-px bg-border" />
-											<span>{mark}</span>
-										</button>
-									))}
-								</div>
-							</div>
-							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
-								<div className="flex items-center justify-between gap-3">
-									<Label htmlFor="retry-recent-failures-interval">
-										失败数据重试间隔
-									</Label>
-									<span className="rounded-md border bg-background px-2.5 py-1 font-mono text-sm font-semibold">
-										{retryRecentFailuresIntervalInput} 分钟
-									</span>
-								</div>
-								<input
-									id="retry-recent-failures-interval"
-									type="range"
-									min={0}
-									max={100}
-									step={1}
-									value={syncIntervalToSliderPosition(
-										retryRecentFailuresIntervalInput,
-									)}
-									onChange={(event) =>
-										setRetryRecentFailuresIntervalInput(
-											syncSliderPositionToInterval(Number(event.target.value)),
-										)
-									}
-									aria-label="失败数据重试间隔（分钟）"
-									aria-valuemin={SYNC_AUTO_FETCH_INTERVAL_MIN}
-									aria-valuemax={SYNC_AUTO_FETCH_INTERVAL_MAX}
-									aria-valuenow={retryRecentFailuresIntervalInput}
-									aria-valuetext={`${retryRecentFailuresIntervalInput} 分钟`}
-									className="h-2 w-full cursor-pointer accent-primary"
-								/>
-								<div className="relative h-11 text-[11px] text-muted-foreground">
-									{SYNC_AUTO_FETCH_INTERVAL_MARKS.map((mark) => (
-										<button
-											key={mark}
-											type="button"
-											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-											style={{ left: syncIntervalMarkPosition(mark) }}
-											onClick={() => setRetryRecentFailuresIntervalInput(mark)}
-										>
-											<span className="mt-1 h-1.5 w-px bg-border" />
-											<span>{mark}</span>
-										</button>
-									))}
-								</div>
-								<p className="text-muted-foreground text-xs">
-									任务会按日报、润色、翻译顺序处理最近 24
-									小时失败数据；上一轮未完成时下一轮自动跳过。
-								</p>
-							</div>
-							<div className="space-y-3 rounded-lg border bg-card/70 px-3 py-4">
-								<div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-									<Label htmlFor="repo-release-worker-concurrency">
-										Release worker 数量
-									</Label>
-									<div className="flex items-center gap-2">
-										<input
-											id="repo-release-worker-concurrency-input"
-											type="number"
-											min={REPO_RELEASE_WORKER_MIN}
-											max={REPO_RELEASE_WORKER_MAX}
-											value={repoReleaseWorkerConcurrencyInput}
-											onChange={(event) =>
-												setRepoReleaseWorkerConcurrencyInput(
-													clampRepoReleaseWorkerConcurrency(
-														Number(event.target.value),
-													),
-												)
-											}
-											aria-label="Release worker 数量输入"
-											className="h-8 w-20 rounded-md border bg-background px-2 font-mono text-sm"
-										/>
-										<span className="text-muted-foreground text-xs">
-											workers
-										</span>
-									</div>
-								</div>
-								<input
-									id="repo-release-worker-concurrency"
-									type="range"
-									min={REPO_RELEASE_WORKER_MIN}
-									max={REPO_RELEASE_WORKER_MAX}
-									step={1}
-									value={repoReleaseWorkerConcurrencyInput}
-									onChange={(event) =>
-										setRepoReleaseWorkerConcurrencyInput(
-											clampRepoReleaseWorkerConcurrency(
-												Number(event.target.value),
-											),
-										)
-									}
-									aria-label="Release worker 数量"
-									aria-valuemin={REPO_RELEASE_WORKER_MIN}
-									aria-valuemax={REPO_RELEASE_WORKER_MAX}
-									aria-valuenow={repoReleaseWorkerConcurrencyInput}
-									aria-valuetext={`${repoReleaseWorkerConcurrencyInput} 个 Release worker`}
-									className="h-2 w-full cursor-pointer accent-primary"
-								/>
-								<div className="relative h-11 text-[11px] text-muted-foreground">
-									{REPO_RELEASE_WORKER_MARKS.map((mark) => (
-										<button
-											key={mark}
-											type="button"
-											className="-translate-x-1/2 absolute top-0 flex min-h-11 min-w-11 flex-col items-center gap-1 rounded-md px-1 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-											style={{
-												left: `${((mark - REPO_RELEASE_WORKER_MIN) / (REPO_RELEASE_WORKER_MAX - REPO_RELEASE_WORKER_MIN)) * 100}%`,
-											}}
-											onClick={() => setRepoReleaseWorkerConcurrencyInput(mark)}
-										>
-											<span className="mt-1 h-1.5 w-px bg-border" />
-											<span>{mark}</span>
-										</button>
-									))}
-								</div>
-								<p className="text-muted-foreground text-xs">
-									只影响共享 repo release
-									队列吞吐；保存后当前进程会按目标数量收敛，不改变定时频率。
-								</p>
-							</div>
+							<p className="text-muted-foreground text-xs">
+								只影响共享 repo release
+								队列吞吐；保存后当前进程会按目标数量收敛。
+							</p>
 							{syncRuntimeConfigError ? (
 								<p className="text-destructive text-sm">
 									{syncRuntimeConfigError}
@@ -5891,14 +5967,14 @@ export function JobManagement({
 						<Button
 							type="button"
 							variant="outline"
-							onClick={() => setSyncSettingsDialogOpen(false)}
+							onClick={() => setSubscriptionSyncSettingsDialogOpen(false)}
 							disabled={syncRuntimeConfigSaving}
 						>
 							取消
 						</Button>
 						<Button
 							type="button"
-							onClick={() => void saveSyncRuntimeConfig()}
+							onClick={() => void saveSubscriptionSyncSettings()}
 							disabled={syncRuntimeConfigSaving}
 						>
 							{syncRuntimeConfigSaving ? "保存中…" : "保存设置"}
