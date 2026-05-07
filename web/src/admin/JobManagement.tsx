@@ -772,7 +772,9 @@ function taskStatusTone(status: string): TaskStatusTone {
 }
 
 function realtimeTaskDisplayStatus(task: AdminRealtimeTaskItem) {
-	return task.task_type === "sync.subscriptions" && task.skipped
+	return (task.task_type === "sync.subscriptions" ||
+		task.task_type === "retry.recent_failures") &&
+		task.skipped
 		? "skipped"
 		: task.status;
 }
