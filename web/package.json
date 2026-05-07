@@ -14,6 +14,7 @@
 		"preview": "vite preview --host 127.0.0.1 --port 55175 --strictPort",
 		"storybook": "storybook dev -p 55176 --host 127.0.0.1 --no-open",
 		"storybook:build": "storybook build",
+		"test:day-groups": "bun run scripts/test-day-groups.ts",
 		"test:embedded-version": "bun run scripts/test-embedded-version.ts"
 	},
 	"dependencies": {
