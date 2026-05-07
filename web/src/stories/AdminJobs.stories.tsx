@@ -771,12 +771,8 @@ function buildTaskDetail(
 					skip_reason: skipped ? "previous_run_active" : null,
 					schedule_key: "interval:10:1772184300",
 					interval_minutes: 10,
-					lookback_hours: 24,
-					max_items_per_kind: 100,
-					kind_timeout_seconds: 600,
 					canceled: false,
 					daily_brief: {
-						kind: "daily_brief",
 						total: skipped ? 0 : 4,
 						processed: skipped ? 0 : 4,
 						succeeded: skipped ? 0 : 3,
@@ -788,7 +784,6 @@ function buildTaskDetail(
 						last_error: skipped ? null : "AI response missing content",
 					},
 					polish: {
-						kind: "polish",
 						total: skipped ? 0 : 2,
 						processed: skipped ? 0 : 2,
 						succeeded: skipped ? 0 : 2,
@@ -800,7 +795,6 @@ function buildTaskDetail(
 						last_error: null,
 					},
 					translation: {
-						kind: "translation",
 						total: skipped ? 0 : 3,
 						processed: skipped ? 0 : 2,
 						succeeded: skipped ? 0 : 2,
