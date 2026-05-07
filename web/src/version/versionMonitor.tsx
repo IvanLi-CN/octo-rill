@@ -9,6 +9,8 @@ import {
 	type ReactNode,
 } from "react";
 
+import { registerPwaServiceWorker } from "@/pwa/serviceWorkerRegistration";
+
 type HealthResponse = {
 	ok: boolean;
 	version: string;
@@ -24,6 +26,7 @@ export type VersionMonitorValue = {
 	loadedVersion: string;
 	availableVersion: string | null;
 	hasUpdate: boolean;
+	hasServiceWorkerUpdate: boolean;
 	refreshPage: () => void;
 };
 
@@ -53,6 +56,7 @@ const defaultValue: VersionMonitorValue = {
 	loadedVersion: EMBEDDED_APP_VERSION,
 	availableVersion: null,
 	hasUpdate: false,
+	hasServiceWorkerUpdate: false,
 	refreshPage: defaultRefreshPage,
 };
 
@@ -106,12 +110,28 @@ function useVersionMonitorController(
 	const [loadedVersion] = useState(EMBEDDED_APP_VERSION);
 	const [availableVersion, setAvailableVersion] = useState<string | null>(null);
 	const [hasUpdate, setHasUpdate] = useState(false);
+	const [hasServiceWorkerUpdate, setHasServiceWorkerUpdate] = useState(false);
 	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
+	const serviceWorkerRefreshRef = useRef<(() => void) | null>(null);
 
 	useEffect(() => {
-		hasUpdateRef.current = hasUpdate;
-	}, [hasUpdate]);
+		hasUpdateRef.current = hasUpdate || hasServiceWorkerUpdate;
+	}, [hasServiceWorkerUpdate, hasUpdate]);
+
+	useEffect(() => {
+		registerPwaServiceWorker({
+			onNeedRefresh(controller) {
+				serviceWorkerRefreshRef.current = controller.applyUpdate;
+				setHasServiceWorkerUpdate(true);
+				setHasUpdate(true);
+			},
+			onRegisterError() {
+				// PWA installability is an enhancement; failed registration should not
+				// block auth boot or normal dashboard usage.
+			},
+		});
+	}, []);
 
 	const applyObservedVersion = useCallback((nextVersion: string) => {
 		if (nextVersion !== baselineVersionRef.current) {
@@ -183,9 +203,17 @@ function useVersionMonitorController(
 			loadedVersion,
 			availableVersion,
 			hasUpdate,
-			refreshPage: defaultRefreshPage,
+			hasServiceWorkerUpdate,
+			refreshPage: () => {
+				const applyServiceWorkerUpdate = serviceWorkerRefreshRef.current;
+				if (applyServiceWorkerUpdate) {
+					applyServiceWorkerUpdate();
+					return;
+				}
+				defaultRefreshPage();
+			},
 		}),
-		[availableVersion, hasUpdate, loadedVersion],
+		[availableVersion, hasServiceWorkerUpdate, hasUpdate, loadedVersion],
 	);
 }
 
