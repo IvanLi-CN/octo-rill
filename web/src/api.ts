@@ -255,6 +255,7 @@ export type SyncAutoFetchTaskItem = {
 };
 export type AdminSyncRuntimeConfigResponse = {
 	sync_auto_fetch_interval_minutes: number;
+	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
 };
@@ -296,6 +297,7 @@ export type AdminPublicReleaseReposResponse = {
 };
 export type AdminSyncRuntimeConfigUpdateRequest = {
 	sync_auto_fetch_interval_minutes: number;
+	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
 };
 export type DailyBriefProfilePatchRequest = {
@@ -639,6 +641,27 @@ export type AdminBriefRefreshContentDiagnostics = {
 	last_error: string | null;
 	canceled: boolean;
 };
+export type AdminRetryRecentFailuresKindDiagnostics = {
+	total: number;
+	processed: number;
+	succeeded: number;
+	failed: number;
+	skipped: number;
+	timed_out: boolean;
+	duration_ms: number;
+	current_id: string | null;
+	last_error: string | null;
+};
+export type AdminRetryRecentFailuresDiagnostics = {
+	skipped: boolean;
+	skip_reason: string | null;
+	canceled: boolean;
+	schedule_key: string | null;
+	interval_minutes: number | null;
+	daily_brief: AdminRetryRecentFailuresKindDiagnostics;
+	polish: AdminRetryRecentFailuresKindDiagnostics;
+	translation: AdminRetryRecentFailuresKindDiagnostics;
+};
 export type AdminSyncSubscriptionsDiagnostics = {
 	trigger: string | null;
 	schedule_key: string | null;
@@ -695,6 +718,7 @@ export type AdminTaskDiagnostics = {
 	brief_generate?: AdminBriefGenerateDiagnostics | null;
 	brief_history_recompute?: AdminBriefHistoryRecomputeDiagnostics | null;
 	brief_refresh_content?: AdminBriefRefreshContentDiagnostics | null;
+	retry_recent_failures?: AdminRetryRecentFailuresDiagnostics | null;
 	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {

@@ -1135,7 +1135,7 @@ export function AppShell({
 	return (
 		<AppShellChromeContext.Provider value={chromeState}>
 			<div
-				className="min-h-screen"
+				className="flex min-h-screen flex-col"
 				data-app-shell-mobile-chrome={mobileChrome ? "true" : "false"}
 				data-app-shell-header-compact={mobileCompactHeader ? "true" : "false"}
 				data-app-shell-header-progress={chromeState.headerProgress.toFixed(3)}
@@ -1201,7 +1201,7 @@ export function AppShell({
 
 				<main
 					className={cn(
-						"mx-auto max-w-6xl px-6 py-8",
+						"mx-auto w-full max-w-6xl flex-1 px-6 py-8",
 						footer ? "pb-16" : null,
 						mobileChrome && "px-4 py-4 pb-20 sm:px-6 sm:py-8 sm:pb-16",
 					)}

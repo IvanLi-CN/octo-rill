@@ -1041,6 +1041,7 @@ pub async fn me_patch_profile(
 #[derive(Debug, Serialize)]
 pub struct SyncRuntimeConfigResponse {
     sync_auto_fetch_interval_minutes: i64,
+    retry_recent_failures_interval_minutes: i64,
     repo_release_worker_concurrency: usize,
     recent_sync_tasks: Vec<SyncAutoFetchTaskItem>,
 }
@@ -1048,6 +1049,7 @@ pub struct SyncRuntimeConfigResponse {
 #[derive(Debug, Deserialize)]
 pub struct SyncRuntimeConfigPatchRequest {
     sync_auto_fetch_interval_minutes: i64,
+    retry_recent_failures_interval_minutes: Option<i64>,
     repo_release_worker_concurrency: Option<i64>,
 }
 
@@ -1059,9 +1061,14 @@ async fn load_sync_runtime_config(state: &AppState) -> Result<SyncRuntimeConfigR
         admin_runtime::load_repo_release_worker_concurrency(&state.pool)
             .await
             .map_err(ApiError::internal)?;
+    let retry_recent_failures_interval_minutes =
+        admin_runtime::load_retry_recent_failures_interval_minutes(&state.pool)
+            .await
+            .map_err(ApiError::internal)?;
 
     Ok(SyncRuntimeConfigResponse {
         sync_auto_fetch_interval_minutes: interval,
+        retry_recent_failures_interval_minutes,
         repo_release_worker_concurrency,
         recent_sync_tasks: load_recent_sync_auto_fetch_tasks(state).await?,
     })
@@ -1074,6 +1081,13 @@ async fn persist_sync_runtime_config(
     if !(1..=120).contains(&req.sync_auto_fetch_interval_minutes) {
         return Err(ApiError::bad_request(
             "sync_auto_fetch_interval_minutes must be between 1 and 120",
+        ));
+    }
+    if let Some(interval) = req.retry_recent_failures_interval_minutes
+        && !(1..=120).contains(&interval)
+    {
+        return Err(ApiError::bad_request(
+            "retry_recent_failures_interval_minutes must be between 1 and 120",
         ));
     }
     if let Some(concurrency) = req.repo_release_worker_concurrency
@@ -1090,6 +1104,11 @@ async fn persist_sync_runtime_config(
     )
     .await
     .map_err(ApiError::internal)?;
+    if let Some(interval) = req.retry_recent_failures_interval_minutes {
+        admin_runtime::update_retry_recent_failures_interval_minutes(&state.pool, interval)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     if let Some(concurrency) = req.repo_release_worker_concurrency {
         admin_runtime::update_repo_release_worker_concurrency(&state.pool, concurrency)
             .await
@@ -2740,6 +2759,7 @@ pub async fn admin_list_realtime_tasks(
     let task_group = query.task_group.unwrap_or_else(|| "all".to_owned());
     let scheduled_daily_task = jobs::SCHEDULED_TASK_TYPES[0];
     let scheduled_subscription_task = jobs::SCHEDULED_TASK_TYPES[1];
+    let scheduled_retry_task = jobs::SCHEDULED_TASK_TYPES[2];
 
     let total = sqlx::query_scalar::<_, i64>(
         r#"
@@ -2750,8 +2770,8 @@ pub async fn admin_list_realtime_tasks(
           AND (? = '' OR task_type != ?)
           AND (
             ? = 'all'
-            OR (? = 'scheduled' AND task_type IN (?, ?))
-            OR (? = 'realtime' AND task_type NOT IN (?, ?))
+            OR (? = 'scheduled' AND task_type IN (?, ?, ?))
+            OR (? = 'realtime' AND task_type NOT IN (?, ?, ?))
           )
         "#,
     )
@@ -2765,9 +2785,11 @@ pub async fn admin_list_realtime_tasks(
     .bind(task_group.as_str())
     .bind(scheduled_daily_task)
     .bind(scheduled_subscription_task)
+    .bind(scheduled_retry_task)
     .bind(task_group.as_str())
     .bind(scheduled_daily_task)
     .bind(scheduled_subscription_task)
+    .bind(scheduled_retry_task)
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
@@ -2794,8 +2816,8 @@ pub async fn admin_list_realtime_tasks(
           AND (? = '' OR task_type != ?)
           AND (
             ? = 'all'
-            OR (? = 'scheduled' AND task_type IN (?, ?))
-            OR (? = 'realtime' AND task_type NOT IN (?, ?))
+            OR (? = 'scheduled' AND task_type IN (?, ?, ?))
+            OR (? = 'realtime' AND task_type NOT IN (?, ?, ?))
           )
         ORDER BY
           unixepoch(created_at) DESC,
@@ -2814,9 +2836,11 @@ pub async fn admin_list_realtime_tasks(
     .bind(task_group.as_str())
     .bind(jobs::TASK_BRIEF_DAILY_SLOT)
     .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+    .bind(jobs::TASK_RETRY_RECENT_FAILURES)
     .bind(task_group.as_str())
     .bind(jobs::TASK_BRIEF_DAILY_SLOT)
     .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+    .bind(jobs::TASK_RETRY_RECENT_FAILURES)
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.pool)
@@ -2879,6 +2903,8 @@ pub struct AdminTaskDiagnostics {
     brief_history_recompute: Option<AdminBriefHistoryRecomputeDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     brief_refresh_content: Option<AdminBriefRefreshContentDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_recent_failures: Option<AdminRetryRecentFailuresDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_subscriptions: Option<AdminSyncSubscriptionsDiagnostics>,
 }
@@ -2978,6 +3004,31 @@ pub struct AdminBriefRefreshContentDiagnostics {
     current_brief_id: Option<String>,
     last_error: Option<String>,
     canceled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRetryRecentFailuresKindDiagnostics {
+    total: i64,
+    processed: i64,
+    succeeded: i64,
+    failed: i64,
+    skipped: i64,
+    timed_out: bool,
+    duration_ms: i64,
+    current_id: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminRetryRecentFailuresDiagnostics {
+    skipped: bool,
+    skip_reason: Option<String>,
+    canceled: bool,
+    schedule_key: Option<String>,
+    interval_minutes: Option<i64>,
+    daily_brief: AdminRetryRecentFailuresKindDiagnostics,
+    polish: AdminRetryRecentFailuresKindDiagnostics,
+    translation: AdminRetryRecentFailuresKindDiagnostics,
 }
 
 #[derive(Debug, Serialize)]
@@ -3926,6 +3977,98 @@ fn build_brief_refresh_content_diagnostics(
     (outcome, diagnostics)
 }
 
+fn retry_kind_diagnostics_from_value(
+    value: Option<&serde_json::Value>,
+) -> AdminRetryRecentFailuresKindDiagnostics {
+    let object = value.and_then(serde_json::Value::as_object);
+    AdminRetryRecentFailuresKindDiagnostics {
+        total: json_object_get_i64(object, "total").unwrap_or(0),
+        processed: json_object_get_i64(object, "processed").unwrap_or(0),
+        succeeded: json_object_get_i64(object, "succeeded").unwrap_or(0),
+        failed: json_object_get_i64(object, "failed").unwrap_or(0),
+        skipped: json_object_get_i64(object, "skipped").unwrap_or(0),
+        timed_out: json_object_get_bool(object, "timed_out").unwrap_or(false),
+        duration_ms: json_object_get_i64(object, "duration_ms").unwrap_or(0),
+        current_id: json_object_get_string(object, "current_id"),
+        last_error: json_object_get_string(object, "last_error"),
+    }
+}
+
+fn build_retry_recent_failures_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+) -> (AdminBusinessOutcome, AdminRetryRecentFailuresDiagnostics) {
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+    let daily_brief = retry_kind_diagnostics_from_value(
+        result_object.and_then(|object| object.get("daily_brief")),
+    );
+    let polish =
+        retry_kind_diagnostics_from_value(result_object.and_then(|object| object.get("polish")));
+    let translation = retry_kind_diagnostics_from_value(
+        result_object.and_then(|object| object.get("translation")),
+    );
+    let skipped = json_object_get_bool(result_object, "skipped").unwrap_or(false);
+    let skip_reason = json_object_get_string(result_object, "skip_reason");
+    let canceled = task.status == jobs::STATUS_CANCELED
+        || json_object_get_bool(result_object, "canceled").unwrap_or(false);
+    let diagnostics = AdminRetryRecentFailuresDiagnostics {
+        skipped,
+        skip_reason: skip_reason.clone(),
+        canceled,
+        schedule_key: json_object_get_string(result_object, "schedule_key"),
+        interval_minutes: json_object_get_i64(result_object, "interval_minutes"),
+        daily_brief,
+        polish,
+        translation,
+    };
+
+    let total_processed = diagnostics.daily_brief.processed
+        + diagnostics.polish.processed
+        + diagnostics.translation.processed;
+    let total_succeeded = diagnostics.daily_brief.succeeded
+        + diagnostics.polish.succeeded
+        + diagnostics.translation.succeeded;
+    let total_failed =
+        diagnostics.daily_brief.failed + diagnostics.polish.failed + diagnostics.translation.failed;
+    let total_timed_out = diagnostics.daily_brief.timed_out
+        || diagnostics.polish.timed_out
+        || diagnostics.translation.timed_out;
+
+    let outcome = if skipped {
+        business_outcome(
+            "ok",
+            "已跳过",
+            skip_reason.unwrap_or_else(|| "上一轮失败数据重试仍在运行，本轮已跳过。".to_owned()),
+        )
+    } else if canceled {
+        business_outcome("unknown", "已取消", "失败数据重试任务已取消。")
+    } else if task.status == jobs::STATUS_FAILED {
+        business_outcome(
+            "failed",
+            "业务失败",
+            task.error_message
+                .clone()
+                .unwrap_or_else(|| "失败数据重试任务失败。".to_owned()),
+        )
+    } else if task.status == jobs::STATUS_QUEUED || task.status == jobs::STATUS_RUNNING {
+        business_outcome("unknown", "处理中", "失败数据重试任务正在执行。")
+    } else if total_processed == 0 {
+        business_outcome("ok", "无需执行", "最近 24 小时没有可重试失败数据。")
+    } else if total_failed > 0 && total_succeeded == 0 {
+        business_outcome("failed", "业务失败", "失败数据重试未成功处理任何对象。")
+    } else if total_failed > 0 || total_timed_out {
+        business_outcome(
+            "partial",
+            "部分成功",
+            "失败数据重试已部分推进，仍有失败或超时。",
+        )
+    } else {
+        business_outcome("ok", "业务成功", "失败数据重试已完成。")
+    };
+
+    (outcome, diagnostics)
+}
+
 fn map_sync_subscription_event(
     row: AdminSyncSubscriptionEventRow,
 ) -> AdminSyncSubscriptionEventItem {
@@ -4289,6 +4432,7 @@ fn build_task_diagnostics(
                 brief_generate: None,
                 brief_history_recompute: None,
                 brief_refresh_content: None,
+                retry_recent_failures: None,
                 sync_subscriptions: None,
             })
         }
@@ -4301,6 +4445,7 @@ fn build_task_diagnostics(
                 brief_generate: None,
                 brief_history_recompute: None,
                 brief_refresh_content: None,
+                retry_recent_failures: None,
                 sync_subscriptions: None,
             })
         }
@@ -4313,6 +4458,7 @@ fn build_task_diagnostics(
                 brief_generate: Some(diagnostics),
                 brief_history_recompute: None,
                 brief_refresh_content: None,
+                retry_recent_failures: None,
                 sync_subscriptions: None,
             })
         }
@@ -4326,6 +4472,7 @@ fn build_task_diagnostics(
                 brief_generate: None,
                 brief_history_recompute: Some(diagnostics),
                 brief_refresh_content: None,
+                retry_recent_failures: None,
                 sync_subscriptions: None,
             })
         }
@@ -4339,6 +4486,20 @@ fn build_task_diagnostics(
                 brief_generate: None,
                 brief_history_recompute: None,
                 brief_refresh_content: Some(diagnostics),
+                retry_recent_failures: None,
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_RETRY_RECENT_FAILURES => {
+            let (business_outcome, diagnostics) = build_retry_recent_failures_diagnostics(task);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                brief_history_recompute: None,
+                brief_refresh_content: None,
+                retry_recent_failures: Some(diagnostics),
                 sync_subscriptions: None,
             })
         }
@@ -4352,6 +4513,7 @@ fn build_task_diagnostics(
                 brief_generate: None,
                 brief_history_recompute: None,
                 brief_refresh_content: None,
+                retry_recent_failures: None,
                 sync_subscriptions: Some(diagnostics),
             })
         }
@@ -22908,6 +23070,7 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: 10,
+                retry_recent_failures_interval_minutes: Some(15),
                 repo_release_worker_concurrency: Some(12),
             },
         )
@@ -22915,11 +23078,12 @@ echo should_not_be_in_excerpt
         .expect("sync settings update should succeed");
 
         assert_eq!(settings.sync_auto_fetch_interval_minutes, 10);
+        assert_eq!(settings.retry_recent_failures_interval_minutes, 15);
         assert_eq!(settings.repo_release_worker_concurrency, 12);
 
-        let row = sqlx::query_as::<_, (i64, i64)>(
+        let row = sqlx::query_as::<_, (i64, i64, i64)>(
             r#"
-            SELECT sync_auto_fetch_interval_minutes, repo_release_worker_concurrency
+            SELECT sync_auto_fetch_interval_minutes, retry_recent_failures_interval_minutes, repo_release_worker_concurrency
             FROM admin_runtime_settings
             WHERE id = 1
             "#,
@@ -22929,7 +23093,8 @@ echo should_not_be_in_excerpt
         .expect("load sync runtime config");
 
         assert_eq!(row.0, 10);
-        assert_eq!(row.1, 12);
+        assert_eq!(row.1, 15);
+        assert_eq!(row.2, 12);
     }
 
     #[tokio::test]
@@ -22942,6 +23107,7 @@ echo should_not_be_in_excerpt
                 state.as_ref(),
                 super::SyncRuntimeConfigPatchRequest {
                     sync_auto_fetch_interval_minutes: interval,
+                    retry_recent_failures_interval_minutes: None,
                     repo_release_worker_concurrency: None,
                 },
             )
@@ -22957,6 +23123,29 @@ echo should_not_be_in_excerpt
     }
 
     #[tokio::test]
+    async fn persist_sync_runtime_config_rejects_retry_interval_out_of_range() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+
+        let err = super::persist_sync_runtime_config(
+            state.as_ref(),
+            super::SyncRuntimeConfigPatchRequest {
+                sync_auto_fetch_interval_minutes: 10,
+                retry_recent_failures_interval_minutes: Some(0),
+                repo_release_worker_concurrency: None,
+            },
+        )
+        .await
+        .expect_err("sync settings update should reject invalid retry interval");
+
+        assert_eq!(err.code(), "bad_request");
+        assert!(
+            err.to_string()
+                .contains("retry_recent_failures_interval_minutes must be between 1 and 120")
+        );
+    }
+
+    #[tokio::test]
     async fn persist_sync_runtime_config_rejects_worker_concurrency_without_partial_update() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -22965,6 +23154,7 @@ echo should_not_be_in_excerpt
             state.as_ref(),
             super::SyncRuntimeConfigPatchRequest {
                 sync_auto_fetch_interval_minutes: 10,
+                retry_recent_failures_interval_minutes: None,
                 repo_release_worker_concurrency: Some(33),
             },
         )

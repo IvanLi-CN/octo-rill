@@ -724,7 +724,7 @@ fn pending_result_status_from_work_status(work_item_status: Option<&str>) -> &'s
     }
 }
 
-fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
+pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
     let Some(raw) = error_text else {
         return false;
     };
@@ -5381,7 +5381,7 @@ async fn canonicalize_translation_result_item(
         .unwrap_or_else(|| item.clone()))
 }
 
-async fn current_server_source_hash_for_item(
+pub(crate) async fn current_server_source_hash_for_item(
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
