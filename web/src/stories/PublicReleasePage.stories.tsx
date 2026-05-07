@@ -26,6 +26,7 @@ const publicReleaseVersionState: VersionMonitorValue = {
 	loadedVersion: "v2.29.0",
 	availableVersion: null,
 	hasUpdate: false,
+	hasServiceWorkerUpdate: false,
 	refreshPage: () => undefined,
 };
 
