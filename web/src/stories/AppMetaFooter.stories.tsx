@@ -15,9 +15,9 @@ type FooterPreviewProps = {
 	hasUpdate: boolean;
 };
 
-const FOOTER_RELEASE_HREF = "/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
+const FOOTER_RELEASE_HREF = "/public/IvanLi-CN/octo-rill/releases/tag/v2.29.0";
 const FOOTER_RAW_SEMVER_RELEASE_HREF =
-	"/IvanLi-CN/octo-rill/releases/tag/v2.30.0";
+	"/public/IvanLi-CN/octo-rill/releases/tag/v2.30.0";
 const APP_META_FOOTER_VIEWPORTS = {
 	...INITIAL_VIEWPORTS,
 	footerMobile390: {

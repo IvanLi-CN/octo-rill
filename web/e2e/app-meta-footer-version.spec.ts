@@ -8,7 +8,7 @@ type VersionApiMockOptions = {
 };
 
 const EMBEDDED_FRONTEND_VERSION = "v0.1.0";
-const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
+const EMBEDDED_FRONTEND_VERSION_RELEASE_HREF = `/public/IvanLi-CN/octo-rill/releases/tag/${EMBEDDED_FRONTEND_VERSION}`;
 
 async function accelerateVersionPolling(page: Page) {
 	await page.addInitScript(() => {
