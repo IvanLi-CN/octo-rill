@@ -46,6 +46,7 @@ try {
 		480,
 		[],
 		new Date("2026-05-07T12:00:00+08:00"),
+		true,
 	);
 
 	assert(groups.length === 1, "expected one raw group");
@@ -78,6 +79,7 @@ try {
 			},
 		],
 		new Date("2026-05-07T12:00:00+08:00"),
+		true,
 	);
 
 	assert(historicalGroups.length === 1, "expected one historical group");
@@ -105,6 +107,7 @@ try {
 		480,
 		[],
 		new Date("2026-05-07T12:00:00+08:00"),
+		true,
 	);
 
 	assert(
@@ -118,6 +121,48 @@ try {
 	assert(
 		mixedGroups[0].releaseCount === 2,
 		"expected two releases in the raw group",
+	);
+
+	const currentWindowRelease = release("319182286", "2026-05-07T20:48:56Z");
+	const currentGroups = groupFeedItemsByDay(
+		[currentWindowRelease],
+		"08:00",
+		"Asia/Shanghai",
+		480,
+		[],
+		new Date("2026-05-07T12:00:00+08:00"),
+		true,
+	);
+
+	assert(currentGroups.length === 1, "expected one current raw group");
+	assert(currentGroups[0].isCurrent === true, "expected current raw group");
+	assert(
+		currentGroups[0].id === "2026-05-07@08:00",
+		"current raw group id should stay window-start based",
+	);
+	assert(
+		currentGroups[0].displayDate === "2026-05-07",
+		"current raw group should not display the future brief date",
+	);
+	assert(
+		currentGroups[0].briefDate === "2026-05-08",
+		"current raw group should keep the generated brief target date",
+	);
+
+	const releasesTabGroups = groupFeedItemsByDay(
+		[earlyMorningRawRelease],
+		"08:00",
+		"Asia/Shanghai",
+		480,
+		[],
+		new Date("2026-05-07T12:00:00+08:00"),
+		false,
+	);
+
+	assert(releasesTabGroups.length === 1, "expected one releases tab group");
+	assert(
+		releasesTabGroups[0].displayDate === "2026-05-05",
+		"release tab raw groups should keep the window start date",
 	);
 
 	console.log("day group display date checks passed");

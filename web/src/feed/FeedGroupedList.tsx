@@ -660,6 +660,7 @@ export function FeedGroupedList(
 				dailyBoundaryUtcOffsetMinutes,
 				mode === "all" ? briefs : [],
 				now,
+				mode === "all",
 			),
 		[
 			items,
