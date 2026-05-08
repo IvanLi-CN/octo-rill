@@ -192,6 +192,7 @@
   - 等待共享 queue 结果
   - 在任务结果里输出 repo 级摘要
 - Release 阶段等待共享 queue 时必须主动收敛已过期 work item；不能因 pending watcher 永久存在而让根 `sync.subscriptions` 长期保持 `running`。
+- Release queue 的 claim / attach / watcher 写路径必须在事务开始时声明写意图，避免 SQLite WAL 多连接下先读后写的事务在升级写锁时因陈旧快照失败。
 - Release 结束后继续按 Star 成功用户 fan-out：
   - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
   - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数

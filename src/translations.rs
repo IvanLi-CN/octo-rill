@@ -3550,7 +3550,7 @@ async fn claim_next_batch(
         first.target_lang, first.protocol_version, first.model_profile
     );
     let now_str = now.to_rfc3339();
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let mut request_ids = HashSet::new();
     for item in &selected {
         let rows = sqlx::query_scalar::<_, String>(
@@ -4522,7 +4522,7 @@ async fn recover_runtime_state_with_mode(
         )
         .await?;
 
-        let mut tx = state.pool.begin().await?;
+        let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
         let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
         let now = Utc::now().to_rfc3339();
         fail_batch_with_message(
