@@ -393,10 +393,13 @@ class CandidateClient:
             "commit-no-pr": None,
             "merge-commit": (152, "https://github.com/IvanLi-CN/octo-rill/pull/152"),
             "squash-commit": (151, "https://github.com/IvanLi-CN/octo-rill/pull/151"),
+            "rebase-commit-1": (153, "https://github.com/IvanLi-CN/octo-rill/pull/153"),
+            "rebase-commit-2": (153, "https://github.com/IvanLi-CN/octo-rill/pull/153"),
         }
         self.labels_by_pr = {
             152: ["type:patch", "channel:stable"],
             151: ["type:patch", "channel:stable"],
+            153: ["type:patch", "channel:stable"],
         }
 
     def pull_for_commit(self, repo: str, sha: str):
@@ -423,10 +426,13 @@ try:
         "commit-no-pr",
         "merge-commit",
         "squash-commit",
+        "rebase-commit-1",
+        "rebase-commit-2",
     ]
     module.list_tags_pointing_at = lambda repo_root, sha: {
         "merge-commit": ["v2.31.3"],
         "squash-commit": ["v2.31.2"],
+        "rebase-commit-2": ["v2.31.4"],
     }.get(sha, [])
 
     built_candidates = module.build_release_candidates(
@@ -439,8 +445,8 @@ finally:
     module.list_first_parent_commits = original_first_parent_commits
     module.list_tags_pointing_at = original_tags_pointing_at
 
-assert [candidate.sha for candidate in built_candidates] == ["merge-commit", "squash-commit"]
-assert [candidate.pr_number for candidate in built_candidates] == [152, 151]
+assert [candidate.sha for candidate in built_candidates] == ["merge-commit", "squash-commit", "rebase-commit-2"]
+assert [candidate.pr_number for candidate in built_candidates] == [152, 151, 153]
 
 release_workflow = contract.load_yaml(release_workflow_path)
 release_workflow_text = release_workflow_path.read_text(encoding="utf-8")

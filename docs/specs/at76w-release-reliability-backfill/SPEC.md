@@ -40,7 +40,7 @@
 
 - Release workflow:
   - 改为监听 `push.branches=[main]` 与 `workflow_dispatch(head_sha)`。
-  - 新增 release target planning / audit 步骤，按 first-parent 主干提交顺序选择最早的漏发提交，覆盖 merge commit 与 squash merge commit。
+  - 新增 release target planning / audit 步骤，按 first-parent 主干提交顺序选择最早的漏发提交，覆盖 merge commit、squash merge commit 与 rebase merge commit；同一 PR 多个主干提交只保留最后一个提交作为 release candidate。
   - 对 push 触发完成当前补发后，如仍存在后续漏项，自动 dispatch 下一次 backfill。
   - 对历史 backfill target 的缺失 tag，优先使用仓库 secret `RELEASE_TOKEN` 创建 release；若 secret 缺失，则在 workflow 内明确阻断并提示先推送 tag 再重跑。
 - Release helper scripts:

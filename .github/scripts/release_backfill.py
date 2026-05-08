@@ -470,6 +470,7 @@ def build_release_candidates(
     client: GitHubApiClient,
 ) -> list[ReleaseCandidate]:
     candidates: list[ReleaseCandidate] = []
+    candidate_index_by_pr: dict[int, int] = {}
     for sha in list_first_parent_commits(repo_root, head_ref):
         pull = client.pull_for_commit(repo, sha)
         if pull is None:
@@ -494,17 +495,22 @@ def build_release_candidates(
             release_exists = client.release_exists(repo, matching_tag)
             comment_exists = client.has_managed_comment(repo, pr_number)
 
-        candidates.append(
-            ReleaseCandidate(
-                sha=sha,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                intent=intent,
-                matching_tag=matching_tag,
-                release_exists=release_exists,
-                comment_exists=comment_exists,
-            )
+        candidate = ReleaseCandidate(
+            sha=sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            intent=intent,
+            matching_tag=matching_tag,
+            release_exists=release_exists,
+            comment_exists=comment_exists,
         )
+        existing_index = candidate_index_by_pr.get(pr_number)
+        if existing_index is not None:
+            candidates[existing_index] = candidate
+            continue
+
+        candidate_index_by_pr[pr_number] = len(candidates)
+        candidates.append(candidate)
     return candidates
 
 
