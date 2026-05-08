@@ -386,6 +386,68 @@ assert explicit.selected_sha == missing_sixty_two.sha
 assert explicit.selection_reason == "explicit_head_sha"
 assert explicit.next_candidate == missing_sixty_three
 
+
+class CandidateClient:
+    def __init__(self) -> None:
+        self.pull_by_sha = {
+            "commit-no-pr": None,
+            "merge-commit": (152, "https://github.com/IvanLi-CN/octo-rill/pull/152"),
+            "squash-commit": (151, "https://github.com/IvanLi-CN/octo-rill/pull/151"),
+            "rebase-commit-1": (153, "https://github.com/IvanLi-CN/octo-rill/pull/153"),
+            "rebase-commit-2": (153, "https://github.com/IvanLi-CN/octo-rill/pull/153"),
+        }
+        self.labels_by_pr = {
+            152: ["type:patch", "channel:stable"],
+            151: ["type:patch", "channel:stable"],
+            153: ["type:patch", "channel:stable"],
+        }
+
+    def pull_for_commit(self, repo: str, sha: str):
+        assert repo == "IvanLi-CN/octo-rill"
+        return self.pull_by_sha[sha]
+
+    def labels_for_pull(self, repo: str, pr_number: int) -> list[str]:
+        assert repo == "IvanLi-CN/octo-rill"
+        return self.labels_by_pr[pr_number]
+
+    def release_exists(self, repo: str, tag: str) -> bool:
+        assert repo == "IvanLi-CN/octo-rill"
+        return True
+
+    def has_managed_comment(self, repo: str, pr_number: int) -> bool:
+        assert repo == "IvanLi-CN/octo-rill"
+        return True
+
+
+original_first_parent_commits = module.list_first_parent_commits
+original_tags_pointing_at = module.list_tags_pointing_at
+try:
+    module.list_first_parent_commits = lambda repo_root, head_ref: [
+        "commit-no-pr",
+        "merge-commit",
+        "squash-commit",
+        "rebase-commit-1",
+        "rebase-commit-2",
+    ]
+    module.list_tags_pointing_at = lambda repo_root, sha: {
+        "merge-commit": ["v2.31.3"],
+        "squash-commit": ["v2.31.2"],
+        "rebase-commit-2": ["v2.31.4"],
+    }.get(sha, [])
+
+    built_candidates = module.build_release_candidates(
+        Path("."),
+        "HEAD",
+        repo="IvanLi-CN/octo-rill",
+        client=CandidateClient(),
+    )
+finally:
+    module.list_first_parent_commits = original_first_parent_commits
+    module.list_tags_pointing_at = original_tags_pointing_at
+
+assert [candidate.sha for candidate in built_candidates] == ["merge-commit", "squash-commit", "rebase-commit-2"]
+assert [candidate.pr_number for candidate in built_candidates] == [152, 151, 153]
+
 release_workflow = contract.load_yaml(release_workflow_path)
 release_workflow_text = release_workflow_path.read_text(encoding="utf-8")
 on_section = contract.require_mapping(contract.mapping_get(release_workflow, "on"), "release.yml.on")
