@@ -1177,6 +1177,11 @@ async function installAdminJobsMocks(
 								succeeded_repos: liveSubscriptionProgress ? 79 : 123,
 								failed_repos: liveSubscriptionProgress ? 4 : 5,
 								candidate_failures: liveSubscriptionProgress ? 5 : 7,
+								fetched_count: liveSubscriptionProgress ? 924 : 1840,
+								inserted_count: liveSubscriptionProgress ? 148 : 320,
+								updated_count: liveSubscriptionProgress ? 41 : 96,
+								unchanged_count: liveSubscriptionProgress ? 735 : 1424,
+								pages_fetched: liveSubscriptionProgress ? 79 : 123,
 							},
 							social: {
 								total_users: 11,
@@ -1273,6 +1278,11 @@ async function installAdminJobsMocks(
 								failed_repos: liveSubscriptionProgress ? 4 : 5,
 								pending_repos: liveSubscriptionProgress ? 45 : 0,
 								releases_written: liveSubscriptionProgress ? 924 : 1840,
+								fetched_count: liveSubscriptionProgress ? 924 : 1840,
+								inserted_count: liveSubscriptionProgress ? 148 : 320,
+								updated_count: liveSubscriptionProgress ? 41 : 96,
+								unchanged_count: liveSubscriptionProgress ? 735 : 1424,
+								pages_fetched: liveSubscriptionProgress ? 79 : 123,
 							}),
 							created_at: liveSubscriptionProgress
 								? "2026-02-26T14:37:30Z"
