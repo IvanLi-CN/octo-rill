@@ -1623,9 +1623,9 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     let _claim_guard = task_claim_lock().lock().await;
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "job_task_claim")
         .await
         .context("begin task claim tx")?;
 
@@ -1698,6 +1698,7 @@ async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     .context("reload claimed task")?;
 
     tx.commit().await.context("commit claim tx")?;
+    drop(sqlite_write);
 
     append_task_event(
         state,
@@ -3326,51 +3327,63 @@ async fn finalize_task(
         .transpose()
         .context("serialize task result")?;
 
-    sqlx::query(
-        r#"
-        UPDATE job_tasks
-        SET status = ?,
-            result_json = ?,
-            error_message = ?,
-            finished_at = ?,
-            runtime_owner_id = NULL,
-            lease_heartbeat_at = NULL,
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(status)
-    .bind(result_json.as_deref())
-    .bind(error_message.as_deref())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(task_id)
-    .execute(&state.pool)
-    .await
-    .context("failed to finalize task")?;
+    state
+        .sqlite_writer
+        .write("job_task_finalize", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE job_tasks
+                SET status = ?,
+                    result_json = ?,
+                    error_message = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(status)
+            .bind(result_json.as_deref())
+            .bind(error_message.as_deref())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(task_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to finalize task")?;
+            Ok(())
+        })
+        .await?;
 
     Ok(())
 }
 
 async fn heartbeat_task_lease(state: &AppState, task_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE job_tasks
-        SET lease_heartbeat_at = ?, updated_at = ?
-        WHERE id = ?
-          AND status = ?
-          AND runtime_owner_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(task_id)
-    .bind(STATUS_RUNNING)
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to heartbeat task lease")?;
+    state
+        .sqlite_writer
+        .write("job_task_heartbeat", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE job_tasks
+                SET lease_heartbeat_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = ?
+                  AND runtime_owner_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to heartbeat task lease")?;
+            Ok(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -4704,6 +4717,7 @@ mod tests {
             ),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
