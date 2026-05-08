@@ -24,7 +24,7 @@ pub struct AdminRuntimeSettingsSnapshot {
 
 pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
 pub const DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES: i64 = 10;
-pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 5;
+pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 8;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
