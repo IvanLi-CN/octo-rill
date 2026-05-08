@@ -437,8 +437,8 @@ def ensure_ref_contains_commit(repo_root: Path, commit_sha: str, head_ref: str) 
         raise RuntimeError(f"{commit_sha} is not reachable from {head_ref}")
 
 
-def list_first_parent_merges(repo_root: Path, head_ref: str) -> list[str]:
-    return git_lines(repo_root, "rev-list", "--reverse", "--merges", "--first-parent", head_ref)
+def list_first_parent_commits(repo_root: Path, head_ref: str) -> list[str]:
+    return git_lines(repo_root, "rev-list", "--reverse", "--first-parent", head_ref)
 
 
 def list_tags_pointing_at(repo_root: Path, sha: str) -> list[str]:
@@ -470,7 +470,7 @@ def build_release_candidates(
     client: GitHubApiClient,
 ) -> list[ReleaseCandidate]:
     candidates: list[ReleaseCandidate] = []
-    for sha in list_first_parent_merges(repo_root, head_ref):
+    for sha in list_first_parent_commits(repo_root, head_ref):
         pull = client.pull_for_commit(repo, sha)
         if pull is None:
             continue
