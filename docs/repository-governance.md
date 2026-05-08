@@ -49,6 +49,12 @@ Before merge, maintainers confirm:
 - release intent labels match the planned release channel and version impact;
 - documentation reflects stable project truth when the change affects product behavior, architecture, operations, or repository workflow.
 
+## Release automation
+
+Release automation runs from `push` events on `main` and can also be backfilled with `workflow_dispatch(head_sha)`.
+
+The release planner scans first-parent commits on `main`, resolves each commit to its pull request, and uses the PR `type:*` and `channel:*` labels as release intent. This includes both merge commits and squash/direct PR commits, so all release-bearing PRs remain visible to the backfill and repair queue.
+
 ## Review policy
 
 Review policy is enforced by `Review Policy Gate`.
