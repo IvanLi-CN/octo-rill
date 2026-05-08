@@ -171,6 +171,9 @@
 - `全部` tab 历史日组缺少日报时显示“生成日报”入口并保留原始 Release 卡片流
 ![全部 tab 历史日组生成入口](./assets/dashboard-all-history-fallback.png)
 
+- `全部` tab 使用线上同时间段数据脱敏后的 mock：5月8日 10:39 后直接进入 5月7日日报周期，07:56 明细被日报覆盖隐藏
+![全部 tab 线上脱敏数据周期分割线](./assets/dashboard-sanitized-production-may8-boundary.png)
+
 ## 方案概述（Approach, high-level）
 
 - 在 Dashboard 启动数据中新增日报边界时间，让前端不再从 brief 样本推断分组规则。

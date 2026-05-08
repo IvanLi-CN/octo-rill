@@ -172,6 +172,27 @@ function resolveWindowStartDateKey(
 	return formatLocalDateKey(resolveWindowStart(value, boundary));
 }
 
+function resolveBriefWindowStartDateKey(
+	brief: BriefSnapshotCandidate,
+	boundary: DailyBoundaryLocal,
+	timeZone: string | null | undefined,
+	utcOffsetMinutes: number | null | undefined,
+) {
+	if (!brief.window_start) {
+		return brief.date;
+	}
+	const windowStart = new Date(brief.window_start);
+	if (Number.isNaN(windowStart.getTime())) {
+		return brief.date;
+	}
+	return resolveWindowStartDateKey(
+		windowStart,
+		boundary,
+		timeZone,
+		utcOffsetMinutes,
+	);
+}
+
 export function groupFeedItemsByDay(
 	items: FeedItem[],
 	dailyBoundaryLocal: string | null | undefined,
@@ -179,7 +200,7 @@ export function groupFeedItemsByDay(
 	dailyBoundaryUtcOffsetMinutes: number | null | undefined,
 	briefs: BriefSnapshotCandidate[] = [],
 	now = new Date(),
-	displayHistoricalRawGroupsByBriefDate = false,
+	_displayHistoricalRawGroupsByBriefDate = false,
 ) {
 	const boundary = parseDailyBoundaryLocal(dailyBoundaryLocal);
 	const currentWindowStartKey = resolveWindowStartDateKey(
@@ -347,12 +368,14 @@ export function groupFeedItemsByDay(
 			{
 				kind: historicalBrief ? "historical" : "raw",
 				id: groupId,
-				displayDate:
-					historicalBrief?.date ??
-					(displayHistoricalRawGroupsByBriefDate &&
-					rawGroupId !== currentGroupId
-						? briefDate
-						: windowStartKey),
+				displayDate: historicalBrief
+					? resolveBriefWindowStartDateKey(
+							historicalBrief,
+							boundary,
+							dailyBoundaryTimeZone,
+							dailyBoundaryUtcOffsetMinutes,
+						)
+					: windowStartKey,
 				briefDate: historicalBrief?.date ?? briefDate,
 				briefId: historicalBrief?.id ?? null,
 				items: [],
