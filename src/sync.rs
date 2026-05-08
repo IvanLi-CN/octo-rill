@@ -2765,9 +2765,9 @@ async fn attach_release_demand(
     let freshness_cutoff = repo_release_fresh_cutoff(now);
 
     for repo in repos {
-        let mut tx = state
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "repo_release_attach")
             .await
             .context("begin repo release attach tx")?;
         let existing = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
@@ -4531,9 +4531,9 @@ async fn claim_next_repo_release_work_item(
     state: &AppState,
 ) -> Result<Option<RepoReleaseWorkItemRow>> {
     let _claim_guard = repo_release_claim_lock().lock().await;
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "repo_release_claim")
         .await
         .context("begin repo release claim tx")?;
 
@@ -4680,45 +4680,54 @@ async fn process_repo_release_work_item(
 
     match result {
         Ok((release_count, candidate_failures)) => {
-            let updated = sqlx::query(
-                r#"
-                UPDATE repo_release_work_items
-                SET
-                  status = ?,
-                  priority = 0,
-                  has_new_repo_watchers = 0,
-                  deadline_at = ?,
-                  last_release_count = ?,
-                  last_candidate_failures = ?,
-                  last_success_at = ?,
-                  error_text = NULL,
-                  finished_at = ?,
-                  updated_at = ?,
-                  runtime_owner_id = NULL,
-                  lease_heartbeat_at = NULL
-                WHERE id = ?
-                  AND status = ?
-                  AND runtime_owner_id = ?
-                  AND started_at = ?
-                  AND julianday(deadline_at) > julianday(?)
-                "#,
-            )
-            .bind(jobs::STATUS_SUCCEEDED)
-            .bind(now.as_str())
-            .bind(i64::try_from(release_count).unwrap_or(i64::MAX))
-            .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(&work_item.id)
-            .bind(jobs::STATUS_RUNNING)
-            .bind(state.runtime_owner_id.as_str())
-            .bind(work_item.started_at.as_deref().unwrap_or_default())
-            .bind(now.as_str())
-            .execute(&state.pool)
-            .await
-            .with_context(|| format!("failed to finalize repo release work item {}", work_item.id))?
-            .rows_affected();
+            let updated = state
+                .sqlite_writer
+                .write("repo_release_finalize", |_| async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                        UPDATE repo_release_work_items
+                        SET
+                          status = ?,
+                          priority = 0,
+                          has_new_repo_watchers = 0,
+                          deadline_at = ?,
+                          last_release_count = ?,
+                          last_candidate_failures = ?,
+                          last_success_at = ?,
+                          error_text = NULL,
+                          finished_at = ?,
+                          updated_at = ?,
+                          runtime_owner_id = NULL,
+                          lease_heartbeat_at = NULL
+                        WHERE id = ?
+                          AND status = ?
+                          AND runtime_owner_id = ?
+                          AND started_at = ?
+                          AND julianday(deadline_at) > julianday(?)
+                        "#,
+                        )
+                        .bind(jobs::STATUS_SUCCEEDED)
+                        .bind(now.as_str())
+                        .bind(i64::try_from(release_count).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
+                        .bind(now.as_str())
+                        .bind(now.as_str())
+                        .bind(now.as_str())
+                        .bind(&work_item.id)
+                        .bind(jobs::STATUS_RUNNING)
+                        .bind(state.runtime_owner_id.as_str())
+                        .bind(work_item.started_at.as_deref().unwrap_or_default())
+                        .bind(now.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!("failed to finalize repo release work item {}", work_item.id)
+                        })?
+                        .rows_affected(),
+                    )
+                })
+                .await?;
             if updated > 0 {
                 mark_repo_release_watchers(state.as_ref(), &work_item.id, "succeeded", None, &now)
                     .await?;
@@ -4726,40 +4735,49 @@ async fn process_repo_release_work_item(
         }
         Err(err) => {
             let error_message = err.to_string();
-            let updated = sqlx::query(
-                r#"
-                UPDATE repo_release_work_items
-                SET
-                  status = ?,
-                  priority = 0,
-                  has_new_repo_watchers = 0,
-                  deadline_at = ?,
-                  error_text = ?,
-                  finished_at = ?,
-                  updated_at = ?,
-                  runtime_owner_id = NULL,
-                  lease_heartbeat_at = NULL
-                WHERE id = ?
-                  AND status = ?
-                  AND runtime_owner_id = ?
-                  AND started_at = ?
-                  AND julianday(deadline_at) > julianday(?)
-                "#,
-            )
-            .bind(jobs::STATUS_FAILED)
-            .bind(now.as_str())
-            .bind(error_message.as_str())
-            .bind(now.as_str())
-            .bind(now.as_str())
-            .bind(&work_item.id)
-            .bind(jobs::STATUS_RUNNING)
-            .bind(state.runtime_owner_id.as_str())
-            .bind(work_item.started_at.as_deref().unwrap_or_default())
-            .bind(now.as_str())
-            .execute(&state.pool)
-            .await
-            .with_context(|| format!("failed to fail repo release work item {}", work_item.id))?
-            .rows_affected();
+            let updated = state
+                .sqlite_writer
+                .write("repo_release_finalize", |_| async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                        UPDATE repo_release_work_items
+                        SET
+                          status = ?,
+                          priority = 0,
+                          has_new_repo_watchers = 0,
+                          deadline_at = ?,
+                          error_text = ?,
+                          finished_at = ?,
+                          updated_at = ?,
+                          runtime_owner_id = NULL,
+                          lease_heartbeat_at = NULL
+                        WHERE id = ?
+                          AND status = ?
+                          AND runtime_owner_id = ?
+                          AND started_at = ?
+                          AND julianday(deadline_at) > julianday(?)
+                        "#,
+                        )
+                        .bind(jobs::STATUS_FAILED)
+                        .bind(now.as_str())
+                        .bind(error_message.as_str())
+                        .bind(now.as_str())
+                        .bind(now.as_str())
+                        .bind(&work_item.id)
+                        .bind(jobs::STATUS_RUNNING)
+                        .bind(state.runtime_owner_id.as_str())
+                        .bind(work_item.started_at.as_deref().unwrap_or_default())
+                        .bind(now.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!("failed to fail repo release work item {}", work_item.id)
+                        })?
+                        .rows_affected(),
+                    )
+                })
+                .await?;
             if updated > 0 {
                 mark_repo_release_watchers(
                     state.as_ref(),
@@ -5071,9 +5089,12 @@ async fn upsert_repo_releases(
     releases: &[GitHubRelease],
 ) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    for release in releases {
-        sqlx::query(
-            r#"
+    state
+        .sqlite_writer
+        .write("repo_release_upsert", |_| async {
+            for release in releases {
+                sqlx::query(
+                    r#"
             INSERT INTO repo_releases (
               id,
               repo_id,
@@ -5114,66 +5135,69 @@ async fn upsert_repo_releases(
               react_rocket = excluded.react_rocket,
               react_eyes = excluded.react_eyes
             "#,
-        )
-        .bind(local_id::generate_local_id())
-        .bind(repo_id)
-        .bind(release.id)
-        .bind(release.node_id.as_deref())
-        .bind(release.tag_name.as_str())
-        .bind(release.name.as_deref())
-        .bind(release.body.as_deref())
-        .bind(release.html_url.as_str())
-        .bind(release.published_at.as_deref())
-        .bind(release.created_at.as_deref())
-        .bind(release.prerelease as i64)
-        .bind(release.draft as i64)
-        .bind(now.as_str())
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.plus1)
-                .unwrap_or(0),
-        )
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.laugh)
-                .unwrap_or(0),
-        )
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.heart)
-                .unwrap_or(0),
-        )
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.hooray)
-                .unwrap_or(0),
-        )
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.rocket)
-                .unwrap_or(0),
-        )
-        .bind(
-            release
-                .reactions
-                .as_ref()
-                .map(|value| value.eyes)
-                .unwrap_or(0),
-        )
-        .execute(&state.pool)
-        .await
-        .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
-    }
+                )
+                .bind(local_id::generate_local_id())
+                .bind(repo_id)
+                .bind(release.id)
+                .bind(release.node_id.as_deref())
+                .bind(release.tag_name.as_str())
+                .bind(release.name.as_deref())
+                .bind(release.body.as_deref())
+                .bind(release.html_url.as_str())
+                .bind(release.published_at.as_deref())
+                .bind(release.created_at.as_deref())
+                .bind(release.prerelease as i64)
+                .bind(release.draft as i64)
+                .bind(now.as_str())
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.plus1)
+                        .unwrap_or(0),
+                )
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.laugh)
+                        .unwrap_or(0),
+                )
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.heart)
+                        .unwrap_or(0),
+                )
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.hooray)
+                        .unwrap_or(0),
+                )
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.rocket)
+                        .unwrap_or(0),
+                )
+                .bind(
+                    release
+                        .reactions
+                        .as_ref()
+                        .map(|value| value.eyes)
+                        .unwrap_or(0),
+                )
+                .execute(&state.pool)
+                .await
+                .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
 
     Ok(releases.len())
 }
@@ -5185,20 +5209,26 @@ async fn mark_repo_release_watchers(
     error_text: Option<&str>,
     now_rfc3339: &str,
 ) -> Result<()> {
-    sqlx::query(
-        r#"
-        UPDATE repo_release_watchers
-        SET status = ?, error_text = ?, updated_at = ?
-        WHERE work_item_id = ? AND status = 'pending'
-        "#,
-    )
-    .bind(status)
-    .bind(error_text)
-    .bind(now_rfc3339)
-    .bind(work_item_id)
-    .execute(&state.pool)
-    .await
-    .context("failed to update repo release watchers")?;
+    state
+        .sqlite_writer
+        .write("repo_release_watchers", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE repo_release_watchers
+                SET status = ?, error_text = ?, updated_at = ?
+                WHERE work_item_id = ? AND status = 'pending'
+                "#,
+            )
+            .bind(status)
+            .bind(error_text)
+            .bind(now_rfc3339)
+            .bind(work_item_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to update repo release watchers")?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -5207,21 +5237,27 @@ async fn heartbeat_repo_release_work_item_lease(
     work_item_id: &str,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE repo_release_work_items
-        SET lease_heartbeat_at = ?, updated_at = ?
-        WHERE id = ? AND status = ? AND runtime_owner_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(work_item_id)
-    .bind(jobs::STATUS_RUNNING)
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to heartbeat repo release work item")?;
+    state
+        .sqlite_writer
+        .write("repo_release_heartbeat", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE repo_release_work_items
+                SET lease_heartbeat_at = ?, updated_at = ?
+                WHERE id = ? AND status = ? AND runtime_owner_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(work_item_id)
+            .bind(jobs::STATUS_RUNNING)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to heartbeat repo release work item")?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -5241,38 +5277,45 @@ async fn fail_repo_release_work_item(
     } else {
         0_i64
     };
-    let updated = sqlx::query(
-        r#"
-        UPDATE repo_release_work_items
-        SET
-          status = ?,
-          priority = 0,
-          has_new_repo_watchers = 0,
-          deadline_at = ?,
-          error_text = ?,
-          finished_at = ?,
-          updated_at = ?,
-          runtime_owner_id = NULL,
-          lease_heartbeat_at = NULL
-        WHERE id = ?
-          AND status IN (?, ?)
-          AND (? = 0 OR julianday(deadline_at) <= julianday(?))
-        "#,
-    )
-    .bind(jobs::STATUS_FAILED)
-    .bind(now)
-    .bind(error_text)
-    .bind(now)
-    .bind(now)
-    .bind(work_item_id)
-    .bind(jobs::STATUS_QUEUED)
-    .bind(jobs::STATUS_RUNNING)
-    .bind(require_expired_deadline)
-    .bind(now)
-    .execute(&state.pool)
-    .await
-    .with_context(|| format!("failed to fail repo release work item {work_item_id}"))?
-    .rows_affected();
+    let updated = state
+        .sqlite_writer
+        .write("repo_release_fail", |_| async {
+            Ok::<_, anyhow::Error>(
+                sqlx::query(
+                    r#"
+                UPDATE repo_release_work_items
+                SET
+                  status = ?,
+                  priority = 0,
+                  has_new_repo_watchers = 0,
+                  deadline_at = ?,
+                  error_text = ?,
+                  finished_at = ?,
+                  updated_at = ?,
+                  runtime_owner_id = NULL,
+                  lease_heartbeat_at = NULL
+                WHERE id = ?
+                  AND status IN (?, ?)
+                  AND (? = 0 OR julianday(deadline_at) <= julianday(?))
+                "#,
+                )
+                .bind(jobs::STATUS_FAILED)
+                .bind(now)
+                .bind(error_text)
+                .bind(now)
+                .bind(now)
+                .bind(work_item_id)
+                .bind(jobs::STATUS_QUEUED)
+                .bind(jobs::STATUS_RUNNING)
+                .bind(require_expired_deadline)
+                .bind(now)
+                .execute(&state.pool)
+                .await
+                .with_context(|| format!("failed to fail repo release work item {work_item_id}"))?
+                .rows_affected(),
+            )
+        })
+        .await?;
 
     if updated > 0 {
         mark_repo_release_watchers(state, work_item_id, "failed", Some(error_text), now).await?;
@@ -12321,6 +12364,7 @@ mod tests {
             ),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,

@@ -84,22 +84,28 @@ pub fn stale_cutoff_timestamp(now: DateTime<Utc>) -> String {
 
 pub async fn register_runtime_owner(state: &AppState) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(runtime_owner_id) DO UPDATE SET
-          lease_heartbeat_at = excluded.lease_heartbeat_at,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(state.runtime_owner_id.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to register runtime owner")?;
+    state
+        .sqlite_writer
+        .write("runtime_owner_register", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO runtime_owners (runtime_owner_id, lease_heartbeat_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(runtime_owner_id) DO UPDATE SET
+                  lease_heartbeat_at = excluded.lease_heartbeat_at,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(state.runtime_owner_id.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to register runtime owner")?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
 
     prune_stale_runtime_owners(state).await?;
     Ok(())
@@ -136,20 +142,27 @@ pub fn spawn_runtime_owner_heartbeat(state: Arc<AppState>) -> LeaseHeartbeat {
 
 async fn touch_runtime_owner_lease(state: &AppState) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let updated_rows = sqlx::query(
-        r#"
-        UPDATE runtime_owners
-        SET lease_heartbeat_at = ?, updated_at = ?
-        WHERE runtime_owner_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to heartbeat runtime owner")?
-    .rows_affected();
+    let updated_rows = state
+        .sqlite_writer
+        .write("runtime_owner_heartbeat", |_| async {
+            Ok::<_, anyhow::Error>(
+                sqlx::query(
+                    r#"
+                UPDATE runtime_owners
+                SET lease_heartbeat_at = ?, updated_at = ?
+                WHERE runtime_owner_id = ?
+                "#,
+                )
+                .bind(now.as_str())
+                .bind(now.as_str())
+                .bind(state.runtime_owner_id.as_str())
+                .execute(&state.pool)
+                .await
+                .context("failed to heartbeat runtime owner")?
+                .rows_affected(),
+            )
+        })
+        .await?;
 
     if updated_rows == 0 {
         register_runtime_owner(state).await?;

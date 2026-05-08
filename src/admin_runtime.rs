@@ -647,6 +647,7 @@ mod tests {
             encryption_key: config.encryption_key.clone(),
             runtime_owner_id: generate_local_id(),
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             config,
         })
     }
