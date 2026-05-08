@@ -437,8 +437,8 @@ def ensure_ref_contains_commit(repo_root: Path, commit_sha: str, head_ref: str) 
         raise RuntimeError(f"{commit_sha} is not reachable from {head_ref}")
 
 
-def list_first_parent_merges(repo_root: Path, head_ref: str) -> list[str]:
-    return git_lines(repo_root, "rev-list", "--reverse", "--merges", "--first-parent", head_ref)
+def list_first_parent_commits(repo_root: Path, head_ref: str) -> list[str]:
+    return git_lines(repo_root, "rev-list", "--reverse", "--first-parent", head_ref)
 
 
 def list_tags_pointing_at(repo_root: Path, sha: str) -> list[str]:
@@ -470,7 +470,8 @@ def build_release_candidates(
     client: GitHubApiClient,
 ) -> list[ReleaseCandidate]:
     candidates: list[ReleaseCandidate] = []
-    for sha in list_first_parent_merges(repo_root, head_ref):
+    candidate_index_by_pr: dict[int, int] = {}
+    for sha in list_first_parent_commits(repo_root, head_ref):
         pull = client.pull_for_commit(repo, sha)
         if pull is None:
             continue
@@ -494,17 +495,22 @@ def build_release_candidates(
             release_exists = client.release_exists(repo, matching_tag)
             comment_exists = client.has_managed_comment(repo, pr_number)
 
-        candidates.append(
-            ReleaseCandidate(
-                sha=sha,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                intent=intent,
-                matching_tag=matching_tag,
-                release_exists=release_exists,
-                comment_exists=comment_exists,
-            )
+        candidate = ReleaseCandidate(
+            sha=sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            intent=intent,
+            matching_tag=matching_tag,
+            release_exists=release_exists,
+            comment_exists=comment_exists,
         )
+        existing_index = candidate_index_by_pr.get(pr_number)
+        if existing_index is not None:
+            candidates[existing_index] = candidate
+            continue
+
+        candidate_index_by_pr[pr_number] = len(candidates)
+        candidates.append(candidate)
     return candidates
 
 

@@ -25,8 +25,8 @@
 
 ## 关键约束
 
-- 主干 push 触发的 release 需要先扫描当前 `main` 的 first-parent merge 历史，再决定本次真正要发布的目标 SHA。
-- 若存在更早的未发布 release-eligible merge commit，本次 push 不能先发布较新的 merge commit。
+- 主干 push 触发的 release 需要先扫描当前 `main` 的 first-parent 主干提交历史，再决定本次真正要发布的目标 SHA。
+- 若存在更早的未发布 release-eligible PR 主干提交，本次 push 不能先发布较新的 PR 主干提交。
 - 无论本次要发布的是当前 push 还是更早的 backfill 目标，都必须校验该 target SHA 自己的 `CI Pipeline` push run 已进入终态；`success` 与 `cancelled` 允许继续发布，`failure`/`timed_out` 必须阻断发布。
 - 当某个历史 target SHA 的 `CI Pipeline` 结论为阻断态时，本次 run 不能发布该 SHA，但仍要继续评估并 dispatch 更靠后的 pending release，避免整个 backfill 队列永久卡死。
 - 对同一 target SHA 重跑 release 时，版本号必须复用该提交上已存在的 release tag，而不是继续向后 bump。
@@ -40,7 +40,7 @@
 
 - Release workflow:
   - 改为监听 `push.branches=[main]` 与 `workflow_dispatch(head_sha)`。
-  - 新增 release target planning / audit 步骤，按 first-parent merge 顺序选择最早的漏发提交。
+  - 新增 release target planning / audit 步骤，按 first-parent 主干提交顺序选择最早的漏发提交，覆盖 merge commit、squash merge commit 与 rebase merge commit；同一 PR 多个主干提交只保留最后一个提交作为 release candidate。
   - 对 push 触发完成当前补发后，如仍存在后续漏项，自动 dispatch 下一次 backfill。
   - 对历史 backfill target 的缺失 tag，优先使用仓库 secret `RELEASE_TOKEN` 创建 release；若 secret 缺失，则在 workflow 内明确阻断并提示先推送 tag 再重跑。
 - Release helper scripts:
