@@ -1623,7 +1623,11 @@ pub fn admin_jobs_sse_response(state: Arc<AppState>) -> Response {
 
 async fn claim_next_queued_task(state: &AppState) -> Result<Option<TaskRow>> {
     let _claim_guard = task_claim_lock().lock().await;
-    let mut tx = state.pool.begin().await.context("begin task claim tx")?;
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .context("begin task claim tx")?;
 
     let task_id = sqlx::query_scalar::<_, String>(
         r#"

@@ -2767,7 +2767,7 @@ async fn attach_release_demand(
     for repo in repos {
         let mut tx = state
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .context("begin repo release attach tx")?;
         let existing = sqlx::query_as::<_, RepoReleaseWorkItemRow>(
@@ -4533,7 +4533,7 @@ async fn claim_next_repo_release_work_item(
     let _claim_guard = repo_release_claim_lock().lock().await;
     let mut tx = state
         .pool
-        .begin()
+        .begin_with("BEGIN IMMEDIATE")
         .await
         .context("begin repo release claim tx")?;
 
