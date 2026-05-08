@@ -56,12 +56,12 @@ try {
 		"raw group id should stay window-start based",
 	);
 	assert(
-		groups[0].displayDate === "2026-05-06",
-		"raw group should display the brief/window end date",
+		groups[0].displayDate === "2026-05-05",
+		"raw group should display the daily window start date",
 	);
 	assert(
 		groups[0].briefDate === "2026-05-06",
-		"generated brief date should remain the window end date",
+		"generated brief API date should remain compatible with the stored window end date",
 	);
 
 	const historicalGroups = groupFeedItemsByDay(
@@ -88,8 +88,8 @@ try {
 		"expected release to fold into its brief",
 	);
 	assert(
-		historicalGroups[0].displayDate === "2026-05-06",
-		"historical group should keep brief date",
+		historicalGroups[0].displayDate === "2026-05-05",
+		"historical group should display the stored window start date",
 	);
 	assert(
 		historicalGroups[0].briefId === "brief-2026-05-06",
@@ -115,8 +115,8 @@ try {
 		"expected early morning releases to stay in the same window group",
 	);
 	assert(
-		mixedGroups[0].displayDate === "2026-05-06",
-		"mixed raw group should display May 6",
+		mixedGroups[0].displayDate === "2026-05-05",
+		"mixed raw group should display May 5",
 	);
 	assert(
 		mixedGroups[0].releaseCount === 2,
