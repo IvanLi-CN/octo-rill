@@ -5,3 +5,4 @@
 - 2026-05-07: 公开 Release 页面页脚补齐 OctoRill 前端加载版本号；有效版本号链接到 OctoRill 自身 public-only Release 详情页，并补充移动端视觉证据。
 - 2026-05-07: 公开文档站补齐 `公开 Release 接入` 页面，作为第三方展示特定 GitHub 仓库 Releases 的稳定接入入口。
 - 2026-05-08: 公开 Release 首次登记改为优先复用近期本地公开仓库 metadata 与共享 Release 缓存，避免已有缓存的公开仓库卡在 metadata pending；同时 SQLite 主连接池改为默认 8 且可通过环境变量调整。
+- 2026-05-08: 主连接池放大后，高竞争后台写事务必须提前获取 SQLite writer slot；repo release / translation scheduler 的 claim / attach 路径按该约束收敛，避免 `SQLITE_BUSY_SNAPSHOT` 让计划任务连续失败。
