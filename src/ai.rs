@@ -5481,6 +5481,7 @@ mod tests {
             ),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,

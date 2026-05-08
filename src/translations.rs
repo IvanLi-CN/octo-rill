@@ -2227,15 +2227,16 @@ async fn create_translation_request_with_origin(
     request_origin: &str,
 ) -> Result<CreatedTranslationRequest, ApiError> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_request")
         .await
         .map_err(ApiError::internal)?;
     let created =
         insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
             .await?;
     tx.commit().await.map_err(ApiError::internal)?;
+    drop(sqlite_write);
     refresh_live_batch_runtime_for_request(state, &created).await?;
     Ok(created)
 }
@@ -2247,9 +2248,9 @@ async fn resolve_translation_results_for_user(
     retry_on_error: bool,
 ) -> Result<Vec<TranslationResultItem>, ApiError> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_result_resolve")
         .await
         .map_err(ApiError::internal)?;
     let mut out = Vec::with_capacity(items.len());
@@ -2278,9 +2279,9 @@ async fn create_translation_requests_batch_with_origin(
     request_origin: &str,
 ) -> Result<Vec<CreatedTranslationRequest>, ApiError> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_request_batch")
         .await
         .map_err(ApiError::internal)?;
     let mut out = Vec::with_capacity(items.len());
@@ -2291,6 +2292,7 @@ async fn create_translation_requests_batch_with_origin(
         );
     }
     tx.commit().await.map_err(ApiError::internal)?;
+    drop(sqlite_write);
     for created in &out {
         refresh_live_batch_runtime_for_request(state, created).await?;
     }
@@ -3550,7 +3552,10 @@ async fn claim_next_batch(
         first.target_lang, first.protocol_version, first.model_profile
     );
     let now_str = now.to_rfc3339();
-    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_claim")
+        .await?;
     let mut request_ids = HashSet::new();
     for item in &selected {
         let rows = sqlx::query_scalar::<_, String>(
@@ -4126,7 +4131,10 @@ async fn finalize_batch_success(
     results: Vec<TerminalWorkResult>,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    let mut tx = state.pool.begin().await?;
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_finalize")
+        .await?;
     for result in &results {
         sqlx::query(
             r#"
@@ -4267,7 +4275,10 @@ async fn finalize_batch_failure(
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     let message = err.to_string();
-    let mut tx = state.pool.begin().await?;
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_finalize")
+        .await?;
     fail_batch_with_message(
         &mut tx,
         batch.id.as_str(),
@@ -4282,21 +4293,27 @@ async fn finalize_batch_failure(
 
 async fn heartbeat_translation_batch_lease(state: &AppState, batch_id: &str) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE translation_batches
-        SET lease_heartbeat_at = ?, updated_at = ?
-        WHERE id = ?
-          AND status = 'running'
-          AND runtime_owner_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(batch_id)
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await?;
+    state
+        .sqlite_writer
+        .write("translation_batch_heartbeat", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE translation_batches
+                SET lease_heartbeat_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND runtime_owner_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(batch_id)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -4522,7 +4539,10 @@ async fn recover_runtime_state_with_mode(
         )
         .await?;
 
-        let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (_sqlite_write, mut tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "translation_batch_recovery")
+            .await?;
         let items = load_batch_work_items(&mut tx, batch.id.as_str()).await?;
         let now = Utc::now().to_rfc3339();
         fail_batch_with_message(
@@ -10644,6 +10664,7 @@ mod tests {
             )),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,

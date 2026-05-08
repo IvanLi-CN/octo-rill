@@ -5,6 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -434,18 +435,44 @@ async fn maybe_bootstrap_access_sync(
 
 async fn touch_user_last_active_at(state: &AppState, user_id: &str) -> Result<(), ApiError> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE users
-        SET last_active_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(user_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    let result = state
+        .sqlite_writer
+        .try_write("user_activity", || async {
+            sqlx::query(
+                r#"
+                UPDATE users
+                SET last_active_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(user_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to touch user last_active_at")?;
+            Ok(())
+        })
+        .await;
+    match result {
+        Ok(Some(())) => {}
+        Ok(None) => {
+            tracing::debug!(
+                user_id,
+                "skip best-effort last_active_at touch because sqlite writer is busy"
+            );
+        }
+        Err(err) => {
+            if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) {
+                tracing::warn!(
+                    user_id,
+                    err = %err,
+                    "skip best-effort last_active_at touch after sqlite busy retries"
+                );
+                return Ok(());
+            }
+            return Err(ApiError::internal(err));
+        }
+    }
     Ok(())
 }
 
@@ -14883,6 +14910,7 @@ mod tests {
             ),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,
@@ -14934,6 +14962,7 @@ mod tests {
             ),
             config,
             pool,
+            sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
             github_oauth,
             linuxdo_oauth: None,

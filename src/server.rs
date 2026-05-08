@@ -133,6 +133,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )),
         config: config.clone(),
         pool: pool.clone(),
+        sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
         http,
         github_oauth,
         linuxdo_oauth,

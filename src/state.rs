@@ -27,7 +27,7 @@ use webauthn_rs_core::{
 
 use crate::{
     ai::LlmScheduler, config::AppConfig, crypto::EncryptionKey, local_id,
-    translations::TranslationSchedulerController,
+    sqlite_write::SqliteWriteCoordinator, translations::TranslationSchedulerController,
 };
 
 pub type GitHubOAuthClient =
@@ -39,6 +39,7 @@ pub type LinuxDoOAuthClient =
 pub struct AppState {
     pub config: AppConfig,
     pub pool: SqlitePool,
+    pub sqlite_writer: SqliteWriteCoordinator,
     pub http: reqwest::Client,
     pub github_oauth: GitHubOAuthClient,
     pub linuxdo_oauth: Option<LinuxDoOAuthClient>,
