@@ -5266,20 +5266,26 @@ async fn public_release_usage_repo_exists(state: &AppState, repo_id: i64) -> Res
 
 async fn mark_public_release_usage_sync_success(state: &AppState, repo_id: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE public_repo_release_usage
-        SET last_sync_status = 'ready',
-            last_sync_error = NULL,
-            updated_at = ?
-        WHERE repo_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(repo_id)
-    .execute(&state.pool)
-    .await
-    .context("failed to mark public release usage sync success")?;
+    state
+        .sqlite_writer
+        .write("public_release_usage_success", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE public_repo_release_usage
+                SET last_sync_status = 'ready',
+                    last_sync_error = NULL,
+                    updated_at = ?
+                WHERE repo_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(repo_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to mark public release usage sync success")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -5294,22 +5300,29 @@ async fn mark_public_release_usage_sync_failure(
     } else {
         "failed"
     };
-    sqlx::query(
-        r#"
-        UPDATE public_repo_release_usage
-        SET last_sync_status = ?,
-            last_sync_error = ?,
-            updated_at = ?
-        WHERE repo_id = ?
-        "#,
-    )
-    .bind(status)
-    .bind(format!("{}: {}", err.reason_code, err.message))
-    .bind(now.as_str())
-    .bind(repo_id)
-    .execute(&state.pool)
-    .await
-    .context("failed to mark public release usage sync failure")?;
+    let error_message = format!("{}: {}", err.reason_code, err.message);
+    state
+        .sqlite_writer
+        .write("public_release_usage_failure", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE public_repo_release_usage
+                SET last_sync_status = ?,
+                    last_sync_error = ?,
+                    updated_at = ?
+                WHERE repo_id = ?
+                "#,
+            )
+            .bind(status)
+            .bind(error_message.as_str())
+            .bind(now.as_str())
+            .bind(repo_id)
+            .execute(&state.pool)
+            .await
+            .context("failed to mark public release usage sync failure")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -5339,54 +5352,60 @@ async fn record_repo_release_sync_success(
     stats: &RepoReleaseWriteStats,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO repo_release_sync_state (
-          repo_id, etag, last_modified, last_success_at, last_attempt_at,
-          last_not_modified_at, last_error_text, backoff_until, last_page_count,
-          last_fetched_count, last_inserted_count, last_updated_count,
-          last_unchanged_count, last_stopped_reason, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(repo_id) DO UPDATE SET
-          etag = COALESCE(excluded.etag, repo_release_sync_state.etag),
-          last_modified = COALESCE(excluded.last_modified, repo_release_sync_state.last_modified),
-          last_success_at = excluded.last_success_at,
-          last_attempt_at = excluded.last_attempt_at,
-          last_not_modified_at = CASE
-            WHEN excluded.last_not_modified_at IS NOT NULL THEN excluded.last_not_modified_at
-            ELSE repo_release_sync_state.last_not_modified_at
-          END,
-          last_error_text = NULL,
-          backoff_until = NULL,
-          last_page_count = CASE
-            WHEN excluded.last_page_count > 0 THEN excluded.last_page_count
-            ELSE repo_release_sync_state.last_page_count
-          END,
-          last_fetched_count = excluded.last_fetched_count,
-          last_inserted_count = excluded.last_inserted_count,
-          last_updated_count = excluded.last_updated_count,
-          last_unchanged_count = excluded.last_unchanged_count,
-          last_stopped_reason = excluded.last_stopped_reason,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(repo_id)
-    .bind(http_state.etag)
-    .bind(http_state.last_modified)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(not_modified.then_some(now.as_str()))
-    .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
-    .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
-    .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
-    .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
-    .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
-    .bind(stats.stopped_reason.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to record repo release sync success")?;
+    state
+        .sqlite_writer
+        .write("repo_release_sync_success", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO repo_release_sync_state (
+                  repo_id, etag, last_modified, last_success_at, last_attempt_at,
+                  last_not_modified_at, last_error_text, backoff_until, last_page_count,
+                  last_fetched_count, last_inserted_count, last_updated_count,
+                  last_unchanged_count, last_stopped_reason, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET
+                  etag = COALESCE(excluded.etag, repo_release_sync_state.etag),
+                  last_modified = COALESCE(excluded.last_modified, repo_release_sync_state.last_modified),
+                  last_success_at = excluded.last_success_at,
+                  last_attempt_at = excluded.last_attempt_at,
+                  last_not_modified_at = CASE
+                    WHEN excluded.last_not_modified_at IS NOT NULL THEN excluded.last_not_modified_at
+                    ELSE repo_release_sync_state.last_not_modified_at
+                  END,
+                  last_error_text = NULL,
+                  backoff_until = NULL,
+                  last_page_count = CASE
+                    WHEN excluded.last_page_count > 0 THEN excluded.last_page_count
+                    ELSE repo_release_sync_state.last_page_count
+                  END,
+                  last_fetched_count = excluded.last_fetched_count,
+                  last_inserted_count = excluded.last_inserted_count,
+                  last_updated_count = excluded.last_updated_count,
+                  last_unchanged_count = excluded.last_unchanged_count,
+                  last_stopped_reason = excluded.last_stopped_reason,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(repo_id)
+            .bind(http_state.etag.as_deref())
+            .bind(http_state.last_modified.as_deref())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(not_modified.then_some(now.as_str()))
+            .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
+            .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
+            .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+            .bind(stats.stopped_reason.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to record repo release sync success")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -5402,28 +5421,35 @@ async fn record_repo_release_sync_failure(
         None
     };
     let now = now.to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO repo_release_sync_state (
-          repo_id, etag, last_modified, last_success_at, last_attempt_at,
-          last_not_modified_at, last_error_text, backoff_until, updated_at
-        )
-        VALUES (?, NULL, NULL, NULL, ?, NULL, ?, ?, ?)
-        ON CONFLICT(repo_id) DO UPDATE SET
-          last_attempt_at = excluded.last_attempt_at,
-          last_error_text = excluded.last_error_text,
-          backoff_until = excluded.backoff_until,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(repo_id)
-    .bind(now.as_str())
-    .bind(format!("{}: {}", error.reason_code, error.message))
-    .bind(backoff_until.as_deref())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to record repo release sync failure")?;
+    let error_message = format!("{}: {}", error.reason_code, error.message);
+    state
+        .sqlite_writer
+        .write("repo_release_sync_failure", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO repo_release_sync_state (
+                  repo_id, etag, last_modified, last_success_at, last_attempt_at,
+                  last_not_modified_at, last_error_text, backoff_until, updated_at
+                )
+                VALUES (?, NULL, NULL, NULL, ?, NULL, ?, ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET
+                  last_attempt_at = excluded.last_attempt_at,
+                  last_error_text = excluded.last_error_text,
+                  backoff_until = excluded.backoff_until,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(repo_id)
+            .bind(now.as_str())
+            .bind(error_message.as_str())
+            .bind(backoff_until.as_deref())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to record repo release sync failure")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 

@@ -791,41 +791,47 @@ async fn insert_task_record(
     let payload_json = serde_json::to_string(&new_task.payload).context("serialize payload")?;
     let log_file_path = build_task_log_path(state, &new_task.task_type, &task_id)?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO job_tasks (
-          id,
-          task_type,
-          status,
-          source,
-          requested_by,
-          parent_task_id,
-          payload_json,
-          log_file_path,
-          created_at,
-          started_at,
-          runtime_owner_id,
-          lease_heartbeat_at,
-          updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&task_id)
-    .bind(&new_task.task_type)
-    .bind(status)
-    .bind(&new_task.source)
-    .bind(new_task.requested_by.as_deref())
-    .bind(new_task.parent_task_id.as_deref())
-    .bind(payload_json)
-    .bind(log_file_path.as_deref())
-    .bind(now.as_str())
-    .bind(started_at)
-    .bind(runtime_owner_id)
-    .bind(lease_heartbeat_at)
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to insert job task")?;
+    state
+        .sqlite_writer
+        .write_foreground("job_task_insert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO job_tasks (
+                  id,
+                  task_type,
+                  status,
+                  source,
+                  requested_by,
+                  parent_task_id,
+                  payload_json,
+                  log_file_path,
+                  created_at,
+                  started_at,
+                  runtime_owner_id,
+                  lease_heartbeat_at,
+                  updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&task_id)
+            .bind(&new_task.task_type)
+            .bind(status)
+            .bind(&new_task.source)
+            .bind(new_task.requested_by.as_deref())
+            .bind(new_task.parent_task_id.as_deref())
+            .bind(payload_json.as_str())
+            .bind(log_file_path.as_deref())
+            .bind(now.as_str())
+            .bind(started_at)
+            .bind(runtime_owner_id)
+            .bind(lease_heartbeat_at)
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to insert job task")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
 
     Ok(task_id)
 }
@@ -1057,21 +1063,26 @@ pub async fn retry_task(
 pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
     let now = Utc::now().to_rfc3339();
 
-    let canceled_queued = sqlx::query(
-        r#"
-        UPDATE job_tasks
-        SET status = ?, cancel_requested = 1, finished_at = ?, updated_at = ?
-        WHERE id = ? AND status = ?
-        "#,
-    )
-    .bind(STATUS_CANCELED)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(task_id)
-    .bind(STATUS_QUEUED)
-    .execute(&state.pool)
-    .await
-    .context("failed to cancel queued task")?;
+    let canceled_queued = state
+        .sqlite_writer
+        .write_foreground("job_task_cancel_queued", |_| async {
+            sqlx::query(
+                r#"
+                    UPDATE job_tasks
+                    SET status = ?, cancel_requested = 1, finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    "#,
+            )
+            .bind(STATUS_CANCELED)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_QUEUED)
+            .execute(&state.pool)
+            .await
+            .context("failed to cancel queued task")
+        })
+        .await?;
 
     if canceled_queued.rows_affected() > 0 {
         append_task_event(
@@ -1084,19 +1095,24 @@ pub async fn cancel_task(state: &AppState, task_id: &str) -> Result<String> {
         return Ok(STATUS_CANCELED.to_owned());
     }
 
-    let requested_running = sqlx::query(
-        r#"
-        UPDATE job_tasks
-        SET cancel_requested = 1, updated_at = ?
-        WHERE id = ? AND status = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(task_id)
-    .bind(STATUS_RUNNING)
-    .execute(&state.pool)
-    .await
-    .context("failed to request cancellation")?;
+    let requested_running = state
+        .sqlite_writer
+        .write_foreground("job_task_cancel_running", |_| async {
+            sqlx::query(
+                r#"
+                    UPDATE job_tasks
+                    SET cancel_requested = 1, updated_at = ?
+                    WHERE id = ? AND status = ?
+                    "#,
+            )
+            .bind(now.as_str())
+            .bind(task_id)
+            .bind(STATUS_RUNNING)
+            .execute(&state.pool)
+            .await
+            .context("failed to request cancellation")
+        })
+        .await?;
 
     if requested_running.rows_affected() > 0 {
         append_task_event(
@@ -1128,20 +1144,26 @@ pub async fn append_task_event(
     let now = Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(&payload).context("serialize task event payload")?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(local_id::generate_local_id())
-    .bind(task_id)
-    .bind(event_type)
-    .bind(payload_json)
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to insert task event")?;
+    state
+        .sqlite_writer
+        .write_foreground("job_task_event_insert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO job_task_events (id, task_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(task_id)
+            .bind(event_type)
+            .bind(payload_json.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to insert task event")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
 
     Ok(())
 }
@@ -3640,14 +3662,14 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING,
+        NewTask, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING,
         TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
         TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
         TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
         claim_next_queued_task, current_recent_failures_retry_schedule_key,
         current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
-        enqueue_recent_failures_retry_if_due, execute_brief_history_recompute_task,
+        enqueue_recent_failures_retry_if_due, enqueue_task, execute_brief_history_recompute_task,
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
         is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
@@ -4804,6 +4826,49 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed translation request");
+    }
+
+    #[tokio::test]
+    async fn enqueue_task_waits_for_foreground_writer_backpressure() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool);
+        let held_writer = state
+            .sqlite_writer
+            .acquire_with_priority(
+                "test_background_pressure",
+                crate::sqlite_write::SqliteWritePriority::Background,
+            )
+            .await
+            .expect("hold sqlite writer");
+
+        let enqueue_state = state.clone();
+        let enqueue = tokio::spawn(async move {
+            enqueue_task(
+                enqueue_state.as_ref(),
+                NewTask {
+                    task_type: TASK_SYNC_ALL.to_owned(),
+                    payload: json!({"trigger": "test"}),
+                    source: "manual".to_owned(),
+                    requested_by: None,
+                    parent_task_id: None,
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !enqueue.is_finished(),
+            "enqueue should wait behind the coordinated writer instead of bypassing it"
+        );
+
+        drop(held_writer);
+        let task = enqueue
+            .await
+            .expect("join enqueue")
+            .expect("enqueue after writer release");
+        assert_eq!(task.task_type, TASK_SYNC_ALL);
+        assert_eq!(task.status, STATUS_QUEUED);
     }
 
     async fn seed_task(

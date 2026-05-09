@@ -14,6 +14,7 @@ mod passkeys;
 mod release_links;
 mod runtime;
 mod server;
+mod session_store;
 mod sqlite_write;
 mod state;
 mod sync;

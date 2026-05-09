@@ -1481,40 +1481,46 @@ async fn insert_llm_call(
     input_messages_json: Option<&str>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO llm_calls (
-          id,
-          status,
-          source,
-          model,
-          requested_by,
-          parent_task_id,
-          parent_task_type,
-          parent_translation_batch_id,
-          max_tokens,
-          prompt_text,
-          input_messages_json,
-          created_at,
-          updated_at
-        ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(log.id.as_str())
-    .bind(log.source.as_str())
-    .bind(model)
-    .bind(log.requested_by.as_deref())
-    .bind(log.parent_task_id.as_deref())
-    .bind(log.parent_task_type.as_deref())
-    .bind(log.parent_translation_batch_id.as_deref())
-    .bind(i64::from(max_tokens))
-    .bind(prompt_text)
-    .bind(input_messages_json)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("insert llm_call failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_insert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO llm_calls (
+                  id,
+                  status,
+                  source,
+                  model,
+                  requested_by,
+                  parent_task_id,
+                  parent_task_type,
+                  parent_translation_batch_id,
+                  max_tokens,
+                  prompt_text,
+                  input_messages_json,
+                  created_at,
+                  updated_at
+                ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(log.id.as_str())
+            .bind(log.source.as_str())
+            .bind(model)
+            .bind(log.requested_by.as_deref())
+            .bind(log.parent_task_id.as_deref())
+            .bind(log.parent_task_type.as_deref())
+            .bind(log.parent_translation_batch_id.as_deref())
+            .bind(i64::from(max_tokens))
+            .bind(prompt_text)
+            .bind(input_messages_json)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("insert llm_call failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     append_llm_call_event(
         state,
         log.id.as_str(),
@@ -1539,43 +1545,48 @@ async fn append_llm_call_event(
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned());
-    let inserted = sqlx::query(
-        r#"
-        INSERT INTO llm_call_events (
-          id,
-          call_id,
-          event_type,
-          status,
-          source,
-          requested_by,
-          parent_task_id,
-          payload_json,
-          created_at
-        )
-        SELECT
-          ?,
-          id,
-          ?,
-          ?,
-          source,
-          requested_by,
-          parent_task_id,
-          ?,
-          ?
-        FROM llm_calls
-        WHERE id = ?
-        LIMIT 1
-        "#,
-    )
-    .bind(local_id::generate_local_id())
-    .bind(event_type)
-    .bind(status)
-    .bind(payload_json)
-    .bind(now.as_str())
-    .bind(call_id)
-    .execute(&state.pool)
-    .await
-    .context("insert llm_call event failed")?;
+    let inserted = state
+        .sqlite_writer
+        .write("llm_call_event_insert", |_| async {
+            sqlx::query(
+                r#"
+                    INSERT INTO llm_call_events (
+                      id,
+                      call_id,
+                      event_type,
+                      status,
+                      source,
+                      requested_by,
+                      parent_task_id,
+                      payload_json,
+                      created_at
+                    )
+                    SELECT
+                      ?,
+                      id,
+                      ?,
+                      ?,
+                      source,
+                      requested_by,
+                      parent_task_id,
+                      ?,
+                      ?
+                    FROM llm_calls
+                    WHERE id = ?
+                    LIMIT 1
+                    "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(event_type)
+            .bind(status)
+            .bind(payload_json.as_str())
+            .bind(now.as_str())
+            .bind(call_id)
+            .execute(&state.pool)
+            .await
+            .context("insert llm_call event failed")
+        })
+        .await?;
     if inserted.rows_affected() == 0 {
         return Err(anyhow!("insert llm_call event failed: call not found"));
     }
@@ -1589,29 +1600,35 @@ async fn update_llm_call_running(
     scheduler_wait_ms: i64,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE llm_calls
-        SET status = 'running',
-            started_at = COALESCE(started_at, ?),
-            attempt_count = ?,
-            scheduler_wait_ms = ?,
-            runtime_owner_id = ?,
-            lease_heartbeat_at = ?,
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(attempt_count)
-    .bind(scheduler_wait_ms)
-    .bind(state.runtime_owner_id.as_str())
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(call_id)
-    .execute(&state.pool)
-    .await
-    .context("update llm_call running failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_running", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE llm_calls
+                SET status = 'running',
+                    started_at = COALESCE(started_at, ?),
+                    attempt_count = ?,
+                    scheduler_wait_ms = ?,
+                    runtime_owner_id = ?,
+                    lease_heartbeat_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(attempt_count)
+            .bind(scheduler_wait_ms)
+            .bind(state.runtime_owner_id.as_str())
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(call_id)
+            .execute(&state.pool)
+            .await
+            .context("update llm_call running failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     append_llm_call_event(
         state,
         call_id,
@@ -1635,25 +1652,31 @@ async fn requeue_llm_call_for_retry(
     retry_delay: Duration,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE llm_calls
-        SET status = 'queued',
-            attempt_count = ?,
-            scheduler_wait_ms = ?,
-            runtime_owner_id = NULL,
-            lease_heartbeat_at = NULL,
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(attempt_count)
-    .bind(scheduler_wait_ms)
-    .bind(now.as_str())
-    .bind(call_id)
-    .execute(&state.pool)
-    .await
-    .context("requeue llm_call failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_requeue", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE llm_calls
+                SET status = 'queued',
+                    attempt_count = ?,
+                    scheduler_wait_ms = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(attempt_count)
+            .bind(scheduler_wait_ms)
+            .bind(now.as_str())
+            .bind(call_id)
+            .execute(&state.pool)
+            .await
+            .context("requeue llm_call failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     append_llm_call_event(
         state,
         call_id,
@@ -1676,46 +1699,52 @@ async fn finalize_llm_call(
     update: FinalizeLlmCallUpdate<'_>,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE llm_calls
-        SET status = ?,
-            attempt_count = ?,
-            scheduler_wait_ms = ?,
-            first_token_wait_ms = ?,
-            duration_ms = ?,
-            output_messages_json = ?,
-            response_text = ?,
-            error_text = ?,
-            input_tokens = ?,
-            output_tokens = ?,
-            cached_input_tokens = ?,
-            total_tokens = ?,
-            finished_at = ?,
-            runtime_owner_id = NULL,
-            lease_heartbeat_at = NULL,
-            updated_at = ?
-        WHERE id = ?
-        "#,
-    )
-    .bind(update.status)
-    .bind(update.attempt_count)
-    .bind(update.scheduler_wait_ms)
-    .bind(update.first_token_wait_ms)
-    .bind(update.duration_ms)
-    .bind(update.output_messages_json)
-    .bind(update.response_text)
-    .bind(update.error_text)
-    .bind(update.input_tokens)
-    .bind(update.output_tokens)
-    .bind(update.cached_input_tokens)
-    .bind(update.total_tokens)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(call_id)
-    .execute(&state.pool)
-    .await
-    .context("finalize llm_call failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_finalize", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE llm_calls
+                SET status = ?,
+                    attempt_count = ?,
+                    scheduler_wait_ms = ?,
+                    first_token_wait_ms = ?,
+                    duration_ms = ?,
+                    output_messages_json = ?,
+                    response_text = ?,
+                    error_text = ?,
+                    input_tokens = ?,
+                    output_tokens = ?,
+                    cached_input_tokens = ?,
+                    total_tokens = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(update.status)
+            .bind(update.attempt_count)
+            .bind(update.scheduler_wait_ms)
+            .bind(update.first_token_wait_ms)
+            .bind(update.duration_ms)
+            .bind(update.output_messages_json)
+            .bind(update.response_text)
+            .bind(update.error_text)
+            .bind(update.input_tokens)
+            .bind(update.output_tokens)
+            .bind(update.cached_input_tokens)
+            .bind(update.total_tokens)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(call_id)
+            .execute(&state.pool)
+            .await
+            .context("finalize llm_call failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     append_llm_call_event(
         state,
         call_id,
@@ -2255,22 +2284,28 @@ fn spawn_llm_call_lease_heartbeat(
 
 async fn heartbeat_llm_call_lease(state: &AppState, call_id: &str) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE llm_calls
-        SET lease_heartbeat_at = ?, updated_at = ?
-        WHERE id = ?
-          AND status = 'running'
-          AND runtime_owner_id = ?
-        "#,
-    )
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(call_id)
-    .bind(state.runtime_owner_id.as_str())
-    .execute(&state.pool)
-    .await
-    .context("heartbeat llm_call lease failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_heartbeat", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE llm_calls
+                SET lease_heartbeat_at = ?, updated_at = ?
+                WHERE id = ?
+                  AND status = 'running'
+                  AND runtime_owner_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(call_id)
+            .bind(state.runtime_owner_id.as_str())
+            .execute(&state.pool)
+            .await
+            .context("heartbeat llm_call lease failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -2283,26 +2318,32 @@ async fn recover_llm_call_with_message(
     event_type: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE llm_calls
-        SET status = 'failed',
-            error_text = ?,
-            finished_at = ?,
-            runtime_owner_id = NULL,
-            lease_heartbeat_at = NULL,
-            updated_at = ?
-        WHERE id = ?
-          AND status IN ('queued', 'running')
-        "#,
-    )
-    .bind(message)
-    .bind(now.as_str())
-    .bind(now.as_str())
-    .bind(call_id)
-    .execute(&state.pool)
-    .await
-    .context("recover llm_call failed")?;
+    state
+        .sqlite_writer
+        .write("llm_call_recover", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE llm_calls
+                SET status = 'failed',
+                    error_text = ?,
+                    finished_at = ?,
+                    runtime_owner_id = NULL,
+                    lease_heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'running')
+                "#,
+            )
+            .bind(message)
+            .bind(now.as_str())
+            .bind(now.as_str())
+            .bind(call_id)
+            .execute(&state.pool)
+            .await
+            .context("recover llm_call failed")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     append_llm_call_event(
         state,
         call_id,
