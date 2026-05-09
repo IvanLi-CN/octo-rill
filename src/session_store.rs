@@ -63,6 +63,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
+                    drop(_permit);
                     warn!(
                         sqlite_write_lane = "session_create",
                         sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
@@ -102,6 +103,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
+                    drop(_permit);
                     warn!(
                         sqlite_write_lane = "session_save",
                         sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
@@ -145,6 +147,7 @@ impl SessionStore for CoordinatedSqliteSessionStore {
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
+                    drop(_permit);
                     warn!(
                         sqlite_write_lane = "session_delete",
                         sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
