@@ -22,12 +22,22 @@ const runningSubscriptionInitialRelease = {
 	succeeded_repos: 58,
 	failed_repos: 2,
 	candidate_failures: 3,
+	fetched_count: 680,
+	inserted_count: 120,
+	updated_count: 32,
+	unchanged_count: 528,
+	pages_fetched: 58,
 	releases_written: 680,
 };
 const runningSubscriptionLiveRelease = {
 	succeeded_repos: 79,
 	failed_repos: 4,
 	candidate_failures: 5,
+	fetched_count: 924,
+	inserted_count: 148,
+	updated_count: 41,
+	unchanged_count: 735,
+	pages_fetched: 79,
 	releases_written: 924,
 };
 
@@ -49,6 +59,11 @@ function applyRunningSubscriptionReleaseProgress(
 	sync.release.succeeded_repos = progress.succeeded_repos;
 	sync.release.failed_repos = progress.failed_repos;
 	sync.release.candidate_failures = progress.candidate_failures;
+	sync.release.fetched_count = progress.fetched_count;
+	sync.release.inserted_count = progress.inserted_count;
+	sync.release.updated_count = progress.updated_count;
+	sync.release.unchanged_count = progress.unchanged_count;
+	sync.release.pages_fetched = progress.pages_fetched;
 	sync.releases_written = progress.releases_written;
 }
 
@@ -832,6 +847,11 @@ function buildTaskDetail(
 							succeeded_repos: 0,
 							failed_repos: 0,
 							candidate_failures: 0,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
 						},
 						social: {
 							total_users: 0,
@@ -896,6 +916,11 @@ function buildTaskDetail(
 							succeeded_repos: 0,
 							failed_repos: 0,
 							candidate_failures: 0,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
 						},
 						social: {
 							total_users: 0,
@@ -1012,6 +1037,12 @@ function buildTaskDetail(
 							failed_repos: runningSubscriptionInitialRelease.failed_repos,
 							candidate_failures:
 								runningSubscriptionInitialRelease.candidate_failures,
+							fetched_count: runningSubscriptionInitialRelease.fetched_count,
+							inserted_count: runningSubscriptionInitialRelease.inserted_count,
+							updated_count: runningSubscriptionInitialRelease.updated_count,
+							unchanged_count:
+								runningSubscriptionInitialRelease.unchanged_count,
+							pages_fetched: runningSubscriptionInitialRelease.pages_fetched,
 						},
 						social: {
 							total_users: 0,
@@ -1085,6 +1116,11 @@ function buildTaskDetail(
 						succeeded_repos: 123,
 						failed_repos: 5,
 						candidate_failures: 7,
+						fetched_count: 1840,
+						inserted_count: 260,
+						updated_count: 44,
+						unchanged_count: 1536,
+						pages_fetched: 128,
 					},
 					social: {
 						total_users: 11,
@@ -1216,6 +1252,11 @@ function buildTaskDetail(
 						succeeded_repos: 123,
 						failed_repos: 5,
 						candidate_failures: 7,
+						fetched_count: 1840,
+						inserted_count: 260,
+						updated_count: 44,
+						unchanged_count: 1536,
+						pages_fetched: 128,
 					},
 					social: {
 						total_users: 11,

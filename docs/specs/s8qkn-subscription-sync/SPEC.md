@@ -118,7 +118,7 @@
   - 链路用时从根 `sync.subscriptions` 创建时间开始，到根任务及其直接触发的 `translate.release.batch` / `summarize.release.smart.batch` 子任务全部完成时结束
 - 点击任一用时项打开对应的订阅同步详情页面，页面展示该任务详情、阶段摘要和最近事件。
 - `GET /api/admin/jobs/sync/runtime-config` / `PATCH /api/admin/jobs/sync/runtime-config` 负责读取和保存该全局设置。
-- 同一接口同时返回和保存 `repo_release_worker_concurrency`，合法范围为 `1-32`，默认 `5`。
+- 同一接口同时返回和保存 `repo_release_worker_concurrency`，合法范围为 `1-32`，默认 `8`。
 - `repo_release_worker_concurrency` 保存后当前进程热生效；缩容不取消已领取的 work item，新增 worker 会在后续轮询中参与 claim。
 
 ### Admin Jobs 订阅同步视图
@@ -179,12 +179,23 @@
   - `304 Not Modified` 视为该 repo 本轮成功完成，不重新下载 release 列表；
   - `200 OK` 后更新 repo 级 conditional headers 与 `last_success_at`；
   - timeout / network error 写入 repo 级失败状态和短期 `backoff_until`，当前轮失败不得阻塞其他 repo。
+- 定时订阅同步的 Release 抓取必须按“小窗口增量”执行：
+  - 普通 repo 默认 `per_page=20`、最多 1 页；
+  - 若浅窗口发现本地未知 release，可扩到最多 3 页；
+  - 大 repo 默认 `per_page=10`、最多 1 页；大 repo 判定为本地已有 `repo_releases >= 500` 或最近一次抓取页数 `>= 10`；
+  - 手动 backfill / deep scan 才允许使用更大的页预算。
+- Release 抓取与写入统计必须区分 `fetched_count / inserted_count / updated_count / unchanged_count / pages_fetched / stopped_reason`；Admin Jobs 不得把 GitHub 返回条数展示为“写入 Releases”。
 - 成功抓取后写入共享 `repo_releases`，并把等待中的 watcher 标记为 `succeeded`。
 - 失败时把等待中的 watcher 标记为 `failed`。
 
 ### `sync.subscriptions`
 
 - Star 阶段仍然按用户活跃度刷新 `starred_repos`，失败用户不会参与 repo 聚合。
+- 定时订阅同步的 Star 阶段默认使用最近 Star 窗口：
+  - 已有本地水位的用户只拉 GraphQL `first=50`；
+  - 遇到 `starredAt <= starred_sync_watermark` 即停止；
+  - 浅同步只 upsert 最近窗口，不删除旧 star；
+  - 首次同步、手动修复或低频 reconciliation 才允许完整翻页并替换全量快照。
 - Release 阶段不再 inline 抓 GitHub Release，也不再 fan-out 写用户私有 `releases`。
 - Release 阶段改成：
   - 聚合 repo demand
@@ -197,6 +208,10 @@
   - `social_summary`：调用 `sync_social_activity_best_effort`，聚合 `repo_stars / followers / events`
   - `notifications_summary`：调用 `sync_notifications`，聚合新增通知数
 - social 同步若遇到 owned-repo GraphQL 的视觉字段返回 `null`，必须按兼容值归一化，不得把该用户整个 social 阶段直接降级成 `source_degraded`。
+- social 的 followers 与 owned repo stargazers 必须有页预算：
+  - followers 默认 `per_page=50`、最多 2 页；
+  - owned repo stargazers 默认 `per_page=50`、每 repo 最多 1 页；
+  - 达到页预算的 partial snapshot 不能删除本地未出现在浅窗口里的旧成员；全量成员修正交给低频 reconciliation。
 - social / Inbox 任一用户失败时，本轮 `sync.subscriptions` 仍继续执行并返回完成态，但必须把失败写入 `sync_subscription_events` / run log / admin diagnostics。
 - social feed 中的 GitHub `ReleaseEvent` 写为 `release_update`，不得复用 `announcement`；Discussions Announcements 继续使用 `announcement`。
 - `release_update` 命中的 repo 会以 interactive 优先级挂入共享 repo release queue，用于加速发现，但不得替代定时同步中的全量 repo demand。
@@ -404,3 +419,16 @@ state=subscription-sync-list-skipped-status
 evidence_note=验证订阅同步列表中底层 succeeded 但 `skipped=true` 的任务显示“已跳过”，不再显示“成功”。
 
 ![Subscription sync list skipped status](./assets/subscription-sync-list-skipped-status.png)
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=default
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=pending-owner-approval
+story_id_or_title=Admin/Admin Jobs/Subscription Sync Detail Running
+state=release-incremental-stats
+evidence_note=验证 Release Queue 阶段展示“扫描 / 新增 / 更新 / 未变”的真实统计口径，不再把 GitHub 返回条数标成写入量。
+
+![Release incremental stats](./assets/admin-jobs-release-incremental-stats.png)

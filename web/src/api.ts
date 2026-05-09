@@ -680,6 +680,11 @@ export type AdminSyncSubscriptionsDiagnostics = {
 		succeeded_repos: number;
 		failed_repos: number;
 		candidate_failures: number;
+		fetched_count: number;
+		inserted_count: number;
+		updated_count: number;
+		unchanged_count: number;
+		pages_fetched: number;
 	};
 	social: {
 		total_users: number;

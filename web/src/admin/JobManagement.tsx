@@ -1070,12 +1070,15 @@ function formatEventPresentation(event: AdminTaskEventItem): EventPresentation {
 			const totalRepos = readNumber(payload, "total_repos");
 			const succeededRepos = readNumber(payload, "succeeded_repos");
 			const failedRepos = readNumber(payload, "failed_repos");
-			const releasesWritten = readNumber(payload, "releases_written");
+			const fetched = readNumber(payload, "fetched_count");
+			const inserted = readNumber(payload, "inserted_count");
+			const updated = readNumber(payload, "updated_count");
+			const unchanged = readNumber(payload, "unchanged_count");
 			return {
 				title: "Release 阶段完成",
 				description:
 					totalRepos !== null
-						? `仓库 ${totalRepos} · 成功 ${succeededRepos ?? "-"} · 失败 ${failedRepos ?? "-"} · 写入 ${releasesWritten ?? "-"}`
+						? `仓库 ${totalRepos} · 成功 ${succeededRepos ?? "-"} · 失败 ${failedRepos ?? "-"} · 扫描 ${fetched ?? "-"} · 新增 ${inserted ?? "-"} · 更新 ${updated ?? "-"} · 未变 ${unchanged ?? "-"}`
 						: "Release 阶段已输出汇总。",
 				level: failedRepos !== null && failedRepos > 0 ? "warning" : "success",
 				payload,
@@ -2942,7 +2945,12 @@ function buildSubscriptionWorkflowStages(
 				["成功仓库", formatCount(diagnostics.release.succeeded_repos)],
 				["失败仓库", formatCount(diagnostics.release.failed_repos)],
 				["候选异常", formatCount(diagnostics.release.candidate_failures)],
-				["写入 Releases", formatCount(diagnostics.releases_written)],
+				["扫描 Releases", formatCount(diagnostics.release.fetched_count)],
+				[
+					"新增 / 更新",
+					`${formatCount(diagnostics.release.inserted_count)} / ${formatCount(diagnostics.release.updated_count)}`,
+				],
+				["未变", formatCount(diagnostics.release.unchanged_count)],
 			],
 		},
 		{
