@@ -6,7 +6,7 @@
 
 - OctoRill 继续使用单个 SQLite 数据库承载 HTTP 请求、后台任务、repo release worker、translation worker 与 LLM 调度状态。
 - SQLite WAL 允许读写并发，但仍只有一个 writer；当高并发 worker 直接争抢写事务时，`database is locked` 会外溢到用户请求并造成 500。
-- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但缺少应用层写入协调，无法在业务高并发下把 SQLite 写锁竞争转换成可观测的有界排队。
+- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle 与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
 
 ## 目标 / 非目标
 
@@ -14,7 +14,8 @@
 
 - 保留高并发 worker 能力；只在进入 SQLite 写入段时协调单 writer。
 - 读请求继续使用现有 `SqlitePool`，不得因为写协调退化为全局单连接。
-- 高竞争写路径必须通过统一 coordinator 获取 writer permit，并记录 lane、等待时长、attempt 与写入耗时。
+- 高竞争写路径必须通过统一 coordinator 获取 writer permit，并记录 lane、priority、等待时长、attempt 与写入耗时。
+- coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
 - SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
 
@@ -30,7 +31,7 @@
 ### In scope
 
 - 后端 runtime 内的 SQLite write coordinator。
-- `job_tasks` claim/heartbeat、repo release attach/claim/finalize/heartbeat、translation request/batch/recovery/finalize、`touch_user_last_active_at` 等热写路径。
+- `job_tasks` enqueue/event/cancel/claim/heartbeat/finalize、session create/save/delete、repo release attach/claim/finalize/heartbeat/recovery/sync-state、translation request/batch/recovery/finalize、LLM call lifecycle、`touch_user_last_active_at` 等热写路径。
 - 针对 SQLite WAL + 多连接 pool 的并发回归测试。
 
 ### Out of scope
@@ -44,6 +45,8 @@
 ### MUST
 
 - 写协调层必须以应用内单 writer permit 串行化 SQLite 写入段。
+- 前台写入必须能在当前 writer 释放后优先于已排队后台写入运行。
+- best-effort 写入不得因为后台 writer backlog 破坏用户主要流程。
 - 网络请求、GitHub API、AI 调用与长耗时计算不得在 writer permit 内执行。
 - busy/locked retry 必须有上限，避免无限等待。
 - 关键写入 lane 必须有结构化 tracing 字段。
@@ -62,6 +65,7 @@
 ### Core flows
 
 - 后台 worker 可以继续高并发执行网络/AI 阶段；进入 SQLite 写入时通过 coordinator 排队。
+- 登录/session、手动触发任务、job enqueue 与取消任务走 foreground lane；后台 claim/heartbeat/finalize/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 
@@ -95,7 +99,11 @@
 
 - Given writer lane 出现等待或 retry
   When 查看 tracing 日志
-  Then 能看到 lane、wait、attempt、elapsed 或 retry_after 字段。
+  Then 能看到 lane、priority、wait、attempt、elapsed 或 retry_after 字段。
+
+- Given 多个后台 repo release/translation/LLM worker 正在高并发执行网络任务并产生 heartbeat/finalize 写入
+  When 前台请求创建 session 或调用 `jobs::enqueue_task`
+  Then 前台写入通过 coordinator 排队并优先进入写段，不直接把 SQLite busy/locked 冒泡成 500。
 
 ## 验收清单（Acceptance checklist）
 
@@ -108,8 +116,8 @@
 
 ### Testing
 
-- Unit tests: `SqliteWriteCoordinator` 并发串行化与 busy 分类。
-- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争。
+- Unit tests: `SqliteWriteCoordinator` 并发串行化、foreground 优先级与 busy 分类。
+- Integration tests: SQLite WAL + 多连接 pool 下并发写入热路径不产生应用内 writer 竞争；后台 writer 压力下 `enqueue_task` 不绕过 coordinator。
 - E2E tests: None。
 
 ### UI / Storybook (if applicable)

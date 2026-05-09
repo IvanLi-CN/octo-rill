@@ -29,10 +29,10 @@ use tower_http::{
 use tower_sessions::cookie::SameSite;
 use tower_sessions::session_store::ExpiredDeletion;
 use tower_sessions::{Expiry, SessionManagerLayer};
-use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{info, warn};
 
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
+use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
     admin_runtime, ai, api, auth, config::AppConfig, jobs, runtime, state, sync, translations,
@@ -102,7 +102,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
     );
     warn_if_runtime_concurrency_exceeds_sqlite_pool(&config, &runtime_settings);
 
-    let session_store = SqliteStore::new(pool.clone());
+    let sqlite_writer = crate::sqlite_write::SqliteWriteCoordinator::new();
+    let session_store = CoordinatedSqliteSessionStore::new(
+        tower_sessions_sqlx_store::SqliteStore::new(pool.clone()),
+        sqlite_writer.clone(),
+    );
     session_store
         .migrate()
         .await
@@ -133,7 +137,7 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )),
         config: config.clone(),
         pool: pool.clone(),
-        sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
+        sqlite_writer,
         http,
         github_oauth,
         linuxdo_oauth,
