@@ -227,6 +227,11 @@ export const SyncSubscriptions: Story = {
 							succeeded_repos: 123,
 							failed_repos: 5,
 							candidate_failures: 7,
+							fetched_count: 1840,
+							inserted_count: 260,
+							updated_count: 44,
+							unchanged_count: 1536,
+							pages_fetched: 128,
 						},
 						social: {
 							total_users: 11,
@@ -373,6 +378,11 @@ export const SyncSubscriptionsSkipped: Story = {
 							succeeded_repos: 0,
 							failed_repos: 0,
 							candidate_failures: 0,
+							fetched_count: 0,
+							inserted_count: 0,
+							updated_count: 0,
+							unchanged_count: 0,
+							pages_fetched: 0,
 						},
 						social: {
 							total_users: 0,

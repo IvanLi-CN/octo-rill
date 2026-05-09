@@ -599,8 +599,10 @@ function buildTaskDetailPageModel(
 								: null,
 					),
 					field(
-						"写入 Release 数",
-						diagnostics ? `${diagnostics.releases_written}` : null,
+						"Release 扫描 / 新增 / 更新 / 未变",
+						diagnostics
+							? `${diagnostics.release.fetched_count} / ${diagnostics.release.inserted_count} / ${diagnostics.release.updated_count} / ${diagnostics.release.unchanged_count}`
+							: null,
 					),
 					field(
 						"关键事件数",
@@ -1035,7 +1037,10 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 					<div className={detailCardClass}>
 						<p className="text-muted-foreground text-[11px]">附加信息</p>
 						<p className="mt-1 text-sm font-semibold">
-							写入 {syncDiagnostics.releases_written} 条 Release
+							扫描 {syncDiagnostics.release.fetched_count} · 新增{" "}
+							{syncDiagnostics.release.inserted_count} · 更新{" "}
+							{syncDiagnostics.release.updated_count} · 未变{" "}
+							{syncDiagnostics.release.unchanged_count}
 						</p>
 						<p className="text-muted-foreground mt-1 text-xs">
 							关键事件 {syncDiagnostics.critical_events} · 本轮

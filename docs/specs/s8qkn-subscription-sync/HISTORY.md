@@ -3,7 +3,7 @@
 ## 生命周期
 
 - Lifecycle: active
-- Last: 2026-05-05
+- Last: 2026-05-09
 
 ## 历史摘要
 
@@ -11,6 +11,7 @@
 - 2026-05-05: `sync.subscriptions` 的 Star、Release Queue、Social、Notifications 长阶段新增节流后的根任务 `task.progress` 阶段内进度事件；详情 diagnostics 识别 `release_progress` 等增量事件，前端通过既有 SSE 后刷新详情链路显示阶段内实时成功、失败与 Release 写入数。
 - 2026-05-05: Admin Jobs 订阅同步详情的运行中阶段总览改为在 `result_json` 尚未写入时从当前 `task.progress` 事件派生 Star、repo collect、Release queue、social 与 Inbox 统计，避免执行时间线已有进展但阶段卡片仍显示等待或零值。
 - 2026-05-08: Release queue 的 task claim、repo release claim 与 watcher attach 事务切换为提前获取 SQLite writer slot，解决主连接池放大后 `sync.subscriptions` 因 `database is locked` / `SQLITE_BUSY_SNAPSHOT` 连续失败的问题。
+- 2026-05-09: 定时订阅同步增加取数预算与水位语义：Release 默认小窗口抓取并记录真实扫描/新增/更新/未变统计；Starred 已有水位时只 upsert 最近窗口；followers 与 owned repo stargazers 达到页预算时按 partial 处理，避免浅窗口误删历史成员；Release worker 默认并发收敛到 8。
 - 2026-05-04: 明确跳过的订阅同步记录不进入设置弹窗最近链路用时；跳过任务详情展示“已跳过”与未执行阶段语义。
 - 2026-05-02: repo release work item 的 `deadline_at` 升级为硬业务超时；订阅同步等待 shared release queue 时会主动收敛过期 pending watcher，避免根任务长期 running 后让后续计划任务持续跳过。
 - 2026-04-27: Admin Jobs 定时任务页新增全局自动获取间隔、最近三次 `sync.subscriptions` 链路用时和任务详情抽屉入口；该配置与账号访问状态无关。

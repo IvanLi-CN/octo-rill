@@ -39,8 +39,18 @@ const REPO_RELEASE_WORKERS_MAX: usize = admin_runtime::MAX_REPO_RELEASE_WORKER_C
 const REPO_RELEASE_QUEUE_POLL_INTERVAL: Duration = Duration::from_millis(450);
 const REPO_RELEASE_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const REPO_RELEASE_FRESHNESS_WINDOW: Duration = Duration::from_secs(30 * 60);
+const REPO_RELEASE_DEFAULT_PER_PAGE: usize = 20;
+const REPO_RELEASE_LARGE_REPO_PER_PAGE: usize = 10;
+const REPO_RELEASE_DEFAULT_MAX_PAGES: usize = 1;
+const REPO_RELEASE_CHANGED_MAX_PAGES: usize = 3;
+const REPO_RELEASE_LARGE_REPO_THRESHOLD: i64 = 500;
+const REPO_RELEASE_LARGE_REPO_LAST_PAGE_THRESHOLD: i64 = 10;
 const SMART_PREHEAT_RECENT_RELEASE_LIMIT: usize = 30;
 const SOCIAL_STARGAZER_FETCH_CONCURRENCY: usize = 4;
+const SOCIAL_STARGAZER_PER_PAGE: usize = 50;
+const SOCIAL_STARGAZER_MAX_PAGES: usize = 1;
+const SOCIAL_FOLLOWERS_PER_PAGE: usize = 50;
+const SOCIAL_FOLLOWERS_MAX_PAGES: usize = 2;
 const DISCUSSION_ANNOUNCEMENT_REPO_BATCH_SIZE: usize = 20;
 const DISCUSSION_ANNOUNCEMENT_PAGE_SIZE: usize = 10;
 const REPO_RELEASE_PRIORITY_SYSTEM: i64 = 1;
@@ -53,6 +63,9 @@ const NOTIFICATIONS_SINCE_KEY: &str = "notifications_since";
 const NOTIFICATION_OPEN_URL_REPAIR_KEY: &str = "notifications_open_url_repair_v2";
 const NOTIFICATION_OPEN_URL_REPAIR_PENDING: &str = "pending";
 const NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE: usize = 100;
+const STARRED_RECENT_WINDOW_SIZE: usize = 50;
+const STARRED_WATERMARK_KEY: &str = "starred_sync_watermark";
+const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 
 static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -110,6 +123,11 @@ pub struct SyncSubscriptionReleaseSummary {
     pub succeeded_repos: usize,
     pub failed_repos: usize,
     pub candidate_failures: usize,
+    pub fetched_count: usize,
+    pub inserted_count: usize,
+    pub updated_count: usize,
+    pub unchanged_count: usize,
+    pub pages_fetched: usize,
 }
 
 #[derive(Debug, Serialize, Default, Clone)]
@@ -290,17 +308,36 @@ struct RepoReleaseWorkItemRow {
 struct RepoReleaseSyncStateRow {
     etag: Option<String>,
     last_modified: Option<String>,
+    last_page_count: i64,
 }
 
 enum RepoReleaseFetchOutcome {
-    Updated(Vec<GitHubRelease>, RepoReleaseHttpState),
+    Updated(RepoReleaseFetchResult),
     NotModified(RepoReleaseHttpState),
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct RepoReleaseHttpState {
     etag: Option<String>,
     last_modified: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct RepoReleaseWriteStats {
+    pub fetched_count: usize,
+    pub inserted_count: usize,
+    pub updated_count: usize,
+    pub unchanged_count: usize,
+    pub pages_fetched: usize,
+    pub stopped_reason: String,
+}
+
+#[derive(Debug)]
+struct RepoReleaseFetchResult {
+    releases: Vec<GitHubRelease>,
+    http_state: RepoReleaseHttpState,
+    pages_fetched: usize,
+    stopped_reason: String,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -584,6 +621,25 @@ struct GitHubReleaseReactions {
     eyes: i64,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ExistingRepoReleaseRow {
+    node_id: Option<String>,
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    created_at: Option<String>,
+    is_prerelease: i64,
+    is_draft: i64,
+    react_plus1: i64,
+    react_laugh: i64,
+    react_heart: i64,
+    react_hooray: i64,
+    react_rocket: i64,
+    react_eyes: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubPublicRepo {
     id: i64,
@@ -666,7 +722,29 @@ struct OwnedRepoSource {
 struct StarPhaseSuccess {
     user_id: String,
     last_active_at: Option<String>,
+    repo_count: usize,
+    #[cfg_attr(not(test), allow(dead_code))]
     repos: Vec<StarredRepoSnapshot>,
+}
+
+#[derive(Debug)]
+struct StarredFetchResult {
+    repos: Vec<StarredRepoSnapshot>,
+    is_full_snapshot: bool,
+    watermark: Option<String>,
+    connection_watermarks: Vec<(String, String)>,
+}
+
+#[derive(Debug)]
+struct FollowersFetchResult {
+    followers: Vec<FollowerSnapshot>,
+    partial: bool,
+}
+
+#[derive(Debug)]
+struct RepoStargazerFetchResult {
+    members: Vec<RepoStargazerSnapshot>,
+    partial: bool,
 }
 
 #[derive(Clone)]
@@ -950,11 +1028,23 @@ fn notification_sync_key(base_key: &str, connection_id: &str) -> String {
 }
 
 pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarredResult> {
-    let repos = fetch_starred_snapshot(state, user_id)
+    let result = fetch_starred_snapshot(state, user_id, false)
         .await
         .map_err(SyncRequestError::into_anyhow)?;
-    replace_starred_repos(state, user_id, &repos).await?;
-    Ok(SyncStarredResult { repos: repos.len() })
+    if result.is_full_snapshot {
+        replace_starred_repos(state, user_id, &result.repos).await?;
+    } else {
+        upsert_starred_repos(state, user_id, &result.repos).await?;
+    }
+    if let Some(watermark) = result.watermark.as_deref() {
+        store_sync_state_value(state, user_id, STARRED_WATERMARK_KEY, watermark).await?;
+    }
+    for (key, watermark) in &result.connection_watermarks {
+        store_sync_state_value(state, user_id, key, watermark).await?;
+    }
+    Ok(SyncStarredResult {
+        repos: result.repos.len(),
+    })
 }
 
 pub async fn sync_releases(state: &AppState, user_id: &str) -> Result<SyncReleasesResult> {
@@ -1038,6 +1128,7 @@ pub async fn sync_social_activity(
     let mut source_errors = Vec::new();
     let mut owned_repo_sources = HashMap::<i64, OwnedRepoSource>::new();
     let mut followers_by_id = HashMap::<i64, FollowerSnapshot>::new();
+    let mut followers_partial = false;
     let mut feed_events_by_id = HashMap::<String, FeedActivityEventSnapshot>::new();
     let announcement_repos = load_user_discussion_announcement_repos(state, user_id).await?;
 
@@ -1068,8 +1159,9 @@ pub async fn sync_social_activity(
         }
 
         match fetch_followers_snapshot(state, &connection.access_token).await {
-            Ok(followers) => {
-                for follower in followers {
+            Ok(result) => {
+                followers_partial |= result.partial;
+                for follower in result.followers {
                     followers_by_id.entry(follower.actor.id).or_insert(follower);
                 }
             }
@@ -1202,22 +1294,26 @@ pub async fn sync_social_activity(
         (!followers.is_empty()).then_some(followers.as_slice()),
     ) {
         (Some(owned_repos), Some(followers)) => {
-            apply_social_activity_snapshot(
+            apply_social_activity_snapshot_with_options(
                 state,
                 user_id,
-                owned_repos,
-                repo_collection.repo_members.as_slice(),
-                followers,
+                Some(owned_repos),
+                Some(repo_collection.repo_members.as_slice()),
+                Some(followers),
+                repo_collection.partial_repos.is_empty(),
+                !followers_partial,
             )
             .await?
         }
         _ => {
-            apply_social_activity_snapshot_partial(
+            apply_social_activity_snapshot_with_options(
                 state,
                 user_id,
                 (!owned_repos.is_empty()).then_some(owned_repos.as_slice()),
                 (!owned_repos.is_empty()).then_some(repo_collection.repo_members.as_slice()),
                 (!followers.is_empty()).then_some(followers.as_slice()),
+                repo_collection.partial_repos.is_empty(),
+                !followers_partial,
             )
             .await?
         }
@@ -1228,7 +1324,11 @@ pub async fn sync_social_activity(
         repo_stars: repo_collection.repo_stars,
         followers: followers.len(),
         events,
-        failed_repos: repo_collection.failed_repos,
+        failed_repos: repo_collection
+            .failed_repos
+            .into_iter()
+            .chain(repo_collection.partial_repos.into_iter())
+            .collect(),
         source_errors,
     })
 }
@@ -1279,6 +1379,7 @@ async fn collect_repo_stargazer_snapshots_for_sources(
     let mut repo_stars = 0usize;
     let mut repo_members = Vec::with_capacity(repos.len());
     let mut failed_repos = Vec::new();
+    let mut partial_repos = Vec::new();
     let mut join_set = JoinSet::new();
     let mut pending = repos.iter().cloned().enumerate();
     let concurrency = SOCIAL_STARGAZER_FETCH_CONCURRENCY.max(1);
@@ -1306,9 +1407,12 @@ async fn collect_repo_stargazer_snapshots_for_sources(
         };
 
         match joined {
-            Ok((index, repo, Ok(members))) => {
-                repo_stars += members.len();
-                repo_members.push((index, repo, members));
+            Ok((index, repo, Ok(result))) => {
+                repo_stars += result.members.len();
+                if result.partial {
+                    partial_repos.push(repo.full_name.clone());
+                }
+                repo_members.push((index, repo, result.members));
             }
             Ok((_, repo, Err(err))) => {
                 tracing::warn!(
@@ -1336,18 +1440,20 @@ async fn collect_repo_stargazer_snapshots_for_sources(
             .map(|(_, repo, members)| (repo, members))
             .collect(),
         failed_repos,
+        partial_repos,
     }
 }
 
 #[cfg(test)]
 type RepoStargazerFetchFuture =
-    Pin<Box<dyn Future<Output = Result<Vec<RepoStargazerSnapshot>, anyhow::Error>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<RepoStargazerFetchResult, anyhow::Error>> + Send>>;
 
 #[derive(Debug, Default)]
 struct RepoStargazerCollectionResult {
     repo_stars: usize,
     repo_members: Vec<(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)>,
     failed_repos: Vec<String>,
+    partial_repos: Vec<String>,
 }
 
 #[cfg(test)]
@@ -1363,6 +1469,7 @@ where
     let mut repo_stars = 0usize;
     let mut repo_members = Vec::with_capacity(repos.len());
     let mut failed_repos = Vec::new();
+    let mut partial_repos = Vec::new();
     let mut join_set = JoinSet::new();
     let mut pending = repos.iter().cloned().enumerate();
     let concurrency = SOCIAL_STARGAZER_FETCH_CONCURRENCY.max(1);
@@ -1382,9 +1489,13 @@ where
         };
 
         match joined {
-            Ok((index, repo, Ok(members))) => {
-                repo_stars += members.len();
-                repo_members.push((index, repo, members));
+            Ok((index, repo, Ok(result))) => {
+                repo_stars += result.members.len();
+                if result.partial {
+                    partial_repos.push(repo.full_name);
+                } else {
+                    repo_members.push((index, repo, result.members));
+                }
             }
             Ok((_, repo, Err(err))) => {
                 tracing::warn!(
@@ -1412,6 +1523,7 @@ where
             .map(|(_, repo, members)| (repo, members))
             .collect(),
         failed_repos,
+        partial_repos,
     }
 }
 
@@ -1539,6 +1651,11 @@ struct WaitReleaseDemandResult {
     releases: usize,
     failed: usize,
     candidate_failures: usize,
+    fetched_count: usize,
+    inserted_count: usize,
+    updated_count: usize,
+    unchanged_count: usize,
+    pages_fetched: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1548,7 +1665,11 @@ struct ReleaseDemandProgress {
     failed_repos: usize,
     pending_repos: usize,
     candidate_failures: usize,
-    releases_written: usize,
+    fetched_count: usize,
+    inserted_count: usize,
+    updated_count: usize,
+    unchanged_count: usize,
+    pages_fetched: usize,
 }
 
 struct SubscriptionProgressEmitter {
@@ -1603,6 +1724,7 @@ struct RepoReleaseWatcherUpsert<'a> {
     origin: RepoReleaseOrigin,
     reason: &'a str,
     is_new_repo: bool,
+    reused_fresh: bool,
     status: &'a str,
     error_text: Option<&'a str>,
     now_rfc3339: &'a str,
@@ -1711,6 +1833,7 @@ async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) 
     Ok(true)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn apply_social_activity_snapshot(
     state: &AppState,
     user_id: &str,
@@ -1734,6 +1857,27 @@ async fn apply_social_activity_snapshot_partial(
     owned_repos: Option<&[OwnedRepoSnapshot]>,
     repo_members: Option<&[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)]>,
     followers: Option<&[FollowerSnapshot]>,
+) -> Result<usize> {
+    apply_social_activity_snapshot_with_options(
+        state,
+        user_id,
+        owned_repos,
+        repo_members,
+        followers,
+        true,
+        true,
+    )
+    .await
+}
+
+async fn apply_social_activity_snapshot_with_options(
+    state: &AppState,
+    user_id: &str,
+    owned_repos: Option<&[OwnedRepoSnapshot]>,
+    repo_members: Option<&[(OwnedRepoSnapshot, Vec<RepoStargazerSnapshot>)]>,
+    followers: Option<&[FollowerSnapshot]>,
+    delete_stale_repo_members: bool,
+    delete_stale_followers: bool,
 ) -> Result<usize> {
     debug_assert_eq!(owned_repos.is_some(), repo_members.is_some());
 
@@ -1851,18 +1995,20 @@ async fn apply_social_activity_snapshot_partial(
             upsert_follower_current_member_tx(&mut tx, user_id, follower, now.as_str()).await?;
         }
 
-        for current_id in current_follower_ids.difference(&next_follower_ids) {
-            sqlx::query(
-                r#"
-                DELETE FROM follower_current_members
-                WHERE user_id = ? AND actor_github_user_id = ?
-                "#,
-            )
-            .bind(user_id)
-            .bind(*current_id)
-            .execute(&mut *tx)
-            .await
-            .context("delete stale follower current member")?;
+        if delete_stale_followers {
+            for current_id in current_follower_ids.difference(&next_follower_ids) {
+                sqlx::query(
+                    r#"
+                    DELETE FROM follower_current_members
+                    WHERE user_id = ? AND actor_github_user_id = ?
+                    "#,
+                )
+                .bind(user_id)
+                .bind(*current_id)
+                .execute(&mut *tx)
+                .await
+                .context("delete stale follower current member")?;
+            }
         }
 
         if !follower_baseline_exists {
@@ -2040,24 +2186,26 @@ async fn apply_social_activity_snapshot_partial(
                 upsert_repo_star_current_member_tx(&mut tx, user_id, member, now.as_str()).await?;
             }
 
-            for current_id in current_ids.difference(&next_ids) {
-                sqlx::query(
-                    r#"
-                    DELETE FROM repo_star_current_members
-                    WHERE user_id = ? AND repo_id = ? AND actor_github_user_id = ?
-                    "#,
-                )
-                .bind(user_id)
-                .bind(repo.repo_id)
-                .bind(*current_id)
-                .execute(&mut *tx)
-                .await
-                .with_context(|| {
-                    format!(
-                        "delete stale repo star current member for {}",
-                        repo.full_name
+            if delete_stale_repo_members {
+                for current_id in current_ids.difference(&next_ids) {
+                    sqlx::query(
+                        r#"
+                        DELETE FROM repo_star_current_members
+                        WHERE user_id = ? AND repo_id = ? AND actor_github_user_id = ?
+                        "#,
                     )
-                })?;
+                    .bind(user_id)
+                    .bind(repo.repo_id)
+                    .bind(*current_id)
+                    .execute(&mut *tx)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "delete stale repo star current member for {}",
+                            repo.full_name
+                        )
+                    })?;
+                }
             }
 
             events_written +=
@@ -2834,6 +2982,7 @@ async fn attach_release_demand(
                             origin,
                             reason,
                             is_new_repo: repo.is_new_repo,
+                            reused_fresh: true,
                             status: "succeeded",
                             error_text: None,
                             now_rfc3339: &now_rfc3339,
@@ -2910,6 +3059,7 @@ async fn attach_release_demand(
                             origin,
                             reason,
                             is_new_repo: repo.is_new_repo,
+                            reused_fresh: false,
                             status: "pending",
                             error_text: None,
                             now_rfc3339: &now_rfc3339,
@@ -2975,6 +3125,7 @@ async fn attach_release_demand(
                         origin,
                         reason,
                         is_new_repo: repo.is_new_repo,
+                        reused_fresh: false,
                         status: "pending",
                         error_text: None,
                         now_rfc3339: &now_rfc3339,
@@ -3008,17 +3159,19 @@ async fn upsert_repo_release_watcher(
           priority,
           reason,
           is_new_repo,
+          reused_fresh,
           status,
           error_text,
           created_at,
           updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(task_id, work_item_id) DO UPDATE SET
           user_id = excluded.user_id,
           origin = excluded.origin,
           priority = excluded.priority,
           reason = excluded.reason,
           is_new_repo = excluded.is_new_repo,
+          reused_fresh = excluded.reused_fresh,
           status = CASE
             WHEN repo_release_watchers.status = 'succeeded' THEN repo_release_watchers.status
             ELSE excluded.status
@@ -3035,6 +3188,7 @@ async fn upsert_repo_release_watcher(
     .bind(watcher.origin.priority())
     .bind(watcher.reason)
     .bind(if watcher.is_new_repo { 1_i64 } else { 0_i64 })
+    .bind(if watcher.reused_fresh { 1_i64 } else { 0_i64 })
     .bind(watcher.status)
     .bind(watcher.error_text)
     .bind(watcher.now_rfc3339)
@@ -3099,7 +3253,12 @@ async fn wait_for_release_demand(
                         "failed_repos": snapshot.failed_repos,
                         "pending_repos": snapshot.pending_repos,
                         "candidate_failures": snapshot.candidate_failures,
-                        "releases_written": snapshot.releases_written,
+                        "releases_written": snapshot.inserted_count + snapshot.updated_count,
+                        "fetched_count": snapshot.fetched_count,
+                        "inserted_count": snapshot.inserted_count,
+                        "updated_count": snapshot.updated_count,
+                        "unchanged_count": snapshot.unchanged_count,
+                        "pages_fetched": snapshot.pages_fetched,
                     }),
                     false,
                 )
@@ -3158,7 +3317,12 @@ async fn wait_for_release_demand(
                     "failed_repos": snapshot.failed_repos,
                     "pending_repos": snapshot.pending_repos,
                     "candidate_failures": snapshot.candidate_failures,
-                    "releases_written": snapshot.releases_written,
+                    "releases_written": snapshot.inserted_count + snapshot.updated_count,
+                    "fetched_count": snapshot.fetched_count,
+                    "inserted_count": snapshot.inserted_count,
+                    "updated_count": snapshot.updated_count,
+                    "unchanged_count": snapshot.unchanged_count,
+                    "pages_fetched": snapshot.pages_fetched,
                 }),
                 true,
             )
@@ -3168,7 +3332,13 @@ async fn wait_for_release_demand(
             SELECT
               COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
               COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
-              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_release_count ELSE 0 END), 0) AS stats_release_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
+              COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
             FROM repo_release_watchers rw
             JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
             WHERE rw.task_id = "#,
@@ -3179,12 +3349,31 @@ async fn wait_for_release_demand(
             .fetch_one(&state.pool)
             .await
             .context("failed to summarize repo release watchers")?;
-        return Ok(WaitReleaseDemandResult {
+        let legacy_stats_count =
+            usize::try_from(row.get::<i64, _>("stats_release_count")).unwrap_or_default();
+        let mut result = WaitReleaseDemandResult {
             releases: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
             failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
             candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
                 .unwrap_or_default(),
-        });
+            fetched_count: usize::try_from(row.get::<i64, _>("fetched_count")).unwrap_or_default(),
+            inserted_count: usize::try_from(row.get::<i64, _>("inserted_count"))
+                .unwrap_or_default(),
+            updated_count: usize::try_from(row.get::<i64, _>("updated_count")).unwrap_or_default(),
+            unchanged_count: usize::try_from(row.get::<i64, _>("unchanged_count"))
+                .unwrap_or_default(),
+            pages_fetched: usize::try_from(row.get::<i64, _>("pages_fetched")).unwrap_or_default(),
+        };
+        if result.fetched_count
+            + result.inserted_count
+            + result.updated_count
+            + result.unchanged_count
+            == 0
+        {
+            result.fetched_count = legacy_stats_count;
+            result.inserted_count = legacy_stats_count;
+        }
+        return Ok(result);
     }
 
     let mut builder = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
@@ -3192,6 +3381,11 @@ async fn wait_for_release_demand(
         SELECT
           COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
           COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_release_count ELSE 0 END), 0) AS release_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_fetched_count ELSE 0 END), 0) AS fetched_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_inserted_count ELSE 0 END), 0) AS inserted_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_updated_count ELSE 0 END), 0) AS updated_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
+          COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
           COALESCE(SUM(CASE WHEN status = 'succeeded' THEN last_candidate_failures ELSE 0 END), 0) AS candidate_failures
         FROM repo_release_work_items
         WHERE id IN (
@@ -3209,12 +3403,26 @@ async fn wait_for_release_demand(
         .fetch_one(&state.pool)
         .await
         .context("failed to summarize repo release work items")?;
-    Ok(WaitReleaseDemandResult {
-        releases: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
+    let legacy_release_count =
+        usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default();
+    let mut result = WaitReleaseDemandResult {
+        releases: legacy_release_count,
         failed: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
         candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
             .unwrap_or_default(),
-    })
+        fetched_count: usize::try_from(row.get::<i64, _>("fetched_count")).unwrap_or_default(),
+        inserted_count: usize::try_from(row.get::<i64, _>("inserted_count")).unwrap_or_default(),
+        updated_count: usize::try_from(row.get::<i64, _>("updated_count")).unwrap_or_default(),
+        unchanged_count: usize::try_from(row.get::<i64, _>("unchanged_count")).unwrap_or_default(),
+        pages_fetched: usize::try_from(row.get::<i64, _>("pages_fetched")).unwrap_or_default(),
+    };
+    if result.fetched_count + result.inserted_count + result.updated_count + result.unchanged_count
+        == 0
+    {
+        result.fetched_count = legacy_release_count;
+        result.inserted_count = legacy_release_count;
+    }
+    Ok(result)
 }
 
 async fn load_release_demand_progress(
@@ -3228,8 +3436,13 @@ async fn load_release_demand_progress(
           COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN 1 ELSE 0 END), 0) AS succeeded_count,
           COALESCE(SUM(CASE WHEN rw.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
           COALESCE(SUM(CASE WHEN rw.status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
-          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_release_count ELSE 0 END), 0) AS release_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_fetched_count ELSE 0 END), 0) AS fetched_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_inserted_count ELSE 0 END), 0) AS inserted_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_updated_count ELSE 0 END), 0) AS updated_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_unchanged_count ELSE 0 END), 0) AS unchanged_count,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_pages_fetched ELSE 0 END), 0) AS pages_fetched,
+          COALESCE(SUM(CASE WHEN rw.status = 'succeeded' AND rw.reused_fresh = 0 THEN wi.last_candidate_failures ELSE 0 END), 0) AS candidate_failures
         FROM repo_release_watchers rw
         JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
         WHERE rw.task_id = ?
@@ -3239,15 +3452,28 @@ async fn load_release_demand_progress(
     .fetch_one(&state.pool)
     .await
     .context("failed to load release demand progress")?;
-    Ok(ReleaseDemandProgress {
+    let legacy_release_count =
+        usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default();
+    let mut result = ReleaseDemandProgress {
         total_repos,
         succeeded_repos: usize::try_from(row.get::<i64, _>("succeeded_count")).unwrap_or_default(),
         failed_repos: usize::try_from(row.get::<i64, _>("failed_count")).unwrap_or_default(),
         pending_repos: usize::try_from(row.get::<i64, _>("pending_count")).unwrap_or_default(),
         candidate_failures: usize::try_from(row.get::<i64, _>("candidate_failures"))
             .unwrap_or_default(),
-        releases_written: usize::try_from(row.get::<i64, _>("release_count")).unwrap_or_default(),
-    })
+        fetched_count: usize::try_from(row.get::<i64, _>("fetched_count")).unwrap_or_default(),
+        inserted_count: usize::try_from(row.get::<i64, _>("inserted_count")).unwrap_or_default(),
+        updated_count: usize::try_from(row.get::<i64, _>("updated_count")).unwrap_or_default(),
+        unchanged_count: usize::try_from(row.get::<i64, _>("unchanged_count")).unwrap_or_default(),
+        pages_fetched: usize::try_from(row.get::<i64, _>("pages_fetched")).unwrap_or_default(),
+    };
+    if result.fetched_count + result.inserted_count + result.updated_count + result.unchanged_count
+        == 0
+    {
+        result.fetched_count = legacy_release_count;
+        result.inserted_count = legacy_release_count;
+    }
+    Ok(result)
 }
 
 fn repo_release_deadline_at(now: DateTime<Utc>, origin: RepoReleaseOrigin) -> String {
@@ -3460,6 +3686,11 @@ pub async fn sync_subscriptions(
             "failed_repos": release_summary.failed_repos,
             "candidate_failures": release_summary.candidate_failures,
             "releases_written": releases_written,
+            "fetched_count": release_summary.fetched_count,
+            "inserted_count": release_summary.inserted_count,
+            "updated_count": release_summary.updated_count,
+            "unchanged_count": release_summary.unchanged_count,
+            "pages_fetched": release_summary.pages_fetched,
         }),
     )
     .await?;
@@ -3536,6 +3767,12 @@ pub async fn sync_subscriptions(
     }
 
     let notifications_summary = run_notifications_phase(&context, &successful_users).await?;
+    if let Err(err) = prune_subscription_sync_history(state).await {
+        tracing::warn!(
+            ?err,
+            "sync.subscriptions: prune subscription sync history failed"
+        );
+    }
     jobs::append_task_event(
         state,
         task_id,
@@ -3703,7 +3940,7 @@ fn collect_star_result(
     match joined {
         Ok(Ok(Some(success))) => {
             summary.succeeded_users += 1;
-            summary.total_repos += success.repos.len();
+            summary.total_repos += success.repo_count;
             successful_users.push(success);
             Ok(())
         }
@@ -3726,7 +3963,7 @@ async fn sync_starred_for_user(
         user,
         move |user_id| {
             let state = state.clone();
-            async move { fetch_starred_snapshot(state.as_ref(), &user_id).await }
+            async move { fetch_starred_snapshot(state.as_ref(), &user_id, true).await }
         },
         |attempt| async move {
             tokio::time::sleep(subscription_retry_delay(attempt)).await;
@@ -3743,7 +3980,7 @@ async fn sync_starred_for_user_with_fetch<Fetch, FetchFut, Sleep, SleepFut>(
 ) -> Result<Option<StarPhaseSuccess>>
 where
     Fetch: FnMut(String) -> FetchFut,
-    FetchFut: Future<Output = Result<Vec<StarredRepoSnapshot>, SyncRequestError>>,
+    FetchFut: Future<Output = Result<StarredFetchResult, SyncRequestError>>,
     Sleep: FnMut(usize) -> SleepFut,
     SleepFut: Future<Output = ()>,
 {
@@ -3777,8 +4014,33 @@ where
             return Ok(None);
         }
         match fetch(user.id.clone()).await {
-            Ok(repos) => {
-                replace_starred_repos(context.state.as_ref(), &user.id, &repos).await?;
+            Ok(result) => {
+                if result.is_full_snapshot {
+                    replace_starred_repos(context.state.as_ref(), &user.id, &result.repos).await?;
+                    store_sync_state_value(
+                        context.state.as_ref(),
+                        &user.id,
+                        STARRED_FULL_SYNC_KEY,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
+                    .await?;
+                } else {
+                    upsert_starred_repos(context.state.as_ref(), &user.id, &result.repos).await?;
+                }
+                if let Some(watermark) = result.watermark.as_deref() {
+                    store_sync_state_value(
+                        context.state.as_ref(),
+                        &user.id,
+                        STARRED_WATERMARK_KEY,
+                        watermark,
+                    )
+                    .await?;
+                }
+                for (key, watermark) in &result.connection_watermarks {
+                    store_sync_state_value(context.state.as_ref(), &user.id, key, watermark)
+                        .await?;
+                }
+                let repo_count = count_user_starred_repos(context.state.as_ref(), &user.id).await?;
                 context
                     .log(
                         "info",
@@ -3787,7 +4049,8 @@ where
                         format!("user #{} starred snapshot refreshed", user.id),
                         json!({
                             "user_id": user.id,
-                            "repo_count": repos.len(),
+                            "repo_count": result.repos.len(),
+                            "is_full_snapshot": result.is_full_snapshot,
                             "attempt": attempt,
                         }),
                     )
@@ -3795,7 +4058,8 @@ where
                 return Ok(Some(StarPhaseSuccess {
                     user_id: user.id.clone(),
                     last_active_at: user.last_active_at.clone(),
-                    repos,
+                    repo_count,
+                    repos: result.repos,
                 }));
             }
             Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
@@ -4034,8 +4298,13 @@ async fn run_release_phase(
             succeeded_repos: attached.repos.saturating_sub(waited.failed),
             failed_repos: waited.failed,
             candidate_failures: waited.candidate_failures,
+            fetched_count: waited.fetched_count,
+            inserted_count: waited.inserted_count,
+            updated_count: waited.updated_count,
+            unchanged_count: waited.unchanged_count,
+            pages_fetched: waited.pages_fetched,
         },
-        waited.releases,
+        waited.inserted_count + waited.updated_count,
     ))
 }
 
@@ -4679,7 +4948,7 @@ async fn process_repo_release_work_item(
     }
 
     match result {
-        Ok((release_count, candidate_failures)) => {
+        Ok((stats, candidate_failures)) => {
             let updated = state
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
@@ -4693,6 +4962,12 @@ async fn process_repo_release_work_item(
                           has_new_repo_watchers = 0,
                           deadline_at = ?,
                           last_release_count = ?,
+                          last_fetched_count = ?,
+                          last_inserted_count = ?,
+                          last_updated_count = ?,
+                          last_unchanged_count = ?,
+                          last_pages_fetched = ?,
+                          last_stopped_reason = ?,
                           last_candidate_failures = ?,
                           last_success_at = ?,
                           error_text = NULL,
@@ -4709,7 +4984,16 @@ async fn process_repo_release_work_item(
                         )
                         .bind(jobs::STATUS_SUCCEEDED)
                         .bind(now.as_str())
-                        .bind(i64::try_from(release_count).unwrap_or(i64::MAX))
+                        .bind(
+                            i64::try_from(stats.inserted_count + stats.updated_count)
+                                .unwrap_or(i64::MAX),
+                        )
+                        .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
+                        .bind(stats.stopped_reason.as_str())
                         .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
                         .bind(now.as_str())
                         .bind(now.as_str())
@@ -4797,7 +5081,7 @@ async fn process_repo_release_work_item(
 async fn execute_repo_release_work_item(
     state: &AppState,
     work_item: &RepoReleaseWorkItemRow,
-) -> Result<(usize, usize)> {
+) -> Result<(RepoReleaseWriteStats, usize)> {
     let public_usage_repo = public_release_usage_repo_exists(state, work_item.repo_id).await?;
     let candidates = sqlx::query_as::<_, ReleaseCandidateUserRow>(
         r#"
@@ -4830,7 +5114,7 @@ async fn execute_repo_release_work_item(
     }
 
     let mut candidate_failures = 0usize;
-    let mut authenticated_release_count = None;
+    let mut authenticated_stats: Option<RepoReleaseWriteStats> = None;
     'candidate_users: for candidate in candidates {
         for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
             match fetch_repo_releases_for_user(
@@ -4841,25 +5125,44 @@ async fn execute_repo_release_work_item(
             )
             .await
             {
-                Ok(RepoReleaseFetchOutcome::Updated(releases, http_state)) => {
-                    let release_count =
-                        upsert_repo_releases(state, work_item.repo_id, &releases).await?;
-                    record_repo_release_sync_success(state, work_item.repo_id, http_state, false)
-                        .await?;
+                Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
+                    let mut stats =
+                        upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases)
+                            .await?;
+                    stats.pages_fetched = fetch_result.pages_fetched;
+                    stats.stopped_reason = fetch_result.stopped_reason;
+                    record_repo_release_sync_success(
+                        state,
+                        work_item.repo_id,
+                        fetch_result.http_state,
+                        false,
+                        &stats,
+                    )
+                    .await?;
                     if public_usage_repo {
-                        authenticated_release_count = Some(release_count);
+                        authenticated_stats = Some(stats);
                         break 'candidate_users;
                     }
-                    return Ok((release_count, candidate_failures));
+                    return Ok((stats, candidate_failures));
                 }
                 Ok(RepoReleaseFetchOutcome::NotModified(http_state)) => {
-                    record_repo_release_sync_success(state, work_item.repo_id, http_state, true)
-                        .await?;
+                    let stats = RepoReleaseWriteStats {
+                        stopped_reason: "not_modified".to_owned(),
+                        ..RepoReleaseWriteStats::default()
+                    };
+                    record_repo_release_sync_success(
+                        state,
+                        work_item.repo_id,
+                        http_state,
+                        true,
+                        &stats,
+                    )
+                    .await?;
                     if public_usage_repo {
-                        authenticated_release_count = Some(0);
+                        authenticated_stats = Some(stats);
                         break 'candidate_users;
                     }
-                    return Ok((0, candidate_failures));
+                    return Ok((stats, candidate_failures));
                 }
                 Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
                     candidate_failures += 1;
@@ -4881,23 +5184,46 @@ async fn execute_repo_release_work_item(
         )
         .await
         {
-            Ok(RepoReleaseFetchOutcome::Updated(releases, http_state)) => {
-                let release_count =
-                    upsert_repo_releases(state, work_item.repo_id, &releases).await?;
-                record_repo_release_sync_success(state, work_item.repo_id, http_state, false)
-                    .await?;
+            Ok(RepoReleaseFetchOutcome::Updated(fetch_result)) => {
+                let mut stats =
+                    upsert_repo_releases(state, work_item.repo_id, &fetch_result.releases).await?;
+                stats.pages_fetched = fetch_result.pages_fetched;
+                stats.stopped_reason = fetch_result.stopped_reason;
+                record_repo_release_sync_success(
+                    state,
+                    work_item.repo_id,
+                    fetch_result.http_state,
+                    false,
+                    &stats,
+                )
+                .await?;
                 mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
-                let release_count = release_count.max(authenticated_release_count.unwrap_or(0));
-                return Ok((release_count, candidate_failures));
+                if let Some(authenticated) = authenticated_stats
+                    && authenticated.inserted_count + authenticated.updated_count
+                        > stats.inserted_count + stats.updated_count
+                {
+                    return Ok((authenticated, candidate_failures));
+                }
+                return Ok((stats, candidate_failures));
             }
             Ok(RepoReleaseFetchOutcome::NotModified(http_state)) => {
-                record_repo_release_sync_success(state, work_item.repo_id, http_state, true)
-                    .await?;
+                let stats = RepoReleaseWriteStats {
+                    stopped_reason: "not_modified".to_owned(),
+                    ..RepoReleaseWriteStats::default()
+                };
+                record_repo_release_sync_success(
+                    state,
+                    work_item.repo_id,
+                    http_state,
+                    true,
+                    &stats,
+                )
+                .await?;
                 mark_public_release_usage_sync_success(state, work_item.repo_id).await?;
-                return Ok((authenticated_release_count.unwrap_or(0), candidate_failures));
+                return Ok((authenticated_stats.unwrap_or(stats), candidate_failures));
             }
             Err(err) => {
-                if authenticated_release_count.is_none()
+                if authenticated_stats.is_none()
                     && let Err(record_err) =
                         record_repo_release_sync_failure(state, work_item.repo_id, &err).await
                 {
@@ -4909,8 +5235,8 @@ async fn execute_repo_release_work_item(
                     );
                 }
                 mark_public_release_usage_sync_failure(state, work_item.repo_id, &err).await?;
-                if let Some(release_count) = authenticated_release_count {
-                    return Ok((release_count, candidate_failures));
+                if let Some(stats) = authenticated_stats {
+                    return Ok((stats, candidate_failures));
                 }
             }
         }
@@ -4993,7 +5319,7 @@ async fn load_repo_release_sync_state(
 ) -> Result<Option<RepoReleaseSyncStateRow>> {
     sqlx::query_as::<_, RepoReleaseSyncStateRow>(
         r#"
-        SELECT etag, last_modified
+        SELECT etag, last_modified, last_page_count
         FROM repo_release_sync_state
         WHERE repo_id = ?
         LIMIT 1
@@ -5010,15 +5336,18 @@ async fn record_repo_release_sync_success(
     repo_id: i64,
     http_state: RepoReleaseHttpState,
     not_modified: bool,
+    stats: &RepoReleaseWriteStats,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         INSERT INTO repo_release_sync_state (
           repo_id, etag, last_modified, last_success_at, last_attempt_at,
-          last_not_modified_at, last_error_text, backoff_until, updated_at
+          last_not_modified_at, last_error_text, backoff_until, last_page_count,
+          last_fetched_count, last_inserted_count, last_updated_count,
+          last_unchanged_count, last_stopped_reason, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(repo_id) DO UPDATE SET
           etag = COALESCE(excluded.etag, repo_release_sync_state.etag),
           last_modified = COALESCE(excluded.last_modified, repo_release_sync_state.last_modified),
@@ -5030,6 +5359,15 @@ async fn record_repo_release_sync_success(
           END,
           last_error_text = NULL,
           backoff_until = NULL,
+          last_page_count = CASE
+            WHEN excluded.last_page_count > 0 THEN excluded.last_page_count
+            ELSE repo_release_sync_state.last_page_count
+          END,
+          last_fetched_count = excluded.last_fetched_count,
+          last_inserted_count = excluded.last_inserted_count,
+          last_updated_count = excluded.last_updated_count,
+          last_unchanged_count = excluded.last_unchanged_count,
+          last_stopped_reason = excluded.last_stopped_reason,
           updated_at = excluded.updated_at
         "#,
     )
@@ -5039,6 +5377,12 @@ async fn record_repo_release_sync_success(
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(not_modified.then_some(now.as_str()))
+    .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
+    .bind(i64::try_from(stats.fetched_count).unwrap_or(i64::MAX))
+    .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
+    .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
+    .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+    .bind(stats.stopped_reason.as_str())
     .bind(now.as_str())
     .execute(&state.pool)
     .await
@@ -5087,12 +5431,76 @@ async fn upsert_repo_releases(
     state: &AppState,
     repo_id: i64,
     releases: &[GitHubRelease],
-) -> Result<usize> {
+) -> Result<RepoReleaseWriteStats> {
     let now = Utc::now().to_rfc3339();
     state
         .sqlite_writer
         .write("repo_release_upsert", |_| async {
+            let mut stats = RepoReleaseWriteStats {
+                fetched_count: releases.len(),
+                stopped_reason: "completed".to_owned(),
+                ..RepoReleaseWriteStats::default()
+            };
             for release in releases {
+                let existing = sqlx::query_as::<_, ExistingRepoReleaseRow>(
+                    r#"
+            SELECT
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            FROM repo_releases
+            WHERE release_id = ?
+            LIMIT 1
+            "#,
+                )
+                .bind(release.id)
+                .fetch_optional(&state.pool)
+                .await
+                .with_context(|| format!("failed to load shared release {}", release.tag_name))?;
+                let reactions = release.reactions.as_ref();
+                let plus1 = reactions.map(|value| value.plus1).unwrap_or(0);
+                let laugh = reactions.map(|value| value.laugh).unwrap_or(0);
+                let heart = reactions.map(|value| value.heart).unwrap_or(0);
+                let hooray = reactions.map(|value| value.hooray).unwrap_or(0);
+                let rocket = reactions.map(|value| value.rocket).unwrap_or(0);
+                let eyes = reactions.map(|value| value.eyes).unwrap_or(0);
+                if let Some(existing) = existing.as_ref() {
+                    let unchanged = existing.node_id == release.node_id
+                        && existing.tag_name == release.tag_name
+                        && existing.name == release.name
+                        && existing.body == release.body
+                        && existing.html_url == release.html_url
+                        && existing.published_at == release.published_at
+                        && existing.created_at == release.created_at
+                        && existing.is_prerelease == release.prerelease as i64
+                        && existing.is_draft == release.draft as i64
+                        && existing.react_plus1 == plus1
+                        && existing.react_laugh == laugh
+                        && existing.react_heart == heart
+                        && existing.react_hooray == hooray
+                        && existing.react_rocket == rocket
+                        && existing.react_eyes == eyes;
+                    if unchanged {
+                        stats.unchanged_count += 1;
+                        continue;
+                    }
+                    stats.updated_count += 1;
+                } else {
+                    stats.inserted_count += 1;
+                }
+
                 sqlx::query(
                     r#"
             INSERT INTO repo_releases (
@@ -5149,57 +5557,19 @@ async fn upsert_repo_releases(
                 .bind(release.prerelease as i64)
                 .bind(release.draft as i64)
                 .bind(now.as_str())
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.plus1)
-                        .unwrap_or(0),
-                )
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.laugh)
-                        .unwrap_or(0),
-                )
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.heart)
-                        .unwrap_or(0),
-                )
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.hooray)
-                        .unwrap_or(0),
-                )
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.rocket)
-                        .unwrap_or(0),
-                )
-                .bind(
-                    release
-                        .reactions
-                        .as_ref()
-                        .map(|value| value.eyes)
-                        .unwrap_or(0),
-                )
+                .bind(plus1)
+                .bind(laugh)
+                .bind(heart)
+                .bind(hooray)
+                .bind(rocket)
+                .bind(eyes)
                 .execute(&state.pool)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<_, anyhow::Error>(stats)
         })
-        .await?;
-
-    Ok(releases.len())
+        .await
 }
 
 async fn mark_repo_release_watchers(
@@ -5567,6 +5937,64 @@ async fn append_subscription_event(
     .execute(&state.pool)
     .await
     .context("failed to insert sync_subscription_event")?;
+    Ok(())
+}
+
+async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
+    const BATCH_SIZE: i64 = 1000;
+    let now = Utc::now();
+    let succeeded_cutoff = (now - chrono::Duration::days(14)).to_rfc3339();
+    let failed_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+    let event_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
+
+    for _ in 0..10 {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM repo_release_watchers
+            WHERE id IN (
+              SELECT id
+              FROM repo_release_watchers
+              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
+                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+              LIMIT ?
+            )
+            "#,
+        )
+        .bind(succeeded_cutoff.as_str())
+        .bind(failed_cutoff.as_str())
+        .bind(BATCH_SIZE)
+        .execute(&state.pool)
+        .await
+        .context("prune repo release watchers")?
+        .rows_affected();
+        if deleted == 0 {
+            break;
+        }
+    }
+
+    for _ in 0..5 {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM sync_subscription_events
+            WHERE id IN (
+              SELECT id
+              FROM sync_subscription_events
+              WHERE julianday(created_at) < julianday(?)
+              LIMIT ?
+            )
+            "#,
+        )
+        .bind(event_cutoff.as_str())
+        .bind(BATCH_SIZE)
+        .execute(&state.pool)
+        .await
+        .context("prune sync subscription events")?
+        .rows_affected();
+        if deleted == 0 {
+            break;
+        }
+    }
+
     Ok(())
 }
 
@@ -5960,13 +6388,16 @@ fn owned_repo_snapshot_from_node(
 async fn fetch_followers_snapshot(
     state: &AppState,
     access_token: &str,
-) -> Result<Vec<FollowerSnapshot>, SyncRequestError> {
+) -> Result<FollowersFetchResult, SyncRequestError> {
     let mut page = 1usize;
     let mut followers = Vec::new();
+    let mut partial = false;
 
-    loop {
+    while page <= SOCIAL_FOLLOWERS_MAX_PAGES {
         let operation = format!("sync social followers page {page}");
-        let url = format!("{REST_API_BASE}/user/followers?per_page=100&page={page}");
+        let url = format!(
+            "{REST_API_BASE}/user/followers?per_page={SOCIAL_FOLLOWERS_PER_PAGE}&page={page}"
+        );
         let items = fetch_github_rest_page::<Vec<GitHubActor>>(
             state,
             access_token,
@@ -5978,7 +6409,11 @@ async fn fetch_followers_snapshot(
 
         let count = items.len();
         followers.extend(items.into_iter().map(|actor| FollowerSnapshot { actor }));
-        if count < 100 {
+        if count < SOCIAL_FOLLOWERS_PER_PAGE {
+            break;
+        }
+        if page == SOCIAL_FOLLOWERS_MAX_PAGES {
+            partial = true;
             break;
         }
         page += 1;
@@ -5986,7 +6421,7 @@ async fn fetch_followers_snapshot(
 
     followers.sort_by(|left, right| left.actor.id.cmp(&right.actor.id));
     followers.dedup_by(|left, right| left.actor.id == right.actor.id);
-    Ok(followers)
+    Ok(FollowersFetchResult { followers, partial })
 }
 
 async fn fetch_feed_activity_events_snapshot(
@@ -6561,14 +6996,15 @@ async fn fetch_repo_stargazers_snapshot(
     state: &AppState,
     access_token: &str,
     repo: &OwnedRepoSnapshot,
-) -> Result<Vec<RepoStargazerSnapshot>, anyhow::Error> {
+) -> Result<RepoStargazerFetchResult, anyhow::Error> {
     let mut page = 1usize;
     let mut members = Vec::new();
+    let mut partial = false;
 
-    loop {
+    while page <= SOCIAL_STARGAZER_MAX_PAGES {
         let operation = format!("sync social stargazers {} page {page}", repo.full_name);
         let url = format!(
-            "{REST_API_BASE}/repos/{}/stargazers?per_page=100&page={page}",
+            "{REST_API_BASE}/repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
             repo.full_name
         );
         let items = fetch_github_rest_page::<Vec<GitHubStargazer>>(
@@ -6588,7 +7024,11 @@ async fn fetch_repo_stargazers_snapshot(
             actor: item.user,
             starred_at: item.starred_at,
         }));
-        if count < 100 {
+        if count < SOCIAL_STARGAZER_PER_PAGE {
+            break;
+        }
+        if page == SOCIAL_STARGAZER_MAX_PAGES {
+            partial = true;
             break;
         }
         page += 1;
@@ -6596,22 +7036,61 @@ async fn fetch_repo_stargazers_snapshot(
 
     members.sort_by(|left, right| left.actor.id.cmp(&right.actor.id));
     members.dedup_by(|left, right| left.actor.id == right.actor.id);
-    Ok(members)
+    Ok(RepoStargazerFetchResult { members, partial })
 }
 
 async fn fetch_starred_snapshot(
     state: &AppState,
     user_id: &str,
-) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
+    allow_shallow: bool,
+) -> Result<StarredFetchResult, SyncRequestError> {
     let connections = load_sync_github_connections(state, user_id).await?;
+    let has_existing =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|err| {
+                SyncRequestError::non_retryable(
+                    "sync_state_error",
+                    format!("count starred repos: {err}"),
+                    None,
+                )
+            })?
+            > 0;
     let mut repos_by_id = HashMap::<i64, StarredRepoSnapshot>::new();
     let mut any_success = false;
     let mut last_error: Option<SyncRequestError> = None;
+    let mut fetched_full = true;
+    let mut connection_watermarks = Vec::new();
     for connection in connections {
-        match fetch_starred_snapshot_with_token(state, &connection.access_token).await {
-            Ok(repos) => {
+        let watermark_key = notification_sync_key(STARRED_WATERMARK_KEY, &connection.id);
+        let connection_watermark = load_sync_state_value(state, user_id, watermark_key.as_str())
+            .await
+            .map_err(|err| {
+                SyncRequestError::non_retryable(
+                    "sync_state_error",
+                    format!("load starred sync watermark: {err}"),
+                    None,
+                )
+            })?;
+        let shallow = allow_shallow && has_existing && connection_watermark.is_some();
+        match fetch_starred_snapshot_with_token(
+            state,
+            &connection.access_token,
+            connection_watermark.as_deref(),
+            shallow,
+        )
+        .await
+        {
+            Ok(result) => {
                 any_success = true;
-                for repo in repos {
+                fetched_full &= result.is_full_snapshot;
+                if let Some(watermark) = result.watermark.as_ref().or(connection_watermark.as_ref())
+                {
+                    connection_watermarks.push((watermark_key, watermark.clone()));
+                }
+                for repo in result.repos {
                     match repos_by_id.get(&repo.repo_id) {
                         Some(existing) if existing.stargazed_at >= repo.stargazed_at => {}
                         _ => {
@@ -6649,17 +7128,35 @@ async fn fetch_starred_snapshot(
             .cmp(&left.stargazed_at)
             .then_with(|| left.full_name.cmp(&right.full_name))
     });
-    Ok(all)
+    let next_watermark = all.first().map(|repo| repo.stargazed_at.clone());
+    Ok(StarredFetchResult {
+        repos: all,
+        is_full_snapshot: fetched_full,
+        watermark: next_watermark,
+        connection_watermarks,
+    })
+}
+
+async fn count_user_starred_repos(state: &AppState, user_id: &str) -> Result<usize> {
+    let count =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+            .bind(user_id)
+            .fetch_one(&state.pool)
+            .await
+            .context("count starred repos for user")?;
+    Ok(usize::try_from(count).unwrap_or_default())
 }
 
 async fn fetch_starred_snapshot_with_token(
     state: &AppState,
     token: &str,
-) -> Result<Vec<StarredRepoSnapshot>, SyncRequestError> {
+    watermark: Option<&str>,
+    shallow: bool,
+) -> Result<StarredFetchResult, SyncRequestError> {
     let query = r#"
       query($after: String) {
         viewer {
-          starredRepositories(first: 100, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
+          starredRepositories(first: 50, after: $after, orderBy: {field: STARRED_AT, direction: DESC}) {
             pageInfo { hasNextPage endCursor }
             edges {
               starredAt
@@ -6685,6 +7182,7 @@ async fn fetch_starred_snapshot_with_token(
 
     let mut after: Option<String> = None;
     let mut all = Vec::new();
+    let mut is_full_snapshot = true;
 
     loop {
         let payload = with_subscription_timeout("sync starred graphql", async {
@@ -6722,6 +7220,14 @@ async fn fetch_starred_snapshot_with_token(
             .viewer
             .starred_repositories;
         for edge in page.edges {
+            if shallow
+                && watermark
+                    .as_ref()
+                    .is_some_and(|watermark| edge.starred_at.as_str() <= *watermark)
+            {
+                is_full_snapshot = false;
+                break;
+            }
             let Some(repo_id) = edge.node.database_id else {
                 continue;
             };
@@ -6740,11 +7246,15 @@ async fn fetch_starred_snapshot_with_token(
                 uses_custom_open_graph_image,
             });
         }
-        if !page.page_info.has_next_page {
+        if !is_full_snapshot || !page.page_info.has_next_page {
             break;
         }
         after = page.page_info.end_cursor;
         if after.is_none() {
+            break;
+        }
+        if shallow && all.len() >= STARRED_RECENT_WINDOW_SIZE {
+            is_full_snapshot = false;
             break;
         }
     }
@@ -6755,7 +7265,13 @@ async fn fetch_starred_snapshot_with_token(
             .cmp(&left.stargazed_at)
             .then_with(|| left.full_name.cmp(&right.full_name))
     });
-    Ok(all)
+    let next_watermark = all.first().map(|repo| repo.stargazed_at.clone());
+    Ok(StarredFetchResult {
+        repos: all,
+        is_full_snapshot,
+        watermark: next_watermark,
+        connection_watermarks: Vec::new(),
+    })
 }
 
 async fn replace_starred_repos(
@@ -6810,6 +7326,55 @@ async fn replace_starred_repos(
     Ok(())
 }
 
+async fn upsert_starred_repos(
+    state: &AppState,
+    user_id: &str,
+    repos: &[StarredRepoSnapshot],
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    for repo in repos {
+        sqlx::query(
+            r#"
+            INSERT INTO starred_repos (
+              id, user_id, repo_id, full_name, owner_login, name, description, html_url,
+              stargazed_at, is_private, updated_at, owner_avatar_url, open_graph_image_url,
+              uses_custom_open_graph_image
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, repo_id) DO UPDATE SET
+              full_name = excluded.full_name,
+              owner_login = excluded.owner_login,
+              name = excluded.name,
+              description = excluded.description,
+              html_url = excluded.html_url,
+              stargazed_at = excluded.stargazed_at,
+              is_private = excluded.is_private,
+              updated_at = excluded.updated_at,
+              owner_avatar_url = excluded.owner_avatar_url,
+              open_graph_image_url = excluded.open_graph_image_url,
+              uses_custom_open_graph_image = excluded.uses_custom_open_graph_image
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id)
+        .bind(repo.repo_id)
+        .bind(&repo.full_name)
+        .bind(&repo.owner_login)
+        .bind(&repo.name)
+        .bind(repo.description.as_deref())
+        .bind(&repo.html_url)
+        .bind(&repo.stargazed_at)
+        .bind(repo.is_private as i64)
+        .bind(&now)
+        .bind(repo.owner_avatar_url.as_deref())
+        .bind(repo.open_graph_image_url.as_deref())
+        .bind(repo.uses_custom_open_graph_image as i64)
+        .execute(&state.pool)
+        .await
+        .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
+    }
+    Ok(())
+}
+
 async fn fetch_repo_releases_for_user(
     state: &AppState,
     user_id: &str,
@@ -6831,6 +7396,7 @@ async fn fetch_repo_releases_for_user(
         match fetch_repo_releases_with_token(
             state,
             &connection.access_token,
+            repo_id,
             repo_full_name,
             sync_state.as_ref(),
         )
@@ -6882,30 +7448,78 @@ async fn fetch_repo_releases_public(
                 None,
             )
         })?;
-    fetch_repo_releases_with_optional_token(state, None, repo_full_name, sync_state.as_ref()).await
+    fetch_repo_releases_with_optional_token(
+        state,
+        None,
+        repo_id,
+        repo_full_name,
+        sync_state.as_ref(),
+    )
+    .await
 }
 
 async fn fetch_repo_releases_with_token(
     state: &AppState,
     token: &str,
+    repo_id: i64,
     repo_full_name: &str,
     sync_state: Option<&RepoReleaseSyncStateRow>,
 ) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
-    fetch_repo_releases_with_optional_token(state, Some(token), repo_full_name, sync_state).await
+    fetch_repo_releases_with_optional_token(state, Some(token), repo_id, repo_full_name, sync_state)
+        .await
 }
 
 async fn fetch_repo_releases_with_optional_token(
     state: &AppState,
     token: Option<&str>,
+    repo_id: i64,
     repo_full_name: &str,
     sync_state: Option<&RepoReleaseSyncStateRow>,
 ) -> Result<RepoReleaseFetchOutcome, SyncRequestError> {
     let mut page = 1usize;
     let mut releases = Vec::new();
     let mut http_state = RepoReleaseHttpState::default();
+    let stored_release_count =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM repo_releases WHERE repo_id = ?"#)
+            .bind(repo_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|err| {
+                SyncRequestError::non_retryable(
+                    "sync_state_error",
+                    format!("count cached repo releases: {err}"),
+                    None,
+                )
+            })?;
+    let is_large_repo = stored_release_count >= REPO_RELEASE_LARGE_REPO_THRESHOLD
+        || sync_state
+            .map(|state| state.last_page_count >= REPO_RELEASE_LARGE_REPO_LAST_PAGE_THRESHOLD)
+            .unwrap_or(false);
+    let known_release_ids =
+        sqlx::query_scalar::<_, i64>(r#"SELECT release_id FROM repo_releases WHERE repo_id = ?"#)
+            .bind(repo_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|err| {
+                SyncRequestError::non_retryable(
+                    "sync_state_error",
+                    format!("load cached repo release ids: {err}"),
+                    None,
+                )
+            })?
+            .into_iter()
+            .collect::<HashSet<_>>();
+    let per_page = if is_large_repo {
+        REPO_RELEASE_LARGE_REPO_PER_PAGE
+    } else {
+        REPO_RELEASE_DEFAULT_PER_PAGE
+    };
+    let mut max_pages = REPO_RELEASE_DEFAULT_MAX_PAGES;
+    let mut stopped_reason = String::from("page_budget");
     loop {
-        let url =
-            format!("{REST_API_BASE}/repos/{repo_full_name}/releases?per_page=100&page={page}");
+        let url = format!(
+            "{REST_API_BASE}/repos/{repo_full_name}/releases?per_page={per_page}&page={page}"
+        );
         let operation = format!("sync releases {repo_full_name}");
         let page_result = with_subscription_timeout(operation.as_str(), async {
             let mut request = state
@@ -6955,15 +7569,32 @@ async fn fetch_repo_releases_with_optional_token(
             return Ok(RepoReleaseFetchOutcome::NotModified(http_state));
         };
         if page_releases.is_empty() {
+            stopped_reason = "empty_page".to_owned();
             break;
         }
+        let page_count = page_releases.len();
+        let has_changed_release = page_releases
+            .iter()
+            .any(|release| !known_release_ids.contains(&release.id));
         releases.extend(page_releases);
-        if page >= 50 {
+        if !is_large_repo && has_changed_release {
+            max_pages = REPO_RELEASE_CHANGED_MAX_PAGES;
+        }
+        if page_count < per_page {
+            stopped_reason = "short_page".to_owned();
+            break;
+        }
+        if page >= max_pages {
             break;
         }
         page += 1;
     }
-    Ok(RepoReleaseFetchOutcome::Updated(releases, http_state))
+    Ok(RepoReleaseFetchOutcome::Updated(RepoReleaseFetchResult {
+        releases,
+        http_state,
+        pages_fetched: page,
+        stopped_reason,
+    }))
 }
 
 pub async fn sync_notifications(
@@ -7587,26 +8218,28 @@ mod tests {
 
     use super::{
         EligibleUserRow, FeedActivityEventSnapshot, FollowerSnapshot, GitHubActivityEvent,
-        GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification,
+        GitHubActivityPayload, GitHubActor, GitHubEventRepo, GitHubNotification, GitHubRelease,
         GitHubReleaseEventPayload, NOTIFICATION_OPEN_URL_REPAIR_BATCH_SIZE,
         NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoStargazerSnapshot,
-        SocialActivityEventInsert, StarPhaseSuccess, StarredRepoSnapshot, SubscriptionRunContext,
+        RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
+        RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
+        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionRunContext,
         SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        attach_and_wait_for_user_release_demand, attach_release_demand,
-        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
-        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
-        expire_repo_release_deadlines, fail_repo_release_work_item,
-        feed_activity_event_from_github, insert_feed_activity_events,
+        apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
+        attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
+        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
+        discussion_announcement_from_node, expire_repo_release_deadlines,
+        fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, is_terminal_notification_thread_error,
         owned_repo_snapshot_from_node, process_repo_release_work_item,
-        recover_repo_release_runtime_state_on_startup, repo_release_deadline_at,
-        resolve_notification_open_url, subscription_event_counts_as_critical,
-        subscription_timeout_error, sync_notifications_with_fetch,
-        sync_starred_for_user_with_fetch, wait_for_release_demand,
+        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
+        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
+        subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
+        upsert_starred_repos, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -7850,6 +8483,7 @@ mod tests {
             StarPhaseSuccess {
                 user_id: test_user_id("2"),
                 last_active_at: Some("2026-03-06T12:00:00Z".to_owned()),
+                repo_count: 2,
                 repos: vec![
                     StarredRepoSnapshot {
                         repo_id: 2,
@@ -7882,6 +8516,7 @@ mod tests {
             StarPhaseSuccess {
                 user_id: test_user_id("1"),
                 last_active_at: Some("2026-03-06T13:00:00Z".to_owned()),
+                repo_count: 1,
                 repos: vec![StarredRepoSnapshot {
                     repo_id: 1,
                     full_name: "octo/alpha".to_owned(),
@@ -8726,7 +9361,12 @@ mod tests {
                                 None,
                             ))
                         } else {
-                            Ok(repos)
+                            Ok(StarredFetchResult {
+                                repos,
+                                is_full_snapshot: true,
+                                watermark: Some("2026-03-06T13:00:00Z".to_owned()),
+                                connection_watermarks: Vec::new(),
+                            })
                         }
                     }
                 }
@@ -9937,6 +10577,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn social_activity_budgeted_partial_snapshot_upserts_without_deleting_unseen_members() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-budgeted-partial-snapshot");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let repo = OwnedRepoSnapshot {
+            repo_id: 42,
+            full_name: "octo/alpha".to_owned(),
+            owner_avatar_url: None,
+            open_graph_image_url: None,
+            uses_custom_open_graph_image: false,
+        };
+        let old_follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 201,
+                login: "monalisa".to_owned(),
+                avatar_url: Some("https://avatars.example/monalisa.png".to_owned()),
+                html_url: Some("https://github.com/monalisa".to_owned()),
+            },
+        };
+        let old_stargazer = RepoStargazerSnapshot {
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.clone(),
+            actor: GitHubActor {
+                id: 301,
+                login: "octocat".to_owned(),
+                avatar_url: Some("https://avatars.example/octocat.png".to_owned()),
+                html_url: Some("https://github.com/octocat".to_owned()),
+            },
+            starred_at: Some("2026-03-06T10:00:00Z".to_owned()),
+        };
+        apply_social_activity_snapshot(
+            state.as_ref(),
+            user_id.as_str(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec![old_stargazer])],
+            std::slice::from_ref(&old_follower),
+        )
+        .await
+        .expect("seed full social snapshot");
+
+        let new_follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 202,
+                login: "gaearon".to_owned(),
+                avatar_url: Some("https://avatars.example/gaearon.png".to_owned()),
+                html_url: Some("https://github.com/gaearon".to_owned()),
+            },
+        };
+        let new_stargazer = RepoStargazerSnapshot {
+            repo_id: repo.repo_id,
+            repo_full_name: repo.full_name.clone(),
+            actor: GitHubActor {
+                id: 302,
+                login: "defunkt".to_owned(),
+                avatar_url: Some("https://avatars.example/defunkt.png".to_owned()),
+                html_url: Some("https://github.com/defunkt".to_owned()),
+            },
+            starred_at: Some("2026-03-06T11:00:00Z".to_owned()),
+        };
+        let repo_members = vec![(repo.clone(), vec![new_stargazer])];
+        let events = apply_social_activity_snapshot_with_options(
+            state.as_ref(),
+            user_id.as_str(),
+            Some(std::slice::from_ref(&repo)),
+            Some(repo_members.as_slice()),
+            Some(std::slice::from_ref(&new_follower)),
+            false,
+            false,
+        )
+        .await
+        .expect("apply budgeted partial snapshot");
+        assert_eq!(events, 2);
+
+        let follower_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM follower_current_members
+            WHERE user_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count followers after partial snapshot");
+        assert_eq!(follower_count, 2);
+
+        let stargazer_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM repo_star_current_members
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(repo.repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stargazers after partial snapshot");
+        assert_eq!(stargazer_count, 2);
+    }
+
+    #[tokio::test]
     async fn social_activity_first_repo_snapshot_after_follower_only_baseline_emits_events() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -10312,17 +11056,20 @@ mod tests {
                     if repo.repo_id == 42 {
                         return Err(anyhow::anyhow!("repo unavailable"));
                     }
-                    Ok(vec![RepoStargazerSnapshot {
-                        repo_id: repo.repo_id,
-                        repo_full_name: repo.full_name.clone(),
-                        actor: GitHubActor {
-                            id: 501,
-                            login: "good-cat".to_owned(),
-                            avatar_url: Some("https://avatars.example/good-cat.png".to_owned()),
-                            html_url: Some("https://github.com/good-cat".to_owned()),
-                        },
-                        starred_at: Some("2026-03-06T13:00:00Z".to_owned()),
-                    }])
+                    Ok(RepoStargazerFetchResult {
+                        members: vec![RepoStargazerSnapshot {
+                            repo_id: repo.repo_id,
+                            repo_full_name: repo.full_name.clone(),
+                            actor: GitHubActor {
+                                id: 501,
+                                login: "good-cat".to_owned(),
+                                avatar_url: Some("https://avatars.example/good-cat.png".to_owned()),
+                                html_url: Some("https://github.com/good-cat".to_owned()),
+                            },
+                            starred_at: Some("2026-03-06T13:00:00Z".to_owned()),
+                        }],
+                        partial: false,
+                    })
                 })
             })
             .await;
@@ -10366,20 +11113,26 @@ mod tests {
                     let barrier = barrier.clone();
                     Box::pin(async move {
                         barrier.wait().await;
-                        Ok(vec![RepoStargazerSnapshot {
-                            repo_id: repo.repo_id,
-                            repo_full_name: repo.full_name.clone(),
-                            actor: GitHubActor {
-                                id: 700 + repo.repo_id,
-                                login: format!("cat-{}", repo.repo_id),
-                                avatar_url: Some(format!(
-                                    "https://avatars.example/cat-{}.png",
-                                    repo.repo_id
-                                )),
-                                html_url: Some(format!("https://github.com/cat-{}", repo.repo_id)),
-                            },
-                            starred_at: Some("2026-03-06T15:00:00Z".to_owned()),
-                        }])
+                        Ok(RepoStargazerFetchResult {
+                            members: vec![RepoStargazerSnapshot {
+                                repo_id: repo.repo_id,
+                                repo_full_name: repo.full_name.clone(),
+                                actor: GitHubActor {
+                                    id: 700 + repo.repo_id,
+                                    login: format!("cat-{}", repo.repo_id),
+                                    avatar_url: Some(format!(
+                                        "https://avatars.example/cat-{}.png",
+                                        repo.repo_id
+                                    )),
+                                    html_url: Some(format!(
+                                        "https://github.com/cat-{}",
+                                        repo.repo_id
+                                    )),
+                                },
+                                starred_at: Some("2026-03-06T15:00:00Z".to_owned()),
+                            }],
+                            partial: false,
+                        })
                     })
                 },
             ),
@@ -11011,6 +11764,78 @@ mod tests {
         assert_eq!(result.failed, 1);
         assert_eq!(result.releases, 0);
         assert_eq!(result.candidate_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn wait_for_release_demand_excludes_reused_fresh_writes_from_current_run_stats() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-reused-fresh").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-reused-fresh",
+                repo_id: 43,
+                repo_full_name: "octo/fresh",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 7,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET last_fetched_count = 7,
+                last_inserted_count = 3,
+                last_updated_count = 2,
+                last_unchanged_count = 2,
+                last_pages_fetched = 1
+            WHERE id = ?
+            "#,
+        )
+        .bind("repo-work-reused-fresh")
+        .execute(&pool)
+        .await
+        .expect("seed reused fresh stats");
+        seed_repo_release_watcher(
+            &pool,
+            "watch-reused-fresh",
+            "repo-work-reused-fresh",
+            "task-release-reused-fresh",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_watchers
+            SET status = 'succeeded',
+                reused_fresh = 1
+            WHERE id = ?
+            "#,
+        )
+        .bind("watch-reused-fresh")
+        .execute(&pool)
+        .await
+        .expect("mark reused fresh watcher");
+
+        let result = wait_for_release_demand(
+            state.as_ref(),
+            Some("task-release-reused-fresh"),
+            &["repo-work-reused-fresh".to_owned()],
+            Some(1),
+        )
+        .await
+        .expect("wait for reused fresh release demand");
+
+        assert_eq!(result.releases, 7);
+        assert_eq!(result.fetched_count, 0);
+        assert_eq!(result.inserted_count, 0);
+        assert_eq!(result.updated_count, 0);
+        assert_eq!(result.unchanged_count, 0);
+        assert_eq!(result.pages_fetched, 0);
     }
 
     #[tokio::test]
@@ -12301,6 +13126,168 @@ mod tests {
         .execute(&state.pool)
         .await
         .expect("seed subscription task");
+    }
+
+    #[tokio::test]
+    async fn upsert_repo_releases_counts_insert_update_and_unchanged() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        let release = GitHubRelease {
+            id: 9_001,
+            node_id: Some("R_9001".to_owned()),
+            tag_name: "v1.0.0".to_owned(),
+            name: Some("First".to_owned()),
+            body: Some("initial body".to_owned()),
+            html_url: "https://github.com/octo/app/releases/tag/v1.0.0".to_owned(),
+            published_at: Some("2026-03-06T10:00:00Z".to_owned()),
+            created_at: Some("2026-03-06T09:00:00Z".to_owned()),
+            prerelease: false,
+            draft: false,
+            reactions: None,
+        };
+
+        let inserted = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
+            .await
+            .expect("insert release");
+        assert_eq!(inserted.fetched_count, 1);
+        assert_eq!(inserted.inserted_count, 1);
+        assert_eq!(inserted.updated_count, 0);
+        assert_eq!(inserted.unchanged_count, 0);
+
+        let unchanged = upsert_repo_releases(state.as_ref(), 42, std::slice::from_ref(&release))
+            .await
+            .expect("unchanged release");
+        assert_eq!(unchanged.inserted_count, 0);
+        assert_eq!(unchanged.updated_count, 0);
+        assert_eq!(unchanged.unchanged_count, 1);
+
+        let mut edited = release;
+        edited.body = Some("edited body".to_owned());
+        let updated = upsert_repo_releases(state.as_ref(), 42, &[edited])
+            .await
+            .expect("update release");
+        assert_eq!(updated.inserted_count, 0);
+        assert_eq!(updated.updated_count, 1);
+        assert_eq!(updated.unchanged_count, 0);
+    }
+
+    #[tokio::test]
+    async fn repo_release_sync_success_preserves_page_count_on_not_modified() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        record_repo_release_sync_success(
+            state.as_ref(),
+            42,
+            RepoReleaseHttpState {
+                etag: Some("etag-1".to_owned()),
+                last_modified: Some("Fri, 06 Mar 2026 10:00:00 GMT".to_owned()),
+            },
+            false,
+            &RepoReleaseWriteStats {
+                pages_fetched: 12,
+                fetched_count: 120,
+                stopped_reason: "page_budget".to_owned(),
+                ..RepoReleaseWriteStats::default()
+            },
+        )
+        .await
+        .expect("seed release sync state");
+
+        record_repo_release_sync_success(
+            state.as_ref(),
+            42,
+            RepoReleaseHttpState::default(),
+            true,
+            &RepoReleaseWriteStats {
+                stopped_reason: "not_modified".to_owned(),
+                ..RepoReleaseWriteStats::default()
+            },
+        )
+        .await
+        .expect("record not modified state");
+
+        let page_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT last_page_count
+            FROM repo_release_sync_state
+            WHERE repo_id = ?
+            "#,
+        )
+        .bind(42_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load page count");
+        assert_eq!(page_count, 12);
+    }
+
+    #[tokio::test]
+    async fn upsert_starred_repos_keeps_old_rows_for_shallow_window() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("shallow-star");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        replace_starred_repos(
+            state.as_ref(),
+            user_id.as_str(),
+            &[
+                StarredRepoSnapshot {
+                    repo_id: 101,
+                    full_name: "octo/old".to_owned(),
+                    owner_login: "octo".to_owned(),
+                    name: "old".to_owned(),
+                    description: None,
+                    html_url: "https://github.com/octo/old".to_owned(),
+                    stargazed_at: "2026-03-01T00:00:00Z".to_owned(),
+                    is_private: false,
+                    owner_avatar_url: None,
+                    open_graph_image_url: None,
+                    uses_custom_open_graph_image: false,
+                },
+                StarredRepoSnapshot {
+                    repo_id: 102,
+                    full_name: "octo/recent".to_owned(),
+                    owner_login: "octo".to_owned(),
+                    name: "recent".to_owned(),
+                    description: None,
+                    html_url: "https://github.com/octo/recent".to_owned(),
+                    stargazed_at: "2026-03-06T00:00:00Z".to_owned(),
+                    is_private: false,
+                    owner_avatar_url: None,
+                    open_graph_image_url: None,
+                    uses_custom_open_graph_image: false,
+                },
+            ],
+        )
+        .await
+        .expect("seed starred repos");
+
+        upsert_starred_repos(
+            state.as_ref(),
+            user_id.as_str(),
+            &[StarredRepoSnapshot {
+                repo_id: 103,
+                full_name: "octo/new".to_owned(),
+                owner_login: "octo".to_owned(),
+                name: "new".to_owned(),
+                description: None,
+                html_url: "https://github.com/octo/new".to_owned(),
+                stargazed_at: "2026-03-07T00:00:00Z".to_owned(),
+                is_private: false,
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
+            }],
+        )
+        .await
+        .expect("upsert shallow starred repos");
+
+        let count =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count starred repos");
+        assert_eq!(count, 3);
     }
 
     async fn setup_pool() -> SqlitePool {

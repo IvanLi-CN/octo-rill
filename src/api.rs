@@ -3072,6 +3072,11 @@ pub struct AdminSyncSubscriptionReleaseDiagnostics {
     succeeded_repos: i64,
     failed_repos: i64,
     candidate_failures: i64,
+    fetched_count: i64,
+    inserted_count: i64,
+    updated_count: i64,
+    unchanged_count: i64,
+    pages_fetched: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -4150,6 +4155,11 @@ fn build_sync_subscriptions_diagnostics(
         succeeded_repos: json_object_get_i64(release_object, "succeeded_repos").unwrap_or(0),
         failed_repos: json_object_get_i64(release_object, "failed_repos").unwrap_or(0),
         candidate_failures: json_object_get_i64(release_object, "candidate_failures").unwrap_or(0),
+        fetched_count: json_object_get_i64(release_object, "fetched_count").unwrap_or(0),
+        inserted_count: json_object_get_i64(release_object, "inserted_count").unwrap_or(0),
+        updated_count: json_object_get_i64(release_object, "updated_count").unwrap_or(0),
+        unchanged_count: json_object_get_i64(release_object, "unchanged_count").unwrap_or(0),
+        pages_fetched: json_object_get_i64(release_object, "pages_fetched").unwrap_or(0),
     };
     let mut social = AdminSyncSubscriptionSocialDiagnostics {
         total_users: json_object_get_i64(social_object, "total_users").unwrap_or(0),
@@ -4352,6 +4362,17 @@ fn apply_sync_subscription_progress_events(
                     release.candidate_failures =
                         json_object_get_i64(payload_object, "candidate_failures")
                             .unwrap_or(release.candidate_failures);
+                    release.fetched_count = json_object_get_i64(payload_object, "fetched_count")
+                        .unwrap_or(release.fetched_count);
+                    release.inserted_count = json_object_get_i64(payload_object, "inserted_count")
+                        .unwrap_or(release.inserted_count);
+                    release.updated_count = json_object_get_i64(payload_object, "updated_count")
+                        .unwrap_or(release.updated_count);
+                    release.unchanged_count =
+                        json_object_get_i64(payload_object, "unchanged_count")
+                            .unwrap_or(release.unchanged_count);
+                    release.pages_fetched = json_object_get_i64(payload_object, "pages_fetched")
+                        .unwrap_or(release.pages_fetched);
                 }
                 if fill_all || fill_releases_written {
                     *releases_written = json_object_get_i64(payload_object, "releases_written")
@@ -4370,6 +4391,17 @@ fn apply_sync_subscription_progress_events(
                     release.candidate_failures =
                         json_object_get_i64(payload_object, "candidate_failures")
                             .unwrap_or(release.candidate_failures);
+                    release.fetched_count = json_object_get_i64(payload_object, "fetched_count")
+                        .unwrap_or(release.fetched_count);
+                    release.inserted_count = json_object_get_i64(payload_object, "inserted_count")
+                        .unwrap_or(release.inserted_count);
+                    release.updated_count = json_object_get_i64(payload_object, "updated_count")
+                        .unwrap_or(release.updated_count);
+                    release.unchanged_count =
+                        json_object_get_i64(payload_object, "unchanged_count")
+                            .unwrap_or(release.unchanged_count);
+                    release.pages_fetched = json_object_get_i64(payload_object, "pages_fetched")
+                        .unwrap_or(release.pages_fetched);
                 }
                 if fill_all || fill_releases_written {
                     *releases_written = json_object_get_i64(payload_object, "releases_written")
