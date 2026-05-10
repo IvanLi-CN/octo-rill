@@ -3054,64 +3054,12 @@ fn extract_github_links(body: &str, max_links: usize) -> Vec<String> {
     out
 }
 
-fn extract_fallback_bullets(body: &str, max_bullets: usize) -> Vec<String> {
-    let mut bullets = Vec::new();
-    let mut in_code = false;
-
-    for raw in body.replace("\r\n", "\n").lines() {
-        let line = raw.trim();
-        if line.starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-        if in_code || line.is_empty() {
-            continue;
-        }
-
-        let content = line
-            .strip_prefix("- ")
-            .or_else(|| line.strip_prefix("* "))
-            .or_else(|| line.strip_prefix("+ "))
-            .map(str::trim)
-            .or_else(|| {
-                let (head, tail) = line.split_once('.')?;
-                if head.chars().all(|c| c.is_ascii_digit()) && tail.starts_with(' ') {
-                    Some(tail.trim())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(line);
-
-        if content.starts_with('#') {
-            continue;
-        }
-
-        let cleaned = sanitize_bullet_text(content);
-        if cleaned.is_empty() {
-            continue;
-        }
-        bullets.push(truncate_chars(&cleaned, 180));
-        if bullets.len() >= max_bullets {
-            break;
-        }
+fn extract_fallback_bullets(body: &str, _max_bullets: usize) -> Vec<String> {
+    if non_empty_lines(body).any(|line| !line.starts_with('#')) {
+        return vec!["本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。".to_owned()];
     }
 
-    if bullets.is_empty() {
-        let mut fallback = non_empty_lines(body)
-            .filter(|line| !line.starts_with('#'))
-            .take(max_bullets)
-            .map(sanitize_bullet_text)
-            .filter(|line| !line.is_empty())
-            .map(|line| truncate_chars(&line, 180))
-            .collect::<Vec<_>>();
-        if fallback.is_empty() {
-            fallback.push("本次发布未提供可提取的变更说明。".to_owned());
-        }
-        return fallback;
-    }
-
-    bullets
+    vec!["本次发布未提供可提取的变更说明。".to_owned()]
 }
 
 fn to_release_digest(rows: Vec<ReleaseRow>) -> Vec<ReleaseDigest> {
@@ -3326,7 +3274,8 @@ fn build_project_prompt(full_name: &str, releases: &[ReleaseDigest]) -> String {
     body.push_str("1) 必须覆盖输入中的每个 release_id；\n");
     body.push_str("2) 不得新增输入里不存在的事实；\n");
     body.push_str("3) 不输出任何 URL；\n");
-    body.push_str("4) 可标注 breaking/security/perf/docs/fix 等类型，但条目要简洁。\n\n");
+    body.push_str("4) 默认使用简体中文整理要点；代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n");
+    body.push_str("5) 可标注 breaking/security/perf/docs/fix 等类型，但条目要简洁。\n\n");
     body.push_str("仓库：");
     body.push_str(full_name);
     body.push_str("\n\nReleases:\n");
@@ -3354,7 +3303,8 @@ fn build_projects_batch_prompt(projects: &[(String, Vec<ReleaseDigest>)]) -> Str
     body.push_str("1) 必须覆盖输入中的每个 release_id；\n");
     body.push_str("2) 不得新增输入里不存在的事实；\n");
     body.push_str("3) 不输出任何 URL；\n");
-    body.push_str("4) 可标注 breaking/security/perf/docs/fix 等类型，但条目要简洁。\n\n");
+    body.push_str("4) 默认使用简体中文整理要点；代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n");
+    body.push_str("5) 可标注 breaking/security/perf/docs/fix 等类型，但条目要简洁。\n\n");
 
     for (full_name, releases) in projects {
         body.push_str("====\n");
@@ -3977,12 +3927,12 @@ async fn polish_brief_markdown(
         }
     };
     let prompt = format!(
-        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n4) 不新增编造事实；\n5) release 与 repo 的顺序必须保持不变；\n6) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n7) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n8) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n9) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
+        "请在不删减任何 release 条目与社交摘要的前提下，对下面日报做一次统一润色。\n\n硬性要求：\n1) 保留所有链接原样（尤其 /owner/repo/releases/tag/<tag>?from=briefs）；\n{social_structure_rule}\n3) 默认使用简体中文优化可读性；技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文；\n4) 不要输出 markdown code block，也不要把整篇内容包进 ```markdown ```；\n5) 不新增编造事实；\n6) release 与 repo 的顺序必须保持不变；\n7) 必须严格保持 Markdown 层级：仓库标题保持 `### [repo](...)`；每条 release 保持顶层 `- [title](/owner/repo/releases/tag/<tag>?from=briefs)`；release 下的摘要与“相关链接”必须保持缩进两个空格的子 bullet `  - ...`；\n8) 不得把 release 下的子 bullet 改写成普通段落、硬换行文本或空行分隔；\n9) 除章节、仓库标题、release block 之间已有的单个空行外，不得新增额外空行；\n10) 你只能改写既有 bullet 的措辞、去重或压缩重复表达，不能改结构。\n\n日报原文：\n{markdown}",
     );
 
     let polished = chat_completion(
         state,
-        "你是一个发布日报编辑器，负责在不丢失信息的前提下优化可读性。",
+        "你是一个发布日报编辑器，负责在不丢失信息的前提下用简体中文优化可读性。",
         &prompt,
         1600,
     )
@@ -7189,6 +7139,145 @@ mod tests {
         assert!(!markdown.contains("## 获星与关注"));
         assert!(!markdown.contains("### 获星"));
         assert!(!markdown.contains("### 关注"));
+    }
+
+    #[test]
+    fn daily_brief_summary_prompts_request_chinese_with_technical_exceptions() {
+        let release = ReleaseDigest {
+            body: "- feat(api): add batch endpoint".to_owned(),
+            ..test_release_digest(
+                42,
+                "acme/rocket",
+                "v1.0.0",
+                "https://github.com/acme/rocket/releases/tag/v1.0.0",
+            )
+        };
+        let single = build_project_prompt("acme/rocket", std::slice::from_ref(&release));
+        let batch = build_projects_batch_prompt(&[("acme/rocket".to_owned(), vec![release])]);
+
+        for prompt in [single, batch] {
+            assert!(prompt.contains("默认使用简体中文整理要点"));
+            assert!(prompt.contains(
+                "代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文"
+            ));
+        }
+    }
+
+    #[test]
+    fn fallback_bullets_use_chinese_guidance_instead_of_source_notes() {
+        let bullets = extract_fallback_bullets("- feat(api): add batch endpoint", 3);
+
+        assert_eq!(
+            bullets,
+            vec!["本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。".to_owned()]
+        );
+        assert!(
+            !bullets
+                .iter()
+                .any(|bullet| bullet.contains("feat(api): add batch endpoint"))
+        );
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_without_ai() {
+        let state = setup_llm_state().await;
+
+        let built = build_brief_content_from_digests(
+            state.as_ref(),
+            vec![ReleaseDigest {
+                release_id: 42,
+                full_name: "acme/rocket".to_owned(),
+                title: "v1.0.0".to_owned(),
+                body: "- feat(api): add batch endpoint".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+                published_at: "2026-03-06T12:00:00Z".to_owned(),
+                is_prerelease: false,
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("build brief content");
+
+        assert!(brief_content_is_canonical(&built.content_markdown));
+        assert!(
+            built
+                .content_markdown
+                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+        );
+        assert!(
+            !built
+                .content_markdown
+                .contains("feat(api): add batch endpoint")
+        );
+        assert!(
+            built
+                .content_markdown
+                .contains("[v1.0.0](/acme/rocket/releases/tag/v1.0.0?from=briefs)")
+        );
+    }
+
+    #[tokio::test]
+    async fn build_brief_content_from_digests_falls_back_to_chinese_guidance_on_ai_parse_failure() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|Json(payload): Json<Value>| async move {
+                let messages = payload["messages"]
+                    .as_array()
+                    .expect("messages should be present");
+                let prompt = messages[1]["content"]
+                    .as_str()
+                    .expect("user prompt should be present");
+                if prompt.contains("对下面日报做一次统一润色") {
+                    assert!(prompt.contains("默认使用简体中文优化可读性"));
+                    assert!(
+                        prompt.contains(
+                            "技术术语、代码标识符、commit type、包名、API 名、项目名、版本号和原始标题可以保留英文"
+                        )
+                    );
+                } else {
+                    assert!(prompt.contains("默认使用简体中文整理要点"));
+                }
+
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": { "content": "not json" }
+                        }]
+                    })),
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+
+        let built = build_brief_content_from_digests(
+            state.as_ref(),
+            vec![ReleaseDigest {
+                release_id: 42,
+                full_name: "acme/rocket".to_owned(),
+                title: "v1.0.0".to_owned(),
+                body: "- feat(api): add batch endpoint".to_owned(),
+                html_url: "https://github.com/acme/rocket/releases/tag/v1.0.0".to_owned(),
+                published_at: "2026-03-06T12:00:00Z".to_owned(),
+                is_prerelease: false,
+            }],
+            Vec::new(),
+        )
+        .await
+        .expect("build brief content");
+
+        assert!(brief_content_is_canonical(&built.content_markdown));
+        assert!(
+            built
+                .content_markdown
+                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+        );
+        assert!(
+            !built
+                .content_markdown
+                .contains("feat(api): add batch endpoint")
+        );
     }
 
     #[tokio::test]

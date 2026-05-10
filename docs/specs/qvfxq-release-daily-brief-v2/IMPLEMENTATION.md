@@ -5,14 +5,15 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-04-16
-- Last: 2026-04-19
-- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed
+- Last: 2026-05-10
+- Summary: 已交付；fast-track / canonical brief markdown validator + refresh drift repair landed；日报生成 prompt 与 deterministic fallback 已补齐默认中文倾向
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
 ## 文档更新（Docs to Update）
 
 - `docs/product.md`: 日报内容结构改为 `项目更新 + 获星与关注`
+- `docs/product.md`: 日报 release 要点默认中文倾向与 AI 失败兜底口径
 - `docs/specs/README.md`: 登记本 spec，收口后写入 PR 号与状态
 - `docs/specs/qvfxq-release-daily-brief-v2/SPEC.md`: 同步实现状态、视觉证据与验证结果
 
@@ -32,6 +33,7 @@ None
 - [x] M2: 后端生成链路升级为 V2 正文，并补齐短链接 / fence 清洗 / 原位刷新。
 - [x] M3: 内容刷新任务、admin diagnostics 与相关回归测试落地。
 - [x] M4: Storybook、文档、视觉证据与快车道收口完成。
+- [x] M5: 日报 summary / polish prompt 补齐默认简体中文契约；AI 不可用或 parse failed 时使用中文提示式 fallback，避免直接复用原始 release notes bullet。
 
 ## 验证结果
 
