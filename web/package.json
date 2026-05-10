@@ -15,7 +15,8 @@
 		"storybook": "storybook dev -p 55176 --host 127.0.0.1 --no-open",
 		"storybook:build": "storybook build",
 		"test:day-groups": "bun run scripts/test-day-groups.ts",
-		"test:embedded-version": "bun run scripts/test-embedded-version.ts"
+		"test:embedded-version": "bun run scripts/test-embedded-version.ts",
+		"test:pwa-build-contract": "bun ./scripts/test-pwa-build-contract.mjs"
 	},
 	"dependencies": {
 		"@radix-ui/react-slot": "^1.2.0",
