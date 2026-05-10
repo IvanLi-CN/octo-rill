@@ -6080,7 +6080,11 @@ mod tests {
         .expect("load refreshed brief");
         assert_eq!(row.0, "brief-refresh-v2-drift");
         assert_eq!(row.1, "content_refresh");
-        assert!(row.2.contains("  - fix: keep nested bullets stable"));
+        assert!(
+            row.2
+                .contains("  - 本次发布提供了变更说明，请打开 Release 详情查看原文与翻译。")
+        );
+        assert!(!row.2.contains("  - fix: keep nested bullets stable"));
         assert!(!row.2.contains("stable  \n"));
         assert!(
             row.2
