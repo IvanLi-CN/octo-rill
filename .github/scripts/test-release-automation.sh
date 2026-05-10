@@ -140,7 +140,8 @@ python3 - <<'PY' \
   "$repo_root/.github/scripts/release_backfill.py" \
   "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   "$repo_root/.github/workflows/release.yml" \
-  "$repo_root/.github/workflows/ci.yml"
+  "$repo_root/.github/workflows/ci.yml" \
+  "$repo_root/.github/workflows/notify-release-failure.yml"
 from __future__ import annotations
 
 import importlib.util
@@ -152,6 +153,7 @@ backfill_path = Path(sys.argv[1])
 contract_path = Path(sys.argv[2])
 release_workflow_path = Path(sys.argv[3])
 ci_workflow_path = Path(sys.argv[4])
+notify_release_workflow_path = Path(sys.argv[5])
 
 
 def load_module(path: Path, name: str):
@@ -477,10 +479,16 @@ await_ci_checkout_with = contract.require_mapping(
 assert await_ci_checkout.get("uses") == "actions/checkout@v4"
 assert await_ci_checkout_with.get("ref") == "${{ github.workflow_sha }}"
 await_ci_step = contract.step_config(await_ci_job, "Gate current push release against CI", "release.yml.jobs.await-ci")
+await_ci_run = contract.step_run(
+    await_ci_step,
+    "release.yml.jobs.await-ci.steps['Gate current push release against CI']",
+)
 assert "python3 ./.github/scripts/release_backfill.py await-ci" in contract.step_run(
     await_ci_step,
     "release.yml.jobs.await-ci.steps['Gate current push release against CI']",
 )
+assert "timeout_seconds=1800" in await_ci_run
+assert "timeout_seconds=120" not in await_ci_run
 
 assert prepare_job.get("needs") == ["plan", "await-ci"]
 intent_step = contract.step_config(prepare_job, "Determine release intent", "release.yml.jobs.prepare")
@@ -575,6 +583,65 @@ assert "python3 ./.github/scripts/release_backfill.py dispatch" in contract.step
     dispatch_step,
     "release.yml.jobs.audit-backfill.steps['Dispatch next release backfill']",
 )
+
+notify_job = contract.job_config(release_workflow, "notify-on-failure", "release.yml")
+assert notify_job.get("name") == "Notify manual release failure"
+assert notify_job.get("needs") == [
+    "plan",
+    "await-ci",
+    "prepare",
+    "docker-release",
+    "pr-release-comment",
+    "audit-backfill",
+]
+notify_if = notify_job.get("if", "")
+assert "always()" in notify_if
+assert "github.event_name == 'workflow_dispatch'" in notify_if
+for needed_job in [
+    "plan",
+    "await-ci",
+    "prepare",
+    "docker-release",
+    "pr-release-comment",
+    "audit-backfill",
+]:
+    assert f"needs.{needed_job}.result == 'failure'" in notify_if
+assert notify_job.get("permissions") == {}
+assert (
+    notify_job.get("uses")
+    == "IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main"
+)
+notify_with = contract.require_mapping(notify_job.get("with"), "release.yml.jobs.notify-on-failure.with")
+assert notify_with.get("repository") == "${{ github.repository }}"
+assert notify_with.get("workflow_name") == "${{ github.workflow }}"
+assert notify_with.get("conclusion") == "failure"
+assert notify_with.get("run_url") == "${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}"
+assert notify_with.get("ref_label") == "${{ github.ref_name && format('branch: {0}', github.ref_name) || 'ref: unavailable' }}"
+assert notify_with.get("head_sha") == "${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}"
+assert notify_with.get("run_attempt") == "${{ github.run_attempt }}"
+assert notify_with.get("actor") == "${{ github.actor }}"
+assert notify_with.get("event_name") == "${{ github.event_name }}"
+notify_secrets = contract.require_mapping(
+    notify_job.get("secrets"),
+    "release.yml.jobs.notify-on-failure.secrets",
+)
+assert notify_secrets.get("SHOUTRRR_URL") == "${{ secrets.SHOUTRRR_URL }}"
+
+notify_release_workflow = contract.load_yaml(notify_release_workflow_path)
+notify_failure_job = contract.job_config(
+    notify_release_workflow,
+    "notify_failure",
+    "notify-release-failure.yml",
+)
+notify_failure_if = notify_failure_job.get("if", "")
+assert "github.event.workflow_run.conclusion == 'failure'" in notify_failure_if
+assert "github.event.workflow_run.event != 'workflow_dispatch'" in notify_failure_if
+smoke_job = contract.job_config(
+    notify_release_workflow,
+    "smoke_test",
+    "notify-release-failure.yml",
+)
+assert smoke_job.get("if") == "${{ github.event_name == 'workflow_dispatch' }}"
 
 ci_workflow = contract.load_yaml(ci_workflow_path)
 lint_job = contract.job_config(ci_workflow, "lint", "ci.yml")

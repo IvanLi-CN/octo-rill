@@ -114,9 +114,6 @@ jobs:
           fi
 
           timeout_seconds=1800
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ needs.plan.outputs.release_head_sha }}" != "${REQUESTED_HEAD_SHA}" ]]; then
-            timeout_seconds=120
-          fi
 
           python3 ./.github/scripts/release_backfill.py await-ci \
             --head-sha "${{ needs.plan.outputs.release_head_sha }}" \
@@ -478,3 +475,32 @@ jobs:
             echo "- next_pending_reason: ${{ steps.target.outputs.selection_pending_reason }}"
             echo "- next_pending_pr_number: ${{ steps.target.outputs.release_pr_number }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-on-failure:
+    name: Notify manual release failure
+    needs: [plan, await-ci, prepare, docker-release, pr-release-comment, audit-backfill]
+    if: >-
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      (
+        needs.plan.result == 'failure' ||
+        needs.await-ci.result == 'failure' ||
+        needs.prepare.result == 'failure' ||
+        needs.docker-release.result == 'failure' ||
+        needs.pr-release-comment.result == 'failure' ||
+        needs.audit-backfill.result == 'failure'
+      )
+    permissions: {}
+    uses: IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main
+    with:
+      repository: ${{ github.repository }}
+      workflow_name: ${{ github.workflow }}
+      conclusion: failure
+      run_url: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      ref_label: "${{ github.ref_name && format('branch: {0}', github.ref_name) || 'ref: unavailable' }}"
+      head_sha: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.sha }}
+      run_attempt: ${{ github.run_attempt }}
+      actor: ${{ github.actor }}
+      event_name: ${{ github.event_name }}
+    secrets:
+      SHOUTRRR_URL: ${{ secrets.SHOUTRRR_URL }}
