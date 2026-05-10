@@ -58,6 +58,8 @@
 - related links 不得再直出完整 GitHub URL；PR / Issue 显示 `#编号`，commit 显示短 SHA。
 - 润色后的日报若被单层 markdown fence 包裹，落库前必须剥离该外层 fence。
 - 润色结果若把 release 子 bullet 改写成段落、硬换行文本、双空行或其它非 canonical 结构，必须拒绝并回退到 deterministic markdown。
+- Release 要点生成与润色 prompt 必须声明默认使用简体中文整理日报内容，同时允许保留代码标识符、commit type、包名、API 名、项目名、版本号和原始标题等必要英文。
+- 当 AI 不可用或返回不可解析摘要时，deterministic fallback 不得直接复用原始 release notes 的英文 bullet；应输出中文提示式兜底，并保留 release 主链接与 GitHub Release 外链。
 - 已存在的标准化 brief 命中同一窗口时，重新生成必须更新原有行，而不是直接 no-op 复用旧内容。
 - 历史修复任务必须能够扫描并刷新命中旧格式签名的可重建 brief。
 
@@ -87,6 +89,7 @@
 - 当窗口内没有任何 Release 时，`## 项目更新` 仍需输出“本时间窗口内没有新的 Release。”。
 - 当窗口内没有任何获星 / 关注时，`## 获星与关注` 仍需输出“本时间窗口内没有新的获星或关注动态。”。
 - 当 LLM 润色结果缺少必需章节、丢失内部 release 链接、打乱 release 顺序、把子 bullet 改成段落/硬换行文本，或产出空白内容时，必须回退到 deterministic markdown。
+- 不对生产 brief 内容做中文比例、英文比例或字符类别硬性判定；语言倾向通过 prompt 契约、合成 fixture 测试与可控 fallback 保障。
 - legacy brief 若既没有存储窗口也无法从正文解析窗口，仍由原有 history recompute 失败语义处理，不进入内容刷新任务。
 
 ## 接口契约（Interfaces & Contracts）

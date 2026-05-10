@@ -4,9 +4,10 @@
 
 - Lifecycle: active
 - Created: 2026-04-16
-- Last: 2026-04-19
+- Last: 2026-05-10
 
 ## 变更记录
 
 - 2026-04-16: 创建规格，冻结“移除概览/窗口、补社交摘要、支持历史内容刷新”的实现口径。
 - 2026-04-19: 收紧 brief canonical Markdown 契约，新增结构校验 / deterministic fallback，并把 V2 正文层级漂移纳入历史刷新。
+- 2026-05-10: 明确日报 release 要点默认简体中文倾向；AI 不可用或摘要不可解析时，deterministic fallback 改为中文提示式摘要，不直接复用原始 release notes bullet。
