@@ -62,7 +62,9 @@ async function installAnonymousApiMocks(page: Page) {
 
 type StaticPwaServer = {
 	origin: string;
+	setApiVersion: (version: string) => void;
 	setServiceWorkerRevision: (revision: number) => void;
+	getServiceWorkerRequests: () => number;
 	getSkipWaitingMessages: () => number;
 	close: () => Promise<void>;
 };
@@ -83,7 +85,9 @@ const contentTypes = new Map([
 ]);
 
 async function startStaticPwaServer(): Promise<StaticPwaServer> {
+	let apiVersion = "0.1.0";
 	let serviceWorkerRevision = 1;
+	let serviceWorkerRequests = 0;
 	let skipWaitingMessages = 0;
 
 	const server = createServer(
@@ -98,13 +102,13 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 			if (requestUrl.pathname === "/api/version") {
 				writeJson(response, 200, {
 					ok: true,
-					version: "0.1.0",
+					version: apiVersion,
 					source: "APP_EFFECTIVE_VERSION",
 				});
 				return;
 			}
 			if (requestUrl.pathname === "/api/health") {
-				writeJson(response, 200, { ok: true, version: "0.1.0" });
+				writeJson(response, 200, { ok: true, version: apiVersion });
 				return;
 			}
 			if (requestUrl.pathname === "/auth/logout") {
@@ -128,6 +132,7 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 			try {
 				let body = await readFile(filePath);
 				if (requestUrl.pathname === "/sw.js") {
+					serviceWorkerRequests += 1;
 					body = Buffer.concat([
 						body,
 						Buffer.from(
@@ -170,8 +175,14 @@ self.addEventListener("message", (event) => {
 
 	return {
 		origin: `http://127.0.0.1:${address.port}`,
+		setApiVersion(version: string) {
+			apiVersion = version;
+		},
 		setServiceWorkerRevision(revision: number) {
 			serviceWorkerRevision = revision;
+		},
+		getServiceWorkerRequests() {
+			return serviceWorkerRequests;
 		},
 		getSkipWaitingMessages() {
 			return skipWaitingMessages;
@@ -244,15 +255,31 @@ test("app exposes installable PWA metadata without blocking anonymous login", as
 	const manifestResponse = await page.request.get("/manifest.webmanifest");
 	expect(manifestResponse.ok()).toBe(true);
 	const manifest = (await manifestResponse.json()) as {
+		id?: string;
 		name?: string;
 		display?: string;
 		icons?: Array<{ src?: string; purpose?: string }>;
+		screenshots?: Array<{ src?: string; form_factor?: string }>;
+		shortcuts?: Array<{ name?: string; url?: string }>;
 	};
+	expect(manifest.id).toBe("/");
 	expect(manifest.name).toBe("OctoRill");
 	expect(manifest.display).toBe("standalone");
 	expect(
 		manifest.icons?.some((icon) => icon.purpose?.includes("maskable")),
 	).toBe(true);
+	expect(manifest.screenshots?.map((screenshot) => screenshot.src)).toEqual([
+		"/pwa/screenshot-wide.png",
+		"/pwa/screenshot-narrow.png",
+	]);
+	expect(
+		manifest.screenshots?.map((screenshot) => screenshot.form_factor),
+	).toEqual(["wide", "narrow"]);
+	expect(manifest.shortcuts?.map((shortcut) => shortcut.url)).toEqual([
+		"/",
+		"/releases",
+		"/briefs",
+	]);
 });
 
 test("production service worker falls back to cached app shell while bypassing private network paths", async ({
@@ -275,6 +302,7 @@ test("production service worker falls back to cached app shell while bypassing p
 			for (const [key, input, init] of [
 				["api", "/api/version", undefined],
 				["auth", "/auth/logout", undefined],
+				["authDeepLink", "/auth/github/callback?code=test", undefined],
 				["post", "/settings", { method: "POST" }],
 			] as const) {
 				try {
@@ -290,6 +318,7 @@ test("production service worker falls back to cached app shell while bypassing p
 		expect(privateRequests).toEqual({
 			api: "rejected",
 			auth: "rejected",
+			authDeepLink: "rejected",
 			post: "rejected",
 		});
 	} finally {
@@ -298,22 +327,34 @@ test("production service worker falls back to cached app shell while bypassing p
 	}
 });
 
-test("waiting service worker uses the existing update notice and activates only after refresh", async ({
+test("version drift checks for a waiting service worker and activates only after refresh", async ({
 	page,
 }) => {
 	const server = await startStaticPwaServer();
 	try {
 		await page.goto(server.origin);
 		await waitForServiceWorkerControl(page);
+		const initialServiceWorkerRequests = server.getServiceWorkerRequests();
 
+		server.setApiVersion("0.2.0");
 		server.setServiceWorkerRevision(2);
-		await page.evaluate(async () => {
-			const registration = await navigator.serviceWorker.ready;
-			await registration.update();
+		await page.evaluate(() => {
+			document.dispatchEvent(new Event("visibilitychange"));
 		});
 
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(initialServiceWorkerRequests);
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting !== null;
+				}),
+			)
+			.toBe(true);
 		await expect(page.locator("[data-version-update-notice]")).toContainText(
-			"检测到新前端版本",
+			"检测到新版本",
 		);
 		await expect.poll(() => server.getSkipWaitingMessages()).toBe(0);
 
