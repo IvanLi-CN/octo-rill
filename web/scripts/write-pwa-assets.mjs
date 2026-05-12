@@ -20,6 +20,7 @@ const appShellAssetUrls = new Set([
 ]);
 const pwaAssetExtensions = new Set([".png"]);
 const brandAssetExtensions = new Set([".svg"]);
+const reactionAssetExtensions = new Set([".svg"]);
 
 async function listFiles(dir) {
 	const entries = await readdir(dir, { withFileTypes: true });
@@ -55,6 +56,9 @@ function isAllowedPrecacheUrl(url) {
 	}
 	if (url.startsWith("/brand/")) {
 		return brandAssetExtensions.has(extension);
+	}
+	if (url.startsWith("/reactions/")) {
+		return reactionAssetExtensions.has(extension);
 	}
 	return false;
 }

@@ -171,6 +171,10 @@ assert(
 	"precache includes Vite JS assets",
 );
 assert(
+	precache.urls.includes("/reactions/heart.svg"),
+	"precache includes static reaction icons",
+);
+assert(
 	!precache.urls.includes("/vite.svg"),
 	"precache excludes default Vite SVG",
 );
