@@ -157,11 +157,24 @@ function useVersionMonitorController(
 	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
 	const serviceWorkerRefreshRef = useRef<(() => void) | null>(null);
+	const serviceWorkerUpdateCheckRef = useRef<(() => void) | null>(null);
+	const pendingServiceWorkerUpdateCheckRef = useRef(false);
 	const pwaInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
 
 	useEffect(() => {
 		hasUpdateRef.current = hasUpdate || hasServiceWorkerUpdate;
 	}, [hasServiceWorkerUpdate, hasUpdate]);
+
+	const requestServiceWorkerUpdateCheck = useCallback(() => {
+		const checkForUpdate = serviceWorkerUpdateCheckRef.current;
+		if (!checkForUpdate) {
+			pendingServiceWorkerUpdateCheckRef.current = true;
+			return;
+		}
+
+		pendingServiceWorkerUpdateCheckRef.current = false;
+		checkForUpdate();
+	}, []);
 
 	useEffect(() => {
 		registerPwaServiceWorker({
@@ -170,12 +183,18 @@ function useVersionMonitorController(
 				setHasServiceWorkerUpdate(true);
 				setHasUpdate(true);
 			},
+			onRegistered(controller) {
+				serviceWorkerUpdateCheckRef.current = controller.checkForUpdate;
+				if (pendingServiceWorkerUpdateCheckRef.current) {
+					requestServiceWorkerUpdateCheck();
+				}
+			},
 			onRegisterError() {
 				// PWA installability is an enhancement; failed registration should not
 				// block auth boot or normal dashboard usage.
 			},
 		});
-	}, []);
+	}, [requestServiceWorkerUpdateCheck]);
 
 	useEffect(() => {
 		const handleBeforeInstallPrompt = (event: Event) => {
@@ -255,6 +274,9 @@ function useVersionMonitorController(
 				if (!active || abortController.signal.aborted) {
 					return;
 				}
+				if (nextVersion !== baselineVersionRef.current) {
+					requestServiceWorkerUpdateCheck();
+				}
 				applyObservedVersion(nextVersion);
 			} catch {
 				// Frontend loadedVersion is embedded at build time, so request failure
@@ -273,6 +295,7 @@ function useVersionMonitorController(
 		}, pollIntervalMs);
 		const handleVisibilityChange = () => {
 			if (!document.hidden) {
+				requestServiceWorkerUpdateCheck();
 				void runCheck(true);
 			}
 		};
@@ -284,7 +307,12 @@ function useVersionMonitorController(
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
 			currentAbortController?.abort();
 		};
-	}, [applyObservedVersion, hasUpdate, pollIntervalMs]);
+	}, [
+		applyObservedVersion,
+		hasUpdate,
+		pollIntervalMs,
+		requestServiceWorkerUpdateCheck,
+	]);
 
 	return useMemo(
 		() => ({
