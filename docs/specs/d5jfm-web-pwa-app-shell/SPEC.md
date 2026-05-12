@@ -35,3 +35,9 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - Browser installability checks identify the app as installable.
 - Auth, passkey, OAuth, API, and SSE paths continue to use network behavior.
 - The existing version update notice can represent both server version drift and Service Worker update availability.
+
+## Visual Evidence
+
+- Update + install state: [update-install.png](./assets/update-install.png)
+- Install-only state: [install-only.png](./assets/install-only.png)
+- Update-only state: [update-only.png](./assets/update-only.png)
