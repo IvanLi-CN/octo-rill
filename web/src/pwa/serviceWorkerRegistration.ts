@@ -2,8 +2,13 @@ type PwaServiceWorkerUpdateController = {
 	applyUpdate: () => void;
 };
 
+type PwaServiceWorkerRegistrationController = {
+	checkForUpdate: () => void;
+};
+
 type RegisterPwaServiceWorkerOptions = {
 	onNeedRefresh: (controller: PwaServiceWorkerUpdateController) => void;
+	onRegistered?: (controller: PwaServiceWorkerRegistrationController) => void;
 	onRegisterError?: (error: unknown) => void;
 };
 
@@ -32,6 +37,14 @@ export function registerPwaServiceWorker(
 		void navigator.serviceWorker
 			.register(SW_URL)
 			.then((registration) => {
+				options.onRegistered?.({
+					checkForUpdate: () => {
+						void registration.update().catch((error: unknown) => {
+							options.onRegisterError?.(error);
+						});
+					},
+				});
+
 				const notify = (worker: ServiceWorker) => {
 					options.onNeedRefresh({
 						applyUpdate: () => {
