@@ -114,6 +114,7 @@ function useVersionMonitorController(
 	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
 	const serviceWorkerRefreshRef = useRef<(() => void) | null>(null);
+	const serviceWorkerUpdateCheckRef = useRef<(() => void) | null>(null);
 
 	useEffect(() => {
 		hasUpdateRef.current = hasUpdate || hasServiceWorkerUpdate;
@@ -125,6 +126,9 @@ function useVersionMonitorController(
 				serviceWorkerRefreshRef.current = controller.applyUpdate;
 				setHasServiceWorkerUpdate(true);
 				setHasUpdate(true);
+			},
+			onRegistered(controller) {
+				serviceWorkerUpdateCheckRef.current = controller.checkForUpdate;
 			},
 			onRegisterError() {
 				// PWA installability is an enhancement; failed registration should not
@@ -167,6 +171,9 @@ function useVersionMonitorController(
 				if (!active || abortController.signal.aborted) {
 					return;
 				}
+				if (nextVersion !== baselineVersionRef.current) {
+					serviceWorkerUpdateCheckRef.current?.();
+				}
 				applyObservedVersion(nextVersion);
 			} catch {
 				// Frontend loadedVersion is embedded at build time, so request failure
@@ -185,6 +192,7 @@ function useVersionMonitorController(
 		}, pollIntervalMs);
 		const handleVisibilityChange = () => {
 			if (!document.hidden) {
+				serviceWorkerUpdateCheckRef.current?.();
 				void runCheck(true);
 			}
 		};

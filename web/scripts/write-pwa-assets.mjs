@@ -3,18 +3,23 @@ import { readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const distDir = path.resolve(import.meta.dirname, "../dist");
-const precacheExtensions = new Set([
+const viteAssetExtensions = new Set([
 	".css",
-	".html",
-	".ico",
 	".js",
 	".json",
 	".png",
 	".svg",
-	".webmanifest",
 	".woff",
 	".woff2",
 ]);
+const appShellAssetUrls = new Set([
+	"/index.html",
+	"/manifest.webmanifest",
+	"/favicon.ico",
+	"/favicon.svg",
+]);
+const pwaAssetExtensions = new Set([".png"]);
+const brandAssetExtensions = new Set([".svg"]);
 
 async function listFiles(dir) {
 	const entries = await readdir(dir, { withFileTypes: true });
@@ -37,13 +42,30 @@ function toUrl(filePath) {
 	return `/${path.relative(distDir, filePath).split(path.sep).join("/")}`;
 }
 
+function isAllowedPrecacheUrl(url) {
+	const extension = path.extname(url);
+	if (appShellAssetUrls.has(url)) {
+		return true;
+	}
+	if (url.startsWith("/assets/")) {
+		return viteAssetExtensions.has(extension);
+	}
+	if (url.startsWith("/pwa/")) {
+		return pwaAssetExtensions.has(extension);
+	}
+	if (url.startsWith("/brand/")) {
+		return brandAssetExtensions.has(extension);
+	}
+	return false;
+}
+
 const files = (await listFiles(distDir))
 	.filter((filePath) => {
 		const name = path.basename(filePath);
 		if (name === "sw.js" || name === "pwa-precache-manifest.json") {
 			return false;
 		}
-		return precacheExtensions.has(path.extname(filePath));
+		return isAllowedPrecacheUrl(toUrl(filePath));
 	})
 	.map((filePath) => ({ filePath, url: toUrl(filePath) }))
 	.sort((a, b) => a.url.localeCompare(b.url));

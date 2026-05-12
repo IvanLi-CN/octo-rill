@@ -22,16 +22,18 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 
 ## Requirements
 
-- `manifest.webmanifest` must use `display: standalone`, root `scope`, root `start_url`, OctoRill name metadata, and install icons including a maskable 512px PNG.
+- `manifest.webmanifest` must use a stable root `id`, `display: standalone`, root `scope`, root `start_url`, OctoRill name metadata, categories, install icons including a maskable 512px PNG, screenshots, and shortcuts for primary app destinations.
 - The Service Worker must ignore non-GET requests, cross-origin requests, `/api/**`, and `/auth/**`.
 - Document navigations should prefer the network and fall back to the cached app shell only when the network is unavailable.
+- The precache list must be generated from an explicit allowlist covering only app-shell files, PWA assets, brand/favicon assets, and Vite build artifacts.
 - Build assets generated under Vite's hashed asset directory may be served with long immutable cache headers.
 - `index.html`, `sw.js`, and `manifest.webmanifest` must not be served with long immutable cache headers.
+- The app should proactively ask the registered Service Worker to check for updates when the page becomes visible and when backend version polling detects frontend version drift.
 - A waiting Service Worker must be activated only after the user clicks the existing refresh action.
 
 ## Acceptance
 
 - Production build emits `manifest.webmanifest`, `sw.js`, `pwa-precache-manifest.json`, and PNG app icons.
-- Browser installability checks identify the app as installable.
+- Browser installability checks identify the app as installable and expose the declared screenshots and shortcuts.
 - Auth, passkey, OAuth, API, and SSE paths continue to use network behavior.
 - The existing version update notice can represent both server version drift and Service Worker update availability.

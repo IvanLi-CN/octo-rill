@@ -2,11 +2,13 @@
 	"name": "OctoRill",
 	"short_name": "OctoRill",
 	"description": "A focused workspace for GitHub releases, stars, followers, daily briefs, and inbox activity.",
+	"id": "/",
 	"start_url": "/",
 	"scope": "/",
 	"display": "standalone",
 	"background_color": "#0f172a",
 	"theme_color": "#0f172a",
+	"categories": ["productivity", "utilities", "news"],
 	"icons": [
 		{
 			"src": "/pwa/icon-192.png",
@@ -23,6 +25,45 @@
 			"sizes": "512x512",
 			"type": "image/png",
 			"purpose": "any maskable"
+		}
+	],
+	"screenshots": [
+		{
+			"src": "/pwa/screenshot-wide.png",
+			"sizes": "3200x2400",
+			"type": "image/png",
+			"form_factor": "wide",
+			"label": "OctoRill dashboard overview"
+		},
+		{
+			"src": "/pwa/screenshot-narrow.png",
+			"sizes": "780x1688",
+			"type": "image/png",
+			"form_factor": "narrow",
+			"label": "OctoRill release feed"
+		}
+	],
+	"shortcuts": [
+		{
+			"name": "Dashboard",
+			"short_name": "Dashboard",
+			"description": "Open the main OctoRill workspace.",
+			"url": "/",
+			"icons": [{ "src": "/pwa/icon-192.png", "sizes": "192x192" }]
+		},
+		{
+			"name": "Releases",
+			"short_name": "Releases",
+			"description": "Open tracked release activity.",
+			"url": "/releases",
+			"icons": [{ "src": "/pwa/icon-192.png", "sizes": "192x192" }]
+		},
+		{
+			"name": "Daily Briefs",
+			"short_name": "Briefs",
+			"description": "Open daily activity summaries.",
+			"url": "/briefs",
+			"icons": [{ "src": "/pwa/icon-192.png", "sizes": "192x192" }]
 		}
 	]
 }
