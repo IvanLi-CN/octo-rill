@@ -413,6 +413,39 @@ test("version drift checks for a waiting service worker and activates only after
 	}
 });
 
+test("version drift before service worker registration still triggers an update check", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		const initialServiceWorkerRequests = server.getServiceWorkerRequests();
+
+		server.setApiVersion("0.2.0");
+		server.setServiceWorkerRevision(2);
+		await page.reload({ waitUntil: "domcontentloaded" });
+
+		await expect(page.locator("[data-version-update-notice]")).toContainText(
+			"检测到新版本",
+		);
+		await expect
+			.poll(() => server.getServiceWorkerRequests())
+			.toBeGreaterThan(initialServiceWorkerRequests);
+		await expect
+			.poll(async () =>
+				page.evaluate(async () => {
+					const registration = await navigator.serviceWorker.ready;
+					return registration.waiting !== null;
+				}),
+			)
+			.toBe(true);
+		await expect.poll(() => server.getSkipWaitingMessages()).toBe(0);
+	} finally {
+		await server.close();
+	}
+});
+
 test("install prompt appears when beforeinstallprompt fires and hides after appinstalled", async ({
 	page,
 }) => {
