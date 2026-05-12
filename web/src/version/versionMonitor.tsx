@@ -27,7 +27,10 @@ export type VersionMonitorValue = {
 	availableVersion: string | null;
 	hasUpdate: boolean;
 	hasServiceWorkerUpdate: boolean;
+	canInstallPwa?: boolean;
+	isPwaInstalled?: boolean;
 	refreshPage: () => void;
+	promptInstallPwa?: () => Promise<void>;
 };
 
 type VersionMonitorProviderProps = {
@@ -52,12 +55,17 @@ const defaultRefreshPage = () => {
 	window.location.reload();
 };
 
+const defaultPromptInstallPwa = async () => {};
+
 const defaultValue: VersionMonitorValue = {
 	loadedVersion: EMBEDDED_APP_VERSION,
 	availableVersion: null,
 	hasUpdate: false,
 	hasServiceWorkerUpdate: false,
+	canInstallPwa: false,
+	isPwaInstalled: false,
 	refreshPage: defaultRefreshPage,
+	promptInstallPwa: defaultPromptInstallPwa,
 };
 
 const VersionMonitorContext = createContext<VersionMonitorValue>(defaultValue);
@@ -104,6 +112,37 @@ export async function fetchLatestVersion(signal: AbortSignal): Promise<string> {
 	}
 }
 
+type BeforeInstallPromptChoice = {
+	outcome?: "accepted" | "dismissed";
+	platform?: string;
+};
+
+type BeforeInstallPromptEvent = Event & {
+	prompt: () => Promise<void>;
+	userChoice: Promise<BeforeInstallPromptChoice>;
+};
+
+function isBeforeInstallPromptEvent(
+	event: Event,
+): event is BeforeInstallPromptEvent {
+	const candidate = event as Partial<BeforeInstallPromptEvent>;
+	return (
+		typeof candidate.prompt === "function" &&
+		typeof candidate.userChoice?.then === "function"
+	);
+}
+
+function isStandalonePwaDisplayMode() {
+	if (typeof window === "undefined") return false;
+	const standaloneNavigator = navigator as Navigator & {
+		standalone?: boolean;
+	};
+	return (
+		standaloneNavigator.standalone === true ||
+		window.matchMedia("(display-mode: standalone)").matches
+	);
+}
+
 function useVersionMonitorController(
 	pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
 ): VersionMonitorValue {
@@ -111,10 +150,15 @@ function useVersionMonitorController(
 	const [availableVersion, setAvailableVersion] = useState<string | null>(null);
 	const [hasUpdate, setHasUpdate] = useState(false);
 	const [hasServiceWorkerUpdate, setHasServiceWorkerUpdate] = useState(false);
+	const [canInstallPwa, setCanInstallPwa] = useState(false);
+	const [isPwaInstalled, setIsPwaInstalled] = useState(() =>
+		isStandalonePwaDisplayMode(),
+	);
 	const baselineVersionRef = useRef(EMBEDDED_APP_VERSION);
 	const hasUpdateRef = useRef(false);
 	const serviceWorkerRefreshRef = useRef<(() => void) | null>(null);
 	const serviceWorkerUpdateCheckRef = useRef<(() => void) | null>(null);
+	const pwaInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
 
 	useEffect(() => {
 		hasUpdateRef.current = hasUpdate || hasServiceWorkerUpdate;
@@ -136,6 +180,50 @@ function useVersionMonitorController(
 			},
 		});
 	}, []);
+
+	useEffect(() => {
+		const handleBeforeInstallPrompt = (event: Event) => {
+			if (!isBeforeInstallPromptEvent(event) || isStandalonePwaDisplayMode()) {
+				return;
+			}
+			event.preventDefault();
+			pwaInstallPromptRef.current = event;
+			setIsPwaInstalled(false);
+			setCanInstallPwa(true);
+		};
+
+		const handleAppInstalled = () => {
+			pwaInstallPromptRef.current = null;
+			setCanInstallPwa(false);
+			setIsPwaInstalled(true);
+		};
+
+		window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+		window.addEventListener("appinstalled", handleAppInstalled);
+
+		return () => {
+			window.removeEventListener(
+				"beforeinstallprompt",
+				handleBeforeInstallPrompt,
+			);
+			window.removeEventListener("appinstalled", handleAppInstalled);
+		};
+	}, []);
+
+	const promptInstallPwa = useCallback(async () => {
+		const promptEvent = pwaInstallPromptRef.current;
+		if (!promptEvent || isPwaInstalled) {
+			return;
+		}
+
+		pwaInstallPromptRef.current = null;
+		setCanInstallPwa(false);
+		await promptEvent.prompt();
+		const choice = await promptEvent.userChoice.catch(() => null);
+		if (choice?.outcome === "accepted") {
+			setIsPwaInstalled(true);
+		}
+	}, [isPwaInstalled]);
 
 	const applyObservedVersion = useCallback((nextVersion: string) => {
 		if (nextVersion !== baselineVersionRef.current) {
@@ -212,6 +300,8 @@ function useVersionMonitorController(
 			availableVersion,
 			hasUpdate,
 			hasServiceWorkerUpdate,
+			canInstallPwa,
+			isPwaInstalled,
 			refreshPage: () => {
 				const applyServiceWorkerUpdate = serviceWorkerRefreshRef.current;
 				if (applyServiceWorkerUpdate) {
@@ -220,8 +310,17 @@ function useVersionMonitorController(
 				}
 				defaultRefreshPage();
 			},
+			promptInstallPwa,
 		}),
-		[availableVersion, hasServiceWorkerUpdate, hasUpdate, loadedVersion],
+		[
+			availableVersion,
+			canInstallPwa,
+			hasServiceWorkerUpdate,
+			hasUpdate,
+			isPwaInstalled,
+			loadedVersion,
+			promptInstallPwa,
+		],
 	);
 }
 

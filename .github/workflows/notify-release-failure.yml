@@ -14,7 +14,7 @@ permissions: {}
 
 jobs:
   notify_failure:
-    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' }}
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.event != 'workflow_dispatch' }}
     uses: IvanLi-CN/github-workflows/.github/workflows/release-failure-telegram.yml@main
     with:
       repository: ${{ github.repository }}
