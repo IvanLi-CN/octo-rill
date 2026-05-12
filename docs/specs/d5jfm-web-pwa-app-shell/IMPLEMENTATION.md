@@ -6,7 +6,7 @@
 - PWA shell uses generated static assets and a conservative same-origin Service Worker.
 - Manifest now carries install identity, shortcuts, and screenshots sourced from stable app-shell evidence.
 - Version notice now surfaces both Service Worker refresh and native install prompt actions in one shared shell surface.
-- Precache generation uses an explicit allowlist for app shell, PWA, brand/favicon, and Vite build assets instead of broad extension-based inclusion.
+- Precache generation uses an explicit allowlist for app shell, PWA, brand/favicon, static reaction icons, and Vite build assets instead of broad extension-based inclusion.
 - Version monitoring can ask the registered Service Worker to check for updates on page visibility and observed version drift while preserving user-confirmed activation.
 - Axum static hosting is responsible for cache headers that keep app-shell updates discoverable.
 
