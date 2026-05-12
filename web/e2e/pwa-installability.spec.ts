@@ -230,6 +230,52 @@ async function waitForServiceWorkerControl(page: Page) {
 	});
 }
 
+async function dispatchBeforeInstallPrompt(
+	page: Page,
+	outcome: "accepted" | "dismissed" = "accepted",
+) {
+	await page.evaluate(async (nextOutcome) => {
+		type PromptChoice = {
+			outcome: "accepted" | "dismissed";
+			platform: string;
+		};
+
+		type InstallPromptEvent = Event & {
+			prompt: () => Promise<void>;
+			userChoice: Promise<PromptChoice>;
+		};
+
+		const state = (
+			window as Window & {
+				__octoRillInstallPromptState?: { promptCalls: number };
+			}
+		).__octoRillInstallPromptState ?? { promptCalls: 0 };
+		(
+			window as Window & {
+				__octoRillInstallPromptState?: { promptCalls: number };
+			}
+		).__octoRillInstallPromptState = state;
+
+		const event = new Event("beforeinstallprompt", {
+			cancelable: true,
+		}) as InstallPromptEvent;
+		event.prompt = async () => {
+			state.promptCalls += 1;
+		};
+		event.userChoice = Promise.resolve({
+			outcome: nextOutcome,
+			platform: "web",
+		});
+		window.dispatchEvent(event);
+	}, outcome);
+}
+
+async function dispatchAppInstalled(page: Page) {
+	await page.evaluate(() => {
+		window.dispatchEvent(new Event("appinstalled"));
+	});
+}
+
 test("app exposes installable PWA metadata without blocking anonymous login", async ({
 	page,
 }) => {
@@ -269,16 +315,16 @@ test("app exposes installable PWA metadata without blocking anonymous login", as
 		manifest.icons?.some((icon) => icon.purpose?.includes("maskable")),
 	).toBe(true);
 	expect(manifest.screenshots?.map((screenshot) => screenshot.src)).toEqual([
-		"/pwa/screenshot-wide.png",
-		"/pwa/screenshot-narrow.png",
+		"/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
+		"/pwa/screenshots/app-shell-update-notice.png",
 	]);
 	expect(
 		manifest.screenshots?.map((screenshot) => screenshot.form_factor),
-	).toEqual(["wide", "narrow"]);
+	).toEqual(["narrow", "wide"]);
 	expect(manifest.shortcuts?.map((shortcut) => shortcut.url)).toEqual([
 		"/",
-		"/releases",
-		"/briefs",
+		"/admin",
+		"/settings",
 	]);
 });
 
@@ -357,6 +403,71 @@ test("version drift checks for a waiting service worker and activates only after
 			"检测到新版本",
 		);
 		await expect.poll(() => server.getSkipWaitingMessages()).toBe(0);
+
+		await page.getByRole("button", { name: "刷新" }).click();
+		await expect
+			.poll(() => server.getSkipWaitingMessages())
+			.toBeGreaterThanOrEqual(1);
+	} finally {
+		await server.close();
+	}
+});
+
+test("install prompt appears when beforeinstallprompt fires and hides after appinstalled", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+
+		await dispatchBeforeInstallPrompt(page);
+		await expect(page.locator("[data-version-update-notice]")).toContainText(
+			"可安装为独立应用",
+		);
+		await expect(page.getByRole("button", { name: "安装" })).toBeVisible();
+
+		await dispatchAppInstalled(page);
+		await expect(page.getByRole("button", { name: "安装" })).toHaveCount(0);
+	} finally {
+		await server.close();
+	}
+});
+
+test("install prompt click calls the native prompt and still coexists with refresh update actions", async ({
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+
+		server.setServiceWorkerRevision(2);
+		await page.evaluate(async () => {
+			const registration = await navigator.serviceWorker.ready;
+			await registration.update();
+		});
+		await dispatchBeforeInstallPrompt(page);
+
+		await expect(page.locator("[data-version-update-notice]")).toContainText(
+			"也可安装为独立应用",
+		);
+		await expect(page.getByRole("button", { name: "刷新" })).toBeVisible();
+		await expect(page.getByRole("button", { name: "安装" })).toBeVisible();
+
+		await page.getByRole("button", { name: "安装" }).click();
+		await expect
+			.poll(async () =>
+				page.evaluate(() => {
+					const state = (
+						window as Window & {
+							__octoRillInstallPromptState?: { promptCalls: number };
+						}
+					).__octoRillInstallPromptState;
+					return state?.promptCalls ?? 0;
+				}),
+			)
+			.toBe(1);
 
 		await page.getByRole("button", { name: "刷新" }).click();
 		await expect
