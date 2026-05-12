@@ -99,7 +99,14 @@ export function DashboardRouteShell(props: {
 	if (!auth.isAuthenticated || !auth.me) {
 		return (
 			<Suspense fallback={fallback}>
-				<LandingRouteSurface bootError={auth.bootError} />
+				<LandingRouteSurface
+					bootError={auth.bootError}
+					bootErrorKind={auth.bootErrorKind}
+					bootErrorDetail={auth.bootErrorDetail}
+					onRetryBoot={() => {
+						void auth.refreshAuth();
+					}}
+				/>
 			</Suspense>
 		);
 	}
@@ -109,7 +116,11 @@ export function DashboardRouteShell(props: {
 			<DashboardRouteSurface
 				me={auth.me}
 				routeState={routeState}
-				warmStart={auth.bootPresentation === "warm-cache" ? warmStart : null}
+				warmStart={warmStart}
+				bootError={auth.bootError}
+				bootErrorKind={auth.bootErrorKind}
+				bootErrorDetail={auth.bootErrorDetail}
+				onRetryBoot={() => auth.refreshAuth()}
 				onRouteStateChange={(nextRouteState, options) => {
 					void router.navigate({
 						to: buildDashboardRouteUrl(nextRouteState),
