@@ -11,17 +11,24 @@ import {
 	VersionMonitorStateProvider,
 } from "@/version/versionMonitor";
 
-type ShellScenario = "steady" | "update" | "unknown";
+type ShellScenario =
+	| "steady"
+	| "update"
+	| "install"
+	| "update-install"
+	| "unknown";
 
 type AppShellPreviewProps = {
 	scenario: ShellScenario;
 	onRefresh: () => void;
+	onInstall: () => void;
 	mobileChrome?: boolean;
 };
 
 function makeVersionState(
 	scenario: ShellScenario,
 	onRefresh: () => void,
+	onInstall: () => void,
 ): VersionMonitorValue {
 	switch (scenario) {
 		case "update":
@@ -31,6 +38,32 @@ function makeVersionState(
 				hasUpdate: true,
 				hasServiceWorkerUpdate: false,
 				refreshPage: onRefresh,
+			};
+		case "install":
+			return {
+				loadedVersion: "v2.4.6",
+				availableVersion: null,
+				hasUpdate: false,
+				hasServiceWorkerUpdate: false,
+				canInstallPwa: true,
+				isPwaInstalled: false,
+				refreshPage: onRefresh,
+				promptInstallPwa: async () => {
+					onInstall();
+				},
+			};
+		case "update-install":
+			return {
+				loadedVersion: "v2.4.6",
+				availableVersion: "v2.5.0",
+				hasUpdate: true,
+				hasServiceWorkerUpdate: true,
+				canInstallPwa: true,
+				isPwaInstalled: false,
+				refreshPage: onRefresh,
+				promptInstallPwa: async () => {
+					onInstall();
+				},
 			};
 		case "unknown":
 			return {
@@ -54,10 +87,13 @@ function makeVersionState(
 function AppShellPreview({
 	scenario,
 	onRefresh,
+	onInstall,
 	mobileChrome = false,
 }: AppShellPreviewProps) {
 	return (
-		<VersionMonitorStateProvider value={makeVersionState(scenario, onRefresh)}>
+		<VersionMonitorStateProvider
+			value={makeVersionState(scenario, onRefresh, onInstall)}
+		>
 			<AppShell
 				header={
 					<div className="flex items-center justify-between gap-3">
@@ -165,14 +201,18 @@ const meta = {
 	args: {
 		scenario: "steady",
 		onRefresh: fn(),
+		onInstall: fn(),
 		mobileChrome: false,
 	},
 	argTypes: {
 		scenario: {
 			control: "inline-radio",
-			options: ["steady", "update", "unknown"],
+			options: ["steady", "update", "install", "update-install", "unknown"],
 		},
 		onRefresh: {
+			control: false,
+		},
+		onInstall: {
 			control: false,
 		},
 		mobileChrome: {
@@ -196,6 +236,49 @@ export const Stable: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.queryByText(/检测到新版本/)).not.toBeInTheDocument();
 		await expect(canvas.getByText("Version v2.4.6")).toBeVisible();
+	},
+};
+
+export const InstallAvailable: Story = {
+	args: {
+		scenario: "install",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"PWA 安装可用但没有前端更新时，顶部提示只提供安装动作，不制造额外横幅。",
+			},
+		},
+	},
+	play: async ({ args, canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText(/可安装为独立应用/)).toBeVisible();
+		await expect(canvas.queryByRole("button", { name: "刷新" })).toBeNull();
+		await userEvent.click(canvas.getByRole("button", { name: "安装" }));
+		await expect(args.onInstall).toHaveBeenCalled();
+	},
+};
+
+export const UpdateAndInstallAvailable: Story = {
+	args: {
+		scenario: "update-install",
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"前端更新和 PWA 安装同时可用时，两个动作共享同一条顶部提示，移动端允许自然换行。",
+			},
+		},
+	},
+	play: async ({ args, canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText(/也可安装为独立应用/)).toBeVisible();
+		await userEvent.click(canvas.getByRole("button", { name: "刷新" }));
+		await expect(args.onRefresh).toHaveBeenCalled();
+		await userEvent.click(canvas.getByRole("button", { name: "安装" }));
+		await expect(args.onInstall).toHaveBeenCalled();
 	},
 };
 

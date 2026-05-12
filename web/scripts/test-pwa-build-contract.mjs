@@ -40,12 +40,40 @@ function assertNoPrivatePath(urls) {
 const manifest = await readJson(manifestPath);
 assert.equal(manifest.name, "OctoRill");
 assert.equal(manifest.short_name, "OctoRill");
+assert.equal(manifest.id, "/");
 assert.equal(manifest.start_url, "/");
 assert.equal(manifest.scope, "/");
 assert.equal(manifest.display, "standalone");
+assert.deepEqual(manifest.display_override, ["standalone", "browser"]);
 assert.equal(manifest.theme_color, "#0f172a");
 assert.equal(manifest.background_color, "#0f172a");
+assert.deepEqual(manifest.categories, ["productivity", "utilities"]);
 assert(Array.isArray(manifest.icons), "manifest icons must be an array");
+assert(
+	Array.isArray(manifest.shortcuts),
+	"manifest shortcuts must be an array",
+);
+assert(
+	Array.isArray(manifest.screenshots),
+	"manifest screenshots must be an array",
+);
+
+const expectedShortcuts = new Map([
+	["/", "工作台"],
+	["/admin", "管理"],
+	["/settings", "设置"],
+]);
+
+for (const [url, expectedName] of expectedShortcuts) {
+	const shortcut = manifest.shortcuts.find(
+		(candidate) => candidate?.url === url,
+	);
+	assert(shortcut, `manifest includes shortcut ${url}`);
+	assert.equal(shortcut.name, expectedName);
+	assert.equal(shortcut.short_name, expectedName);
+	assert.equal(typeof shortcut.description, "string");
+	assert(shortcut.description.length > 0, `${url} shortcut has description`);
+}
 
 const expectedIcons = new Map([
 	["/pwa/icon-192.png", { width: 192, height: 192, maskable: false }],
@@ -76,6 +104,43 @@ const appleTouchIcon = await readPngSize(
 );
 assert.deepEqual(appleTouchIcon, { width: 180, height: 180 });
 
+const expectedScreenshots = new Map([
+	[
+		"/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
+		{
+			width: 780,
+			height: 1688,
+			formFactor: "narrow",
+			label: "Mobile dashboard shell",
+		},
+	],
+	[
+		"/pwa/screenshots/app-shell-update-notice.png",
+		{
+			width: 2880,
+			height: 2400,
+			formFactor: "wide",
+			label: "App shell update notice",
+		},
+	],
+]);
+
+for (const [src, expected] of expectedScreenshots) {
+	const screenshot = manifest.screenshots.find(
+		(candidate) => candidate?.src === src,
+	);
+	assert(screenshot, `manifest includes screenshot ${src}`);
+	assert.equal(screenshot.sizes, `${expected.width}x${expected.height}`);
+	assert.equal(screenshot.type, "image/png");
+	assert.equal(screenshot.form_factor, expected.formFactor);
+	assert.equal(screenshot.label, expected.label);
+	const actual = await readPngSize(path.join(distDir, src));
+	assert.deepEqual(actual, {
+		width: expected.width,
+		height: expected.height,
+	});
+}
+
 const precache = await readJson(precachePath);
 assert.match(precache.cacheName, /^octo-rill-precache-[0-9a-f]{16}$/);
 assert(Array.isArray(precache.urls), "precache urls must be an array");
@@ -88,6 +153,16 @@ assert(
 assert(
 	precache.urls.includes("/pwa/icon-192.png"),
 	"precache includes install icon",
+);
+assert(
+	precache.urls.includes(
+		"/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
+	),
+	"precache includes narrow install screenshot",
+);
+assert(
+	precache.urls.includes("/pwa/screenshots/app-shell-update-notice.png"),
+	"precache includes wide install screenshot",
 );
 assert(
 	precache.urls.some(

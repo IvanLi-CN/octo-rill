@@ -1,12 +1,51 @@
 {
+	"id": "/",
 	"name": "OctoRill",
 	"short_name": "OctoRill",
 	"description": "A focused workspace for GitHub releases, stars, followers, daily briefs, and inbox activity.",
 	"start_url": "/",
 	"scope": "/",
 	"display": "standalone",
+	"display_override": ["standalone", "browser"],
 	"background_color": "#0f172a",
 	"theme_color": "#0f172a",
+	"categories": ["productivity", "utilities"],
+	"shortcuts": [
+		{
+			"name": "工作台",
+			"short_name": "工作台",
+			"description": "打开 Dashboard 阅读入口",
+			"url": "/"
+		},
+		{
+			"name": "管理",
+			"short_name": "管理",
+			"description": "打开管理与观测面板",
+			"url": "/admin"
+		},
+		{
+			"name": "设置",
+			"short_name": "设置",
+			"description": "打开账户与偏好设置",
+			"url": "/settings"
+		}
+	],
+	"screenshots": [
+		{
+			"src": "/pwa/screenshots/dashboard-warm-skeleton-mobile-shell.png",
+			"sizes": "780x1688",
+			"type": "image/png",
+			"form_factor": "narrow",
+			"label": "Mobile dashboard shell"
+		},
+		{
+			"src": "/pwa/screenshots/app-shell-update-notice.png",
+			"sizes": "2880x2400",
+			"type": "image/png",
+			"form_factor": "wide",
+			"label": "App shell update notice"
+		}
+	],
 	"icons": [
 		{
 			"src": "/pwa/icon-192.png",
