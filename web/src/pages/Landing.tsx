@@ -12,6 +12,7 @@ import {
 } from "@/auth/passkeys";
 import { AuthProviderIcon } from "@/components/brand/AuthProviderIcon";
 import { BrandLogo } from "@/components/brand/BrandLogo";
+import { ErrorDetailDisclosure } from "@/components/feedback/ErrorDetailDisclosure";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -24,11 +25,15 @@ import { ThemeToggle } from "@/components/theme/ThemeToggle";
 import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
-import { Inbox, Package2, Users } from "lucide-react";
+import type { NetworkErrorKind } from "@/lib/errorPresentation";
+import { Inbox, Package2, RefreshCcw, Users, WifiOff } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 type LandingProps = {
 	bootError?: string | null;
+	bootErrorKind?: NetworkErrorKind | null;
+	bootErrorDetail?: string | null;
+	onRetryBoot?: () => void;
 	passkeySupportOverride?: boolean | null;
 };
 
@@ -58,6 +63,9 @@ const heroHighlights = [
 
 export function Landing({
 	bootError,
+	bootErrorKind = null,
+	bootErrorDetail = null,
+	onRetryBoot,
 	passkeySupportOverride = null,
 }: LandingProps) {
 	const [passkeySupported, setPasskeySupported] = useState(
@@ -71,6 +79,10 @@ export function Landing({
 	useEffect(() => {
 		setPasskeySupported(passkeySupportOverride ?? browserSupportsPasskeys());
 	}, [passkeySupportOverride]);
+
+	const authNetworkUnavailable =
+		bootErrorKind === "offline" || bootErrorKind === "network";
+	const loginLinkDisabled = authNetworkUnavailable;
 
 	const onAuthenticatePasskey = useCallback(() => {
 		if (!passkeySupported) {
@@ -189,9 +201,19 @@ export function Landing({
 								<Button
 									asChild
 									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
+									data-disabled={loginLinkDisabled ? "true" : undefined}
 									data-landing-login-cta
 								>
-									<a href="/auth/github/login">
+									<a
+										href="/auth/github/login"
+										aria-disabled={loginLinkDisabled ? "true" : undefined}
+										tabIndex={loginLinkDisabled ? -1 : undefined}
+										onClick={(event) => {
+											if (loginLinkDisabled) {
+												event.preventDefault();
+											}
+										}}
+									>
 										<AuthProviderIcon provider="github" />
 										使用 GitHub 登录
 									</a>
@@ -200,9 +222,19 @@ export function Landing({
 									asChild
 									variant="outline"
 									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
+									data-disabled={loginLinkDisabled ? "true" : undefined}
 									data-landing-linuxdo-cta
 								>
-									<a href="/auth/linuxdo/login">
+									<a
+										href="/auth/linuxdo/login"
+										aria-disabled={loginLinkDisabled ? "true" : undefined}
+										tabIndex={loginLinkDisabled ? -1 : undefined}
+										onClick={(event) => {
+											if (loginLinkDisabled) {
+												event.preventDefault();
+											}
+										}}
+									>
 										<AuthProviderIcon provider="linuxdo" />
 										使用 LinuxDO 登录
 									</a>
@@ -212,7 +244,11 @@ export function Landing({
 									variant="secondary"
 									className="h-12 w-full rounded-2xl text-base font-semibold sm:h-14"
 									onClick={onAuthenticatePasskey}
-									disabled={!passkeySupported || passkeyBusyMode !== null}
+									disabled={
+										!passkeySupported ||
+										passkeyBusyMode !== null ||
+										authNetworkUnavailable
+									}
 									data-landing-passkey-login-cta
 								>
 									<AuthProviderIcon provider="passkey" />
@@ -225,7 +261,11 @@ export function Landing({
 									variant="ghost"
 									className="h-11 w-full rounded-2xl text-sm font-medium"
 									onClick={onRegisterPasskey}
-									disabled={!passkeySupported || passkeyBusyMode !== null}
+									disabled={
+										!passkeySupported ||
+										passkeyBusyMode !== null ||
+										authNetworkUnavailable
+									}
 									data-landing-passkey-register-cta
 								>
 									{passkeyBusyMode === "register"
@@ -247,8 +287,43 @@ export function Landing({
 								) : null}
 
 								{bootError ? (
-									<div className="rounded-2xl border border-destructive/25 bg-destructive/5 px-4 py-3 text-sm leading-6 text-destructive">
-										{bootError}
+									<div
+										className="rounded-2xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm leading-6 text-amber-950 dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+										data-landing-boot-network-state={bootErrorKind ?? "unknown"}
+									>
+										<div className="flex items-start gap-3">
+											<div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+												<WifiOff className="size-4" />
+											</div>
+											<div className="min-w-0 flex-1 space-y-2">
+												<div className="space-y-1">
+													<p className="font-semibold">
+														{authNetworkUnavailable
+															? "网络连接不可用"
+															: "登录状态检查失败"}
+													</p>
+													<p className="text-amber-900/80 dark:text-amber-100/80">
+														{bootError}
+													</p>
+												</div>
+												<ErrorDetailDisclosure
+													detail={bootErrorDetail}
+													summary={bootError}
+												/>
+												{onRetryBoot ? (
+													<Button
+														type="button"
+														variant="outline"
+														size="sm"
+														className="border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background"
+														onClick={onRetryBoot}
+													>
+														<RefreshCcw className="size-4" />
+														重试连接
+													</Button>
+												) : null}
+											</div>
+										</div>
 									</div>
 								) : null}
 							</CardContent>

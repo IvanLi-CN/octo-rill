@@ -1,8 +1,8 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { ArrowDownToLine } from "lucide-react";
+import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { INITIAL_VIEWPORTS } from "storybook/viewport";
-import { expect, userEvent, waitFor, within } from "storybook/test";
+import { expect, fn, userEvent, waitFor, within } from "storybook/test";
 
 import type { ReleaseDetailResponse } from "@/api";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,7 @@ import { InternalLink } from "@/lib/internalNavigation";
 import { AppShell } from "@/layout/AppShell";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
+import type { NetworkErrorKind } from "@/lib/errorPresentation";
 import {
 	buildDashboardReleaseHref,
 	buildDashboardReleaseTarget,
@@ -87,6 +88,10 @@ type StoryLiveNotices = {
 	briefs?: StoryLiveNotice;
 	notifications?: StoryLiveNotice;
 };
+const EMPTY_STORY_LIVE_NOTICES: StoryLiveNotices = {};
+const EMPTY_STORY_DEFERRED_TABS: Tab[] = [];
+const EMPTY_STORY_REACTION_ERRORS: Record<string, string> = {};
+const EMPTY_STORY_FRESH_KEYS: string[] = [];
 
 function mergeStoryFeedNotice(
 	currentNotices: StoryFeedLiveNotice[],
@@ -2330,6 +2335,10 @@ function DashboardPreview(props: {
 	initialFeedTabLoading?: Tab | null;
 	deferredFeedLoadDelayMs?: number;
 	feedError?: FeedLoadError | null;
+	bootError?: string | null;
+	bootErrorKind?: NetworkErrorKind | null;
+	bootErrorDetail?: string | null;
+	onRetryBoot?: () => unknown | Promise<unknown>;
 	reactionErrorByKey?: Record<string, string>;
 	liveNotices?: StoryLiveNotices;
 	onFeedBoundaryEntered?: (boundaryId: string) => void;
@@ -2358,17 +2367,21 @@ function DashboardPreview(props: {
 		releaseDetail = null,
 		releaseDetailSmartResolveMode,
 		showFooter = true,
-		deferredFeedTabs = [],
+		deferredFeedTabs = EMPTY_STORY_DEFERRED_TABS,
 		initialFeedTabLoading = null,
 		deferredFeedLoadDelayMs = 1400,
 		feedError = null,
-		reactionErrorByKey = {},
-		liveNotices = {},
+		bootError = null,
+		bootErrorKind = null,
+		bootErrorDetail = null,
+		onRetryBoot,
+		reactionErrorByKey = EMPTY_STORY_REACTION_ERRORS,
+		liveNotices = EMPTY_STORY_LIVE_NOTICES,
 		onFeedBoundaryEntered,
 		onFeedBoundaryResolved,
-		freshFeedKeys = [],
-		freshBriefKeys = [],
-		freshNotificationKeys = [],
+		freshFeedKeys = EMPTY_STORY_FRESH_KEYS,
+		freshBriefKeys = EMPTY_STORY_FRESH_KEYS,
+		freshNotificationKeys = EMPTY_STORY_FRESH_KEYS,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail, {
 		smartResolveMode: releaseDetailSmartResolveMode,
@@ -2583,154 +2596,253 @@ function DashboardPreview(props: {
 		const isActiveMode = tab === mode;
 		const loadingInitial = isActiveMode && pendingFeedTab === mode;
 		const filteredItems = loadingInitial ? [] : visibleItems(mode);
+		const bootNetworkUnavailable =
+			bootErrorKind === "offline" || bootErrorKind === "network";
+		const feedNetworkUnavailable =
+			feedError?.phase === "initial" &&
+			(feedError.kind === "offline" || feedError.kind === "network");
+		const networkUnavailable =
+			bootNetworkUnavailable || Boolean(feedNetworkUnavailable);
+		const networkUnavailableMessage =
+			(feedNetworkUnavailable ? feedError?.message : null) ??
+			bootError ??
+			"当前处于离线状态，正在显示可用缓存内容。";
+		const networkUnavailableDetail =
+			(feedNetworkUnavailable ? feedError?.detail : null) ?? bootErrorDetail;
 		const blockingFeedError =
-			feedError?.phase === "initial" && filteredItems.length === 0;
+			feedError?.phase === "initial" &&
+			filteredItems.length === 0 &&
+			!networkUnavailable;
+		const offlineEmpty =
+			networkUnavailable && !loadingInitial && filteredItems.length === 0;
+		const offlineWithCachedContent =
+			networkUnavailable && filteredItems.length > 0;
+		const retryNetwork = () => {
+			void onRetryBoot?.();
+		};
 
-		return filteredItems.length === 0 &&
-			!loadingInitial &&
-			!blockingFeedError ? (
-			<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-				{emptyState === "auto-sync" ? (
-					<>
-						<h2 className="text-base font-semibold tracking-tight">
-							正在同步你的 GitHub 动态
-						</h2>
-						<p className="text-muted-foreground mt-1 text-sm">
-							先展示已有缓存，再补齐最新
-							release、被加星和被关注记录；完成后这里会自动刷新。
-						</p>
-					</>
-				) : (
-					<>
-						<h2 className="text-base font-semibold tracking-tight">
-							还没有缓存内容
-						</h2>
-						<p className="text-muted-foreground mt-1 text-sm">
-							可以先同步一次，把 release 和社交动态都拉下来。
-						</p>
-						<div className="mt-4 flex flex-wrap gap-2">
-							<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
+		return (
+			<>
+				{offlineWithCachedContent ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-offline-cache-banner="true"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<div className="flex min-w-0 items-start gap-3">
+								<div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+									<WifiOff className="size-4" />
+								</div>
+								<div className="min-w-0">
+									<p className="font-semibold">正在显示缓存内容</p>
+									<p className="mt-0.5 text-amber-900/80 dark:text-amber-100/80">
+										{networkUnavailableMessage}
+									</p>
+								</div>
+							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								onClick={retryNetwork}
+							>
+								<RefreshCcw className="size-4" />
+								重试连接
+							</Button>
 						</div>
-					</>
-				)}
-			</div>
-		) : (
-			<FeedGroupedList
-				mode={mode}
-				items={filteredItems}
-				currentViewer={STORYBOOK_VIEWER}
-				briefs={storyBriefs}
-				dailyBoundaryLocal={dailyBoundaryLocal}
-				dailyBoundaryTimeZone={dailyBoundaryTimeZone}
-				dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-				now={now}
-				error={feedError}
-				loadingInitial={loadingInitial}
-				loadingMore={false}
-				hasMore={false}
-				translationInFlightKeys={translationInFlightKeys}
-				smartInFlightKeys={smartInFlightKeys}
-				registerItemRef={() => () => {}}
-				onLoadMore={() => {}}
-				onRetryInitial={() => {}}
-				selectedLaneByKey={Object.fromEntries(
-					filteredItems.map((item) => [
-						feedItemKey(item),
-						defaultLaneForItem(
-							item,
-							pageDefaultLane,
-							allowReleaseItemLaneOverride,
-							selectedLaneByKey[feedItemKey(item)],
-						),
-					]),
-				)}
-				onSelectLane={(item, lane) =>
-					setSelectedLaneByKey((prev) => ({
-						...prev,
-						[feedItemKey(item)]: lane,
-					}))
-				}
-				onTranslateNow={() => {}}
-				onSmartNow={triggerSmartNow}
-				reactionBusyKeys={reactionBusyKeys}
-				reactionErrorByKey={reactionErrorByKey}
-				freshKeys={new Set(freshFeedKeys)}
-				onToggleReaction={() => {}}
-				onOpenReleaseFromBrief={mode === "all" ? openReleaseDetail : undefined}
-				onGenerateBriefForDate={
-					mode === "all" ? generateBriefForDate : undefined
-				}
-				newContentBoundaries={(storyLiveNotices.feed ?? []).map(
-					(notice, index) => ({
-						id: notice.boundaryId,
-						count: notice.newCount,
-						label: "动态",
-						latestKeys: notice.latestKeys,
-						afterKey: notice.afterKey,
-						isLatest: index === 0,
-						isSealed: notice.sealed,
-						onExitedViewport: (boundaryId) => {
-							setStoryLiveNotices((current) => ({
-								...current,
-								feed: current.feed?.filter(
-									(feedNotice) => feedNotice.boundaryId !== boundaryId,
-								),
-							}));
-						},
-						onFreshAreaEntered: (boundaryId) => {
-							onFeedBoundaryEntered?.(boundaryId);
-							setStoryLiveNotices((current) => ({
-								...current,
-								feed: current.feed?.map((feedNotice) =>
-									feedNotice.boundaryId === boundaryId
-										? { ...feedNotice, sealed: true }
-										: feedNotice,
-								),
-							}));
-						},
-						onResolveAfterKey: (boundaryId, afterKey) => {
-							onFeedBoundaryResolved?.(boundaryId, afterKey);
-							setStoryLiveNotices((current) => ({
-								...current,
-								feed:
-									afterKey === null
-										? current.feed?.filter(
-												(feedNotice) => feedNotice.boundaryId !== boundaryId,
-											)
-										: current.feed?.map((feedNotice) =>
-												feedNotice.boundaryId === boundaryId &&
-												feedNotice.afterKey === undefined
-													? { ...feedNotice, afterKey }
-													: feedNotice,
-											),
-							}));
-						},
-						onReveal: () => {
-							const freshKey = notice.latestKeys[0] ?? freshFeedKeys[0];
-							setStoryLiveNotices((current) => ({
-								...current,
-								feed: current.feed?.filter(
-									(feedNotice) => feedNotice.boundaryId !== notice.boundaryId,
-								),
-							}));
-							window.requestAnimationFrame(() => {
-								const itemElements = Array.from(
-									document.querySelectorAll<HTMLElement>(
-										"[data-feed-item-key]",
+					</div>
+				) : null}
+
+				{offlineEmpty ? (
+					<div
+						className="bg-card/75 mb-4 rounded-2xl border border-amber-300/45 p-6 shadow-sm dark:border-amber-300/20"
+						data-dashboard-offline-empty-state="true"
+					>
+						<div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+							<div className="flex size-11 shrink-0 items-center justify-center rounded-full border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+								<WifiOff className="size-5" />
+							</div>
+							<div className="min-w-0 flex-1">
+								<h2 className="text-base font-semibold tracking-tight">
+									离线时没有可用缓存
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm leading-6">
+									当前页面之前没有保存到本地的内容；恢复网络后可以重新加载最新动态。
+								</p>
+								<p className="mt-3 text-sm leading-6 text-amber-900 dark:text-amber-100">
+									{networkUnavailableMessage}
+								</p>
+								{networkUnavailableDetail ? (
+									<p className="text-muted-foreground mt-2 break-words font-mono text-xs">
+										{networkUnavailableDetail}
+									</p>
+								) : null}
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button
+										type="button"
+										variant="outline"
+										onClick={retryNetwork}
+									>
+										<RefreshCcw className="size-4" />
+										重试连接
+									</Button>
+								</div>
+							</div>
+						</div>
+					</div>
+				) : null}
+
+				{filteredItems.length === 0 &&
+				!loadingInitial &&
+				!blockingFeedError &&
+				!offlineEmpty ? (
+					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
+						{emptyState === "auto-sync" ? (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									正在同步你的 GitHub 动态
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm">
+									先展示已有缓存，再补齐最新
+									release、被加星和被关注记录；完成后这里会自动刷新。
+								</p>
+							</>
+						) : (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									还没有缓存内容
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm">
+									可以先同步一次，把 release 和社交动态都拉下来。
+								</p>
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button disabled={syncingAll}>{SYNC_ALL_LABEL}</Button>
+								</div>
+							</>
+						)}
+					</div>
+				) : null}
+
+				<FeedGroupedList
+					mode={mode}
+					items={filteredItems}
+					currentViewer={STORYBOOK_VIEWER}
+					briefs={storyBriefs}
+					dailyBoundaryLocal={dailyBoundaryLocal}
+					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
+					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
+					now={now}
+					error={offlineEmpty ? null : feedError}
+					loadingInitial={loadingInitial}
+					loadingMore={false}
+					hasMore={false}
+					translationInFlightKeys={translationInFlightKeys}
+					smartInFlightKeys={smartInFlightKeys}
+					registerItemRef={() => () => {}}
+					onLoadMore={() => {}}
+					onRetryInitial={() => {}}
+					selectedLaneByKey={Object.fromEntries(
+						filteredItems.map((item) => [
+							feedItemKey(item),
+							defaultLaneForItem(
+								item,
+								pageDefaultLane,
+								allowReleaseItemLaneOverride,
+								selectedLaneByKey[feedItemKey(item)],
+							),
+						]),
+					)}
+					onSelectLane={(item, lane) =>
+						setSelectedLaneByKey((prev) => ({
+							...prev,
+							[feedItemKey(item)]: lane,
+						}))
+					}
+					onTranslateNow={() => {}}
+					onSmartNow={triggerSmartNow}
+					reactionBusyKeys={reactionBusyKeys}
+					reactionErrorByKey={reactionErrorByKey}
+					freshKeys={new Set(freshFeedKeys)}
+					onToggleReaction={() => {}}
+					onOpenReleaseFromBrief={
+						mode === "all" ? openReleaseDetail : undefined
+					}
+					onGenerateBriefForDate={
+						mode === "all" ? generateBriefForDate : undefined
+					}
+					newContentBoundaries={(storyLiveNotices.feed ?? []).map(
+						(notice, index) => ({
+							id: notice.boundaryId,
+							count: notice.newCount,
+							label: "动态",
+							latestKeys: notice.latestKeys,
+							afterKey: notice.afterKey,
+							isLatest: index === 0,
+							isSealed: notice.sealed,
+							onExitedViewport: (boundaryId) => {
+								setStoryLiveNotices((current) => ({
+									...current,
+									feed: current.feed?.filter(
+										(feedNotice) => feedNotice.boundaryId !== boundaryId,
 									),
-								);
-								const element = itemElements.find(
-									(item) => item.dataset.feedItemKey === freshKey,
-								);
-								element?.scrollIntoView({
-									block: "start",
-									behavior: "smooth",
+								}));
+							},
+							onFreshAreaEntered: (boundaryId) => {
+								onFeedBoundaryEntered?.(boundaryId);
+								setStoryLiveNotices((current) => ({
+									...current,
+									feed: current.feed?.map((feedNotice) =>
+										feedNotice.boundaryId === boundaryId
+											? { ...feedNotice, sealed: true }
+											: feedNotice,
+									),
+								}));
+							},
+							onResolveAfterKey: (boundaryId, afterKey) => {
+								onFeedBoundaryResolved?.(boundaryId, afterKey);
+								setStoryLiveNotices((current) => ({
+									...current,
+									feed:
+										afterKey === null
+											? current.feed?.filter(
+													(feedNotice) => feedNotice.boundaryId !== boundaryId,
+												)
+											: current.feed?.map((feedNotice) =>
+													feedNotice.boundaryId === boundaryId &&
+													feedNotice.afterKey === undefined
+														? { ...feedNotice, afterKey }
+														: feedNotice,
+												),
+								}));
+							},
+							onReveal: () => {
+								const freshKey = notice.latestKeys[0] ?? freshFeedKeys[0];
+								setStoryLiveNotices((current) => ({
+									...current,
+									feed: current.feed?.filter(
+										(feedNotice) => feedNotice.boundaryId !== notice.boundaryId,
+									),
+								}));
+								window.requestAnimationFrame(() => {
+									const itemElements = Array.from(
+										document.querySelectorAll<HTMLElement>(
+											"[data-feed-item-key]",
+										),
+									);
+									const element = itemElements.find(
+										(item) => item.dataset.feedItemKey === freshKey,
+									);
+									element?.scrollIntoView({
+										block: "start",
+										behavior: "smooth",
+									});
 								});
-							});
-						},
-					}),
-				)}
-			/>
+							},
+						}),
+					)}
+				/>
+			</>
 		);
 	};
 
@@ -5705,6 +5817,8 @@ export const ErrorFeedInitialFailure: Story = {
 			feedError={{
 				phase: "initial",
 				message: "动态列表拉取失败，请稍后重试。",
+				kind: "unknown",
+				detail: null,
 				at: 1,
 			}}
 		/>
@@ -5713,6 +5827,109 @@ export const ErrorFeedInitialFailure: Story = {
 		const canvas = within(canvasElement);
 		await expect(canvas.getByText("动态加载失败")).toBeVisible();
 		await expect(canvas.getByRole("button", { name: "重试" })).toBeVisible();
+	},
+};
+
+export const OfflineCachedFeedContent: Story = {
+	name: "PWA / Offline With Cached Feed",
+	args: {
+		onRetryBoot: fn(),
+	},
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	render: () => (
+		<DashboardPreview
+			initialTab="releases"
+			showFooter={false}
+			bootError="当前处于离线状态，正在显示可用缓存内容。"
+			bootErrorKind="offline"
+			bootErrorDetail="Failed to fetch"
+			feedItems={[
+				buildFeedItem("offline-cached-release", {
+					repo_full_name: "octo-rill/app-shell",
+					title: "v0.8.0",
+					body: "Cached release notes remain readable while the network is unavailable.",
+					ts: "2026-04-04T02:30:00Z",
+				}),
+			]}
+			feedError={{
+				phase: "initial",
+				message: "当前处于离线状态，正在显示可用缓存内容。",
+				kind: "offline",
+				detail: "Failed to fetch",
+				at: 1,
+			}}
+		/>
+	),
+	play: async ({ args, canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("正在显示缓存内容")).toBeVisible();
+		await expect(canvas.getByText("octo-rill/app-shell")).toBeVisible();
+		await expect(
+			canvas.queryByText("离线时没有可用缓存"),
+		).not.toBeInTheDocument();
+		await userEvent.click(canvas.getByRole("button", { name: "重试连接" }));
+		await expect(args.onRetryBoot).toHaveBeenCalled();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"已登录用户离线访问且当前 tab 有 warm feed 内容时，只显示小横幅并保留缓存列表。",
+			},
+		},
+	},
+};
+
+export const OfflineNoCachedFeedContent: Story = {
+	name: "PWA / Offline Without Cached Feed",
+	args: {
+		onRetryBoot: fn(),
+	},
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	render: () => (
+		<DashboardPreview
+			initialTab="stars"
+			showFooter={false}
+			feedItems={[]}
+			feedError={{
+				phase: "initial",
+				message:
+					"当前处于离线状态，登录和最新数据需要网络连接；已保留可用的应用壳。",
+				kind: "offline",
+				detail: "Failed to fetch",
+				at: 1,
+			}}
+		/>
+	),
+	play: async ({ args, canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("离线时没有可用缓存")).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "重试连接" }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText("正在显示缓存内容"),
+		).not.toBeInTheDocument();
+		await userEvent.click(canvas.getByRole("button", { name: "重试连接" }));
+		await expect(args.onRetryBoot).toHaveBeenCalled();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"已登录用户离线访问但当前 tab 没有可用缓存时，显示大空态，避免误导成普通空列表或登录失败。",
+			},
+		},
 	},
 };
 

@@ -95,6 +95,8 @@ export const Default: Story = {
 export const WithError: Story = {
 	args: {
 		bootError: "Example error: unauthorized",
+		bootErrorKind: "unknown",
+		bootErrorDetail: "Example error detail",
 		passkeySupportOverride: true,
 	},
 	play: async ({ canvasElement }) => {
@@ -108,6 +110,44 @@ export const WithError: Story = {
 		docs: {
 			description: {
 				story: "模拟 OAuth 或引导阶段失败时的错误提示文案。",
+			},
+		},
+	},
+};
+
+export const OfflineBootFallback: Story = {
+	args: {
+		bootError:
+			"当前处于离线状态，登录和最新数据需要网络连接；已保留可用的应用壳。",
+		bootErrorKind: "offline",
+		bootErrorDetail: "Failed to fetch",
+		onRetryBoot: () => undefined,
+		passkeySupportOverride: true,
+	},
+	play: async ({ canvasElement, userEvent }) => {
+		const canvas = within(canvasElement);
+		const githubLink = canvas.getByRole("link", { name: "使用 GitHub 登录" });
+		const linuxDoLink = canvas.getByRole("link", { name: "使用 LinuxDO 登录" });
+		await expect(canvas.getByText("网络连接不可用")).toBeVisible();
+		await expect(
+			canvas.getByText(
+				"当前处于离线状态，登录和最新数据需要网络连接；已保留可用的应用壳。",
+			),
+		).toBeVisible();
+		await expect(githubLink).toHaveAttribute("aria-disabled", "true");
+		await expect(githubLink).toHaveAttribute("data-disabled", "true");
+		await expect(linuxDoLink).toHaveAttribute("aria-disabled", "true");
+		await expect(linuxDoLink).toHaveAttribute("data-disabled", "true");
+		await expect(
+			canvas.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeDisabled();
+		await userEvent.click(canvas.getByRole("button", { name: "重试连接" }));
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"PWA app shell 离线命中但 `/api/me` 无法访问时，登录卡显示明确网络状态并避免把离线误报成认证失败。",
 			},
 		},
 	},

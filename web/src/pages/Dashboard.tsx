@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDownToLine } from "lucide-react";
+import { ArrowDownToLine, RefreshCcw, WifiOff } from "lucide-react";
 
 import { type MeResponse, ApiError, apiGet, apiPost, apiPostJson } from "@/api";
 import {
@@ -44,7 +44,10 @@ import { AppMetaFooter } from "@/layout/AppMetaFooter";
 import { AppShell } from "@/layout/AppShell";
 import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import { InternalLink } from "@/lib/internalNavigation";
-import { describeUnknownError } from "@/lib/errorPresentation";
+import {
+	describeUnknownError,
+	type NetworkErrorKind,
+} from "@/lib/errorPresentation";
 import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
 	buildDashboardReleaseTarget,
@@ -507,12 +510,20 @@ export function Dashboard(props: {
 		},
 	) => void;
 	warmStart?: DashboardWarmSnapshot | null;
+	bootError?: string | null;
+	bootErrorKind?: NetworkErrorKind | null;
+	bootErrorDetail?: string | null;
+	onRetryBoot?: () => unknown | Promise<unknown>;
 }) {
 	const {
 		me,
 		routeState: controlledRouteState,
 		onRouteStateChange,
 		warmStart = null,
+		bootError = null,
+		bootErrorKind = null,
+		bootErrorDetail = null,
+		onRetryBoot,
 	} = props;
 	const { pushErrorToast, pushToast } = useAppToast();
 	const isRouteControlled = controlledRouteState !== undefined;
@@ -2179,16 +2190,109 @@ export function Dashboard(props: {
 	const dashboardContentLayoutClassName = renderSidebar
 		? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
 		: "grid gap-4 md:gap-6";
+	const bootNetworkUnavailable =
+		bootErrorKind === "offline" || bootErrorKind === "network";
+	const retryDashboardNetwork = useCallback(async () => {
+		await Promise.allSettled([onRetryBoot?.(), feed.loadInitial()]);
+	}, [feed.loadInitial, onRetryBoot]);
 
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
 		const filteredItems = filterFeedItemsForTab(feed.items, mode);
+		const feedNetworkUnavailable =
+			feed.error?.phase === "initial" &&
+			(feed.error.kind === "offline" || feed.error.kind === "network");
+		const networkUnavailable =
+			bootNetworkUnavailable || Boolean(feedNetworkUnavailable);
+		const networkUnavailableMessage =
+			(feedNetworkUnavailable ? feed.error?.message : null) ??
+			bootError ??
+			"当前处于离线状态，正在显示可用缓存内容。";
+		const networkUnavailableDetail =
+			(feedNetworkUnavailable ? feed.error?.detail : null) ?? bootErrorDetail;
 		const blockingFeedError =
-			feed.error?.phase === "initial" && filteredItems.length === 0;
+			feed.error?.phase === "initial" &&
+			filteredItems.length === 0 &&
+			!networkUnavailable;
+		const offlineEmpty =
+			networkUnavailable && !feed.loadingInitial && filteredItems.length === 0;
+		const offlineWithCachedContent =
+			networkUnavailable && filteredItems.length > 0;
 		return (
 			<>
+				{offlineWithCachedContent ? (
+					<div
+						className="mb-4 rounded-xl border border-amber-300/45 bg-amber-50/80 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-300/20 dark:bg-amber-950/20 dark:text-amber-100"
+						data-dashboard-offline-cache-banner="true"
+					>
+						<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+							<div className="flex min-w-0 items-start gap-3">
+								<div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+									<WifiOff className="size-4" />
+								</div>
+								<div className="min-w-0">
+									<p className="font-semibold">正在显示缓存内容</p>
+									<p className="mt-0.5 text-amber-900/80 dark:text-amber-100/80">
+										{networkUnavailableMessage}
+									</p>
+								</div>
+							</div>
+							<Button
+								type="button"
+								variant="outline"
+								size="sm"
+								className="w-full border-amber-300/60 bg-background/70 font-mono text-xs hover:bg-background sm:w-auto"
+								onClick={() => void retryDashboardNetwork()}
+							>
+								<RefreshCcw className="size-4" />
+								重试连接
+							</Button>
+						</div>
+					</div>
+				) : null}
+
+				{offlineEmpty ? (
+					<div
+						className="bg-card/75 mb-4 rounded-2xl border border-amber-300/45 p-6 shadow-sm dark:border-amber-300/20"
+						data-dashboard-offline-empty-state="true"
+					>
+						<div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+							<div className="flex size-11 shrink-0 items-center justify-center rounded-full border border-amber-300/45 bg-amber-100/80 text-amber-700 dark:border-amber-300/20 dark:bg-amber-400/10 dark:text-amber-200">
+								<WifiOff className="size-5" />
+							</div>
+							<div className="min-w-0 flex-1">
+								<h2 className="text-base font-semibold tracking-tight">
+									离线时没有可用缓存
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm leading-6">
+									当前页面之前没有保存到本地的内容；恢复网络后可以重新加载最新动态。
+								</p>
+								<p className="mt-3 text-sm leading-6 text-amber-900 dark:text-amber-100">
+									{networkUnavailableMessage}
+								</p>
+								{networkUnavailableDetail ? (
+									<p className="text-muted-foreground mt-2 break-words font-mono text-xs">
+										{networkUnavailableDetail}
+									</p>
+								) : null}
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button
+										type="button"
+										variant="outline"
+										onClick={() => void retryDashboardNetwork()}
+									>
+										<RefreshCcw className="size-4" />
+										重试连接
+									</Button>
+								</div>
+							</div>
+						</div>
+					</div>
+				) : null}
+
 				{!blockingFeedError &&
+				!offlineEmpty &&
 				!feed.loadingInitial &&
 				filteredItems.length === 0 ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
@@ -2233,7 +2337,7 @@ export function Dashboard(props: {
 					dailyBoundaryLocal={dailyBoundaryLocal}
 					dailyBoundaryTimeZone={dailyBoundaryTimeZone}
 					dailyBoundaryUtcOffsetMinutes={dailyBoundaryUtcOffsetMinutes}
-					error={feed.error}
+					error={offlineEmpty ? null : feed.error}
 					loadingInitial={feed.loadingInitial}
 					loadingMore={feed.loadingMore}
 					hasMore={feed.hasMore}
