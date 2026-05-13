@@ -30,6 +30,8 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - `index.html`, `sw.js`, and `manifest.webmanifest` must not be served with long immutable cache headers.
 - The app should proactively ask the registered Service Worker to check for updates when the page becomes visible and when backend version polling detects frontend version drift.
 - A waiting Service Worker must be activated only after the user clicks the existing refresh action.
+- Offline anonymous boot must distinguish network unavailability from authentication failure and keep login-only actions visibly unavailable until connectivity is restored.
+- Offline authenticated boot should reuse recent auth and dashboard warm caches: if the active page has cached content, show a small offline cache notice while preserving that content; if the active page has no cache, show a large offline empty state with retry instead of a misleading empty list.
 
 ## Acceptance
 
@@ -37,9 +39,14 @@ The PWA layer is an enhancement around the existing React + Vite app shell and A
 - Browser installability checks identify the app as installable and expose the declared screenshots and shortcuts.
 - Auth, passkey, OAuth, API, and SSE paths continue to use network behavior.
 - The existing version update notice can represent both server version drift and Service Worker update availability.
+- The app shell can render a clear offline boundary when `/api/me` cannot be reached from a cached PWA shell.
+- Already-authenticated offline visits preserve active-page warm feed content when available and show a distinct no-cache offline empty state when unavailable.
 
 ## Visual Evidence
 
 - Update + install state: [update-install.png](./assets/update-install.png)
 - Install-only state: [install-only.png](./assets/install-only.png)
 - Update-only state: [update-only.png](./assets/update-only.png)
+- Offline anonymous boot fallback: [offline-boot-fallback.png](./assets/offline-boot-fallback.png)
+- Offline authenticated dashboard with cached content: [offline-dashboard-cached-content.png](./assets/offline-dashboard-cached-content.png)
+- Offline authenticated dashboard without cached content: [offline-dashboard-empty-state.png](./assets/offline-dashboard-empty-state.png)

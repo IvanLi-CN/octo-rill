@@ -15,6 +15,10 @@ import {
 	readStartupPresentationSeed,
 	type StartupPresentation,
 } from "@/auth/startupCache";
+import {
+	describeNetworkAwareError,
+	type NetworkErrorKind,
+} from "@/lib/errorPresentation";
 
 export type AuthBootstrapStatus = "pending" | "anonymous" | "authenticated";
 
@@ -22,6 +26,8 @@ type AuthSnapshot = {
 	status: AuthBootstrapStatus;
 	me: MeResponse | null;
 	bootError: string | null;
+	bootErrorKind: NetworkErrorKind | null;
+	bootErrorDetail: string | null;
 };
 
 export type AuthBootstrapValue = AuthSnapshot & {
@@ -43,6 +49,8 @@ let cachedSnapshot: AuthSnapshot | null = warmStartupSeed
 			status: "authenticated",
 			me: warmStartupSeed.me,
 			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
 		}
 	: null;
 let cachedSnapshotOrigin: "seed" | "network" | "none" = warmStartupSeed
@@ -58,6 +66,8 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 			status: "authenticated",
 			me,
 			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
 		};
 	} catch (err) {
 		if (err instanceof ApiError && err.status === 401) {
@@ -66,8 +76,15 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 				status: "anonymous",
 				me: null,
 				bootError: null,
+				bootErrorKind: null,
+				bootErrorDetail: null,
 			};
 		}
+
+		const bootError = describeNetworkAwareError(
+			err,
+			"登录状态检查失败，请稍后重试。",
+		);
 
 		const canReuseCachedAuth =
 			cachedSnapshot?.status === "authenticated" &&
@@ -82,14 +99,18 @@ async function requestAuthSnapshot(): Promise<AuthSnapshot> {
 			return {
 				status: "authenticated",
 				me: cachedAuthenticatedMe,
-				bootError: err instanceof Error ? err.message : String(err),
+				bootError: bootError.message,
+				bootErrorKind: bootError.kind,
+				bootErrorDetail: bootError.detail,
 			};
 		}
 
 		return {
 			status: "anonymous",
 			me: null,
-			bootError: err instanceof Error ? err.message : String(err),
+			bootError: bootError.message,
+			bootErrorKind: bootError.kind,
+			bootErrorDetail: bootError.detail,
 		};
 	}
 }
@@ -123,12 +144,16 @@ export function AuthBootstrapProvider(props: { children: ReactNode }) {
 				status: "authenticated",
 				me: warmStartupSeed.me,
 				bootError: null,
+				bootErrorKind: null,
+				bootErrorDetail: null,
 			};
 		}
 		return {
 			status: "pending",
 			me: null,
 			bootError: null,
+			bootErrorKind: null,
+			bootErrorDetail: null,
 		};
 	});
 	const [bootPresentation, setBootPresentation] = useState<StartupPresentation>(
