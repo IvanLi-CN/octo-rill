@@ -38,12 +38,15 @@ type ApiOptions = {
 	aiDisabledFeed?: boolean;
 	autoTranslateFeedCount?: number;
 	autoTranslateInitialReadyIds?: string[];
+	autoTranslateInitialErrorIds?: string[];
+	autoTranslateInitialErrorPayloads?: Record<string, TranslationErrorPayload>;
 	autoTranslateDisabledIds?: string[];
 	autoTranslateResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	autoTranslateResolveFailureCount?: number;
 	smartFeedCount?: number;
 	smartInitialReadyIds?: string[];
 	smartInitialErrorIds?: string[];
+	smartInitialErrorPayloads?: Record<string, TranslationErrorPayload>;
 	smartResolveStatuses?: Record<string, "ready" | "missing" | "error">;
 	smartResolveErrors?: Record<string, TranslationErrorPayload>;
 	smartResolveDelayMs?: number;
@@ -120,14 +123,18 @@ function makeAutoTranslateFeedItems(
 	count: number,
 	options?: {
 		initialReadyIds?: string[];
+		initialErrorIds?: string[];
+		initialErrorPayloads?: Record<string, TranslationErrorPayload>;
 		smartInitialReadyIds?: string[];
 		smartInitialErrorIds?: string[];
+		smartInitialErrorPayloads?: Record<string, TranslationErrorPayload>;
 		autoTranslateDisabledIds?: string[];
 		aiDisabled?: boolean;
 		withReactions?: boolean;
 	},
 ) {
 	const initialReadyIds = new Set(options?.initialReadyIds ?? []);
+	const initialErrorIds = new Set(options?.initialErrorIds ?? []);
 	const smartInitialReadyIds = new Set(options?.smartInitialReadyIds ?? []);
 	const smartInitialErrorIds = new Set(options?.smartInitialErrorIds ?? []);
 	const autoTranslateDisabledIds = new Set(
@@ -182,15 +189,32 @@ function makeAutoTranslateFeedItems(
 							summary: readyPayload.summary_md,
 							auto_translate: true,
 						}
-					: {
-							lang: "zh-CN",
-							status: "missing",
-							title: null,
-							summary: null,
-							...(autoTranslateDisabledIds.has(releaseId)
-								? { auto_translate: false }
-								: {}),
-						},
+					: initialErrorIds.has(releaseId)
+						? {
+								lang: "zh-CN",
+								status: "error",
+								title: null,
+								summary: null,
+								error_code:
+									options?.initialErrorPayloads?.[releaseId]?.error_code ??
+									null,
+								error_summary:
+									options?.initialErrorPayloads?.[releaseId]?.error_summary ??
+									null,
+								error_detail:
+									options?.initialErrorPayloads?.[releaseId]?.error_detail ??
+									null,
+								auto_translate: false,
+							}
+						: {
+								lang: "zh-CN",
+								status: "missing",
+								title: null,
+								summary: null,
+								...(autoTranslateDisabledIds.has(releaseId)
+									? { auto_translate: false }
+									: {}),
+							},
 			smart: aiDisabled
 				? {
 						lang: "zh-CN",
@@ -212,6 +236,15 @@ function makeAutoTranslateFeedItems(
 								status: "error",
 								title: null,
 								summary: null,
+								error_code:
+									options?.smartInitialErrorPayloads?.[releaseId]?.error_code ??
+									null,
+								error_summary:
+									options?.smartInitialErrorPayloads?.[releaseId]
+										?.error_summary ?? null,
+								error_detail:
+									options?.smartInitialErrorPayloads?.[releaseId]
+										?.error_detail ?? null,
 								auto_translate: false,
 							}
 						: {
@@ -506,8 +539,11 @@ async function installApiMocks(
 				: cfg.withAutoTranslateFeed
 					? makeAutoTranslateFeedItems(cfg.autoTranslateFeedCount ?? 18, {
 							initialReadyIds: cfg.autoTranslateInitialReadyIds,
+							initialErrorIds: cfg.autoTranslateInitialErrorIds,
+							initialErrorPayloads: cfg.autoTranslateInitialErrorPayloads,
 							smartInitialReadyIds: cfg.smartInitialReadyIds,
 							smartInitialErrorIds: cfg.smartInitialErrorIds,
+							smartInitialErrorPayloads: cfg.smartInitialErrorPayloads,
 							autoTranslateDisabledIds: cfg.autoTranslateDisabledIds,
 							aiDisabled: cfg.aiDisabledFeed,
 							withReactions: cfg.withAutoTranslateReactions,
@@ -1738,6 +1774,82 @@ test("feed smart localized retryable error falls back to the original card inste
 	).toBeVisible();
 	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
 	await expect(page.getByRole("button", { name: "重试润色" })).toHaveCount(0);
+});
+
+test("feed smart upstream rejected error auto retries on page load", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		smartInitialErrorIds: [releaseId],
+		smartInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+			},
+		},
+		smartResolveStatuses: {
+			[releaseId]: "ready",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await expect(page.getByRole("tab", { name: "发布" })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_smart") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	await expect(page.getByText("润色失败", { exact: true })).toHaveCount(0);
+	await expect(
+		page.getByText(`润色 release ${releaseId} 的主要版本变化。`),
+	).toBeVisible();
+});
+
+test("feed translated upstream rejected error auto retries when translation lane is requested", async ({
+	page,
+}) => {
+	const releaseId = makeAutoTranslateReleaseId(0);
+	const tracker = await installApiMocks(page, {
+		withAutoTranslateFeed: true,
+		autoTranslateFeedCount: 1,
+		autoTranslateInitialErrorIds: [releaseId],
+		autoTranslateInitialErrorPayloads: {
+			[releaseId]: {
+				error_code: "upstream_rejected",
+				error_summary: "上游模型拒绝请求",
+				error_detail: "AI returned 403 Forbidden: Chat upstream returned 403",
+			},
+		},
+		autoTranslateResolveStatuses: {
+			[releaseId]: "ready",
+		},
+	});
+
+	await page.goto("/?tab=releases");
+	await page.getByRole("button", { name: "翻译" }).click();
+	await expect
+		.poll(() =>
+			tracker.translationResolveRequests.some(
+				(request) =>
+					request.kinds.every((kind) => kind === "release_summary") &&
+					request.entityIds.includes(releaseId),
+			),
+		)
+		.toBe(true);
+	await expect(
+		page.getByRole("heading", { name: `发布说明 ${releaseId}` }),
+	).toBeVisible();
 });
 
 test("feed smart retry treats insufficient result as a successful collapse", async ({
