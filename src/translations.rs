@@ -758,8 +758,24 @@ pub(crate) fn release_translation_error_is_retryable(error_text: Option<&str>) -
     translation_error_is_retryable(error_text) || translation_error_is_upstream_chat_403(error_text)
 }
 
-fn should_retry_translation_terminal_error(retry_on_error: bool, error_text: Option<&str>) -> bool {
-    retry_on_error || translation_error_is_retryable(error_text)
+fn release_translation_item_allows_upstream_chat_403_retry(
+    item: &TranslationRequestItemInput,
+) -> bool {
+    matches!(
+        item.kind.as_str(),
+        "release_summary" | "release_detail" | "release_smart"
+    )
+}
+
+fn should_retry_translation_terminal_error(
+    retry_on_error: bool,
+    item: &TranslationRequestItemInput,
+    error_text: Option<&str>,
+) -> bool {
+    retry_on_error
+        || translation_error_is_retryable(error_text)
+        || (release_translation_item_allows_upstream_chat_403_retry(item)
+            && translation_error_is_upstream_chat_403(error_text))
 }
 
 fn queued_request_result(
@@ -2345,6 +2361,7 @@ async fn ensure_translation_result_for_item(
             "error"
                 if !should_retry_translation_terminal_error(
                     retry_on_error,
+                    item,
                     existing.error_text.as_deref(),
                 ) =>
             {
@@ -2386,6 +2403,7 @@ async fn ensure_translation_result_for_item(
                 if result.status == "error"
                     && should_retry_translation_terminal_error(
                         retry_on_error,
+                        item,
                         result.error.as_deref(),
                     )
                 {
@@ -2452,6 +2470,7 @@ async fn ensure_translation_result_for_item(
         if existing.status == "error"
             && !should_retry_translation_terminal_error(
                 retry_on_error,
+                item,
                 existing.error_text.as_deref(),
             )
         {
@@ -2729,7 +2748,11 @@ async fn ensure_translation_result_demand(
         )
         .await?;
         if result.status == "error"
-            && should_retry_translation_terminal_error(retry_on_error, result.error.as_deref())
+            && should_retry_translation_terminal_error(
+                retry_on_error,
+                item,
+                result.error.as_deref(),
+            )
         {
             reset_retryable_terminal_work_item(tx, existing.id.as_str(), now).await?;
             attach_request_to_work_item(tx, request_id, existing.id.as_str(), "queued", now)
@@ -6946,6 +6969,250 @@ mod tests {
         assert_eq!(request_status, "queued");
         assert_eq!(request_result_status, None);
         assert_eq!(work_item_status, "queued");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_retries_release_upstream_403_without_explicit_retry() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = seed_canonical_release_item(&pool, "1", 146, 227).await;
+        let error_text = "AI returned 403 Forbidden: Chat upstream returned 403";
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'error',
+                error_text = ?,
+                active_work_item_id = ?,
+                updated_at = ?
+            WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+            "#,
+        )
+        .bind(error_text)
+        .bind(work_item_id.as_str())
+        .bind("2026-03-30T00:00:01Z")
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark cache upstream 403");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = ?,
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(error_text)
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request upstream 403");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = ?,
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(error_text)
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item upstream 403");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("resolve release upstream 403 without explicit retry");
+
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+        let request_result_status: Option<String> = sqlx::query_scalar(
+            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request result status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+
+        assert_eq!(resolved[0].status, "queued");
+        assert_eq!(request_status, "queued");
+        assert_eq!(request_result_status, None);
+        assert_eq!(work_item_status, "queued");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_keeps_notification_upstream_403_terminal() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = TranslationRequestItemInput {
+            producer_ref: "notification:upstream-403".to_owned(),
+            kind: "notification".to_owned(),
+            variant: "inbox_item".to_owned(),
+            entity_id: "upstream-403".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            max_wait_ms: 1500,
+            source_blocks: vec![
+                TranslationSourceBlock {
+                    slot: "title".to_owned(),
+                    text: "Notification title".to_owned(),
+                },
+                TranslationSourceBlock {
+                    slot: "excerpt".to_owned(),
+                    text: "Notification excerpt".to_owned(),
+                },
+            ],
+            target_slots: vec!["title_zh".to_owned(), "summary_md".to_owned()],
+        };
+        let error_text = "AI returned 403 Forbidden: Chat upstream returned 403";
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("work item attached");
+
+        sqlx::query(
+            r#"
+            UPDATE ai_translations
+            SET status = 'error',
+                error_text = ?,
+                active_work_item_id = ?,
+                updated_at = ?
+            WHERE user_id = ? AND entity_type = 'notification' AND entity_id = ? AND lang = 'zh-CN'
+            "#,
+        )
+        .bind(error_text)
+        .bind(work_item_id.as_str())
+        .bind("2026-03-30T00:00:01Z")
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark cache upstream 403");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = ?,
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(error_text)
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark request upstream 403");
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'failed',
+                result_status = 'error',
+                error_text = ?,
+                finished_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(error_text)
+        .bind("2026-03-30T00:00:01Z")
+        .bind("2026-03-30T00:00:01Z")
+        .bind(work_item_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("mark work item upstream 403");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("resolve notification upstream 403 without explicit retry");
+
+        let request_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_requests WHERE id = ? LIMIT 1")
+                .bind(created.request_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load request status");
+        let request_result_status: Option<String> = sqlx::query_scalar(
+            "SELECT result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request result status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+
+        assert_eq!(resolved[0].status, "error");
+        assert_eq!(request_status, "failed");
+        assert_eq!(request_result_status.as_deref(), Some("error"));
+        assert_eq!(work_item_status, "failed");
         assert_eq!(
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
