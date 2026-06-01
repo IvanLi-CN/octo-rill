@@ -738,7 +738,19 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         || normalized.contains("temporarily unavailable")
         || normalized.contains("connection reset")
         || normalized.contains("connection refused")
-        || normalized.contains("chat upstream returned 403")
+        || translation_error_is_upstream_chat_403_normalized(normalized.as_str())
+}
+
+pub(crate) fn translation_error_is_upstream_chat_403(error_text: Option<&str>) -> bool {
+    let Some(raw) = error_text else {
+        return false;
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    translation_error_is_upstream_chat_403_normalized(normalized.as_str())
+}
+
+fn translation_error_is_upstream_chat_403_normalized(normalized: &str) -> bool {
+    normalized.contains("chat upstream returned 403")
         || (normalized.contains("403 forbidden")
             && (normalized.contains("chat") || normalized.contains("upstream")))
 }
