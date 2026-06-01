@@ -9,12 +9,18 @@ import type {
 	TranslatedItem,
 } from "@/feed/types";
 import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
+import {
+	describeNetworkAwareError,
+	type NetworkErrorKind,
+} from "@/lib/errorPresentation";
 
 export type FeedRequestType = "all" | "releases" | "stars" | "followers";
 export type FeedLoadErrorPhase = "initial" | "append";
 export type FeedLoadError = {
 	phase: FeedLoadErrorPhase;
 	message: string;
+	kind: NetworkErrorKind;
+	detail: string | null;
 	at: number;
 };
 
@@ -132,6 +138,7 @@ export function useFeed(
 	const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
 
 	const reqIdRef = useRef(0);
+	const dataTypeRef = useRef(type);
 	const isCurrentType = dataType === type;
 	const currentItems = isCurrentType ? items : [];
 	const currentNextCursor = isCurrentType ? nextCursor : null;
@@ -140,6 +147,10 @@ export function useFeed(
 	const hasMore = Boolean(currentNextCursor);
 
 	useEffect(() => {
+		if (dataTypeRef.current === type) {
+			return;
+		}
+		dataTypeRef.current = type;
 		reqIdRef.current += 1;
 		setDataType(type);
 		setItems([]);
@@ -169,9 +180,15 @@ export function useFeed(
 				setFreshKeys(new Set(options?.freshKeys ?? []));
 			} catch (err) {
 				if (reqId !== reqIdRef.current) return;
+				const description = describeNetworkAwareError(
+					err,
+					"动态加载失败，请稍后重试。",
+				);
 				setError({
 					phase: "initial",
-					message: err instanceof Error ? err.message : String(err),
+					message: description.message,
+					kind: description.kind,
+					detail: description.detail,
 					at: Date.now(),
 				});
 				if (options?.throwOnError) {
@@ -201,9 +218,15 @@ export function useFeed(
 			setNextCursor(res.next_cursor);
 		} catch (err) {
 			if (reqId !== reqIdRef.current) return;
+			const description = describeNetworkAwareError(
+				err,
+				"更多动态加载失败，请稍后重试。",
+			);
 			setError({
 				phase: "append",
-				message: err instanceof Error ? err.message : String(err),
+				message: description.message,
+				kind: description.kind,
+				detail: description.detail,
 				at: Date.now(),
 			});
 		} finally {

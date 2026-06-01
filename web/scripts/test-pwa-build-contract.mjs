@@ -4,6 +4,7 @@ import path from "node:path";
 
 const distDir = path.resolve(import.meta.dirname, "../dist");
 const manifestPath = path.join(distDir, "manifest.webmanifest");
+const indexPath = path.join(distDir, "index.html");
 const precachePath = path.join(distDir, "pwa-precache-manifest.json");
 const serviceWorkerPath = path.join(distDir, "sw.js");
 
@@ -38,6 +39,7 @@ function assertNoPrivatePath(urls) {
 }
 
 const manifest = await readJson(manifestPath);
+const indexHtml = await readFile(indexPath, "utf8");
 assert.equal(manifest.name, "OctoRill");
 assert.equal(manifest.short_name, "OctoRill");
 assert.equal(manifest.id, "/");
@@ -48,6 +50,26 @@ assert.deepEqual(manifest.display_override, ["standalone", "browser"]);
 assert.equal(manifest.theme_color, "#0f172a");
 assert.equal(manifest.background_color, "#0f172a");
 assert.deepEqual(manifest.categories, ["productivity", "utilities"]);
+assert(
+	indexHtml.includes('<meta name="mobile-web-app-capable" content="yes"'),
+	"index includes Android standalone meta",
+);
+assert(
+	indexHtml.includes('<meta name="apple-mobile-web-app-capable" content="yes"'),
+	"index includes iOS standalone meta",
+);
+assert(
+	indexHtml.includes(
+		'<meta name="apple-mobile-web-app-title" content="OctoRill"',
+	),
+	"index includes iOS app title",
+);
+assert(
+	indexHtml.includes(
+		'<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"',
+	),
+	"index includes iOS status bar style",
+);
 assert(Array.isArray(manifest.icons), "manifest icons must be an array");
 assert(
 	Array.isArray(manifest.shortcuts),

@@ -5,6 +5,31 @@ export type ErrorPresentationLike = {
 	message?: string | null;
 };
 
+export type NetworkErrorKind = "offline" | "network" | "unknown";
+
+export type NetworkAwareErrorDescription = {
+	kind: NetworkErrorKind;
+	message: string;
+	detail: string | null;
+};
+
+function browserIsOffline() {
+	return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function looksLikeNetworkFailure(error: unknown) {
+	if (!(error instanceof Error)) return false;
+	if (error.name === "AbortError") return false;
+	if (error instanceof TypeError) return true;
+	const message = error.message.toLowerCase();
+	return (
+		message.includes("failed to fetch") ||
+		message.includes("load failed") ||
+		message.includes("networkerror") ||
+		message.includes("network request failed")
+	);
+}
+
 export function describeUnknownError(
 	error: unknown,
 	fallback = "操作失败，请稍后重试。",
@@ -18,6 +43,33 @@ export function describeUnknownError(
 		return message || fallback;
 	}
 	return fallback;
+}
+
+export function describeNetworkAwareError(
+	error: unknown,
+	fallback = "操作失败，请稍后重试。",
+): NetworkAwareErrorDescription {
+	const detail = error instanceof Error ? error.message : null;
+	if (browserIsOffline()) {
+		return {
+			kind: "offline",
+			message:
+				"当前处于离线状态，登录和最新数据需要网络连接；已保留可用的应用壳。",
+			detail,
+		};
+	}
+	if (looksLikeNetworkFailure(error)) {
+		return {
+			kind: "network",
+			message: "暂时无法连接 OctoRill 服务，请检查网络后重试。",
+			detail,
+		};
+	}
+	return {
+		kind: "unknown",
+		message: describeUnknownError(error, fallback),
+		detail,
+	};
 }
 
 export function resolveErrorSummary(
