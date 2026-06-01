@@ -64,6 +64,7 @@ type StaticPwaServer = {
 	origin: string;
 	setApiVersion: (version: string) => void;
 	setServiceWorkerRevision: (revision: number) => void;
+	getApiMeRequests: () => number;
 	getServiceWorkerRequests: () => number;
 	getSkipWaitingMessages: () => number;
 	close: () => Promise<void>;
@@ -87,6 +88,7 @@ const contentTypes = new Map([
 async function startStaticPwaServer(): Promise<StaticPwaServer> {
 	let apiVersion = "0.1.0";
 	let serviceWorkerRevision = 1;
+	let apiMeRequests = 0;
 	let serviceWorkerRequests = 0;
 	let skipWaitingMessages = 0;
 
@@ -94,6 +96,7 @@ async function startStaticPwaServer(): Promise<StaticPwaServer> {
 		async (request: IncomingMessage, response: ServerResponse) => {
 			const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
 			if (requestUrl.pathname === "/api/me") {
+				apiMeRequests += 1;
 				writeJson(response, 401, {
 					error: { code: "unauthorized", message: "unauthorized" },
 				});
@@ -180,6 +183,9 @@ self.addEventListener("message", (event) => {
 		},
 		setServiceWorkerRevision(revision: number) {
 			serviceWorkerRevision = revision;
+		},
+		getApiMeRequests() {
+			return apiMeRequests;
 		},
 		getServiceWorkerRequests() {
 			return serviceWorkerRequests;
@@ -276,6 +282,87 @@ async function dispatchAppInstalled(page: Page) {
 	});
 }
 
+async function seedAuthenticatedStartupCache(
+	page: Page,
+	options: {
+		tab?: "all" | "releases" | "stars" | "followers";
+		feedItems?: unknown[];
+	},
+) {
+	await page.evaluate((input) => {
+		const savedAt = Date.now();
+		const me = {
+			user: {
+				id: "local-user-1",
+				github_user_id: 30215105,
+				login: "IvanLi-CN",
+				name: "Ivan Li",
+				avatar_url: "https://avatars.githubusercontent.com/u/30215105?v=4",
+				email: null,
+				is_admin: true,
+			},
+			access_sync: {
+				task_id: null,
+				task_type: null,
+				event_path: null,
+				reason: "none",
+			},
+			dashboard: {
+				daily_boundary_local: "08:00",
+				daily_boundary_time_zone: "Asia/Shanghai",
+				daily_boundary_utc_offset_minutes: 480,
+			},
+		};
+		window.localStorage.setItem(
+			"octo-rill.auth-bootstrap.v3",
+			JSON.stringify({ savedAt, me }),
+		);
+		if (input.feedItems) {
+			window.localStorage.setItem(
+				"octo-rill.dashboard-warm.v1",
+				JSON.stringify({
+					savedAt,
+					userId: me.user.id,
+					routeState: {
+						tab: input.tab ?? "all",
+						activeReleaseId: null,
+						activeReleaseLocatorKey: null,
+						releaseReturnTab: "briefs",
+					},
+					feedRequestType: input.tab ?? "all",
+					feedItems: input.feedItems,
+					nextCursor: null,
+					notifications: [],
+					briefs: [],
+					selectedBriefId: null,
+				}),
+			);
+		}
+	}, options);
+}
+
+function cachedReleaseFeedItem() {
+	return {
+		kind: "release",
+		ts: "2026-04-04T02:30:00Z",
+		id: "offline-cached-release",
+		repo_full_name: "octo-rill/app-shell",
+		repo_visual: null,
+		title: "v0.8.0",
+		body: "Cached release notes remain readable while the network is unavailable.",
+		body_truncated: false,
+		subtitle: "OctoRill app shell",
+		reason: null,
+		subject_type: null,
+		html_url: "https://github.com/IvanLi-CN/octo-rill/releases/tag/v0.8.0",
+		unread: null,
+		actor: null,
+		translated: null,
+		smart: null,
+		reactions: null,
+	};
+}
+
 test("app exposes installable PWA metadata without blocking anonymous login", async ({
 	page,
 }) => {
@@ -294,6 +381,18 @@ test("app exposes installable PWA metadata without blocking anonymous login", as
 		"content",
 		"#0f172a",
 	);
+	await expect(
+		page.locator('meta[name="mobile-web-app-capable"]'),
+	).toHaveAttribute("content", "yes");
+	await expect(
+		page.locator('meta[name="apple-mobile-web-app-capable"]'),
+	).toHaveAttribute("content", "yes");
+	await expect(
+		page.locator('meta[name="apple-mobile-web-app-title"]'),
+	).toHaveAttribute("content", "OctoRill");
+	await expect(
+		page.locator('meta[name="apple-mobile-web-app-status-bar-style"]'),
+	).toHaveAttribute("content", "black-translucent");
 	await expect(
 		page.getByRole("link", { name: "使用 GitHub 登录" }),
 	).toBeVisible();
@@ -367,6 +466,103 @@ test("production service worker falls back to cached app shell while bypassing p
 			authDeepLink: "rejected",
 			post: "rejected",
 		});
+	} finally {
+		await context.setOffline(false);
+		await server.close();
+	}
+});
+
+test("offline anonymous boot shows a network boundary instead of an auth failure", async ({
+	context,
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+
+		await context.setOffline(true);
+		await page.goto(server.origin, { waitUntil: "domcontentloaded" });
+
+		await expect(page.getByText("网络连接不可用")).toBeVisible();
+		await expect(
+			page.getByText(
+				"当前处于离线状态，登录和最新数据需要网络连接；已保留可用的应用壳。",
+			),
+		).toBeVisible();
+		await expect(
+			page.getByRole("button", { name: "使用 Passkey 登录" }),
+		).toBeDisabled();
+	} finally {
+		await context.setOffline(false);
+		await server.close();
+	}
+});
+
+test("offline authenticated boot keeps cached dashboard content with a small banner", async ({
+	context,
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		await seedAuthenticatedStartupCache(page, {
+			tab: "releases",
+			feedItems: [cachedReleaseFeedItem()],
+		});
+
+		await context.setOffline(true);
+		await page.goto(`${server.origin}/releases`, {
+			waitUntil: "domcontentloaded",
+		});
+
+		await expect(
+			page.locator("[data-dashboard-offline-cache-banner]"),
+		).toBeVisible();
+		await expect(page.getByText("正在显示缓存内容")).toBeVisible();
+		await expect(page.getByText("octo-rill/app-shell")).toBeVisible();
+		await expect(
+			page.locator("[data-dashboard-offline-empty-state]"),
+		).toHaveCount(0);
+
+		const requestsBeforeRetry = server.getApiMeRequests();
+		await context.setOffline(false);
+		await page.getByRole("button", { name: "重试连接" }).click();
+		await expect
+			.poll(() => server.getApiMeRequests())
+			.toBeGreaterThan(requestsBeforeRetry);
+	} finally {
+		await context.setOffline(false);
+		await server.close();
+	}
+});
+
+test("offline authenticated boot shows an offline empty state when the active page has no cache", async ({
+	context,
+	page,
+}) => {
+	const server = await startStaticPwaServer();
+	try {
+		await page.goto(server.origin);
+		await waitForServiceWorkerControl(page);
+		await seedAuthenticatedStartupCache(page, {});
+
+		await context.setOffline(true);
+		await page.goto(`${server.origin}/stars`, {
+			waitUntil: "domcontentloaded",
+		});
+
+		await expect(
+			page.locator("[data-dashboard-offline-empty-state]"),
+		).toBeVisible();
+		await expect(page.getByText("离线时没有可用缓存")).toBeVisible();
+		await expect(
+			page.getByText("当前页面之前没有保存到本地的内容"),
+		).toBeVisible();
+		await expect(
+			page.locator("[data-dashboard-offline-cache-banner]"),
+		).toHaveCount(0);
 	} finally {
 		await context.setOffline(false);
 		await server.close();
