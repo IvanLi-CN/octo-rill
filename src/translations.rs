@@ -738,6 +738,9 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         || normalized.contains("temporarily unavailable")
         || normalized.contains("connection reset")
         || normalized.contains("connection refused")
+        || normalized.contains("chat upstream returned 403")
+        || (normalized.contains("403 forbidden")
+            && (normalized.contains("chat") || normalized.contains("upstream")))
 }
 
 fn should_retry_translation_terminal_error(retry_on_error: bool, error_text: Option<&str>) -> bool {
@@ -6797,8 +6800,20 @@ mod tests {
         assert!(translation_error_is_retryable(Some(
             "repo scope required; re-login via GitHub OAuth",
         )));
+        assert!(translation_error_is_retryable(Some(
+            "AI returned 403 Forbidden: Chat upstream returned 403",
+        )));
         assert!(!translation_error_is_retryable(Some(
             "private repository compare requires repo scope; re-login via GitHub OAuth",
+        )));
+        assert!(!translation_error_is_retryable(Some(
+            "invalid_model_error: model not found",
+        )));
+        assert!(!translation_error_is_retryable(Some(
+            "AI returned 401 Unauthorized",
+        )));
+        assert!(!translation_error_is_retryable(Some(
+            "AI returned 403 Forbidden: insufficient_quota",
         )));
     }
 
