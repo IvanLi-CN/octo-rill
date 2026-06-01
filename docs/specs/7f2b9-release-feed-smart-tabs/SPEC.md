@@ -133,7 +133,8 @@
 - 润色 / 翻译 lane 缺数据但仍会自动生成时，正文区继续显示原文；正在加载的 lane 只在 selector option 上显示呼吸态。
 - sync 新写入的 release：后台同时预热 `翻译` 与 `润色` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
-- 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
+- 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`、上游聊天通道返回的 `AI returned 403 Forbidden: Chat upstream returned 403`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
+- 上游聊天通道 403 只在 release 翻译 / 润色链路中视为可恢复终态：feed/detail read model 可重新暴露为 `missing + auto_translate`，`retry.recent_failures` 可定时重排队；底层 AI 客户端单次调用仍快速失败，不扩大 403 的同请求重试预算。
 - 当 `translation.scheduler.*` 或 `api.translate_*` 路径中的 LLM 调用返回 `AI response missing content` 时，共享 AI 客户端必须在**同一次请求内**把总尝试上限从 4 提升到 8；其他 source 与其他错误类型继续维持 4 次总尝试，不引入后台重排队。
 - 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `润色中`。
 - queued batch recovery 只能接手**已经陈旧的遗留 batch**；刚创建、尚未进入执行阶段的 fresh batch 不能被第二个 scheduler tick 抢占重放。
@@ -162,6 +163,10 @@
 - Given smart lane 之前落过可重试的瞬时错误
   When 用户重新打开 feed 或再次触发 sync
   Then 系统会把该卡片重新纳入润色预热/预加载，而不是继续展示陈旧错误态。
+
+- Given 翻译或润色 lane 之前落过上游聊天通道 403
+  When 用户重新打开 feed/detail 或 `retry.recent_failures` 定时任务运行
+  Then 该 lane 会被重新纳入前台按需生成或后台重排队，页面不继续展示陈旧的 `上游模型拒绝请求` 终态。
 
 - Given feed 首次加载完成且当前页里仍有 missing 的 smart 卡片
   When 页面进入空闲态

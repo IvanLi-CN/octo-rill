@@ -9680,6 +9680,9 @@ fn smart_item(
 fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<TranslatedItem> {
     match status {
         "disabled" => Some(translated_item("disabled", None, None, None, None)),
+        "error" if crate::translations::translation_error_is_retryable(error_text) => {
+            Some(translated_missing_item(true))
+        }
         "missing" | "error" => Some(translated_item(
             status,
             None,
@@ -9781,19 +9784,7 @@ fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
 }
 
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
-    let Some(raw) = error_text else {
-        return false;
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    normalized.contains("runtime_lease_expired")
-        || normalized.contains("repo scope required; re-login via github oauth")
-        || normalized.contains("database is locked")
-        || normalized.contains("busy")
-        || normalized.contains("timed out")
-        || normalized.contains("timeout")
-        || normalized.contains("temporarily unavailable")
-        || normalized.contains("connection reset")
-        || normalized.contains("connection refused")
+    crate::translations::translation_error_is_retryable(error_text)
 }
 
 fn feed_item_from_row(
@@ -19919,6 +19910,32 @@ mod tests {
     }
 
     #[test]
+    fn feed_item_from_row_retries_upstream_rejected_translation_errors() {
+        let mut row = test_feed_row(Some("R_node"));
+        row.repo_full_name = Some("openai/codex".to_owned());
+        row.title = Some("Release v1.2.3".to_owned());
+        row.release_body = Some("- item".to_owned());
+        let body = release_feed_body(row.release_body.as_deref()).expect("release body");
+        let source = format!(
+            "v=5\nkind=release\nrepo={}\ntitle={}\nbody={}\n",
+            row.repo_full_name.as_deref().unwrap_or(""),
+            row.title.as_deref().unwrap_or(""),
+            body,
+        );
+        row.trans_source_hash = Some(ai::sha256_hex(&source));
+        row.trans_status = Some("error".to_owned());
+        row.trans_error_text =
+            Some("AI returned 403 Forbidden: Chat upstream returned 403".to_owned());
+
+        let item = feed_item_from_row(row, true, None);
+        let translated = item.translated.expect("translated item");
+        assert_eq!(translated.status, "missing");
+        assert_eq!(translated.auto_translate, None);
+        assert!(translated.title.is_none());
+        assert!(translated.summary.is_none());
+    }
+
+    #[test]
     fn feed_item_from_row_uses_release_detail_translation_for_truncated_release() {
         let mut row = test_feed_row(Some("R_node"));
         row.repo_full_name = Some("openai/codex".to_owned());
@@ -20134,6 +20151,9 @@ body={}
         assert!(smart_error_is_retryable(Some(
             "repo scope required; re-login via GitHub OAuth",
         )));
+        assert!(smart_error_is_retryable(Some(
+            "AI returned 403 Forbidden: Chat upstream returned 403",
+        )));
         assert!(!smart_error_is_retryable(Some(
             "private repository compare requires repo scope; re-login via GitHub OAuth",
         )));
@@ -20156,7 +20176,8 @@ body={}
             row.release_previous_tag_name.as_deref(),
         ));
         row.smart_status = Some("error".to_owned());
-        row.smart_error_text = Some("runtime_lease_expired".to_owned());
+        row.smart_error_text =
+            Some("AI returned 403 Forbidden: Chat upstream returned 403".to_owned());
 
         let item = feed_item_from_row(row, true, None);
         let smart = item.smart.expect("smart item");

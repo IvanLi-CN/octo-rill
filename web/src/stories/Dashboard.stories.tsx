@@ -71,6 +71,7 @@ type FeedMode =
 	| "smart-ready-body"
 	| "smart-ready-diff"
 	| "smart-loading"
+	| "smart-upstream-retry"
 	| "smart-retry-error"
 	| "smart-insufficient";
 type StoryLiveNotice = {
@@ -1852,6 +1853,22 @@ function makeSmartLoadingFeed(): FeedItem[] {
 	];
 }
 
+function makeSmartUpstreamRetryFeed(): FeedItem[] {
+	return [
+		buildFeedItem("50006", {
+			title: "v5.2.2",
+			body: "- Upstream rejected the previous smart summary request",
+			smart: {
+				lang: "zh-CN",
+				status: "missing",
+				title: null,
+				summary: null,
+				auto_translate: true,
+			},
+		}),
+	];
+}
+
 function makeSmartRetryErrorFeed(): FeedItem[] {
 	return [
 		buildFeedItem("50005", {
@@ -1898,9 +1915,11 @@ function makeSmartInFlightKeys(mode: FeedMode) {
 	return new Set(
 		mode === "smart-loading"
 			? ["release:50003"]
-			: mode === "smart-retry-error"
-				? []
-				: [],
+			: mode === "smart-upstream-retry"
+				? ["release:50006"]
+				: mode === "smart-retry-error"
+					? []
+					: [],
 	);
 }
 
@@ -2415,11 +2434,13 @@ function DashboardPreview(props: {
 									? makeSmartReadyDiffFeed()
 									: feedMode === "smart-loading"
 										? makeSmartLoadingFeed()
-										: feedMode === "smart-retry-error"
-											? makeSmartRetryErrorFeed()
-											: feedMode === "smart-insufficient"
-												? makeSmartInsufficientFeed()
-												: makeVisibleWindowFeed(feedMode);
+										: feedMode === "smart-upstream-retry"
+											? makeSmartUpstreamRetryFeed()
+											: feedMode === "smart-retry-error"
+												? makeSmartRetryErrorFeed()
+												: feedMode === "smart-insufficient"
+													? makeSmartInsufficientFeed()
+													: makeVisibleWindowFeed(feedMode);
 	const notifications = showEmptyInbox ? [] : mockNotifs;
 	const translationInFlightKeys =
 		emptyState !== "content" ||
@@ -2429,6 +2450,7 @@ function DashboardPreview(props: {
 		feedMode === "smart-ready-body" ||
 		feedMode === "smart-ready-diff" ||
 		feedMode === "smart-loading" ||
+		feedMode === "smart-upstream-retry" ||
 		feedMode === "smart-retry-error" ||
 		feedMode === "smart-insufficient"
 			? new Set<string>()
@@ -4753,6 +4775,55 @@ export const SmartLoading: Story = {
 		await expect(
 			canvas.getByText(/Placeholder body for smart loading state/),
 		).toBeVisible();
+		const smartTrigger = canvasElement.querySelector(
+			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
+		);
+		expect(smartTrigger).not.toBeNull();
+	},
+};
+
+export const SmartUpstreamRetrying: Story = {
+	args: {
+		initialTab: "releases",
+		feedMode: "smart-upstream-retry",
+	},
+	render: () => {
+		const item = makeSmartUpstreamRetryFeed()[0] as ReleaseFeedItem;
+		return (
+			<div className="bg-background min-h-screen px-4 py-6">
+				<div className="mx-auto w-full max-w-2xl">
+					<FeedItemCard
+						item={item}
+						currentViewer={STORYBOOK_VIEWER}
+						activeLane="smart"
+						isTranslating={false}
+						isSmartGenerating
+						isReactionBusy={false}
+						reactionError={null}
+						onSelectLane={() => {}}
+						onTranslateNow={() => {}}
+						onSmartNow={() => {}}
+						onToggleReaction={() => {}}
+					/>
+				</div>
+			</div>
+		);
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"上游聊天通道 403 旧错误会被 read model 重新暴露为可自动生成状态；卡片保留原文回退并显示润色生成中，而不是继续展示润色失败终态。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByRole("heading", { name: "v5.2.2" })).toBeVisible();
+		await expect(
+			canvas.getByText(/Upstream rejected the previous smart summary request/),
+		).toBeVisible();
+		await expect(canvas.queryByText("润色失败")).not.toBeInTheDocument();
 		const smartTrigger = canvasElement.querySelector(
 			'[data-feed-lane-trigger="smart"][data-feed-lane-loading="true"]',
 		);

@@ -23,6 +23,33 @@ const REQUEST_RESUME_WINDOW_MAX_RETRIES = 15;
 const REQUEST_PENDING_MAX_AGE_MS =
 	REQUEST_STATUS_POLL_WINDOW_MS * REQUEST_RESUME_WINDOW_MAX_RETRIES;
 
+function translationErrorIsRetryable(error?: string | null) {
+	if (!error) return false;
+	const normalized = error.trim().toLowerCase();
+	return (
+		normalized.includes("runtime_lease_expired") ||
+		normalized.includes("repo scope required; re-login via github oauth") ||
+		normalized.includes("database is locked") ||
+		normalized.includes("busy") ||
+		normalized.includes("timeout") ||
+		normalized.includes("timed out") ||
+		normalized.includes("temporarily unavailable") ||
+		normalized.includes("connection reset") ||
+		normalized.includes("connection refused") ||
+		normalized.includes("chat upstream returned 403") ||
+		(normalized.includes("403 forbidden") &&
+			(normalized.includes("chat") || normalized.includes("upstream")))
+	);
+}
+
+function feedTranslationIsRetryable(item: FeedItem) {
+	return translationErrorIsRetryable(
+		item.translated?.error_detail ??
+			item.translated?.error_summary ??
+			item.translated?.error_code,
+	);
+}
+
 function buildReleaseSummaryRequestItem(
 	item: FeedItem,
 ): TranslationRequestItemInput {
@@ -52,11 +79,15 @@ function mapTranslationItemToFeedTranslated(item: {
 	title_zh: string | null;
 	summary_md: string | null;
 	body_md?: string | null;
+	error?: string | null;
 	error_code?: string | null;
 	error_summary?: string | null;
 	error_detail?: string | null;
 }): TranslatedItem | null {
 	const translatedBody = item.body_md ?? item.summary_md;
+	const retryable = translationErrorIsRetryable(
+		item.error_detail ?? item.error,
+	);
 	switch (item.status) {
 		case "ready":
 			return {
@@ -92,13 +123,13 @@ function mapTranslationItemToFeedTranslated(item: {
 		case "error":
 			return {
 				lang: "zh-CN",
-				status: "error",
+				status: retryable ? "missing" : "error",
 				title: null,
 				summary: null,
 				error_code: item.error_code ?? null,
 				error_summary: item.error_summary ?? null,
 				error_detail: item.error_detail ?? null,
-				auto_translate: false,
+				auto_translate: retryable,
 			};
 		default:
 			return null;
@@ -296,6 +327,8 @@ export function useAutoTranslate(params: {
 			isReleaseFeedItem(item) &&
 			((item.translated?.status === "missing" &&
 				item.translated.auto_translate !== false) ||
+				(item.translated?.status === "error" &&
+					feedTranslationIsRetryable(item)) ||
 				(item.translated?.status === "ready" &&
 					item.translated.auto_translate === true)) &&
 			!failedRef.current.has(keyOf(item)),
