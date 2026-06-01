@@ -31,11 +31,6 @@ import {
 	CardTitle,
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import {
-	Tooltip,
-	TooltipContent,
-	TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
 import {
 	isReleaseFeedItem,
@@ -288,31 +283,31 @@ function FeedCardLaneTabs(props: {
 						: "animate-pulse text-foreground/60 ring-1 ring-primary/20"
 					: null;
 				return (
-					<Tooltip key={option.lane}>
-						<TooltipTrigger asChild>
-							<TabsTrigger
-								value={option.lane}
-								aria-label={option.label}
-								data-feed-lane-trigger={option.lane}
-								data-active={active ? "true" : "false"}
-								data-feed-lane-loading={isLoading ? "true" : "false"}
-								className={cn(
-									compact ? "size-7" : RELEASE_TOOL_ICON_BUTTON_CLASS,
-									"flex-none rounded-full border px-0 shadow-none transition-all",
-									active
-										? "border-foreground bg-foreground text-background shadow-sm hover:bg-foreground hover:text-background"
-										: "border-transparent text-foreground/30 hover:text-foreground/60",
-									loadingClass,
-								)}
-							>
-								<Icon className={compact ? "size-3" : "size-3.25"} />
-								<span className="sr-only">{option.label}</span>
-							</TabsTrigger>
-						</TooltipTrigger>
-						<TooltipContent side="top" sideOffset={6}>
+					<TabsTrigger
+						key={option.lane}
+						value={option.lane}
+						aria-label={option.label}
+						data-feed-lane-trigger={option.lane}
+						data-active={active ? "true" : "false"}
+						data-feed-lane-loading={isLoading ? "true" : "false"}
+						className={cn(
+							compact ? "size-7" : RELEASE_TOOL_ICON_BUTTON_CLASS,
+							"group/lane-trigger flex-none overflow-visible rounded-full border px-0 shadow-none transition-all",
+							active
+								? "border-foreground bg-foreground text-background shadow-sm hover:bg-foreground hover:text-background"
+								: "border-transparent text-foreground/30 hover:text-foreground/60",
+							loadingClass,
+						)}
+					>
+						<Icon className={compact ? "size-3" : "size-3.25"} />
+						<span className="sr-only">{option.label}</span>
+						<span
+							aria-hidden="true"
+							className="pointer-events-none absolute left-1/2 top-0 z-20 -translate-x-1/2 -translate-y-[calc(100%+0.5rem)] rounded-md bg-foreground px-2 py-1 text-[11px] font-medium text-background opacity-0 shadow-md transition-opacity group-focus-visible/lane-trigger:opacity-100 group-hover/lane-trigger:opacity-100"
+						>
 							{option.label}
-						</TooltipContent>
-					</Tooltip>
+						</span>
+					</TabsTrigger>
 				);
 			})}
 		</TabsList>

@@ -32,7 +32,18 @@ function smartErrorIsRetryable(error?: string | null) {
 		normalized.includes("timed out") ||
 		normalized.includes("temporarily unavailable") ||
 		normalized.includes("connection reset") ||
-		normalized.includes("connection refused")
+		normalized.includes("connection refused") ||
+		normalized.includes("chat upstream returned 403") ||
+		(normalized.includes("403 forbidden") &&
+			(normalized.includes("chat") || normalized.includes("upstream")))
+	);
+}
+
+function feedSmartIsRetryable(item: FeedItem) {
+	return smartErrorIsRetryable(
+		item.smart?.error_detail ??
+			item.smart?.error_summary ??
+			item.smart?.error_code,
 	);
 }
 
@@ -321,6 +332,7 @@ export function useAutoSmart(params: {
 			isReleaseFeedItem(item) &&
 			((item.smart?.status === "missing" &&
 				item.smart.auto_translate !== false) ||
+				(item.smart?.status === "error" && feedSmartIsRetryable(item)) ||
 				(item.smart?.status === "ready" &&
 					item.smart.auto_translate === true)) &&
 			!failedRef.current.has(keyOf(item)),

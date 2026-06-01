@@ -2877,6 +2877,19 @@ async fn load_recent_failed_translation_retry_candidates(
                 OR lower(error_text) LIKE '%temporarily unavailable%'
                 OR lower(error_text) LIKE '%connection reset%'
                 OR lower(error_text) LIKE '%connection refused%'
+                OR (
+                  kind IN ('release_smart', 'release_summary', 'release_detail')
+                  AND (
+                    lower(error_text) LIKE '%chat upstream returned 403%'
+                    OR (
+                      lower(error_text) LIKE '%403 forbidden%'
+                      AND (
+                        lower(error_text) LIKE '%chat%'
+                        OR lower(error_text) LIKE '%upstream%'
+                      )
+                    )
+                  )
+                )
               )
             )
           )
@@ -2894,7 +2907,16 @@ async fn load_recent_failed_translation_retry_candidates(
 
 fn retry_candidate_is_retryable(row: &RetryTranslationCandidateRow) -> bool {
     match row.result_status.as_deref() {
-        Some("error") => translations::translation_error_is_retryable(row.error_text.as_deref()),
+        Some("error") => {
+            if translations::translation_error_is_upstream_chat_403(row.error_text.as_deref()) {
+                matches!(
+                    row.kind.as_str(),
+                    "release_smart" | "release_summary" | "release_detail"
+                )
+            } else {
+                translations::translation_error_is_retryable(row.error_text.as_deref())
+            }
+        }
         Some("missing") => row.error_text.is_none(),
         _ => false,
     }
@@ -3662,10 +3684,10 @@ mod tests {
     use std::{net::SocketAddr, sync::Arc};
 
     use super::{
-        NewTask, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING,
-        TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE, TASK_BRIEF_REFRESH_CONTENT,
-        TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH, TASK_SYNC_ALL,
-        TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
+        NewTask, RetryTranslationCandidateRow, SMART_NO_VALUABLE_VERSION_INFO, STATUS_FAILED,
+        STATUS_QUEUED, STATUS_RUNNING, TASK_BRIEF_DAILY_SLOT, TASK_BRIEF_HISTORY_RECOMPUTE,
+        TASK_BRIEF_REFRESH_CONTENT, TASK_RETRY_RECENT_FAILURES, TASK_SUMMARIZE_RELEASE_SMART_BATCH,
+        TASK_SYNC_ALL, TASK_SYNC_RELEASES, TASK_SYNC_SUBSCRIPTIONS, TranslationStreamCursor,
         claim_next_queued_task, current_recent_failures_retry_schedule_key,
         current_subscription_schedule_key, enqueue_brief_history_recompute_if_needed,
         enqueue_brief_refresh_content_if_needed, enqueue_hour_slot_if_due,
@@ -5119,6 +5141,122 @@ mod tests {
         assert_eq!(rows[99].id, "work-099");
         assert!(retry_candidate_is_retryable(&rows[0]));
         assert!(retry_candidate_is_retryable(&rows[99]));
+    }
+
+    #[tokio::test]
+    async fn recent_failed_translation_retry_candidates_include_upstream_403() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_006, "translation-retry-403-user").await;
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-upstream-403")
+        .bind("dedupe-upstream-403")
+        .bind("90006")
+        .bind("release_smart")
+        .bind("feed_card")
+        .bind("release-upstream-403")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("hash-upstream-403")
+        .bind("[]")
+        .bind("[]")
+        .bind(128_i64)
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind("failed")
+        .bind("error")
+        .bind("AI returned 403 Forbidden: Chat upstream returned 403")
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed upstream 403 retry candidate");
+
+        let rows =
+            load_recent_failed_translation_retry_candidates(state.as_ref(), &["release_smart"])
+                .await
+                .expect("load failed translation candidates");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "work-upstream-403");
+        assert!(retry_candidate_is_retryable(&rows[0]));
+    }
+
+    #[tokio::test]
+    async fn recent_failed_translation_retry_candidates_exclude_notification_upstream_403() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_007, "translation-retry-notification-403-user").await;
+        let now = Utc::now();
+        let error_text = "AI returned 403 Forbidden: Chat upstream returned 403";
+
+        sqlx::query(
+            r#"
+            INSERT INTO translation_work_items (
+              id, dedupe_key, scope_user_id, kind, variant, entity_id, target_lang,
+              protocol_version, model_profile, source_hash, source_blocks_json,
+              target_slots_json, token_estimate, deadline_at, status, result_status,
+              error_text, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("work-notification-upstream-403")
+        .bind("dedupe-notification-upstream-403")
+        .bind("90007")
+        .bind("notification")
+        .bind("feed_card")
+        .bind("notification-upstream-403")
+        .bind("zh-CN")
+        .bind("v1")
+        .bind("default")
+        .bind("hash-notification-upstream-403")
+        .bind("[]")
+        .bind("[]")
+        .bind(128_i64)
+        .bind((now + Duration::hours(1)).to_rfc3339())
+        .bind("failed")
+        .bind("error")
+        .bind(error_text)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&pool)
+        .await
+        .expect("seed notification upstream 403 retry candidate");
+
+        let rows = load_recent_failed_translation_retry_candidates(
+            state.as_ref(),
+            &["release_summary", "release_detail", "notification"],
+        )
+        .await
+        .expect("load failed translation candidates");
+
+        assert!(rows.is_empty());
+
+        let row = RetryTranslationCandidateRow {
+            id: "work-notification-upstream-403".to_owned(),
+            scope_user_id: "90007".to_owned(),
+            kind: "notification".to_owned(),
+            variant: "feed_card".to_owned(),
+            entity_id: "notification-upstream-403".to_owned(),
+            target_lang: "zh-CN".to_owned(),
+            source_hash: "hash-notification-upstream-403".to_owned(),
+            source_blocks_json: "[]".to_owned(),
+            target_slots_json: "[]".to_owned(),
+            result_status: Some("error".to_owned()),
+            error_text: Some(error_text.to_owned()),
+        };
+        assert!(!retry_candidate_is_retryable(&row));
     }
 
     #[tokio::test]
