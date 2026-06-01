@@ -9680,7 +9680,7 @@ fn smart_item(
 fn translated_terminal_item(status: &str, error_text: Option<&str>) -> Option<TranslatedItem> {
     match status {
         "disabled" => Some(translated_item("disabled", None, None, None, None)),
-        "error" if crate::translations::translation_error_is_retryable(error_text) => {
+        "error" if crate::translations::release_translation_error_is_retryable(error_text) => {
             Some(translated_missing_item(true))
         }
         "missing" | "error" => Some(translated_item(
@@ -9784,7 +9784,7 @@ fn smart_missing_item(auto_translate: Option<bool>) -> SmartItem {
 }
 
 fn smart_error_is_retryable(error_text: Option<&str>) -> bool {
-    crate::translations::translation_error_is_retryable(error_text)
+    crate::translations::release_translation_error_is_retryable(error_text)
 }
 
 fn feed_item_from_row(

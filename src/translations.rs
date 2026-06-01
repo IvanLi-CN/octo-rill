@@ -738,7 +738,6 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         || normalized.contains("temporarily unavailable")
         || normalized.contains("connection reset")
         || normalized.contains("connection refused")
-        || translation_error_is_upstream_chat_403_normalized(normalized.as_str())
 }
 
 pub(crate) fn translation_error_is_upstream_chat_403(error_text: Option<&str>) -> bool {
@@ -753,6 +752,10 @@ fn translation_error_is_upstream_chat_403_normalized(normalized: &str) -> bool {
     normalized.contains("chat upstream returned 403")
         || (normalized.contains("403 forbidden")
             && (normalized.contains("chat") || normalized.contains("upstream")))
+}
+
+pub(crate) fn release_translation_error_is_retryable(error_text: Option<&str>) -> bool {
+    translation_error_is_retryable(error_text) || translation_error_is_upstream_chat_403(error_text)
 }
 
 fn should_retry_translation_terminal_error(retry_on_error: bool, error_text: Option<&str>) -> bool {
@@ -6812,7 +6815,13 @@ mod tests {
         assert!(translation_error_is_retryable(Some(
             "repo scope required; re-login via GitHub OAuth",
         )));
-        assert!(translation_error_is_retryable(Some(
+        assert!(!translation_error_is_retryable(Some(
+            "AI returned 403 Forbidden: Chat upstream returned 403",
+        )));
+        assert!(translation_error_is_upstream_chat_403(Some(
+            "AI returned 403 Forbidden: Chat upstream returned 403",
+        )));
+        assert!(release_translation_error_is_retryable(Some(
             "AI returned 403 Forbidden: Chat upstream returned 403",
         )));
         assert!(!translation_error_is_retryable(Some(
