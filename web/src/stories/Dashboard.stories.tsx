@@ -2337,6 +2337,12 @@ function DashboardPreview(props: {
 	initialTab?: Tab;
 	initialPatDialogOpen?: boolean;
 	syncingAll?: boolean;
+	syncProgress?: {
+		currentStep: number;
+		totalSteps: number;
+		stageLabel: string;
+		detail: string;
+	} | null;
 	showEmptyInbox?: boolean;
 	emptyState?: "content" | "auto-sync" | "no-cache";
 	feedMode?: FeedMode;
@@ -2373,6 +2379,7 @@ function DashboardPreview(props: {
 		initialTab = "all",
 		initialPatDialogOpen = false,
 		syncingAll = false,
+		syncProgress = null,
 		showEmptyInbox = false,
 		emptyState = "content",
 		feedMode = "default",
@@ -2879,6 +2886,7 @@ function DashboardPreview(props: {
 						aiDisabledHint={aiDisabledHint}
 						busy={syncingAll}
 						syncingAll={syncingAll}
+						syncProgress={syncProgress}
 						onSyncAll={() => {}}
 						logoutHref="#"
 						mobileControlBand={
@@ -3100,6 +3108,7 @@ const meta = {
 		initialTab: "all",
 		initialPatDialogOpen: false,
 		syncingAll: false,
+		syncProgress: null,
 		showEmptyInbox: false,
 		emptyState: "content",
 		feedMode: "default",
@@ -4745,14 +4754,33 @@ export const FeedHotPathAfterReactionRefresh: Story = {
 export const AccessSyncEmptyState: Story = {
 	args: {
 		emptyState: "auto-sync",
+		syncingAll: true,
+		syncProgress: {
+			currentStep: 0,
+			totalSteps: 4,
+			stageLabel: "后台任务已启动",
+			detail: "正在准备 Star 阶段",
+		},
 	},
 	parameters: {
 		docs: {
 			description: {
 				story:
-					"首访或超过 1 小时未访问时的自动同步空态，验证 staged refresh 期间不会再提示手动点 Sync all。",
+					"首访或超过 1 小时未访问时的自动同步空态，验证 staged refresh 期间会先进入 warmup，而不是继续停在“等待后台任务开始”。",
 			},
 		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			canvas.getByRole("heading", { name: "正在同步你的 Star / Release" }),
+		).toBeVisible();
+		const syncButton = canvas.getByRole("button", { name: SYNC_ALL_LABEL });
+		await userEvent.hover(syncButton);
+		await expect(body.getByText("后台任务已启动")).toBeVisible();
+		await expect(body.getByText("0/4")).toBeVisible();
+		await expect(body.getByText("正在准备 Star 阶段")).toBeVisible();
 	},
 };
 

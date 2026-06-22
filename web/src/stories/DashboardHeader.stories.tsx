@@ -307,6 +307,37 @@ export const Default: Story = {
 	},
 };
 
+export const Warmup: Story = {
+	args: {
+		busy: true,
+		syncingAll: true,
+		syncProgress: {
+			currentStep: 0,
+			totalSteps: 4,
+			stageLabel: "后台任务已启动",
+			detail: "正在准备 Star 阶段",
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		const body = within(canvasElement.ownerDocument.body);
+		const syncButton = canvas.getByRole("button", { name: "同步" });
+		await expect(syncButton).toBeEnabled();
+		await userEvent.hover(syncButton);
+		await expect(body.getByText("后台任务已启动")).toBeVisible();
+		await expect(body.getByText("0/4")).toBeVisible();
+		await expect(body.getByText("正在准备 Star 阶段")).toBeVisible();
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"后台任务刚进入 running 但还没到 `star_refreshed` 的 warmup 态：仍然保留 0/4 业务进度，但文案已经明确提示后台任务已启动。",
+			},
+		},
+	},
+};
+
 export const Syncing: Story = {
 	args: {
 		busy: true,

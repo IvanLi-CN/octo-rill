@@ -24,7 +24,9 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::Mutex, task::JoinSet};
 
-use crate::{admin_runtime, jobs, local_id, runtime, state::AppState};
+use crate::{
+    admin_runtime, jobs, local_id, runtime, sqlite_write::SqliteWritePriority, state::AppState,
+};
 
 const REST_API_BASE: &str = "https://api.github.com";
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
@@ -1032,7 +1034,14 @@ pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarred
         .await
         .map_err(SyncRequestError::into_anyhow)?;
     if result.is_full_snapshot {
-        replace_starred_repos(state, user_id, &result.repos).await?;
+        replace_starred_repos_with_priority(
+            state,
+            user_id,
+            &result.repos,
+            "sync_access_refresh_starred_repos",
+            SqliteWritePriority::Foreground,
+        )
+        .await?;
     } else {
         upsert_starred_repos(state, user_id, &result.repos).await?;
     }
@@ -4016,7 +4025,14 @@ where
         match fetch(user.id.clone()).await {
             Ok(result) => {
                 if result.is_full_snapshot {
-                    replace_starred_repos(context.state.as_ref(), &user.id, &result.repos).await?;
+                    replace_starred_repos_with_priority(
+                        context.state.as_ref(),
+                        &user.id,
+                        &result.repos,
+                        "sync_subscriptions_starred_repos",
+                        SqliteWritePriority::Background,
+                    )
+                    .await?;
                     store_sync_state_value(
                         context.state.as_ref(),
                         &user.id,
@@ -7300,15 +7316,33 @@ async fn fetch_starred_snapshot_with_token(
     })
 }
 
+#[cfg(test)]
 async fn replace_starred_repos(
     state: &AppState,
     user_id: &str,
     repos: &[StarredRepoSnapshot],
 ) -> Result<()> {
+    replace_starred_repos_with_priority(
+        state,
+        user_id,
+        repos,
+        "starred_repos_replace",
+        SqliteWritePriority::Background,
+    )
+    .await
+}
+
+async fn replace_starred_repos_with_priority(
+    state: &AppState,
+    user_id: &str,
+    repos: &[StarredRepoSnapshot],
+    lane: &'static str,
+    priority: SqliteWritePriority,
+) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(&state.pool, lane, priority)
         .await
         .context("begin replace starred_repos tx")?;
     sqlx::query(r#"DELETE FROM starred_repos WHERE user_id = ?"#)
@@ -8238,8 +8272,9 @@ mod tests {
     use serde_json::{Value, json};
     use sqlx::{
         SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
+    use std::time::Duration;
     use url::Url;
 
     use super::{
@@ -13316,16 +13351,121 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    #[tokio::test]
+    async fn replace_starred_repos_surfaces_clear_failure_under_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("locked-star");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        replace_starred_repos(
+            state.as_ref(),
+            user_id.as_str(),
+            &[StarredRepoSnapshot {
+                repo_id: 101,
+                full_name: "octo/original".to_owned(),
+                owner_login: "octo".to_owned(),
+                name: "original".to_owned(),
+                description: None,
+                html_url: "https://github.com/octo/original".to_owned(),
+                stargazed_at: "2026-03-01T00:00:00Z".to_owned(),
+                is_private: false,
+                owner_avatar_url: None,
+                open_graph_image_url: None,
+                uses_custom_open_graph_image: false,
+            }],
+        )
+        .await
+        .expect("seed starred repos");
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let replacement_user_id = user_id.clone();
+        let replacement = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                replace_starred_repos(
+                    state.as_ref(),
+                    replacement_user_id.as_str(),
+                    &[StarredRepoSnapshot {
+                        repo_id: 102,
+                        full_name: "octo/replacement".to_owned(),
+                        owner_login: "octo".to_owned(),
+                        name: "replacement".to_owned(),
+                        description: None,
+                        html_url: "https://github.com/octo/replacement".to_owned(),
+                        stargazed_at: "2026-03-07T00:00:00Z".to_owned(),
+                        is_private: false,
+                        owner_avatar_url: None,
+                        open_graph_image_url: None,
+                        uses_custom_open_graph_image: false,
+                    }],
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        replacement
+            .await
+            .expect("join replacement task")
+            .expect("replace should succeed after the writer lock is released");
+
+        let count =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count replaced starred repos");
+        assert_eq!(count, 1);
+        let full_name: String = sqlx::query_scalar(
+            r#"
+            SELECT full_name
+            FROM starred_repos
+            WHERE user_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load replacement starred repo");
+        assert_eq!(full_name, "octo/replacement");
+    }
+
     async fn setup_pool() -> SqlitePool {
+        setup_pool_with_max_connections(1).await
+    }
+
+    async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
+        setup_pool_with_max_connections_and_wal(max_connections, Duration::from_secs(5)).await
+    }
+
+    async fn setup_pool_with_max_connections_and_wal(
+        max_connections: u32,
+        busy_timeout: Duration,
+    ) -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
         ));
         let options = SqliteConnectOptions::new()
             .filename(&database_path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(busy_timeout);
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(max_connections)
             .connect_with(options)
             .await
             .expect("create sqlite memory db");
