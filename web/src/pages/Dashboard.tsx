@@ -387,6 +387,7 @@ function joinSyncDetails(parts: string[]) {
 function accessSyncProgressFromStage(
 	stage:
 		| "waiting"
+		| "running"
 		| "star_refreshed"
 		| "release_summary"
 		| "social_summary"
@@ -394,6 +395,13 @@ function accessSyncProgressFromStage(
 	payload: TaskEventPayload = {},
 ): DashboardSyncProgress {
 	switch (stage) {
+		case "running":
+			return {
+				currentStep: 0,
+				totalSteps: ACCESS_SYNC_TOTAL_STEPS,
+				stageLabel: "后台任务已启动",
+				detail: "正在准备 Star 阶段",
+			};
 		case "star_refreshed": {
 			const repos = readPayloadNumber(payload, "repos");
 			return {
@@ -568,7 +576,7 @@ export function Dashboard(props: {
 		TaskStreamState[]
 	>([]);
 	const [accessSyncStage, setAccessSyncStage] = useState<
-		"idle" | "waiting" | "star_refreshed" | "completed" | "failed"
+		"idle" | "waiting" | "running" | "star_refreshed" | "completed" | "failed"
 	>(initialAccessTask ? "waiting" : "idle");
 	const [accessSyncProgress, setAccessSyncProgress] =
 		useState<DashboardSyncProgress | null>(
@@ -1536,6 +1544,17 @@ export function Dashboard(props: {
 			}
 		};
 
+		const onRunning = () => {
+			setAccessSyncStage((current) =>
+				current === "waiting" ? "running" : current,
+			);
+			setAccessSyncProgress((current) =>
+				current && current.currentStep > 0
+					? current
+					: accessSyncProgressFromStage("running"),
+			);
+		};
+
 		const onCompleted = (event: Event) => {
 			const payload = parsePayload(event as MessageEvent<string>);
 			const completedTaskId = accessTaskStream.taskId;
@@ -1594,6 +1613,7 @@ export function Dashboard(props: {
 		};
 
 		source.onopen = clearReconnectTimer;
+		source.addEventListener("task.running", onRunning);
 		source.addEventListener("task.progress", onProgress);
 		source.addEventListener("task.completed", onCompleted);
 		source.onerror = () => {
@@ -1610,6 +1630,7 @@ export function Dashboard(props: {
 
 		return () => {
 			clearReconnectTimer();
+			source.removeEventListener("task.running", onRunning);
 			source.removeEventListener("task.progress", onProgress);
 			source.removeEventListener("task.completed", onCompleted);
 			source.close();
@@ -2296,11 +2317,10 @@ export function Dashboard(props: {
 				!feed.loadingInitial &&
 				filteredItems.length === 0 ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-						{accessSyncStage === "waiting" ||
-						accessSyncStage === "star_refreshed" ? (
+						{accessSyncRunning ? (
 							<>
 								<h2 className="text-base font-semibold tracking-tight">
-									正在同步你的 GitHub 动态
+									正在同步你的 Star / Release
 								</h2>
 								<p className="text-muted-foreground mt-1 text-sm">
 									先展示服务端已有缓存，再补齐最新
