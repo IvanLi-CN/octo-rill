@@ -1752,7 +1752,7 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 
 	try {
 		await page.addInitScript(
-			({ taskId, starDelayMs, completeDelayMs }) => {
+			({ taskId, runningDelayMs, starDelayMs, completeDelayMs }) => {
 				class MockEventSource {
 					url: string;
 					readyState = 1;
@@ -1779,6 +1779,14 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 							}, 0),
 						);
 						if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+						this.timers.push(
+							window.setTimeout(() => {
+								this.dispatch("task.running", {
+									task_id: taskId,
+									status: "running",
+								});
+							}, runningDelayMs),
+						);
 						this.timers.push(
 							window.setTimeout(() => {
 								this.dispatch("task.progress", {
@@ -1836,7 +1844,12 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 
 				window.EventSource = MockEventSource as unknown as typeof EventSource;
 			},
-			{ taskId: "task-access-1", starDelayMs: 180, completeDelayMs: 3200 },
+			{
+				taskId: "task-access-1",
+				runningDelayMs: 60,
+				starDelayMs: 2200,
+				completeDelayMs: 4300,
+			},
 		);
 
 		await page.route("**/api/**", async (route) => {
@@ -1954,6 +1967,12 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		});
 
 		await page.goto("/");
+
+		await page.getByRole("button", { name: "同步" }).hover();
+		const tooltip = page.locator('[data-slot="tooltip-content"]').first();
+		await expect(tooltip).toBeVisible();
+		await expect(tooltip).toContainText("后台任务已启动");
+		await expect(tooltip).toContainText("0/4");
 
 		await expect(page.getByText("Cached release")).toBeVisible();
 		await expect(page.getByText("Fresh release")).toHaveCount(0, {

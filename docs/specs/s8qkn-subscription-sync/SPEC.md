@@ -233,6 +233,7 @@
 
 - 首屏仍先加载旧 feed / brief / inbox。
 - 若 `me.access_sync.task_id` 存在，则立即连用户侧 SSE。
+- 收到 `task.running` 时，Dashboard Header 显示独立 warmup 态：`后台任务已启动 / 正在准备 Star 阶段`，但 4 步业务进度仍保持 `0/4`。
 - 收到 `star_refreshed` 时执行第一次 `refreshAll()`，以显示服务端已知的共享缓存。
 - 收到 `task.completed(status=succeeded)` 时执行第二次 `refreshAll()`。
 - 当 access sync 进行中且 feed 为空时，空态显示“正在同步你的 Star / Release”。
@@ -251,6 +252,10 @@
 - Given 系统已有最近三次 `sync.subscriptions` 历史
   When 打开 Admin Jobs 定时任务页
   Then 页面展示最近三次非跳过链路用时；点击用时项会打开对应的订阅同步详情页面。
+
+- Given 用户已经有旧缓存 Release
+  When `sync.access_refresh` 先收到 `task.running` 再收到 `star_refreshed`
+  Then Dashboard Header 先显示 `后台任务已启动 / 正在准备 Star 阶段`，再在 `star_refreshed` 后切到 `1/4`
 
 - Given 用户已经有旧缓存 Release
   When `sync.access_refresh` 发出 `star_refreshed`
@@ -301,6 +306,21 @@
   Then 阶段总览从事件派生实时统计，不应把已完成阶段显示为等待或 `0 / 0`。
 
 ## Visual Evidence
+
+source_type=storybook_canvas
+target_program=mock-only
+capture_scope=element
+requested_viewport=1440x900
+viewport_strategy=storybook-viewport
+sensitive_exclusion=N/A
+submission_gate=approved
+story_id_or_title=Pages/Dashboard Header / Warmup
+state=task.running warmup
+evidence_note=验证 access sync 在 task.running 到 star_refreshed 之间显示独立 warmup 态：后台任务已启动 / 正在准备 Star 阶段 / 0/4。
+
+PR: include
+![Dashboard header warmup](./assets/dashboard-header-warmup.png)
+
 
 source_type=storybook_canvas
 target_program=mock-only
