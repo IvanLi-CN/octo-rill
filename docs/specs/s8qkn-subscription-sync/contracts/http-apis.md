@@ -121,6 +121,8 @@ Behavior:
 Event payload contract:
 
 - `task.running`
+  - Marks the task as accepted and actively running before the first business-stage progress event arrives.
+  - Dashboard warmup UI should show `后台任务已启动 / 正在准备 Star 阶段` with `0/4` until `task.progress(stage=star_refreshed)` lands.
 - `task.progress`
   - `stage=star_refreshed`
   - `stage=release_attached`
