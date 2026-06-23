@@ -233,6 +233,7 @@
 
 - 首屏仍先加载旧 feed / brief / inbox。
 - 若 `me.access_sync.task_id` 存在，则立即连用户侧 SSE。
+- 用户点击 Sync 后，Dashboard Header 应立即打开进度气泡并显示等待 / 连接中的状态，不必等 hover；收到 `task.running` 后再切到 warmup 文案。
 - 收到 `task.running` 时，Dashboard Header 显示独立 warmup 态：`后台任务已启动 / 正在准备 Star 阶段`，但 4 步业务进度仍保持 `0/4`。
 - 收到 `star_refreshed` 时执行第一次 `refreshAll()`，以显示服务端已知的共享缓存。
 - 收到 `task.completed(status=succeeded)` 时执行第二次 `refreshAll()`。
@@ -252,6 +253,10 @@
 - Given 系统已有最近三次 `sync.subscriptions` 历史
   When 打开 Admin Jobs 定时任务页
   Then 页面展示最近三次非跳过链路用时；点击用时项会打开对应的订阅同步详情页面。
+
+- Given 用户已经有旧缓存 Release
+  When 用户点击 Sync 后 task 还未进入 `running`
+  Then Dashboard Header 已经展示进度气泡，不需要把指针移出再移入按钮才能看到状态
 
 - Given 用户已经有旧缓存 Release
   When `sync.access_refresh` 先收到 `task.running` 再收到 `star_refreshed`

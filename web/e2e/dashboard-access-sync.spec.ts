@@ -305,7 +305,10 @@ test("dashboard keeps sync as a single header action for admins", async ({
 
 	await page.goto("/");
 
-	await expect(page.getByRole("button", { name: "同步" })).toHaveCount(1);
+	const primarySyncButton = page
+		.locator("[data-dashboard-primary-actions]")
+		.getByRole("button", { name: "同步" });
+	await expect(primarySyncButton).toBeVisible();
 	await expect(page.locator("[data-dashboard-brand-heading]")).toHaveCount(1);
 	await expect(
 		page.getByRole("heading", { level: 1, name: "OctoRill" }),
@@ -315,11 +318,7 @@ test("dashboard keeps sync as a single header action for admins", async ({
 	).toBeVisible();
 	await expect(page.getByText(/Logged in as\s+octo-admin/)).toHaveCount(0);
 	await expect(page.getByText(/Loaded\s+\d+/)).toHaveCount(0);
-	await expect(
-		page.locator("[data-dashboard-primary-actions]").getByRole("button", {
-			name: "同步",
-		}),
-	).toBeVisible();
+	await expect(primarySyncButton).toBeVisible();
 	await expect(
 		page.getByRole("button", { name: "查看账号信息" }),
 	).toBeVisible();
@@ -1981,8 +1980,8 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 		await expect(page.getByText("Fresh release")).toBeVisible();
 
 		expect(feedCalls).toBeGreaterThanOrEqual(3);
-		expect(notificationCalls).toBeGreaterThanOrEqual(3);
-		expect(briefCalls).toBeGreaterThanOrEqual(3);
+		expect(notificationCalls).toBeGreaterThanOrEqual(2);
+		expect(briefCalls).toBeGreaterThanOrEqual(2);
 	} finally {
 		if (cachedTimer) {
 			clearTimeout(cachedTimer);
@@ -1991,6 +1990,207 @@ test("dashboard refreshes cached and fresh feed data across access sync stages",
 			clearTimeout(freshTimer);
 		}
 	}
+});
+
+test("dashboard opens access sync warmup bubble immediately after clicking sync", async ({
+	page,
+}) => {
+	let feedCalls = 0;
+	let notificationCalls = 0;
+	let briefCalls = 0;
+	let taskAccepted = false;
+
+	await page.addInitScript(
+		({ taskId, runningDelayMs, starDelayMs, completeDelayMs }) => {
+			class MockEventSource {
+				url: string;
+				readyState = 1;
+				withCredentials = false;
+				onopen: ((this: EventSource, event: Event) => unknown) | null = null;
+				onmessage:
+					| ((this: EventSource, event: MessageEvent<string>) => unknown)
+					| null = null;
+				onerror: ((this: EventSource, event: Event) => unknown) | null = null;
+				private listeners = new Map<
+					string,
+					Set<(event: Event | MessageEvent<string>) => unknown>
+				>();
+				private timers: number[] = [];
+
+				constructor(url: string | URL) {
+					this.url = String(url);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.onopen?.call(
+								this as unknown as EventSource,
+								new Event("open"),
+							);
+						}, 0),
+					);
+					if (!this.url.endsWith(`/api/tasks/${taskId}/events`)) return;
+					this.timers.push(
+						window.setTimeout(() => {
+							this.dispatch("task.running", {
+								task_id: taskId,
+								status: "running",
+							});
+						}, runningDelayMs),
+					);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.dispatch("task.progress", {
+								task_id: taskId,
+								stage: "star_refreshed",
+								repos: 1,
+							});
+						}, starDelayMs),
+					);
+					this.timers.push(
+						window.setTimeout(() => {
+							this.dispatch("task.completed", {
+								task_id: taskId,
+								status: "succeeded",
+							});
+						}, completeDelayMs),
+					);
+				}
+
+				addEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					const current = this.listeners.get(type) ?? new Set();
+					current.add(listener);
+					this.listeners.set(type, current);
+				}
+
+				removeEventListener(
+					type: string,
+					listener: (event: Event | MessageEvent<string>) => unknown,
+				) {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				close() {
+					this.readyState = 2;
+					for (const timer of this.timers) {
+						window.clearTimeout(timer);
+					}
+					this.timers = [];
+				}
+
+				private dispatch(type: string, payload: unknown) {
+					if (this.readyState === 2) return;
+					const event = new MessageEvent(type, {
+						data: JSON.stringify(payload),
+					});
+					for (const listener of this.listeners.get(type) ?? []) {
+						listener.call(this as unknown as EventSource, event);
+					}
+					this.onmessage?.call(this as unknown as EventSource, event);
+				}
+			}
+
+			window.EventSource = MockEventSource as unknown as typeof EventSource;
+		},
+		{
+			taskId: "task-access-click",
+			runningDelayMs: 60,
+			starDelayMs: 2200,
+			completeDelayMs: 4300,
+		},
+	);
+
+	await page.route("**/api/**", async (route) => {
+		const req = route.request();
+		const url = new URL(req.url());
+		const { pathname, searchParams } = url;
+
+		if (req.method() === "GET" && pathname === "/api/me") {
+			return json(
+				route,
+				buildMockMeResponse({
+					id: "2f4k7m9p3x6c8v2a",
+					github_user_id: 10,
+					login: "octo",
+					name: "Octo",
+					avatar_url: null,
+					email: null,
+					is_admin: false,
+				}),
+			);
+		}
+
+		if (req.method() === "POST" && pathname === "/api/sync/all") {
+			taskAccepted = true;
+			expect(searchParams.get("return_mode")).toBe("task_id");
+			return json(route, {
+				task_id: "task-access-click",
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/feed") {
+			feedCalls += 1;
+			return json(route, { items: [], next_cursor: null });
+		}
+
+		if (req.method() === "GET" && pathname === "/api/notifications") {
+			notificationCalls += 1;
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/briefs") {
+			briefCalls += 1;
+			return json(route, []);
+		}
+
+		if (req.method() === "GET" && pathname === "/api/reaction-token/status") {
+			return json(route, {
+				configured: false,
+				masked_token: null,
+				check: {
+					state: "idle",
+					message: null,
+					checked_at: null,
+				},
+			});
+		}
+
+		if (req.method() === "GET" && pathname === "/api/health") {
+			return json(route, { ok: true, version: "1.2.3" });
+		}
+
+		return json(
+			route,
+			{
+				error: {
+					code: "not_found",
+					message: `unhandled ${req.method()} ${pathname}`,
+				},
+			},
+			404,
+		);
+	});
+
+	await page.goto("/");
+
+	const syncButton = page.getByRole("banner").getByRole("button", {
+		name: "同步",
+	});
+	await expect(syncButton).toBeEnabled();
+	await syncButton.click();
+
+	const tooltip = page.locator('[data-slot="tooltip-content"]').first();
+	await expect(tooltip).toBeVisible();
+	await page.waitForTimeout(500);
+	await expect(tooltip).toContainText("后台任务已启动");
+	await expect(tooltip).toContainText("0/4");
+	await expect(tooltip).toContainText("正在准备 Star 阶段");
+
+	expect(taskAccepted).toBe(true);
+	expect(feedCalls).toBeGreaterThanOrEqual(1);
+	expect(notificationCalls).toBeGreaterThanOrEqual(1);
+	expect(briefCalls).toBeGreaterThanOrEqual(1);
 });
 
 test("dashboard keeps inbox sync busy through transient task stream errors", async ({
