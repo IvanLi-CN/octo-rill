@@ -1036,11 +1036,7 @@ export function Dashboard(props: {
 				const target = currentFeedNotices.find(
 					(notice) => notice.boundaryId === boundaryId,
 				);
-				if (
-					!target ||
-					!target.hydrated ||
-					target.boundaryAfterKey !== undefined
-				) {
+				if (!target?.hydrated || target.boundaryAfterKey !== undefined) {
 					return current;
 				}
 				if (boundaryAfterKey === null) {

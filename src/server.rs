@@ -20,6 +20,7 @@ use sqlx::{
 };
 use time::Duration;
 use tokio::task::AbortHandle;
+use tower::ServiceBuilder;
 use tower::ServiceExt;
 use tower_http::{
     cors::CorsLayer,
@@ -35,8 +36,8 @@ use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::session_store::CoordinatedSqliteSessionStore;
 use crate::state::AppState;
 use crate::{
-    admin_runtime, ai, api, auth, config::AppConfig, jobs, runtime, state, sync, translations,
-    version,
+    admin_runtime, ai, api, auth, config::AppConfig, jobs, observability, runtime, state, sync,
+    translations, version,
 };
 
 const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
@@ -69,6 +70,7 @@ const STATIC_ASSET_EXTENSIONS: &[&str] = &[
 ];
 
 pub async fn serve(config: AppConfig) -> Result<()> {
+    observability::set_logging_thresholds(config.logging.clone());
     ensure_sqlite_dir(&config.database_url)?;
     ensure_dir_exists(&config.task_log_dir)?;
 
@@ -392,7 +394,21 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::PATCH])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
-    let app = app.layer(cors).layer(TraceLayer::new_for_http());
+    let (set_request_id, propagate_request_id) = observability::request_id_layers();
+    let access_log = middleware::from_fn(observability::access_log_middleware);
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|request: &Request| observability::request_trace_span(request))
+        .on_request(())
+        .on_response(())
+        .on_failure(());
+    let app = app.layer(
+        ServiceBuilder::new()
+            .layer(set_request_id)
+            .layer(trace_layer)
+            .layer(access_log)
+            .layer(cors)
+            .layer(propagate_request_id),
+    );
 
     runtime::register_runtime_owner(app_state.as_ref()).await?;
     let runtime_owner_heartbeat = runtime::spawn_runtime_owner_heartbeat(app_state.clone());
@@ -863,12 +879,19 @@ mod tests {
     use axum::{
         Router,
         body::Body,
-        http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+        http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header},
+        middleware,
         routing::get,
     };
-    use std::{fs, time::SystemTime};
-    use tower::ServiceExt;
+    use serde_json::Value;
+    use std::{
+        fs, io,
+        sync::{Arc, Mutex as StdMutex, OnceLock},
+        time::SystemTime,
+    };
+    use tower::{ServiceBuilder, ServiceExt};
     use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+    use tracing_subscriber::fmt::MakeWriter;
 
     async fn create_test_session(session: Session) -> StatusCode {
         session
@@ -900,6 +923,129 @@ mod tests {
             .with_name(cookie_name.to_owned())
             .with_same_site(SameSite::Lax)
             .with_expiry(session_inactivity_expiry())
+    }
+
+    fn observability_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct LoggingThresholdTestGuard;
+
+    impl LoggingThresholdTestGuard {
+        fn new(thresholds: crate::observability::LoggingThresholds) -> Self {
+            crate::observability::set_logging_thresholds(thresholds);
+            Self
+        }
+    }
+
+    impl Drop for LoggingThresholdTestGuard {
+        fn drop(&mut self) {
+            crate::observability::set_logging_thresholds(
+                crate::observability::LoggingThresholds::default(),
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer {
+        inner: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    struct SharedLogWriter {
+        inner: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl io::Write for SharedLogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner
+                .lock()
+                .expect("log buffer lock poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedLogWriter {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    impl SharedLogBuffer {
+        fn json_events(&self) -> Vec<Value> {
+            let bytes = self.inner.lock().expect("log buffer lock poisoned").clone();
+            String::from_utf8(bytes)
+                .expect("captured logs should be utf-8")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("captured line should be valid json"))
+                .collect()
+        }
+    }
+
+    fn build_access_log_test_app(status: StatusCode, delay_ms: u64) -> Router {
+        let (set_request_id, propagate_request_id) = crate::observability::request_id_layers();
+        let access_log = middleware::from_fn(crate::observability::access_log_middleware);
+        Router::new()
+            .route(
+                "/users/{user_id}",
+                get(move || async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    status
+                }),
+            )
+            .layer(
+                ServiceBuilder::new()
+                    .layer(set_request_id)
+                    .layer(access_log)
+                    .layer(propagate_request_id),
+            )
+    }
+
+    async fn run_request_with_captured_logs(
+        app: Router,
+        request: Request<Body>,
+    ) -> (axum::response::Response, Vec<Value>) {
+        let buffer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_target(false)
+            .with_writer(buffer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let response = app.oneshot(request).await.expect("test response");
+        drop(_guard);
+        (response, buffer.json_events())
+    }
+
+    fn http_access_events(events: &[Value]) -> Vec<&Value> {
+        events
+            .iter()
+            .filter(|event| event.get("event").and_then(Value::as_str) == Some("http.access"))
+            .collect()
+    }
+
+    fn json_u64_field(value: &Value, field: &str) -> Option<u64> {
+        value.get(field).and_then(|raw| match raw {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.parse::<u64>().ok(),
+            _ => None,
+        })
     }
 
     #[tokio::test]
@@ -1047,6 +1193,7 @@ mod tests {
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+            logging: crate::observability::LoggingThresholds::default(),
         }
     }
 
@@ -1130,6 +1277,156 @@ mod tests {
             .expect("clear set-cookie header");
         assert!(clear_cookie.contains("octo_rill_sid_test="));
         assert!(clear_cookie.contains("Max-Age=0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supplied_request_id_is_echoed_back_to_client() {
+        let _lock = observability_test_lock().lock().await;
+        let _thresholds =
+            LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds::default());
+        let app = build_access_log_test_app(StatusCode::OK, 0);
+
+        let (response, _) = run_request_with_captured_logs(
+            app,
+            Request::builder()
+                .uri("/users/42")
+                .header("x-request-id", "req-explicit-123")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("req-explicit-123")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_request_id_is_generated_and_echoed_back_to_client() {
+        let _lock = observability_test_lock().lock().await;
+        let _thresholds =
+            LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds::default());
+        let app = build_access_log_test_app(StatusCode::OK, 0);
+
+        let (response, _) = run_request_with_captured_logs(
+            app,
+            Request::builder()
+                .uri("/users/42")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await;
+
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("generated x-request-id header");
+        assert!(!request_id.trim().is_empty());
+        assert_ne!(request_id, "-");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_success_request_does_not_emit_access_log() {
+        let _lock = observability_test_lock().lock().await;
+        let _thresholds =
+            LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds::default());
+        let app = build_access_log_test_app(StatusCode::OK, 0);
+
+        let (_, events) = run_request_with_captured_logs(
+            app,
+            Request::builder()
+                .uri("/users/42?email=alice@example.com&token=top-secret")
+                .header("x-request-id", "req-fast-123")
+                .header(header::COOKIE, "session=super-secret")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await;
+
+        assert!(http_access_events(&events).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_success_request_emits_sanitized_access_log() {
+        let _lock = observability_test_lock().lock().await;
+        let _thresholds = LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds {
+            http_slow_ms: 1,
+            ..crate::observability::LoggingThresholds::default()
+        });
+        let app = build_access_log_test_app(StatusCode::OK, 5);
+
+        let (_, events) = run_request_with_captured_logs(
+            app,
+            Request::builder()
+                .uri("/users/42?email=alice@example.com&token=top-secret")
+                .header("x-request-id", "req-slow-123")
+                .header(header::COOKIE, "session=super-secret")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await;
+
+        let access_events = http_access_events(&events);
+        assert_eq!(access_events.len(), 1);
+        let access_event = access_events[0];
+        let serialized = serde_json::to_string(access_event).expect("serialize access event");
+
+        assert_eq!(
+            access_event.get("request_id"),
+            Some(&Value::from("req-slow-123"))
+        );
+        assert_eq!(access_event.get("method"), Some(&Value::from("GET")));
+        assert_eq!(
+            access_event.get("route"),
+            Some(&Value::from("/users/{user_id}"))
+        );
+        assert_eq!(access_event.get("status"), Some(&Value::from(200)));
+        assert!(
+            json_u64_field(access_event, "latency_ms").expect("latency_ms should be present") >= 1
+        );
+        assert!(serialized.contains("\"threshold_ms\":1"));
+        assert!(!serialized.contains("alice@example.com"));
+        assert!(!serialized.contains("top-secret"));
+        assert!(!serialized.contains("session=super-secret"));
+        assert!(!serialized.contains("/users/42?"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_error_request_emits_access_log_even_when_fast() {
+        let _lock = observability_test_lock().lock().await;
+        let _thresholds =
+            LoggingThresholdTestGuard::new(crate::observability::LoggingThresholds::default());
+        let app = build_access_log_test_app(StatusCode::BAD_REQUEST, 0);
+
+        let (_, events) = run_request_with_captured_logs(
+            app,
+            Request::builder()
+                .uri("/users/42")
+                .header("x-request-id", "req-error-123")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await;
+
+        let access_events = http_access_events(&events);
+        assert_eq!(access_events.len(), 1);
+        let access_event = access_events[0];
+        assert_eq!(
+            access_event.get("request_id"),
+            Some(&Value::from("req-error-123"))
+        );
+        assert_eq!(
+            access_event.get("route"),
+            Some(&Value::from("/users/{user_id}"))
+        );
+        assert_eq!(access_event.get("status"), Some(&Value::from(400)));
+        assert!(access_event.get("threshold_ms").is_none());
     }
 
     #[tokio::test]

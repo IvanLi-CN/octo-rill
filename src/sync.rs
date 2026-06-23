@@ -1155,14 +1155,17 @@ pub async fn sync_social_activity(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.social.owned_repo_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync social activity: skip owned repo snapshot"
                 );
                 source_errors.push(format!(
-                    "owned_repos(@{}, {}): {}",
-                    connection.login, err.reason_code, err.message
+                    "owned_repos(conn:{}, {}): {}",
+                    connection.id, err.reason_code, err.message
                 ));
             }
         }
@@ -1176,14 +1179,17 @@ pub async fn sync_social_activity(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.social.followers_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync social activity: skip followers snapshot"
                 );
                 source_errors.push(format!(
-                    "followers(@{}, {}): {}",
-                    connection.login, err.reason_code, err.message
+                    "followers(conn:{}, {}): {}",
+                    connection.id, err.reason_code, err.message
                 ));
             }
         }
@@ -1204,14 +1210,17 @@ pub async fn sync_social_activity(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.social.feed_activity_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync social activity: skip feed activity events snapshot"
                 );
                 source_errors.push(format!(
-                    "feed_events(@{}, {}): {}",
-                    connection.login, err.reason_code, err.message
+                    "feed_events(conn:{}, {}): {}",
+                    connection.id, err.reason_code, err.message
                 ));
             }
         }
@@ -1232,14 +1241,17 @@ pub async fn sync_social_activity(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.social.discussion_announcements_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync social activity: skip discussion announcements snapshot"
                 );
                 source_errors.push(format!(
-                    "discussion_announcements(@{}, {}): {}",
-                    connection.login, err.reason_code, err.message
+                    "discussion_announcements(conn:{}, {}): {}",
+                    connection.id, err.reason_code, err.message
                 ));
             }
         }
@@ -1816,9 +1828,12 @@ async fn refresh_owned_repo_release_visibility(state: &AppState, user_id: &str) 
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.releases.owned_repo_visibility_refresh",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync releases: skip owned repo visibility refresh for github connection"
                 );
                 last_error = Some(err);
@@ -7143,9 +7158,12 @@ async fn fetch_starred_snapshot(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.starred.connection_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync starred: skip github connection"
                 );
                 last_error = Some(err);
@@ -7475,10 +7493,13 @@ async fn fetch_repo_releases_for_user(
                     );
                 }
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.releases.repo_read",
                     user_id,
-                    login = connection.login.as_str(),
+                    connection_id = connection.id.as_str(),
                     repo = repo_full_name,
+                    error_kind = err.reason_code,
+                    error_chain = %err.message,
                     "sync releases: github connection could not read repo releases"
                 );
                 last_error = Some(err);
@@ -7761,10 +7782,12 @@ pub async fn sync_notifications(
             }
             Err(err) => {
                 tracing::warn!(
-                    ?err,
+                    event = "upstream.call",
+                    operation = "sync.notifications.connection_snapshot",
                     user_id,
-                    login = connection.login.as_str(),
                     connection_id = connection.id.as_str(),
+                    error_kind = "connection_snapshot_failed",
+                    error_chain = %err,
                     "sync notifications: skip github connection"
                 );
                 last_error = Some(err);
@@ -13505,6 +13528,7 @@ mod tests {
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+            logging: crate::observability::LoggingThresholds::default(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
         let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
