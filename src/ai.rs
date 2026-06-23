@@ -19,7 +19,7 @@ use crate::{
     admin_runtime,
     briefs::{self, DailyWindow as UserDailyWindow},
     config::AiConfig,
-    jobs, local_id,
+    jobs, local_id, observability,
     release_links::{
         InternalReleaseRef, build_internal_brief_release_href_from_html_url,
         parse_internal_release_ref, parse_release_locator_from_github_release_url,
@@ -565,7 +565,13 @@ pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'
     }
 
     if let Err(err) = refresh_model_limits(state, false).await {
-        tracing::warn!(?err, "model catalog lazy refresh failed");
+        tracing::warn!(
+            event = "upstream.call",
+            operation = "ai.model_catalog.lazy_refresh",
+            error_kind = "refresh_failed",
+            error_chain = %observability::error_chain_summary(err.as_ref()),
+            "model catalog lazy refresh failed"
+        );
     }
 
     {
@@ -658,7 +664,13 @@ pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::Abort
         loop {
             interval.tick().await;
             if let Err(err) = refresh_model_limits(state.as_ref(), true).await {
-                tracing::warn!(?err, "model catalog scheduled refresh failed");
+                tracing::warn!(
+                    event = "upstream.call",
+                    operation = "ai.model_catalog.scheduled_refresh",
+                    error_kind = "refresh_failed",
+                    error_chain = %observability::error_chain_summary(err.as_ref()),
+                    "model catalog scheduled refresh failed"
+                );
             }
         }
     });
@@ -686,7 +698,13 @@ pub fn spawn_llm_call_retention_task(state: Arc<AppState>) -> tokio::task::Abort
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!(?err, "llm call retention cleanup failed");
+                    tracing::warn!(
+                        event = "sqlite.write",
+                        operation = "ai.llm_call_retention_cleanup",
+                        error_kind = "cleanup_failed",
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
+                        "llm call retention cleanup failed"
+                    );
                 }
             }
             tokio::time::sleep(LLM_CALL_LOG_CLEANUP_INTERVAL).await;
@@ -699,7 +717,13 @@ pub fn spawn_llm_call_recovery_task(state: Arc<AppState>) -> tokio::task::AbortH
     let handle = tokio::spawn(async move {
         loop {
             if let Err(err) = recover_runtime_state(state.as_ref()).await {
-                tracing::warn!(?err, "llm call recovery sweep failed");
+                tracing::warn!(
+                    event = "sqlite.write",
+                    operation = "ai.llm_call_recovery_sweep",
+                    error_kind = "recovery_failed",
+                    error_chain = %observability::error_chain_summary(err.as_ref()),
+                    "llm call recovery sweep failed"
+                );
             }
             tokio::time::sleep(runtime::RUNTIME_LEASE_HEARTBEAT_INTERVAL).await;
         }
@@ -897,15 +921,6 @@ struct ProjectSummaryItem {
     summary_bullets: Vec<String>,
 }
 
-fn truncate_chars_lossy(bytes: &[u8], max_chars: usize) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    let mut out: String = s.chars().take(max_chars).collect();
-    if s.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
-}
-
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars {
@@ -1000,7 +1015,7 @@ fn extract_sse_error_message(body: &[u8]) -> Option<String> {
 fn extract_plain_text_error_message(body: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(body);
     let trimmed = text.trim();
-    (!trimmed.is_empty()).then(|| truncate_chars(trimmed, 400))
+    (!trimmed.is_empty()).then_some("upstream_plain_text_error".to_owned())
 }
 
 fn ai_response_message_is_non_retryable(message: &str) -> bool {
@@ -1782,9 +1797,12 @@ async fn reconcile_admin_override_after_persist(
         Ok(()) => state.llm_scheduler.clear_admin_override(call_id).await,
         Err(err) => {
             tracing::warn!(
-                ?err,
+                event = "sqlite.write",
+                operation = "ai.llm_call_persist_update",
                 call_id,
                 context = failure_context,
+                error_kind = "persist_failed",
+                error_chain = %observability::error_chain_summary(err.as_ref()),
                 "llm call persist update failed"
             );
         }
@@ -1860,7 +1878,17 @@ async fn chat_completion_once(
             }
         })?;
     let first_token_wait_ms =
-        Some(i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX));
+        i64::try_from(response_wait_started_at.elapsed().as_millis()).unwrap_or(i64::MAX);
+    if first_token_wait_ms >= state.config.logging.upstream_slow_ms as i64 {
+        tracing::info!(
+            event = "upstream.call",
+            operation = "ai.chat_completions",
+            elapsed_ms = first_token_wait_ms,
+            threshold_ms = state.config.logging.upstream_slow_ms,
+            "ai upstream responded slowly"
+        );
+    }
+    let first_token_wait_ms = Some(first_token_wait_ms);
 
     let status = resp.status();
     let retry_after = retry_after_delay(resp.headers());
@@ -1881,7 +1909,7 @@ async fn chat_completion_once(
         })?;
 
     if !status.is_success() {
-        let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
+        let msg = extract_error_message(&body).unwrap_or_else(|| "upstream_error".to_owned());
         return Err(ChatCompletionAttemptError {
             err: anyhow!("AI returned {status}: {msg}"),
             retryable: is_retryable_status(status) && !ai_response_message_is_non_retryable(&msg),
@@ -1898,7 +1926,7 @@ async fn chat_completion_once(
         && !content_type_lower.contains("application/json")
         && !content_type_lower.contains("+json")
     {
-        let msg = extract_error_message(&body).unwrap_or_else(|| truncate_chars_lossy(&body, 400));
+        let msg = extract_error_message(&body).unwrap_or_else(|| "non_json_success".to_owned());
         return Err(ChatCompletionAttemptError {
             err: anyhow!(
                 "AI returned non-json success response (content-type {content_type}): {msg}"
@@ -1914,7 +1942,7 @@ async fn chat_completion_once(
             err: anyhow!(
                 "AI response json decode failed: {}",
                 extract_error_message(&body)
-                    .unwrap_or_else(|| format!("{err}; body={}", truncate_chars_lossy(&body, 400)))
+                    .unwrap_or_else(|| format!("{err}; upstream_json_decode_failed"))
             ),
             retryable: extract_error_message(&body)
                 .map(|msg| !ai_response_message_is_non_retryable(&msg))
@@ -1988,7 +2016,13 @@ pub async fn chat_completion(
     {
         Ok(()) => true,
         Err(err) => {
-            tracing::warn!(?err, "llm call log insert failed");
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "ai.llm_call_log_insert",
+                error_kind = "insert_failed",
+                error_chain = %observability::error_chain_summary(err.as_ref()),
+                "llm call log insert failed"
+            );
             false
         }
     };
@@ -2240,13 +2274,17 @@ pub async fn chat_completion(
                 }
                 heartbeat.stop().await;
                 tracing::warn!(
+                    event = "upstream.call",
+                    operation = "ai.chat_completions",
                     attempt,
                     max_attempts,
                     retries_left = max_attempts.saturating_sub(attempt),
+                    elapsed_ms = first_token_wait_ms.unwrap_or_default(),
                     retry_after_ms = retry_after
                         .map(|delay| i64::try_from(delay.as_millis()).unwrap_or(i64::MAX)),
                     retry_delay_ms = i64::try_from(retry_delay.as_millis()).unwrap_or(i64::MAX),
-                    ?err,
+                    error_kind = "request_failed",
+                    error_chain = %observability::error_chain_summary(err.as_ref()),
                     "ai request failed; sleeping before retry"
                 );
                 tokio::time::sleep(retry_delay).await;
@@ -3448,11 +3486,20 @@ async fn summarize_projects_with_ai(
                 if ai_error_is_non_retryable(&err) {
                     abort_remaining_batches = true;
                     tracing::warn!(
-                        ?err,
+                        event = "upstream.call",
+                        operation = "ai.project_batch_summary",
+                        error_kind = "non_retryable_upstream_error",
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
                         "project batch summary upstream error is non-retryable; skipping per-repo fallback"
                     );
                 } else {
-                    tracing::warn!(?err, "project batch summary failed; fallback to per-repo");
+                    tracing::warn!(
+                        event = "upstream.call",
+                        operation = "ai.project_batch_summary",
+                        error_kind = "summary_failed",
+                        error_chain = %observability::error_chain_summary(err.as_ref()),
+                        "project batch summary failed; fallback to per-repo"
+                    );
                 }
             }
         }
@@ -5460,6 +5507,7 @@ mod tests {
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: crate::briefs::DEFAULT_DAILY_BRIEF_TIME_ZONE.to_owned(),
+            logging: crate::observability::LoggingThresholds::default(),
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
         let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
@@ -5823,6 +5871,37 @@ mod tests {
                 .to_string()
                 .contains("AppChatReverse: Chat failed, 401")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_once_redacts_plain_text_error_response_body() {
+        let base_url = spawn_test_ai_server(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/plain; charset=utf-8",
+                    )],
+                    "temporary upstream failure email=alice@example.com token=top-secret",
+                )
+            }),
+        ))
+        .await;
+        let state = setup_llm_state_with_ai(Some(base_url)).await;
+        let ai = state.config.ai.clone().expect("test ai config");
+
+        let err = chat_completion_once(state.as_ref(), &ai, "system", "user", 128)
+            .await
+            .expect_err("plain text upstream error should fail");
+
+        assert!(err.retryable);
+        let error_text = err.err.to_string();
+        assert!(error_text.contains("upstream_plain_text_error"));
+        assert!(!error_text.contains("alice@example.com"));
+        assert!(!error_text.contains("top-secret"));
+        assert!(!error_text.contains("token="));
     }
 
     #[tokio::test]
