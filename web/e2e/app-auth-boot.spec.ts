@@ -296,6 +296,8 @@ async function installAppAuthMocks(page: Page, options: AppAuthMockOptions) {
 						email: "admin@example.com",
 						is_admin: true,
 						is_disabled: false,
+						repo_total: 12,
+						include_own_releases: true,
 						last_active_at: "2026-04-15T08:00:00Z",
 						created_at: "2026-04-15T08:00:00Z",
 						updated_at: "2026-04-15T08:00:00Z",

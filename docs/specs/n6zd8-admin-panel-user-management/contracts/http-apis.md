@@ -42,6 +42,9 @@
       "email": null,
       "is_admin": true,
       "is_disabled": false,
+      "repo_total": 12,
+      "include_own_releases": true,
+      "last_active_at": "2026-06-23T08:00:00Z",
       "created_at": "2026-02-25T01:00:00Z",
       "updated_at": "2026-02-25T01:00:00Z"
     }
@@ -51,6 +54,12 @@
   "total": 1
 }
 ```
+
+### Item semantics
+
+- `repo_total`: deduplicated repository count across `starred_repos ∪ owned_repo_star_baselines`, grouped by `repo_id`.
+- `include_own_releases`: whether the user currently includes owned-repository baselines in release visibility.
+- `last_active_at`: optional latest protected-session activity timestamp.
 
 ## New: `PATCH /api/admin/users/{user_id}`
 
