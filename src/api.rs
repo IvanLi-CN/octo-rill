@@ -508,6 +508,8 @@ pub struct AdminUserItem {
     email: Option<String>,
     is_admin: bool,
     is_disabled: bool,
+    repo_total: i64,
+    include_own_releases: bool,
     last_active_at: Option<String>,
     created_at: String,
     updated_at: String,
@@ -643,24 +645,38 @@ pub async fn admin_list_users(
 
     let items = sqlx::query_as::<_, AdminUserItem>(
         r#"
+        WITH repo_totals AS (
+          SELECT
+            repo_sources.user_id,
+            COUNT(DISTINCT repo_sources.repo_id) AS repo_total
+          FROM (
+            SELECT user_id, repo_id FROM starred_repos
+            UNION ALL
+            SELECT user_id, repo_id FROM owned_repo_star_baselines
+          ) repo_sources
+          GROUP BY repo_sources.user_id
+        )
         SELECT
-          id,
-          github_user_id,
-          login,
-          name,
-          avatar_url,
-          email,
-          is_admin,
-          is_disabled,
-          last_active_at,
-          created_at,
-          updated_at
+          users.id,
+          users.github_user_id,
+          users.login,
+          users.name,
+          users.avatar_url,
+          users.email,
+          users.is_admin,
+          users.is_disabled,
+          COALESCE(repo_totals.repo_total, 0) AS repo_total,
+          users.include_own_releases,
+          users.last_active_at,
+          users.created_at,
+          users.updated_at
         FROM users
+        LEFT JOIN repo_totals ON repo_totals.user_id = users.id
         WHERE
-          (? = '' OR lower(login) LIKE ? OR lower(COALESCE(name, '')) LIKE ? OR lower(COALESCE(email, '')) LIKE ?)
-          AND (? = 'all' OR (? = 'admin' AND is_admin = 1) OR (? = 'user' AND is_admin = 0))
-          AND (? = 'all' OR (? = 'enabled' AND is_disabled = 0) OR (? = 'disabled' AND is_disabled = 1))
-        ORDER BY created_at ASC, id ASC
+          (? = '' OR lower(users.login) LIKE ? OR lower(COALESCE(users.name, '')) LIKE ? OR lower(COALESCE(users.email, '')) LIKE ?)
+          AND (? = 'all' OR (? = 'admin' AND users.is_admin = 1) OR (? = 'user' AND users.is_admin = 0))
+          AND (? = 'all' OR (? = 'enabled' AND users.is_disabled = 0) OR (? = 'disabled' AND users.is_disabled = 1))
+        ORDER BY users.created_at ASC, users.id ASC
         LIMIT ? OFFSET ?
         "#,
     )
@@ -805,20 +821,34 @@ pub async fn admin_patch_user(
 
     let updated = sqlx::query_as::<_, AdminUserItem>(
         r#"
+        WITH repo_totals AS (
+          SELECT
+            repo_sources.user_id,
+            COUNT(DISTINCT repo_sources.repo_id) AS repo_total
+          FROM (
+            SELECT user_id, repo_id FROM starred_repos
+            UNION ALL
+            SELECT user_id, repo_id FROM owned_repo_star_baselines
+          ) repo_sources
+          GROUP BY repo_sources.user_id
+        )
         SELECT
-          id,
-          github_user_id,
-          login,
-          name,
-          avatar_url,
-          email,
-          is_admin,
-          is_disabled,
-          last_active_at,
-          created_at,
-          updated_at
+          users.id,
+          users.github_user_id,
+          users.login,
+          users.name,
+          users.avatar_url,
+          users.email,
+          users.is_admin,
+          users.is_disabled,
+          COALESCE(repo_totals.repo_total, 0) AS repo_total,
+          users.include_own_releases,
+          users.last_active_at,
+          users.created_at,
+          users.updated_at
         FROM users
-        WHERE id = ?
+        LEFT JOIN repo_totals ON repo_totals.user_id = users.id
+        WHERE users.id = ?
         "#,
     )
     .bind(&target_user_id)
@@ -16317,6 +16347,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_list_users_returns_repo_totals_and_include_own_releases() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_star_for_user_with_privacy(&pool, 1, 42, false).await;
+        seed_star_for_user_with_privacy(&pool, 1, 43, true).await;
+        seed_owned_repo_baseline(&pool, 43, "IvanLi-CN/private-owned").await;
+        seed_owned_repo_baseline(&pool, 44, "IvanLi-CN/octo-rill").await;
+        set_include_own_releases(&pool, true).await;
+
+        seed_user(&pool, 2, "viewer", 0, 0).await;
+        seed_star_for_user_with_privacy(&pool, 2, 77, false).await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let Json(response) = admin_list_users(
+            State(state),
+            session,
+            Query(AdminUsersQuery {
+                query: None,
+                role: None,
+                status: None,
+                page: None,
+                page_size: None,
+            }),
+        )
+        .await
+        .expect("admin list users should succeed");
+
+        let admin = response
+            .items
+            .iter()
+            .find(|item| item.id == test_user_id(1))
+            .expect("seeded admin item");
+        assert_eq!(admin.repo_total, 3);
+        assert!(admin.include_own_releases);
+
+        let viewer = response
+            .items
+            .iter()
+            .find(|item| item.id == test_user_id(2))
+            .expect("seeded viewer item");
+        assert_eq!(viewer.repo_total, 1);
+        assert!(!viewer.include_own_releases);
+    }
+
+    #[tokio::test]
     async fn admin_patch_user_rejects_demoting_last_admin_via_handler() {
         let pool = setup_pool().await;
         sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
@@ -16340,6 +16421,42 @@ mod tests {
         .expect_err("last admin demotion should fail");
 
         assert_eq!(err.code(), "last_admin_guard");
+    }
+
+    #[tokio::test]
+    async fn admin_patch_user_returns_repo_totals_and_include_own_releases() {
+        let pool = setup_pool().await;
+        sqlx::query(r#"UPDATE users SET is_admin = 1 WHERE id = ?"#)
+            .bind(test_user_id(1))
+            .execute(&pool)
+            .await
+            .expect("promote seeded user to admin");
+        seed_star_for_user_with_privacy(&pool, 1, 42, false).await;
+        seed_owned_repo_baseline(&pool, 42, "IvanLi-CN/octo-rill").await;
+        set_include_own_releases(&pool, true).await;
+
+        seed_user(&pool, 2, "viewer", 0, 0).await;
+        seed_star_for_user_with_privacy(&pool, 2, 77, false).await;
+
+        let state = setup_state(pool);
+        let session = setup_session(1).await;
+
+        let Json(updated) = admin_patch_user(
+            State(state),
+            session,
+            Path(test_user_id(2)),
+            Json(AdminUserPatchRequest {
+                is_admin: Some(true),
+                is_disabled: None,
+            }),
+        )
+        .await
+        .expect("admin patch should succeed");
+
+        assert_eq!(updated.id, test_user_id(2));
+        assert_eq!(updated.repo_total, 1);
+        assert!(!updated.include_own_releases);
+        assert!(updated.is_admin);
     }
 
     #[tokio::test]
