@@ -27,6 +27,7 @@ OctoRill 当前由 4 个长期维护面组成：
 - GitHub 数据同步与派生视图
 - 翻译请求、批次执行与日报生成
 - 管理员运行时配置与后台任务观测
+- 容器 stdout 结构化日志、request-id 贯通与运行期排障入口
 
 ### 数据与外部依赖
 
@@ -40,7 +41,8 @@ OctoRill 当前由 4 个长期维护面组成：
 ### 进程入口
 
 - `src/main.rs` 负责读取 `.env.local` / `.env`、初始化 tracing，然后把 `AppConfig` 交给 `server::serve()`
-- `src/server.rs` 负责完成真正的运行时装配：数据库、migrations、session store、HTTP client、OAuth client、WebAuthn、scheduler、router 与静态文件服务
+- `src/server.rs` 负责完成真正的运行时装配：数据库、migrations、session store、HTTP client、OAuth client、WebAuthn、scheduler、router、request-id / access log middleware 与静态文件服务
+- `src/observability.rs` 负责 JSON stdout subscriber、慢阈值、request-id helper、access log 与 error-chain 共用逻辑
 
 ### 共享应用状态
 
@@ -127,6 +129,25 @@ Storybook 在这个仓库里不是展示橱窗，而是**稳定验证面**。改
 当一个结论已经稳定到“后续维护者不读 spec 也应该知道”，就应优先提升到 `docs/*.md` 或仓库入口文档，而不是只留在 `docs/specs/**`。
 
 ## 排查入口
+
+### 容器日志 / 性能 / 慢请求问题
+
+先看：
+
+- `docker logs <container> | jq`
+- `RUST_LOG`
+- `X-Request-Id`
+- `src/observability.rs`
+- `src/server.rs`
+- `src/sqlite_write.rs`
+- `src/session_store.rs`
+
+维护约束：
+
+- 容器 stdout 只输出单行 JSON，不提供第二套应用内 pretty/text 模式。
+- 默认只记录慢请求与错误请求的 `http.access`，快速 `2xx` 不记 access log。
+- 运行时日志只保留 `request_id`、`task_id`、`user_id`、`repo_id`、`operation`、`attempt`、`elapsed_ms`、`error_chain` 等排障必要字段。
+- 不记录 body、token、cookie、email、login、完整 query string；生产默认不输出 Rust backtrace。
 
 ### 登录 / 绑定 / 会话问题
 

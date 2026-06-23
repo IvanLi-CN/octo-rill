@@ -1801,6 +1801,7 @@ mod tests {
             ai_max_concurrency: 1,
             ai_daily_at_local: None,
             app_default_time_zone: "Asia/Shanghai".to_owned(),
+            logging: crate::observability::LoggingThresholds::default(),
         }
     }
 
