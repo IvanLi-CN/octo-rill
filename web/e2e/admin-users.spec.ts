@@ -11,6 +11,8 @@ type MockUser = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	repo_total: number;
+	include_own_releases: boolean;
 	last_active_at: string | null;
 	created_at: string;
 	updated_at: string;
@@ -74,6 +76,8 @@ async function installBaseMocks(
 			email: "admin@example.com",
 			is_admin: true,
 			is_disabled: false,
+			repo_total: 21,
+			include_own_releases: true,
 			last_active_at: "2026-02-26T08:00:00Z",
 			created_at: "2026-02-24T08:00:00Z",
 			updated_at: "2026-02-24T08:00:00Z",
@@ -87,6 +91,8 @@ async function installBaseMocks(
 			email: "user@example.com",
 			is_admin: false,
 			is_disabled: false,
+			repo_total: 7,
+			include_own_releases: false,
 			last_active_at: "2026-02-26T07:00:00Z",
 			created_at: "2026-02-25T08:00:00Z",
 			updated_at: "2026-02-25T08:00:00Z",
@@ -102,6 +108,8 @@ async function installBaseMocks(
 			email: `extra-user-${index + 1}@example.com`,
 			is_admin: false,
 			is_disabled: false,
+			repo_total: index + 1,
+			include_own_releases: index % 2 === 0,
 			last_active_at: "2026-02-26T06:00:00Z",
 			created_at: "2026-02-25T09:00:00Z",
 			updated_at: "2026-02-25T09:00:00Z",
@@ -212,6 +220,7 @@ async function installBaseMocks(
 				user_id: target.id,
 				daily_brief_local_time: "08:00",
 				daily_brief_time_zone: "Asia/Shanghai",
+				include_own_releases: target.include_own_releases,
 				last_active_at: target.last_active_at,
 			});
 		}
@@ -238,6 +247,7 @@ async function installBaseMocks(
 				user_id: target.id,
 				daily_brief_local_time: body.daily_brief_local_time ?? "08:00",
 				daily_brief_time_zone: body.daily_brief_time_zone ?? "Asia/Shanghai",
+				include_own_releases: target.include_own_releases,
 				last_active_at: target.last_active_at,
 			});
 		}
@@ -294,6 +304,10 @@ async function installBaseMocks(
 	});
 }
 
+function userRow(page: Page, userId: string) {
+	return page.locator(`[data-user-row][data-user-id="${userId}"]`);
+}
+
 test("admin user can manage users in admin panel", async ({ page }) => {
 	await installBaseMocks(page, { isAdmin: true });
 	await page.goto("/");
@@ -331,31 +345,33 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	await expect(revokeAdminButton).toBeDisabled();
 	await expect(page.getByText("唯一管理员，不能撤销")).toBeVisible();
 
-	const userRow = page
-		.getByText("octo-user", { exact: false })
-		.first()
-		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
-	await expect(userRow).toContainText("最后活动：");
-	await expect(userRow).toContainText("普通用户");
-	await userRow.getByRole("button", { name: "详情" }).click();
+	const standardUserRow = userRow(page, STANDARD_USER_ID);
+	await expect(standardUserRow).toContainText("最后活动：");
+	await expect(standardUserRow).toContainText("普通用户");
+	await expect(standardUserRow).toContainText("总数：7");
+	await expect(standardUserRow).toContainText("我的发布：未纳入");
+	await standardUserRow.getByRole("button", { name: "详情" }).click();
 	const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 	await expect(profileSheet).toBeVisible();
+	await expect(profileSheet.getByText("UID")).toBeVisible();
+	await expect(profileSheet.getByText(STANDARD_USER_ID)).toBeVisible();
+	await expect(profileSheet).toContainText("项目处理仓库总数 7");
 	await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
 	await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 		"Asia/Shanghai",
 	);
 	await page.getByRole("button", { name: "关闭", exact: true }).click();
 	await expect(profileSheet).toHaveCount(0);
-	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	await standardUserRow.getByRole("button", { name: "设为管理员" }).click();
 	await expect(
 		page.getByRole("alertdialog", { name: "确认管理员变更" }),
 	).toBeVisible();
 	await page.getByRole("button", { name: "确认更改" }).click();
-	await expect(userRow).toContainText("管理员");
+	await expect(standardUserRow).toContainText("管理员");
 	await expect(revokeAdminButton).toBeEnabled();
 
-	await userRow.getByRole("button", { name: "禁用" }).click();
-	await expect(userRow).toContainText("已禁用");
+	await standardUserRow.getByRole("button", { name: "禁用" }).click();
+	await expect(standardUserRow).toContainText("已禁用");
 });
 
 test("admin action error remains visible after list refresh", async ({
@@ -372,11 +388,8 @@ test("admin action error remains visible after list refresh", async ({
 	await expect(page).toHaveURL(/\/admin\/users$/);
 	await expect(page.getByRole("heading", { name: "用户管理" })).toBeVisible();
 
-	const userRow = page
-		.getByText("octo-user", { exact: false })
-		.first()
-		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
-	await userRow.getByRole("button", { name: "禁用" }).click();
+	const standardUserRow = userRow(page, STANDARD_USER_ID);
+	await standardUserRow.getByRole("button", { name: "禁用" }).click();
 
 	await expect(
 		page.getByText("至少保留一名启用管理员，当前操作已被拦截。"),
@@ -396,18 +409,12 @@ test("self-demoted admin is redirected out of admin panel", async ({
 		page.getByText("管理账号角色与状态：支持筛选、升降管理员、启用/禁用。"),
 	).toBeVisible();
 
-	const userRow = page
-		.getByText("octo-user", { exact: false })
-		.first()
-		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
-	await userRow.getByRole("button", { name: "设为管理员" }).click();
+	const standardUserRow = userRow(page, STANDARD_USER_ID);
+	await standardUserRow.getByRole("button", { name: "设为管理员" }).click();
 	await page.getByRole("button", { name: "确认更改" }).click();
-	await expect(userRow).toContainText("管理员");
+	await expect(standardUserRow).toContainText("管理员");
 
-	const selfRow = page
-		.getByText("octo-admin（你）", { exact: false })
-		.first()
-		.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
+	const selfRow = userRow(page, CURRENT_USER_ID);
 	await selfRow.getByRole("button", { name: "撤销管理员" }).click();
 	await page.getByRole("button", { name: "确认更改" }).click();
 
@@ -497,6 +504,126 @@ test("admin panel keeps header utilities inline on tablet widths", async ({
 	}
 });
 
+test("admin users list keeps compact single-line rows with horizontal scroll on narrow screens", async ({
+	page,
+}) => {
+	await installBaseMocks(page, {
+		isAdmin: true,
+		currentUserLogin: LONG_ADMIN_LOGIN,
+	});
+	await page.setViewportSize({ width: 768, height: 1024 });
+	await page.goto("/admin/users");
+
+	const tableShell = page.locator("[data-admin-users-table-shell]");
+	await expect(tableShell).toBeVisible();
+	const standardUserRow = userRow(page, STANDARD_USER_ID);
+	await expect(standardUserRow).toContainText("总数：7");
+	await expect(standardUserRow).toContainText("我的发布：未纳入");
+
+	const metrics = await page.evaluate((userId) => {
+		const shell = document.querySelector(
+			"[data-admin-users-table-shell]",
+		) as HTMLElement | null;
+		const scrollContainer = shell?.querySelector(
+			'[data-slot="table-container"]',
+		) as HTMLElement | null;
+		const row = document.querySelector(
+			`[data-user-row][data-user-id="${userId}"]`,
+		) as HTMLElement | null;
+		const loginText = row?.querySelector("td:nth-child(1) p:nth-child(1)");
+		const secondaryText = row?.querySelector("td:nth-child(1) p:nth-child(2)");
+		if (
+			!(shell instanceof HTMLElement) ||
+			!(scrollContainer instanceof HTMLElement) ||
+			!(row instanceof HTMLElement) ||
+			!(loginText instanceof HTMLElement) ||
+			!(secondaryText instanceof HTMLElement)
+		) {
+			throw new Error("Expected admin users table metrics anchors");
+		}
+		return {
+			shellScrollOverflow:
+				scrollContainer.scrollWidth - scrollContainer.clientWidth,
+			rowHeight: row.getBoundingClientRect().height,
+			loginLineHeight: Number.parseFloat(
+				getComputedStyle(loginText).lineHeight,
+			),
+			secondaryLineHeight: Number.parseFloat(
+				getComputedStyle(secondaryText).lineHeight,
+			),
+			loginWhiteSpace: getComputedStyle(loginText).whiteSpace,
+			secondaryWhiteSpace: getComputedStyle(secondaryText).whiteSpace,
+		};
+	}, STANDARD_USER_ID);
+
+	expect(metrics.shellScrollOverflow).toBeGreaterThan(0);
+	expect(metrics.rowHeight).toBeLessThanOrEqual(
+		metrics.loginLineHeight + metrics.secondaryLineHeight + 40,
+	);
+	expect(metrics.loginWhiteSpace).toBe("nowrap");
+	expect(metrics.secondaryWhiteSpace).toBe("nowrap");
+});
+
+test("admin users list keeps the action column visible on desktop widths", async ({
+	page,
+}) => {
+	await installBaseMocks(page, {
+		isAdmin: true,
+		currentUserLogin: LONG_ADMIN_LOGIN,
+	});
+	await page.setViewportSize({ width: 1600, height: 1100 });
+	await page.goto("/admin/users");
+
+	const tableShell = page.locator("[data-admin-users-table-shell]");
+	await expect(tableShell).toBeVisible();
+
+	const layout = await page.evaluate((userId) => {
+		const shell = document.querySelector(
+			"[data-admin-users-table-shell]",
+		) as HTMLElement | null;
+		const container = shell?.querySelector(
+			'[data-slot="table-container"]',
+		) as HTMLElement | null;
+		const row = document.querySelector(
+			`[data-user-row][data-user-id="${userId}"]`,
+		) as HTMLElement | null;
+		const actionCell = row?.querySelector(
+			"td:nth-child(5)",
+		) as HTMLElement | null;
+		const actionButtons = Array.from(
+			actionCell?.querySelectorAll("button") ?? [],
+		) as HTMLElement[];
+		if (
+			!(shell instanceof HTMLElement) ||
+			!(container instanceof HTMLElement) ||
+			!(row instanceof HTMLElement) ||
+			!(actionCell instanceof HTMLElement) ||
+			actionButtons.length === 0
+		) {
+			throw new Error("Expected desktop admin users layout anchors");
+		}
+
+		const shellRect = shell.getBoundingClientRect();
+		const actionRect = actionCell.getBoundingClientRect();
+		const lastButtonRect =
+			actionButtons.at(-1)?.getBoundingClientRect() ?? actionRect;
+
+		return {
+			scrollOverflow: container.scrollWidth - container.clientWidth,
+			actionCellLeft: actionRect.left,
+			actionCellRight: actionRect.right,
+			lastButtonRight: lastButtonRect.right,
+			shellLeft: shellRect.left,
+			shellRight: shellRect.right,
+		};
+	}, STANDARD_USER_ID);
+
+	expect(layout.scrollOverflow).toBeLessThanOrEqual(1);
+	expect(layout.actionCellLeft).toBeGreaterThanOrEqual(layout.shellLeft - 1);
+	expect(layout.actionCellRight).toBeLessThanOrEqual(layout.shellRight + 1);
+	expect(layout.lastButtonRight).toBeLessThanOrEqual(layout.shellRight + 1);
+});
+
 test.describe("mobile admin shell", () => {
 	test.use({ viewport: { width: 390, height: 844 } });
 
@@ -553,11 +680,8 @@ test.describe("daily brief time formatting", () => {
 
 			await page.getByRole("link", { name: "管理员面板" }).click();
 			await page.getByRole("link", { name: "用户管理" }).click();
-			const userRow = page
-				.getByText("octo-user", { exact: false })
-				.first()
-				.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
-			await userRow.getByRole("button", { name: "详情" }).click();
+			const standardUserRow = userRow(page, STANDARD_USER_ID);
+			await standardUserRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
@@ -579,11 +703,8 @@ test.describe("daily brief time formatting", () => {
 
 			await page.getByRole("link", { name: "管理员面板" }).click();
 			await page.getByRole("link", { name: "用户管理" }).click();
-			const userRow = page
-				.getByText("octo-user", { exact: false })
-				.first()
-				.locator("xpath=ancestor::div[contains(@class,'bg-card')][1]");
-			await userRow.getByRole("button", { name: "详情" }).click();
+			const standardUserRow = userRow(page, STANDARD_USER_ID);
+			await standardUserRow.getByRole("button", { name: "详情" }).click();
 
 			const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 			await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
