@@ -577,7 +577,7 @@ export function DashboardHeader({
 							)}
 						/>
 					</div>
-					<Tooltip>
+					<Tooltip open={syncingAll}>
 						<TooltipTrigger asChild>
 							<Button
 								disabled={busy && !syncingAll}

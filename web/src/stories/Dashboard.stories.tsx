@@ -4776,8 +4776,6 @@ export const AccessSyncEmptyState: Story = {
 		await expect(
 			canvas.getByRole("heading", { name: "正在同步你的 Star / Release" }),
 		).toBeVisible();
-		const syncButton = canvas.getByRole("button", { name: SYNC_ALL_LABEL });
-		await userEvent.hover(syncButton);
 		await expect(body.getByText("后台任务已启动")).toBeVisible();
 		await expect(body.getByText("0/4")).toBeVisible();
 		await expect(body.getByText("正在准备 Star 阶段")).toBeVisible();

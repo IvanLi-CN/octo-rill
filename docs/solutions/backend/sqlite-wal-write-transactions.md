@@ -59,6 +59,7 @@ Keep this targeted to write-intent paths such as:
 ## Guardrails / Reuse Notes
 
 - For `replace_starred_repos` and similar full-replacement write paths, acquire the writer permit with `BEGIN IMMEDIATE` before deleting/replacing rows. That keeps the stale snapshot upgrade from surfacing as `failed to clear starred_repos` under concurrent access refresh or subscription sync.
+- For `store_sync_state_value` and related sync watermark writes, use the same coordinator lane and `BEGIN IMMEDIATE` contract. These upserts are high-contention write-intent paths during access refresh and subscription sync, and they should not bypass the writer coordinator by writing straight to the pool.
 - Do not solve this by forcing `OCTORILL_SQLITE_POOL_MAX_CONNECTIONS=1`; that hides the race by serializing the whole app and can starve HTTP reads.
 - Do not lower worker/LLM concurrency as the durable database fix. Keep network and AI concurrency high; coordinate only the SQLite write section.
 - Do not preserve direct high-frequency writes to the pool in worker lifecycle paths. If a path can run per worker or per heartbeat, it needs a coordinator lane.
