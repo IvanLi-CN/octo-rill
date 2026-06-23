@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-06-23: `store_sync_state_value` 也改为通过 `sqlite_writer.begin_immediate_with_priority` 运行，补齐 `sync.access_refresh` / `sync.subscriptions` 的 `sync_state` 写锁保护；Dashboard 的同步进度泡泡现在在点击 Sync 后立即打开，不再依赖 hover 才出现。
 - 2026-06-23: `replace_starred_repos` 改为通过 `sqlite_writer.begin_immediate_with_priority` 运行，并按调用方区分 foreground/background lane，避免 `sync.access_refresh` / `sync.subscriptions` 在 SQLite WAL 写锁竞争下继续把 `failed to clear starred_repos` 冒泡给用户；Dashboard 现在会在 `task.running` 与 `star_refreshed` 之间展示独立 warmup 态，而不是把该窗口继续渲染成“等待后台任务开始”。
 - 2026-05-03: 订阅同步提速方向冻结为“不降频、不扩大 freshness window”；Release 阶段新增 worker 热配置、repo 级 conditional request 状态和 timeout 退避，`ReleaseEvent` 仅作为快速发现信号提升 repo demand，Discussions Announcements 继续独立表示仓库公告；Admin Jobs 新增订阅同步列表页和独立工作流详情页。
 - 2026-05-05: `sync.subscriptions` 的 Star、Release Queue、Social、Notifications 长阶段新增节流后的根任务 `task.progress` 阶段内进度事件；详情 diagnostics 识别 `release_progress` 等增量事件，前端通过既有 SSE 后刷新详情链路显示阶段内实时成功、失败与 Release 写入数。
