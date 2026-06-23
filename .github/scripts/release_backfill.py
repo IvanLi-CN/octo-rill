@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import email.utils
+import http.client
 import json
 import os
 import re
@@ -257,7 +258,7 @@ class GitHubApiClient:
                 if not self._should_retry_http_error(exc, method=method, attempt=attempt, max_attempts=max_attempts):
                     raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
                 self._sleep_before_retry(exc, attempt=attempt)
-            except (TimeoutError, urllib.error.URLError) as exc:
+            except (TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError) as exc:
                 if method.upper() != "GET" or attempt >= max_attempts:
                     raise RuntimeError(f"GitHub API {method} {path} failed: {exc}") from exc
                 self._sleep_before_retry(None, attempt=attempt)
