@@ -8191,6 +8191,15 @@ async fn store_sync_state_value(
     key: &str,
     value: &str,
 ) -> Result<()> {
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_state_upsert",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin sync_state upsert tx")?;
     sqlx::query(
         r#"
         INSERT INTO sync_state (id, user_id, key, value, updated_at)
@@ -8205,10 +8214,10 @@ async fn store_sync_state_value(
     .bind(key)
     .bind(value)
     .bind(value)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .context("failed to upsert sync_state")?;
-
+    tx.commit().await.context("commit sync_state upsert tx")?;
     Ok(())
 }
 
@@ -8321,7 +8330,7 @@ mod tests {
         owned_repo_snapshot_from_node, process_repo_release_work_item,
         record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
         replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
-        subscription_event_counts_as_critical, subscription_timeout_error,
+        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
         upsert_starred_repos, wait_for_release_demand,
     };
@@ -13464,6 +13473,61 @@ mod tests {
         .await
         .expect("load replacement starred repo");
         assert_eq!(full_name, "octo/replacement");
+    }
+
+    #[tokio::test]
+    async fn store_sync_state_value_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("locked-sync-state");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let replacement_user_id = user_id.clone();
+        let replacement = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                store_sync_state_value(
+                    state.as_ref(),
+                    replacement_user_id.as_str(),
+                    "starred_sync_watermark",
+                    "2026-03-07T00:00:00Z",
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        replacement
+            .await
+            .expect("join sync state task")
+            .expect("sync state upsert should succeed after the writer lock is released");
+
+        let stored_value: String = sqlx::query_scalar(
+            r#"
+            SELECT value
+            FROM sync_state
+            WHERE user_id = ? AND key = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("starred_sync_watermark")
+        .fetch_one(&pool)
+        .await
+        .expect("load sync state");
+        assert_eq!(stored_value, "2026-03-07T00:00:00Z");
     }
 
     async fn setup_pool() -> SqlitePool {

@@ -323,7 +323,6 @@ export const Warmup: Story = {
 		const body = within(canvasElement.ownerDocument.body);
 		const syncButton = canvas.getByRole("button", { name: "同步" });
 		await expect(syncButton).toBeEnabled();
-		await userEvent.hover(syncButton);
 		await expect(body.getByText("后台任务已启动")).toBeVisible();
 		await expect(body.getByText("0/4")).toBeVisible();
 		await expect(body.getByText("正在准备 Star 阶段")).toBeVisible();
@@ -355,7 +354,6 @@ export const Syncing: Story = {
 		await expect(syncButton).toBeEnabled();
 		const icon = syncButton.querySelector("svg");
 		expect(icon?.classList.contains("animate-spin")).toBe(true);
-		await userEvent.hover(syncButton);
 		const tooltipTitles = await screen.findAllByText(
 			"正在后台同步你的 GitHub 数据",
 		);
