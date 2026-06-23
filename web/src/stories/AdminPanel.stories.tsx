@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 
 import type { UserManagementStoryState } from "@/admin/UserManagement";
 import type { AdminUserItem } from "@/admin/UserManagement";
+import { AuthBootstrapProvider } from "@/auth/AuthBootstrap";
 import { AdminPanel } from "@/pages/AdminPanel";
 
 const CURRENT_USER_ID = "2f4k7m9p3x6c8v2a";
@@ -13,12 +14,14 @@ const mockAdminUsers: AdminUserItem[] = [
 	{
 		id: CURRENT_USER_ID,
 		github_user_id: 10,
-		login: "storybook-admin",
-		name: "Storybook Admin",
+		login: "storybook-admin-with-a-very-long-login-name-for-truncation",
+		name: "Storybook Admin With A Very Long Display Name",
 		avatar_url: null,
-		email: "admin@example.com",
+		email: "admin-team-with-a-very-long-address@example.com",
 		is_admin: true,
 		is_disabled: false,
+		repo_total: 48,
+		include_own_releases: true,
 		last_active_at: "2026-02-26T08:00:00Z",
 		created_at: "2026-02-25T08:00:00Z",
 		updated_at: "2026-02-25T08:00:00Z",
@@ -26,12 +29,14 @@ const mockAdminUsers: AdminUserItem[] = [
 	{
 		id: STANDARD_USER_ID,
 		github_user_id: 11,
-		login: "octo-user",
-		name: "Octo User",
+		login: "octo-user-with-an-equally-long-login-name",
+		name: "Octo User With A Long Name",
 		avatar_url: null,
-		email: "user@example.com",
+		email: "user-with-a-long-email-address@example.com",
 		is_admin: false,
 		is_disabled: false,
+		repo_total: 17,
+		include_own_releases: false,
 		last_active_at: "2026-02-26T07:30:00Z",
 		created_at: "2026-02-25T08:10:00Z",
 		updated_at: "2026-02-25T08:10:00Z",
@@ -45,6 +50,8 @@ const mockAdminUsers: AdminUserItem[] = [
 		email: "disabled@example.com",
 		is_admin: false,
 		is_disabled: true,
+		repo_total: 3,
+		include_own_releases: false,
 		last_active_at: null,
 		created_at: "2026-02-25T08:20:00Z",
 		updated_at: "2026-02-25T08:20:00Z",
@@ -68,6 +75,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 					user_id: user.id,
 					daily_brief_local_time: "08:00",
 					daily_brief_time_zone: "Asia/Shanghai",
+					include_own_releases: user.include_own_releases,
 					last_active_at: user.last_active_at,
 				},
 			]),
@@ -79,6 +87,37 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 					? new Request(input, init)
 					: input;
 			const url = new URL(req.url, window.location.origin);
+
+			if (url.pathname === "/api/me" && req.method === "GET") {
+				return new Response(
+					JSON.stringify({
+						user: {
+							id: CURRENT_USER_ID,
+							github_user_id: 10,
+							login: "storybook-admin",
+							name: "Storybook Admin",
+							avatar_url: null,
+							email: "admin@example.com",
+							is_admin: true,
+						},
+						access_sync: {
+							task_id: null,
+							task_type: null,
+							event_path: null,
+							reason: "none",
+						},
+						dashboard: {
+							daily_boundary_local: "08:00",
+							daily_boundary_time_zone: "Asia/Shanghai",
+							daily_boundary_utc_offset_minutes: 480,
+						},
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				);
+			}
 
 			if (url.pathname === "/api/admin/users" && req.method === "GET") {
 				const query = (url.searchParams.get("query") ?? "").toLowerCase();
@@ -141,6 +180,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 							user_id: target.id,
 							daily_brief_local_time: "08:00",
 							daily_brief_time_zone: "Asia/Shanghai",
+							include_own_releases: target.include_own_releases,
 							last_active_at: target.last_active_at,
 						}),
 					}),
@@ -179,6 +219,7 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 					daily_brief_local_time: payload.daily_brief_local_time ?? "08:00",
 					daily_brief_time_zone:
 						payload.daily_brief_time_zone ?? "Asia/Shanghai",
+					include_own_releases: target.include_own_releases,
 					last_active_at: target.last_active_at,
 				};
 				profiles.set(target.id, nextProfile);
@@ -240,31 +281,33 @@ function AdminPanelPreview({ storyState }: AdminPanelPreviewProps) {
 	}
 
 	return (
-		<AdminPanel
-			me={{
-				user: {
-					id: CURRENT_USER_ID,
-					github_user_id: 10,
-					login: "storybook-admin",
-					name: "Storybook Admin",
-					avatar_url: null,
-					email: "admin@example.com",
-					is_admin: true,
-				},
-				access_sync: {
-					task_id: null,
-					task_type: null,
-					event_path: null,
-					reason: "none",
-				},
-				dashboard: {
-					daily_boundary_local: "08:00",
-					daily_boundary_time_zone: "Asia/Shanghai",
-					daily_boundary_utc_offset_minutes: 480,
-				},
-			}}
-			userManagementStoryState={storyState}
-		/>
+		<AuthBootstrapProvider>
+			<AdminPanel
+				me={{
+					user: {
+						id: CURRENT_USER_ID,
+						github_user_id: 10,
+						login: "storybook-admin",
+						name: "Storybook Admin",
+						avatar_url: null,
+						email: "admin@example.com",
+						is_admin: true,
+					},
+					access_sync: {
+						task_id: null,
+						task_type: null,
+						event_path: null,
+						reason: "none",
+					},
+					dashboard: {
+						daily_boundary_local: "08:00",
+						daily_boundary_time_zone: "Asia/Shanghai",
+						daily_boundary_utc_offset_minutes: 480,
+					},
+				}}
+				userManagementStoryState={storyState}
+			/>
+		</AuthBootstrapProvider>
 	);
 }
 
@@ -310,6 +353,18 @@ export const Filtered: Story = {
 			description: {
 				story:
 					"模拟筛选条件生效后的结果列表，用来验证搜索与角色/状态筛选组合。",
+			},
+		},
+	},
+};
+
+export const EvidenceCompactList: Story = {
+	name: "Evidence / Compact Repo List",
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"紧凑双层列表布局证据，覆盖超长 login/name/email、仓库总数、我的发布纳入状态，以及单行截断策略。",
 			},
 		},
 	},

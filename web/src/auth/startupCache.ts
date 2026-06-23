@@ -6,7 +6,7 @@ import type { DashboardWarmRouteState } from "@/dashboard/routeState";
 
 const AUTH_CACHE_KEY = "octo-rill.auth-bootstrap.v3";
 const DASHBOARD_CACHE_KEY = "octo-rill.dashboard-warm.v1";
-const ADMIN_USERS_CACHE_KEY = "octo-rill.admin-users-warm.v1";
+const ADMIN_USERS_CACHE_KEY = "octo-rill.admin-users-warm.v2";
 
 export const STARTUP_WARM_TTL_MS = 60 * 60 * 1000;
 export const PERSISTENT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -55,6 +55,8 @@ export type AdminUsersWarmItem = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	repo_total: number;
+	include_own_releases: boolean;
 	last_active_at: string | null;
 	created_at: string;
 	updated_at: string;

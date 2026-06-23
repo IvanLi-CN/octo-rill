@@ -45,6 +45,14 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import {
+	Table,
+	TableBody,
+	TableCell,
+	TableHead,
+	TableHeader,
+	TableRow,
+} from "@/components/ui/table";
 import { useInternalNavigate } from "@/lib/internalNavigation";
 import {
 	Sheet,
@@ -66,6 +74,8 @@ export type AdminUserItem = {
 	email: string | null;
 	is_admin: boolean;
 	is_disabled: boolean;
+	repo_total: number;
+	include_own_releases: boolean;
 	last_active_at: string | null;
 	created_at: string;
 	updated_at: string;
@@ -107,6 +117,13 @@ const HM_FORMATTER = new Intl.DateTimeFormat(undefined, {
 	minute: "2-digit",
 	hour12: false,
 });
+const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
+	month: "2-digit",
+	day: "2-digit",
+	hour: "2-digit",
+	minute: "2-digit",
+	hour12: false,
+});
 
 const PAGE_SIZE = 20;
 const DEFAULT_GUARD = { admin_total: 0, active_admin_total: 0 };
@@ -126,6 +143,13 @@ function formatLocalHm(value: string | null | undefined) {
 	const parsed = new Date(value);
 	if (Number.isNaN(parsed.getTime())) return "-";
 	return HM_FORMATTER.format(parsed);
+}
+
+function formatLocalDateTime(value: string | null | undefined) {
+	if (!value) return "-";
+	const parsed = new Date(value);
+	if (Number.isNaN(parsed.getTime())) return "-";
+	return DATE_TIME_FORMATTER.format(parsed);
 }
 
 function toAdminUserErrorMessage(err: unknown) {
@@ -148,7 +172,7 @@ function toAdminUserErrorMessage(err: unknown) {
 	return err instanceof Error ? err.message : String(err);
 }
 
-const USER_CARD_SKELETON_KEYS = [
+const USER_ROW_SKELETON_KEYS = [
 	"user-skeleton-1",
 	"user-skeleton-2",
 	"user-skeleton-3",
@@ -160,12 +184,6 @@ function userRoleBadgeClass(isAdmin: boolean) {
 	return isAdmin
 		? "border-emerald-300 bg-emerald-100 text-emerald-900 dark:border-emerald-500/60 dark:bg-emerald-500/20 dark:text-emerald-100"
 		: "bg-muted/70 text-foreground";
-}
-
-function userStatusBadgeClass(isDisabled: boolean) {
-	return isDisabled
-		? "border-red-300 bg-red-100 text-red-900 dark:border-red-500/60 dark:bg-red-500/20 dark:text-red-100"
-		: "border-sky-300 bg-sky-100 text-sky-900 dark:border-sky-500/60 dark:bg-sky-500/20 dark:text-sky-100";
 }
 
 export function UserManagement({
@@ -488,125 +506,240 @@ export function UserManagement({
 
 				{error ? <p className="text-destructive text-sm">{error}</p> : null}
 
-				<div className="space-y-2">
+				<div
+					className="overflow-hidden rounded-xl border"
+					data-admin-users-table-shell
+				>
 					{showStartupSkeleton ? (
-						USER_CARD_SKELETON_KEYS.map((key) => (
-							<div
-								key={key}
-								className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 md:flex-row md:items-center md:justify-between"
-							>
-								<div className="min-w-0 space-y-2">
-									<div className="bg-muted h-4 w-24 animate-pulse rounded-full" />
-									<div className="bg-muted h-3 w-40 animate-pulse rounded-full" />
-									<div className="bg-muted h-3 w-20 animate-pulse rounded-full" />
-								</div>
-								<div className="flex flex-wrap gap-2">
-									<div className="bg-muted h-9 w-14 animate-pulse rounded-xl" />
-									<div className="bg-muted h-9 w-20 animate-pulse rounded-xl" />
-									<div className="bg-muted h-9 w-16 animate-pulse rounded-xl" />
-								</div>
-							</div>
-						))
+						<Table
+							className="min-w-[65rem] table-fixed"
+							containerClassName="overflow-x-auto"
+						>
+							<TableHeader className="bg-muted/40">
+								<TableRow>
+									<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
+									<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
+									<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
+									<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
+									<TableHead className="w-[15rem] px-3 py-2 text-right">
+										操作
+									</TableHead>
+								</TableRow>
+							</TableHeader>
+							<TableBody>
+								{USER_ROW_SKELETON_KEYS.map((key) => (
+									<TableRow key={key}>
+										<TableCell className="px-3 py-3">
+											<div className="space-y-2">
+												<div className="bg-muted h-4 w-32 animate-pulse rounded-full" />
+												<div className="bg-muted h-3 w-48 animate-pulse rounded-full" />
+											</div>
+										</TableCell>
+										<TableCell className="px-3 py-3">
+											<div className="space-y-2">
+												<div className="bg-muted h-4 w-16 animate-pulse rounded-full" />
+												<div className="bg-muted h-3 w-28 animate-pulse rounded-full" />
+											</div>
+										</TableCell>
+										<TableCell className="px-3 py-3">
+											<div className="space-y-2">
+												<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
+												<div className="bg-muted h-3 w-20 animate-pulse rounded-full" />
+											</div>
+										</TableCell>
+										<TableCell className="px-3 py-3">
+											<div className="space-y-2">
+												<div className="bg-muted h-4 w-20 animate-pulse rounded-full" />
+												<div className="bg-muted h-3 w-24 animate-pulse rounded-full" />
+											</div>
+										</TableCell>
+										<TableCell className="px-3 py-3">
+											<div className="ml-auto flex justify-end gap-2">
+												<div className="bg-muted h-9 w-14 animate-pulse rounded-xl" />
+												<div className="bg-muted h-9 w-20 animate-pulse rounded-xl" />
+												<div className="bg-muted h-9 w-16 animate-pulse rounded-xl" />
+											</div>
+										</TableCell>
+									</TableRow>
+								))}
+							</TableBody>
+						</Table>
 					) : loading ? (
-						<p className="text-muted-foreground text-sm">正在刷新用户列表...</p>
+						<p className="text-muted-foreground px-3 py-4 text-sm">
+							正在刷新用户列表...
+						</p>
 					) : items.length === 0 ? (
-						<p className="text-muted-foreground text-sm">没有匹配的用户。</p>
+						<p className="text-muted-foreground px-3 py-4 text-sm">
+							没有匹配的用户。
+						</p>
 					) : (
-						items.map((user) => {
-							const busy = actionBusyUserId === user.id;
-							const isSelf = user.id === currentUserId;
-							const isLastAdmin =
-								user.is_admin && guardSummary.admin_total <= 1;
-							const isLastActiveAdmin =
-								user.is_admin &&
-								!user.is_disabled &&
-								guardSummary.active_admin_total <= 1;
-							const adminActionBlocked = user.is_admin
-								? isLastAdmin || isLastActiveAdmin
-								: false;
-							const disableActionBlocked =
-								(isSelf && !user.is_disabled) || isLastActiveAdmin;
-							const adminActionHint =
-								user.is_admin && isLastAdmin
-									? "唯一管理员，不能撤销"
-									: user.is_admin && isLastActiveAdmin
-										? "最后一名启用管理员，不能撤销"
-										: null;
-							const disableActionHint =
-								!user.is_disabled && isSelf
-									? "不能禁用自己"
-									: !user.is_disabled && isLastActiveAdmin
-										? "最后一名启用管理员，不能禁用"
-										: null;
-							const guardHint = adminActionHint ?? disableActionHint;
-							return (
-								<div
-									key={user.id}
-									className="bg-card/70 flex flex-col gap-3 rounded-lg border p-3 md:flex-row md:items-center md:justify-between"
-								>
-									<div className="min-w-0">
-										<p className="font-medium text-sm">
-											{user.login}
-											{user.id === currentUserId ? "（你）" : ""}
-										</p>
-										<p className="text-muted-foreground truncate text-xs">
-											{user.name ?? "-"} · {user.email ?? "-"}
-										</p>
-										<p className="text-muted-foreground mt-1 text-xs">
-											最后活动：{formatLocalHm(user.last_active_at)}
-										</p>
-										<div className="mt-1 flex flex-wrap gap-1">
-											<Badge
-												variant="outline"
-												className="font-mono text-[11px]"
-											>
-												UID:{user.id}
-											</Badge>
-											<Badge
-												variant="outline"
-												className={userRoleBadgeClass(user.is_admin)}
-											>
-												{user.is_admin ? "管理员" : "普通用户"}
-											</Badge>
-											<Badge
-												variant="outline"
-												className={userStatusBadgeClass(user.is_disabled)}
-											>
-												{user.is_disabled ? "已禁用" : "已启用"}
-											</Badge>
-										</div>
-										{guardHint ? (
-											<p className="text-muted-foreground mt-1 text-xs">
-												{guardHint}
-											</p>
-										) : null}
-									</div>
-									<div className="flex flex-wrap gap-2">
-										<Button
-											variant="outline"
-											disabled={busy}
-											onClick={() => void onOpenProfile(user)}
+						<Table
+							className="min-w-[65rem] table-fixed"
+							containerClassName="overflow-x-auto"
+						>
+							<TableHeader className="bg-muted/40">
+								<TableRow>
+									<TableHead className="w-[18rem] px-3 py-2">用户</TableHead>
+									<TableHead className="w-[9rem] px-3 py-2">仓库</TableHead>
+									<TableHead className="w-[13rem] px-3 py-2">状态</TableHead>
+									<TableHead className="w-[10rem] px-3 py-2">时间</TableHead>
+									<TableHead className="w-[15rem] px-3 py-2 text-right">
+										操作
+									</TableHead>
+								</TableRow>
+							</TableHeader>
+							<TableBody>
+								{items.map((user) => {
+									const busy = actionBusyUserId === user.id;
+									const isSelf = user.id === currentUserId;
+									const isLastAdmin =
+										user.is_admin && guardSummary.admin_total <= 1;
+									const isLastActiveAdmin =
+										user.is_admin &&
+										!user.is_disabled &&
+										guardSummary.active_admin_total <= 1;
+									const adminActionBlocked = user.is_admin
+										? isLastAdmin || isLastActiveAdmin
+										: false;
+									const disableActionBlocked =
+										(isSelf && !user.is_disabled) || isLastActiveAdmin;
+									const adminActionHint =
+										user.is_admin && isLastAdmin
+											? "唯一管理员，不能撤销"
+											: user.is_admin && isLastActiveAdmin
+												? "最后一名启用管理员，不能撤销"
+												: null;
+									const disableActionHint =
+										!user.is_disabled && isSelf
+											? "不能禁用自己"
+											: !user.is_disabled && isLastActiveAdmin
+												? "最后一名启用管理员，不能禁用"
+												: null;
+									const guardHint = adminActionHint ?? disableActionHint;
+									return (
+										<TableRow
+											key={user.id}
+											data-user-row
+											data-user-id={user.id}
 										>
-											详情
-										</Button>
-										<Button
-											variant="outline"
-											disabled={busy || adminActionBlocked}
-											onClick={() => void onToggleAdmin(user)}
-										>
-											{user.is_admin ? "撤销管理员" : "设为管理员"}
-										</Button>
-										<Button
-											variant={user.is_disabled ? "secondary" : "destructive"}
-											disabled={busy || disableActionBlocked}
-											onClick={() => void onToggleDisabled(user)}
-										>
-											{user.is_disabled ? "启用" : "禁用"}
-										</Button>
-									</div>
-								</div>
-							);
-						})
+											<TableCell className="px-3 py-3">
+												<div className="min-w-0 space-y-1">
+													<p
+														className="truncate font-medium text-sm whitespace-nowrap"
+														title={`${user.login}${isSelf ? "（你）" : ""}`}
+													>
+														{user.login}
+														{isSelf ? "（你）" : ""}
+													</p>
+													<p
+														className="text-muted-foreground truncate text-xs whitespace-nowrap"
+														title={`${user.name ?? "-"} · ${user.email ?? "-"}`}
+													>
+														{user.name ?? "-"} · {user.email ?? "-"}
+													</p>
+												</div>
+											</TableCell>
+											<TableCell className="px-3 py-3">
+												<div className="min-w-0 space-y-1">
+													<p
+														className="truncate font-medium text-sm whitespace-nowrap"
+														title={`项目处理仓库总数：${user.repo_total}`}
+													>
+														总数：{user.repo_total}
+													</p>
+													<p
+														className="text-muted-foreground truncate text-xs whitespace-nowrap"
+														title={
+															user.include_own_releases
+																? "我的发布：已纳入"
+																: "我的发布：未纳入"
+														}
+													>
+														我的发布：
+														{user.include_own_releases ? "已纳入" : "未纳入"}
+													</p>
+												</div>
+											</TableCell>
+											<TableCell className="px-3 py-3">
+												<div className="min-w-0 space-y-1">
+													<div className="min-w-0">
+														<Badge
+															variant="outline"
+															className={`max-w-full truncate whitespace-nowrap ${userRoleBadgeClass(user.is_admin)}`}
+															title={user.is_admin ? "管理员" : "普通用户"}
+														>
+															{user.is_admin ? "管理员" : "普通用户"}
+														</Badge>
+													</div>
+													<p
+														className="text-muted-foreground truncate text-xs whitespace-nowrap"
+														title={
+															guardHint
+																? `${user.is_disabled ? "已禁用" : "已启用"} · ${guardHint}`
+																: user.is_disabled
+																	? "已禁用"
+																	: "已启用"
+														}
+													>
+														{user.is_disabled ? "已禁用" : "已启用"}
+														{guardHint ? ` · ${guardHint}` : ""}
+													</p>
+												</div>
+											</TableCell>
+											<TableCell className="px-3 py-3">
+												<div className="min-w-0 space-y-1">
+													<p
+														className="truncate font-medium text-sm whitespace-nowrap"
+														title={`最后活动：${formatLocalHm(user.last_active_at)}`}
+													>
+														最后活动：{formatLocalHm(user.last_active_at)}
+													</p>
+													<p
+														className="text-muted-foreground truncate text-xs whitespace-nowrap"
+														title={`创建时间：${formatLocalDateTime(user.created_at)}`}
+													>
+														创建时间：{formatLocalDateTime(user.created_at)}
+													</p>
+												</div>
+											</TableCell>
+											<TableCell className="px-3 py-3">
+												<div className="flex justify-end gap-1.5 whitespace-nowrap">
+													<Button
+														variant="outline"
+														size="sm"
+														className="shrink-0"
+														disabled={busy}
+														onClick={() => void onOpenProfile(user)}
+													>
+														详情
+													</Button>
+													<Button
+														variant="outline"
+														size="sm"
+														className="shrink-0"
+														disabled={busy || adminActionBlocked}
+														onClick={() => void onToggleAdmin(user)}
+													>
+														{user.is_admin ? "撤销管理员" : "设为管理员"}
+													</Button>
+													<Button
+														variant={
+															user.is_disabled ? "secondary" : "destructive"
+														}
+														size="sm"
+														className="shrink-0"
+														disabled={busy || disableActionBlocked}
+														onClick={() => void onToggleDisabled(user)}
+													>
+														{user.is_disabled ? "启用" : "禁用"}
+													</Button>
+												</div>
+											</TableCell>
+										</TableRow>
+									);
+								})}
+							</TableBody>
+						</Table>
 					)}
 				</div>
 
@@ -656,6 +789,12 @@ export function UserManagement({
 					<div className="space-y-4 px-5 pb-5">
 						<div className="space-y-3 text-sm">
 							<div className="rounded-lg border p-3">
+								<p className="text-muted-foreground text-xs">UID</p>
+								<p className="mt-1 font-mono font-medium">
+									{profileUser?.id ?? "-"}
+								</p>
+							</div>
+							<div className="rounded-lg border p-3">
 								<p className="text-muted-foreground text-xs">
 									最后活动（浏览器当前时区）
 								</p>
@@ -669,7 +808,12 @@ export function UserManagement({
 								<p className="text-muted-foreground text-xs">账号状态</p>
 								<p className="mt-1 font-medium">
 									{profileUser?.is_disabled ? "已禁用" : "已启用"} ·{" "}
-									{profileUser?.is_admin ? "管理员" : "普通用户"}
+									{profileUser?.is_admin ? "管理员" : "普通用户"} ·
+									项目处理仓库总数 {profileUser?.repo_total ?? 0}
+								</p>
+								<p className="text-muted-foreground mt-1 text-xs">
+									我的发布：
+									{profileUser?.include_own_releases ? "已纳入" : "未纳入"}
 								</p>
 							</div>
 						</div>
