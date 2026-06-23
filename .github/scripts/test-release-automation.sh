@@ -144,6 +144,7 @@ python3 - <<'PY' \
   "$repo_root/.github/workflows/notify-release-failure.yml"
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import io
 import sys
@@ -236,6 +237,25 @@ try:
     assert retry_client.request_json("/repos/IvanLi-CN/octo-rill/actions/runs/1") == {"ok": True}
     assert network_calls["count"] == 2
     assert sleep_calls == [1]
+    sleep_calls.clear()
+
+    disconnect_calls = {"count": 0}
+
+    def flaky_disconnect(request, *, timeout):
+        assert timeout == module.DEFAULT_GITHUB_API_TIMEOUT_SECONDS
+        disconnect_calls["count"] += 1
+        if disconnect_calls["count"] == 1:
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+        return FakeResponse(b'[{"number":129,"html_url":"https://github.com/IvanLi-CN/octo-rill/pull/129"}]')
+
+    module.urllib.request.urlopen = flaky_disconnect
+    assert retry_client.pull_for_commit("IvanLi-CN/octo-rill", "sha-disconnect") == (
+        129,
+        "https://github.com/IvanLi-CN/octo-rill/pull/129",
+    )
+    assert disconnect_calls["count"] == 2
+    assert sleep_calls == [1]
+    sleep_calls.clear()
 
     allow_404_calls = {"count": 0}
 

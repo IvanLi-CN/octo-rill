@@ -6,7 +6,7 @@
 - Implementation: 已交付
 - Created: 2026-04-04
 - Last: 2026-04-28
-- Summary: 已交付；release run 可在 GitHub API 瞬时失败时对读取请求有界重试，PR 评论仍保持幂等更新。
+- Summary: 已交付；release run 可在 GitHub API 瞬时失败时对读取请求有界重试，PR 评论仍保持幂等更新，并已覆盖远端直接断开连接的重试场景。
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
