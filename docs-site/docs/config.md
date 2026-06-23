@@ -16,6 +16,10 @@ description: OctoRill 运行时、AI 与文档预览相关配置项。
 - Session cookie 名不再提供运行时配置入口：根路径公网部署固定为 `octo_rill_sid`；本地多实例、非默认端口或非根路径部署会自动派生隔离后缀，避免不同实例互相覆盖登录态。
 - `DATABASE_URL`：数据库连接串。默认 `sqlite:./.data/octo-rill.db`。
 - `OCTORILL_TASK_LOG_DIR`：后台任务日志目录。默认 `.data/task-logs`。
+- `RUST_LOG`：运行时日志级别入口。默认回退到 `info,tower_http=info`。容器 stdout 始终输出单行 JSON；开发环境的人类可读性建议通过 `docker logs ... | jq`、`lnav` 或包装脚本解决，而不是切换应用内文本模式。
+- `OCTORILL_HTTP_SLOW_MS`：HTTP access log 慢请求阈值（毫秒）。默认 `1000`。
+- `OCTORILL_UPSTREAM_SLOW_MS`：上游 HTTP / AI 调用慢请求阈值（毫秒）。默认 `2000`。
+- `OCTORILL_SQLITE_WRITE_SLOW_MS`：SQLite 写路径慢操作阈值（毫秒）。默认 `250`。
 - `OCTORILL_TASK_WORKERS`：后台任务 worker 数量。默认 `4`，必须是正整数。
 - `OCTORILL_ENCRYPTION_KEY_BASE64`：32 字节 base64 密钥。**必填**；用于本地敏感信息加密。
 - `APP_DEFAULT_TIME_ZONE`：默认时区。未设置时会优先尝试系统时区，再回退到内置日报时区；必须是整点偏移的 IANA time zone。
@@ -81,6 +85,15 @@ http://127.0.0.1:58090/auth/linuxdo/callback
 - 可选的模型输入长度上限
 
 一旦管理员在任务中心保存这些设置，后续重启会优先使用数据库中的持久化值，而不是初次启动时的 env/default 种子。
+
+## 运行时日志与排障
+
+- OctoRill 正式运行日志采用 `JSON Only` 单行 stdout，适合 Docker / 容器日志收集。
+- HTTP 响应会接受并回传 `X-Request-Id`；若请求未携带，服务端会生成并回传。
+- 默认只记录慢请求与错误请求的 `http.access` 日志；快速 `2xx` 不会产生 access log 噪音。
+- 容器 stdout 只保留排障必要元数据，例如 `request_id`、`task_id`、`user_id`、`repo_id`、`operation`、`attempt`、`elapsed_ms`、`error_chain`。
+- 日志不会记录 request / response body、`Authorization`、Cookie、OAuth / AI token、email、login、完整 query string。
+- 现有 `OCTORILL_TASK_LOG_DIR` 仍然负责任务级文件日志；它是补充通道，不替代容器 stdout 主合同。
 
 ## 文档站与 Storybook 相关变量
 

@@ -10,6 +10,7 @@ use tower_sessions::{
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing::{debug, warn};
 
+use crate::observability;
 use crate::sqlite_write::{SqliteWriteCoordinator, SqliteWritePriority};
 
 #[derive(Clone)]
@@ -53,24 +54,41 @@ impl SessionStore for CoordinatedSqliteSessionStore {
             let result = self.inner.create(record).await;
             match result {
                 Ok(()) => {
-                    debug!(
-                        sqlite_write_lane = "session_create",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        attempt,
-                        "sqlite session write completed"
-                    );
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let threshold_ms = observability::logging_thresholds().sqlite_write_slow_ms;
+                    if elapsed_ms >= threshold_ms as u128 {
+                        warn!(
+                            event = "sqlite.write",
+                            operation = "session_create",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            threshold_ms,
+                            "sqlite session write completed slowly"
+                        );
+                    } else {
+                        debug!(
+                            event = "sqlite.write",
+                            operation = "session_create",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            "sqlite session write completed"
+                        );
+                    }
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
                     drop(_permit);
                     warn!(
-                        sqlite_write_lane = "session_create",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
+                        event = "sqlite.write",
+                        operation = "session_create",
+                        priority = SqliteWritePriority::Foreground.as_str(),
                         elapsed_ms = started.elapsed().as_millis(),
                         attempt,
                         retry_after_ms = session_retry_delay(attempt).as_millis(),
-                        err = %err,
+                        error_kind = "sqlite_busy",
+                        error_chain = %err,
                         "sqlite session write hit busy state; retrying"
                     );
                     tokio::time::sleep(session_retry_delay(attempt)).await;
@@ -93,24 +111,41 @@ impl SessionStore for CoordinatedSqliteSessionStore {
             let result = self.inner.save(record).await;
             match result {
                 Ok(()) => {
-                    debug!(
-                        sqlite_write_lane = "session_save",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        attempt,
-                        "sqlite session write completed"
-                    );
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let threshold_ms = observability::logging_thresholds().sqlite_write_slow_ms;
+                    if elapsed_ms >= threshold_ms as u128 {
+                        warn!(
+                            event = "sqlite.write",
+                            operation = "session_save",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            threshold_ms,
+                            "sqlite session write completed slowly"
+                        );
+                    } else {
+                        debug!(
+                            event = "sqlite.write",
+                            operation = "session_save",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            "sqlite session write completed"
+                        );
+                    }
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
                     drop(_permit);
                     warn!(
-                        sqlite_write_lane = "session_save",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
+                        event = "sqlite.write",
+                        operation = "session_save",
+                        priority = SqliteWritePriority::Foreground.as_str(),
                         elapsed_ms = started.elapsed().as_millis(),
                         attempt,
                         retry_after_ms = session_retry_delay(attempt).as_millis(),
-                        err = %err,
+                        error_kind = "sqlite_busy",
+                        error_chain = %err,
                         "sqlite session write hit busy state; retrying"
                     );
                     tokio::time::sleep(session_retry_delay(attempt)).await;
@@ -137,24 +172,41 @@ impl SessionStore for CoordinatedSqliteSessionStore {
             let result = self.inner.delete(session_id).await;
             match result {
                 Ok(()) => {
-                    debug!(
-                        sqlite_write_lane = "session_delete",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
-                        elapsed_ms = started.elapsed().as_millis(),
-                        attempt,
-                        "sqlite session write completed"
-                    );
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let threshold_ms = observability::logging_thresholds().sqlite_write_slow_ms;
+                    if elapsed_ms >= threshold_ms as u128 {
+                        warn!(
+                            event = "sqlite.write",
+                            operation = "session_delete",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            threshold_ms,
+                            "sqlite session write completed slowly"
+                        );
+                    } else {
+                        debug!(
+                            event = "sqlite.write",
+                            operation = "session_delete",
+                            priority = SqliteWritePriority::Foreground.as_str(),
+                            elapsed_ms,
+                            attempt,
+                            "sqlite session write completed"
+                        );
+                    }
                     return Ok(());
                 }
                 Err(err) if session_error_is_busy(&err) && attempt < SESSION_WRITE_MAX_ATTEMPTS => {
                     drop(_permit);
                     warn!(
-                        sqlite_write_lane = "session_delete",
-                        sqlite_write_priority = SqliteWritePriority::Foreground.as_str(),
+                        event = "sqlite.write",
+                        operation = "session_delete",
+                        priority = SqliteWritePriority::Foreground.as_str(),
                         elapsed_ms = started.elapsed().as_millis(),
                         attempt,
                         retry_after_ms = session_retry_delay(attempt).as_millis(),
-                        err = %err,
+                        error_kind = "sqlite_busy",
+                        error_chain = %err,
                         "sqlite session write hit busy state; retrying"
                     );
                     tokio::time::sleep(session_retry_delay(attempt)).await;
@@ -173,13 +225,22 @@ impl ExpiredDeletion for CoordinatedSqliteSessionStore {
             .sqlite_writer
             .try_acquire_best_effort("session_delete_expired")
         else {
-            debug!("skip session expiry cleanup because sqlite writer is busy");
+            debug!(
+                event = "sqlite.write",
+                operation = "session_delete_expired",
+                priority = SqliteWritePriority::BestEffort.as_str(),
+                "skip session expiry cleanup because sqlite writer is busy"
+            );
             return Ok(());
         };
         if let Err(err) = self.inner.delete_expired().await {
             if session_error_is_busy(&err) {
                 warn!(
-                    err = %err,
+                    event = "sqlite.write",
+                    operation = "session_delete_expired",
+                    priority = SqliteWritePriority::BestEffort.as_str(),
+                    error_kind = "sqlite_busy",
+                    error_chain = %err,
                     "skip session expiry cleanup after sqlite busy state"
                 );
                 return Ok(());

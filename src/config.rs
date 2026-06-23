@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use url::Url;
 
 use crate::crypto::EncryptionKey;
+use crate::observability::LoggingThresholds;
 
 fn ensure_trailing_slash(mut url: Url) -> Url {
     if !url.path().ends_with('/') {
@@ -104,6 +105,7 @@ pub struct AppConfig {
     pub ai_max_concurrency: usize,
     pub ai_daily_at_local: Option<chrono::NaiveTime>,
     pub app_default_time_zone: String,
+    pub logging: LoggingThresholds,
 }
 
 #[derive(Clone)]
@@ -176,6 +178,7 @@ impl fmt::Debug for AppConfig {
             .field("ai_max_concurrency", &self.ai_max_concurrency)
             .field("ai_daily_at_local", &self.ai_daily_at_local)
             .field("app_default_time_zone", &self.app_default_time_zone)
+            .field("logging", &self.logging)
             .field("encryption_key", &"<redacted>")
             .finish()
     }
@@ -309,6 +312,23 @@ impl AppConfig {
             legacy_runtime_time_zone.as_deref(),
         )?;
 
+        let logging = LoggingThresholds {
+            http_slow_ms: parse_bounded_positive_usize_env("OCTORILL_HTTP_SLOW_MS", true, 60_000)?
+                .unwrap_or(1_000),
+            upstream_slow_ms: parse_bounded_positive_usize_env(
+                "OCTORILL_UPSTREAM_SLOW_MS",
+                true,
+                60_000,
+            )?
+            .unwrap_or(2_000),
+            sqlite_write_slow_ms: parse_bounded_positive_usize_env(
+                "OCTORILL_SQLITE_WRITE_SLOW_MS",
+                true,
+                60_000,
+            )?
+            .unwrap_or(250),
+        };
+
         let static_dir = {
             let candidate = PathBuf::from("web/dist");
             if candidate.exists() {
@@ -337,6 +357,7 @@ impl AppConfig {
             ai_max_concurrency,
             ai_daily_at_local,
             app_default_time_zone,
+            logging,
         })
     }
 }
@@ -369,6 +390,9 @@ mod tests {
             env::remove_var("DATABASE_URL");
             env::remove_var("OCTORILL_TASK_WORKERS");
             env::remove_var("OCTORILL_SQLITE_POOL_MAX_CONNECTIONS");
+            env::remove_var("OCTORILL_HTTP_SLOW_MS");
+            env::remove_var("OCTORILL_UPSTREAM_SLOW_MS");
+            env::remove_var("OCTORILL_SQLITE_WRITE_SLOW_MS");
             env::remove_var("LINUXDO_CLIENT_ID");
             env::remove_var("LINUXDO_CLIENT_SECRET");
             env::remove_var("LINUXDO_OAUTH_REDIRECT_URL");
@@ -406,6 +430,35 @@ mod tests {
         let config = AppConfig::from_env().expect("build config");
 
         assert_eq!(config.sqlite_pool_max_connections, 1);
+    }
+
+    #[test]
+    fn from_env_defaults_logging_thresholds() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.logging.http_slow_ms, 1_000);
+        assert_eq!(config.logging.upstream_slow_ms, 2_000);
+        assert_eq!(config.logging.sqlite_write_slow_ms, 250);
+    }
+
+    #[test]
+    fn from_env_accepts_logging_threshold_overrides() {
+        let _guard = env_lock().lock().expect("lock env");
+        set_required_env();
+        unsafe {
+            env::set_var("OCTORILL_HTTP_SLOW_MS", "1200");
+            env::set_var("OCTORILL_UPSTREAM_SLOW_MS", "3000");
+            env::set_var("OCTORILL_SQLITE_WRITE_SLOW_MS", "400");
+        }
+
+        let config = AppConfig::from_env().expect("build config");
+
+        assert_eq!(config.logging.http_slow_ms, 1_200);
+        assert_eq!(config.logging.upstream_slow_ms, 3_000);
+        assert_eq!(config.logging.sqlite_write_slow_ms, 400);
     }
 
     #[test]
