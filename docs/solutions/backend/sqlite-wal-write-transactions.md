@@ -56,8 +56,12 @@ Keep this targeted to write-intent paths such as:
 - translation batch scheduling or stale batch recovery when the transaction reads rows and then updates them
 - translation batch startup state flips (`translation_batches queued -> running`, `translation_work_items batched -> running`) when a worker has already claimed a batch and is about to start AI work
 - social activity snapshot and feed activity event persistence when sync workers read current-member snapshots or dedupe rows before inserting `social_activity_events`
+- subscription event persistence (`sync_subscription_events`) and other per-run diagnostics writes emitted by `sync.subscriptions`
 - lightweight user activity writes such as `last_active_at`, which should be best-effort, should not wait behind background writer backlog, and must not turn read endpoints into 500 responses
 - non-critical refresh persistence such as release reaction counts, which may skip under writer pressure as long as the live payload or user-visible result still returns and the downgrade is observable
+- retention / cleanup paths such as `repo_release_watchers`, `sync_subscription_events`, or `llm_calls` pruning, which should use best-effort lanes and degrade to observable skips when writer pressure or SQLite busy would otherwise starve foreground claims or heartbeats
+- incremental sync writes such as `starred_repos` upsert batches, notification inbox upsert / open-url repair, and `public_repo_release_usage` metadata refresh, which may look harmless in isolation but still bypass the single-writer contract when they run per page, per user, or per background worker
+- scheduler bookkeeping such as `daily_brief_hour_slots.last_dispatch_at`, `scheduled_task_dispatch_state`, or brief retry failure marks, because these low-payload writes still run on periodic background cadences and can starve claim / heartbeat paths if they bypass the coordinator
 
 ## Guardrails / Reuse Notes
 
@@ -68,8 +72,9 @@ Keep this targeted to write-intent paths such as:
 - Do not preserve direct high-frequency writes to the pool in worker lifecycle paths. If a path can run per worker or per heartbeat, it needs a coordinator lane.
 - Do not assume “claim path already uses coordinator” is enough. Any follow-up state transition that runs per claimed batch or per work item start can still leak `database is locked` if it writes straight to the pool.
 - Do not convert pure read transactions to `BEGIN IMMEDIATE`; that would unnecessarily block writers.
-- Do not hold the writer permit around GitHub API, AI calls, HTTP calls, or long computation. Prepare data first, acquire the permit, write quickly, and release it.
+- Do not hold the writer permit around GitHub API, AI calls, HTTP calls, or long computation. Prepare data first, including notification-thread refreshes or other repair lookups, then acquire the permit, write quickly, and release it. If the repair writes back into rows that other sync paths can update concurrently, re-read the current row inside the writer transaction before applying the repair so stale lookup results do not overwrite fresher fields, and prefer the refreshed thread metadata only when its timestamp is at least as new as the current row.
 - If a user-visible or API-compatible pending snapshot already exists, prefer returning that snapshot under writer pressure instead of opening a fresh write transaction just to restate the same `queued/running` fact.
+- Best-effort cleanup paths should treat both "writer permit unavailable" and actual SQLite busy as non-fatal downgrade signals when the work can safely run later; log those cases explicitly so production incidents can distinguish backlog from true write failures.
 - When diagnosing production incidents, copy a SQLite backup to an isolated testbox and reproduce with the same pool/concurrency settings before changing live service configuration.
 - A minimal probe is: one deferred transaction reads, a second connection commits, then the first writes. Seeing `517` confirms the stale snapshot upgrade pattern.
 

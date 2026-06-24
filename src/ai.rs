@@ -680,13 +680,42 @@ pub fn spawn_model_catalog_sync_task(state: Arc<AppState>) -> tokio::task::Abort
 async fn cleanup_expired_llm_calls(state: &AppState) -> Result<u64> {
     let retention_seconds = i64::try_from(LLM_CALL_LOG_RETENTION.as_secs()).unwrap_or(i64::MAX);
     let cutoff = (chrono::Utc::now() - chrono::Duration::seconds(retention_seconds)).to_rfc3339();
-    let deleted = sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
-        .bind(cutoff.as_str())
-        .execute(&state.pool)
+    match state
+        .sqlite_writer
+        .try_write("llm_call_retention_cleanup", || async {
+            Ok::<_, anyhow::Error>(
+                sqlx::query(r#"DELETE FROM llm_calls WHERE created_at < ?"#)
+                    .bind(cutoff.as_str())
+                    .execute(&state.pool)
+                    .await
+                    .context("delete expired llm_calls failed")?
+                    .rows_affected(),
+            )
+        })
         .await
-        .context("delete expired llm_calls failed")?
-        .rows_affected();
-    Ok(deleted)
+    {
+        Ok(Some(deleted)) => Ok(deleted),
+        Ok(None) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "ai.llm_call_retention_cleanup",
+                downgrade_reason = "sqlite_writer_busy",
+                "skipped llm call retention cleanup under sqlite writer pressure"
+            );
+            Ok(0)
+        }
+        Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = "ai.llm_call_retention_cleanup",
+                downgrade_reason = "sqlite_busy",
+                error_chain = %observability::error_chain_summary(err.as_ref()),
+                "skipped llm call retention cleanup after sqlite busy"
+            );
+            Ok(0)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn spawn_llm_call_retention_task(state: Arc<AppState>) -> tokio::task::AbortHandle {
@@ -5450,11 +5479,14 @@ pub async fn legacy_brief_count(state: &AppState) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use axum::{Json, Router, http::StatusCode, routing::post};
     use chrono::Utc;
-    use sqlx::{Row, sqlite::SqlitePoolOptions};
+    use sqlx::{
+        Row,
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    };
     use url::Url;
 
     use crate::{
@@ -5467,17 +5499,10 @@ mod tests {
         setup_llm_state_with_ai(None).await
     }
 
-    async fn setup_llm_state_with_ai(base_url: Option<Url>) -> Arc<AppState> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .expect("create sqlite memory db");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("run migrations");
-
+    async fn setup_llm_state_with_pool(
+        pool: sqlx::SqlitePool,
+        base_url: Option<Url>,
+    ) -> Arc<AppState> {
         let encryption_key =
             EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
                 .expect("build encryption key");
@@ -5528,6 +5553,44 @@ mod tests {
             encryption_key,
             runtime_owner_id: "ai-test-runtime-owner".to_owned(),
         })
+    }
+
+    async fn setup_llm_state_with_ai(base_url: Option<Url>) -> Arc<AppState> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("create sqlite memory db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        setup_llm_state_with_pool(pool, base_url).await
+    }
+
+    async fn setup_llm_state_with_busy_timeout(
+        max_connections: u32,
+        busy_timeout: Duration,
+    ) -> Arc<AppState> {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-ai-tests-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(busy_timeout);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(options)
+            .await
+            .expect("create sqlite wal test db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        setup_llm_state_with_pool(pool, None).await
     }
 
     fn test_release_digest(
@@ -8847,5 +8910,104 @@ mod tests {
         assert_eq!(stored.effective_local_boundary, "07:00");
         assert_eq!(stored.window_start, "2026-03-06T07:00:00+00:00");
         assert_eq!(stored.window_end, "2026-03-07T07:00:00+00:00");
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_llm_calls_skips_when_sqlite_writer_is_busy() {
+        let state = setup_llm_state_with_busy_timeout(2, Duration::from_millis(10)).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id, status, source, model, max_tokens, prompt_text,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("llm-retention-busy")
+        .bind("succeeded")
+        .bind("tests.llm.retention")
+        .bind("gpt-test")
+        .bind(128_i64)
+        .bind("prompt")
+        .bind("2025-01-01T00:00:00Z")
+        .bind("2025-01-01T00:00:00Z")
+        .execute(&state.pool)
+        .await
+        .expect("seed expired llm call");
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_llm_retention_hold")
+            .await
+            .expect("hold sqlite writer");
+
+        let deleted = cleanup_expired_llm_calls(state.as_ref())
+            .await
+            .expect("cleanup should skip while writer busy");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        assert_eq!(deleted, 0);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM llm_calls WHERE id = ?")
+            .bind("llm-retention-busy")
+            .fetch_one(&state.pool)
+            .await
+            .expect("count preserved llm call");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_llm_calls_skips_when_sqlite_reports_busy() {
+        let state = setup_llm_state_with_busy_timeout(2, Duration::from_millis(10)).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO llm_calls (
+              id, status, source, model, max_tokens, prompt_text,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("llm-retention-sqlite-busy")
+        .bind("succeeded")
+        .bind("tests.llm.retention")
+        .bind("gpt-test")
+        .bind(128_i64)
+        .bind("prompt")
+        .bind("2025-01-01T00:00:00Z")
+        .bind("2025-01-01T00:00:00Z")
+        .execute(&state.pool)
+        .await
+        .expect("seed expired llm call");
+
+        let mut hold_tx = state
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE llm_calls SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind("llm-retention-sqlite-busy")
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let deleted = cleanup_expired_llm_calls(state.as_ref())
+            .await
+            .expect("cleanup should downgrade sqlite busy");
+
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        assert_eq!(deleted, 0);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM llm_calls WHERE id = ?")
+            .bind("llm-retention-sqlite-busy")
+            .fetch_one(&state.pool)
+            .await
+            .expect("count preserved llm call");
+        assert_eq!(count, 1);
     }
 }
