@@ -11,6 +11,7 @@
 - 2026-06-24：线上剩余 `sync.subscriptions` 日志继续出现 `insert social activity event`、`upsert follower current member` 与 `delete stale repo star current members` 的 `database is locked`；决定把 social activity snapshot 与 feed activity event 两个仍用 deferred transaction 的路径一并迁到 coordinator + `BEGIN IMMEDIATE`。
 - 2026-06-24：复核 host 101 线上日志后，进一步确认高频后台直写仍会挤占协调后的 claim / heartbeat 路径；决定把 `sync_subscription_events` 写入、订阅历史裁剪与 `llm_calls` 保留清理一并收回 coordinator，并在 writer permit 不可得或 SQLite busy 时统一走可观测的 non-fatal downgrade。
 - 2026-06-24：继续复核当前代码后，确认 `starred_repos` 增量 upsert、通知 inbox upsert / open-url repair 与 `public_repo_release_usage` 元数据刷新仍直接写 `state.pool`；决定把这些高频后台增量写也收回 coordinator，避免遗漏路径继续抢占 SQLite writer。
+- 2026-06-24：继续沿 claim / heartbeat 邻近路径复核后，确认 jobs scheduler 的 `daily_brief_hour_slots` / `scheduled_task_dispatch_state` 周期写入与 brief failure 标记仍直接写 `state.pool`；决定把这些 20s/45s 周期后台写与失败补偿写也收回 coordinator，补齐 task orchestration 周边的 single-writer 合同。
 
 ## Key Reasons / Replacements
 

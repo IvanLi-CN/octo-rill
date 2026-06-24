@@ -24,6 +24,7 @@
 - feed reaction refresh 的 counts 持久化改为 best-effort writer lane；writer permit 不可得或 SQLite busy 时跳过持久化，但保留 live payload 返回与结构化 warning。
 - subscription sync 的 `sync_subscription_events` 插入已接入 writer coordinator；`repo_release_watchers` / `sync_subscription_events` 历史裁剪改为 best-effort writer lane，在 writer permit 不可得或 SQLite busy 时跳过本轮清理并留下结构化 downgrade 日志。
 - `starred_repos` 的增量 upsert、通知 inbox upsert / open-url repair，以及 `public_repo_release_usage` 元数据刷新也已收回 writer coordinator，避免这些高频后台增量写继续绕过协调层挤占 `job_task_claim` / heartbeat 等已串行化路径。
+- jobs scheduler 的 `daily_brief_hour_slots.last_dispatch_at`、`scheduled_task_dispatch_state` 写入，以及 brief history/content refresh 失败标记也已收回 writer coordinator，避免 20s/45s 周期调度写和失败补偿写继续绕过协调层挤占 task claim / heartbeat。
 - 网络、GitHub API、AI 调用与长耗时处理仍留在 writer permit 外；permit 只包住 SQLite 写入段。
 
 ## Validation
@@ -44,6 +45,7 @@
 - `src/sync.rs` 新增 social activity snapshot 与 feed activity event 在 competing writer 下等待并成功提交的并发回归。
 - `src/api.rs` 新增 feed reaction refresh 在 SQLite writer 压力下跳过持久化但继续返回 live item 的回归。
 - `src/jobs.rs` 新增后台 writer 压力下 `enqueue_task` 等待 coordinator 而不是绕过写入背压的回归测试。
+- `src/jobs.rs` 新增 daily slot dispatch、scheduled dispatch state 与 brief failure mark 在 competing writer 下等待成功提交的并发回归测试。
 - `src/sync.rs` 新增 subscription event 写入在 competing writer 下等待成功提交，以及 subscription history prune 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。
 - `src/sync.rs` 新增 `starred_repos` 增量 upsert 与通知 upsert 在 competing writer 下等待成功提交的并发回归测试。
 - `src/ai.rs` 新增 LLM retention cleanup 在 writer permit 不可得或 SQLite busy 时降级跳过的回归测试。

@@ -61,6 +61,7 @@ Keep this targeted to write-intent paths such as:
 - non-critical refresh persistence such as release reaction counts, which may skip under writer pressure as long as the live payload or user-visible result still returns and the downgrade is observable
 - retention / cleanup paths such as `repo_release_watchers`, `sync_subscription_events`, or `llm_calls` pruning, which should use best-effort lanes and degrade to observable skips when writer pressure or SQLite busy would otherwise starve foreground claims or heartbeats
 - incremental sync writes such as `starred_repos` upsert batches, notification inbox upsert / open-url repair, and `public_repo_release_usage` metadata refresh, which may look harmless in isolation but still bypass the single-writer contract when they run per page, per user, or per background worker
+- scheduler bookkeeping such as `daily_brief_hour_slots.last_dispatch_at`, `scheduled_task_dispatch_state`, or brief retry failure marks, because these low-payload writes still run on periodic background cadences and can starve claim / heartbeat paths if they bypass the coordinator
 
 ## Guardrails / Reuse Notes
 
