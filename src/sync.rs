@@ -6028,39 +6028,118 @@ async fn append_subscription_event(
     let payload_json =
         serde_json::to_string(&event.payload).context("serialize subscription event")?;
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO sync_subscription_events (
-          id,
-          task_id,
-          stage,
-          event_type,
-          severity,
-          recoverable,
-          attempt,
-          user_id,
-          repo_id,
-          repo_full_name,
-          payload_json,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(local_id::generate_local_id())
-    .bind(task_id)
-    .bind(event.stage)
-    .bind(event.event_type)
-    .bind(event.severity)
-    .bind(if event.recoverable { 1_i64 } else { 0_i64 })
-    .bind(i64::try_from(event.attempt).unwrap_or(i64::MAX))
-    .bind(event.user_id)
-    .bind(event.repo_id)
-    .bind(event.repo_full_name)
-    .bind(payload_json)
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to insert sync_subscription_event")?;
+    state
+        .sqlite_writer
+        .write("sync_subscription_event_insert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id,
+                  task_id,
+                  stage,
+                  event_type,
+                  severity,
+                  recoverable,
+                  attempt,
+                  user_id,
+                  repo_id,
+                  repo_full_name,
+                  payload_json,
+                  created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(task_id)
+            .bind(event.stage)
+            .bind(event.event_type)
+            .bind(event.severity)
+            .bind(if event.recoverable { 1_i64 } else { 0_i64 })
+            .bind(i64::try_from(event.attempt).unwrap_or(i64::MAX))
+            .bind(event.user_id)
+            .bind(event.repo_id)
+            .bind(event.repo_full_name)
+            .bind(payload_json.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to insert sync_subscription_event")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionPrunePhaseOutcome {
+    Deleted(u64),
+    Skipped,
+}
+
+async fn run_subscription_prune_phase<F, Fut>(
+    state: &AppState,
+    writer_lane: &'static str,
+    log_operation: &'static str,
+    writer_busy_message: &'static str,
+    sqlite_busy_message: &'static str,
+    query: F,
+) -> Result<SubscriptionPrunePhaseOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<u64>>,
+{
+    match state.sqlite_writer.try_write(writer_lane, query).await {
+        Ok(Some(deleted)) => Ok(SubscriptionPrunePhaseOutcome::Deleted(deleted)),
+        Ok(None) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = log_operation,
+                downgrade_reason = "sqlite_writer_busy",
+                "{writer_busy_message}"
+            );
+            Ok(SubscriptionPrunePhaseOutcome::Skipped)
+        }
+        Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = log_operation,
+                downgrade_reason = "sqlite_busy",
+                error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                "{sqlite_busy_message}"
+            );
+            Ok(SubscriptionPrunePhaseOutcome::Skipped)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn execute_subscription_prune_phases<Watchers, WatchersFut, Events, EventsFut>(
+    mut prune_watchers: Watchers,
+    mut prune_events: Events,
+) -> Result<()>
+where
+    Watchers: FnMut() -> WatchersFut,
+    WatchersFut: Future<Output = Result<SubscriptionPrunePhaseOutcome>>,
+    Events: FnMut() -> EventsFut,
+    EventsFut: Future<Output = Result<SubscriptionPrunePhaseOutcome>>,
+{
+    for _ in 0..10 {
+        match prune_watchers().await? {
+            SubscriptionPrunePhaseOutcome::Deleted(0) | SubscriptionPrunePhaseOutcome::Skipped => {
+                break;
+            }
+            SubscriptionPrunePhaseOutcome::Deleted(_) => {}
+        }
+    }
+
+    for _ in 0..5 {
+        match prune_events().await? {
+            SubscriptionPrunePhaseOutcome::Deleted(0) => break,
+            SubscriptionPrunePhaseOutcome::Deleted(_) => {}
+            SubscriptionPrunePhaseOutcome::Skipped => return Ok(()),
+        }
+    }
+
     Ok(())
 }
 
@@ -6071,55 +6150,71 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
     let failed_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
     let event_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
 
-    for _ in 0..10 {
-        let deleted = sqlx::query(
-            r#"
-            DELETE FROM repo_release_watchers
-            WHERE id IN (
-              SELECT id
-              FROM repo_release_watchers
-              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
-              LIMIT ?
+    execute_subscription_prune_phases(
+        || {
+            run_subscription_prune_phase(
+                state,
+                "repo_release_watchers_prune",
+                "sync.repo_release_watchers_prune",
+                "skipped repo release watcher prune under sqlite writer pressure",
+                "skipped repo release watcher prune after sqlite busy",
+                || async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                            DELETE FROM repo_release_watchers
+                            WHERE id IN (
+                              SELECT id
+                              FROM repo_release_watchers
+                              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
+                                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+                              LIMIT ?
+                            )
+                            "#,
+                        )
+                        .bind(succeeded_cutoff.as_str())
+                        .bind(failed_cutoff.as_str())
+                        .bind(BATCH_SIZE)
+                        .execute(&state.pool)
+                        .await
+                        .context("prune repo release watchers")?
+                        .rows_affected(),
+                    )
+                },
             )
-            "#,
-        )
-        .bind(succeeded_cutoff.as_str())
-        .bind(failed_cutoff.as_str())
-        .bind(BATCH_SIZE)
-        .execute(&state.pool)
-        .await
-        .context("prune repo release watchers")?
-        .rows_affected();
-        if deleted == 0 {
-            break;
-        }
-    }
-
-    for _ in 0..5 {
-        let deleted = sqlx::query(
-            r#"
-            DELETE FROM sync_subscription_events
-            WHERE id IN (
-              SELECT id
-              FROM sync_subscription_events
-              WHERE julianday(created_at) < julianday(?)
-              LIMIT ?
+        },
+        || {
+            run_subscription_prune_phase(
+                state,
+                "sync_subscription_events_prune",
+                "sync.subscription_events_prune",
+                "skipped subscription event prune under sqlite writer pressure",
+                "skipped subscription event prune after sqlite busy",
+                || async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                            DELETE FROM sync_subscription_events
+                            WHERE id IN (
+                              SELECT id
+                              FROM sync_subscription_events
+                              WHERE julianday(created_at) < julianday(?)
+                              LIMIT ?
+                            )
+                            "#,
+                        )
+                        .bind(event_cutoff.as_str())
+                        .bind(BATCH_SIZE)
+                        .execute(&state.pool)
+                        .await
+                        .context("prune sync subscription events")?
+                        .rows_affected(),
+                    )
+                },
             )
-            "#,
-        )
-        .bind(event_cutoff.as_str())
-        .bind(BATCH_SIZE)
-        .execute(&state.pool)
-        .await
-        .context("prune sync subscription events")?
-        .rows_affected();
-        if deleted == 0 {
-            break;
-        }
-    }
-
-    Ok(())
+        },
+    )
+    .await
 }
 
 fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestError {
@@ -6127,6 +6222,23 @@ fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestEr
         return SyncRequestError::retryable("network_error", format!("{operation}: {err}"), None);
     }
     SyncRequestError::non_retryable("request_error", format!("{operation}: {err}"), None)
+}
+
+fn notification_thread_refresh_is_fresher(
+    current_updated_at: Option<&str>,
+    thread_updated_at: Option<&str>,
+) -> bool {
+    let thread_updated_at =
+        thread_updated_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    let current_updated_at =
+        current_updated_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+
+    match (current_updated_at, thread_updated_at) {
+        (_, Some(thread_updated_at)) => current_updated_at
+            .map(|current_updated_at| thread_updated_at >= current_updated_at)
+            .unwrap_or(true),
+        _ => false,
+    }
 }
 
 fn classify_github_http_error(
@@ -6311,53 +6423,65 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
             Ok(public_repo) if !public_repo.private => {
                 let full_name_lower = public_repo.full_name.to_ascii_lowercase();
                 let owner_login = public_repo.owner.login;
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET repo_id = ?,
-                        owner_login = ?,
-                        repo_name = ?,
-                        full_name = ?,
-                        full_name_lower = ?,
-                        last_sync_status = 'pending',
-                        last_sync_error = NULL,
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(public_repo.id)
-                .bind(owner_login.as_str())
-                .bind(public_repo.name.as_str())
-                .bind(public_repo.full_name.as_str())
-                .bind(full_name_lower.as_str())
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to update public repo metadata for {}",
-                        repo.full_name
-                    )
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_ready", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET repo_id = ?,
+                                owner_login = ?,
+                                repo_name = ?,
+                                full_name = ?,
+                                full_name_lower = ?,
+                                last_sync_status = 'pending',
+                                last_sync_error = NULL,
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(public_repo.id)
+                        .bind(owner_login.as_str())
+                        .bind(public_repo.name.as_str())
+                        .bind(public_repo.full_name.as_str())
+                        .bind(full_name_lower.as_str())
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to update public repo metadata for {}",
+                                repo.full_name
+                            )
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
             Ok(_) => {
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET last_sync_status = 'inaccessible',
-                        last_sync_error = 'repository is private',
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!("failed to mark private public repo {}", repo.full_name)
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_private", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET last_sync_status = 'inaccessible',
+                                last_sync_error = 'repository is private',
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!("failed to mark private public repo {}", repo.full_name)
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
             Err(err) => {
                 let status = if err.reason_code == "repo_inaccessible" {
@@ -6365,27 +6489,33 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
                 } else {
                     "failed"
                 };
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET last_sync_status = ?,
-                        last_sync_error = ?,
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(status)
-                .bind(format!("{}: {}", err.reason_code, err.message))
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to mark public repo metadata error for {}",
-                        repo.full_name
-                    )
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_error", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET last_sync_status = ?,
+                                last_sync_error = ?,
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(status)
+                        .bind(format!("{}: {}", err.reason_code, err.message))
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to mark public repo metadata error for {}",
+                                repo.full_name
+                            )
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
         }
     }
@@ -7477,6 +7607,15 @@ async fn upsert_starred_repos(
     repos: &[StarredRepoSnapshot],
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_starred_repos_upsert",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin upsert starred_repos tx")?;
     for repo in repos {
         sqlx::query(
             r#"
@@ -7513,10 +7652,13 @@ async fn upsert_starred_repos(
         .bind(repo.owner_avatar_url.as_deref())
         .bind(repo.open_graph_image_url.as_deref())
         .bind(repo.uses_custom_open_graph_image as i64)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
     }
+    tx.commit()
+        .await
+        .context("commit upsert starred_repos tx")?;
     Ok(())
 }
 
@@ -7974,6 +8116,15 @@ async fn upsert_notifications(
     notifications: &[GitHubNotification],
     now: &str,
 ) -> Result<()> {
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_notifications_upsert",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin notifications upsert tx")?;
     for notification in notifications {
         let api_url = notification
             .subject
@@ -8024,11 +8175,14 @@ async fn upsert_notifications(
         .bind(api_url)
         .bind(html_url)
         .bind(now)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to upsert notification")?;
     }
 
+    tx.commit()
+        .await
+        .context("commit notifications upsert tx")?;
     Ok(())
 }
 
@@ -8045,6 +8199,11 @@ where
         NotNeeded,
         Refreshed(Option<GitHubNotification>),
         Failed,
+    }
+
+    struct NotificationRepairUpdate {
+        thread_id: String,
+        thread_refresh: ThreadRefresh,
     }
 
     let rows = sqlx::query_as::<
@@ -8092,15 +8251,17 @@ where
         return Ok(true);
     }
 
+    let mut updates = Vec::with_capacity(rows.len());
+
     for (
         thread_id,
-        repo_full_name,
-        subject_title,
-        subject_type,
-        reason,
-        updated_at,
+        _repo_full_name,
+        _subject_title,
+        _subject_type,
+        _reason,
+        _updated_at,
         url,
-        unread,
+        _unread,
         html_url,
     ) in rows
     {
@@ -8123,37 +8284,134 @@ where
         } else {
             ThreadRefresh::NotNeeded
         };
-        let thread = match &thread_refresh {
+        updates.push(NotificationRepairUpdate {
+            thread_id,
+            thread_refresh,
+        });
+    }
+
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_notification_open_url_repair",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin notification repair tx")?;
+
+    for update in updates {
+        let current = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT
+              repo_full_name,
+              subject_title,
+              subject_type,
+              reason,
+              updated_at,
+              url,
+              unread,
+              html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(update.thread_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to reload notification before repair update")?;
+
+        let Some((
+            current_repo_full_name,
+            current_subject_title,
+            current_subject_type,
+            current_reason,
+            current_updated_at,
+            current_url,
+            current_unread,
+            current_html_url,
+        )) = current
+        else {
+            continue;
+        };
+
+        let current_needs_thread_lookup = current_url
+            .as_deref()
+            .is_some_and(is_notification_thread_api_url)
+            || current_html_url.is_none();
+        if !current_needs_thread_lookup {
+            continue;
+        }
+
+        let thread = match &update.thread_refresh {
             ThreadRefresh::Refreshed(thread) => thread.as_ref(),
             ThreadRefresh::NotNeeded | ThreadRefresh::Failed => None,
         };
+        let prefer_thread_metadata = notification_thread_refresh_is_fresher(
+            current_updated_at.as_deref(),
+            thread.and_then(|item| item.updated_at.as_deref()),
+        );
 
-        let resolved_repo_full_name = thread
-            .as_ref()
-            .and_then(|item| item.repository.full_name.clone())
-            .or(repo_full_name.clone());
-        let resolved_subject_title = thread
-            .as_ref()
-            .and_then(|item| item.subject.title.clone())
-            .or(subject_title.clone());
-        let resolved_subject_type = thread
-            .as_ref()
-            .and_then(|item| item.subject.subject_type.clone())
-            .or(subject_type.clone());
-        let resolved_reason = thread
-            .as_ref()
-            .and_then(|item| item.reason.clone())
-            .or(reason.clone());
-        let resolved_updated_at = thread
-            .as_ref()
-            .and_then(|item| item.updated_at.clone())
-            .or(updated_at.clone());
-        let resolved_unread = thread
-            .as_ref()
-            .and_then(|item| item.unread)
-            .map(|unread| unread as i64)
-            .unwrap_or(unread);
-        let resolved_api_url = match (&thread_refresh, thread) {
+        let resolved_repo_full_name = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.repository.full_name.clone())
+                .or(current_repo_full_name.clone())
+        } else {
+            current_repo_full_name
+                .clone()
+                .or_else(|| thread.and_then(|item| item.repository.full_name.clone()))
+        };
+        let resolved_subject_title = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.subject.title.clone())
+                .or(current_subject_title.clone())
+        } else {
+            current_subject_title
+                .clone()
+                .or_else(|| thread.and_then(|item| item.subject.title.clone()))
+        };
+        let resolved_subject_type = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.subject.subject_type.clone())
+                .or(current_subject_type.clone())
+        } else {
+            current_subject_type
+                .clone()
+                .or_else(|| thread.and_then(|item| item.subject.subject_type.clone()))
+        };
+        let resolved_reason = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.reason.clone())
+                .or(current_reason.clone())
+        } else {
+            current_reason
+                .clone()
+                .or_else(|| thread.and_then(|item| item.reason.clone()))
+        };
+        let resolved_updated_at = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.updated_at.clone())
+                .or(current_updated_at.clone())
+        } else {
+            current_updated_at
+                .clone()
+                .or_else(|| thread.and_then(|item| item.updated_at.clone()))
+        };
+        let resolved_api_url = match (&update.thread_refresh, thread) {
             (_, Some(item)) => item
                 .subject
                 .url
@@ -8164,26 +8422,30 @@ where
                         .as_deref()
                         .and_then(non_thread_notification_api_url)
                 })
-                .or_else(|| url.as_deref().and_then(non_thread_notification_api_url)),
-            (ThreadRefresh::Failed, _) => url.clone(),
-            (ThreadRefresh::Refreshed(None), _) if needs_thread_lookup => {
-                url.as_deref().and_then(non_thread_notification_api_url)
-            }
-            _ => url.clone(),
+                .or_else(|| {
+                    current_url
+                        .as_deref()
+                        .and_then(non_thread_notification_api_url)
+                }),
+            (ThreadRefresh::Failed, _) => current_url.clone(),
+            (ThreadRefresh::Refreshed(None), _) if current_needs_thread_lookup => current_url
+                .as_deref()
+                .and_then(non_thread_notification_api_url),
+            _ => current_url.clone(),
         };
-        let resolved_html_url = match thread_refresh {
-            ThreadRefresh::Failed => html_url.unwrap_or_else(|| {
+        let resolved_html_url = match update.thread_refresh {
+            ThreadRefresh::Failed => current_html_url.clone().unwrap_or_else(|| {
                 resolve_notification_open_url(
-                    url.as_deref(),
+                    current_url.as_deref(),
                     resolved_repo_full_name.as_deref(),
-                    Some(thread_id.as_str()),
+                    Some(update.thread_id.as_str()),
                 )
             }),
             ThreadRefresh::NotNeeded | ThreadRefresh::Refreshed(_) => {
                 resolve_notification_open_url(
                     resolved_api_url.as_deref(),
                     resolved_repo_full_name.as_deref(),
-                    Some(thread_id.as_str()),
+                    Some(update.thread_id.as_str()),
                 )
             }
         };
@@ -8209,16 +8471,18 @@ where
         .bind(resolved_subject_type)
         .bind(resolved_reason)
         .bind(resolved_updated_at)
-        .bind(resolved_unread)
+        .bind(current_unread)
         .bind(resolved_api_url)
         .bind(resolved_html_url)
         .bind(now)
         .bind(user_id)
-        .bind(thread_id)
-        .execute(&state.pool)
+        .bind(update.thread_id)
+        .execute(&mut *tx)
         .await
         .context("failed to repair cached notification open url")?;
     }
+
+    tx.commit().await.context("commit notification repair tx")?;
 
     let remaining = sqlx::query_scalar::<_, i64>(
         r#"
@@ -8386,22 +8650,24 @@ mod tests {
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
+        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
+        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
         attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
         cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
+        discussion_announcement_from_node, execute_subscription_prune_phases,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
-        process_repo_release_work_item, record_repo_release_sync_success,
-        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
-        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
-        subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
-        upsert_starred_repos, wait_for_release_demand,
+        process_repo_release_work_item, prune_subscription_sync_history,
+        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
+        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
+        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
+        upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -8637,6 +8903,64 @@ mod tests {
         .expect("load notification unread");
 
         assert_eq!(unread, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T10:00:00Z";
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-04-13T10:00:01Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let busy_user_id = user_id.clone();
+        let notification_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let notification = mock_notification(
+                    "thread-busy",
+                    Some("https://api.github.com/repos/octo/rocket/issues/3"),
+                    Some("octo/rocket"),
+                    Some("Issue"),
+                    now,
+                );
+                upsert_notifications(state.as_ref(), busy_user_id.as_str(), &[notification], now)
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        notification_task
+            .await
+            .expect("join notification upsert task")
+            .expect("notification upsert should succeed after writer release");
+
+        let unread = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-busy")
+        .fetch_one(&pool)
+        .await
+        .expect("load busy notification unread");
+        assert_eq!(unread, 1);
     }
 
     #[test]
@@ -8938,9 +9262,18 @@ mod tests {
         assert_eq!(observed[0].1, observed[1].1);
         assert!(observed[0].1.is_some());
 
-        let stored = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        let stored = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             r#"
-            SELECT thread_id, url, html_url
+            SELECT thread_id, subject_title, updated_at, url, html_url
             FROM notifications
             WHERE user_id = ?
             ORDER BY thread_id
@@ -8953,21 +9286,29 @@ mod tests {
         assert_eq!(stored.len(), 51);
         assert!(stored.contains(&(
             "cached-thread".to_owned(),
+            Some("Notification cached-thread".to_owned()),
+            Some("2026-03-06T03:30:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
             Some("https://github.com/octo/alpha/pull/120".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-1".to_owned(),
+            Some("Notification thread-1".to_owned()),
+            Some("2026-03-06T03:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/issues/12".to_owned()),
             Some("https://github.com/octo/alpha/issues/12".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-2".to_owned(),
+            Some("Notification thread-2".to_owned()),
+            Some("2026-03-06T02:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/check-suites/99".to_owned()),
             Some("https://github.com/notifications/threads/thread-2".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-3".to_owned(),
+            Some("Notification thread-3".to_owned()),
+            Some("2026-03-06T01:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/beta/pulls/34".to_owned()),
             Some("https://github.com/octo/beta/pull/34".to_owned()),
         )));
@@ -9109,6 +9450,249 @@ mod tests {
         .await
         .expect("read notifications since");
         assert!(!since_value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_releases_sqlite_writer_during_thread_lookup() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-repair-permit-lifecycle");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .bind("octo/alpha")
+        .bind("Old cached notification")
+        .bind("PullRequest")
+        .bind("state_change")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(1_i64)
+        .bind("https://api.github.com/notifications/threads/cached-thread")
+        .bind("https://github.com/octo/alpha")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale notification");
+
+        let release_lookup = Arc::new(tokio::sync::Notify::new());
+        let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sync_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            let release_lookup = release_lookup.clone();
+            tokio::spawn(async move {
+                sync_notifications_with_fetch(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    move |_since, _before, page| {
+                        Box::pin(async move {
+                            assert_eq!(page, 1);
+                            Ok(Vec::new())
+                        })
+                    },
+                    move |thread_id| {
+                        let release_lookup = release_lookup.clone();
+                        let reached_tx = reached_tx.clone();
+                        Box::pin(async move {
+                            reached_tx
+                                .send(())
+                                .expect("signal repair reached thread lookup");
+                            release_lookup.notified().await;
+                            Ok(Some(mock_notification(
+                                &thread_id,
+                                Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                                Some("octo/alpha"),
+                                Some("PullRequest"),
+                                "2026-03-06T03:30:00Z",
+                            )))
+                        })
+                    },
+                )
+                .await
+            })
+        };
+
+        reached_rx
+            .recv()
+            .await
+            .expect("repair should reach thread lookup");
+
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            state
+                .sqlite_writer
+                .write_foreground("notifications_repair_foreground_probe", |_| async {
+                    Ok::<_, anyhow::Error>(())
+                }),
+        )
+        .await
+        .expect("foreground writer should not wait on notification thread lookup")
+        .expect("foreground probe should succeed");
+
+        release_lookup.notify_waiters();
+
+        let result = sync_task
+            .await
+            .expect("join sync notifications task")
+            .expect("sync notifications");
+        assert_eq!(result.notifications, 0);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired notification");
+        assert_eq!(
+            stored,
+            (
+                Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
+                Some("https://github.com/octo/alpha/pull/120".to_owned()),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_preserves_newer_fields_after_concurrent_upsert() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-repair-concurrent-upsert");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .bind("octo/alpha")
+        .bind("Old cached notification")
+        .bind("PullRequest")
+        .bind("state_change")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(1_i64)
+        .bind("https://api.github.com/notifications/threads/cached-thread")
+        .bind("https://github.com/notifications/threads/cached-thread")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale notification");
+
+        let release_lookup = Arc::new(tokio::sync::Notify::new());
+        let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sync_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            let release_lookup = release_lookup.clone();
+            tokio::spawn(async move {
+                sync_notifications_with_fetch(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    move |_since, _before, page| {
+                        Box::pin(async move {
+                            assert_eq!(page, 1);
+                            Ok(Vec::new())
+                        })
+                    },
+                    move |thread_id| {
+                        let release_lookup = release_lookup.clone();
+                        let reached_tx = reached_tx.clone();
+                        Box::pin(async move {
+                            reached_tx
+                                .send(())
+                                .expect("signal repair reached thread lookup");
+                            release_lookup.notified().await;
+                            Ok(Some(mock_notification(
+                                &thread_id,
+                                Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                                Some("octo/alpha"),
+                                Some("PullRequest"),
+                                "2026-03-06T03:30:00Z",
+                            )))
+                        })
+                    },
+                )
+                .await
+            })
+        };
+
+        reached_rx
+            .recv()
+            .await
+            .expect("repair should reach thread lookup");
+
+        let newer = GitHubNotification {
+            id: "cached-thread".to_owned(),
+            unread: Some(false),
+            reason: Some("mention".to_owned()),
+            updated_at: Some("2026-03-06T04:00:00Z".to_owned()),
+            url: Some("https://api.github.com/notifications/threads/cached-thread".to_owned()),
+            subject: NotificationSubject {
+                title: Some("Fresh notification title".to_owned()),
+                subject_type: Some("Issue".to_owned()),
+                url: Some("https://api.github.com/repos/octo/alpha/issues/88".to_owned()),
+            },
+            repository: NotificationRepo {
+                full_name: Some("octo/alpha".to_owned()),
+            },
+        };
+        upsert_notifications(
+            state.as_ref(),
+            user_id.as_str(),
+            &[newer],
+            "2026-03-06T04:00:00Z",
+        )
+        .await
+        .expect("concurrent notification upsert");
+
+        release_lookup.notify_waiters();
+
+        sync_task
+            .await
+            .expect("join sync notifications task")
+            .expect("sync notifications");
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, i64)>(
+            r#"
+            SELECT subject_title, updated_at, html_url, unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired notification");
+        assert_eq!(
+            stored,
+            (
+                Some("Fresh notification title".to_owned()),
+                Some("2026-03-06T04:00:00Z".to_owned()),
+                Some("https://github.com/octo/alpha/issues/88".to_owned()),
+                0,
+            )
+        );
     }
 
     #[tokio::test]
@@ -13609,6 +14193,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_starred_repos_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("shallow-star-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let busy_user_id = user_id.clone();
+        let upsert_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                upsert_starred_repos(
+                    state.as_ref(),
+                    busy_user_id.as_str(),
+                    &[StarredRepoSnapshot {
+                        repo_id: 103,
+                        full_name: "octo/new".to_owned(),
+                        owner_login: "octo".to_owned(),
+                        name: "new".to_owned(),
+                        description: None,
+                        html_url: "https://github.com/octo/new".to_owned(),
+                        stargazed_at: "2026-03-07T00:00:00Z".to_owned(),
+                        is_private: false,
+                        owner_avatar_url: None,
+                        open_graph_image_url: None,
+                        uses_custom_open_graph_image: false,
+                    }],
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        upsert_task
+            .await
+            .expect("join starred upsert task")
+            .expect("starred upsert should succeed after writer release");
+
+        let full_name: String = sqlx::query_scalar(
+            r#"
+            SELECT full_name
+            FROM starred_repos
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(103_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load new starred repo");
+        assert_eq!(full_name, "octo/new");
+    }
+
+    #[tokio::test]
     async fn replace_starred_repos_surfaces_clear_failure_under_sqlite_write_lock() {
         let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
         let user_id = test_user_id("locked-star");
@@ -13753,6 +14403,234 @@ mod tests {
         .await
         .expect("load sync state");
         assert_eq!(stored_value, "2026-03-07T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn append_subscription_event_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-event-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-event-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let append_task = {
+            let state = state.clone();
+            let task_id = task_id.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                let event = SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_sync_failed",
+                    severity: "error",
+                    recoverable: true,
+                    attempt: 1,
+                    user_id: Some(user_id.as_str()),
+                    repo_id: Some(42),
+                    repo_full_name: Some("octo/repo"),
+                    payload: json!({"message":"writer lock repro"}),
+                };
+                append_subscription_event(state.as_ref(), task_id.as_str(), event).await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        append_task
+            .await
+            .expect("join append event task")
+            .expect("subscription event insert should succeed after writer release");
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("social_sync_failed")
+        .fetch_one(&pool)
+        .await
+        .expect("count inserted subscription event");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_subscription_sync_history_skips_when_sqlite_writer_is_busy() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-prune-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-prune-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(task_id.as_str())
+        .bind("social")
+        .bind("old-event")
+        .bind("warning")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .bind("octo/repo")
+        .bind(r#"{"message":"old"}"#)
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed old subscription event");
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_subscription_prune_hold")
+            .await
+            .expect("hold sqlite writer");
+
+        prune_subscription_sync_history(state.as_ref())
+            .await
+            .expect("prune should skip while writer busy");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("old-event")
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved subscription event");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_prune_keeps_event_cleanup_when_watcher_phase_skips() {
+        let watcher_calls = Arc::new(tokio::sync::Mutex::new(0usize));
+        let event_calls = Arc::new(tokio::sync::Mutex::new(0usize));
+
+        execute_subscription_prune_phases(
+            {
+                let watcher_calls = watcher_calls.clone();
+                move || {
+                    let watcher_calls = watcher_calls.clone();
+                    async move {
+                        *watcher_calls.lock().await += 1;
+                        Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Skipped)
+                    }
+                }
+            },
+            {
+                let event_calls = event_calls.clone();
+                move || {
+                    let event_calls = event_calls.clone();
+                    async move {
+                        let mut calls = event_calls.lock().await;
+                        *calls += 1;
+                        if *calls == 1 {
+                            Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Deleted(2))
+                        } else {
+                            Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Deleted(0))
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("subscription prune phases should continue to event cleanup");
+
+        assert_eq!(*watcher_calls.lock().await, 1);
+        assert_eq!(*event_calls.lock().await, 2);
+    }
+
+    #[tokio::test]
+    async fn prune_subscription_sync_history_skips_when_sqlite_reports_busy() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-prune-sqlite-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-prune-sqlite-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(task_id.as_str())
+        .bind("social")
+        .bind("old-event")
+        .bind("warning")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .bind("octo/repo")
+        .bind(r#"{"message":"old"}"#)
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed old subscription event");
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE sync_subscription_events SET severity = ? WHERE task_id = ?")
+            .bind("error")
+            .bind(task_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        prune_subscription_sync_history(state.as_ref())
+            .await
+            .expect("prune should downgrade sqlite busy");
+
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("old-event")
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved subscription event");
+        assert_eq!(count, 1);
     }
 
     async fn setup_pool() -> SqlitePool {
