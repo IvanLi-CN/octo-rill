@@ -5,8 +5,8 @@
 - Lifecycle: active
 - Implementation: 已交付
 - Created: 2026-02-25
-- Last: 2026-03-30
-- Summary: 已交付；local implementation completed; batching/dedupe contract landed; runtime input-limit source superseded by #y2yf8
+- Last: 2026-06-25
+- Summary: 已交付；batching/dedupe contract landed; runtime backpressure plus release-detail retryable-upstream requeue follow-up synced
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 
@@ -32,3 +32,4 @@ None
 - [x] M3: 后端 batch API 与单条委托改造（release/release detail/notification/brief）。
 - [x] M4: 前端自动翻译切换到 visible-window 结果聚合接口 + Storybook / E2E 回归验证。
 - 运行时背压收口：当结果表已存在当前 source hash 的 pending 快照时，`/api/translate/results` 会先走读优先快路径；命中 SQLite writer / translation worker / LLM scheduler 背压时直接返回既有 `queued/running`，避免重复 resolve 继续放大写压。
+- Release Detail follow-up：request-based `wait` 路径现在在 `max_wait_ms` 预算耗尽后立即交付单-request pending 快照；批次内命中 retryable upstream `429` / rate-limit 时，request/work item 会回排到 `queued`，避免 UI 把暂时性上游拥塞解释成稳定失败。

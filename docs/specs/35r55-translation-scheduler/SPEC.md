@@ -16,9 +16,9 @@
 ### Goals
 
 - 新建统一翻译调度器，接收单条或多条翻译需求并按 `max_wait_ms` + token 窗口统一组批。
-- 翻译工作从 `job_tasks` 域中剥离，形成独立的 requests / work items / batches / watchers 领域模型。
+- 翻译工作从 `job_tasks` 域中剥离，形成独立的 requests / work items / batches 领域模型；request 单条结果契约由后续 `#apras` 继续收口。
 - 提供统一生产者 API，支持 `async` / `wait` / `stream` 三种交付方式。
-- 支持同一批次内混合 `release_summary`、`release_detail`、`notification`，并只在批次终态时向请求方返回整组结果。
+- 支持同一批次内混合 `release_summary`、`release_detail`、`notification`，并与后续单-request 合同兼容。
 - 在 `/admin/jobs` 新增“翻译调度”标签页，提供调度状态、请求视图、批次视图与 LLM 调用追链。
 - 停止为新的翻译工作创建 `translate.release*` / `translate.notification` 类 `job_tasks`。
 
@@ -39,7 +39,7 @@
 | `GET /api/translate/requests/{request_id}` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web producers |
 | `GET /api/translate/requests/{request_id}/stream` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web producers |
 | `/api/admin/jobs/translations/*` | HTTP API | external | New | `./contracts/http-apis.md` | backend | web-admin |
-| `translation_requests` / `translation_request_items` / `translation_work_items` / `translation_work_watchers` / `translation_batches` / `translation_batch_items` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
+| `translation_requests` / `translation_work_items` / `translation_batches` / `translation_batch_items` | DB schema | internal | New | `./contracts/db.md` | backend | backend |
 | `llm_calls` translation parent link | DB schema | internal | Modify | `./contracts/db.md` | backend | backend / web-admin |
 
 ### 契约文档（按 Kind 拆分）
@@ -55,15 +55,19 @@
 
 - Given 多个请求命中同一 `scope_user_id + kind + variant + entity_id + target_lang + source_hash`
   When 调度器尚未完成翻译
-  Then 多个请求共享同一 `work_item`，批次完成后向所有 watcher 扇出相同结果。
+  Then 多个请求共享同一 `work_item`，批次完成后向所有关联 request 扇出相同结果。
 
 - Given 队列累计 token 达到阈值或最早 `deadline_at` 到达
   When 调度器扫描工作项
   Then 创建 `translation_batch` 并将符合条件的 work items 一次封批执行。
 
-- Given 请求使用 `wait` 或 `stream`
-  When 所属批次尚未完成
-  Then 请求方不能提前拿到单项结果；只有批次终态后才能收到本请求对应的整组结果。
+- Given 请求使用 `wait`
+  When `item.max_wait_ms` 预算耗尽且所属 work item 仍未终态
+  Then 请求方收到当前 request 的单结果快照，`result.status` 允许保持 `queued` 或 `running`，而不是继续同步阻塞到批次终态。
+
+- Given release detail work item 在批次内遇到上游 `429` / rate-limit / 暂时性 upstream slow
+  When 错误被判定为 retryable terminal error
+  Then 调度器必须把该 request、work item 与结果表状态重置回 `queued`，而不是把本次失败沉成 owner-facing `error` 终态。
 
 - Given 一个批次同时包含 `release_summary`、`release_detail`、`notification`
   When 管理员查看批次详情

@@ -49,6 +49,7 @@
 - 对 `kind=release_summary` 且 `variant=feed_card` 的条目，后端必须先用当前 release 数据重建 canonical source blocks，再参与 source hash 命中、去重与建队列；旧页面带来的旧 source 不得绑定当前结果行。
 - 若旧 source hash 的 resolve 在更晚时间再次到达，后端不得把结果表回退到更旧的 pending/ready 状态；只有当前已绑定的活跃 work item 或同 source hash 的终态结果才允许真正覆盖结果行。
 - 若条目上一次结果为 error，默认继续返回 error；只有 `retry_on_error=true` 时才允许在原 request/work item 上重置并重新入队，并优先复用最近一次失败的 `translation_requests` 快照供 request-based 读取接口继续追踪。
+- 对 `kind=release_detail` 的批次执行，若上游返回 `429` / rate-limit / plan exhaustion 等 retryable terminal error，后端必须把该 request/work item/结果行复位回 `queued`，让后续 request-based 读取继续观察同一需求，而不是把暂时性拥塞暴露为默认终态错误。
 
 ## Feed / Detail Read Semantics
 
@@ -85,6 +86,7 @@
 - Release feed 自动翻译不再直接调用该接口。
 - Release detail 侧栏与其他保留路径仍可继续使用该接口。
 - 旧的 `/api/translate/release*` 与 `/api/translate/notification*` 端点继续保留为兼容 shim，防止前后端滚动发布时旧 bundle 因缓存命中而失效；新代码不得新增对这些旧端点的依赖。
+- `mode=wait` 的同步等待预算以 `item.max_wait_ms` 为上限；命中 `queued/running` 快照后，调用方应转入后台轮询或后续显式读取，不得继续在同一次用户点击里额外同步阻塞。
 
 ## Get Translation Request（GET /api/translate/requests/{request_id}）
 
