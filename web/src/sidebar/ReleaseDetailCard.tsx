@@ -360,9 +360,7 @@ export function ReleaseDetailCard(props: {
 							requestId: response.request_id,
 						};
 						if (Date.now() >= deadline) {
-							throw new Error(
-								"translation is still processing; please try again shortly",
-							);
+							return;
 						}
 						if (translateRequestSeqRef.current !== requestSeq) return;
 						await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);

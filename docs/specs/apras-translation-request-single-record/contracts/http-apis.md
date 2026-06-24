@@ -88,6 +88,8 @@
 - `wait` / `stream` 只接受 `item`。
 - `async` 可接受 `item` 或 `items`。
 - `wait` 最多阻塞到 `item.max_wait_ms`；若预算内未进入终态，则返回该 request 当前的单结果快照（`status` 可能仍为 `queued | running`）。
+- 调用方在 `wait` 返回 `queued | running` 后，应转为后台轮询或后续显式读取；不得继续在同一次 owner-facing 操作里追加超出 `max_wait_ms` 合同的同步等待。
+- 若 release detail 批次内命中 retryable upstream `429` / rate-limit / plan exhaustion，后端会把关联 request/work item 复位回 `queued`；后续 `GET /api/translate/requests/{request_id}` 继续返回同一需求的 pending 快照，而不是默认终态错误。
 - 旧的 `{ "mode": "wait", "items": [...] }` 与 `{ "mode": "stream", "items": [...] }` 直接返回 `400 bad_request`。
 
 ## `GET /api/translate/requests/{request_id}`
