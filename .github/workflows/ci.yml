@@ -152,6 +152,7 @@ jobs:
           python3 -m py_compile \
             .github/scripts/release_backfill.py \
             .github/scripts/release_pr_comment.py \
+            .github/scripts/verify_release_rollout.py \
             .github/scripts/metadata_gate.py \
             .github/scripts/check_live_quality_gates.py \
             .github/scripts/check_quality_gates_contract.py

@@ -7,6 +7,7 @@
 - **先理解项目现在做什么**：看 [`product.md`](./product.md)
 - **先理解系统怎么拼起来**：看 [`architecture.md`](./architecture.md)
 - **先核对仓库合并与 GitHub 保护规则**：看 [`repository-governance.md`](./repository-governance.md)
+- **先分清“发版”与“101 上线”由谁负责**：先看 [`repository-governance.md`](./repository-governance.md)，再到 101 上对应 stack 的 deployment card
 - **先在本地跑起来**：看 [`../docs-site/docs/quick-start.md`](../docs-site/docs/quick-start.md)
 - **先核对运行配置**：看 [`../docs-site/docs/config.md`](../docs-site/docs/config.md)
 - **要接入公开仓库 Release 展示**：看 [`../docs-site/docs/public-releases.md`](../docs-site/docs/public-releases.md)
@@ -47,6 +48,7 @@
 - **日报 / 翻译 / 后台任务为什么这样运作**：先看 [`product.md`](./product.md) 与 [`architecture.md`](./architecture.md)，再看相关 spec 与 `src/briefs.rs`、`src/translations.rs`、`src/ai.rs`、`src/jobs.rs`
 - **UI 改动应该从哪里验证**：先看 [`../web/README.md`](../web/README.md)，优先用 Storybook 和现有 e2e / story 入口
 - **PR 合并、GitHub ruleset 与 required checks 怎么维护**：看 [`repository-governance.md`](./repository-governance.md)，再看 `.github/quality-gates.json`
+- **GitHub Release 已出但线上版本没更新**：先确认 release workflow 成功，再去 101 上检查 `/home/ivan/srv/octo-rill/octo-rill.md` 与 `octo-rill-rollout.timer`
 
 ## 维护约定
 

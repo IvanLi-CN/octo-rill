@@ -138,6 +138,7 @@ grep -qx 'reason=intent_skip' "$release_output_two"
 
 python3 - <<'PY' \
   "$repo_root/.github/scripts/release_backfill.py" \
+  "$repo_root/.github/scripts/verify_release_rollout.py" \
   "$repo_root/.github/scripts/check_quality_gates_contract.py" \
   "$repo_root/.github/workflows/release.yml" \
   "$repo_root/.github/workflows/ci.yml" \
@@ -147,14 +148,17 @@ from __future__ import annotations
 import http.client
 import importlib.util
 import io
+import json
 import sys
+import time
 from pathlib import Path
 
 backfill_path = Path(sys.argv[1])
-contract_path = Path(sys.argv[2])
-release_workflow_path = Path(sys.argv[3])
-ci_workflow_path = Path(sys.argv[4])
-notify_release_workflow_path = Path(sys.argv[5])
+verify_rollout_path = Path(sys.argv[2])
+contract_path = Path(sys.argv[3])
+release_workflow_path = Path(sys.argv[4])
+ci_workflow_path = Path(sys.argv[5])
+notify_release_workflow_path = Path(sys.argv[6])
 
 
 def load_module(path: Path, name: str):
@@ -167,7 +171,23 @@ def load_module(path: Path, name: str):
 
 
 module = load_module(backfill_path, "release_backfill")
+verify_rollout = load_module(verify_rollout_path, "verify_release_rollout")
 contract = load_module(contract_path, "quality_gates_contract")
+
+
+class FakeHealthResponse:
+    def __init__(self, payload: dict[str, object], status: int = 200) -> None:
+        self.payload = json.dumps(payload).encode("utf-8")
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self.payload
 
 
 class FakeResponse:
@@ -470,6 +490,64 @@ finally:
 assert [candidate.sha for candidate in built_candidates] == ["merge-commit", "squash-commit", "rebase-commit-2"]
 assert [candidate.pr_number for candidate in built_candidates] == [152, 151, 153]
 
+original_verify_urlopen = verify_rollout.urllib.request.urlopen
+original_verify_sleep = verify_rollout.time.sleep
+original_verify_monotonic = verify_rollout.time.monotonic
+try:
+    verify_attempts = {"count": 0}
+
+    def rollout_eventually_matches(request, *, timeout):
+        del request, timeout
+        verify_attempts["count"] += 1
+        if verify_attempts["count"] < 3:
+            return FakeHealthResponse({"ok": True, "version": "2.37.4"})
+        return FakeHealthResponse({"ok": True, "version": "2.37.5"})
+
+    verify_rollout.urllib.request.urlopen = rollout_eventually_matches
+    verify_rollout.time.sleep = lambda _seconds: None
+    sys.argv = [
+        "verify_release_rollout.py",
+        "--url",
+        "https://octo-rill.ivanli.cc/api/health",
+        "--expected-version",
+        "2.37.5",
+        "--timeout-seconds",
+        "60",
+        "--poll-interval",
+        "1",
+    ]
+    assert verify_rollout.main() == 0
+    assert verify_attempts["count"] == 3
+
+    verify_attempts = {"count": 0}
+
+    def rollout_never_matches(request, *, timeout):
+        del request, timeout
+        verify_attempts["count"] += 1
+        return FakeHealthResponse({"ok": True, "version": "2.37.4"})
+
+    monotonic_values = iter([0.0, 0.0, 16.0])
+    verify_rollout.urllib.request.urlopen = rollout_never_matches
+    verify_rollout.time.sleep = lambda _seconds: None
+    verify_rollout.time.monotonic = lambda: next(monotonic_values)
+    sys.argv = [
+        "verify_release_rollout.py",
+        "--url",
+        "https://octo-rill.ivanli.cc/api/health",
+        "--expected-version",
+        "2.37.5",
+        "--timeout-seconds",
+        "15",
+        "--poll-interval",
+        "1",
+    ]
+    assert verify_rollout.main() == 1
+    assert verify_attempts["count"] == 2
+finally:
+    verify_rollout.urllib.request.urlopen = original_verify_urlopen
+    verify_rollout.time.sleep = original_verify_sleep
+    verify_rollout.time.monotonic = original_verify_monotonic
+
 release_workflow = contract.load_yaml(release_workflow_path)
 release_workflow_text = release_workflow_path.read_text(encoding="utf-8")
 on_section = contract.require_mapping(contract.mapping_get(release_workflow, "on"), "release.yml.on")
@@ -585,9 +663,46 @@ assert release_missing_with.get("target_commitish") == "${{ env.RELEASE_HEAD_SHA
 assert release_missing_with.get("token") == "${{ secrets.RELEASE_TOKEN != '' && secrets.RELEASE_TOKEN || github.token }}"
 assert 'git push origin "refs/tags/${tag}"' not in release_workflow_text
 
+verify_job = contract.job_config(release_workflow, "verify-prod-rollout", "release.yml")
+assert verify_job.get("name") == "Verify production rollout"
+assert verify_job.get("needs") == ["plan", "await-ci", "prepare", "docker-release", "pr-release-comment"]
+verify_if = verify_job.get("if", "")
+assert "github.event_name == 'push'" in verify_if
+assert "needs.prepare.outputs.should_release == 'true'" in verify_if
+assert "needs.prepare.outputs.app_is_prerelease != 'true'" in verify_if
+verify_permissions = contract.require_mapping(
+    verify_job.get("permissions"),
+    "release.yml.jobs.verify-prod-rollout.permissions",
+)
+assert verify_permissions == {"contents": "read"}
+verify_checkout = contract.uses_step_config(
+    verify_job,
+    "Checkout workflow revision",
+    "actions/checkout@v4",
+    "release.yml.jobs.verify-prod-rollout",
+)
+verify_checkout_with = contract.require_mapping(
+    verify_checkout.get("with"),
+    "release.yml.jobs.verify-prod-rollout.steps['Checkout workflow revision'].with",
+)
+assert verify_checkout_with.get("ref") == "${{ github.workflow_sha }}"
+verify_step = contract.step_config(
+    verify_job,
+    "Verify production health version",
+    "release.yml.jobs.verify-prod-rollout",
+)
+verify_run = contract.step_run(
+    verify_step,
+    "release.yml.jobs.verify-prod-rollout.steps['Verify production health version']",
+)
+assert "python3 ./.github/scripts/verify_release_rollout.py" in verify_run
+assert '--url "https://octo-rill.ivanli.cc/api/health"' in verify_run
+assert '--expected-version "${{ needs.prepare.outputs.app_effective_version }}"' in verify_run
+
 audit_job = contract.job_config(release_workflow, "audit-backfill", "release.yml")
 assert "github.event_name == 'push'" in audit_job.get("if", "")
 assert "needs.await-ci.result == 'success'" in audit_job.get("if", "")
+assert "needs.verify-prod-rollout.result == 'success'" in audit_job.get("if", "")
 audit_permissions = contract.require_mapping(
     audit_job.get("permissions"),
     "release.yml.jobs.audit-backfill.permissions",
@@ -612,6 +727,7 @@ assert notify_job.get("needs") == [
     "prepare",
     "docker-release",
     "pr-release-comment",
+    "verify-prod-rollout",
     "audit-backfill",
 ]
 notify_if = notify_job.get("if", "")
@@ -623,6 +739,7 @@ for needed_job in [
     "prepare",
     "docker-release",
     "pr-release-comment",
+    "verify-prod-rollout",
     "audit-backfill",
 ]:
     assert f"needs.{needed_job}.result == 'failure'" in notify_if
@@ -668,6 +785,7 @@ lint_job = contract.job_config(ci_workflow, "lint", "ci.yml")
 compile_step = contract.step_config(lint_job, "Check quality-gates scripts", "ci.yml.jobs.lint")
 compile_run = contract.step_run(compile_step, "ci.yml.jobs.lint.steps['Check quality-gates scripts']")
 assert ".github/scripts/release_backfill.py" in compile_run
+assert ".github/scripts/verify_release_rollout.py" in compile_run
 self_tests_step = contract.step_config(lint_job, "Quality gates self-tests", "ci.yml.jobs.lint")
 self_tests_run = contract.step_run(self_tests_step, "ci.yml.jobs.lint.steps['Quality gates self-tests']")
 assert "bash .github/scripts/test-release-automation.sh" in self_tests_run

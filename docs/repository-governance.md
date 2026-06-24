@@ -4,7 +4,7 @@ This document defines the repository-level workflow and GitHub configuration for
 
 ## Protected branch
 
-`main` is the production branch. It represents the source used for releases, GitHub Pages assembly, and deployment-oriented automation.
+`main` is the production branch. It represents the source used for releases, GitHub Pages assembly, and container publication automation.
 
 The `Main Branch Quality Gate` ruleset protects `main` with these guarantees:
 
@@ -54,6 +54,14 @@ Before merge, maintainers confirm:
 Release automation runs from `push` events on `main` and can also be backfilled with `workflow_dispatch(head_sha)`.
 
 The release planner scans first-parent commits on `main`, resolves each commit to its pull request, and uses the PR `type:*` and `channel:*` labels as release intent. This includes merge commits, squash/direct PR commits, and rebase-merged PR commits. When multiple mainline commits resolve to the same PR, the planner keeps the PR's last mainline commit so each release-bearing PR contributes at most one candidate to the backfill and repair queue.
+
+Release automation is responsible for:
+
+- computing the effective version;
+- creating or repairing the GitHub Release;
+- publishing the GHCR image tags for that version.
+
+Release automation is not the production rollout mechanism. OctoRill production reconciliation on machine 101 is host-side ops automation maintained under `/home/ivan/srv/octo-rill/`; if a GitHub Release exists but the live version is stale, maintainers should inspect the matched deployment card and rollout timer on the host instead of expecting an in-repo GitHub Actions deploy job.
 
 ## Review policy
 
