@@ -15,6 +15,7 @@
 - 2026-06-24：PR review 继续指出 notification open-url repair 虽然已接入 coordinator，但把 GitHub thread lookup 也包进了 writer permit；决定补并发回归并把 lookup 前移到 permit 外，只保留最终 repair update 的短事务。
 - 2026-06-24：继续 review 时又确认 subscription history prune 的 watcher 裁剪一旦 busy 会提前短路整个函数，导致 event retention 同轮完全不跑；决定把两个 prune 相位拆成独立 best-effort 控制流，并补回归锁住“watcher skip 不得短路 event prune”。
 - 2026-06-24：继续 review 又确认 notification open-url repair 在 lookup 前移后仍会用旧快照覆盖并发更新的新字段；决定在 writer 事务内按 `thread_id` 重读当前 notification，只在仍需 repair 时更新 URL 相关字段，并补并发回归锁住“repair 不得回滚更新更晚的通知数据”。
+- 2026-06-24：继续 review 再确认 notification open-url repair 重新读取当前行后，仍会把“当前非空但更旧”的标题/类型/reason 保留到最终写回，导致 fresher thread refresh 无法真正修复 stale metadata；决定按 `updated_at` 比较 freshness，仅在线程刷新不早于当前行时让其 metadata 覆盖旧值，并补回归锁住“旧行 metadata 能被 fresher thread 修正，但不会覆盖更新更晚的并发 upsert”。
 
 ## Key Reasons / Replacements
 

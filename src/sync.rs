@@ -6224,6 +6224,23 @@ fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestEr
     SyncRequestError::non_retryable("request_error", format!("{operation}: {err}"), None)
 }
 
+fn notification_thread_refresh_is_fresher(
+    current_updated_at: Option<&str>,
+    thread_updated_at: Option<&str>,
+) -> bool {
+    let thread_updated_at =
+        thread_updated_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+    let current_updated_at =
+        current_updated_at.and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+
+    match (current_updated_at, thread_updated_at) {
+        (_, Some(thread_updated_at)) => current_updated_at
+            .map(|current_updated_at| thread_updated_at >= current_updated_at)
+            .unwrap_or(true),
+        _ => false,
+    }
+}
+
 fn classify_github_http_error(
     operation: &str,
     status: StatusCode,
@@ -8344,22 +8361,56 @@ where
             ThreadRefresh::Refreshed(thread) => thread.as_ref(),
             ThreadRefresh::NotNeeded | ThreadRefresh::Failed => None,
         };
+        let prefer_thread_metadata = notification_thread_refresh_is_fresher(
+            current_updated_at.as_deref(),
+            thread.and_then(|item| item.updated_at.as_deref()),
+        );
 
-        let resolved_repo_full_name = current_repo_full_name
-            .clone()
-            .or_else(|| thread.and_then(|item| item.repository.full_name.clone()));
-        let resolved_subject_title = current_subject_title
-            .clone()
-            .or_else(|| thread.and_then(|item| item.subject.title.clone()));
-        let resolved_subject_type = current_subject_type
-            .clone()
-            .or_else(|| thread.and_then(|item| item.subject.subject_type.clone()));
-        let resolved_reason = current_reason
-            .clone()
-            .or_else(|| thread.and_then(|item| item.reason.clone()));
-        let resolved_updated_at = current_updated_at
-            .clone()
-            .or_else(|| thread.and_then(|item| item.updated_at.clone()));
+        let resolved_repo_full_name = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.repository.full_name.clone())
+                .or(current_repo_full_name.clone())
+        } else {
+            current_repo_full_name
+                .clone()
+                .or_else(|| thread.and_then(|item| item.repository.full_name.clone()))
+        };
+        let resolved_subject_title = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.subject.title.clone())
+                .or(current_subject_title.clone())
+        } else {
+            current_subject_title
+                .clone()
+                .or_else(|| thread.and_then(|item| item.subject.title.clone()))
+        };
+        let resolved_subject_type = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.subject.subject_type.clone())
+                .or(current_subject_type.clone())
+        } else {
+            current_subject_type
+                .clone()
+                .or_else(|| thread.and_then(|item| item.subject.subject_type.clone()))
+        };
+        let resolved_reason = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.reason.clone())
+                .or(current_reason.clone())
+        } else {
+            current_reason
+                .clone()
+                .or_else(|| thread.and_then(|item| item.reason.clone()))
+        };
+        let resolved_updated_at = if prefer_thread_metadata {
+            thread
+                .and_then(|item| item.updated_at.clone())
+                .or(current_updated_at.clone())
+        } else {
+            current_updated_at
+                .clone()
+                .or_else(|| thread.and_then(|item| item.updated_at.clone()))
+        };
         let resolved_api_url = match (&update.thread_refresh, thread) {
             (_, Some(item)) => item
                 .subject
@@ -9211,9 +9262,18 @@ mod tests {
         assert_eq!(observed[0].1, observed[1].1);
         assert!(observed[0].1.is_some());
 
-        let stored = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+        let stored = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             r#"
-            SELECT thread_id, url, html_url
+            SELECT thread_id, subject_title, updated_at, url, html_url
             FROM notifications
             WHERE user_id = ?
             ORDER BY thread_id
@@ -9226,21 +9286,29 @@ mod tests {
         assert_eq!(stored.len(), 51);
         assert!(stored.contains(&(
             "cached-thread".to_owned(),
+            Some("Notification cached-thread".to_owned()),
+            Some("2026-03-06T03:30:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
             Some("https://github.com/octo/alpha/pull/120".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-1".to_owned(),
+            Some("Notification thread-1".to_owned()),
+            Some("2026-03-06T03:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/issues/12".to_owned()),
             Some("https://github.com/octo/alpha/issues/12".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-2".to_owned(),
+            Some("Notification thread-2".to_owned()),
+            Some("2026-03-06T02:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/alpha/check-suites/99".to_owned()),
             Some("https://github.com/notifications/threads/thread-2".to_owned()),
         )));
         assert!(stored.contains(&(
             "thread-3".to_owned(),
+            Some("Notification thread-3".to_owned()),
+            Some("2026-03-06T01:00:00Z".to_owned()),
             Some("https://api.github.com/repos/octo/beta/pulls/34".to_owned()),
             Some("https://github.com/octo/beta/pull/34".to_owned()),
         )));
