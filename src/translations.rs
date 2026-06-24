@@ -754,6 +754,11 @@ pub(crate) fn translation_error_is_retryable(error_text: Option<&str>) -> bool {
         || normalized.contains("repo scope required; re-login via github oauth")
         || normalized.contains("database is locked")
         || normalized.contains("busy")
+        || normalized.contains("ai returned 429")
+        || normalized.contains("too many requests")
+        || normalized.contains("rate limit")
+        || normalized.contains("rpm exhausted")
+        || normalized.contains("token plan limit exhausted")
         || normalized.contains("timed out")
         || normalized.contains("timeout")
         || normalized.contains("temporarily unavailable")
@@ -4339,6 +4344,90 @@ async fn finalize_batch_success(
         .begin_immediate(&state.pool, "translation_batch_finalize")
         .await?;
     for result in &results {
+        let Some(work_item) = batch
+            .items
+            .iter()
+            .find(|item| item.id == result.work_item_id)
+        else {
+            continue;
+        };
+        let retryable_terminal_error = result.result_status == "error"
+            && should_retry_translation_terminal_error(
+                false,
+                &TranslationRequestItemInput {
+                    producer_ref: String::new(),
+                    kind: work_item.kind.clone(),
+                    variant: work_item.variant.clone(),
+                    entity_id: work_item.entity_id.clone(),
+                    target_lang: work_item.target_lang.clone(),
+                    max_wait_ms: 0,
+                    source_blocks: Vec::new(),
+                    target_slots: Vec::new(),
+                },
+                result.error.as_deref(),
+            );
+
+        if retryable_terminal_error {
+            reset_retryable_terminal_work_item(&mut tx, work_item.id.as_str(), now.as_str())
+                .await?;
+            sqlx::query(
+                r#"
+                UPDATE translation_batch_items
+                SET result_status = NULL, error_text = NULL, updated_at = ?
+                WHERE batch_id = ? AND work_item_id = ?
+                "#,
+            )
+            .bind(now.as_str())
+            .bind(batch.id.as_str())
+            .bind(work_item.id.as_str())
+            .execute(&mut *tx)
+            .await?;
+
+            let requests = sqlx::query(
+                r#"
+                SELECT id
+                FROM translation_requests
+                WHERE work_item_id = ?
+                "#,
+            )
+            .bind(work_item.id.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+            for request in requests {
+                let request_id: String = request.try_get("id")?;
+                reset_request_for_retry(&mut tx, request_id.as_str(), now.as_str()).await?;
+                attach_request_to_work_item(
+                    &mut tx,
+                    request_id.as_str(),
+                    work_item.id.as_str(),
+                    "queued",
+                    now.as_str(),
+                )
+                .await?;
+            }
+
+            upsert_translation_demand_state(
+                &mut tx,
+                &work_item.scope_user_id,
+                &TranslationRequestItemInput {
+                    producer_ref: work_item.dedupe_key.clone(),
+                    kind: work_item.kind.clone(),
+                    variant: work_item.variant.clone(),
+                    entity_id: work_item.entity_id.clone(),
+                    target_lang: work_item.target_lang.clone(),
+                    max_wait_ms: 0,
+                    source_blocks: Vec::new(),
+                    target_slots: Vec::new(),
+                },
+                work_item.source_hash.as_str(),
+                "queued",
+                work_item.id.as_str(),
+                now.as_str(),
+            )
+            .await?;
+            continue;
+        }
+
         sqlx::query(
             r#"
             UPDATE translation_work_items
@@ -4426,28 +4515,22 @@ async fn finalize_batch_success(
             .await?;
         }
 
-        if let Some(work_item) = batch
-            .items
-            .iter()
-            .find(|item| item.id == result.work_item_id)
-        {
-            persist_translation_terminal_state(
-                &mut tx,
-                &work_item.scope_user_id,
-                work_item.kind.as_str(),
-                work_item.variant.as_str(),
-                work_item.entity_id.as_str(),
-                work_item.target_lang.as_str(),
-                work_item.source_hash.as_str(),
-                result.result_status.as_str(),
-                result.title_zh.as_deref(),
-                result.summary_md.as_deref().or(result.body_md.as_deref()),
-                result.error.as_deref(),
-                work_item.id.as_str(),
-                now.as_str(),
-            )
-            .await?;
-        }
+        persist_translation_terminal_state(
+            &mut tx,
+            &work_item.scope_user_id,
+            work_item.kind.as_str(),
+            work_item.variant.as_str(),
+            work_item.entity_id.as_str(),
+            work_item.target_lang.as_str(),
+            work_item.source_hash.as_str(),
+            result.result_status.as_str(),
+            result.title_zh.as_deref(),
+            result.summary_md.as_deref().or(result.body_md.as_deref()),
+            result.error.as_deref(),
+            work_item.id.as_str(),
+            now.as_str(),
+        )
+        .await?;
     }
 
     sqlx::query(
@@ -7309,6 +7392,155 @@ mod tests {
             resolved[0].work_item_id.as_deref(),
             Some(work_item_id.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_batch_success_requeues_retryable_release_detail_errors() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            120,
+            "openai/codex",
+            "Release v1.2.3",
+            "- item",
+        )
+        .await;
+        let mut item = release_detail_card_item(
+            "120",
+            "Stale title",
+            Some("- stale item"),
+            Some("openai/codex\n2026-03-30T00:00:00Z"),
+        );
+        item.max_wait_ms = 0;
+
+        let created = create_translation_request(state.as_ref(), "1", "wait", &item)
+            .await
+            .expect("create wait detail request");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let work_item = batch
+            .items
+            .iter()
+            .find(|candidate| candidate.entity_id == "120")
+            .expect("detail work item")
+            .clone();
+
+        sqlx::query(
+            r#"
+            UPDATE translation_work_items
+            SET status = 'running',
+                batch_id = ?,
+                result_status = NULL,
+                error_text = NULL,
+                started_at = COALESCE(started_at, ?),
+                finished_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(batch.id.as_str())
+        .bind("2026-03-30T00:00:00Z")
+        .bind("2026-03-30T00:00:00Z")
+        .bind(work_item.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("restore running work item");
+        sqlx::query(
+            r#"
+            UPDATE translation_requests
+            SET status = 'running',
+                work_item_id = ?,
+                result_status = NULL,
+                error_text = NULL,
+                started_at = COALESCE(started_at, ?),
+                finished_at = NULL,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(work_item.id.as_str())
+        .bind("2026-03-30T00:00:00Z")
+        .bind("2026-03-30T00:00:00Z")
+        .bind(created.request_id.as_str())
+        .execute(&pool)
+        .await
+        .expect("restore running request");
+        sqlx::query(
+            r#"
+            UPDATE translation_batches
+            SET status = 'running',
+                error_text = NULL,
+                finished_at = NULL,
+                runtime_owner_id = ?,
+                lease_heartbeat_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(state.runtime_owner_id.as_str())
+        .bind("2026-03-30T00:00:00Z")
+        .bind("2026-03-30T00:00:00Z")
+        .bind(batch.id.as_str())
+        .execute(&pool)
+        .await
+        .expect("restore running batch");
+
+        finalize_batch_success(
+            state.as_ref(),
+            &batch,
+            vec![TerminalWorkResult {
+                work_item_id: work_item.id.clone(),
+                result_status: "error".to_owned(),
+                title_zh: None,
+                summary_md: None,
+                body_md: None,
+                error: Some("AI returned 429 Too Many Requests: rpm exhausted".to_owned()),
+            }],
+        )
+        .await
+        .expect("finalize batch success with retryable error");
+
+        let request_row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, result_status FROM translation_requests WHERE id = ? LIMIT 1",
+        )
+        .bind(created.request_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load request row");
+        let work_item_row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, result_status, batch_id FROM translation_work_items WHERE id = ? LIMIT 1",
+        )
+        .bind(work_item.id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load work item row");
+        let state_row: (String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT status, error_text
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind("120")
+        .fetch_one(&pool)
+        .await
+        .expect("load translation state");
+
+        assert_eq!(request_row.0, "queued");
+        assert_eq!(request_row.1, None);
+        assert_eq!(work_item_row.0, "queued");
+        assert_eq!(work_item_row.1, None);
+        assert_eq!(work_item_row.2, None);
+        assert_eq!(state_row.0, "queued");
+        assert_eq!(state_row.1, None);
     }
 
     #[tokio::test]

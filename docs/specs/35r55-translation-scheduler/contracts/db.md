@@ -4,12 +4,8 @@
 
 - `translation_requests`
   - producer-facing request envelope
-- `translation_request_items`
-  - per-request item status and returned fields
 - `translation_work_items`
   - deduplicated scheduler work items keyed by scope + kind + variant + entity + source hash
-- `translation_work_watchers`
-  - request-item to work-item fan-out mapping
 - `translation_batches`
   - actual scheduled batches with trigger reason and token estimate
 - `translation_batch_items`

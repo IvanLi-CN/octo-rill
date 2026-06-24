@@ -4,7 +4,7 @@
 
 - Lifecycle: active
 - Created: 2026-03-09
-- Last: 2026-03-10
+- Last: 2026-06-25
 
 ## 变更记录
 
@@ -12,3 +12,4 @@
 - 2026-03-09: 实现与验证同步完成：后端迁移/调度逻辑切到单 request 直连 work item，前端与 fixtures 改为 singular result，并补跑 Rust、web build、Playwright 与 Storybook build。
 - 2026-03-09: 创建 PR #35，补上发布标签门禁与类型窄化修复；当前 checks 全绿、review-loop 无阻塞项，状态更新为 `已完成`。
 - 2026-03-10: 补上 work item 去重竞争保护，并将 `wait` 语义收敛为“最多等待 `max_wait_ms` 后返回当前单结果快照”，前端调用方同步增加超时保护。
+- 2026-06-25: 根据线上 release detail 行为补齐 follow-up 合同：前端拿到 `queued/running` 单结果快照后不再额外同步阻塞；批次内 retryable upstream `429` / rate-limit / plan exhaustion 改为把 request/work item 回排到 `queued`，避免默认沉成终态错误。
