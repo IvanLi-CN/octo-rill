@@ -8186,14 +8186,7 @@ where
 
     struct NotificationRepairUpdate {
         thread_id: String,
-        repo_full_name: Option<String>,
-        subject_title: Option<String>,
-        subject_type: Option<String>,
-        reason: Option<String>,
-        updated_at: Option<String>,
-        unread: i64,
-        url: Option<String>,
-        html_url: String,
+        thread_refresh: ThreadRefresh,
     }
 
     let rows = sqlx::query_as::<
@@ -8245,13 +8238,13 @@ where
 
     for (
         thread_id,
-        repo_full_name,
-        subject_title,
-        subject_type,
-        reason,
-        updated_at,
+        _repo_full_name,
+        _subject_title,
+        _subject_type,
+        _reason,
+        _updated_at,
         url,
-        unread,
+        _unread,
         html_url,
     ) in rows
     {
@@ -8274,81 +8267,9 @@ where
         } else {
             ThreadRefresh::NotNeeded
         };
-        let thread = match &thread_refresh {
-            ThreadRefresh::Refreshed(thread) => thread.as_ref(),
-            ThreadRefresh::NotNeeded | ThreadRefresh::Failed => None,
-        };
-
-        let resolved_repo_full_name = thread
-            .as_ref()
-            .and_then(|item| item.repository.full_name.clone())
-            .or(repo_full_name.clone());
-        let resolved_subject_title = thread
-            .as_ref()
-            .and_then(|item| item.subject.title.clone())
-            .or(subject_title.clone());
-        let resolved_subject_type = thread
-            .as_ref()
-            .and_then(|item| item.subject.subject_type.clone())
-            .or(subject_type.clone());
-        let resolved_reason = thread
-            .as_ref()
-            .and_then(|item| item.reason.clone())
-            .or(reason.clone());
-        let resolved_updated_at = thread
-            .as_ref()
-            .and_then(|item| item.updated_at.clone())
-            .or(updated_at.clone());
-        let resolved_unread = thread
-            .as_ref()
-            .and_then(|item| item.unread)
-            .map(|unread| unread as i64)
-            .unwrap_or(unread);
-        let resolved_api_url = match (&thread_refresh, thread) {
-            (_, Some(item)) => item
-                .subject
-                .url
-                .as_deref()
-                .and_then(non_thread_notification_api_url)
-                .or_else(|| {
-                    item.url
-                        .as_deref()
-                        .and_then(non_thread_notification_api_url)
-                })
-                .or_else(|| url.as_deref().and_then(non_thread_notification_api_url)),
-            (ThreadRefresh::Failed, _) => url.clone(),
-            (ThreadRefresh::Refreshed(None), _) if needs_thread_lookup => {
-                url.as_deref().and_then(non_thread_notification_api_url)
-            }
-            _ => url.clone(),
-        };
-        let resolved_html_url = match thread_refresh {
-            ThreadRefresh::Failed => html_url.unwrap_or_else(|| {
-                resolve_notification_open_url(
-                    url.as_deref(),
-                    resolved_repo_full_name.as_deref(),
-                    Some(thread_id.as_str()),
-                )
-            }),
-            ThreadRefresh::NotNeeded | ThreadRefresh::Refreshed(_) => {
-                resolve_notification_open_url(
-                    resolved_api_url.as_deref(),
-                    resolved_repo_full_name.as_deref(),
-                    Some(thread_id.as_str()),
-                )
-            }
-        };
-
         updates.push(NotificationRepairUpdate {
             thread_id,
-            repo_full_name: resolved_repo_full_name,
-            subject_title: resolved_subject_title,
-            subject_type: resolved_subject_type,
-            reason: resolved_reason,
-            updated_at: resolved_updated_at,
-            unread: resolved_unread,
-            url: resolved_api_url,
-            html_url: resolved_html_url,
+            thread_refresh,
         });
     }
 
@@ -8363,6 +8284,121 @@ where
         .context("begin notification repair tx")?;
 
     for update in updates {
+        let current = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT
+              repo_full_name,
+              subject_title,
+              subject_type,
+              reason,
+              updated_at,
+              url,
+              unread,
+              html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(update.thread_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to reload notification before repair update")?;
+
+        let Some((
+            current_repo_full_name,
+            current_subject_title,
+            current_subject_type,
+            current_reason,
+            current_updated_at,
+            current_url,
+            current_unread,
+            current_html_url,
+        )) = current
+        else {
+            continue;
+        };
+
+        let current_needs_thread_lookup = current_url
+            .as_deref()
+            .is_some_and(is_notification_thread_api_url)
+            || current_html_url.is_none();
+        if !current_needs_thread_lookup {
+            continue;
+        }
+
+        let thread = match &update.thread_refresh {
+            ThreadRefresh::Refreshed(thread) => thread.as_ref(),
+            ThreadRefresh::NotNeeded | ThreadRefresh::Failed => None,
+        };
+
+        let resolved_repo_full_name = current_repo_full_name
+            .clone()
+            .or_else(|| thread.and_then(|item| item.repository.full_name.clone()));
+        let resolved_subject_title = current_subject_title
+            .clone()
+            .or_else(|| thread.and_then(|item| item.subject.title.clone()));
+        let resolved_subject_type = current_subject_type
+            .clone()
+            .or_else(|| thread.and_then(|item| item.subject.subject_type.clone()));
+        let resolved_reason = current_reason
+            .clone()
+            .or_else(|| thread.and_then(|item| item.reason.clone()));
+        let resolved_updated_at = current_updated_at
+            .clone()
+            .or_else(|| thread.and_then(|item| item.updated_at.clone()));
+        let resolved_api_url = match (&update.thread_refresh, thread) {
+            (_, Some(item)) => item
+                .subject
+                .url
+                .as_deref()
+                .and_then(non_thread_notification_api_url)
+                .or_else(|| {
+                    item.url
+                        .as_deref()
+                        .and_then(non_thread_notification_api_url)
+                })
+                .or_else(|| {
+                    current_url
+                        .as_deref()
+                        .and_then(non_thread_notification_api_url)
+                }),
+            (ThreadRefresh::Failed, _) => current_url.clone(),
+            (ThreadRefresh::Refreshed(None), _) if current_needs_thread_lookup => current_url
+                .as_deref()
+                .and_then(non_thread_notification_api_url),
+            _ => current_url.clone(),
+        };
+        let resolved_html_url = match update.thread_refresh {
+            ThreadRefresh::Failed => current_html_url.clone().unwrap_or_else(|| {
+                resolve_notification_open_url(
+                    current_url.as_deref(),
+                    resolved_repo_full_name.as_deref(),
+                    Some(update.thread_id.as_str()),
+                )
+            }),
+            ThreadRefresh::NotNeeded | ThreadRefresh::Refreshed(_) => {
+                resolve_notification_open_url(
+                    resolved_api_url.as_deref(),
+                    resolved_repo_full_name.as_deref(),
+                    Some(update.thread_id.as_str()),
+                )
+            }
+        };
+
         sqlx::query(
             r#"
             UPDATE notifications
@@ -8379,14 +8415,14 @@ where
             WHERE user_id = ? AND thread_id = ?
             "#,
         )
-        .bind(update.repo_full_name)
-        .bind(update.subject_title)
-        .bind(update.subject_type)
-        .bind(update.reason)
-        .bind(update.updated_at)
-        .bind(update.unread)
-        .bind(update.url)
-        .bind(update.html_url)
+        .bind(resolved_repo_full_name)
+        .bind(resolved_subject_title)
+        .bind(resolved_subject_type)
+        .bind(resolved_reason)
+        .bind(resolved_updated_at)
+        .bind(current_unread)
+        .bind(resolved_api_url)
+        .bind(resolved_html_url)
         .bind(now)
         .bind(user_id)
         .bind(update.thread_id)
@@ -9459,6 +9495,134 @@ mod tests {
             (
                 Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
                 Some("https://github.com/octo/alpha/pull/120".to_owned()),
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_preserves_newer_fields_after_concurrent_upsert() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-repair-concurrent-upsert");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .bind("octo/alpha")
+        .bind("Old cached notification")
+        .bind("PullRequest")
+        .bind("state_change")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(1_i64)
+        .bind("https://api.github.com/notifications/threads/cached-thread")
+        .bind("https://github.com/notifications/threads/cached-thread")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale notification");
+
+        let release_lookup = Arc::new(tokio::sync::Notify::new());
+        let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sync_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            let release_lookup = release_lookup.clone();
+            tokio::spawn(async move {
+                sync_notifications_with_fetch(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    move |_since, _before, page| {
+                        Box::pin(async move {
+                            assert_eq!(page, 1);
+                            Ok(Vec::new())
+                        })
+                    },
+                    move |thread_id| {
+                        let release_lookup = release_lookup.clone();
+                        let reached_tx = reached_tx.clone();
+                        Box::pin(async move {
+                            reached_tx
+                                .send(())
+                                .expect("signal repair reached thread lookup");
+                            release_lookup.notified().await;
+                            Ok(Some(mock_notification(
+                                &thread_id,
+                                Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                                Some("octo/alpha"),
+                                Some("PullRequest"),
+                                "2026-03-06T03:30:00Z",
+                            )))
+                        })
+                    },
+                )
+                .await
+            })
+        };
+
+        reached_rx
+            .recv()
+            .await
+            .expect("repair should reach thread lookup");
+
+        let newer = GitHubNotification {
+            id: "cached-thread".to_owned(),
+            unread: Some(false),
+            reason: Some("mention".to_owned()),
+            updated_at: Some("2026-03-06T04:00:00Z".to_owned()),
+            url: Some("https://api.github.com/notifications/threads/cached-thread".to_owned()),
+            subject: NotificationSubject {
+                title: Some("Fresh notification title".to_owned()),
+                subject_type: Some("Issue".to_owned()),
+                url: Some("https://api.github.com/repos/octo/alpha/issues/88".to_owned()),
+            },
+            repository: NotificationRepo {
+                full_name: Some("octo/alpha".to_owned()),
+            },
+        };
+        upsert_notifications(
+            state.as_ref(),
+            user_id.as_str(),
+            &[newer],
+            "2026-03-06T04:00:00Z",
+        )
+        .await
+        .expect("concurrent notification upsert");
+
+        release_lookup.notify_waiters();
+
+        sync_task
+            .await
+            .expect("join sync notifications task")
+            .expect("sync notifications");
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>, i64)>(
+            r#"
+            SELECT subject_title, updated_at, html_url, unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired notification");
+        assert_eq!(
+            stored,
+            (
+                Some("Fresh notification title".to_owned()),
+                Some("2026-03-06T04:00:00Z".to_owned()),
+                Some("https://github.com/octo/alpha/issues/88".to_owned()),
+                0,
             )
         );
     }
