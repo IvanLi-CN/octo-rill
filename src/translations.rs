@@ -5510,28 +5510,46 @@ async fn build_canonical_feed_request_item(
 
     let row = sqlx::query_as::<_, CanonicalFeedReleaseRow>(
         r#"
-        SELECT full_name, tag_name, name, body, previous_tag_name
-        FROM (
+        WITH target_release AS (
           SELECT
-            sr.full_name AS full_name,
+            r.repo_id AS repo_id,
+            r.release_id AS release_id,
             r.tag_name AS tag_name,
             r.name AS name,
             r.body AS body,
-            r.release_id AS release_id,
-            LAG(r.tag_name) OVER (
-              PARTITION BY r.repo_id
-              ORDER BY COALESCE(r.published_at, r.created_at, r.updated_at) ASC, r.release_id ASC
-            ) AS previous_tag_name
+            COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts
           FROM repo_releases r
-          JOIN user_release_visible_repos sr
-            ON sr.user_id = ? AND sr.repo_id = r.repo_id
+          WHERE r.release_id = ?
         )
-        WHERE release_id = ?
+        SELECT
+          sr.full_name AS full_name,
+          tr.tag_name AS tag_name,
+          tr.name AS name,
+          tr.body AS body,
+          (
+            SELECT prev.tag_name
+            FROM repo_releases prev
+            WHERE prev.repo_id = tr.repo_id
+              AND (
+                COALESCE(prev.published_at, prev.created_at, prev.updated_at) < tr.sort_ts
+                OR (
+                  COALESCE(prev.published_at, prev.created_at, prev.updated_at) = tr.sort_ts
+                  AND prev.release_id < tr.release_id
+                )
+              )
+            ORDER BY
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at) DESC,
+              prev.release_id DESC
+            LIMIT 1
+          ) AS previous_tag_name
+        FROM target_release tr
+        JOIN user_release_visible_repos sr
+          ON sr.user_id = ? AND sr.repo_id = tr.repo_id
         LIMIT 1
         "#,
     )
-    .bind(user_id)
     .bind(release_id)
+    .bind(user_id)
     .fetch_optional(&mut **tx)
     .await
     .map_err(ApiError::internal)?;
@@ -5592,6 +5610,49 @@ async fn build_canonical_feed_request_item(
         source_blocks,
         ..item.clone()
     }))
+}
+
+#[cfg(test)]
+fn canonical_feed_release_query_plan_sql() -> &'static str {
+    r#"
+    EXPLAIN QUERY PLAN
+    WITH target_release AS (
+      SELECT
+        r.repo_id AS repo_id,
+        r.release_id AS release_id,
+        r.tag_name AS tag_name,
+        r.name AS name,
+        r.body AS body,
+        COALESCE(r.published_at, r.created_at, r.updated_at) AS sort_ts
+      FROM repo_releases r
+      WHERE r.release_id = ?
+    )
+    SELECT
+      sr.full_name AS full_name,
+      tr.tag_name AS tag_name,
+      tr.name AS name,
+      tr.body AS body,
+      (
+        SELECT prev.tag_name
+        FROM repo_releases prev
+        WHERE prev.repo_id = tr.repo_id
+          AND (
+            COALESCE(prev.published_at, prev.created_at, prev.updated_at) < tr.sort_ts
+            OR (
+              COALESCE(prev.published_at, prev.created_at, prev.updated_at) = tr.sort_ts
+              AND prev.release_id < tr.release_id
+            )
+          )
+        ORDER BY
+          COALESCE(prev.published_at, prev.created_at, prev.updated_at) DESC,
+          prev.release_id DESC
+        LIMIT 1
+      ) AS previous_tag_name
+    FROM target_release tr
+    JOIN user_release_visible_repos sr
+      ON sr.user_id = ? AND sr.repo_id = tr.repo_id
+    LIMIT 1
+    "#
 }
 
 async fn canonicalize_translation_result_item(
@@ -8348,6 +8409,101 @@ mod tests {
         assert_eq!(request_count, 0);
         assert_eq!(work_item_count, 0);
         assert_eq!(translation_count, 0);
+    }
+
+    #[tokio::test]
+    async fn canonical_feed_request_item_query_plan_avoids_global_release_sort() {
+        let pool = setup_pool().await;
+        seed_user(&pool, 1, "octo").await;
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_repo_releases_repo_sort_ts
+              ON repo_releases(
+                repo_id,
+                COALESCE(published_at, created_at, updated_at),
+                release_id
+              )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create repo release sort ts index");
+
+        seed_feed_release(
+            &pool,
+            "1",
+            42,
+            420,
+            "openai/codex",
+            "Release v2.0.0",
+            "- current body",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO repo_releases (
+              id,
+              repo_id,
+              release_id,
+              node_id,
+              tag_name,
+              name,
+              body,
+              html_url,
+              published_at,
+              created_at,
+              is_prerelease,
+              is_draft,
+              updated_at,
+              react_plus1,
+              react_laugh,
+              react_heart,
+              react_hooray,
+              react_rocket,
+              react_eyes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 0, 0, 0, 0, 0)
+            "#,
+        )
+        .bind("repo-release-42-421")
+        .bind(42_i64)
+        .bind(421_i64)
+        .bind("node-421")
+        .bind("Release v2.0.1")
+        .bind("Release v2.0.1")
+        .bind("- current body 2")
+        .bind("https://github.com/openai/codex/releases/tag/Release-v2.0.1")
+        .bind("2026-03-31T00:00:00Z")
+        .bind("2026-03-31T00:00:00Z")
+        .bind("2026-03-31T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed second repo release");
+
+        let plan_rows = sqlx::query(canonical_feed_release_query_plan_sql())
+            .bind(421_i64)
+            .bind("1")
+            .fetch_all(&pool)
+            .await
+            .expect("load query plan");
+
+        let details = plan_rows
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect::<Vec<_>>();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_repo_releases_repo_sort_ts")),
+            "expected plan to use repo-local sort index, got: {details:#?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "expected plan to avoid temp b-tree sort, got: {details:#?}"
+        );
     }
 
     #[tokio::test]

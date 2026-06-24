@@ -395,6 +395,8 @@ pub struct RepoReleaseWriteStats {
     pub unchanged_count: usize,
     pub pages_fetched: usize,
     pub stopped_reason: String,
+    #[serde(skip)]
+    pub new_release_ids: Vec<i64>,
 }
 
 #[derive(Debug)]
@@ -2719,32 +2721,38 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
     Ok(rows.into_iter().collect())
 }
 
-async fn load_release_ids_for_repo_ids(state: &AppState, repo_ids: &[i64]) -> Result<HashSet<i64>> {
-    if repo_ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+async fn load_new_release_ids_for_task(state: &AppState, task_id: &str) -> Result<Vec<i64>> {
+    let rows = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT DISTINCT release_id
-        FROM repo_releases
-        WHERE repo_id IN (
+        SELECT COALESCE(wi.last_new_release_ids_json, '[]')
+        FROM repo_release_watchers rw
+        JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+        WHERE rw.task_id = ?
+          AND rw.status = 'succeeded'
+          AND rw.reused_fresh = 0
+          AND wi.status = ?
         "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for repo_id in repo_ids {
-            separated.push_bind(repo_id);
+    )
+    .bind(task_id)
+    .bind(jobs::STATUS_SUCCEEDED)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query current-run new release ids")?;
+
+    let mut seen = HashSet::new();
+    let mut release_ids = Vec::new();
+    for payload in rows {
+        let ids: Vec<i64> = serde_json::from_str(&payload).with_context(|| {
+            format!("failed to parse repo release ids payload for task {task_id}")
+        })?;
+        for release_id in ids {
+            if seen.insert(release_id) {
+                release_ids.push(release_id);
+            }
         }
     }
-    query.push(")");
-
-    let rows = query
-        .build_query_scalar::<i64>()
-        .fetch_all(&state.pool)
-        .await
-        .context("failed to query release ids for repo ids")?;
-    Ok(rows.into_iter().collect())
+    release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    Ok(release_ids)
 }
 
 async fn load_user_relevant_release_ids(
@@ -3685,8 +3693,6 @@ pub async fn sync_subscriptions(
     .await?;
 
     let repos = aggregate_release_visible_repos(&context, &successful_users).await?;
-    let repo_ids = repos.iter().map(|repo| repo.repo_id).collect::<Vec<_>>();
-    let before_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -3700,12 +3706,7 @@ pub async fn sync_subscriptions(
     .await?;
 
     let (release_summary, releases_written) = run_release_phase(&context, repos).await?;
-    let after_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
-    let mut new_release_ids = after_release_ids
-        .difference(&before_release_ids)
-        .copied()
-        .collect::<Vec<_>>();
-    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let new_release_ids = load_new_release_ids_for_task(state, task_id).await?;
     if !new_release_ids.is_empty() && state.config.ai.is_some() {
         for user in &successful_users {
             let user_release_ids =
@@ -5046,6 +5047,8 @@ async fn process_repo_release_work_item(
 
     match result {
         Ok((stats, candidate_failures)) => {
+            let new_release_ids_json = serde_json::to_string(&stats.new_release_ids)
+                .context("serialize repo release new ids payload")?;
             let updated = state
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
@@ -5063,6 +5066,7 @@ async fn process_repo_release_work_item(
                           last_inserted_count = ?,
                           last_updated_count = ?,
                           last_unchanged_count = ?,
+                          last_new_release_ids_json = ?,
                           last_pages_fetched = ?,
                           last_stopped_reason = ?,
                           last_candidate_failures = ?,
@@ -5089,6 +5093,7 @@ async fn process_repo_release_work_item(
                         .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
                         .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
                         .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+                        .bind(new_release_ids_json.as_str())
                         .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
                         .bind(stats.stopped_reason.as_str())
                         .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
@@ -5689,6 +5694,9 @@ async fn upsert_repo_releases(
                 .execute(&state.pool)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
+                if existing.is_none() {
+                    stats.new_release_ids.push(release.id);
+                }
             }
             Ok::<_, anyhow::Error>(stats)
         })
@@ -12781,6 +12789,118 @@ mod tests {
         assert_eq!(result.updated_count, 0);
         assert_eq!(result.unchanged_count, 0);
         assert_eq!(result.pages_fetched, 0);
+    }
+
+    #[tokio::test]
+    async fn load_new_release_ids_for_task_uses_current_run_work_item_payloads() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-new-ids").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-a",
+                repo_id: 51,
+                repo_full_name: "octo/a",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 3,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-b",
+                repo_id: 52,
+                repo_full_name: "octo/b",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 2,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-fresh",
+                repo_id: 53,
+                repo_full_name: "octo/fresh",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET last_new_release_ids_json = CASE id
+              WHEN 'repo-work-new-ids-a' THEN '[501, 499]'
+              WHEN 'repo-work-new-ids-b' THEN '[500, 499]'
+              ELSE '[700]'
+            END
+            WHERE id IN (?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-new-ids-a")
+        .bind("repo-work-new-ids-b")
+        .bind("repo-work-new-ids-fresh")
+        .execute(&pool)
+        .await
+        .expect("seed new release id payloads");
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-a",
+            "repo-work-new-ids-a",
+            "task-release-new-ids",
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-b",
+            "repo-work-new-ids-b",
+            "task-release-new-ids",
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-fresh",
+            "repo-work-new-ids-fresh",
+            "task-release-new-ids",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_watchers
+            SET status = 'succeeded',
+                reused_fresh = CASE id
+                  WHEN 'watch-new-ids-fresh' THEN 1
+                  ELSE 0
+                END
+            WHERE task_id = ?
+            "#,
+        )
+        .bind("task-release-new-ids")
+        .execute(&pool)
+        .await
+        .expect("mark watcher statuses");
+
+        let release_ids =
+            super::load_new_release_ids_for_task(state.as_ref(), "task-release-new-ids")
+                .await
+                .expect("load new release ids");
+
+        assert_eq!(release_ids, vec![501, 500, 499]);
     }
 
     #[tokio::test]
