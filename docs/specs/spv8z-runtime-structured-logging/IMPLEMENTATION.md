@@ -26,3 +26,4 @@
 - [x] M5: AI / sync 上游热点日志补统一字段并去除 login 等敏感披露。
 - [x] M6: 自动化测试补齐 request-id / slow+error-only / 敏感字段不泄露断言。
 - [x] M7: 文档、spec sync 与 project doc promotion 收口完成。
+- 运行时背压补充：translation 结果聚合在直接复用 pending 快照时输出 `event=translation.backpressure` + 明确原因；feed reaction refresh 在跳过 counts persist 时输出 `event=feed.reactions.persist` + `downgrade_reason`。

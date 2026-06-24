@@ -45,6 +45,7 @@
 - feed 自动翻译必须调用 `POST /api/translate/results`，由前端上报可见 release 与最后一个可见 release 之后的连续 10 条；当窗口条目数超过接口单次 `60` 条上限时，前端必须按连续顺序拆成多次调用。
 - `ai_translations` 必须升级为带状态的结果真相源；同一用户、同一实体、同一语言在任意时刻只保留 1 条当前结果记录，并显式表达 `queued/running/ready/disabled/missing/error`。
 - 结果聚合接口必须先读取结果表；只有结果表未命中当前 source hash，或结果表声明 pending 但找不到活跃 work item 时，后端才允许进入 work item 队列层。
+- 当 SQLite writer 已活跃、存在 foreground writer backlog、translation worker 没有 idle slot，或 LLM scheduler 已出现 waiting/saturated 信号时，结果聚合接口应优先复用当前 source hash 上已有的 `queued/running` 快照；不得为了重复 resolve 再把可排队需求拖进新的同步写压或长尾等待。
 - 后端必须保证同一用户、同一 release、同一 source hash、同一请求模式的重复 resolve / 重复同源请求会复用同一条 `translation_requests` 记录，不会新增重复 `translation_work_items`，也不会因为轮询继续制造额外 request 行。
 - 当较新的 source hash 进入排队时，后端不得为了挂起新任务而清空已经 `ready` 的旧译文；现有可展示译文必须保留到新任务真正进入终态为止。
 - feed / release detail 的普通读取接口必须透传当前 source hash 上的 `disabled/missing/error` 终态；其中 `missing/error` 需要显式标记为“禁止自动重排队”，避免页面刷新后再次自动建队列。
@@ -70,6 +71,7 @@
 ### Core flows
 
 - Feed 自动翻译：前端在首载、滚动、resize、feed 追加与卡片高度变化后重算真实视口；把当前可见 release 与最后一个可见卡片之后连续 10 条按原顺序交给结果聚合接口。若候选数超过单次 `60` 条限制，则前端继续按顺序拆成多次 resolve 调用。接口先读取结果表：`ready/disabled/missing/error` 直接返回；`queued/running` 会继续核对活跃 work item；只有结果缺失或 pending 漂移时才在后端 ensure 队列任务。
+- Feed 自动翻译：若结果表已经存在当前 source hash 的 `queued/running` 状态，且运行时命中 writer / worker / LLM 背压信号，则接口可以直接返回该 pending 快照，不需要先进入新的 `BEGIN IMMEDIATE` 写事务。
 - Feed 自动翻译：`release_summary/feed_card` 的 source hash 以服务端当前 release 数据为准；若旧页面带来的旧 source blocks 晚到，后端必须先 canonicalize 到当前 release，再决定复用/建队列，旧 source 不得覆盖当前结果行。
 - Feed 自动翻译：当前可见窗口的自动任务默认只给后端约 `500ms` 聚合时间；若窗口内请求足够多，调度器优先按 `1800 tokens` 左右切成多个小批，以便更多 worker 并行启动，而不是等待大批次攒满再跑。
 - Release detail 翻译：详情 Markdown chunk 批量翻译，失败 chunk 再单条重试。
@@ -115,6 +117,10 @@
 - Given 某条 release 的译文尚未 ready
   When 结果聚合接口被重复轮询
   Then 接口必须持续返回 `queued/running` 并复用原结果行/work item，直到任务进入终态。
+
+- Given 当前 source hash 已有 `queued/running` 结果，且运行时存在 SQLite writer / worker / LLM 背压
+  When 客户端再次调用结果聚合接口
+  Then 接口应直接返回既有 `queued/running` 快照，不引入新的 owner-facing error 语义，也不因为重复 resolve 把请求拖成长阻塞或 500。
 
 - Given 某条 release 已经存在一条可展示的 `ready` 译文
   When 新 source hash 被结果聚合接口补建 work item

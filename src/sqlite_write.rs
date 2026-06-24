@@ -25,6 +25,12 @@ struct SqliteWriteState {
     waiting_foreground: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SqliteWriteRuntimeStatus {
+    pub active: bool,
+    pub waiting_foreground: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqliteWritePriority {
     Foreground,
@@ -112,6 +118,16 @@ impl SqliteWriteCoordinator {
             },
             slow_threshold_ms: observability::logging_thresholds().sqlite_write_slow_ms,
         }
+    }
+
+    pub fn runtime_status(&self) -> SqliteWriteRuntimeStatus {
+        self.state
+            .lock()
+            .map(|state| SqliteWriteRuntimeStatus {
+                active: state.active,
+                waiting_foreground: state.waiting_foreground,
+            })
+            .unwrap_or_default()
     }
 
     pub async fn write<T, Fut, Op>(&self, lane: &'static str, operation: Op) -> Result<T>

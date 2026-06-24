@@ -4,6 +4,7 @@
 
 - 首屏 feed 曾在返回前同步拉取 GitHub GraphQL reaction viewer/counts，导致第三方网络进入 Dashboard 主列首屏热路径。
 - 本规范将 feed 热路径与 reaction 最新性拆分：feed 优先本地缓存快速返回，reaction 在首屏后异步补齐。
+- 2026-06-24：reaction refresh 持久化进一步降级为 non-fatal best-effort 写入；SQLite writer 压力下允许跳过 counts persist，但继续返回 live payload，避免非关键 refresh 把 endpoint 打成 500。
 
 ## 决策记录
 

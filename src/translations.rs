@@ -37,6 +37,27 @@ pub const DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY: usize = 1;
 
 static TRANSLATION_BATCH_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranslationBackpressureReason {
+    SqliteWriterActive,
+    SqliteWriterBacklog,
+    NoIdleWorkers,
+    LlmWaiting,
+    LlmSaturated,
+}
+
+impl TranslationBackpressureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SqliteWriterActive => "sqlite_writer_active",
+            Self::SqliteWriterBacklog => "sqlite_writer_backlog",
+            Self::NoIdleWorkers => "translation_worker_busy",
+            Self::LlmWaiting => "llm_waiting",
+            Self::LlmSaturated => "llm_saturated",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationSourceBlock {
     pub slot: String,
@@ -1502,6 +1523,33 @@ pub async fn translation_worker_runtime_statuses(
     state.translation_scheduler.runtime_statuses().await
 }
 
+async fn translation_backpressure_reason(
+    state: &AppState,
+) -> Option<TranslationBackpressureReason> {
+    let sqlite_status = state.sqlite_writer.runtime_status();
+    if sqlite_status.waiting_foreground > 0 {
+        return Some(TranslationBackpressureReason::SqliteWriterBacklog);
+    }
+    if sqlite_status.active {
+        return Some(TranslationBackpressureReason::SqliteWriterActive);
+    }
+
+    let llm_status = state.llm_scheduler.runtime_status();
+    if llm_status.waiting_calls > 0 {
+        return Some(TranslationBackpressureReason::LlmWaiting);
+    }
+    if llm_status.available_slots <= 0 {
+        return Some(TranslationBackpressureReason::LlmSaturated);
+    }
+
+    let workers = state.translation_scheduler.runtime_statuses().await;
+    if !workers.is_empty() && workers.iter().all(|worker| worker.status != "idle") {
+        return Some(TranslationBackpressureReason::NoIdleWorkers);
+    }
+
+    None
+}
+
 #[cfg(test)]
 async fn reset_translation_worker_runtime_for_tests(state: &AppState) {
     state.translation_scheduler.abort_all().await;
@@ -2281,6 +2329,12 @@ async fn resolve_translation_results_for_user(
     items: &[TranslationRequestItemInput],
     retry_on_error: bool,
 ) -> Result<Vec<TranslationResultItem>, ApiError> {
+    if let Some(results) =
+        try_resolve_translation_results_without_write(state, user_id, items, retry_on_error).await?
+    {
+        return Ok(results);
+    }
+
     let now = Utc::now().to_rfc3339();
     let (_sqlite_write, mut tx) = state
         .sqlite_writer
@@ -2303,6 +2357,70 @@ async fn resolve_translation_results_for_user(
     }
     tx.commit().await.map_err(ApiError::internal)?;
     Ok(out)
+}
+
+async fn try_resolve_translation_results_without_write(
+    state: &AppState,
+    user_id: &str,
+    items: &[TranslationRequestItemInput],
+    retry_on_error: bool,
+) -> Result<Option<Vec<TranslationResultItem>>, ApiError> {
+    let Some(reason) = translation_backpressure_reason(state).await else {
+        return Ok(None);
+    };
+
+    let mut tx = state.pool.begin().await.map_err(ApiError::internal)?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let canonical_item = canonicalize_translation_result_item(&mut tx, user_id, item).await?;
+        let source_hash = build_source_hash(&canonical_item);
+        let Some(existing) = load_translation_state_row(&mut tx, user_id, &canonical_item).await?
+        else {
+            return Ok(None);
+        };
+        if existing.source_hash != source_hash {
+            return Ok(None);
+        }
+        match existing.status.as_str() {
+            "queued" | "running" => {
+                let Some(work_item) = load_pending_work_item_for_translation_state(
+                    &mut tx,
+                    user_id,
+                    &canonical_item,
+                    source_hash.as_str(),
+                    &existing,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                out.push(pending_result_from_work_row(&work_item, &canonical_item));
+            }
+            "ready" | "disabled" | "missing" => out.push(existing.to_result(&canonical_item)),
+            "error"
+                if !should_retry_translation_terminal_error(
+                    retry_on_error,
+                    &canonical_item,
+                    existing.error_text.as_deref(),
+                ) =>
+            {
+                out.push(existing.to_result(&canonical_item));
+            }
+            _ => return Ok(None),
+        }
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+
+    tracing::info!(
+        event = "translation.backpressure",
+        reason = reason.as_str(),
+        item_count = out.len(),
+        sqlite_writer_active = state.sqlite_writer.runtime_status().active,
+        sqlite_writer_waiting_foreground = state.sqlite_writer.runtime_status().waiting_foreground,
+        "translation resolve returned pending snapshot under backpressure"
+    );
+
+    Ok(Some(out))
 }
 
 async fn create_translation_requests_batch_with_origin(
@@ -2370,14 +2488,14 @@ async fn ensure_translation_result_for_item(
             _ => {}
         }
 
-        let work_item = if let Some(work_item_id) = existing.active_work_item_id.as_deref() {
-            load_work_item_by_id(tx, work_item_id)
-                .await?
-                .filter(|row| row.source_hash == source_hash)
-        } else {
-            None
-        }
-        .or(load_existing_work_item(tx, user_id, item, &source_hash).await?);
+        let work_item = load_work_item_for_translation_state(
+            tx,
+            user_id,
+            item,
+            source_hash.as_str(),
+            &existing,
+        )
+        .await?;
 
         if let Some(work_item) = work_item {
             if work_item.result_status.is_some()
@@ -2793,6 +2911,42 @@ async fn ensure_translation_result_demand(
         refresh_batch_request_counters(tx, batch_id, existing.id.as_str(), now).await?;
     }
     Ok(result)
+}
+
+async fn load_work_item_for_translation_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+    existing: &TranslationStateRow,
+) -> Result<Option<WorkItemRow>, ApiError> {
+    let active = if let Some(work_item_id) = existing.active_work_item_id.as_deref() {
+        load_work_item_by_id(tx, work_item_id)
+            .await?
+            .filter(|row| row.source_hash == source_hash)
+    } else {
+        None
+    };
+
+    if active.is_some() {
+        return Ok(active);
+    }
+
+    load_existing_work_item(tx, user_id, item, source_hash).await
+}
+
+async fn load_pending_work_item_for_translation_state(
+    tx: &mut Transaction<'_, Sqlite>,
+    user_id: &str,
+    item: &TranslationRequestItemInput,
+    source_hash: &str,
+    existing: &TranslationStateRow,
+) -> Result<Option<WorkItemRow>, ApiError> {
+    Ok(
+        load_work_item_for_translation_state(tx, user_id, item, source_hash, existing)
+            .await?
+            .filter(|row| row.result_status.is_none()),
+    )
 }
 
 async fn attach_request_to_work_item(
@@ -3780,6 +3934,10 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         batch.worker_kind.as_str(),
         batch.worker_slot,
     );
+    let (sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "translation_batch_start")
+        .await?;
     let rows_affected = sqlx::query(
         r#"
         UPDATE translation_batches
@@ -3803,10 +3961,12 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
     .bind(now.as_str())
     .bind(now.as_str())
     .bind(batch.id.as_str())
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if rows_affected == 0 {
+        tx.commit().await?;
+        drop(sqlite_write);
         warn!(
             batch_id = batch.id.as_str(),
             worker_id = batch.worker_id.as_str(),
@@ -3832,17 +3992,6 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         }
         return Ok(());
     }
-    update_translation_worker_runtime(
-        state,
-        &worker,
-        TranslationWorkerRuntimeUpdate::running(
-            batch.id.as_str(),
-            batch.request_count,
-            i64::try_from(batch.items.len()).unwrap_or(i64::MAX),
-            batch.trigger_reason.as_str(),
-        ),
-    )
-    .await;
     for item in &batch.items {
         sqlx::query(
             r#"
@@ -3854,9 +4003,22 @@ async fn execute_claimed_batch(state: &AppState, batch: ClaimedBatch) -> Result<
         .bind(now.as_str())
         .bind(now.as_str())
         .bind(item.id.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
+    drop(sqlite_write);
+    update_translation_worker_runtime(
+        state,
+        &worker,
+        TranslationWorkerRuntimeUpdate::running(
+            batch.id.as_str(),
+            batch.request_count,
+            i64::try_from(batch.items.len()).unwrap_or(i64::MAX),
+            batch.trigger_reason.as_str(),
+        ),
+    )
+    .await;
     let heartbeat =
         spawn_translation_batch_lease_heartbeat(Arc::new(state.clone()), batch.id.clone());
 
@@ -8454,6 +8616,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_claimed_batch_serializes_start_writes_under_sqlite_write_pressure() {
+        let pool = setup_pool_with_busy_timeout(4, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let mut item = sample_release_item("write-pressure-start");
+        item.max_wait_ms = 0;
+
+        create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("request created");
+        let batch = claim_next_batch(state.as_ref(), test_worker_profile(1, "general"))
+            .await
+            .expect("claim batch")
+            .expect("batch exists");
+        let batch_id = batch.id.clone();
+        let work_item_id = batch.items[0].id.clone();
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_pressure_hold")
+            .await
+            .expect("hold sqlite writer");
+        let execute = {
+            let state = state.clone();
+            tokio::spawn(async move { execute_claimed_batch(state.as_ref(), batch).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let batch_status_during_hold: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load batch status during hold");
+        assert_eq!(batch_status_during_hold, "queued");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        execute
+            .await
+            .expect("join execute task")
+            .expect("execution succeeds after serialized writer release");
+
+        let batch_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_batches WHERE id = ?")
+                .bind(batch_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load batch status");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ?")
+                .bind(work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load work item status");
+        assert_eq!(batch_status, "completed");
+        assert_eq!(work_item_status, "completed");
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_returns_queued_under_backpressure() {
+        let pool = setup_pool_with_max_connections(4).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = seed_canonical_release_item(&pool, "1", 201, 301).await;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create queued translation request");
+        let work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("queued result should keep work item");
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_backpressure_hold")
+            .await
+            .expect("hold sqlite writer");
+
+        let resolved = resolve_translation_results_for_user(
+            state.as_ref(),
+            "1",
+            std::slice::from_ref(&item),
+            false,
+        )
+        .await
+        .expect("resolve under backpressure");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, "queued");
+        assert_eq!(
+            resolved[0].work_item_id.as_deref(),
+            Some(work_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_translation_results_waits_for_repair_when_backpressure_snapshot_is_stale() {
+        let pool = setup_pool_with_busy_timeout(4, Duration::from_millis(25)).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 1, "octo").await;
+        let item = seed_canonical_release_item(&pool, "1", 202, 302).await;
+
+        let created = create_translation_request(state.as_ref(), "1", "async", &item)
+            .await
+            .expect("create queued translation request");
+        let stale_work_item_id = created
+            .result
+            .work_item_id
+            .clone()
+            .expect("queued result should keep work item");
+
+        sqlx::query("DELETE FROM translation_work_items WHERE id = ?")
+            .bind(stale_work_item_id.as_str())
+            .execute(&pool)
+            .await
+            .expect("delete stale work item");
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_backpressure_stale_snapshot")
+            .await
+            .expect("hold sqlite writer");
+
+        let resolve_task = {
+            let state = state.clone();
+            let item = item.clone();
+            tokio::spawn(async move {
+                resolve_translation_results_for_user(
+                    state.as_ref(),
+                    "1",
+                    std::slice::from_ref(&item),
+                    false,
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !resolve_task.is_finished(),
+            "stale pending snapshot should fall back to writer-backed repair"
+        );
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        let resolved = resolve_task
+            .await
+            .expect("join resolve task")
+            .expect("resolve after repair");
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, "queued");
+        assert_ne!(
+            resolved[0].work_item_id.as_deref(),
+            Some(stale_work_item_id.as_str())
+        );
+
+        let current_work_item_id = resolved[0]
+            .work_item_id
+            .clone()
+            .expect("repaired result should attach a work item");
+        let state_row: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT source_hash, status, active_work_item_id
+            FROM ai_translations
+            WHERE user_id = ? AND entity_type = 'release_detail' AND entity_id = ? AND lang = 'zh-CN'
+            LIMIT 1
+            "#,
+        )
+        .bind("1")
+        .bind(item.entity_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired translation state");
+        let work_item_status: String =
+            sqlx::query_scalar("SELECT status FROM translation_work_items WHERE id = ? LIMIT 1")
+                .bind(current_work_item_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("load repaired work item status");
+
+        assert_eq!(state_row.1, "queued");
+        assert_eq!(state_row.2.as_deref(), Some(current_work_item_id.as_str()));
+        assert_eq!(work_item_status, "queued");
+    }
+
+    #[tokio::test]
     async fn refresh_requests_marks_terminal_errors_as_failed() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -10910,6 +11266,13 @@ mod tests {
     }
 
     async fn setup_pool_with_max_connections(max_connections: u32) -> SqlitePool {
+        setup_pool_with_busy_timeout(max_connections, Duration::from_secs(5)).await
+    }
+
+    async fn setup_pool_with_busy_timeout(
+        max_connections: u32,
+        busy_timeout: Duration,
+    ) -> SqlitePool {
         let database_path = std::env::temp_dir().join(format!(
             "octo-rill-test-{}.db",
             crate::local_id::generate_local_id(),
@@ -10918,7 +11281,7 @@ mod tests {
             .filename(&database_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(busy_timeout);
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(options)

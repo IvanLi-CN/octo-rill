@@ -54,7 +54,9 @@ Keep this targeted to write-intent paths such as:
 - repo release demand attach / watcher upsert
 - repo release work item finalize/heartbeat/fail, shared release upsert, sync-state success/failure
 - translation batch scheduling or stale batch recovery when the transaction reads rows and then updates them
+- translation batch startup state flips (`translation_batches queued -> running`, `translation_work_items batched -> running`) when a worker has already claimed a batch and is about to start AI work
 - lightweight user activity writes such as `last_active_at`, which should be best-effort, should not wait behind background writer backlog, and must not turn read endpoints into 500 responses
+- non-critical refresh persistence such as release reaction counts, which may skip under writer pressure as long as the live payload or user-visible result still returns and the downgrade is observable
 
 ## Guardrails / Reuse Notes
 
@@ -63,8 +65,10 @@ Keep this targeted to write-intent paths such as:
 - Do not solve this by forcing `OCTORILL_SQLITE_POOL_MAX_CONNECTIONS=1`; that hides the race by serializing the whole app and can starve HTTP reads.
 - Do not lower worker/LLM concurrency as the durable database fix. Keep network and AI concurrency high; coordinate only the SQLite write section.
 - Do not preserve direct high-frequency writes to the pool in worker lifecycle paths. If a path can run per worker or per heartbeat, it needs a coordinator lane.
+- Do not assume “claim path already uses coordinator” is enough. Any follow-up state transition that runs per claimed batch or per work item start can still leak `database is locked` if it writes straight to the pool.
 - Do not convert pure read transactions to `BEGIN IMMEDIATE`; that would unnecessarily block writers.
 - Do not hold the writer permit around GitHub API, AI calls, HTTP calls, or long computation. Prepare data first, acquire the permit, write quickly, and release it.
+- If a user-visible or API-compatible pending snapshot already exists, prefer returning that snapshot under writer pressure instead of opening a fresh write transaction just to restate the same `queued/running` fact.
 - When diagnosing production incidents, copy a SQLite backup to an isolated testbox and reproduce with the same pool/concurrency settings before changing live service configuration.
 - A minimal probe is: one deferred transaction reads, a second connection commits, then the first writes. Seeing `517` confirms the stale snapshot upgrade pattern.
 
