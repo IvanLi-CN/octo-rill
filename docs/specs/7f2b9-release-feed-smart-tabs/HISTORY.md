@@ -13,3 +13,4 @@
 - 2026-04-30：移除单卡 icon-only selector 触发器上的浏览器原生 `title`，确保 `原文 / 翻译 / 润色` 只显示产品内 tooltip，并补充 Storybook 回归断言。
 - 2026-04-30：刷新 Dashboard 页面级阅读模式切换器的产品化样式合同，补充暗色桌面与窄平板 Storybook 视觉证据，确保控件与管理员入口同高、同基线、低阴影。
 - 2026-06-01：将 release 翻译 / 润色链路中的上游聊天通道 403 归为可恢复终态，由前台按需生成和后台 `retry.recent_failures` 重新排队，底层 AI 单次调用仍快速失败。
+- 2026-06-25：release-smart canonical feed lookup 改为先按目标 `release_id` 收口，再按 repo 内排序键回查 `previous_tag_name`，并补充 query-plan 回归，避免翻译 canonicalization 在 `user_release_visible_repos` 全集上做窗口排序。

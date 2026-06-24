@@ -187,6 +187,7 @@
 - Release 抓取与写入统计必须区分 `fetched_count / inserted_count / updated_count / unchanged_count / pages_fetched / stopped_reason`；Admin Jobs 不得把 GitHub 返回条数展示为“写入 Releases”。
 - 成功抓取后写入共享 `repo_releases`，并把等待中的 watcher 标记为 `succeeded`。
 - 失败时把等待中的 watcher 标记为 `failed`。
+- GitHub REST repo 读取遇到 rename/canonicalization redirect 时，Release / social repo-read 路径必须跟随 GitHub 返回的 canonical `Location`，不得把 `301 Moved Permanently` 误记为 repo 读取失败或 `repo_inaccessible`。
 
 ### `sync.subscriptions`
 

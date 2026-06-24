@@ -29,7 +29,6 @@ use crate::{
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
-const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2022-11-28";
 const SUBSCRIPTION_STAR_WORKERS: usize = 5;
 const SUBSCRIPTION_SOCIAL_WORKERS: usize = 4;
@@ -396,6 +395,8 @@ pub struct RepoReleaseWriteStats {
     pub unchanged_count: usize,
     pub pages_fetched: usize,
     pub stopped_reason: String,
+    #[serde(skip)]
+    pub new_release_ids: Vec<i64>,
 }
 
 #[derive(Debug)]
@@ -2720,32 +2721,38 @@ async fn load_release_ids_for_user(state: &AppState, user_id: &str) -> Result<Ha
     Ok(rows.into_iter().collect())
 }
 
-async fn load_release_ids_for_repo_ids(state: &AppState, repo_ids: &[i64]) -> Result<HashSet<i64>> {
-    if repo_ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-
-    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+async fn load_new_release_ids_for_task(state: &AppState, task_id: &str) -> Result<Vec<i64>> {
+    let rows = sqlx::query_scalar::<_, String>(
         r#"
-        SELECT DISTINCT release_id
-        FROM repo_releases
-        WHERE repo_id IN (
+        SELECT COALESCE(wi.last_new_release_ids_json, '[]')
+        FROM repo_release_watchers rw
+        JOIN repo_release_work_items wi ON wi.id = rw.work_item_id
+        WHERE rw.task_id = ?
+          AND rw.status = 'succeeded'
+          AND rw.reused_fresh = 0
+          AND wi.status = ?
         "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for repo_id in repo_ids {
-            separated.push_bind(repo_id);
+    )
+    .bind(task_id)
+    .bind(jobs::STATUS_SUCCEEDED)
+    .fetch_all(&state.pool)
+    .await
+    .context("failed to query current-run new release ids")?;
+
+    let mut seen = HashSet::new();
+    let mut release_ids = Vec::new();
+    for payload in rows {
+        let ids: Vec<i64> = serde_json::from_str(&payload).with_context(|| {
+            format!("failed to parse repo release ids payload for task {task_id}")
+        })?;
+        for release_id in ids {
+            if seen.insert(release_id) {
+                release_ids.push(release_id);
+            }
         }
     }
-    query.push(")");
-
-    let rows = query
-        .build_query_scalar::<i64>()
-        .fetch_all(&state.pool)
-        .await
-        .context("failed to query release ids for repo ids")?;
-    Ok(rows.into_iter().collect())
+    release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    Ok(release_ids)
 }
 
 async fn load_user_relevant_release_ids(
@@ -3686,8 +3693,6 @@ pub async fn sync_subscriptions(
     .await?;
 
     let repos = aggregate_release_visible_repos(&context, &successful_users).await?;
-    let repo_ids = repos.iter().map(|repo| repo.repo_id).collect::<Vec<_>>();
-    let before_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
     jobs::append_task_event(
         state,
         task_id,
@@ -3701,12 +3706,7 @@ pub async fn sync_subscriptions(
     .await?;
 
     let (release_summary, releases_written) = run_release_phase(&context, repos).await?;
-    let after_release_ids = load_release_ids_for_repo_ids(state, &repo_ids).await?;
-    let mut new_release_ids = after_release_ids
-        .difference(&before_release_ids)
-        .copied()
-        .collect::<Vec<_>>();
-    new_release_ids.sort_unstable_by(|left, right| right.cmp(left));
+    let new_release_ids = load_new_release_ids_for_task(state, task_id).await?;
     if !new_release_ids.is_empty() && state.config.ai.is_some() {
         for user in &successful_users {
             let user_release_ids =
@@ -5047,6 +5047,8 @@ async fn process_repo_release_work_item(
 
     match result {
         Ok((stats, candidate_failures)) => {
+            let new_release_ids_json = serde_json::to_string(&stats.new_release_ids)
+                .context("serialize repo release new ids payload")?;
             let updated = state
                 .sqlite_writer
                 .write("repo_release_finalize", |_| async {
@@ -5064,6 +5066,7 @@ async fn process_repo_release_work_item(
                           last_inserted_count = ?,
                           last_updated_count = ?,
                           last_unchanged_count = ?,
+                          last_new_release_ids_json = ?,
                           last_pages_fetched = ?,
                           last_stopped_reason = ?,
                           last_candidate_failures = ?,
@@ -5090,6 +5093,7 @@ async fn process_repo_release_work_item(
                         .bind(i64::try_from(stats.inserted_count).unwrap_or(i64::MAX))
                         .bind(i64::try_from(stats.updated_count).unwrap_or(i64::MAX))
                         .bind(i64::try_from(stats.unchanged_count).unwrap_or(i64::MAX))
+                        .bind(new_release_ids_json.as_str())
                         .bind(i64::try_from(stats.pages_fetched).unwrap_or(i64::MAX))
                         .bind(stats.stopped_reason.as_str())
                         .bind(i64::try_from(candidate_failures).unwrap_or(i64::MAX))
@@ -5690,6 +5694,9 @@ async fn upsert_repo_releases(
                 .execute(&state.pool)
                 .await
                 .with_context(|| format!("failed to upsert shared release {}", release.tag_name))?;
+                if existing.is_none() {
+                    stats.new_release_ids.push(release.id);
+                }
             }
             Ok::<_, anyhow::Error>(stats)
         })
@@ -6344,6 +6351,28 @@ async fn fetch_json_response<T: DeserializeOwned>(
     })
 }
 
+fn github_rest_url(state: &AppState, path_and_query: &str) -> Result<String, SyncRequestError> {
+    state
+        .github_rest_api_base
+        .join(path_and_query)
+        .map(|url| url.to_string())
+        .map_err(|err| {
+            SyncRequestError::non_retryable(
+                "request_error",
+                format!("invalid github rest url {path_and_query}: {err}"),
+                None,
+            )
+        })
+}
+
+fn github_rest_url_anyhow(state: &AppState, path_and_query: &str) -> Result<String> {
+    state
+        .github_rest_api_base
+        .join(path_and_query)
+        .map(|url| url.to_string())
+        .context("failed to build github rest url")
+}
+
 async fn fetch_github_rest_page<T: DeserializeOwned>(
     state: &AppState,
     access_token: &str,
@@ -6353,7 +6382,7 @@ async fn fetch_github_rest_page<T: DeserializeOwned>(
 ) -> Result<T, SyncRequestError> {
     with_subscription_timeout(operation, async {
         let response = state
-            .http
+            .github_rest_http
             .get(url)
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
@@ -6375,7 +6404,7 @@ async fn fetch_github_public_rest<T: DeserializeOwned>(
 ) -> Result<T, SyncRequestError> {
     with_subscription_timeout(operation, async {
         let response = state
-            .http
+            .github_rest_http
             .get(url)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -6413,11 +6442,15 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
 
     for repo in pending {
         let now = Utc::now().to_rfc3339();
-        let url = format!(
-            "{REST_API_BASE}/repos/{}/{}",
-            urlencoding::encode(repo.owner_login.as_str()),
-            urlencoding::encode(repo.repo_name.as_str())
-        );
+        let url = github_rest_url_anyhow(
+            state,
+            format!(
+                "repos/{}/{}",
+                urlencoding::encode(repo.owner_login.as_str()),
+                urlencoding::encode(repo.repo_name.as_str())
+            )
+            .as_str(),
+        )?;
         let operation = format!("sync public repo metadata {}", repo.full_name);
         match fetch_github_public_rest::<GitHubPublicRepo>(state, &url, operation.as_str()).await {
             Ok(public_repo) if !public_repo.private => {
@@ -6560,7 +6593,7 @@ async fn fetch_owned_repo_snapshot(
         let payload = with_subscription_timeout("sync social owned repos graphql", async {
             let response = state
                 .http
-                .post(GRAPHQL_URL)
+                .post(state.github_graphql_url.clone())
                 .bearer_auth(access_token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -6649,9 +6682,10 @@ async fn fetch_followers_snapshot(
 
     while page <= SOCIAL_FOLLOWERS_MAX_PAGES {
         let operation = format!("sync social followers page {page}");
-        let url = format!(
-            "{REST_API_BASE}/user/followers?per_page={SOCIAL_FOLLOWERS_PER_PAGE}&page={page}"
-        );
+        let url = github_rest_url(
+            state,
+            format!("user/followers?per_page={SOCIAL_FOLLOWERS_PER_PAGE}&page={page}").as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubActor>>(
             state,
             access_token,
@@ -6688,10 +6722,14 @@ async fn fetch_feed_activity_events_snapshot(
 
     while page <= 3 {
         let operation = format!("sync social received events @{login} page {page}");
-        let url = format!(
-            "{REST_API_BASE}/users/{}/received_events?per_page=100&page={page}",
-            urlencoding::encode(login)
-        );
+        let url = github_rest_url(
+            state,
+            format!(
+                "users/{}/received_events?per_page=100&page={page}",
+                urlencoding::encode(login)
+            )
+            .as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubActivityEvent>>(
             state,
             access_token,
@@ -6833,7 +6871,7 @@ async fn fetch_discussion_announcement_batch(
     let payload = with_subscription_timeout(operation, async {
         let response = state
             .http
-            .post(GRAPHQL_URL)
+            .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -6939,7 +6977,7 @@ async fn fetch_discussion_announcement_category_discussions(
     let payload = with_subscription_timeout(operation, async {
         let response = state
             .http
-            .post(GRAPHQL_URL)
+            .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -7257,10 +7295,14 @@ async fn fetch_repo_stargazers_snapshot(
 
     while page <= SOCIAL_STARGAZER_MAX_PAGES {
         let operation = format!("sync social stargazers {} page {page}", repo.full_name);
-        let url = format!(
-            "{REST_API_BASE}/repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
-            repo.full_name
-        );
+        let url = github_rest_url_anyhow(
+            state,
+            format!(
+                "repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
+                repo.full_name
+            )
+            .as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubStargazer>>(
             state,
             access_token,
@@ -7445,7 +7487,7 @@ async fn fetch_starred_snapshot_with_token(
         let payload = with_subscription_timeout("sync starred graphql", async {
             let response = state
                 .http
-                .post(GRAPHQL_URL)
+                .post(state.github_graphql_url.clone())
                 .bearer_auth(token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -7807,13 +7849,14 @@ async fn fetch_repo_releases_with_optional_token(
     let mut max_pages = REPO_RELEASE_DEFAULT_MAX_PAGES;
     let mut stopped_reason = String::from("page_budget");
     loop {
-        let url = format!(
-            "{REST_API_BASE}/repos/{repo_full_name}/releases?per_page={per_page}&page={page}"
-        );
+        let url = github_rest_url(
+            state,
+            format!("repos/{repo_full_name}/releases?per_page={per_page}&page={page}").as_str(),
+        )?;
         let operation = format!("sync releases {repo_full_name}");
         let page_result = with_subscription_timeout(operation.as_str(), async {
             let mut request = state
-                .http
+                .github_rest_http
                 .get(url)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -8648,18 +8691,19 @@ mod tests {
         NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
-        RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
-        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        announcement_category_id_from_repo_value, append_subscription_event,
-        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
-        attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, execute_subscription_prune_phases,
-        expire_repo_release_deadlines, fail_repo_release_work_item,
-        feed_activity_event_from_github, insert_feed_activity_events,
+        RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow,
+        RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
+        SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
+        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
+        append_subscription_event, apply_social_activity_snapshot,
+        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
+        attach_and_wait_for_user_release_demand, attach_release_demand,
+        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        execute_subscription_prune_phases, expire_repo_release_deadlines,
+        fail_repo_release_work_item, feed_activity_event_from_github,
+        fetch_repo_releases_with_optional_token, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
         process_repo_release_work_item, prune_subscription_sync_history,
@@ -8675,7 +8719,14 @@ mod tests {
         jobs, local_id, runtime,
         state::{AppState, build_oauth_client},
     };
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::{
+        Json, Router,
+        extract::{Path, Query},
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::collections::BTreeMap;
 
     fn test_user_id(seed: &str) -> String {
         crate::local_id::test_local_id(seed)
@@ -12741,6 +12792,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_new_release_ids_for_task_uses_current_run_work_item_payloads() {
+        let pool = setup_pool().await;
+        let state = setup_state(pool.clone());
+        seed_sync_task(&state, "task-release-new-ids").await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-a",
+                repo_id: 51,
+                repo_full_name: "octo/a",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 3,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-b",
+                repo_id: 52,
+                repo_full_name: "octo/b",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 2,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        seed_repo_release_work_item(
+            &pool,
+            RepoReleaseWorkSeed {
+                id: "repo-work-new-ids-fresh",
+                repo_id: 53,
+                repo_full_name: "octo/fresh",
+                status: jobs::STATUS_SUCCEEDED,
+                deadline_at: "2999-01-01T00:00:00Z",
+                last_release_count: 1,
+                last_candidate_failures: 0,
+                runtime_owner_id: None,
+                lease_heartbeat_at: None,
+            },
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_work_items
+            SET last_new_release_ids_json = CASE id
+              WHEN 'repo-work-new-ids-a' THEN '[501, 499]'
+              WHEN 'repo-work-new-ids-b' THEN '[500, 499]'
+              ELSE '[700]'
+            END
+            WHERE id IN (?, ?, ?)
+            "#,
+        )
+        .bind("repo-work-new-ids-a")
+        .bind("repo-work-new-ids-b")
+        .bind("repo-work-new-ids-fresh")
+        .execute(&pool)
+        .await
+        .expect("seed new release id payloads");
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-a",
+            "repo-work-new-ids-a",
+            "task-release-new-ids",
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-b",
+            "repo-work-new-ids-b",
+            "task-release-new-ids",
+        )
+        .await;
+        seed_repo_release_watcher(
+            &pool,
+            "watch-new-ids-fresh",
+            "repo-work-new-ids-fresh",
+            "task-release-new-ids",
+        )
+        .await;
+        sqlx::query(
+            r#"
+            UPDATE repo_release_watchers
+            SET status = 'succeeded',
+                reused_fresh = CASE id
+                  WHEN 'watch-new-ids-fresh' THEN 1
+                  ELSE 0
+                END
+            WHERE task_id = ?
+            "#,
+        )
+        .bind("task-release-new-ids")
+        .execute(&pool)
+        .await
+        .expect("mark watcher statuses");
+
+        let release_ids =
+            super::load_new_release_ids_for_task(state.as_ref(), "task-release-new-ids")
+                .await
+                .expect("load new release ids");
+
+        assert_eq!(release_ids, vec![501, 500, 499]);
+    }
+
+    #[tokio::test]
     async fn wait_for_release_demand_expires_pending_watchers_past_deadline() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -14699,6 +14862,14 @@ mod tests {
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
         let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build test http client");
+        let github_rest_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .expect("build test github rest http client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -14709,13 +14880,183 @@ mod tests {
             config,
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
-            http: reqwest::Client::new(),
+            http,
+            github_rest_http,
+            github_rest_api_base: Url::parse("https://api.github.com/")
+                .expect("parse github rest api base"),
+            github_graphql_url: Url::parse("https://api.github.com/graphql")
+                .expect("parse github graphql url"),
             github_oauth,
             linuxdo_oauth: None,
             webauthn,
             encryption_key,
             runtime_owner_id: "sync-test-runtime-owner".to_owned(),
         })
+    }
+
+    fn setup_state_with_http_clients(
+        pool: SqlitePool,
+        http: reqwest::Client,
+        github_rest_http: reqwest::Client,
+    ) -> Arc<AppState> {
+        let state = setup_state(pool);
+        Arc::new(AppState {
+            http,
+            github_rest_http,
+            ..state.as_ref().clone()
+        })
+    }
+
+    fn setup_state_with_github_rest_base(
+        pool: SqlitePool,
+        github_rest_api_base: Url,
+        http: reqwest::Client,
+        github_rest_http: reqwest::Client,
+    ) -> Arc<AppState> {
+        let state = setup_state_with_http_clients(pool, http, github_rest_http);
+        Arc::new(AppState {
+            github_rest_api_base,
+            ..state.as_ref().clone()
+        })
+    }
+
+    async fn spawn_test_github_rest_server() -> Url {
+        async fn renamed_repo_releases(
+            Path((owner, repo)): Path<(String, String)>,
+            Query(query): Query<BTreeMap<String, String>>,
+        ) -> impl IntoResponse {
+            assert_eq!(owner, "old-owner");
+            assert_eq!(repo, "old-repo");
+            let per_page = query
+                .get("per_page")
+                .cloned()
+                .unwrap_or_else(|| "20".to_owned());
+            let page = query.get("page").cloned().unwrap_or_else(|| "1".to_owned());
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                [(
+                    "Location",
+                    format!("/repositories/4242/releases?per_page={per_page}&page={page}"),
+                )],
+            )
+        }
+
+        async fn canonical_repo_releases() -> impl IntoResponse {
+            Json(vec![json!({
+                "id": 4242,
+                "node_id": "RE_kwDOAAAB",
+                "tag_name": "v1.2.3",
+                "name": "v1.2.3",
+                "body": "release body",
+                "html_url": "https://github.com/new-owner/new-repo/releases/tag/v1.2.3",
+                "published_at": "2026-06-24T12:00:00Z",
+                "created_at": "2026-06-24T11:00:00Z",
+                "prerelease": false,
+                "draft": false,
+                "reactions": {
+                    "+1": 0,
+                    "laugh": 0,
+                    "heart": 0,
+                    "hooray": 0,
+                    "rocket": 0,
+                    "eyes": 0
+                }
+            })])
+        }
+
+        let app = Router::new()
+            .route("/repos/{owner}/{repo}/releases", get(renamed_repo_releases))
+            .route(
+                "/repositories/{repo_id}/releases",
+                get(canonical_repo_releases),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test github rest server");
+        let addr = listener
+            .local_addr()
+            .expect("resolve test github rest server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test github rest app");
+        });
+        Url::parse(&format!("http://{addr}/")).expect("parse test github rest base url")
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_releases_fails_without_github_rest_redirect_support() {
+        let pool = setup_pool().await;
+        let github_rest_api_base = spawn_test_github_rest_server().await;
+        let state = setup_state_with_github_rest_base(
+            pool,
+            github_rest_api_base,
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test http client"),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test github rest client"),
+        );
+
+        let err = match fetch_repo_releases_with_optional_token(
+            state.as_ref(),
+            None,
+            42,
+            "old-owner/old-repo",
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("repo release fetch should fail without redirect support"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.reason_code, "github_http_error");
+        assert!(
+            err.message.contains("301 Moved Permanently"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_releases_follows_github_rest_redirect_for_renamed_repo() {
+        let pool = setup_pool().await;
+        let github_rest_api_base = spawn_test_github_rest_server().await;
+        let state = setup_state_with_github_rest_base(
+            pool,
+            github_rest_api_base,
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test http client"),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .expect("build test github rest client"),
+        );
+
+        let outcome = fetch_repo_releases_with_optional_token(
+            state.as_ref(),
+            None,
+            42,
+            "old-owner/old-repo",
+            None,
+        )
+        .await
+        .expect("repo release fetch should follow redirect");
+
+        let RepoReleaseFetchOutcome::Updated(result) = outcome else {
+            panic!("expected updated repo release fetch result");
+        };
+        assert_eq!(result.releases.len(), 1);
+        assert_eq!(result.releases[0].id, 4242);
+        assert_eq!(result.releases[0].tag_name, "v1.2.3");
+        assert_eq!(result.pages_fetched, 1);
+        assert_eq!(result.stopped_reason, "short_page");
     }
 
     async fn seed_user(pool: &SqlitePool, user_id: &str) {

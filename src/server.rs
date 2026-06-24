@@ -31,6 +31,7 @@ use tower_sessions::cookie::SameSite;
 use tower_sessions::session_store::ExpiredDeletion;
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tracing::{info, warn};
+use url::Url;
 
 use crate::runtime::SQLITE_BUSY_TIMEOUT;
 use crate::session_store::CoordinatedSqliteSessionStore;
@@ -128,6 +129,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build http client")?;
+    let github_rest_http = reqwest::Client::builder()
+        .user_agent("OctoRill")
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .context("failed to build github rest http client")?;
 
     let app_state = Arc::new(AppState {
         llm_scheduler: Arc::new(ai::LlmScheduler::new(runtime_settings.llm_max_concurrency)),
@@ -141,6 +147,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         pool: pool.clone(),
         sqlite_writer,
         http,
+        github_rest_http,
+        github_rest_api_base: Url::parse("https://api.github.com/")
+            .context("failed to parse github rest api base url")?,
+        github_graphql_url: Url::parse("https://api.github.com/graphql")
+            .context("failed to parse github graphql url")?,
         github_oauth,
         linuxdo_oauth,
         webauthn,
