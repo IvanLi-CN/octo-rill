@@ -295,19 +295,7 @@ pub async fn enqueue_hour_slot_if_due(
     .await?;
 
     let dispatch_at = now.to_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE daily_brief_hour_slots
-        SET last_dispatch_at = ?, updated_at = ?
-        WHERE hour_utc = ?
-        "#,
-    )
-    .bind(dispatch_at.as_str())
-    .bind(dispatch_at.as_str())
-    .bind(hour_utc)
-    .execute(&state.pool)
-    .await
-    .context("failed to update slot last_dispatch_at")?;
+    update_daily_brief_hour_slot_dispatch(state, hour_utc, dispatch_at.as_str()).await?;
 
     Ok(Some(task.task_id))
 }
@@ -549,27 +537,90 @@ async fn upsert_dispatch_state(
     task_id: &str,
 ) -> Result<()> {
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO scheduled_task_dispatch_state (
-          schedule_name,
-          last_dispatch_key,
-          last_task_id,
-          updated_at
-        ) VALUES (?, ?, ?, ?)
-        ON CONFLICT(schedule_name) DO UPDATE SET
-          last_dispatch_key = excluded.last_dispatch_key,
-          last_task_id = excluded.last_task_id,
-          updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(schedule_name)
-    .bind(schedule_key)
-    .bind(task_id)
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to upsert subscription dispatch state")?;
+    state
+        .sqlite_writer
+        .write("scheduled_task_dispatch_state_upsert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO scheduled_task_dispatch_state (
+                  schedule_name,
+                  last_dispatch_key,
+                  last_task_id,
+                  updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(schedule_name) DO UPDATE SET
+                  last_dispatch_key = excluded.last_dispatch_key,
+                  last_task_id = excluded.last_task_id,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(schedule_name)
+            .bind(schedule_key)
+            .bind(task_id)
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to upsert subscription dispatch state")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn update_daily_brief_hour_slot_dispatch(
+    state: &AppState,
+    hour_utc: i64,
+    dispatch_at: &str,
+) -> Result<()> {
+    state
+        .sqlite_writer
+        .write("daily_brief_hour_slot_dispatch", |_| async {
+            sqlx::query(
+                r#"
+                UPDATE daily_brief_hour_slots
+                SET last_dispatch_at = ?, updated_at = ?
+                WHERE hour_utc = ?
+                "#,
+            )
+            .bind(dispatch_at)
+            .bind(dispatch_at)
+            .bind(hour_utc)
+            .execute(&state.pool)
+            .await
+            .context("failed to update slot last_dispatch_at")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+async fn mark_brief_generation_source(
+    state: &AppState,
+    brief_id: &str,
+    generation_source: &'static str,
+    updated_at: &str,
+    lane: &'static str,
+) -> Result<()> {
+    state
+        .sqlite_writer
+        .write(lane, |_| async {
+            sqlx::query(
+                r#"
+                UPDATE briefs
+                SET generation_source = ?,
+                    updated_at = ?
+                WHERE id = ?
+                "#,
+            )
+            .bind(generation_source)
+            .bind(updated_at)
+            .bind(brief_id)
+            .execute(&state.pool)
+            .await
+            .with_context(|| format!("failed to mark brief {brief_id} as {generation_source}"))?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -2444,24 +2495,14 @@ async fn execute_brief_history_recompute_task(state: &AppState, task_id: &str) -
             }
             Err(err) => {
                 let failed_at = Utc::now().to_rfc3339();
-                sqlx::query(
-                    r#"
-                    UPDATE briefs
-                    SET generation_source = 'history_recompute_failed',
-                        updated_at = ?
-                    WHERE id = ?
-                    "#,
+                mark_brief_generation_source(
+                    state,
+                    row.id.as_str(),
+                    "history_recompute_failed",
+                    failed_at.as_str(),
+                    "brief_history_recompute_failure_mark",
                 )
-                .bind(failed_at.as_str())
-                .bind(&row.id)
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to mark legacy brief {} as history_recompute_failed",
-                        row.id
-                    )
-                })?;
+                .await?;
                 failed += 1;
                 append_task_event(
                     state,
@@ -2630,24 +2671,14 @@ async fn execute_brief_refresh_content_task(state: &AppState, task_id: &str) -> 
             }
             Err(err) => {
                 let failed_at = Utc::now().to_rfc3339();
-                sqlx::query(
-                    r#"
-                    UPDATE briefs
-                    SET generation_source = 'content_refresh_failed',
-                        updated_at = ?
-                    WHERE id = ?
-                    "#,
+                mark_brief_generation_source(
+                    state,
+                    row.id.as_str(),
+                    "content_refresh_failed",
+                    failed_at.as_str(),
+                    "brief_content_refresh_failure_mark",
                 )
-                .bind(failed_at.as_str())
-                .bind(&row.id)
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to mark normalized brief {} as content_refresh_failed",
-                        row.id
-                    )
-                })?;
+                .await?;
                 failed += 1;
                 append_task_event(
                     state,
@@ -3695,15 +3726,16 @@ mod tests {
         execute_brief_refresh_content_task, execute_daily_slot_task, execute_sync_all_task_with,
         is_scheduled_task_type, load_due_daily_slot_users,
         load_recent_failed_brief_retry_candidates, load_recent_failed_translation_retry_candidates,
-        load_translation_stream_cursor, load_translation_stream_rows,
+        load_translation_stream_cursor, load_translation_stream_rows, mark_brief_generation_source,
         next_llm_scheduler_stream_event, payload_slot_hour_key, payload_slot_reference_utc,
         recover_runtime_state, recover_runtime_state_on_startup, retry_candidate_is_retryable,
+        update_daily_brief_hour_slot_dispatch, upsert_dispatch_state,
     };
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::{Value, json};
     use sqlx::{
         Row, SqlitePool,
-        sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     };
     use url::Url;
 
@@ -4723,6 +4755,34 @@ mod tests {
         pool
     }
 
+    async fn setup_pool_with_max_connections_and_wal(
+        max_connections: u32,
+        busy_timeout: std::time::Duration,
+    ) -> SqlitePool {
+        let database_path = std::env::temp_dir().join(format!(
+            "octo-rill-jobs-busy-test-{}.db",
+            crate::local_id::generate_local_id(),
+        ));
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(busy_timeout);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(options)
+            .await
+            .expect("create sqlite db");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        crate::api::ensure_owned_repo_visual_columns(&pool)
+            .await
+            .expect("ensure owned repo visual columns");
+        pool
+    }
+
     fn setup_state(pool: SqlitePool) -> Arc<AppState> {
         let encryption_key =
             EncryptionKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
@@ -4892,6 +4952,181 @@ mod tests {
             .expect("enqueue after writer release");
         assert_eq!(task.task_type, TASK_SYNC_ALL);
         assert_eq!(task.status, STATUS_QUEUED);
+    }
+
+    #[tokio::test]
+    async fn update_daily_brief_hour_slot_dispatch_waits_for_sqlite_write_lock() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE daily_brief_hour_slots SET updated_at = ? WHERE hour_utc = ?")
+            .bind("2026-04-13T00:00:01Z")
+            .bind(0_i64)
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let state_for_update = state.clone();
+        let update_task = tokio::spawn(async move {
+            update_daily_brief_hour_slot_dispatch(
+                state_for_update.as_ref(),
+                0,
+                "2026-04-13T00:00:00Z",
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        update_task
+            .await
+            .expect("join slot dispatch task")
+            .expect("slot dispatch update should succeed after writer release");
+
+        let dispatch_at: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT last_dispatch_at
+            FROM daily_brief_hour_slots
+            WHERE hour_utc = ?
+            "#,
+        )
+        .bind(0_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load slot dispatch state");
+        assert_eq!(dispatch_at.as_deref(), Some("2026-04-13T00:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn upsert_dispatch_state_waits_for_sqlite_write_lock() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE daily_brief_hour_slots SET updated_at = ? WHERE hour_utc = ?")
+            .bind("2026-04-13T00:00:01Z")
+            .bind(0_i64)
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let state_for_upsert = state.clone();
+        let dispatch_task = tokio::spawn(async move {
+            upsert_dispatch_state(
+                state_for_upsert.as_ref(),
+                "test.schedule",
+                "interval:10:1772805600",
+                "task-dispatch-state",
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        dispatch_task
+            .await
+            .expect("join dispatch state task")
+            .expect("dispatch state upsert should succeed after writer release");
+
+        let row = sqlx::query_as::<_, (String, String)>(
+            r#"
+            SELECT last_dispatch_key, last_task_id
+            FROM scheduled_task_dispatch_state
+            WHERE schedule_name = ?
+            "#,
+        )
+        .bind("test.schedule")
+        .fetch_one(&pool)
+        .await
+        .expect("load dispatch state");
+        assert_eq!(row.0, "interval:10:1772805600");
+        assert_eq!(row.1, "task-dispatch-state");
+    }
+
+    #[tokio::test]
+    async fn mark_brief_generation_source_waits_for_sqlite_write_lock() {
+        let pool =
+            setup_pool_with_max_connections_and_wal(2, std::time::Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+        seed_user(&pool, 90_100, "brief-writer-lock-user").await;
+        sqlx::query(
+            r#"
+            INSERT INTO briefs (
+              id, user_id, date, window_start_utc, window_end_utc,
+              effective_time_zone, effective_local_boundary, generation_source,
+              content_markdown, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("brief-writer-lock")
+        .bind("90100")
+        .bind("2026-04-13")
+        .bind("2026-04-12T00:00:00Z")
+        .bind("2026-04-13T00:00:00Z")
+        .bind("Asia/Shanghai")
+        .bind("08:00")
+        .bind("legacy")
+        .bind("placeholder")
+        .bind("2026-04-13T00:00:00Z")
+        .bind("2026-04-13T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed brief");
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE briefs SET updated_at = ? WHERE id = ?")
+            .bind("2026-04-13T00:00:01Z")
+            .bind("brief-writer-lock")
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let state_for_mark = state.clone();
+        let mark_task = tokio::spawn(async move {
+            mark_brief_generation_source(
+                state_for_mark.as_ref(),
+                "brief-writer-lock",
+                "content_refresh_failed",
+                "2026-04-13T00:00:02Z",
+                "test_brief_failure_mark",
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        mark_task
+            .await
+            .expect("join brief mark task")
+            .expect("brief failure mark should succeed after writer release");
+
+        let generation_source: String = sqlx::query_scalar(
+            r#"
+            SELECT generation_source
+            FROM briefs
+            WHERE id = ?
+            "#,
+        )
+        .bind("brief-writer-lock")
+        .fetch_one(&pool)
+        .await
+        .expect("load brief generation source");
+        assert_eq!(generation_source, "content_refresh_failed");
     }
 
     async fn seed_task(
