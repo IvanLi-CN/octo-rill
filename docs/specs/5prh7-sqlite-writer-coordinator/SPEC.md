@@ -6,7 +6,7 @@
 
 - OctoRill 继续使用单个 SQLite 数据库承载 HTTP 请求、后台任务、repo release worker、translation worker 与 LLM 调度状态。
 - SQLite WAL 允许读写并发，但仍只有一个 writer；当高并发 worker 直接争抢写事务时，`database is locked` 会外溢到用户请求并造成 500。
-- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle 与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
+- 既有修复已把部分 read-then-write 事务改为 `BEGIN IMMEDIATE`，但如果写协调只覆盖少数后台 claim/finalize 路径，登录/session、job enqueue、LLM lifecycle、translation batch 启动状态切换、repo release reaction refresh 持久化与 repo release recovery 等路径仍会在高 worker 并发下直接争抢 SQLite writer。
 
 ## 目标 / 非目标
 
@@ -18,6 +18,7 @@
 - coordinator 必须区分 `foreground`、`background`、`best_effort` 语义，保证用户可见写入不会长期排在后台 heartbeat/finalize 后面。
 - SQLite busy/locked 必须作为可恢复背压处理，经过有界退避重试后再决定是否失败。
 - `last_active_at` 等用户热路径 best-effort 写入不得等待后台 writer 排队，也不得把 `/api/me` 类请求打成 500。
+- 对已有 pending 合同的读取接口，若结果表已经存在当前 source hash 的 `queued/running` 状态，则允许在 writer 压力下直接复用该快照，不得为了重复 resolve 再强制进入新的写事务。
 
 ### Non-goals
 
@@ -32,6 +33,7 @@
 
 - 后端 runtime 内的 SQLite write coordinator。
 - `job_tasks` enqueue/event/cancel/claim/heartbeat/finalize、session create/save/delete、repo release attach/claim/finalize/heartbeat/recovery/sync-state、translation request/batch/recovery/finalize、LLM call lifecycle、`touch_user_last_active_at` 等热写路径。
+- `translation_batches queued -> running`、`translation_work_items batched -> running` 与 feed reaction refresh counts 持久化等短写段。
 - 针对 SQLite WAL + 多连接 pool 的并发回归测试。
 
 ### Out of scope
@@ -66,6 +68,8 @@
 
 - 后台 worker 可以继续高并发执行网络/AI 阶段；进入 SQLite 写入时通过 coordinator 排队。
 - 登录/session、手动触发任务、job enqueue 与取消任务走 foreground lane；后台 claim/heartbeat/finalize/recovery 走 background lane；非关键活跃时间和清理类写入走 best-effort lane。
+- translation batch 的启动状态切换必须在单个短事务内完成：`translation_batches` 的 `queued -> running`、关联 `translation_work_items` 的 `running` 标记与 lease 元数据更新都要在 writer permit 内提交，AI 调用与后续长计算继续留在 permit 外。
+- feed reaction refresh 的 counts 持久化属于非关键后台写入；当 writer permit 不可得或 SQLite busy 时允许跳过持久化，但必须保留 live payload 返回与结构化降级证据。
 - HTTP 请求读取数据时不需要 writer permit；更新用户活跃时间等 best-effort 写入使用非阻塞 writer 尝试，拿不到 permit 时直接跳过。
 - 如果 SQLite 返回 busy/locked，coordinator 使用短退避重试，并在耗尽后返回原始错误上下文。
 
@@ -104,6 +108,14 @@
 - Given 多个后台 repo release/translation/LLM worker 正在高并发执行网络任务并产生 heartbeat/finalize 写入
   When 前台请求创建 session 或调用 `jobs::enqueue_task`
   Then 前台写入通过 coordinator 排队并优先进入写段，不直接把 SQLite busy/locked 冒泡成 500。
+
+- Given 翻译调度器已经 claim 到 batch 且另一个 SQLite 写事务暂时持有 writer
+  When worker 尝试把 batch 与 work items 标记为 `running`
+  Then worker 会在 coordinator 内等待短写段串行提交，而不是直接把 `translation_batches ... database is locked` 冒泡成失败。
+
+- Given feed reaction refresh 已经拿到 GitHub live payload
+  When counts 持久化阶段遇到 writer backlog 或 SQLite busy
+  Then 非关键持久化允许跳过，但接口仍返回 live payload，且日志能区分 `sqlite_writer_busy` 或 `sqlite_busy` 降级原因。
 
 ## 验收清单（Acceptance checklist）
 
