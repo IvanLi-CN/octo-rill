@@ -15054,6 +15054,11 @@ mod tests {
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
+            github_rest_http: reqwest::Client::new(),
+            github_rest_api_base: Url::parse("https://api.github.com/")
+                .expect("parse github rest api base"),
+            github_graphql_url: Url::parse("https://api.github.com/graphql")
+                .expect("parse github graphql url"),
             github_oauth,
             linuxdo_oauth: None,
             webauthn,
@@ -15107,6 +15112,11 @@ mod tests {
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
             http: reqwest::Client::new(),
+            github_rest_http: reqwest::Client::new(),
+            github_rest_api_base: Url::parse("https://api.github.com/")
+                .expect("parse github rest api base"),
+            github_graphql_url: Url::parse("https://api.github.com/graphql")
+                .expect("parse github graphql url"),
             github_oauth,
             linuxdo_oauth: None,
             webauthn,
