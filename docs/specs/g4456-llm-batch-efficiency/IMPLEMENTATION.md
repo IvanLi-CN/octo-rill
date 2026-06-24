@@ -31,3 +31,4 @@ None
 - [x] M2: 后端模型上限解析器 + 固定信源同步机制。
 - [x] M3: 后端 batch API 与单条委托改造（release/release detail/notification/brief）。
 - [x] M4: 前端自动翻译切换到 visible-window 结果聚合接口 + Storybook / E2E 回归验证。
+- 运行时背压收口：当结果表已存在当前 source hash 的 pending 快照时，`/api/translate/results` 会先走读优先快路径；命中 SQLite writer / translation worker / LLM scheduler 背压时直接返回既有 `queued/running`，避免重复 resolve 继续放大写压。
