@@ -576,6 +576,7 @@ test("admin users list keeps the action column visible on desktop widths", async
 
 	const tableShell = page.locator("[data-admin-users-table-shell]");
 	await expect(tableShell).toBeVisible();
+	await expect(userRow(page, STANDARD_USER_ID)).toBeVisible();
 
 	const layout = await page.evaluate((userId) => {
 		const shell = document.querySelector(

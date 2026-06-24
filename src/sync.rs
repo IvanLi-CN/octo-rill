@@ -6377,53 +6377,65 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
             Ok(public_repo) if !public_repo.private => {
                 let full_name_lower = public_repo.full_name.to_ascii_lowercase();
                 let owner_login = public_repo.owner.login;
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET repo_id = ?,
-                        owner_login = ?,
-                        repo_name = ?,
-                        full_name = ?,
-                        full_name_lower = ?,
-                        last_sync_status = 'pending',
-                        last_sync_error = NULL,
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(public_repo.id)
-                .bind(owner_login.as_str())
-                .bind(public_repo.name.as_str())
-                .bind(public_repo.full_name.as_str())
-                .bind(full_name_lower.as_str())
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to update public repo metadata for {}",
-                        repo.full_name
-                    )
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_ready", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET repo_id = ?,
+                                owner_login = ?,
+                                repo_name = ?,
+                                full_name = ?,
+                                full_name_lower = ?,
+                                last_sync_status = 'pending',
+                                last_sync_error = NULL,
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(public_repo.id)
+                        .bind(owner_login.as_str())
+                        .bind(public_repo.name.as_str())
+                        .bind(public_repo.full_name.as_str())
+                        .bind(full_name_lower.as_str())
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to update public repo metadata for {}",
+                                repo.full_name
+                            )
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
             Ok(_) => {
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET last_sync_status = 'inaccessible',
-                        last_sync_error = 'repository is private',
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!("failed to mark private public repo {}", repo.full_name)
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_private", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET last_sync_status = 'inaccessible',
+                                last_sync_error = 'repository is private',
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!("failed to mark private public repo {}", repo.full_name)
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
             Err(err) => {
                 let status = if err.reason_code == "repo_inaccessible" {
@@ -6431,27 +6443,33 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
                 } else {
                     "failed"
                 };
-                sqlx::query(
-                    r#"
-                    UPDATE public_repo_release_usage
-                    SET last_sync_status = ?,
-                        last_sync_error = ?,
-                        updated_at = ?
-                    WHERE lower(full_name) = lower(?)
-                    "#,
-                )
-                .bind(status)
-                .bind(format!("{}: {}", err.reason_code, err.message))
-                .bind(now.as_str())
-                .bind(repo.full_name.as_str())
-                .execute(&state.pool)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to mark public repo metadata error for {}",
-                        repo.full_name
-                    )
-                })?;
+                state
+                    .sqlite_writer
+                    .write("public_repo_release_usage_metadata_error", |_| async {
+                        sqlx::query(
+                            r#"
+                            UPDATE public_repo_release_usage
+                            SET last_sync_status = ?,
+                                last_sync_error = ?,
+                                updated_at = ?
+                            WHERE lower(full_name) = lower(?)
+                            "#,
+                        )
+                        .bind(status)
+                        .bind(format!("{}: {}", err.reason_code, err.message))
+                        .bind(now.as_str())
+                        .bind(repo.full_name.as_str())
+                        .execute(&state.pool)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to mark public repo metadata error for {}",
+                                repo.full_name
+                            )
+                        })?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await?;
             }
         }
     }
@@ -7543,6 +7561,15 @@ async fn upsert_starred_repos(
     repos: &[StarredRepoSnapshot],
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_starred_repos_upsert",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin upsert starred_repos tx")?;
     for repo in repos {
         sqlx::query(
             r#"
@@ -7579,10 +7606,13 @@ async fn upsert_starred_repos(
         .bind(repo.owner_avatar_url.as_deref())
         .bind(repo.open_graph_image_url.as_deref())
         .bind(repo.uses_custom_open_graph_image as i64)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to upsert starred repo {}", repo.full_name))?;
     }
+    tx.commit()
+        .await
+        .context("commit upsert starred_repos tx")?;
     Ok(())
 }
 
@@ -8040,6 +8070,15 @@ async fn upsert_notifications(
     notifications: &[GitHubNotification],
     now: &str,
 ) -> Result<()> {
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_notifications_upsert",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin notifications upsert tx")?;
     for notification in notifications {
         let api_url = notification
             .subject
@@ -8090,11 +8129,14 @@ async fn upsert_notifications(
         .bind(api_url)
         .bind(html_url)
         .bind(now)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to upsert notification")?;
     }
 
+    tx.commit()
+        .await
+        .context("commit notifications upsert tx")?;
     Ok(())
 }
 
@@ -8157,6 +8199,16 @@ where
     if rows.is_empty() {
         return Ok(true);
     }
+
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_notification_open_url_repair",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin notification repair tx")?;
 
     for (
         thread_id,
@@ -8281,10 +8333,12 @@ where
         .bind(now)
         .bind(user_id)
         .bind(thread_id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to repair cached notification open url")?;
     }
+
+    tx.commit().await.context("commit notification repair tx")?;
 
     let remaining = sqlx::query_scalar::<_, i64>(
         r#"
@@ -8467,8 +8521,8 @@ mod tests {
         record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
         replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
         store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
-        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
-        upsert_starred_repos, wait_for_release_demand,
+        sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_notifications,
+        upsert_repo_releases, upsert_starred_repos, wait_for_release_demand,
     };
     use crate::{
         config::{AppConfig, GitHubOAuthConfig},
@@ -8704,6 +8758,64 @@ mod tests {
         .expect("load notification unread");
 
         assert_eq!(unread, 0);
+    }
+
+    #[tokio::test]
+    async fn upsert_notifications_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let now = "2026-04-13T10:00:00Z";
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-04-13T10:00:01Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let busy_user_id = user_id.clone();
+        let notification_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let notification = mock_notification(
+                    "thread-busy",
+                    Some("https://api.github.com/repos/octo/rocket/issues/3"),
+                    Some("octo/rocket"),
+                    Some("Issue"),
+                    now,
+                );
+                upsert_notifications(state.as_ref(), busy_user_id.as_str(), &[notification], now)
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        notification_task
+            .await
+            .expect("join notification upsert task")
+            .expect("notification upsert should succeed after writer release");
+
+        let unread = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT unread
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("thread-busy")
+        .fetch_one(&pool)
+        .await
+        .expect("load busy notification unread");
+        assert_eq!(unread, 1);
     }
 
     #[test]
@@ -13673,6 +13785,72 @@ mod tests {
                 .await
                 .expect("count starred repos");
         assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_starred_repos_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("shallow-star-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let busy_user_id = user_id.clone();
+        let upsert_task = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                upsert_starred_repos(
+                    state.as_ref(),
+                    busy_user_id.as_str(),
+                    &[StarredRepoSnapshot {
+                        repo_id: 103,
+                        full_name: "octo/new".to_owned(),
+                        owner_login: "octo".to_owned(),
+                        name: "new".to_owned(),
+                        description: None,
+                        html_url: "https://github.com/octo/new".to_owned(),
+                        stargazed_at: "2026-03-07T00:00:00Z".to_owned(),
+                        is_private: false,
+                        owner_avatar_url: None,
+                        open_graph_image_url: None,
+                        uses_custom_open_graph_image: false,
+                    }],
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        upsert_task
+            .await
+            .expect("join starred upsert task")
+            .expect("starred upsert should succeed after writer release");
+
+        let full_name: String = sqlx::query_scalar(
+            r#"
+            SELECT full_name
+            FROM starred_repos
+            WHERE user_id = ? AND repo_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind(103_i64)
+        .fetch_one(&pool)
+        .await
+        .expect("load new starred repo");
+        assert_eq!(full_name, "octo/new");
     }
 
     #[tokio::test]
