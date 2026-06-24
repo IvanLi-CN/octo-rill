@@ -7,53 +7,89 @@
 ```json
 {
   "mode": "async | wait | stream",
+  "item": {
+    "producer_ref": "feed.auto_translate:release:294043551",
+    "kind": "release_summary | release_detail | notification",
+    "variant": "feed_card | detail_card | inbox_summary",
+    "entity_id": "294043551",
+    "target_lang": "zh-CN",
+    "max_wait_ms": 1200,
+    "source_blocks": [
+      { "slot": "title", "text": "v1.2.3" },
+      { "slot": "excerpt", "text": "- Added..." }
+    ],
+    "target_slots": ["title_zh", "summary_md"]
+  }
+}
+```
+
+### Async batch request
+
+```json
+{
+  "mode": "async",
   "items": [
     {
-      "producer_ref": "feed:release:294043551",
-      "kind": "release_summary | release_detail | notification",
-      "variant": "feed_card | detail_body | inbox_summary",
+      "producer_ref": "feed.auto_translate:release:294043551",
+      "kind": "release_summary",
+      "variant": "feed_card",
       "entity_id": "294043551",
       "target_lang": "zh-CN",
       "max_wait_ms": 1200,
-      "source_blocks": [
-        { "slot": "title", "text": "v1.2.3" },
-        { "slot": "excerpt", "text": "- Added..." }
-      ],
+      "source_blocks": [{ "slot": "title", "text": "v1.2.3" }],
       "target_slots": ["title_zh", "summary_md"]
     }
   ]
 }
 ```
 
-### Async response
+### Single response
 
 ```json
 {
   "request_id": "req_xxx",
-  "status": "queued"
+  "status": "queued | running | completed | failed",
+  "result": {
+    "producer_ref": "feed.auto_translate:release:294043551",
+    "entity_id": "294043551",
+    "kind": "release_summary",
+    "variant": "feed_card",
+    "status": "queued | running | ready | disabled | missing | error",
+    "title_zh": "中文标题",
+    "summary_md": "- 中文摘要",
+    "body_md": null,
+    "error": null,
+    "work_item_id": "work_xxx",
+    "batch_id": "batch_xxx"
+  }
 }
 ```
 
-### Wait response
+### Batch async response
 
 ```json
 {
-  "request_id": "req_xxx",
-  "status": "completed",
-  "items": [
+  "requests": [
     {
-      "producer_ref": "feed:release:294043551",
+      "request_id": "req_xxx",
+      "status": "queued",
+      "producer_ref": "feed.auto_translate:release:294043551",
       "entity_id": "294043551",
       "kind": "release_summary",
-      "status": "ready | disabled | missing | error",
-      "title_zh": "中文标题",
-      "summary_md": "- 中文摘要",
-      "body_md": null,
-      "error": null
+      "variant": "feed_card"
     }
   ]
 }
 ```
+
+### Validation rules
+
+- `item` 与 `items` 互斥。
+- `wait` / `stream` 只接受 `item`。
+- `async` 可接受 `item` 或 `items`。
+- `wait` 最多阻塞到 `item.max_wait_ms`；若预算内未进入终态，则返回该 request 当前的单结果快照，`result.status` 可保持 `queued | running`。
+- release detail 等 request-based 交互不得在前端继续追加超出 `max_wait_ms` 合同的同步阻塞；拿到 pending 快照后应转为后台轮询或等待下次显式读取。
+- release detail 批次若遇到 retryable upstream `429` / rate-limit / 临时 slow，后端会把 request/work item 复位到 `queued` 后再返回后续快照，不把本次失败沉成默认终态错误。
 
 ### Stream events
 
@@ -63,11 +99,11 @@
 - `completed`
 - `failed`
 
-`completed` / `failed` events carry the full request item result set.
+所有事件均绑定单个 `request_id`；终态事件携带单个 `result` 与可选 `error`。
 
 ## `GET /api/translate/requests/{request_id}`
 
-Returns request status, timing, and only the items attached to the given request.
+Returns request status, timing, and the single `result` attached to the given request.
 
 ## `/api/admin/jobs/translations/*`
 

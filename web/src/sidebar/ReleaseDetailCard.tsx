@@ -353,21 +353,12 @@ export function ReleaseDetailCard(props: {
 					response = requestId
 						? await apiGetTranslationRequest(requestId)
 						: await apiTranslateReleaseDetail(activeDetail);
-					const deadline = Date.now() + REQUEST_STATUS_POLL_WINDOW_MS;
 					while (isPendingTranslationResultStatus(response.result.status)) {
 						pendingTranslationRequestRef.current = {
 							releaseId: requestReleaseId,
 							requestId: response.request_id,
 						};
-						if (Date.now() >= deadline) {
-							throw new Error(
-								"translation is still processing; please try again shortly",
-							);
-						}
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						await sleep(REQUEST_STATUS_POLL_INTERVAL_MS);
-						if (translateRequestSeqRef.current !== requestSeq) return;
-						response = await apiGetTranslationRequest(response.request_id);
+						return;
 					}
 					break;
 				} catch (error) {
