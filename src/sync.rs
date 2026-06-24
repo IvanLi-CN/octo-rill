@@ -8155,6 +8155,18 @@ where
         Failed,
     }
 
+    struct NotificationRepairUpdate {
+        thread_id: String,
+        repo_full_name: Option<String>,
+        subject_title: Option<String>,
+        subject_type: Option<String>,
+        reason: Option<String>,
+        updated_at: Option<String>,
+        unread: i64,
+        url: Option<String>,
+        html_url: String,
+    }
+
     let rows = sqlx::query_as::<
         _,
         (
@@ -8200,15 +8212,7 @@ where
         return Ok(true);
     }
 
-    let (_sqlite_write, mut tx) = state
-        .sqlite_writer
-        .begin_immediate_with_priority(
-            &state.pool,
-            "sync_notification_open_url_repair",
-            SqliteWritePriority::Background,
-        )
-        .await
-        .context("begin notification repair tx")?;
+    let mut updates = Vec::with_capacity(rows.len());
 
     for (
         thread_id,
@@ -8306,6 +8310,30 @@ where
             }
         };
 
+        updates.push(NotificationRepairUpdate {
+            thread_id,
+            repo_full_name: resolved_repo_full_name,
+            subject_title: resolved_subject_title,
+            subject_type: resolved_subject_type,
+            reason: resolved_reason,
+            updated_at: resolved_updated_at,
+            unread: resolved_unread,
+            url: resolved_api_url,
+            html_url: resolved_html_url,
+        });
+    }
+
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate_with_priority(
+            &state.pool,
+            "sync_notification_open_url_repair",
+            SqliteWritePriority::Background,
+        )
+        .await
+        .context("begin notification repair tx")?;
+
+    for update in updates {
         sqlx::query(
             r#"
             UPDATE notifications
@@ -8322,17 +8350,17 @@ where
             WHERE user_id = ? AND thread_id = ?
             "#,
         )
-        .bind(resolved_repo_full_name)
-        .bind(resolved_subject_title)
-        .bind(resolved_subject_type)
-        .bind(resolved_reason)
-        .bind(resolved_updated_at)
-        .bind(resolved_unread)
-        .bind(resolved_api_url)
-        .bind(resolved_html_url)
+        .bind(update.repo_full_name)
+        .bind(update.subject_title)
+        .bind(update.subject_type)
+        .bind(update.reason)
+        .bind(update.updated_at)
+        .bind(update.unread)
+        .bind(update.url)
+        .bind(update.html_url)
         .bind(now)
         .bind(user_id)
-        .bind(thread_id)
+        .bind(update.thread_id)
         .execute(&mut *tx)
         .await
         .context("failed to repair cached notification open url")?;
@@ -9288,6 +9316,121 @@ mod tests {
         .await
         .expect("read notifications since");
         assert!(!since_value.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_notifications_repair_releases_sqlite_writer_during_thread_lookup() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("notifications-repair-permit-lifecycle");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (
+              id, user_id, thread_id, repo_full_name, subject_title, subject_type, reason,
+              updated_at, unread, url, html_url, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(crate::local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .bind("octo/alpha")
+        .bind("Old cached notification")
+        .bind("PullRequest")
+        .bind("state_change")
+        .bind("2026-03-06T00:00:00Z")
+        .bind(1_i64)
+        .bind("https://api.github.com/notifications/threads/cached-thread")
+        .bind("https://github.com/octo/alpha")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed stale notification");
+
+        let release_lookup = Arc::new(tokio::sync::Notify::new());
+        let (reached_tx, mut reached_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let sync_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            let release_lookup = release_lookup.clone();
+            tokio::spawn(async move {
+                sync_notifications_with_fetch(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    move |_since, _before, page| {
+                        Box::pin(async move {
+                            assert_eq!(page, 1);
+                            Ok(Vec::new())
+                        })
+                    },
+                    move |thread_id| {
+                        let release_lookup = release_lookup.clone();
+                        let reached_tx = reached_tx.clone();
+                        Box::pin(async move {
+                            reached_tx
+                                .send(())
+                                .expect("signal repair reached thread lookup");
+                            release_lookup.notified().await;
+                            Ok(Some(mock_notification(
+                                &thread_id,
+                                Some("https://api.github.com/repos/octo/alpha/pulls/120"),
+                                Some("octo/alpha"),
+                                Some("PullRequest"),
+                                "2026-03-06T03:30:00Z",
+                            )))
+                        })
+                    },
+                )
+                .await
+            })
+        };
+
+        reached_rx
+            .recv()
+            .await
+            .expect("repair should reach thread lookup");
+
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            state
+                .sqlite_writer
+                .write_foreground("notifications_repair_foreground_probe", |_| async {
+                    Ok::<_, anyhow::Error>(())
+                }),
+        )
+        .await
+        .expect("foreground writer should not wait on notification thread lookup")
+        .expect("foreground probe should succeed");
+
+        release_lookup.notify_waiters();
+
+        let result = sync_task
+            .await
+            .expect("join sync notifications task")
+            .expect("sync notifications");
+        assert_eq!(result.notifications, 0);
+
+        let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT url, html_url
+            FROM notifications
+            WHERE user_id = ? AND thread_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("cached-thread")
+        .fetch_one(&pool)
+        .await
+        .expect("load repaired notification");
+        assert_eq!(
+            stored,
+            (
+                Some("https://api.github.com/repos/octo/alpha/pulls/120".to_owned()),
+                Some("https://github.com/octo/alpha/pull/120".to_owned()),
+            )
+        );
     }
 
     #[tokio::test]
