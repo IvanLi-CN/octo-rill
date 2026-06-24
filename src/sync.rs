@@ -29,7 +29,6 @@ use crate::{
 };
 
 const REST_API_BASE: &str = "https://api.github.com";
-const GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const API_VERSION: &str = "2022-11-28";
 const SUBSCRIPTION_STAR_WORKERS: usize = 5;
 const SUBSCRIPTION_SOCIAL_WORKERS: usize = 4;
@@ -6344,6 +6343,28 @@ async fn fetch_json_response<T: DeserializeOwned>(
     })
 }
 
+fn github_rest_url(state: &AppState, path_and_query: &str) -> Result<String, SyncRequestError> {
+    state
+        .github_rest_api_base
+        .join(path_and_query)
+        .map(|url| url.to_string())
+        .map_err(|err| {
+            SyncRequestError::non_retryable(
+                "request_error",
+                format!("invalid github rest url {path_and_query}: {err}"),
+                None,
+            )
+        })
+}
+
+fn github_rest_url_anyhow(state: &AppState, path_and_query: &str) -> Result<String> {
+    state
+        .github_rest_api_base
+        .join(path_and_query)
+        .map(|url| url.to_string())
+        .context("failed to build github rest url")
+}
+
 async fn fetch_github_rest_page<T: DeserializeOwned>(
     state: &AppState,
     access_token: &str,
@@ -6353,7 +6374,7 @@ async fn fetch_github_rest_page<T: DeserializeOwned>(
 ) -> Result<T, SyncRequestError> {
     with_subscription_timeout(operation, async {
         let response = state
-            .http
+            .github_rest_http
             .get(url)
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
@@ -6375,7 +6396,7 @@ async fn fetch_github_public_rest<T: DeserializeOwned>(
 ) -> Result<T, SyncRequestError> {
     with_subscription_timeout(operation, async {
         let response = state
-            .http
+            .github_rest_http
             .get(url)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -6413,11 +6434,15 @@ async fn refresh_public_release_usage_repo_metadata(state: &AppState) -> Result<
 
     for repo in pending {
         let now = Utc::now().to_rfc3339();
-        let url = format!(
-            "{REST_API_BASE}/repos/{}/{}",
-            urlencoding::encode(repo.owner_login.as_str()),
-            urlencoding::encode(repo.repo_name.as_str())
-        );
+        let url = github_rest_url_anyhow(
+            state,
+            format!(
+                "repos/{}/{}",
+                urlencoding::encode(repo.owner_login.as_str()),
+                urlencoding::encode(repo.repo_name.as_str())
+            )
+            .as_str(),
+        )?;
         let operation = format!("sync public repo metadata {}", repo.full_name);
         match fetch_github_public_rest::<GitHubPublicRepo>(state, &url, operation.as_str()).await {
             Ok(public_repo) if !public_repo.private => {
@@ -6560,7 +6585,7 @@ async fn fetch_owned_repo_snapshot(
         let payload = with_subscription_timeout("sync social owned repos graphql", async {
             let response = state
                 .http
-                .post(GRAPHQL_URL)
+                .post(state.github_graphql_url.clone())
                 .bearer_auth(access_token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -6649,9 +6674,10 @@ async fn fetch_followers_snapshot(
 
     while page <= SOCIAL_FOLLOWERS_MAX_PAGES {
         let operation = format!("sync social followers page {page}");
-        let url = format!(
-            "{REST_API_BASE}/user/followers?per_page={SOCIAL_FOLLOWERS_PER_PAGE}&page={page}"
-        );
+        let url = github_rest_url(
+            state,
+            format!("user/followers?per_page={SOCIAL_FOLLOWERS_PER_PAGE}&page={page}").as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubActor>>(
             state,
             access_token,
@@ -6688,10 +6714,14 @@ async fn fetch_feed_activity_events_snapshot(
 
     while page <= 3 {
         let operation = format!("sync social received events @{login} page {page}");
-        let url = format!(
-            "{REST_API_BASE}/users/{}/received_events?per_page=100&page={page}",
-            urlencoding::encode(login)
-        );
+        let url = github_rest_url(
+            state,
+            format!(
+                "users/{}/received_events?per_page=100&page={page}",
+                urlencoding::encode(login)
+            )
+            .as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubActivityEvent>>(
             state,
             access_token,
@@ -6833,7 +6863,7 @@ async fn fetch_discussion_announcement_batch(
     let payload = with_subscription_timeout(operation, async {
         let response = state
             .http
-            .post(GRAPHQL_URL)
+            .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -6939,7 +6969,7 @@ async fn fetch_discussion_announcement_category_discussions(
     let payload = with_subscription_timeout(operation, async {
         let response = state
             .http
-            .post(GRAPHQL_URL)
+            .post(state.github_graphql_url.clone())
             .bearer_auth(access_token)
             .header(USER_AGENT, "OctoRill")
             .header(ACCEPT, "application/vnd.github+json")
@@ -7257,10 +7287,14 @@ async fn fetch_repo_stargazers_snapshot(
 
     while page <= SOCIAL_STARGAZER_MAX_PAGES {
         let operation = format!("sync social stargazers {} page {page}", repo.full_name);
-        let url = format!(
-            "{REST_API_BASE}/repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
-            repo.full_name
-        );
+        let url = github_rest_url_anyhow(
+            state,
+            format!(
+                "repos/{}/stargazers?per_page={SOCIAL_STARGAZER_PER_PAGE}&page={page}",
+                repo.full_name
+            )
+            .as_str(),
+        )?;
         let items = fetch_github_rest_page::<Vec<GitHubStargazer>>(
             state,
             access_token,
@@ -7445,7 +7479,7 @@ async fn fetch_starred_snapshot_with_token(
         let payload = with_subscription_timeout("sync starred graphql", async {
             let response = state
                 .http
-                .post(GRAPHQL_URL)
+                .post(state.github_graphql_url.clone())
                 .bearer_auth(token)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -7807,13 +7841,14 @@ async fn fetch_repo_releases_with_optional_token(
     let mut max_pages = REPO_RELEASE_DEFAULT_MAX_PAGES;
     let mut stopped_reason = String::from("page_budget");
     loop {
-        let url = format!(
-            "{REST_API_BASE}/repos/{repo_full_name}/releases?per_page={per_page}&page={page}"
-        );
+        let url = github_rest_url(
+            state,
+            format!("repos/{repo_full_name}/releases?per_page={per_page}&page={page}").as_str(),
+        )?;
         let operation = format!("sync releases {repo_full_name}");
         let page_result = with_subscription_timeout(operation.as_str(), async {
             let mut request = state
-                .http
+                .github_rest_http
                 .get(url)
                 .header(USER_AGENT, "OctoRill")
                 .header(ACCEPT, "application/vnd.github+json")
@@ -8648,18 +8683,19 @@ mod tests {
         NOTIFICATION_OPEN_URL_REPAIR_KEY, NOTIFICATION_OPEN_URL_REPAIR_PENDING,
         NOTIFICATIONS_SINCE_KEY, NotificationRepo, NotificationSubject, OwnedRepoNode,
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
-        RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
-        RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
-        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError, aggregate_repos,
-        announcement_category_id_from_repo_value, append_subscription_event,
-        apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
-        apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
-        attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
-        cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, execute_subscription_prune_phases,
-        expire_repo_release_deadlines, fail_repo_release_work_item,
-        feed_activity_event_from_github, insert_feed_activity_events,
+        RepoReleaseFetchOutcome, RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow,
+        RepoReleaseWriteStats, RepoStargazerFetchResult, RepoStargazerSnapshot,
+        SocialActivityEventInsert, StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot,
+        SubscriptionEventRecord, SubscriptionPrunePhaseOutcome, SubscriptionRunContext,
+        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
+        append_subscription_event, apply_social_activity_snapshot,
+        apply_social_activity_snapshot_partial, apply_social_activity_snapshot_with_options,
+        attach_and_wait_for_user_release_demand, attach_release_demand,
+        claim_next_repo_release_work_item, classify_github_http_error, cmp_last_active_desc,
+        collect_repo_stargazer_snapshots_with, discussion_announcement_from_node,
+        execute_subscription_prune_phases, expire_repo_release_deadlines,
+        fail_repo_release_work_item, feed_activity_event_from_github,
+        fetch_repo_releases_with_optional_token, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
         process_repo_release_work_item, prune_subscription_sync_history,
@@ -8675,7 +8711,14 @@ mod tests {
         jobs, local_id, runtime,
         state::{AppState, build_oauth_client},
     };
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::{
+        Json, Router,
+        extract::{Path, Query},
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::collections::BTreeMap;
 
     fn test_user_id(seed: &str) -> String {
         crate::local_id::test_local_id(seed)
@@ -14699,6 +14742,14 @@ mod tests {
         };
         let github_oauth = build_oauth_client(&config).expect("build oauth client");
         let webauthn = crate::state::build_webauthn(&config).expect("build webauthn");
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build test http client");
+        let github_rest_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .expect("build test github rest http client");
         Arc::new(AppState {
             llm_scheduler: Arc::new(crate::ai::LlmScheduler::new(config.ai_max_concurrency)),
             translation_scheduler: Arc::new(
@@ -14709,13 +14760,183 @@ mod tests {
             config,
             pool,
             sqlite_writer: crate::sqlite_write::SqliteWriteCoordinator::new(),
-            http: reqwest::Client::new(),
+            http,
+            github_rest_http,
+            github_rest_api_base: Url::parse("https://api.github.com/")
+                .expect("parse github rest api base"),
+            github_graphql_url: Url::parse("https://api.github.com/graphql")
+                .expect("parse github graphql url"),
             github_oauth,
             linuxdo_oauth: None,
             webauthn,
             encryption_key,
             runtime_owner_id: "sync-test-runtime-owner".to_owned(),
         })
+    }
+
+    fn setup_state_with_http_clients(
+        pool: SqlitePool,
+        http: reqwest::Client,
+        github_rest_http: reqwest::Client,
+    ) -> Arc<AppState> {
+        let state = setup_state(pool);
+        Arc::new(AppState {
+            http,
+            github_rest_http,
+            ..state.as_ref().clone()
+        })
+    }
+
+    fn setup_state_with_github_rest_base(
+        pool: SqlitePool,
+        github_rest_api_base: Url,
+        http: reqwest::Client,
+        github_rest_http: reqwest::Client,
+    ) -> Arc<AppState> {
+        let state = setup_state_with_http_clients(pool, http, github_rest_http);
+        Arc::new(AppState {
+            github_rest_api_base,
+            ..state.as_ref().clone()
+        })
+    }
+
+    async fn spawn_test_github_rest_server() -> Url {
+        async fn renamed_repo_releases(
+            Path((owner, repo)): Path<(String, String)>,
+            Query(query): Query<BTreeMap<String, String>>,
+        ) -> impl IntoResponse {
+            assert_eq!(owner, "old-owner");
+            assert_eq!(repo, "old-repo");
+            let per_page = query
+                .get("per_page")
+                .cloned()
+                .unwrap_or_else(|| "20".to_owned());
+            let page = query.get("page").cloned().unwrap_or_else(|| "1".to_owned());
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                [(
+                    "Location",
+                    format!("/repositories/4242/releases?per_page={per_page}&page={page}"),
+                )],
+            )
+        }
+
+        async fn canonical_repo_releases() -> impl IntoResponse {
+            Json(vec![json!({
+                "id": 4242,
+                "node_id": "RE_kwDOAAAB",
+                "tag_name": "v1.2.3",
+                "name": "v1.2.3",
+                "body": "release body",
+                "html_url": "https://github.com/new-owner/new-repo/releases/tag/v1.2.3",
+                "published_at": "2026-06-24T12:00:00Z",
+                "created_at": "2026-06-24T11:00:00Z",
+                "prerelease": false,
+                "draft": false,
+                "reactions": {
+                    "+1": 0,
+                    "laugh": 0,
+                    "heart": 0,
+                    "hooray": 0,
+                    "rocket": 0,
+                    "eyes": 0
+                }
+            })])
+        }
+
+        let app = Router::new()
+            .route("/repos/{owner}/{repo}/releases", get(renamed_repo_releases))
+            .route(
+                "/repositories/{repo_id}/releases",
+                get(canonical_repo_releases),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test github rest server");
+        let addr = listener
+            .local_addr()
+            .expect("resolve test github rest server addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test github rest app");
+        });
+        Url::parse(&format!("http://{addr}/")).expect("parse test github rest base url")
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_releases_fails_without_github_rest_redirect_support() {
+        let pool = setup_pool().await;
+        let github_rest_api_base = spawn_test_github_rest_server().await;
+        let state = setup_state_with_github_rest_base(
+            pool,
+            github_rest_api_base,
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test http client"),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test github rest client"),
+        );
+
+        let err = match fetch_repo_releases_with_optional_token(
+            state.as_ref(),
+            None,
+            42,
+            "old-owner/old-repo",
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("repo release fetch should fail without redirect support"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.reason_code, "github_http_error");
+        assert!(
+            err.message.contains("301 Moved Permanently"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_releases_follows_github_rest_redirect_for_renamed_repo() {
+        let pool = setup_pool().await;
+        let github_rest_api_base = spawn_test_github_rest_server().await;
+        let state = setup_state_with_github_rest_base(
+            pool,
+            github_rest_api_base,
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build test http client"),
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .build()
+                .expect("build test github rest client"),
+        );
+
+        let outcome = fetch_repo_releases_with_optional_token(
+            state.as_ref(),
+            None,
+            42,
+            "old-owner/old-repo",
+            None,
+        )
+        .await
+        .expect("repo release fetch should follow redirect");
+
+        let RepoReleaseFetchOutcome::Updated(result) = outcome else {
+            panic!("expected updated repo release fetch result");
+        };
+        assert_eq!(result.releases.len(), 1);
+        assert_eq!(result.releases[0].id, 4242);
+        assert_eq!(result.releases[0].tag_name, "v1.2.3");
+        assert_eq!(result.pages_fetched, 1);
+        assert_eq!(result.stopped_reason, "short_page");
     }
 
     async fn seed_user(pool: &SqlitePool, user_id: &str) {

@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-06-24: GitHub rename 仓库的 REST repo-read 现在使用独立的 redirect-enabled client，并把 REST / GraphQL base URL 明确挂到 `AppState`；`sync.releases.repo_read`、followers、received events、stargazers 与 public repo metadata 不再把 GitHub 返回的 `301 Moved Permanently` 误判成 repo 读取失败。
 - 2026-06-24: `sync_subscription_events` 插入改为通过 sqlite writer 串行提交；`repo_release_watchers` 与 `sync_subscription_events` 历史裁剪在 writer permit 不可得或 SQLite busy 时降级为可观测的 best-effort skip，避免订阅同步后台清理继续放大为新的写锁竞争。
 - 2026-06-23: `store_sync_state_value` 也改为通过 `sqlite_writer.begin_immediate_with_priority` 运行，补齐 `sync.access_refresh` / `sync.subscriptions` 的 `sync_state` 写锁保护；Dashboard 的同步进度泡泡现在在点击 Sync 后立即打开，不再依赖 hover 才出现。
 - 2026-06-23: `replace_starred_repos` 改为通过 `sqlite_writer.begin_immediate_with_priority` 运行，并按调用方区分 foreground/background lane，避免 `sync.access_refresh` / `sync.subscriptions` 在 SQLite WAL 写锁竞争下继续把 `failed to clear starred_repos` 冒泡给用户；Dashboard 现在会在 `task.running` 与 `star_refreshed` 之间展示独立 warmup 态，而不是把该窗口继续渲染成“等待后台任务开始”。
