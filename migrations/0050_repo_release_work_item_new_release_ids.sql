@@ -1,0 +1,2 @@
+ALTER TABLE repo_release_work_items
+ADD COLUMN last_new_release_ids_json TEXT;
