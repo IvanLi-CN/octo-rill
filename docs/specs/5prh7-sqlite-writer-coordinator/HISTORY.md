@@ -8,6 +8,7 @@
 - 2026-05-09：实现选择为应用内 `SqliteWriteCoordinator` 单 writer permit；显式写事务返回原生 SQLx transaction，避免破坏 SQLx executor 行为，同时让 permit 覆盖 `BEGIN IMMEDIATE` 到 `commit` 的完整事务段。
 - 2026-05-10：线上仍保留高 `repo_release_worker_concurrency` 等运行时值，说明降低默认值不能修复已有生产配置；writer coordinator 扩展为 foreground/background/best-effort priority，并覆盖 session、job enqueue、LLM lifecycle 与 repo release sync-state 等绕过路径。
 - 2026-06-24：线上日志继续暴露 `translation_batches ... database is locked` 与 reaction refresh 持久化放大错误；决定把 translation batch 启动写段补齐到 coordinator，并把非关键 reaction counts persist 降级为可跳过 best-effort 写入。
+- 2026-06-24：线上剩余 `sync.subscriptions` 日志继续出现 `insert social activity event`、`upsert follower current member` 与 `delete stale repo star current members` 的 `database is locked`；决定把 social activity snapshot 与 feed activity event 两个仍用 deferred transaction 的路径一并迁到 coordinator + `BEGIN IMMEDIATE`。
 
 ## Key Reasons / Replacements
 
