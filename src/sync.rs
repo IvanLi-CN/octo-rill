@@ -6028,39 +6028,45 @@ async fn append_subscription_event(
     let payload_json =
         serde_json::to_string(&event.payload).context("serialize subscription event")?;
     let now = chrono::Utc::now().to_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO sync_subscription_events (
-          id,
-          task_id,
-          stage,
-          event_type,
-          severity,
-          recoverable,
-          attempt,
-          user_id,
-          repo_id,
-          repo_full_name,
-          payload_json,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(local_id::generate_local_id())
-    .bind(task_id)
-    .bind(event.stage)
-    .bind(event.event_type)
-    .bind(event.severity)
-    .bind(if event.recoverable { 1_i64 } else { 0_i64 })
-    .bind(i64::try_from(event.attempt).unwrap_or(i64::MAX))
-    .bind(event.user_id)
-    .bind(event.repo_id)
-    .bind(event.repo_full_name)
-    .bind(payload_json)
-    .bind(now.as_str())
-    .execute(&state.pool)
-    .await
-    .context("failed to insert sync_subscription_event")?;
+    state
+        .sqlite_writer
+        .write("sync_subscription_event_insert", |_| async {
+            sqlx::query(
+                r#"
+                INSERT INTO sync_subscription_events (
+                  id,
+                  task_id,
+                  stage,
+                  event_type,
+                  severity,
+                  recoverable,
+                  attempt,
+                  user_id,
+                  repo_id,
+                  repo_full_name,
+                  payload_json,
+                  created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(local_id::generate_local_id())
+            .bind(task_id)
+            .bind(event.stage)
+            .bind(event.event_type)
+            .bind(event.severity)
+            .bind(if event.recoverable { 1_i64 } else { 0_i64 })
+            .bind(i64::try_from(event.attempt).unwrap_or(i64::MAX))
+            .bind(event.user_id)
+            .bind(event.repo_id)
+            .bind(event.repo_full_name)
+            .bind(payload_json.as_str())
+            .bind(now.as_str())
+            .execute(&state.pool)
+            .await
+            .context("failed to insert sync_subscription_event")?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
     Ok(())
 }
 
@@ -6072,48 +6078,108 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
     let event_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
 
     for _ in 0..10 {
-        let deleted = sqlx::query(
-            r#"
-            DELETE FROM repo_release_watchers
-            WHERE id IN (
-              SELECT id
-              FROM repo_release_watchers
-              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
-              LIMIT ?
-            )
-            "#,
-        )
-        .bind(succeeded_cutoff.as_str())
-        .bind(failed_cutoff.as_str())
-        .bind(BATCH_SIZE)
-        .execute(&state.pool)
-        .await
-        .context("prune repo release watchers")?
-        .rows_affected();
+        let deleted = match state
+            .sqlite_writer
+            .try_write("repo_release_watchers_prune", || async {
+                Ok::<_, anyhow::Error>(
+                    sqlx::query(
+                        r#"
+                        DELETE FROM repo_release_watchers
+                        WHERE id IN (
+                          SELECT id
+                          FROM repo_release_watchers
+                          WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
+                             OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+                          LIMIT ?
+                        )
+                        "#,
+                    )
+                    .bind(succeeded_cutoff.as_str())
+                    .bind(failed_cutoff.as_str())
+                    .bind(BATCH_SIZE)
+                    .execute(&state.pool)
+                    .await
+                    .context("prune repo release watchers")?
+                    .rows_affected(),
+                )
+            })
+            .await
+        {
+            Ok(Some(deleted)) => deleted,
+            Ok(None) => {
+                tracing::warn!(
+                    event = "sqlite.write",
+                    operation = "sync.repo_release_watchers_prune",
+                    downgrade_reason = "sqlite_writer_busy",
+                    "skipped repo release watcher prune under sqlite writer pressure"
+                );
+                return Ok(());
+            }
+            Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+                tracing::warn!(
+                    event = "sqlite.write",
+                    operation = "sync.repo_release_watchers_prune",
+                    downgrade_reason = "sqlite_busy",
+                    error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                    "skipped repo release watcher prune after sqlite busy"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         if deleted == 0 {
             break;
         }
     }
 
     for _ in 0..5 {
-        let deleted = sqlx::query(
-            r#"
-            DELETE FROM sync_subscription_events
-            WHERE id IN (
-              SELECT id
-              FROM sync_subscription_events
-              WHERE julianday(created_at) < julianday(?)
-              LIMIT ?
-            )
-            "#,
-        )
-        .bind(event_cutoff.as_str())
-        .bind(BATCH_SIZE)
-        .execute(&state.pool)
-        .await
-        .context("prune sync subscription events")?
-        .rows_affected();
+        let deleted = match state
+            .sqlite_writer
+            .try_write("sync_subscription_events_prune", || async {
+                Ok::<_, anyhow::Error>(
+                    sqlx::query(
+                        r#"
+                        DELETE FROM sync_subscription_events
+                        WHERE id IN (
+                          SELECT id
+                          FROM sync_subscription_events
+                          WHERE julianday(created_at) < julianday(?)
+                          LIMIT ?
+                        )
+                        "#,
+                    )
+                    .bind(event_cutoff.as_str())
+                    .bind(BATCH_SIZE)
+                    .execute(&state.pool)
+                    .await
+                    .context("prune sync subscription events")?
+                    .rows_affected(),
+                )
+            })
+            .await
+        {
+            Ok(Some(deleted)) => deleted,
+            Ok(None) => {
+                tracing::warn!(
+                    event = "sqlite.write",
+                    operation = "sync.subscription_events_prune",
+                    downgrade_reason = "sqlite_writer_busy",
+                    "skipped subscription event prune under sqlite writer pressure"
+                );
+                return Ok(());
+            }
+            Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+                tracing::warn!(
+                    event = "sqlite.write",
+                    operation = "sync.subscription_events_prune",
+                    downgrade_reason = "sqlite_busy",
+                    error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                    "skipped subscription event prune after sqlite busy"
+                );
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         if deleted == 0 {
             break;
         }
@@ -8386,8 +8452,9 @@ mod tests {
         OwnedRepoSnapshot, REPO_RELEASE_DEADLINE_EXPIRED_ERROR, ReleaseDemandRepo, RepoOwner,
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
-        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionRunContext,
-        SyncRequestError, aggregate_repos, announcement_category_id_from_repo_value,
+        StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
+        SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
         attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
@@ -8396,10 +8463,10 @@ mod tests {
         fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
-        process_repo_release_work_item, record_repo_release_sync_success,
-        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
-        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
-        subscription_event_counts_as_critical, subscription_timeout_error,
+        process_repo_release_work_item, prune_subscription_sync_history,
+        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
+        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
+        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
         upsert_starred_repos, wait_for_release_demand,
     };
@@ -13753,6 +13820,195 @@ mod tests {
         .await
         .expect("load sync state");
         assert_eq!(stored_value, "2026-03-07T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn append_subscription_event_waits_for_sqlite_write_lock() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-event-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-event-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+            .bind("2026-03-06T00:01:00Z")
+            .bind(user_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        let append_task = {
+            let state = state.clone();
+            let task_id = task_id.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                let event = SubscriptionEventRecord {
+                    stage: "social",
+                    event_type: "social_sync_failed",
+                    severity: "error",
+                    recoverable: true,
+                    attempt: 1,
+                    user_id: Some(user_id.as_str()),
+                    repo_id: Some(42),
+                    repo_full_name: Some("octo/repo"),
+                    payload: json!({"message":"writer lock repro"}),
+                };
+                append_subscription_event(state.as_ref(), task_id.as_str(), event).await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        append_task
+            .await
+            .expect("join append event task")
+            .expect("subscription event insert should succeed after writer release");
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("social_sync_failed")
+        .fetch_one(&pool)
+        .await
+        .expect("count inserted subscription event");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_subscription_sync_history_skips_when_sqlite_writer_is_busy() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-prune-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-prune-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(task_id.as_str())
+        .bind("social")
+        .bind("old-event")
+        .bind("warning")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .bind("octo/repo")
+        .bind(r#"{"message":"old"}"#)
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed old subscription event");
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_subscription_prune_hold")
+            .await
+            .expect("hold sqlite writer");
+
+        prune_subscription_sync_history(state.as_ref())
+            .await
+            .expect("prune should skip while writer busy");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("old-event")
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved subscription event");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_subscription_sync_history_skips_when_sqlite_reports_busy() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let user_id = test_user_id("subscription-prune-sqlite-busy");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("subscription-prune-sqlite-busy-task");
+        seed_sync_task(&state, task_id.as_str()).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO sync_subscription_events (
+              id, task_id, stage, event_type, severity, recoverable, attempt,
+              user_id, repo_id, repo_full_name, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(task_id.as_str())
+        .bind("social")
+        .bind("old-event")
+        .bind("warning")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(user_id.as_str())
+        .bind(42_i64)
+        .bind("octo/repo")
+        .bind(r#"{"message":"old"}"#)
+        .bind("2026-01-01T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed old subscription event");
+
+        let mut hold_tx = pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin hold writer tx");
+        sqlx::query("UPDATE sync_subscription_events SET severity = ? WHERE task_id = ?")
+            .bind("error")
+            .bind(task_id.as_str())
+            .execute(&mut *hold_tx)
+            .await
+            .expect("hold sqlite writer lock");
+
+        prune_subscription_sync_history(state.as_ref())
+            .await
+            .expect("prune should downgrade sqlite busy");
+
+        hold_tx.rollback().await.expect("rollback hold writer tx");
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM sync_subscription_events
+            WHERE task_id = ? AND event_type = ?
+            "#,
+        )
+        .bind(task_id.as_str())
+        .bind("old-event")
+        .fetch_one(&pool)
+        .await
+        .expect("count preserved subscription event");
+        assert_eq!(count, 1);
     }
 
     async fn setup_pool() -> SqlitePool {
