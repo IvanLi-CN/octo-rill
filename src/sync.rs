@@ -71,6 +71,70 @@ const STARRED_FULL_SYNC_KEY: &str = "starred_full_sync_at";
 
 static REPO_RELEASE_CLAIM_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Clone)]
+struct SocialActivitySnapshotAfterReadsHook {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: tokio::sync::watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+struct InstalledSocialActivitySnapshotAfterReadsHook {
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    resume: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(test)]
+impl Drop for InstalledSocialActivitySnapshotAfterReadsHook {
+    fn drop(&mut self) {
+        let _ = self.resume.send(true);
+        *social_activity_snapshot_after_reads_hook_slot()
+            .lock()
+            .expect("lock social activity snapshot hook slot") = None;
+    }
+}
+
+#[cfg(test)]
+fn social_activity_snapshot_after_reads_hook_slot()
+-> &'static std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>> {
+    static HOOK: OnceLock<std::sync::Mutex<Option<SocialActivitySnapshotAfterReadsHook>>> =
+        OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn install_social_activity_snapshot_after_reads_hook()
+-> InstalledSocialActivitySnapshotAfterReadsHook {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resume_tx, resume_rx) = tokio::sync::watch::channel(false);
+    *social_activity_snapshot_after_reads_hook_slot()
+        .lock()
+        .expect("lock social activity snapshot hook slot") =
+        Some(SocialActivitySnapshotAfterReadsHook {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    InstalledSocialActivitySnapshotAfterReadsHook {
+        reached: reached_rx,
+        resume: resume_tx,
+    }
+}
+
+#[cfg(test)]
+async fn wait_for_social_activity_snapshot_after_reads_hook() {
+    let hook = social_activity_snapshot_after_reads_hook_slot()
+        .lock()
+        .expect("lock social activity snapshot hook slot")
+        .clone();
+    if let Some(hook) = hook {
+        let _ = hook.reached.send(());
+        let mut resume = hook.resume;
+        if !*resume.borrow() {
+            let _ = resume.changed().await;
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SyncStarredResult {
     pub repos: usize,
@@ -1906,9 +1970,9 @@ async fn apply_social_activity_snapshot_with_options(
     debug_assert_eq!(owned_repos.is_some(), repo_members.is_some());
 
     let now = Utc::now().to_rfc3339();
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "social_activity_snapshot")
         .await
         .context("begin social activity snapshot tx")?;
     let mut events_written = 0usize;
@@ -1969,6 +2033,9 @@ async fn apply_social_activity_snapshot_with_options(
         .iter()
         .map(|(repo, _)| repo.repo_id)
         .collect::<HashSet<_>>();
+
+    #[cfg(test)]
+    wait_for_social_activity_snapshot_after_reads_hook().await;
 
     if let Some(followers) = followers {
         let current_follower_rows = sqlx::query_as::<_, FollowerCurrentMemberRow>(
@@ -6983,9 +7050,9 @@ async fn insert_feed_activity_events(
         return Ok(0);
     }
 
-    let mut tx = state
-        .pool
-        .begin()
+    let (_sqlite_write, mut tx) = state
+        .sqlite_writer
+        .begin_immediate(&state.pool, "feed_activity_events")
         .await
         .context("begin feed activity events tx")?;
     let now = Utc::now().to_rfc3339();
@@ -8291,6 +8358,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Context;
     use std::{
         collections::HashSet,
         fs,
@@ -8326,11 +8394,12 @@ mod tests {
         cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
         discussion_announcement_from_node, expire_repo_release_deadlines,
         fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
-        insert_social_activity_event_tx, is_terminal_notification_thread_error,
-        owned_repo_snapshot_from_node, process_repo_release_work_item,
-        record_repo_release_sync_success, recover_repo_release_runtime_state_on_startup,
-        replace_starred_repos, repo_release_deadline_at, resolve_notification_open_url,
-        store_sync_state_value, subscription_event_counts_as_critical, subscription_timeout_error,
+        insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
+        is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
+        process_repo_release_work_item, record_repo_release_sync_success,
+        recover_repo_release_runtime_state_on_startup, replace_starred_repos,
+        repo_release_deadline_at, resolve_notification_open_url, store_sync_state_value,
+        subscription_event_counts_as_critical, subscription_timeout_error,
         sync_notifications_with_fetch, sync_starred_for_user_with_fetch, upsert_repo_releases,
         upsert_starred_repos, wait_for_release_demand,
     };
@@ -10947,6 +11016,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn social_activity_snapshot_waits_for_sqlite_write_lock_under_concurrent_commit() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("social-busy-snapshot");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let mut hook = install_social_activity_snapshot_after_reads_hook();
+        let follower = FollowerSnapshot {
+            actor: GitHubActor {
+                id: 401,
+                login: "snapshot-cat".to_owned(),
+                avatar_url: Some("https://avatars.example/snapshot-cat.png".to_owned()),
+                html_url: Some("https://github.com/snapshot-cat".to_owned()),
+            },
+        };
+
+        let snapshot_task = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                apply_social_activity_snapshot_partial(
+                    state.as_ref(),
+                    user_id.as_str(),
+                    None,
+                    None,
+                    Some(&[follower]),
+                )
+                .await
+            })
+        };
+
+        let after_reads_observed =
+            tokio::time::timeout(Duration::from_millis(100), hook.reached.recv())
+                .await
+                .expect("wait for social activity snapshot read hook")
+                .is_some();
+
+        assert!(
+            after_reads_observed,
+            "expected social activity snapshot to reach post-read test hook"
+        );
+
+        let concurrent_write = {
+            let state = state.clone();
+            let user_id = user_id.clone();
+            tokio::spawn(async move {
+                state
+                    .sqlite_writer
+                    .write("test_social_activity_competing_write", |_| async {
+                        sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+                            .bind("2026-03-07T00:00:00Z")
+                            .bind(user_id.as_str())
+                            .execute(&state.pool)
+                            .await
+                            .context("update competing user row")?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await
+            })
+        };
+
+        let _ = hook.resume.send(true);
+
+        let written = snapshot_task
+            .await
+            .expect("join social activity snapshot task")
+            .expect("social activity snapshot should succeed after concurrent write commits");
+        assert_eq!(written, 1);
+
+        concurrent_write
+            .await
+            .expect("join competing sqlite write task")
+            .expect("competing sqlite write should succeed");
+
+        let history_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM social_activity_events
+            WHERE user_id = ? AND kind = 'follower_received'
+            "#,
+        )
+        .bind(user_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("count social activity history");
+        assert_eq!(history_count, 1);
+    }
+
+    #[tokio::test]
     async fn feed_activity_events_dedupe_ambient_items_by_github_event_id() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -11025,6 +11183,73 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn feed_activity_events_wait_for_sqlite_writer_under_competing_write() {
+        let pool = setup_pool_with_max_connections_and_wal(2, Duration::from_millis(10)).await;
+        let state = setup_state(pool.clone());
+        let user_id = test_user_id("feed-writer-pressure");
+        seed_user(&pool, user_id.as_str()).await;
+
+        let state_for_write = state.clone();
+        let user_id_for_write = user_id.clone();
+        let competing_write = tokio::spawn(async move {
+            state_for_write
+                .sqlite_writer
+                .write("test_feed_activity_competing_write", |_| async {
+                    sqlx::query("UPDATE users SET updated_at = ? WHERE id = ?")
+                        .bind("2026-03-07T00:00:00Z")
+                        .bind(user_id_for_write.as_str())
+                        .execute(&state_for_write.pool)
+                        .await
+                        .context("update competing user row")?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+        });
+
+        let events = vec![FeedActivityEventSnapshot {
+            kind: "announcement",
+            event_id: "evt-writer-pressure".to_owned(),
+            github_event_id: Some("evt-writer-pressure".to_owned()),
+            repo_id: Some(42),
+            repo_full_name: Some("octo/alpha".to_owned()),
+            title: Some("SQLite writer pressure".to_owned()),
+            body: Some("Should still persist after competing write".to_owned()),
+            html_url: Some("https://github.com/octo/alpha/discussions/42".to_owned()),
+            actor: GitHubActor {
+                id: 777,
+                login: "writer-cat".to_owned(),
+                avatar_url: Some("https://avatars.example/writer-cat.png".to_owned()),
+                html_url: Some("https://github.com/writer-cat".to_owned()),
+            },
+            occurred_at: "2026-03-06T12:00:00Z".to_owned(),
+        }];
+
+        let inserted = insert_feed_activity_events(state.as_ref(), user_id.as_str(), &events)
+            .await
+            .expect("feed activity events should succeed under competing write");
+        assert_eq!(inserted, 1);
+
+        competing_write
+            .await
+            .expect("join competing sqlite write task")
+            .expect("competing sqlite write should succeed");
+
+        let history_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM social_activity_events
+            WHERE user_id = ? AND github_event_id = ?
+            "#,
+        )
+        .bind(user_id.as_str())
+        .bind("evt-writer-pressure")
+        .fetch_one(&pool)
+        .await
+        .expect("count feed activity history");
+        assert_eq!(history_count, 1);
     }
 
     #[test]

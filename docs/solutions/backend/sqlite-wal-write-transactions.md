@@ -55,6 +55,7 @@ Keep this targeted to write-intent paths such as:
 - repo release work item finalize/heartbeat/fail, shared release upsert, sync-state success/failure
 - translation batch scheduling or stale batch recovery when the transaction reads rows and then updates them
 - translation batch startup state flips (`translation_batches queued -> running`, `translation_work_items batched -> running`) when a worker has already claimed a batch and is about to start AI work
+- social activity snapshot and feed activity event persistence when sync workers read current-member snapshots or dedupe rows before inserting `social_activity_events`
 - lightweight user activity writes such as `last_active_at`, which should be best-effort, should not wait behind background writer backlog, and must not turn read endpoints into 500 responses
 - non-critical refresh persistence such as release reaction counts, which may skip under writer pressure as long as the live payload or user-visible result still returns and the downgrade is observable
 
