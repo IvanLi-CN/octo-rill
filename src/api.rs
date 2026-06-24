@@ -9625,7 +9625,7 @@ async fn persist_release_reaction_counts(
 ) -> Result<(), ApiError> {
     state
         .sqlite_writer
-        .write("feed_reaction_counts_persist", |_| async move {
+        .write_foreground("feed_reaction_counts_persist", |_| async move {
             sqlx::query(
                 r#"
                     UPDATE repo_releases
