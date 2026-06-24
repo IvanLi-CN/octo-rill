@@ -7,6 +7,7 @@
 
 ## 历史摘要
 
+- 2026-06-24: release smart 批处理源查询改为先按目标 `release_id` 收口、再按 repo 内排序键回查 `previous_tag_name`，并补充 `repo_releases(repo_id, COALESCE(published_at, created_at, updated_at), release_id)` 表达式索引，避免少量 release 的翻译/润色请求在生产上退化成整批可见 release 的全局窗口排序慢查询。
 - 2026-06-24: GitHub rename 仓库的 REST repo-read 现在使用独立的 redirect-enabled client，并把 REST / GraphQL base URL 明确挂到 `AppState`；`sync.releases.repo_read`、followers、received events、stargazers 与 public repo metadata 不再把 GitHub 返回的 `301 Moved Permanently` 误判成 repo 读取失败。
 - 2026-06-24: `sync_subscription_events` 插入改为通过 sqlite writer 串行提交；`repo_release_watchers` 与 `sync_subscription_events` 历史裁剪在 writer permit 不可得或 SQLite busy 时降级为可观测的 best-effort skip，避免订阅同步后台清理继续放大为新的写锁竞争。
 - 2026-06-23: `store_sync_state_value` 也改为通过 `sqlite_writer.begin_immediate_with_priority` 运行，补齐 `sync.access_refresh` / `sync.subscriptions` 的 `sync_state` 写锁保护；Dashboard 的同步进度泡泡现在在点击 Sync 后立即打开，不再依赖 hover 才出现。
