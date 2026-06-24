@@ -13,6 +13,7 @@
 - 2026-06-24：继续复核当前代码后，确认 `starred_repos` 增量 upsert、通知 inbox upsert / open-url repair 与 `public_repo_release_usage` 元数据刷新仍直接写 `state.pool`；决定把这些高频后台增量写也收回 coordinator，避免遗漏路径继续抢占 SQLite writer。
 - 2026-06-24：继续沿 claim / heartbeat 邻近路径复核后，确认 jobs scheduler 的 `daily_brief_hour_slots` / `scheduled_task_dispatch_state` 周期写入与 brief failure 标记仍直接写 `state.pool`；决定把这些 20s/45s 周期后台写与失败补偿写也收回 coordinator，补齐 task orchestration 周边的 single-writer 合同。
 - 2026-06-24：PR review 继续指出 notification open-url repair 虽然已接入 coordinator，但把 GitHub thread lookup 也包进了 writer permit；决定补并发回归并把 lookup 前移到 permit 外，只保留最终 repair update 的短事务。
+- 2026-06-24：继续 review 时又确认 subscription history prune 的 watcher 裁剪一旦 busy 会提前短路整个函数，导致 event retention 同轮完全不跑；决定把两个 prune 相位拆成独立 best-effort 控制流，并补回归锁住“watcher skip 不得短路 event prune”。
 
 ## Key Reasons / Replacements
 

@@ -6070,6 +6070,79 @@ async fn append_subscription_event(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionPrunePhaseOutcome {
+    Deleted(u64),
+    Skipped,
+}
+
+async fn run_subscription_prune_phase<F, Fut>(
+    state: &AppState,
+    writer_lane: &'static str,
+    log_operation: &'static str,
+    writer_busy_message: &'static str,
+    sqlite_busy_message: &'static str,
+    query: F,
+) -> Result<SubscriptionPrunePhaseOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<u64>>,
+{
+    match state.sqlite_writer.try_write(writer_lane, query).await {
+        Ok(Some(deleted)) => Ok(SubscriptionPrunePhaseOutcome::Deleted(deleted)),
+        Ok(None) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = log_operation,
+                downgrade_reason = "sqlite_writer_busy",
+                "{writer_busy_message}"
+            );
+            Ok(SubscriptionPrunePhaseOutcome::Skipped)
+        }
+        Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+            tracing::warn!(
+                event = "sqlite.write",
+                operation = log_operation,
+                downgrade_reason = "sqlite_busy",
+                error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                "{sqlite_busy_message}"
+            );
+            Ok(SubscriptionPrunePhaseOutcome::Skipped)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn execute_subscription_prune_phases<Watchers, WatchersFut, Events, EventsFut>(
+    mut prune_watchers: Watchers,
+    mut prune_events: Events,
+) -> Result<()>
+where
+    Watchers: FnMut() -> WatchersFut,
+    WatchersFut: Future<Output = Result<SubscriptionPrunePhaseOutcome>>,
+    Events: FnMut() -> EventsFut,
+    EventsFut: Future<Output = Result<SubscriptionPrunePhaseOutcome>>,
+{
+    for _ in 0..10 {
+        match prune_watchers().await? {
+            SubscriptionPrunePhaseOutcome::Deleted(0) | SubscriptionPrunePhaseOutcome::Skipped => {
+                break;
+            }
+            SubscriptionPrunePhaseOutcome::Deleted(_) => {}
+        }
+    }
+
+    for _ in 0..5 {
+        match prune_events().await? {
+            SubscriptionPrunePhaseOutcome::Deleted(0) => break,
+            SubscriptionPrunePhaseOutcome::Deleted(_) => {}
+            SubscriptionPrunePhaseOutcome::Skipped => return Ok(()),
+        }
+    }
+
+    Ok(())
+}
+
 async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
     const BATCH_SIZE: i64 = 1000;
     let now = Utc::now();
@@ -6077,115 +6150,71 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
     let failed_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
     let event_cutoff = (now - chrono::Duration::days(30)).to_rfc3339();
 
-    for _ in 0..10 {
-        let deleted = match state
-            .sqlite_writer
-            .try_write("repo_release_watchers_prune", || async {
-                Ok::<_, anyhow::Error>(
-                    sqlx::query(
-                        r#"
-                        DELETE FROM repo_release_watchers
-                        WHERE id IN (
-                          SELECT id
-                          FROM repo_release_watchers
-                          WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
-                             OR (status = 'failed' AND julianday(updated_at) < julianday(?))
-                          LIMIT ?
+    execute_subscription_prune_phases(
+        || {
+            run_subscription_prune_phase(
+                state,
+                "repo_release_watchers_prune",
+                "sync.repo_release_watchers_prune",
+                "skipped repo release watcher prune under sqlite writer pressure",
+                "skipped repo release watcher prune after sqlite busy",
+                || async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                            DELETE FROM repo_release_watchers
+                            WHERE id IN (
+                              SELECT id
+                              FROM repo_release_watchers
+                              WHERE (status = 'succeeded' AND julianday(updated_at) < julianday(?))
+                                 OR (status = 'failed' AND julianday(updated_at) < julianday(?))
+                              LIMIT ?
+                            )
+                            "#,
                         )
-                        "#,
+                        .bind(succeeded_cutoff.as_str())
+                        .bind(failed_cutoff.as_str())
+                        .bind(BATCH_SIZE)
+                        .execute(&state.pool)
+                        .await
+                        .context("prune repo release watchers")?
+                        .rows_affected(),
                     )
-                    .bind(succeeded_cutoff.as_str())
-                    .bind(failed_cutoff.as_str())
-                    .bind(BATCH_SIZE)
-                    .execute(&state.pool)
-                    .await
-                    .context("prune repo release watchers")?
-                    .rows_affected(),
-                )
-            })
-            .await
-        {
-            Ok(Some(deleted)) => deleted,
-            Ok(None) => {
-                tracing::warn!(
-                    event = "sqlite.write",
-                    operation = "sync.repo_release_watchers_prune",
-                    downgrade_reason = "sqlite_writer_busy",
-                    "skipped repo release watcher prune under sqlite writer pressure"
-                );
-                return Ok(());
-            }
-            Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
-                tracing::warn!(
-                    event = "sqlite.write",
-                    operation = "sync.repo_release_watchers_prune",
-                    downgrade_reason = "sqlite_busy",
-                    error_chain = %crate::observability::error_chain_summary(err.as_ref()),
-                    "skipped repo release watcher prune after sqlite busy"
-                );
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
-        if deleted == 0 {
-            break;
-        }
-    }
-
-    for _ in 0..5 {
-        let deleted = match state
-            .sqlite_writer
-            .try_write("sync_subscription_events_prune", || async {
-                Ok::<_, anyhow::Error>(
-                    sqlx::query(
-                        r#"
-                        DELETE FROM sync_subscription_events
-                        WHERE id IN (
-                          SELECT id
-                          FROM sync_subscription_events
-                          WHERE julianday(created_at) < julianday(?)
-                          LIMIT ?
+                },
+            )
+        },
+        || {
+            run_subscription_prune_phase(
+                state,
+                "sync_subscription_events_prune",
+                "sync.subscription_events_prune",
+                "skipped subscription event prune under sqlite writer pressure",
+                "skipped subscription event prune after sqlite busy",
+                || async {
+                    Ok::<_, anyhow::Error>(
+                        sqlx::query(
+                            r#"
+                            DELETE FROM sync_subscription_events
+                            WHERE id IN (
+                              SELECT id
+                              FROM sync_subscription_events
+                              WHERE julianday(created_at) < julianday(?)
+                              LIMIT ?
+                            )
+                            "#,
                         )
-                        "#,
+                        .bind(event_cutoff.as_str())
+                        .bind(BATCH_SIZE)
+                        .execute(&state.pool)
+                        .await
+                        .context("prune sync subscription events")?
+                        .rows_affected(),
                     )
-                    .bind(event_cutoff.as_str())
-                    .bind(BATCH_SIZE)
-                    .execute(&state.pool)
-                    .await
-                    .context("prune sync subscription events")?
-                    .rows_affected(),
-                )
-            })
-            .await
-        {
-            Ok(Some(deleted)) => deleted,
-            Ok(None) => {
-                tracing::warn!(
-                    event = "sqlite.write",
-                    operation = "sync.subscription_events_prune",
-                    downgrade_reason = "sqlite_writer_busy",
-                    "skipped subscription event prune under sqlite writer pressure"
-                );
-                return Ok(());
-            }
-            Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
-                tracing::warn!(
-                    event = "sqlite.write",
-                    operation = "sync.subscription_events_prune",
-                    downgrade_reason = "sqlite_busy",
-                    error_chain = %crate::observability::error_chain_summary(err.as_ref()),
-                    "skipped subscription event prune after sqlite busy"
-                );
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
-        if deleted == 0 {
-            break;
-        }
-    }
-
-    Ok(())
+                },
+            )
+        },
+    )
+    .await
 }
 
 fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestError {
@@ -8535,14 +8564,15 @@ mod tests {
         RepoReleaseHttpState, RepoReleaseOrigin, RepoReleaseWorkItemRow, RepoReleaseWriteStats,
         RepoStargazerFetchResult, RepoStargazerSnapshot, SocialActivityEventInsert,
         StarPhaseSuccess, StarredFetchResult, StarredRepoSnapshot, SubscriptionEventRecord,
-        SubscriptionRunContext, SyncRequestError, aggregate_repos,
+        SubscriptionPrunePhaseOutcome, SubscriptionRunContext, SyncRequestError, aggregate_repos,
         announcement_category_id_from_repo_value, append_subscription_event,
         apply_social_activity_snapshot, apply_social_activity_snapshot_partial,
         apply_social_activity_snapshot_with_options, attach_and_wait_for_user_release_demand,
         attach_release_demand, claim_next_repo_release_work_item, classify_github_http_error,
         cmp_last_active_desc, collect_repo_stargazer_snapshots_with,
-        discussion_announcement_from_node, expire_repo_release_deadlines,
-        fail_repo_release_work_item, feed_activity_event_from_github, insert_feed_activity_events,
+        discussion_announcement_from_node, execute_subscription_prune_phases,
+        expire_repo_release_deadlines, fail_repo_release_work_item,
+        feed_activity_event_from_github, insert_feed_activity_events,
         insert_social_activity_event_tx, install_social_activity_snapshot_after_reads_hook,
         is_terminal_notification_thread_error, owned_repo_snapshot_from_node,
         process_repo_release_work_item, prune_subscription_sync_history,
@@ -14265,6 +14295,45 @@ mod tests {
         .await
         .expect("count preserved subscription event");
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_prune_keeps_event_cleanup_when_watcher_phase_skips() {
+        let watcher_calls = Arc::new(tokio::sync::Mutex::new(0usize));
+        let event_calls = Arc::new(tokio::sync::Mutex::new(0usize));
+
+        execute_subscription_prune_phases(
+            {
+                let watcher_calls = watcher_calls.clone();
+                move || {
+                    let watcher_calls = watcher_calls.clone();
+                    async move {
+                        *watcher_calls.lock().await += 1;
+                        Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Skipped)
+                    }
+                }
+            },
+            {
+                let event_calls = event_calls.clone();
+                move || {
+                    let event_calls = event_calls.clone();
+                    async move {
+                        let mut calls = event_calls.lock().await;
+                        *calls += 1;
+                        if *calls == 1 {
+                            Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Deleted(2))
+                        } else {
+                            Ok::<_, anyhow::Error>(SubscriptionPrunePhaseOutcome::Deleted(0))
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .expect("subscription prune phases should continue to event cleanup");
+
+        assert_eq!(*watcher_calls.lock().await, 1);
+        assert_eq!(*event_calls.lock().await, 2);
     }
 
     #[tokio::test]
