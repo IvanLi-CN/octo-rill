@@ -47,7 +47,7 @@
 - Reaction refresh 结果按 `release_id` 合并回现有 feed item；若该 item 正在 optimistic toggle 或 flush 中，不得覆盖本地 pending 状态；普通 feed refresh 或分页合并缓存 counts 时应保留已知 live viewer 状态，直到下一次异步 refresh 更新。
 - PAT 可用时，reaction 异步 refresh 不得阻止用户操作；如果 refresh 与 toggle 并发，客户端必须用 pending guard 避免后台 refresh 覆盖用户正在提交的状态，并由 toggle API 的现有 live 校验与错误处理兜底。
 - Reaction refresh 失败必须静默降级为缓存状态，不阻断 feed、sidebar、toast 或全页渲染。
-- Reaction refresh 成功后应把最新 counts 持久化回本地缓存，供后续 feed 热路径使用。
+- Reaction refresh 成功后应尽量把最新 counts 持久化回本地缓存，供后续 feed 热路径使用；若 counts 持久化阶段命中 SQLite writer backlog 或 `sqlite_busy`，允许跳过持久化，但必须继续返回 live payload 且留下结构化降级证据。
 - 后端必须记录 feed DB/total 耗时，以及 reaction refresh 的 DB/GitHub/persist/total 耗时。
 
 ### SHOULD
@@ -107,6 +107,10 @@ Response:
 - Given reaction PAT 可用且 feed 包含 release items
   When feed 首屏渲染完成
   Then 客户端异步请求 reaction refresh，并将返回的 viewer/counts 合并到对应 release。
+
+- Given reaction refresh 已成功拿到 GitHub live viewer/counts
+  When counts 持久化阶段遇到 SQLite writer 压力
+  Then refresh 仍返回 live payload，客户端照常合并 viewer/counts，服务端只把本地 counts 持久化降级为 non-fatal skip。
 
 - Given 用户正在点击 reaction 且本地存在 optimistic pending 状态
   When 异步 refresh 返回旧状态

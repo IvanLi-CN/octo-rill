@@ -13,6 +13,7 @@
 - 固定 `Metadata Only + error chain` 披露面：日志保留稳定排障元数据，不记录 body、token、cookie、email、login、完整 query string，不默认输出 Rust backtrace。
 - 固定 HTTP access log 为 `Slow+Error Only`，同时落地 `Accept+Echo X-Request-Id` 契约。
 - 为高价值慢路径与异常路径补统一字段：`event`、`operation`、`attempt`、`elapsed_ms`、`error_kind`、`error_chain`、`request_id`、`user_id`、`repo_id` 等。
+- 对运行时背压与非关键降级路径，也必须给出可区分的结构化原因字段，例如 translation backpressure 的 `reason`，以及 reaction persist skip 的 `downgrade_reason`。
 
 ### Non-goals
 
@@ -104,6 +105,14 @@
 - Given AI / sync / SQLite 热路径失败或变慢
   When 触发对应日志
   Then 至少带 `operation`、`attempt`、`elapsed_ms`、`error_kind`、`error_chain` 中的相关字段。
+
+- Given `POST /api/translate/results` 在已有 pending 快照前提下命中 writer / worker / LLM 背压
+  When 服务端直接返回 `queued/running`
+  Then 必须输出 `event=translation.backpressure`，并显式区分 `sqlite_writer_active`、`sqlite_writer_backlog`、`translation_worker_busy`、`llm_waiting` 或 `llm_saturated`。
+
+- Given feed reaction refresh 已拿到 live payload 但本地 counts persist 被跳过
+  When 查看容器日志
+  Then 必须能看到 `event=feed.reactions.persist` 与 `downgrade_reason=sqlite_writer_busy|sqlite_busy`，避免把非关键降级误判成 GitHub 上游失败。
 
 - Given 日志中出现用户或仓库相关标识
   When 维护者查看容器 stdout

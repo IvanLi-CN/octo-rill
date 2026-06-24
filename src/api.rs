@@ -9623,31 +9623,119 @@ async fn persist_release_reaction_counts(
     release_id: i64,
     counts: &ReleaseReactionCounts,
 ) -> Result<(), ApiError> {
-    sqlx::query(
-        r#"
-        UPDATE repo_releases
-        SET react_plus1 = ?,
-            react_laugh = ?,
-            react_heart = ?,
-            react_hooray = ?,
-            react_rocket = ?,
-            react_eyes = ?,
-            updated_at = ?
-        WHERE release_id = ?
-        "#,
-    )
-    .bind(counts.plus1)
-    .bind(counts.laugh)
-    .bind(counts.heart)
-    .bind(counts.hooray)
-    .bind(counts.rocket)
-    .bind(counts.eyes)
-    .bind(chrono::Utc::now().to_rfc3339())
-    .bind(release_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::internal)?;
+    state
+        .sqlite_writer
+        .write_foreground("feed_reaction_counts_persist", |_| async move {
+            sqlx::query(
+                r#"
+                    UPDATE repo_releases
+                    SET react_plus1 = ?,
+                        react_laugh = ?,
+                        react_heart = ?,
+                        react_hooray = ?,
+                        react_rocket = ?,
+                        react_eyes = ?,
+                        updated_at = ?
+                    WHERE release_id = ?
+                    "#,
+            )
+            .bind(counts.plus1)
+            .bind(counts.laugh)
+            .bind(counts.heart)
+            .bind(counts.hooray)
+            .bind(counts.rocket)
+            .bind(counts.eyes)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(release_id)
+            .execute(&state.pool)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(ApiError::internal)?;
     Ok(())
+}
+
+async fn persist_release_reaction_counts_best_effort(
+    state: &AppState,
+    release_id: i64,
+    counts: &ReleaseReactionCounts,
+) -> Result<bool, ApiError> {
+    match state
+        .sqlite_writer
+        .try_write("feed_reaction_counts_persist_best_effort", || async move {
+            sqlx::query(
+                r#"
+                UPDATE repo_releases
+                SET react_plus1 = ?,
+                    react_laugh = ?,
+                    react_heart = ?,
+                    react_hooray = ?,
+                    react_rocket = ?,
+                    react_eyes = ?,
+                    updated_at = ?
+                WHERE release_id = ?
+                "#,
+            )
+            .bind(counts.plus1)
+            .bind(counts.laugh)
+            .bind(counts.heart)
+            .bind(counts.hooray)
+            .bind(counts.rocket)
+            .bind(counts.eyes)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .bind(release_id)
+            .execute(&state.pool)
+            .await
+            .map(|_| ())
+            .map_err(anyhow::Error::from)
+        })
+        .await
+    {
+        Ok(Some(())) => Ok(true),
+        Ok(None) => {
+            tracing::warn!(
+                event = "feed.reactions.persist",
+                release_id,
+                downgrade_reason = "sqlite_writer_busy",
+                "skipped release reaction persist under sqlite writer pressure"
+            );
+            Ok(false)
+        }
+        Err(err) if crate::sqlite_write::is_sqlite_busy_error(err.as_ref()) => {
+            tracing::warn!(
+                event = "feed.reactions.persist",
+                release_id,
+                downgrade_reason = "sqlite_busy",
+                error_chain = %crate::observability::error_chain_summary(err.as_ref()),
+                "skipped release reaction persist after sqlite busy"
+            );
+            Ok(false)
+        }
+        Err(err) => Err(ApiError::internal(err)),
+    }
+}
+
+async fn build_feed_reaction_refresh_item(
+    state: &AppState,
+    row: &ReleaseReactionRow,
+    reaction: &LiveReleaseReactions,
+) -> Result<(FeedReactionRefreshItem, bool), ApiError> {
+    let persisted =
+        persist_release_reaction_counts_best_effort(state, row.release_id, &reaction.counts)
+            .await?;
+    Ok((
+        FeedReactionRefreshItem {
+            release_id: row.release_id.to_string(),
+            reactions: ReleaseReactions {
+                counts: reaction.counts.clone(),
+                viewer: reaction.viewer.clone(),
+                status: "ready".to_owned(),
+            },
+        },
+        persisted,
+    ))
 }
 
 const SMART_NO_VALUABLE_VERSION_INFO: &str = "no_valuable_version_info";
@@ -10201,6 +10289,7 @@ pub async fn refresh_feed_reactions(
 
     let persist_started_at = Instant::now();
     let mut items = Vec::new();
+    let mut persist_skipped = 0_usize;
     for row in rows {
         let Some(node_id) = row
             .node_id
@@ -10213,15 +10302,12 @@ pub async fn refresh_feed_reactions(
         let Some(reaction) = live.get(node_id) else {
             continue;
         };
-        persist_release_reaction_counts(state.as_ref(), row.release_id, &reaction.counts).await?;
-        items.push(FeedReactionRefreshItem {
-            release_id: row.release_id.to_string(),
-            reactions: ReleaseReactions {
-                counts: reaction.counts.clone(),
-                viewer: reaction.viewer.clone(),
-                status: "ready".to_owned(),
-            },
-        });
+        let (item, persisted) =
+            build_feed_reaction_refresh_item(state.as_ref(), &row, reaction).await?;
+        if !persisted {
+            persist_skipped += 1;
+        }
+        items.push(item);
     }
     let persist_elapsed = persist_started_at.elapsed();
 
@@ -10233,6 +10319,7 @@ pub async fn refresh_feed_reactions(
         total_ms = started_at.elapsed().as_millis() as u64,
         release_count = release_ids.len(),
         refreshed_count,
+        persist_skipped,
         "feed reaction refresh completed outside feed hot path"
     );
 
@@ -14708,18 +14795,19 @@ mod tests {
         BRIEF_RELEASE_REF_LOCATOR_BATCH_LIMIT, DashboardUpdatesQuery, DashboardUpdatesToken,
         FeedQuery, FeedReactionRefreshRequest, FeedRow, GitHubCompareCommit,
         GitHubCompareCommitDetail, GitHubCompareFile, GitHubCompareResponse, GraphQlError,
-        LLM_CALL_ORDER_BY_CREATED_DESC, PublicReleaseQuery, RELEASE_FEED_BODY_MAX_CHARS,
-        ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem, TranslationCacheRow,
-        TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
+        LLM_CALL_ORDER_BY_CREATED_DESC, LiveReleaseReactions, PublicReleaseQuery,
+        RELEASE_FEED_BODY_MAX_CHARS, ReleaseReactionCounts, ReleaseReactionRow,
+        ReleaseReactionViewer, ReturnModeQuery, SMART_NO_VALUABLE_VERSION_INFO, TranslateBatchItem,
+        TranslationCacheRow, TranslationUpsert, admin_dashboard, admin_delete_public_release_repo,
         admin_download_realtime_task_log, admin_get_llm_call_detail,
         admin_get_llm_scheduler_status, admin_get_realtime_task_detail, admin_list_llm_calls,
         admin_list_realtime_tasks, admin_list_users, admin_patch_llm_runtime_config,
         admin_patch_user, admin_users_offset, ai_error_is_non_retryable,
-        brief_contains_release_link, build_compare_digest, build_task_diagnostics,
-        compact_dashboard_signatures, dashboard_updates, encode_dashboard_updates_token,
-        ensure_account_enabled, execute_sync_all_sync_with, extract_brief_release_ids,
-        extract_translation_fields, feed_item_from_row, get_release_detail,
-        get_release_detail_by_repo_tag, github_access_restricted_error,
+        brief_contains_release_link, build_compare_digest, build_feed_reaction_refresh_item,
+        build_task_diagnostics, compact_dashboard_signatures, dashboard_updates,
+        encode_dashboard_updates_token, ensure_account_enabled, execute_sync_all_sync_with,
+        extract_brief_release_ids, extract_translation_fields, feed_item_from_row,
+        get_release_detail, get_release_detail_by_repo_tag, github_access_restricted_error,
         github_graphql_errors_to_api_error, github_graphql_http_error, github_rate_limited_error,
         github_reauth_required_error, guard_admin_user_update, has_repo_scope,
         last_active_is_stale, list_briefs, list_feed, list_releases, llm_call_order_by_clause,
@@ -21259,6 +21347,61 @@ line two",
         .expect("refresh feed reactions");
 
         assert!(resp.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_reactions_skips_persist_failure_under_sqlite_write_pressure() {
+        let pool = setup_pool().await;
+        seed_repo_release(&pool, 42, 120).await;
+        let state = setup_state(pool.clone());
+        let row = ReleaseReactionRow {
+            release_id: 120,
+            node_id: Some("node-120".to_owned()),
+        };
+        let reaction = LiveReleaseReactions {
+            counts: ReleaseReactionCounts {
+                plus1: 7,
+                laugh: 0,
+                heart: 2,
+                hooray: 1,
+                rocket: 0,
+                eyes: 3,
+            },
+            viewer: ReleaseReactionViewer {
+                plus1: true,
+                laugh: false,
+                heart: false,
+                hooray: false,
+                rocket: false,
+                eyes: true,
+            },
+        };
+
+        let (writer_guard, held_tx) = state
+            .sqlite_writer
+            .begin_immediate(&state.pool, "test_feed_reaction_hold")
+            .await
+            .expect("hold sqlite writer");
+
+        let (item, persisted) = build_feed_reaction_refresh_item(state.as_ref(), &row, &reaction)
+            .await
+            .expect("build refresh item under write pressure");
+
+        held_tx.commit().await.expect("commit held tx");
+        drop(writer_guard);
+
+        assert!(!persisted);
+        assert_eq!(item.release_id, "120");
+        assert_eq!(item.reactions.counts.plus1, 7);
+        assert!(item.reactions.viewer.plus1);
+
+        let stored_plus1: i64 =
+            sqlx::query_scalar("SELECT react_plus1 FROM repo_releases WHERE release_id = ?")
+                .bind(120_i64)
+                .fetch_one(&pool)
+                .await
+                .expect("load stored reaction count");
+        assert_eq!(stored_plus1, 0);
     }
 
     #[tokio::test]
