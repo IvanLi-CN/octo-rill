@@ -928,6 +928,8 @@ fn subscription_timeout_error(operation: &str) -> SyncRequestError {
         ),
         None,
     )
+    .with_phase("timeout")
+    .with_timeout_ms(u64::try_from(SUBSCRIPTION_HTTP_TIMEOUT.as_millis()).unwrap_or(u64::MAX))
 }
 
 async fn with_subscription_timeout<T, Fut>(
@@ -1010,9 +1012,11 @@ impl SubscriptionRunLogger {
 #[derive(Debug, Clone)]
 struct SyncRequestError {
     reason_code: &'static str,
+    phase: &'static str,
     message: String,
     retryable: bool,
     status: Option<u16>,
+    timeout_ms: Option<u64>,
 }
 
 impl SyncRequestError {
@@ -1023,9 +1027,11 @@ impl SyncRequestError {
     ) -> Self {
         Self {
             reason_code,
+            phase: default_sync_request_phase(reason_code),
             message: message.into(),
             retryable: true,
             status: status.map(|value| value.as_u16()),
+            timeout_ms: None,
         }
     }
 
@@ -1036,14 +1042,114 @@ impl SyncRequestError {
     ) -> Self {
         Self {
             reason_code,
+            phase: default_sync_request_phase(reason_code),
             message: message.into(),
             retryable: false,
             status: status.map(|value| value.as_u16()),
+            timeout_ms: None,
         }
+    }
+
+    fn with_phase(mut self, phase: &'static str) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
     }
 
     fn into_anyhow(self) -> anyhow::Error {
         anyhow!(self.message)
+    }
+}
+
+fn default_sync_request_phase(reason_code: &str) -> &'static str {
+    match reason_code {
+        "timeout" => "timeout",
+        "network_error" | "request_error" => "request",
+        "decode_error" => "decode",
+        "graphql_error" => "graphql",
+        "graphql_missing_data" | "github_http_error" | "rate_limited" | "repo_inaccessible" => {
+            "response"
+        }
+        "credentials_invalid" | "credentials_forbidden" | "scope_insufficient" => "credentials",
+        "sync_state_error" => "local",
+        _ => "request",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SyncStarredFailureDiagnostic {
+    operation: String,
+    error_kind: &'static str,
+    error_stage: &'static str,
+    error_chain: String,
+    retryable: bool,
+    http_status: Option<u16>,
+    timeout_ms: Option<u64>,
+    elapsed_ms: u64,
+    attempts: usize,
+    retry_limit: usize,
+}
+
+impl SyncStarredFailureDiagnostic {
+    fn from_request_error(
+        err: SyncRequestError,
+        elapsed_ms: u64,
+        attempts: usize,
+        retry_limit: usize,
+    ) -> Self {
+        let operation = err
+            .message
+            .split_once(':')
+            .map(|(value, _)| value.trim().to_owned())
+            .unwrap_or_else(|| "sync starred".to_owned());
+        Self {
+            operation,
+            error_kind: err.reason_code,
+            error_stage: err.phase,
+            error_chain: err.message,
+            retryable: err.retryable,
+            http_status: err.status,
+            timeout_ms: err.timeout_ms,
+            elapsed_ms,
+            attempts,
+            retry_limit,
+        }
+    }
+
+    fn into_event_payload(self, task_id: &str) -> Value {
+        json!({
+            "task_id": task_id,
+            "stage": "star_failed",
+            "operation": self.operation,
+            "error_kind": self.error_kind,
+            "error_stage": self.error_stage,
+            "retryable": self.retryable,
+            "http_status": self.http_status,
+            "timeout_ms": self.timeout_ms,
+            "elapsed_ms": self.elapsed_ms,
+            "attempts": self.attempts,
+            "retry_limit": self.retry_limit,
+            "error_chain": self.error_chain,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum SyncStarredExecutionError {
+    Upstream(SyncStarredFailureDiagnostic),
+    Local(anyhow::Error),
+}
+
+impl SyncStarredExecutionError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Upstream(diagnostic) => anyhow!(diagnostic.error_chain),
+            Self::Local(err) => err,
+        }
     }
 }
 
@@ -1094,10 +1200,163 @@ fn notification_sync_key(base_key: &str, connection_id: &str) -> String {
     format!("{base_key}:{connection_id}")
 }
 
+async fn append_access_refresh_log_entry(
+    state: &AppState,
+    task_id: &str,
+    level: &str,
+    stage: &str,
+    message: &str,
+    payload: Value,
+) {
+    if let Err(err) = jobs::append_task_log_entry(
+        state,
+        task_id,
+        json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "level": level,
+            "stage": stage,
+            "message": message,
+            "payload": payload,
+        }),
+    )
+    .await
+    {
+        tracing::warn!(
+            ?err,
+            task_id,
+            stage,
+            "sync.access_refresh: append task log entry failed"
+        );
+    }
+}
+
+async fn append_access_refresh_failure_diagnostic(state: &AppState, task_id: &str, payload: Value) {
+    if let Err(err) =
+        jobs::append_task_event(state, task_id, "task.progress", payload.clone()).await
+    {
+        tracing::warn!(
+            ?err,
+            task_id,
+            "sync.access_refresh: append star failure task event failed"
+        );
+    }
+    append_access_refresh_log_entry(
+        state,
+        task_id,
+        "error",
+        "star",
+        "star refresh failed",
+        payload,
+    )
+    .await;
+}
+
 pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarredResult> {
-    let result = fetch_starred_snapshot(state, user_id, false)
+    sync_starred_for_access_refresh(state, user_id)
         .await
-        .map_err(SyncRequestError::into_anyhow)?;
+        .map_err(SyncStarredExecutionError::into_anyhow)
+}
+
+async fn sync_starred_for_access_refresh(
+    state: &AppState,
+    user_id: &str,
+) -> std::result::Result<SyncStarredResult, SyncStarredExecutionError> {
+    sync_starred_core_with_fetch_and_sleep(
+        state,
+        user_id,
+        || async { fetch_starred_snapshot(state, user_id, false).await },
+        |attempt| async move {
+            tokio::time::sleep(subscription_retry_delay(attempt)).await;
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn sync_starred_with_fetch_and_sleep<Fetch, FetchFut, Sleep, SleepFut>(
+    state: &AppState,
+    user_id: &str,
+    fetch: Fetch,
+    sleep: Sleep,
+) -> Result<SyncStarredResult>
+where
+    Fetch: FnMut() -> FetchFut,
+    FetchFut: Future<Output = Result<StarredFetchResult, SyncRequestError>>,
+    Sleep: FnMut(usize) -> SleepFut,
+    SleepFut: Future<Output = ()>,
+{
+    sync_starred_core_with_fetch_and_sleep(state, user_id, fetch, sleep)
+        .await
+        .map_err(SyncStarredExecutionError::into_anyhow)
+}
+
+async fn sync_starred_core_with_fetch_and_sleep<Fetch, FetchFut, Sleep, SleepFut>(
+    state: &AppState,
+    user_id: &str,
+    mut fetch: Fetch,
+    mut sleep: Sleep,
+) -> std::result::Result<SyncStarredResult, SyncStarredExecutionError>
+where
+    Fetch: FnMut() -> FetchFut,
+    FetchFut: Future<Output = Result<StarredFetchResult, SyncRequestError>>,
+    Sleep: FnMut(usize) -> SleepFut,
+    SleepFut: Future<Output = ()>,
+{
+    let mut result: Option<StarredFetchResult> = None;
+    let mut final_error: Option<SyncStarredFailureDiagnostic> = None;
+    let total_started_at = Instant::now();
+
+    for attempt in 1..=SUBSCRIPTION_RETRY_LIMIT {
+        let started_at = Instant::now();
+        match fetch().await {
+            Ok(snapshot) => {
+                result = Some(snapshot);
+                final_error = None;
+                break;
+            }
+            Err(err) if err.retryable && attempt < SUBSCRIPTION_RETRY_LIMIT => {
+                let elapsed_ms =
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    event = "upstream.call",
+                    operation = "sync.starred.interactive_retry",
+                    user_id,
+                    attempt,
+                    retry_limit = SUBSCRIPTION_RETRY_LIMIT,
+                    error_stage = err.phase,
+                    error_kind = err.reason_code,
+                    elapsed_ms,
+                    error_chain = %err.message,
+                    "sync starred: retryable interactive sync failure"
+                );
+                sleep(attempt).await;
+            }
+            Err(err) => {
+                let elapsed_ms =
+                    u64::try_from(total_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                final_error = Some(SyncStarredFailureDiagnostic::from_request_error(
+                    err,
+                    elapsed_ms,
+                    attempt,
+                    SUBSCRIPTION_RETRY_LIMIT,
+                ));
+                break;
+            }
+        }
+    }
+
+    let result = if let Some(result) = result {
+        result
+    } else {
+        return Err(final_error
+            .map(SyncStarredExecutionError::Upstream)
+            .unwrap_or_else(|| {
+                SyncStarredExecutionError::Local(anyhow!(
+                    "sync starred: interactive retry finished without result"
+                ))
+            }));
+    };
+
     if result.is_full_snapshot {
         replace_starred_repos_with_priority(
             state,
@@ -1106,15 +1365,22 @@ pub async fn sync_starred(state: &AppState, user_id: &str) -> Result<SyncStarred
             "sync_access_refresh_starred_repos",
             SqliteWritePriority::Foreground,
         )
-        .await?;
+        .await
+        .map_err(SyncStarredExecutionError::Local)?;
     } else {
-        upsert_starred_repos(state, user_id, &result.repos).await?;
+        upsert_starred_repos(state, user_id, &result.repos)
+            .await
+            .map_err(SyncStarredExecutionError::Local)?;
     }
     if let Some(watermark) = result.watermark.as_deref() {
-        store_sync_state_value(state, user_id, STARRED_WATERMARK_KEY, watermark).await?;
+        store_sync_state_value(state, user_id, STARRED_WATERMARK_KEY, watermark)
+            .await
+            .map_err(SyncStarredExecutionError::Local)?;
     }
     for (key, watermark) in &result.connection_watermarks {
-        store_sync_state_value(state, user_id, key, watermark).await?;
+        store_sync_state_value(state, user_id, key, watermark)
+            .await
+            .map_err(SyncStarredExecutionError::Local)?;
     }
     Ok(SyncStarredResult {
         repos: result.repos.len(),
@@ -1618,25 +1884,117 @@ pub async fn sync_access_refresh(
     task_id: &str,
     user_id: &str,
 ) -> Result<SyncAccessRefreshResult> {
+    sync_access_refresh_with(
+        state,
+        task_id,
+        user_id,
+        |state, user_id| Box::pin(sync_starred_for_access_refresh(state, user_id)),
+        |state, user_id| Box::pin(refresh_owned_repo_release_visibility(state, user_id)),
+    )
+    .await
+}
+
+type AccessRefreshStarFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = std::result::Result<SyncStarredResult, SyncStarredExecutionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+type AccessRefreshVisibilityFuture<'a> = Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
+
+async fn sync_access_refresh_with<SyncStarred, RefreshVisibility>(
+    state: &AppState,
+    task_id: &str,
+    user_id: &str,
+    sync_starred: SyncStarred,
+    refresh_visibility: RefreshVisibility,
+) -> Result<SyncAccessRefreshResult>
+where
+    SyncStarred: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshStarFuture<'a>,
+    RefreshVisibility: for<'a> Fn(&'a AppState, &'a str) -> AccessRefreshVisibilityFuture<'a>,
+{
     let before_repos = load_user_release_visible_repo_rows(state, user_id).await?;
     let before_repo_ids = before_repos
         .iter()
         .map(|repo| repo.repo_id)
         .collect::<HashSet<_>>();
-    let starred = sync_starred(state, user_id).await?;
-    let _owned_release_visibility_refreshed =
-        refresh_owned_repo_release_visibility(state, user_id).await?;
-    jobs::append_task_event(
+    append_access_refresh_log_entry(
         state,
         task_id,
-        "task.progress",
+        "info",
+        "star",
+        "starting star refresh",
         json!({
             "task_id": task_id,
-            "stage": "star_refreshed",
-            "repos": starred.repos,
+            "stage": "star_started",
         }),
     )
-    .await?;
+    .await;
+    let starred = match sync_starred(state, user_id).await {
+        Ok(result) => result,
+        Err(SyncStarredExecutionError::Upstream(diagnostic)) => {
+            let error_chain = diagnostic.error_chain.clone();
+            let payload = diagnostic.into_event_payload(task_id);
+            append_access_refresh_failure_diagnostic(state, task_id, payload).await;
+            return Err(anyhow!(error_chain));
+        }
+        Err(SyncStarredExecutionError::Local(err)) => {
+            let payload = json!({
+                "task_id": task_id,
+                "stage": "star_failed",
+                "operation": "sync starred",
+                "error_kind": "local_error",
+                "error_stage": "local",
+                "retryable": false,
+                "http_status": null,
+                "timeout_ms": null,
+                "elapsed_ms": null,
+                "attempts": null,
+                "retry_limit": SUBSCRIPTION_RETRY_LIMIT,
+                "error_chain": err.to_string(),
+            });
+            append_access_refresh_failure_diagnostic(state, task_id, payload).await;
+            return Err(err);
+        }
+    };
+    let _owned_release_visibility_refreshed = match refresh_visibility(state, user_id).await {
+        Ok(result) => result,
+        Err(err) => {
+            let payload = json!({
+                "task_id": task_id,
+                "stage": "star_failed",
+                "operation": "refresh owned repo visibility",
+                "error_kind": "local_error",
+                "error_stage": "local",
+                "retryable": false,
+                "http_status": null,
+                "timeout_ms": null,
+                "elapsed_ms": null,
+                "attempts": null,
+                "retry_limit": null,
+                "error_chain": err.to_string(),
+            });
+            append_access_refresh_failure_diagnostic(state, task_id, payload).await;
+            return Err(err);
+        }
+    };
+    let star_payload = json!({
+        "task_id": task_id,
+        "stage": "star_refreshed",
+        "repos": starred.repos,
+    });
+    jobs::append_task_event(state, task_id, "task.progress", star_payload.clone()).await?;
+    append_access_refresh_log_entry(
+        state,
+        task_id,
+        "info",
+        "star",
+        "star refresh completed",
+        star_payload,
+    )
+    .await;
 
     let release = attach_and_wait_for_user_release_demand(
         state,
@@ -1647,40 +2005,52 @@ pub async fn sync_access_refresh(
     )
     .await?;
 
-    jobs::append_task_event(
+    let release_payload = json!({
+        "task_id": task_id,
+        "stage": "release_summary",
+        "repos": release.repos,
+        "releases": release.releases,
+        "queued": release.queued,
+        "reused_running": release.reused_running,
+        "reused_fresh": release.reused_fresh,
+        "failed": release.failed,
+    });
+    jobs::append_task_event(state, task_id, "task.progress", release_payload.clone()).await?;
+    append_access_refresh_log_entry(
         state,
         task_id,
-        "task.progress",
-        json!({
-            "task_id": task_id,
-            "stage": "release_summary",
-            "repos": release.repos,
-            "releases": release.releases,
-            "queued": release.queued,
-            "reused_running": release.reused_running,
-            "reused_fresh": release.reused_fresh,
-            "failed": release.failed,
-        }),
+        "info",
+        "release",
+        "release demand completed",
+        release_payload,
     )
-    .await?;
+    .await;
 
     let (social, social_error) =
         sync_social_activity_best_effort(state, user_id, "sync.access_refresh").await;
-    jobs::append_task_event(
+    let social_payload = json!({
+        "task_id": task_id,
+        "stage": "social_summary",
+        "repo_stars": social.repo_stars,
+        "followers": social.followers,
+        "events": social.events,
+        "failed_repos": social.failed_repos.clone(),
+        "error": social_error.clone(),
+    });
+    jobs::append_task_event(state, task_id, "task.progress", social_payload.clone()).await?;
+    append_access_refresh_log_entry(
         state,
         task_id,
-        "task.progress",
-        json!({
-            "task_id": task_id,
-            "stage": "social_summary",
-            "repo_stars": social.repo_stars,
-            "followers": social.followers,
-            "events": social.events,
-            "failed_repos": social.failed_repos,
-            "error": social_error,
-        }),
+        if social_error.is_some() {
+            "warning"
+        } else {
+            "info"
+        },
+        "social",
+        "social sync completed",
+        social_payload,
     )
-    .await?;
+    .await;
 
     let (notifications, notifications_error) = match sync_notifications(state, user_id).await {
         Ok(result) => (result, None),
@@ -1699,19 +2069,33 @@ pub async fn sync_access_refresh(
             )
         }
     };
+    let notifications_payload = json!({
+        "task_id": task_id,
+        "stage": "notifications_summary",
+        "notifications": notifications.notifications,
+        "since": notifications.since.clone(),
+        "error": notifications_error.clone(),
+    });
     jobs::append_task_event(
         state,
         task_id,
         "task.progress",
-        json!({
-            "task_id": task_id,
-            "stage": "notifications_summary",
-            "notifications": notifications.notifications,
-            "since": notifications.since,
-            "error": notifications_error,
-        }),
+        notifications_payload.clone(),
     )
     .await?;
+    append_access_refresh_log_entry(
+        state,
+        task_id,
+        if notifications_error.is_some() {
+            "warning"
+        } else {
+            "info"
+        },
+        "notifications",
+        "notifications sync completed",
+        notifications_payload,
+    )
+    .await;
 
     Ok(SyncAccessRefreshResult {
         starred,
@@ -6225,10 +6609,59 @@ async fn prune_subscription_sync_history(state: &AppState) -> Result<()> {
 }
 
 fn classify_reqwest_error(operation: &str, err: reqwest::Error) -> SyncRequestError {
+    let phase = reqwest_error_phase(&err);
     if err.is_timeout() || err.is_connect() || err.is_request() {
-        return SyncRequestError::retryable("network_error", format!("{operation}: {err}"), None);
+        return SyncRequestError::retryable("network_error", format!("{operation}: {err}"), None)
+            .with_phase(phase);
     }
     SyncRequestError::non_retryable("request_error", format!("{operation}: {err}"), None)
+        .with_phase(phase)
+}
+
+fn reqwest_error_phase(err: &reqwest::Error) -> &'static str {
+    let message = err.to_string().to_ascii_lowercase();
+    if err.is_timeout() {
+        return "timeout";
+    }
+    if err.is_connect() {
+        if message.contains("dns")
+            || message.contains("lookup")
+            || message.contains("name or service not known")
+            || message.contains("temporary failure in name resolution")
+            || message.contains("nodename nor servname")
+        {
+            return "dns";
+        }
+        if message.contains("tls")
+            || message.contains("ssl")
+            || message.contains("certificate")
+            || message.contains("handshake")
+        {
+            return "tls";
+        }
+        return "connect";
+    }
+    if err.is_request() {
+        return "request";
+    }
+    "response"
+}
+
+fn decode_error_phase(err: &reqwest::Error) -> &'static str {
+    let message = err.to_string().to_ascii_lowercase();
+    if message.contains("unexpected eof")
+        || message.contains(" eof while")
+        || message.contains("end of file")
+        || message.contains("error reading a body from connection")
+        || message.contains("error decoding response body")
+    {
+        return "response";
+    }
+    "decode"
+}
+
+fn decode_error_is_retryable(err: &reqwest::Error) -> bool {
+    decode_error_phase(err) == "response"
 }
 
 fn notification_thread_refresh_is_fresher(
@@ -6270,7 +6703,8 @@ fn classify_github_http_error(
             "rate_limited",
             format!("{operation}: github returned {status}"),
             Some(status),
-        );
+        )
+        .with_phase("http_status");
     }
 
     if status == StatusCode::UNAUTHORIZED {
@@ -6278,7 +6712,8 @@ fn classify_github_http_error(
             "credentials_invalid",
             format!("{operation}: github returned 401"),
             Some(status),
-        );
+        )
+        .with_phase("http_status");
     }
 
     if status == StatusCode::FORBIDDEN {
@@ -6292,7 +6727,8 @@ fn classify_github_http_error(
             reason_code,
             format!("{operation}: github returned 403"),
             Some(status),
-        );
+        )
+        .with_phase("http_status");
     }
 
     if status == StatusCode::NOT_FOUND || status.as_u16() == 451 {
@@ -6300,7 +6736,8 @@ fn classify_github_http_error(
             "repo_inaccessible",
             format!("{operation}: github returned {status}"),
             Some(status),
-        );
+        )
+        .with_phase("http_status");
     }
 
     SyncRequestError::non_retryable(
@@ -6308,6 +6745,7 @@ fn classify_github_http_error(
         format!("{operation}: github returned {status}"),
         Some(status),
     )
+    .with_phase("http_status")
 }
 
 fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequestError {
@@ -6322,16 +6760,19 @@ fn classify_graphql_errors(operation: &str, errors: &[GraphQlError]) -> SyncRequ
             "rate_limited",
             format!("{operation}: {message}"),
             None,
-        );
+        )
+        .with_phase("graphql");
     }
     if message_lower.contains("scope") || message_lower.contains("resource not accessible") {
         return SyncRequestError::non_retryable(
             "scope_insufficient",
             format!("{operation}: {message}"),
             None,
-        );
+        )
+        .with_phase("graphql");
     }
     SyncRequestError::non_retryable("graphql_error", format!("{operation}: {message}"), None)
+        .with_phase("graphql")
 }
 
 async fn fetch_json_response<T: DeserializeOwned>(
@@ -6347,7 +6788,17 @@ async fn fetch_json_response<T: DeserializeOwned>(
         ));
     }
     response.json::<T>().await.map_err(|err| {
-        SyncRequestError::non_retryable("decode_error", format!("{operation}: {err}"), Some(status))
+        let phase = decode_error_phase(&err);
+        let request_error = if decode_error_is_retryable(&err) {
+            SyncRequestError::retryable("decode_error", format!("{operation}: {err}"), Some(status))
+        } else {
+            SyncRequestError::non_retryable(
+                "decode_error",
+                format!("{operation}: {err}"),
+                Some(status),
+            )
+        };
+        request_error.with_phase(phase)
     })
 }
 
@@ -8665,7 +9116,7 @@ fn fallback_notification_open_url(thread_id: Option<&str>, repo_full_name: Optio
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Context;
+    use anyhow::{Context, anyhow};
     use std::{
         collections::HashSet,
         fs,
@@ -10294,6 +10745,162 @@ mod tests {
         assert_eq!(event_rows[0], ("warning".to_owned(), 1, 1));
         assert_eq!(event_rows[1], ("warning".to_owned(), 2, 1));
         assert_eq!(event_rows[2], ("error".to_owned(), 3, 0));
+    }
+
+    #[tokio::test]
+    async fn interactive_sync_starred_retries_recoverable_errors_before_success() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("interactive-star-retry-success");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let result = super::sync_starred_with_fetch_and_sleep(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                        if attempt < 3 {
+                            Err(SyncRequestError::retryable(
+                                "network_error",
+                                format!("temporary failure #{attempt}"),
+                                None,
+                            ))
+                        } else {
+                            Ok(StarredFetchResult {
+                                repos: vec![StarredRepoSnapshot {
+                                    repo_id: 201,
+                                    full_name: "octo/interactive".to_owned(),
+                                    owner_login: "octo".to_owned(),
+                                    name: "interactive".to_owned(),
+                                    description: Some("interactive repo".to_owned()),
+                                    html_url: "https://github.com/octo/interactive".to_owned(),
+                                    stargazed_at: "2026-03-06T13:00:00Z".to_owned(),
+                                    is_private: false,
+                                    owner_avatar_url: None,
+                                    open_graph_image_url: None,
+                                    uses_custom_open_graph_image: false,
+                                }],
+                                is_full_snapshot: true,
+                                watermark: Some("2026-03-06T13:00:00Z".to_owned()),
+                                connection_watermarks: Vec::new(),
+                            })
+                        }
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await
+        .expect("interactive sync starred should recover");
+
+        assert_eq!(result.repos, 1);
+        assert_eq!(attempts.load(AtomicTestOrdering::SeqCst), 3);
+
+        let stored_repos =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count interactive starred repos");
+        assert_eq!(stored_repos, 1);
+    }
+
+    #[tokio::test]
+    async fn interactive_sync_starred_returns_final_retryable_error_after_retry_budget() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("interactive-star-retry-failure");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let err = super::sync_starred_with_fetch_and_sleep(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                        Err(SyncRequestError::retryable(
+                            "network_error",
+                            format!("temporary failure #{attempt}"),
+                            None,
+                        ))
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await
+        .expect_err("interactive sync starred should fail after retry budget");
+
+        assert!(
+            err.to_string().contains("temporary failure #3"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(attempts.load(AtomicTestOrdering::SeqCst), 3);
+
+        let stored_repos =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count interactive starred repos after failure");
+        assert_eq!(stored_repos, 0);
+    }
+
+    #[tokio::test]
+    async fn interactive_sync_starred_failure_diagnostic_tracks_total_retry_elapsed() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("interactive-star-retry-diagnostic");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let err = super::sync_starred_core_with_fetch_and_sleep(
+            state.as_ref(),
+            user_id.as_str(),
+            {
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    async move {
+                        let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                        Err(SyncRequestError::retryable(
+                            "network_error",
+                            format!("temporary failure #{attempt}"),
+                            None,
+                        ))
+                    }
+                }
+            },
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            },
+        )
+        .await
+        .expect_err("interactive sync starred should expose upstream diagnostics");
+
+        let diagnostic = match err {
+            super::SyncStarredExecutionError::Upstream(diagnostic) => diagnostic,
+            super::SyncStarredExecutionError::Local(err) => {
+                panic!("expected upstream diagnostic, got local error: {err}")
+            }
+        };
+
+        assert_eq!(attempts.load(AtomicTestOrdering::SeqCst), 3);
+        assert_eq!(diagnostic.attempts, 3);
+        assert!(
+            diagnostic.elapsed_ms >= 30,
+            "expected total retry latency to include backoff sleeps, got {}ms",
+            diagnostic.elapsed_ms
+        );
     }
 
     #[tokio::test]
@@ -13995,6 +14602,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_access_refresh_records_star_failure_diagnostics() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-star-failure");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-failure");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+
+        let err = super::sync_access_refresh_with(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            |_state, _user_id| {
+                Box::pin(async {
+                    Err(super::SyncStarredExecutionError::Upstream(
+                        super::SyncStarredFailureDiagnostic {
+                            operation: "sync starred graphql".to_owned(),
+                            error_kind: "timeout",
+                            error_stage: "timeout",
+                            error_chain: "sync starred graphql: timed out after 30s".to_owned(),
+                            retryable: true,
+                            http_status: None,
+                            timeout_ms: Some(30_000),
+                            elapsed_ms: 30_004,
+                            attempts: 1,
+                            retry_limit: 3,
+                        },
+                    ))
+                })
+            },
+            |_state, _user_id| Box::pin(async { Ok(true) }),
+        )
+        .await
+        .expect_err("access refresh should fail when star refresh fails");
+
+        assert!(
+            err.to_string().contains("timed out after 30s"),
+            "unexpected error: {err}"
+        );
+
+        let payload: String = sqlx::query_scalar(
+            r#"
+            SELECT payload_json
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+            ORDER BY rowid DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("load latest access refresh progress event");
+        let payload: Value = serde_json::from_str(&payload).expect("parse progress payload");
+        assert_eq!(payload.get("stage"), Some(&json!("star_failed")));
+        assert_eq!(payload.get("error_stage"), Some(&json!("timeout")));
+        assert_eq!(payload.get("timeout_ms"), Some(&json!(30_000)));
+        assert_eq!(payload.get("elapsed_ms"), Some(&json!(30_004)));
+
+        let log_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
+            .await
+            .expect("load access refresh log path")
+            .expect("access refresh log path should exist");
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("read access refresh log");
+        assert!(log.contains("star refresh failed"), "unexpected log: {log}");
+        assert!(
+            log.contains("\"error_stage\":\"timeout\""),
+            "unexpected log: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_visibility_failure_records_star_failed_without_star_refreshed() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("access-refresh-visibility-failure");
+        seed_user(&pool, user_id.as_str()).await;
+        let state = setup_state(pool.clone());
+        let task_id = local_id::test_local_id("task-access-refresh-visibility-failure");
+        seed_access_refresh_task(&state, task_id.as_str()).await;
+
+        let err = super::sync_access_refresh_with(
+            state.as_ref(),
+            task_id.as_str(),
+            user_id.as_str(),
+            |_state, _user_id| Box::pin(async { Ok(super::SyncStarredResult { repos: 2 }) }),
+            |_state, _user_id| {
+                Box::pin(async { Err(anyhow!("owned repo visibility refresh failed")) })
+            },
+        )
+        .await
+        .expect_err("visibility refresh failure should fail access refresh");
+
+        assert!(
+            err.to_string()
+                .contains("owned repo visibility refresh failed"),
+            "unexpected error: {err}"
+        );
+
+        let stages = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT json_extract(payload_json, '$.stage')
+            FROM job_task_events
+            WHERE task_id = ? AND event_type = 'task.progress'
+            ORDER BY rowid ASC
+            "#,
+        )
+        .bind(task_id.as_str())
+        .fetch_all(&pool)
+        .await
+        .expect("load access refresh stages");
+
+        assert_eq!(stages, vec!["star_failed".to_owned()]);
+
+        let log_path = jobs::load_task_log_path(state.as_ref(), task_id.as_str())
+            .await
+            .expect("load access refresh log path")
+            .expect("access refresh log path should exist");
+        let log = tokio::fs::read_to_string(&log_path)
+            .await
+            .expect("read access refresh log");
+        assert!(
+            log.contains("\"stage\":\"star_failed\""),
+            "unexpected log: {log}"
+        );
+        assert!(
+            log.contains("\"operation\":\"refresh owned repo visibility\""),
+            "unexpected log: {log}"
+        );
+    }
+
+    #[tokio::test]
     async fn sync_subscriptions_without_eligible_users_emits_social_and_notifications_summaries() {
         let pool = setup_pool().await;
         let state = setup_state(pool.clone());
@@ -14148,7 +14888,7 @@ mod tests {
         .expect("seed repo release watcher");
     }
 
-    async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
+    async fn seed_realtime_task(state: &Arc<AppState>, task_id: &str, task_type: &str) {
         fs::create_dir_all(&state.config.task_log_dir).expect("create task log dir");
         let log_path = state.config.task_log_dir.join(format!("{task_id}.ndjson"));
         let now = "2026-03-06T00:00:00Z";
@@ -14174,7 +14914,7 @@ mod tests {
             "#,
         )
         .bind(task_id)
-        .bind(jobs::TASK_SYNC_SUBSCRIPTIONS)
+        .bind(task_type)
         .bind(jobs::STATUS_RUNNING)
         .bind("test")
         .bind(Option::<String>::None)
@@ -14190,7 +14930,15 @@ mod tests {
         .bind(log_path.to_string_lossy().to_string())
         .execute(&state.pool)
         .await
-        .expect("seed subscription task");
+        .expect("seed realtime task");
+    }
+
+    async fn seed_sync_task(state: &Arc<AppState>, task_id: &str) {
+        seed_realtime_task(state, task_id, jobs::TASK_SYNC_SUBSCRIPTIONS).await;
+    }
+
+    async fn seed_access_refresh_task(state: &Arc<AppState>, task_id: &str) {
+        seed_realtime_task(state, task_id, jobs::TASK_SYNC_ACCESS_REFRESH).await;
     }
 
     #[tokio::test]
@@ -14920,6 +15668,91 @@ mod tests {
         })
     }
 
+    fn setup_state_with_graphql_url(pool: SqlitePool, github_graphql_url: Url) -> Arc<AppState> {
+        let state = setup_state(pool);
+        Arc::new(AppState {
+            github_graphql_url,
+            ..state.as_ref().clone()
+        })
+    }
+
+    async fn spawn_truncated_github_graphql_server() -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated graphql server");
+        let addr = listener
+            .local_addr()
+            .expect("resolve truncated graphql server addr");
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn({
+            let attempts = attempts.clone();
+            async move {
+                loop {
+                    let Ok((mut stream, _peer)) = listener.accept().await else {
+                        break;
+                    };
+                    let attempt = attempts.fetch_add(1, AtomicTestOrdering::SeqCst) + 1;
+                    tokio::spawn(async move {
+                        let mut buffer = vec![0_u8; 8192];
+                        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await;
+                        if attempt == 1 {
+                            let _ = tokio::io::AsyncWriteExt::write_all(
+                                &mut stream,
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n{\"data\":",
+                            )
+                            .await;
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                            return;
+                        }
+
+                        let body = serde_json::to_vec(&json!({
+                            "data": {
+                                "viewer": {
+                                    "starredRepositories": {
+                                        "pageInfo": {
+                                            "hasNextPage": false,
+                                            "endCursor": null
+                                        },
+                                        "edges": [{
+                                            "starredAt": "2026-03-06T13:00:00Z",
+                                            "node": {
+                                                "databaseId": 301,
+                                                "nameWithOwner": "octo/retried",
+                                                "name": "retried",
+                                                "description": "retried repo",
+                                                "url": "https://github.com/octo/retried",
+                                                "isPrivate": false,
+                                                "openGraphImageUrl": null,
+                                                "usesCustomOpenGraphImage": false,
+                                                "owner": {
+                                                    "login": "octo",
+                                                    "avatarUrl": null
+                                                }
+                                            }
+                                        }]
+                                    }
+                                }
+                            }
+                        }))
+                        .expect("serialize graphql success body");
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ =
+                            tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                                .await;
+                        let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, &body).await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
+                    });
+                }
+            }
+        });
+
+        Url::parse(&format!("http://{addr}/graphql")).expect("parse truncated graphql url")
+    }
+
     async fn spawn_test_github_rest_server() -> Url {
         async fn renamed_repo_releases(
             Path((owner, repo)): Path<(String, String)>,
@@ -15057,6 +15890,61 @@ mod tests {
         assert_eq!(result.releases[0].tag_name, "v1.2.3");
         assert_eq!(result.pages_fetched, 1);
         assert_eq!(result.stopped_reason, "short_page");
+    }
+
+    #[tokio::test]
+    async fn sync_starred_retries_truncated_graphql_response_body() {
+        let pool = setup_pool().await;
+        let user_id = test_user_id("interactive-star-truncated-body");
+        seed_user(&pool, user_id.as_str()).await;
+        let graphql_url = spawn_truncated_github_graphql_server().await;
+        let state = setup_state_with_graphql_url(pool.clone(), graphql_url);
+        let encrypted = state
+            .encryption_key
+            .encrypt_str("test-token")
+            .expect("encrypt github access token");
+        sqlx::query(
+            r#"
+            INSERT INTO github_connections (
+              id,
+              user_id,
+              github_user_id,
+              login,
+              access_token_ciphertext,
+              access_token_nonce,
+              scopes,
+              linked_at,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(local_id::generate_local_id())
+        .bind(user_id.as_str())
+        .bind(30_215_105_i64)
+        .bind("octo")
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .bind("read:user")
+        .bind("2026-03-06T00:00:00Z")
+        .bind("2026-03-06T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed github connection");
+
+        let result = super::sync_starred(state.as_ref(), user_id.as_str())
+            .await
+            .expect("sync starred should recover after truncated response body");
+
+        assert_eq!(result.repos, 1);
+
+        let stored_repos =
+            sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM starred_repos WHERE user_id = ?"#)
+                .bind(user_id.as_str())
+                .fetch_one(&pool)
+                .await
+                .expect("count retried starred repos");
+        assert_eq!(stored_repos, 1);
     }
 
     async fn seed_user(pool: &SqlitePool, user_id: &str) {

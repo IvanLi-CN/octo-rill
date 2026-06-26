@@ -153,6 +153,7 @@
   8. 触发 `task.progress(stage=notifications_summary)`
   9. `task.completed`
 - 访问自动刷新会继续补齐 `social + Inbox`，但 `star_refreshed` 仍然是前端第一次刷新缓存的关键节点。
+- 若任务在 `star_refreshed` 前硬失败，必须额外写入 `task.progress(stage=star_failed)` 诊断事件，并把失败阶段、耗时、timeout/http 状态或错误链写入 task log，便于管理员区分 `timeout / dns / connect / tls / request / response / decode / http_status / local`。
 - social 阶段拿到首次 follower / repo star snapshot 时，必须直接写入 `social_activity_events`；其中 `repo_star_received` 保留真实 `starred_at`，`follower_received` 仅保留内部检测时间供排序使用。
 - 若账号在旧版本里已经持有 `follower_current_members` / `repo_star_current_members`，但对应社交事件为空，则 social 阶段必须在下一次正常 sync 中自动完成事件流可见化，不依赖手工 SQL 补写。
 - social / notifications 阶段遇到 GitHub nullable bool（如 `usesCustomOpenGraphImage = null`、`unread = null`）时，必须按兼容默认值继续同步，而不是把整轮任务降级成 decode_error。
