@@ -3,10 +3,13 @@
 ## 生命周期
 
 - Lifecycle: active
-- Last: 2026-05-09
+- Last: 2026-06-26
 
 ## 历史摘要
 
+- 2026-06-26: `sync.access_refresh` 失败链路补齐诊断闭环：Star 阶段现在会写入 `task.progress(stage=star_failed)` 与 access-refresh task log，管理员可直接看到 `error_kind`、`error_stage`、`elapsed_ms`、`timeout_ms`、`http_status` 与 `error_chain`；同轮只读 probe 也确认 101 到 GitHub 会出现 `HTTP 200` 后 body 读取超时 / EOF，问题更接近上游传输链路而非业务逻辑分支。
+- 2026-06-26: 新增本地主诊断回路 `web/e2e/access-sync-admin-link.spec.ts`，用同一条 mock task state 证明 `Dashboard 点击同步 -> /api/sync/all?return_mode=task_id -> task-access-click -> Admin Jobs 实时任务详情` 的 `task_id` 一致；此前的 Storybook 截图只保留为 Admin 失败详情 UI 预览，不再作为该链路的主证据。
+- 2026-06-26: 交互式 `sync.access_refresh` 的 Star 阶段补齐与订阅同步一致的可恢复网络重试预算；当 GitHub GraphQL / 网络短时超时或连接失败时，会先做 3 次退避重试，再决定是否把顶部“同步”任务判为失败，避免偶发上游抖动直接落成前台错误。
 - 2026-06-24: release smart 批处理源查询改为先按目标 `release_id` 收口、再按 repo 内排序键回查 `previous_tag_name`，并补充 `repo_releases(repo_id, COALESCE(published_at, created_at, updated_at), release_id)` 表达式索引，避免少量 release 的翻译/润色请求在生产上退化成整批可见 release 的全局窗口排序慢查询。
 - 2026-06-25: 订阅同步的 release fan-out 不再通过 `load_release_ids_for_repo_ids` 在 release phase 前后各扫一次共享 `repo_releases` 差集；repo release worker finalize 现在持久化本轮新增 `release_id` 集合，后续 translation / smart preheat 直接复用当前任务命中的 work item 结果，避免大 repo 上再次触发 repo 级全量 release 扫描。
 - 2026-06-24: GitHub rename 仓库的 REST repo-read 现在使用独立的 redirect-enabled client，并把 REST / GraphQL base URL 明确挂到 `AppState`；`sync.releases.repo_read`、followers、received events、stargazers 与 public repo metadata 不再把 GitHub 返回的 `301 Moved Permanently` 误判成 repo 读取失败。
