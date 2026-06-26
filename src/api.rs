@@ -227,6 +227,7 @@ struct MeUserRow {
     is_admin: i64,
     is_disabled: i64,
     last_active_at: Option<String>,
+    include_own_releases: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -236,6 +237,29 @@ struct MeFirstGitHubRow {
     name: Option<String>,
     avatar_url: Option<String>,
     email: Option<String>,
+}
+
+async fn load_viewer_user(state: &AppState, user_id: &str) -> Result<MeFirstGitHubRow, ApiError> {
+    sqlx::query_as::<_, MeFirstGitHubRow>(
+        r#"
+        SELECT github_user_id, login, name, avatar_url, email
+        FROM github_connections
+        WHERE user_id = ?
+        ORDER BY linked_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::internal)?
+    .ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "session user has no github connection",
+        )
+    })
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -256,6 +280,7 @@ struct DashboardBootstrap {
     daily_boundary_local: String,
     daily_boundary_time_zone: Option<String>,
     daily_boundary_utc_offset_minutes: i32,
+    include_own_releases: bool,
 }
 
 impl AccessSyncBootstrap {
@@ -286,7 +311,7 @@ pub async fn me(
     let user_id = require_user_id(&session).await?;
     let row = sqlx::query_as::<_, MeUserRow>(
         r#"
-        SELECT id, is_admin, is_disabled, last_active_at
+        SELECT id, is_admin, is_disabled, last_active_at, include_own_releases
         FROM users
         WHERE id = ?
         "#,
@@ -372,6 +397,7 @@ pub async fn me(
             daily_boundary_local,
             daily_boundary_time_zone,
             daily_boundary_utc_offset_minutes,
+            include_own_releases: row.include_own_releases != 0,
         },
     }))
 }
@@ -7416,6 +7442,9 @@ pub struct DashboardUpdatesQuery {
     token: Option<String>,
     feed_type: Option<String>,
     include: Option<String>,
+    scope: Option<String>,
+    items: Option<String>,
+    org: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7447,6 +7476,14 @@ struct DashboardUpdatesToken {
     feed: Vec<String>,
     briefs: Vec<String>,
     notifications: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FeedScope {
+    Repo { owner: String, repo: String },
+    Repos { items: Vec<String> },
+    Org { org: String },
+    Mine,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7503,6 +7540,76 @@ fn parse_dashboard_feed_type(raw: Option<&str>) -> Result<FeedTypeSelection, Api
         Some("stars") => parse_feed_types(Some("stars")),
         Some("followers") => parse_feed_types(Some("followers")),
         Some(value) => Err(ApiError::bad_request(format!("invalid feed_type: {value}"))),
+    }
+}
+
+fn normalize_repo_scope_item(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches('/');
+    let (owner, repo) = trimmed.split_once('/')?;
+    let owner = owner.trim();
+    let repo = repo.trim();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+fn parse_feed_scope(
+    scope: Option<&str>,
+    items: Option<&str>,
+    org: Option<&str>,
+) -> Result<Option<FeedScope>, ApiError> {
+    let Some(scope) = scope.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match scope {
+        "repo" => {
+            let repo_item = items
+                .and_then(normalize_repo_scope_item)
+                .ok_or_else(|| ApiError::bad_request("scope=repo requires items=owner/repo"))?;
+            let (owner, repo) = repo_item
+                .split_once('/')
+                .ok_or_else(|| ApiError::bad_request("invalid repo scope item"))?;
+            Ok(Some(FeedScope::Repo {
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+            }))
+        }
+        "repos" => {
+            let mut deduped = Vec::new();
+            let mut seen = HashSet::new();
+            for raw in items
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let normalized = normalize_repo_scope_item(raw)
+                    .ok_or_else(|| ApiError::bad_request("invalid repo scope item"))?;
+                let key = normalized.to_ascii_lowercase();
+                if seen.insert(key) {
+                    deduped.push(normalized);
+                }
+            }
+            if deduped.is_empty() {
+                return Ok(Some(FeedScope::Repos { items: Vec::new() }));
+            }
+            if deduped.len() > 12 {
+                return Err(ApiError::bad_request("scope repos items exceeds limit"));
+            }
+            Ok(Some(FeedScope::Repos { items: deduped }))
+        }
+        "org" => {
+            let org = org
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| ApiError::bad_request("scope=org requires org"))?;
+            Ok(Some(FeedScope::Org {
+                org: org.to_owned(),
+            }))
+        }
+        "mine" => Ok(Some(FeedScope::Mine)),
+        value => Err(ApiError::bad_request(format!("invalid scope: {value}"))),
     }
 }
 
@@ -7620,8 +7727,10 @@ async fn load_dashboard_feed_signatures(
     state: &AppState,
     user_id: &str,
     types: FeedTypeSelection,
+    scope: Option<&FeedScope>,
+    viewer_login: Option<&str>,
 ) -> Result<Vec<String>, ApiError> {
-    fetch_feed_items(state, user_id, None, types, 30)
+    fetch_feed_items(state, user_id, None, types, scope, viewer_login, 30)
         .await
         .map(|rows| {
             rows.into_iter()
@@ -7676,9 +7785,11 @@ pub async fn dashboard_updates(
     Query(q): Query<DashboardUpdatesQuery>,
 ) -> Result<Json<DashboardUpdatesResponse>, ApiError> {
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
     let previous = decode_dashboard_updates_token(q.token.as_deref())?;
     let include = parse_dashboard_update_include(q.include.as_deref())?;
     let feed_types = parse_dashboard_feed_type(q.feed_type.as_deref())?;
+    let scope = parse_feed_scope(q.scope.as_deref(), q.items.as_deref(), q.org.as_deref())?;
 
     let mut next_token = DashboardUpdatesToken::default();
     let mut lists = DashboardUpdatesLists {
@@ -7688,8 +7799,14 @@ pub async fn dashboard_updates(
     };
 
     if include.feed {
-        let signatures =
-            load_dashboard_feed_signatures(state.as_ref(), &user_id, feed_types).await?;
+        let signatures = load_dashboard_feed_signatures(
+            state.as_ref(),
+            &user_id,
+            feed_types,
+            scope.as_ref(),
+            Some(viewer.login.as_str()),
+        )
+        .await?;
         lists.feed = Some(build_dashboard_list_update(
             previous.as_ref().map(|token| token.feed.as_slice()),
             &signatures,
@@ -8547,6 +8664,9 @@ pub struct FeedQuery {
     cursor: Option<String>,
     limit: Option<i64>,
     types: Option<String>,
+    scope: Option<String>,
+    items: Option<String>,
+    org: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -9146,10 +9266,31 @@ async fn fetch_feed_items(
     user_id: &str,
     cursor: Option<&StreamCursor>,
     types: FeedTypeSelection,
+    scope: Option<&FeedScope>,
+    viewer_login: Option<&str>,
     limit: i64,
 ) -> Result<Vec<FeedRow>, ApiError> {
     let sql = r#"
-        WITH items AS (
+        WITH scoped_visible_repos AS (
+          SELECT *
+          FROM user_release_visible_repos vr
+          WHERE vr.user_id = ?
+            AND (
+              ? = ''
+              OR (? = 'repo' AND lower(vr.full_name) = lower(?))
+              OR (
+                ? = 'repos'
+                AND EXISTS (
+                  SELECT 1
+                  FROM json_each(?)
+                  WHERE lower(json_each.value) = lower(vr.full_name)
+                )
+              )
+              OR (? = 'org' AND lower(vr.owner_login) = lower(?))
+              OR (? = 'mine' AND lower(vr.owner_login) = lower(?))
+            )
+        ),
+        items AS (
           SELECT
             'release' AS kind,
             5 AS kind_rank,
@@ -9215,8 +9356,8 @@ async fn fetch_feed_items(
               r.react_rocket AS react_rocket,
               r.react_eyes AS react_eyes
             FROM repo_releases r
-            JOIN user_release_visible_repos sr
-              ON sr.user_id = ? AND sr.repo_id = r.repo_id
+            JOIN scoped_visible_repos sr
+              ON sr.repo_id = r.repo_id
           )
           UNION ALL
           SELECT
@@ -9273,7 +9414,10 @@ async fn fetch_feed_items(
           FROM social_activity_events e
           LEFT JOIN owned_repo_star_baselines ob
             ON ob.user_id = e.user_id AND ob.repo_id = e.repo_id
+          LEFT JOIN scoped_visible_repos vr
+            ON vr.repo_id = e.repo_id
           WHERE e.user_id = ?
+            AND (? = 0 OR (e.repo_full_name IS NOT NULL AND vr.repo_id IS NOT NULL))
         )
         SELECT
           i.kind, i.sort_ts, i.ts, i.id_key, i.entity_id, i.release_id, i.release_node_id,
@@ -9331,28 +9475,79 @@ async fn fetch_feed_items(
 
     let has_cursor = cursor.is_some();
     let cursor = cursor.cloned();
+    let scope_kind = match scope {
+        Some(FeedScope::Repo { .. }) => "repo",
+        Some(FeedScope::Repos { .. }) => "repos",
+        Some(FeedScope::Org { .. }) => "org",
+        Some(FeedScope::Mine) => "mine",
+        None => "",
+    };
+    let scope_repo_item = match scope {
+        Some(FeedScope::Repo { owner, repo }) => Some(format!("{owner}/{repo}")),
+        _ => None,
+    };
+    let scope_repo_items_json = match scope {
+        Some(FeedScope::Repos { items }) => {
+            Some(serde_json::to_string(items).map_err(ApiError::internal)?)
+        }
+        _ => None,
+    };
+    let scope_org = match scope {
+        Some(FeedScope::Org { org }) => Some(org.clone()),
+        _ => None,
+    };
+    let scope_mine_owner = if matches!(scope, Some(FeedScope::Mine)) {
+        Some(viewer_login.unwrap_or("").to_owned())
+    } else {
+        None
+    };
+    let scoped_all = scope.is_some();
 
     let qy = sqlx::query_as::<_, FeedRow>(sql)
         .bind(user_id)
+        .bind(scope_kind)
+        .bind(scope_kind)
+        .bind(scope_repo_item.as_deref())
+        .bind(scope_kind)
+        .bind(scope_repo_items_json.as_deref())
+        .bind(scope_kind)
+        .bind(scope_org.as_deref())
+        .bind(scope_kind)
+        .bind(scope_mine_owner.as_deref())
         .bind(user_id)
+        .bind(if scoped_all { 1_i64 } else { 0_i64 })
         .bind(user_id)
         .bind(user_id)
         .bind(user_id);
-    qy.bind(if types.releases { 1_i64 } else { 0_i64 })
-        .bind(if types.stars { 1_i64 } else { 0_i64 })
-        .bind(if types.followers { 1_i64 } else { 0_i64 })
-        .bind(if types.ambient { 1_i64 } else { 0_i64 })
-        .bind(if has_cursor { 1_i64 } else { 0_i64 })
-        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-        .bind(cursor.as_ref().map(|c| c.kind_rank))
-        .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
-        .bind(cursor.as_ref().map(|c| c.kind_rank))
-        .bind(cursor.as_ref().map(|c| c.id_key.as_str()))
-        .bind(limit)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::internal)
+    qy.bind(if scoped_all || types.releases {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if types.stars { 1_i64 } else { 0_i64 })
+    .bind(if scoped_all {
+        0_i64
+    } else if types.followers {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if scoped_all || types.ambient {
+        1_i64
+    } else {
+        0_i64
+    })
+    .bind(if has_cursor { 1_i64 } else { 0_i64 })
+    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+    .bind(cursor.as_ref().map(|c| c.kind_rank))
+    .bind(cursor.as_ref().map(|c| c.sort_ts.as_str()))
+    .bind(cursor.as_ref().map(|c| c.kind_rank))
+    .bind(cursor.as_ref().map(|c| c.id_key.as_str()))
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(ApiError::internal)
 }
 
 async fn fetch_visible_release_reaction_rows(
@@ -10147,7 +10342,9 @@ pub async fn list_feed(
 ) -> Result<Json<FeedResponse>, ApiError> {
     let started_at = Instant::now();
     let user_id = require_active_user_id(state.as_ref(), &session).await?;
+    let viewer = load_viewer_user(state.as_ref(), &user_id).await?;
     let types = parse_feed_types(q.types.as_deref())?;
+    let scope = parse_feed_scope(q.scope.as_deref(), q.items.as_deref(), q.org.as_deref())?;
 
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let cursor = q.cursor.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -10157,8 +10354,16 @@ pub async fn list_feed(
     };
 
     let db_started_at = Instant::now();
-    let rows =
-        fetch_feed_items(state.as_ref(), &user_id, feed_cursor.as_ref(), types, limit).await?;
+    let rows = fetch_feed_items(
+        state.as_ref(),
+        &user_id,
+        feed_cursor.as_ref(),
+        types,
+        scope.as_ref(),
+        Some(viewer.login.as_str()),
+        limit,
+    )
+    .await?;
     let db_elapsed = db_started_at.elapsed();
     let ai_enabled = state.config.ai.is_some();
 
@@ -21014,6 +21219,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: None,
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21060,6 +21268,9 @@ line two",
                 cursor: None,
                 limit: Some(2),
                 types: None,
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21080,6 +21291,9 @@ line two",
                 cursor: Some(cursor),
                 limit: Some(30),
                 types: None,
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21100,6 +21314,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: Some("stars".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21115,6 +21332,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: Some("releases".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21129,6 +21349,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: Some("announcements".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await;
@@ -21160,6 +21383,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: Some("releases".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21231,6 +21457,9 @@ line two",
                 token: None,
                 feed_type: None,
                 include: None,
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21262,6 +21491,9 @@ line two",
                 token: None,
                 feed_type: Some("all".to_owned()),
                 include: Some("feed,briefs,notifications".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21300,6 +21532,9 @@ line two",
                 token: Some(initial.token),
                 feed_type: Some("all".to_owned()),
                 include: Some("feed,briefs,notifications".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21365,6 +21600,9 @@ line two",
                 token: None,
                 feed_type: Some("releases".to_owned()),
                 include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21387,6 +21625,9 @@ line two",
                 token: Some(initial.token),
                 feed_type: Some("releases".to_owned()),
                 include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21421,6 +21662,9 @@ line two",
                 token: None,
                 feed_type: Some("all".to_owned()),
                 include: Some("notifications".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21472,6 +21716,9 @@ line two",
                 token: None,
                 feed_type: Some("stars".to_owned()),
                 include: Some("feed".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await
@@ -21595,6 +21842,9 @@ line two",
                 cursor: None,
                 limit: Some(30),
                 types: Some("stars".to_owned()),
+                scope: None,
+                items: None,
+                org: None,
             }),
         )
         .await

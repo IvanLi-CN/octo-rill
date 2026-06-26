@@ -7,6 +7,7 @@ import {
 	readStartupPresentationSeed,
 } from "@/auth/startupCache";
 import {
+	buildDashboardRouteNavigation,
 	buildDashboardRouteUrl,
 	buildDashboardWarmRouteState,
 	isDashboardPathname,
@@ -75,7 +76,7 @@ export function DashboardRouteShell(props: {
 			return;
 		}
 		void router.navigate({
-			to: canonicalUrl,
+			...buildDashboardRouteNavigation(routeState),
 			replace: true,
 		});
 	}, [
@@ -83,6 +84,7 @@ export function DashboardRouteShell(props: {
 		routeState.activeReleaseId,
 		routeState.activeReleaseLocator,
 		router,
+		routeState,
 	]);
 
 	const fallback =
@@ -123,7 +125,7 @@ export function DashboardRouteShell(props: {
 				onRetryBoot={() => auth.refreshAuth()}
 				onRouteStateChange={(nextRouteState, options) => {
 					void router.navigate({
-						to: buildDashboardRouteUrl(nextRouteState),
+						...buildDashboardRouteNavigation(nextRouteState),
 						replace: options?.replace,
 					});
 				}}

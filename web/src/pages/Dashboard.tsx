@@ -52,18 +52,28 @@ import { useMediaQuery } from "@/lib/useMediaQuery";
 import {
 	buildDashboardReleaseTarget,
 	buildDashboardRouteUrl,
+	buildDashboardScopeHref,
+	buildDashboardScopeSignature,
 	buildDashboardWarmRouteState,
+	isScopedDashboardRouteState,
 	parseDashboardRouteStateFromLocation,
 	releaseLocatorFromReleaseDetail,
+	type DashboardScope,
 	type DashboardReleaseTarget,
 	type DashboardRouteState,
 } from "@/dashboard/routeState";
+import {
+	buildDashboardScopeSummary,
+	DASHBOARD_MINE_ENTRY_LABEL,
+	resolveDashboardScopeRepoNames,
+} from "@/dashboard/scopeSummary";
 import {
 	type DashboardLiveUpdateNotice,
 	useDashboardLiveUpdates,
 } from "@/dashboard/useDashboardLiveUpdates";
 import {
 	DashboardMobileControlBand,
+	DASHBOARD_TAB_OPTIONS,
 	type DashboardTab as Tab,
 	DashboardTabsList,
 } from "@/pages/DashboardControlBand";
@@ -118,6 +128,10 @@ type FeedLiveBoundaryNotice = DashboardLiveUpdateNotice & {
 	hydrated?: boolean;
 	sealed?: boolean;
 };
+
+const SCOPED_TAB_OPTIONS = DASHBOARD_TAB_OPTIONS.filter(
+	(option) => option.value === "all" || option.value === "releases",
+);
 
 type DashboardLiveNoticeState = {
 	feed?: Partial<Record<FeedRequestType, FeedLiveBoundaryNotice[]>>;
@@ -270,7 +284,11 @@ function resolveLaneForItem(
 function filterFeedItemsForTab(
 	items: FeedItem[],
 	tab: "all" | "releases" | "stars" | "followers",
+	options?: {
+		scoped?: boolean;
+	},
 ) {
+	const scoped = options?.scoped ?? false;
 	switch (tab) {
 		case "releases":
 			return items.filter((item) => item.kind === "release");
@@ -279,7 +297,16 @@ function filterFeedItemsForTab(
 		case "followers":
 			return items.filter((item) => item.kind === "follower_received");
 		default:
-			return items;
+			return scoped
+				? items.filter(
+						(item) =>
+							item.kind === "release" ||
+							item.kind === "repo_star_received" ||
+							item.kind === "announcement" ||
+							item.kind === "release_update" ||
+							item.kind === "repo_forked",
+					)
+				: items;
 	}
 }
 
@@ -316,6 +343,7 @@ const REACTION_CONTENTS: ReactionContent[] = [
 ];
 
 type DashboardSessionState = {
+	scopeSignature: string | null;
 	notifications: NotificationItem[];
 	briefs: BriefItem[];
 	selectedBriefId: string | null;
@@ -327,6 +355,95 @@ type DashboardSessionState = {
 };
 
 const dashboardSessionStateByUser = new Map<string, DashboardSessionState>();
+
+function ScopedSummaryCard(props: {
+	scope: DashboardScope;
+	feedItems: FeedItem[];
+	desktop?: boolean;
+}) {
+	const { scope, feedItems, desktop = false } = props;
+	const feedRepoNames = Array.from(
+		new Set(
+			feedItems
+				.map((item) => item.repo_full_name?.trim())
+				.filter((value): value is string => Boolean(value)),
+		),
+	);
+	const repoNames = resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const releaseCount = feedItems.filter(
+		(item) => item.kind === "release",
+	).length;
+	const activityCount = feedItems.length - releaseCount;
+	const summary = buildDashboardScopeSummary(scope, repoNames.length);
+
+	return (
+		<div
+			className={[
+				"rounded-[28px] border border-border/70 bg-card/82 shadow-sm backdrop-blur",
+				desktop ? "p-5" : "mb-4 p-4 sm:p-5",
+			].join(" ")}
+			data-dashboard-scope-summary={scope.kind}
+			data-dashboard-scope-summary-layout={desktop ? "desktop" : "mobile"}
+		>
+			<div className="flex items-start justify-between gap-3">
+				<div className="min-w-0">
+					<p className="font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
+						{summary.kicker}
+					</p>
+					<h2 className="mt-1 text-xl font-semibold tracking-tight text-foreground">
+						{summary.title}
+					</h2>
+				</div>
+				<div className="inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+					<span>{summary.chip}</span>
+					<span aria-hidden="true">·</span>
+					<span>{summary.secondary}</span>
+				</div>
+			</div>
+
+			<p className="mt-3 text-sm leading-6 text-muted-foreground">
+				{summary.description}
+			</p>
+
+			<div className="mt-4 grid gap-3 sm:grid-cols-2">
+				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+						发布
+					</p>
+					<p className="mt-1 text-lg font-semibold text-foreground">
+						{releaseCount}
+					</p>
+				</div>
+				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+						动态
+					</p>
+					<p className="mt-1 text-lg font-semibold text-foreground">
+						{activityCount}
+					</p>
+				</div>
+			</div>
+
+			{repoNames.length > 0 ? (
+				<div className="mt-4 flex flex-wrap gap-2">
+					{repoNames.slice(0, desktop ? 8 : 6).map((repo) => (
+						<span
+							key={repo}
+							className="inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78"
+						>
+							{repo}
+						</span>
+					))}
+					{repoNames.length > (desktop ? 8 : 6) ? (
+						<span className="inline-flex items-center rounded-full border border-dashed border-border/65 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+							+{repoNames.length - (desktop ? 8 : 6)} 个仓库
+						</span>
+					) : null}
+				</div>
+			) : null}
+		</div>
+	);
+}
 
 function sortNotifications(items: NotificationItem[]) {
 	return items.slice().sort((a, b) => {
@@ -558,7 +675,14 @@ export function Dashboard(props: {
 					mode: "access" as const,
 				}
 			: null;
-	const sessionState = dashboardSessionStateByUser.get(me.user.id) ?? null;
+	const initialRouteState = controlledRouteState ?? parseDashboardQuery();
+	const scopeSignature = buildDashboardScopeSignature(initialRouteState.scope);
+	const storedSessionState =
+		dashboardSessionStateByUser.get(me.user.id) ?? null;
+	const sessionState =
+		storedSessionState?.scopeSignature === scopeSignature
+			? storedSessionState
+			: null;
 
 	const [busy, setBusy] = useState<string | null>(null);
 	const [hydrationSource] = useState<"warm-cache" | "network">(() =>
@@ -595,9 +719,12 @@ export function Dashboard(props: {
 	>(new Map());
 
 	const [uncontrolledRouteState, setUncontrolledRouteState] =
-		useState<DashboardRouteState>(() => parseDashboardQuery());
+		useState<DashboardRouteState>(() => initialRouteState);
 	const routeState = controlledRouteState ?? uncontrolledRouteState;
 	const tab = routeState.tab;
+	const scope = routeState.scope;
+	const scopedMode = isScopedDashboardRouteState(routeState);
+	const currentScopeSignature = buildDashboardScopeSignature(scope);
 	const activeReleaseId = routeState.activeReleaseId;
 	const activeReleaseLocator = routeState.activeReleaseLocator;
 	const releaseReturnTab = routeState.releaseReturnTab;
@@ -608,9 +735,10 @@ export function Dashboard(props: {
 						releaseId: activeReleaseId,
 						locator: activeReleaseLocator,
 						fromTab: releaseReturnTab,
+						scope,
 					})
 				: null,
-		[activeReleaseId, activeReleaseLocator, releaseReturnTab],
+		[activeReleaseId, activeReleaseLocator, releaseReturnTab, scope],
 	);
 	const setRouteState = useCallback(
 		(
@@ -647,6 +775,7 @@ export function Dashboard(props: {
 			: null;
 	const feed = useFeed(feedRequestType, {
 		initialData: warmFeedData,
+		scope,
 	});
 	const loadInitialFeed = feed.loadInitial;
 	const refreshFeed = feed.refresh;
@@ -912,16 +1041,19 @@ export function Dashboard(props: {
 	);
 
 	const refreshAll = useCallback(async () => {
-		await Promise.all([
-			refreshFeed(),
-			refreshSidebar({
-				includeNotifications:
-					hasDesktopSidebarInbox ||
-					tab === "inbox" ||
-					notificationsBootstrapCompletedRef.current,
-			}),
-		]);
-	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, tab]);
+		const tasks: Array<Promise<unknown>> = [refreshFeed()];
+		if (!scopedMode) {
+			tasks.push(
+				refreshSidebar({
+					includeNotifications:
+						hasDesktopSidebarInbox ||
+						tab === "inbox" ||
+						notificationsBootstrapCompletedRef.current,
+				}),
+			);
+		}
+		await Promise.all(tasks);
+	}, [hasDesktopSidebarInbox, refreshFeed, refreshSidebar, scopedMode, tab]);
 
 	const onDashboardLiveUpdate = useCallback(
 		(notices: DashboardLiveUpdateNotice[]) => {
@@ -957,11 +1089,13 @@ export function Dashboard(props: {
 	const { checkNow: checkDashboardUpdates } = useDashboardLiveUpdates({
 		enabled: shellHydrated && !feed.loadingInitial,
 		feedType: feedRequestType,
-		includeBriefs: true,
+		includeBriefs: !scopedMode,
 		includeNotifications:
-			hasDesktopSidebarInbox ||
-			tab === "inbox" ||
-			notificationsBootstrapCompletedRef.current,
+			!scopedMode &&
+			(hasDesktopSidebarInbox ||
+				tab === "inbox" ||
+				notificationsBootstrapCompletedRef.current),
+		scope,
 		onUpdate: onDashboardLiveUpdate,
 	});
 
@@ -1305,6 +1439,11 @@ export function Dashboard(props: {
 	}, [loadInitialFeed]);
 
 	useEffect(() => {
+		if (scopedMode) {
+			setSidebarLoading(false);
+			sidebarBootstrapCompletedRef.current = false;
+			return;
+		}
 		if (startupBootstrapRequestedRef.current) {
 			return;
 		}
@@ -1323,7 +1462,7 @@ export function Dashboard(props: {
 			});
 		};
 		startSidebarBootstrap(true);
-	}, [bootedFromWarmStart, refreshSidebar]);
+	}, [bootedFromWarmStart, refreshSidebar, scopedMode]);
 
 	useEffect(() => {
 		if (reactionTokenBootstrapRequestedRef.current) {
@@ -2142,37 +2281,40 @@ export function Dashboard(props: {
 		(nextTab: Tab) => {
 			setRouteState({
 				tab: nextTab,
+				scope,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
-				releaseReturnTab: "briefs",
+				releaseReturnTab: scope ? "all" : "briefs",
 			});
 		},
-		[setRouteState],
+		[scope, setRouteState],
 	);
 
 	const onOpenReleaseDetail = useCallback(
 		(target: DashboardReleaseTarget) => {
 			setRouteState({
 				tab: target.fromTab,
+				scope: target.scope ?? scope,
 				activeReleaseId: target.releaseId,
 				activeReleaseLocator: target.locator,
 				releaseReturnTab: target.fromTab,
 			});
 		},
-		[setRouteState],
+		[scope, setRouteState],
 	);
 
 	const onCloseReleaseDetail = useCallback(() => {
 		setRouteState(
 			{
 				tab: releaseReturnTab,
+				scope,
 				activeReleaseId: null,
 				activeReleaseLocator: null,
 				releaseReturnTab,
 			},
 			{ replace: true },
 		);
-	}, [releaseReturnTab, setRouteState]);
+	}, [releaseReturnTab, scope, setRouteState]);
 
 	const onReleaseDetailResolved = useCallback(
 		(detail: {
@@ -2191,6 +2333,7 @@ export function Dashboard(props: {
 			setRouteState(
 				{
 					tab,
+					scope,
 					activeReleaseId: detail.release_id,
 					activeReleaseLocator: locator,
 					releaseReturnTab,
@@ -2198,15 +2341,17 @@ export function Dashboard(props: {
 				{ replace: true },
 			);
 		},
-		[activeReleaseLocator, releaseReturnTab, setRouteState, tab],
+		[activeReleaseLocator, releaseReturnTab, scope, setRouteState, tab],
 	);
 	const showPageLaneSelector = tab === "all" || tab === "releases";
-	const renderSidebarInbox = hasDesktopSidebarInbox;
+	const renderSidebarInbox = !scopedMode && hasDesktopSidebarInbox;
 	const renderSidebar =
 		(tab === "briefs" && hasTabletSidebar) || renderSidebarInbox;
-	const dashboardContentLayoutClassName = renderSidebar
-		? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
-		: "grid gap-4 md:gap-6";
+	const dashboardContentLayoutClassName = scopedMode
+		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
+		: renderSidebar
+			? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
+			: "grid gap-4 md:gap-6";
 	const bootNetworkUnavailable =
 		bootErrorKind === "offline" || bootErrorKind === "network";
 	const retryDashboardNetwork = useCallback(async () => {
@@ -2216,7 +2361,9 @@ export function Dashboard(props: {
 	const renderFeedPanel = (
 		mode: "all" | "releases" | "stars" | "followers",
 	) => {
-		const filteredItems = filterFeedItemsForTab(feed.items, mode);
+		const filteredItems = filterFeedItemsForTab(feed.items, mode, {
+			scoped: scopedMode,
+		});
 		const feedNetworkUnavailable =
 			feed.error?.phase === "initial" &&
 			(feed.error.kind === "offline" || feed.error.kind === "network");
@@ -2236,6 +2383,8 @@ export function Dashboard(props: {
 			networkUnavailable && !feed.loadingInitial && filteredItems.length === 0;
 		const offlineWithCachedContent =
 			networkUnavailable && filteredItems.length > 0;
+		const scopedEmpty =
+			scopedMode && !feed.loadingInitial && filteredItems.length === 0;
 		return (
 			<>
 				{offlineWithCachedContent ? (
@@ -2313,7 +2462,32 @@ export function Dashboard(props: {
 				!feed.loadingInitial &&
 				filteredItems.length === 0 ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-						{accessSyncRunning ? (
+						{scopedEmpty && scope ? (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									当前范围暂无更新
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm leading-6">
+									最近还没有新的发布或相关动态。你可以稍后再看，或返回工作台浏览其他更新。
+								</p>
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button asChild variant="outline">
+										<InternalLink href="/" to="/">
+											返回工作台
+										</InternalLink>
+									</Button>
+									<Button
+										type="button"
+										onClick={() => {
+											void refreshFeed();
+										}}
+									>
+										<RefreshCcw className="size-4" />
+										重新加载
+									</Button>
+								</div>
+							</>
+						) : accessSyncRunning ? (
 							<>
 								<h2 className="text-base font-semibold tracking-tight">
 									正在同步你的 Star / Release
@@ -2329,7 +2503,7 @@ export function Dashboard(props: {
 									还没有缓存内容
 								</h2>
 								<p className="text-muted-foreground mt-1 text-sm">
-									可以先同步一次，把 release、被加星和被关注记录都拉下来喵。
+									可以先同步一次，加载发布、星标和关注动态。
 								</p>
 								<div className="mt-4 flex flex-wrap gap-2">
 									<Button disabled={Boolean(busy)} onClick={onSyncAll}>
@@ -2343,6 +2517,7 @@ export function Dashboard(props: {
 
 				<FeedGroupedList
 					mode={mode}
+					sourceTab={mode}
 					items={filteredItems}
 					currentViewer={{
 						login: me.user.login,
@@ -2466,6 +2641,7 @@ export function Dashboard(props: {
 
 	useEffect(() => {
 		dashboardSessionStateByUser.set(me.user.id, {
+			scopeSignature: currentScopeSignature,
 			notifications,
 			briefs,
 			selectedBriefId,
@@ -2477,6 +2653,7 @@ export function Dashboard(props: {
 		});
 	}, [
 		briefs,
+		currentScopeSignature,
 		me.user.id,
 		notifications,
 		reactionTokenConfigured,
@@ -2532,6 +2709,9 @@ export function Dashboard(props: {
 					syncingAll={syncingAll}
 					syncProgress={accessSyncProgress}
 					onSyncAll={onSyncAll}
+					showMineEntry={me.dashboard.include_own_releases}
+					mineHref={buildDashboardScopeHref({ kind: "mine" })}
+					mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 					mobileControlBand={
 						<DashboardMobileControlBand
 							tab={tab}
@@ -2540,6 +2720,9 @@ export function Dashboard(props: {
 							pageLane={effectivePageDefaultLane}
 							onSelectPageLane={onSelectPageDefaultLane}
 							layout="stacked"
+							tabOptions={
+								scopedMode ? SCOPED_TAB_OPTIONS : DASHBOARD_TAB_OPTIONS
+							}
 						/>
 					}
 				/>
@@ -2555,7 +2738,9 @@ export function Dashboard(props: {
 					className="gap-4 sm:gap-6"
 				>
 					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
-						<DashboardTabsList />
+						<DashboardTabsList
+							options={scopedMode ? SCOPED_TAB_OPTIONS : DASHBOARD_TAB_OPTIONS}
+						/>
 
 						<div
 							className="flex min-h-8 items-center gap-2 self-center"
@@ -2595,6 +2780,11 @@ export function Dashboard(props: {
 
 					<div className={dashboardContentLayoutClassName}>
 						<section className="min-w-0">
+							{scopedMode && scope ? (
+								<div className="lg:hidden">
+									<ScopedSummaryCard scope={scope} feedItems={feed.items} />
+								</div>
+							) : null}
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
 							</TabsContent>
@@ -2674,7 +2864,15 @@ export function Dashboard(props: {
 							</TabsContent>
 						</section>
 
-						{renderSidebar ? (
+						{scopedMode && scope ? (
+							<aside className="hidden space-y-4 lg:block">
+								<ScopedSummaryCard
+									scope={scope}
+									feedItems={feed.items}
+									desktop
+								/>
+							</aside>
+						) : renderSidebar ? (
 							<aside className="space-y-4 sm:space-y-6">
 								{tab === "briefs" ? (
 									<BriefListCard
