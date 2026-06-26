@@ -131,6 +131,74 @@ export const SyncAll: Story = {
 	},
 };
 
+export const SyncAccessRefreshFailed: Story = {
+	args: {
+		detail: buildDetail(
+			"sync.access_refresh",
+			{ user_id: TARGET_USER_ID },
+			{
+				starred: { repos: 5 },
+				release: { repos: 5, releases: 8 },
+				social: { repo_stars: 3, followers: 2, events: 1 },
+				notifications: { notifications: 7 },
+				social_error: "followers timeout",
+				notifications_error: "notifications 502 upstream",
+			},
+			[
+				{
+					stage: "star_failed",
+					operation: "sync starred graphql",
+					error_kind: "timeout",
+					error_stage: "timeout",
+					retryable: true,
+					http_status: 200,
+					timeout_ms: 30000,
+					elapsed_ms: 30004,
+					attempts: 3,
+					retry_limit: 3,
+					error_chain: "sync starred graphql: timed out after 30s",
+				},
+			],
+			{
+				diagnostics: {
+					business_outcome: {
+						code: "failed",
+						label: "Star 阶段失败",
+						message:
+							"Star 阶段在 timeout 后失败，任务未进入 release/social/notifications 完整收敛。",
+					},
+					sync_access_refresh: {
+						log_available: true,
+						log_download_path:
+							"/api/admin/jobs/realtime/task-sync.access_refresh/log",
+						star_repos: 5,
+						release_repos: 5,
+						releases: 8,
+						social_repo_stars: 3,
+						social_followers: 2,
+						social_events: 1,
+						notifications: 7,
+						social_error: "followers timeout",
+						notifications_error: "notifications 502 upstream",
+						failure: {
+							operation: "sync starred graphql",
+							error_kind: "timeout",
+							error_stage: "timeout",
+							retryable: true,
+							http_status: 200,
+							timeout_ms: 30000,
+							elapsed_ms: 30004,
+							attempts: 3,
+							retry_limit: 3,
+							error_chain: "sync starred graphql: timed out after 30s",
+						},
+					},
+				},
+			},
+		),
+	},
+};
+
 export const SyncSubscriptions: Story = {
 	args: {
 		detail: buildDetail(
