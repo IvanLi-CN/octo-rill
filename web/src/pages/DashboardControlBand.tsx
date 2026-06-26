@@ -28,6 +28,8 @@ export const DASHBOARD_TAB_OPTIONS: Array<{
 	{ value: "inbox", mobileLabel: "收件箱", desktopLabel: "收件箱" },
 ];
 
+export type DashboardTabOption = (typeof DASHBOARD_TAB_OPTIONS)[number];
+
 function resolveLaneOption(lane: FeedLane) {
 	return (
 		FEED_LANE_OPTIONS.find((option) => option.lane === lane) ??
@@ -35,7 +37,11 @@ function resolveLaneOption(lane: FeedLane) {
 	);
 }
 
-export function DashboardTabsList(props: { className?: string }) {
+export function DashboardTabsList(props: {
+	className?: string;
+	options?: DashboardTabOption[];
+}) {
+	const options = props.options ?? DASHBOARD_TAB_OPTIONS;
 	return (
 		<TabsList
 			className={cn(
@@ -43,7 +49,7 @@ export function DashboardTabsList(props: { className?: string }) {
 				props.className,
 			)}
 		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => (
+			{options.map((option) => (
 				<TabsTrigger
 					key={option.value}
 					value={option.value}
@@ -62,8 +68,15 @@ function DashboardMobileTabStrip(props: {
 	onSelectTab: (tab: DashboardTab) => void;
 	distributed?: boolean;
 	className?: string;
+	options?: DashboardTabOption[];
 }) {
-	const { tab, onSelectTab, distributed = false, className } = props;
+	const {
+		tab,
+		onSelectTab,
+		distributed = false,
+		className,
+		options = DASHBOARD_TAB_OPTIONS,
+	} = props;
 
 	return (
 		<div
@@ -76,7 +89,7 @@ function DashboardMobileTabStrip(props: {
 				className,
 			)}
 		>
-			{DASHBOARD_TAB_OPTIONS.map((option) => {
+			{options.map((option) => {
 				const active = option.value === tab;
 				return (
 					<button
@@ -233,6 +246,7 @@ export function DashboardMobileControlBand(props: {
 	onSelectPageLane: (lane: FeedLane) => void;
 	layout?: "inline" | "stacked";
 	className?: string;
+	tabOptions?: DashboardTabOption[];
 }) {
 	const {
 		tab,
@@ -242,6 +256,7 @@ export function DashboardMobileControlBand(props: {
 		onSelectPageLane,
 		layout = "inline",
 		className,
+		tabOptions = DASHBOARD_TAB_OPTIONS,
 	} = props;
 
 	if (layout === "stacked") {
@@ -259,6 +274,7 @@ export function DashboardMobileControlBand(props: {
 						<DashboardMobileTabStrip
 							tab={tab}
 							onSelectTab={onSelectTab}
+							options={tabOptions}
 							distributed
 						/>
 						<DashboardMobileLaneMenu
@@ -281,7 +297,11 @@ export function DashboardMobileControlBand(props: {
 		>
 			<div className="-mx-1 overflow-x-auto px-1 no-scrollbar">
 				<div className="flex min-w-max items-center gap-2">
-					<DashboardMobileTabStrip tab={tab} onSelectTab={onSelectTab} />
+					<DashboardMobileTabStrip
+						tab={tab}
+						onSelectTab={onSelectTab}
+						options={tabOptions}
+					/>
 					<FeedPageLaneSelector
 						value={pageLane}
 						onValueChange={onSelectPageLane}

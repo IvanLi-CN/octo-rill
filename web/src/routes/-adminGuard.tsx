@@ -17,6 +17,9 @@ export function useRequiredAdmin() {
 				tab: undefined,
 				release: undefined,
 				from: undefined,
+				scope: undefined,
+				items: undefined,
+				org: undefined,
 			},
 			replace: true,
 		});

@@ -213,6 +213,7 @@ export type MeResponse = {
 		daily_boundary_local: string;
 		daily_boundary_time_zone: string | null;
 		daily_boundary_utc_offset_minutes: number;
+		include_own_releases: boolean;
 	};
 };
 export type DashboardUpdateList = {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 import { apiGet, type DashboardUpdatesResponse } from "@/api";
+import type { DashboardScope } from "@/dashboard/routeState";
 import type { FeedRequestType } from "@/feed/useFeed";
 
 const FOREGROUND_POLL_MS = 30_000;
@@ -54,8 +55,33 @@ function buildBaselineKey(options: {
 	feedType: FeedRequestType;
 	includeBriefs: boolean;
 	includeNotifications: boolean;
+	scope: DashboardScope | null;
 }) {
-	return `${options.feedType}|briefs:${options.includeBriefs ? "1" : "0"}|notifications:${options.includeNotifications ? "1" : "0"}`;
+	const scopeKey = !options.scope
+		? "global"
+		: options.scope.kind === "repo"
+			? `repo:${options.scope.owner}/${options.scope.repo}`
+			: options.scope.kind === "repos"
+				? `repos:${options.scope.items.join(",")}`
+				: options.scope.kind === "org"
+					? `org:${options.scope.org}`
+					: "mine";
+	return `${options.feedType}|briefs:${options.includeBriefs ? "1" : "0"}|notifications:${options.includeNotifications ? "1" : "0"}|scope:${scopeKey}`;
+}
+
+function appendScopeParams(
+	params: URLSearchParams,
+	scope: DashboardScope | null,
+) {
+	if (!scope) return;
+	params.set("scope", scope.kind);
+	if (scope.kind === "repo") {
+		params.set("items", `${scope.owner}/${scope.repo}`);
+	} else if (scope.kind === "repos" && scope.items.length > 0) {
+		params.set("items", scope.items.join(","));
+	} else if (scope.kind === "org") {
+		params.set("org", scope.org);
+	}
 }
 
 export function useDashboardLiveUpdates(options: {
@@ -63,14 +89,22 @@ export function useDashboardLiveUpdates(options: {
 	feedType: FeedRequestType;
 	includeNotifications: boolean;
 	includeBriefs: boolean;
+	scope?: DashboardScope | null;
 	onUpdate: (notices: DashboardLiveUpdateNotice[]) => void;
 }) {
-	const { enabled, feedType, includeNotifications, includeBriefs, onUpdate } =
-		options;
+	const {
+		enabled,
+		feedType,
+		includeNotifications,
+		includeBriefs,
+		scope = null,
+		onUpdate,
+	} = options;
 	const baselineKey = buildBaselineKey({
 		feedType,
 		includeBriefs,
 		includeNotifications,
+		scope,
 	});
 	const tokenRef = useRef<string | null>(null);
 	const timerRef = useRef<number | null>(null);
@@ -83,6 +117,7 @@ export function useDashboardLiveUpdates(options: {
 		(options?: DashboardLiveUpdateCheckOptions) => Promise<void>
 	>(async () => undefined);
 	const feedTypeRef = useRef(feedType);
+	const scopeRef = useRef(scope);
 	const includeRef = useRef({ includeBriefs, includeNotifications });
 	const pendingIncludeBootstrapRef = useRef<DashboardLiveUpdateList[]>([]);
 	const queuedCheckRef = useRef<DashboardLiveUpdateCheckOptions | null>(null);
@@ -93,6 +128,7 @@ export function useDashboardLiveUpdates(options: {
 				feedType: feedTypeRef.current,
 				includeBriefs: includeRef.current.includeBriefs,
 				includeNotifications: includeRef.current.includeNotifications,
+				scope: scopeRef.current,
 			}),
 		[],
 	);
@@ -102,8 +138,9 @@ export function useDashboardLiveUpdates(options: {
 	}, [onUpdate]);
 
 	useEffect(() => {
-		if (feedTypeRef.current !== feedType) {
+		if (feedTypeRef.current !== feedType || scopeRef.current !== scope) {
 			feedTypeRef.current = feedType;
+			scopeRef.current = scope;
 			includeRef.current = { includeBriefs, includeNotifications };
 			pendingIncludeBootstrapRef.current = [];
 			queuedCheckRef.current = null;
@@ -124,7 +161,7 @@ export function useDashboardLiveUpdates(options: {
 				...newlyIncluded,
 			];
 		}
-	}, [feedType, includeBriefs, includeNotifications]);
+	}, [feedType, includeBriefs, includeNotifications, scope]);
 
 	const clearTimer = useCallback(() => {
 		if (timerRef.current === null) return;
@@ -192,6 +229,7 @@ export function useDashboardLiveUpdates(options: {
 						includeParamForLists(bootstrapInclude),
 					);
 					bootstrapParams.set("token", tokenRef.current);
+					appendScopeParams(bootstrapParams, scope);
 					const bootstrapResponse = await apiGet<DashboardUpdatesResponse>(
 						`/api/dashboard/updates?${bootstrapParams.toString()}`,
 					);
@@ -210,6 +248,7 @@ export function useDashboardLiveUpdates(options: {
 				if (tokenRef.current) {
 					params.set("token", tokenRef.current);
 				}
+				appendScopeParams(params, scope);
 				const response = await apiGet<DashboardUpdatesResponse>(
 					`/api/dashboard/updates?${params.toString()}`,
 				);
@@ -274,6 +313,7 @@ export function useDashboardLiveUpdates(options: {
 			feedType,
 			includeBriefs,
 			includeNotifications,
+			scope,
 			currentBaselineKey,
 			scheduleNext,
 		],

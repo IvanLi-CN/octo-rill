@@ -28,6 +28,7 @@ import type { FeedLoadError } from "@/feed/useFeed";
 import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 import type { DashboardReleaseTarget } from "@/dashboard/routeState";
+import type { DashboardTab } from "@/pages/DashboardControlBand";
 
 type BriefLike = BriefSnapshotCandidate & {
 	date: string;
@@ -578,6 +579,7 @@ export function FeedGroupedList(
 		onLoadMore: () => void;
 		onRetryInitial: () => void;
 		mode: "all" | "releases" | "stars" | "followers";
+		sourceTab?: DashboardTab | null;
 		briefs: BriefLike[];
 		dailyBoundaryLocal: string | null | undefined;
 		dailyBoundaryTimeZone: string | null | undefined;
@@ -597,6 +599,7 @@ export function FeedGroupedList(
 		onLoadMore,
 		onRetryInitial,
 		mode,
+		sourceTab = null,
 		briefs,
 		dailyBoundaryLocal,
 		dailyBoundaryTimeZone,
@@ -886,7 +889,7 @@ export function FeedGroupedList(
 								brief={pendingBrief ? null : brief}
 								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
 								items={group.items}
-								feedCardProps={feedCardProps}
+								feedCardProps={{ ...feedCardProps, sourceTab }}
 							/>
 						) : (
 							<>
@@ -899,7 +902,7 @@ export function FeedGroupedList(
 								/>
 								{renderFeedItemsWithBoundaries(
 									group.items,
-									feedCardProps,
+									{ ...feedCardProps, sourceTab },
 									boundariesByAfterKey,
 								)}
 							</>
