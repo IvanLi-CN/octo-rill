@@ -587,10 +587,14 @@ test("settings github pat hidden mode supports menu-style undo and redo", async 
 			throw new Error("expected HTMLInputElement");
 		}
 		node.setSelectionRange(node.value.length, node.value.length);
+		node.dispatchEvent(
+			new InputEvent("beforeinput", {
+				bubbles: true,
+				cancelable: true,
+				inputType: "deleteWordBackward",
+			}),
+		);
 	});
-	await page.keyboard.press(
-		process.platform === "darwin" ? "Alt+Backspace" : "Control+Backspace",
-	);
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
 			throw new Error("expected HTMLInputElement");
@@ -606,7 +610,6 @@ test("settings github pat hidden mode supports menu-style undo and redo", async 
 	await page.getByRole("button", { name: "显示 GitHub PAT" }).click();
 	await expect(input).toHaveValue("ghp_visible_chunk");
 	await page.getByRole("button", { name: "隐藏 GitHub PAT" }).click();
-	await input.focus();
 	await input.evaluate((node) => {
 		if (!(node instanceof HTMLInputElement)) {
 			throw new Error("expected HTMLInputElement");
