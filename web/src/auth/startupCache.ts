@@ -196,8 +196,10 @@ export function readDashboardWarmSnapshot(input: {
 	const cachedActiveReleaseLocatorKey =
 		cached.routeState.activeReleaseLocatorKey ?? null;
 	const cachedReleaseReturnTab = cached.routeState.releaseReturnTab ?? "briefs";
+	const cachedScopeSignature = cached.routeState.scopeSignature ?? null;
 	if (
 		cached.routeState.tab !== input.routeState.tab ||
+		cachedScopeSignature !== input.routeState.scopeSignature ||
 		cached.routeState.activeReleaseId !== input.routeState.activeReleaseId ||
 		cachedActiveReleaseLocatorKey !==
 			input.routeState.activeReleaseLocatorKey ||
@@ -209,6 +211,7 @@ export function readDashboardWarmSnapshot(input: {
 		...cached,
 		routeState: {
 			...cached.routeState,
+			scopeSignature: cachedScopeSignature,
 			activeReleaseLocatorKey: cachedActiveReleaseLocatorKey,
 			releaseReturnTab: cachedReleaseReturnTab,
 		},

@@ -25,11 +25,15 @@ export function buildMockMeResponse(
 	user: MockUser,
 	options?: {
 		access_sync?: MockAccessSync;
+		include_own_releases?: boolean;
 	},
 ) {
 	return {
 		user,
-		dashboard: mockDashboardBootstrap,
+		dashboard: {
+			...mockDashboardBootstrap,
+			include_own_releases: options?.include_own_releases ?? false,
+		},
 		...(options?.access_sync ? { access_sync: options.access_sync } : {}),
 	};
 }

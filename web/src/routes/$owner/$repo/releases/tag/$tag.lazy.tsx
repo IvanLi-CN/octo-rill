@@ -15,8 +15,16 @@ export const Route = createLazyFileRoute("/$owner/$repo/releases/tag/$tag")({
 function DashboardReleaseRouteComponent() {
 	const auth = useAuthBootstrap();
 	const params = routeApi.useParams();
-	const search = routeApi.useSearch() as { from?: unknown };
+	const search = routeApi.useSearch() as {
+		from?: unknown;
+		scope?: unknown;
+		items?: unknown;
+		org?: unknown;
+	};
 	const from = typeof search.from === "string" ? search.from : null;
+	const scope = typeof search.scope === "string" ? search.scope : null;
+	const items = typeof search.items === "string" ? search.items : null;
+	const org = typeof search.org === "string" ? search.org : null;
 	if (auth.status === "pending") {
 		return <AppBoot />;
 	}
@@ -24,10 +32,10 @@ function DashboardReleaseRouteComponent() {
 		return (
 			<DashboardRouteShell
 				routeState={parseDashboardRouteState({
+					search: { from, scope, items, org },
 					owner: params.owner,
 					repo: params.repo,
 					tag: params.tag,
-					from,
 				})}
 			/>
 		);

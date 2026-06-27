@@ -41,10 +41,17 @@ import { VersionUpdateNotice } from "@/layout/VersionUpdateNotice";
 import type { NetworkErrorKind } from "@/lib/errorPresentation";
 import {
 	buildDashboardReleaseHref,
+	buildDashboardScopeHref,
 	buildDashboardReleaseTarget,
+	type DashboardScope,
 	releaseLocatorFromReleaseDetail,
 	type DashboardReleaseTarget,
 } from "@/dashboard/routeState";
+import {
+	buildDashboardScopeSummary,
+	DASHBOARD_MINE_ENTRY_LABEL,
+	resolveDashboardScopeRepoNames,
+} from "@/dashboard/scopeSummary";
 import type { RepoVisual } from "@/lib/repoVisual";
 import {
 	DashboardMobileControlBand,
@@ -62,6 +69,7 @@ import {
 import { type BriefItem, ReleaseDailyCard } from "@/sidebar/ReleaseDailyCard";
 import { ReleaseDetailCard } from "@/sidebar/ReleaseDetailCard";
 import { VersionMonitorStateProvider } from "@/version/versionMonitor";
+import { DASHBOARD_TAB_OPTIONS } from "@/pages/DashboardControlBand";
 
 type FeedMode =
 	| "default"
@@ -93,6 +101,9 @@ const EMPTY_STORY_LIVE_NOTICES: StoryLiveNotices = {};
 const EMPTY_STORY_DEFERRED_TABS: Tab[] = [];
 const EMPTY_STORY_REACTION_ERRORS: Record<string, string> = {};
 const EMPTY_STORY_FRESH_KEYS: string[] = [];
+const SCOPED_STORY_TAB_OPTIONS = DASHBOARD_TAB_OPTIONS.filter(
+	(option) => option.value === "all" || option.value === "releases",
+);
 
 function mergeStoryFeedNotice(
 	currentNotices: StoryFeedLiveNotice[],
@@ -202,7 +213,122 @@ const DASHBOARD_VIEWPORTS = {
 } as const;
 const HISTORY_RAW_MARKER = "raw-history-guardrails-marker";
 const FALLBACK_RAW_MARKER = "raw-fallback-release-marker";
-const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · owner release opt-in";
+const OWNER_RELEASE_OPT_IN_TITLE = "v2.64.0 · 仓库可见性更新";
+
+function filterStoryFeedItemsForTab(
+	items: FeedItem[],
+	tab: "all" | "releases" | "stars" | "followers",
+	scoped = false,
+) {
+	switch (tab) {
+		case "releases":
+			return items.filter((item) => item.kind === "release");
+		case "stars":
+			return items.filter((item) => item.kind === "repo_star_received");
+		case "followers":
+			return items.filter((item) => item.kind === "follower_received");
+		default:
+			return scoped
+				? items.filter(
+						(item) =>
+							item.kind === "release" ||
+							item.kind === "repo_star_received" ||
+							item.kind === "announcement" ||
+							item.kind === "release_update" ||
+							item.kind === "repo_forked",
+					)
+				: items;
+	}
+}
+
+function StoryScopedSummaryCard(props: {
+	scope: DashboardScope;
+	feedItems: FeedItem[];
+	desktop?: boolean;
+}) {
+	const { scope, feedItems, desktop = false } = props;
+	const feedRepoNames = Array.from(
+		new Set(
+			feedItems
+				.map((item) => item.repo_full_name?.trim())
+				.filter((value): value is string => Boolean(value)),
+		),
+	);
+	const repoNames = resolveDashboardScopeRepoNames(scope, feedRepoNames);
+	const releaseCount = feedItems.filter(
+		(item) => item.kind === "release",
+	).length;
+	const activityCount = feedItems.length - releaseCount;
+	const summary = buildDashboardScopeSummary(scope, repoNames.length);
+
+	return (
+		<div
+			className={[
+				"rounded-[28px] border border-border/70 bg-card/82 shadow-sm backdrop-blur",
+				desktop ? "p-5" : "mb-4 p-4 sm:p-5",
+			].join(" ")}
+			data-dashboard-scope-summary={scope.kind}
+			data-dashboard-scope-summary-layout={desktop ? "desktop" : "mobile"}
+		>
+			<div className="flex items-start justify-between gap-3">
+				<div className="min-w-0">
+					<p className="font-mono text-[11px] uppercase tracking-[0.22em] text-muted-foreground">
+						{summary.kicker}
+					</p>
+					<h2 className="mt-1 text-xl font-semibold tracking-tight text-foreground">
+						{summary.title}
+					</h2>
+				</div>
+				<div className="inline-flex shrink-0 items-center gap-2 rounded-full border border-border/70 bg-muted/35 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+					<span>{summary.chip}</span>
+					<span aria-hidden="true">·</span>
+					<span>{summary.secondary}</span>
+				</div>
+			</div>
+
+			<p className="mt-3 text-sm leading-6 text-muted-foreground">
+				{summary.description}
+			</p>
+
+			<div className="mt-4 grid gap-3 sm:grid-cols-2">
+				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+						发布
+					</p>
+					<p className="mt-1 text-lg font-semibold text-foreground">
+						{releaseCount}
+					</p>
+				</div>
+				<div className="rounded-2xl border border-border/65 bg-background/72 px-4 py-3">
+					<p className="font-mono text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+						动态
+					</p>
+					<p className="mt-1 text-lg font-semibold text-foreground">
+						{activityCount}
+					</p>
+				</div>
+			</div>
+
+			{repoNames.length > 0 ? (
+				<div className="mt-4 flex flex-wrap gap-2">
+					{repoNames.slice(0, desktop ? 8 : 6).map((repo) => (
+						<span
+							key={repo}
+							className="inline-flex items-center rounded-full border border-border/65 bg-background/72 px-3 py-1 font-mono text-[11px] text-foreground/78"
+						>
+							{repo}
+						</span>
+					))}
+					{repoNames.length > (desktop ? 8 : 6) ? (
+						<span className="inline-flex items-center rounded-full border border-dashed border-border/65 px-3 py-1 font-mono text-[11px] text-muted-foreground">
+							+{repoNames.length - (desktop ? 8 : 6)} 个仓库
+						</span>
+					) : null}
+				</div>
+			) : null}
+		</div>
+	);
+}
 
 function storyBriefReleaseHref(owner: string, repo: string, tag: string) {
 	return buildDashboardReleaseHref({ owner, repo, tag }, "briefs");
@@ -411,10 +537,11 @@ const PROJECT_OWNER_LOGIN = "IvanLi-CN" as const;
 const PROJECT_OWNER_GITHUB_USER_ID = 30215105 as const;
 const PROJECT_REPO_FULL_NAME = "IvanLi-CN/octo-rill" as const;
 const PROJECT_REPO_URL = "https://github.com/IvanLi-CN/octo-rill" as const;
+const STORYBOOK_VIEWER_AVATAR = avatarDataUrl("IL", "#6f89b6", "#fffaf0");
 
 const STORYBOOK_VIEWER = {
 	login: PROJECT_OWNER_LOGIN,
-	avatar_url: githubAvatarUrlByUserId(PROJECT_OWNER_GITHUB_USER_ID),
+	avatar_url: STORYBOOK_VIEWER_AVATAR,
 	html_url: "https://github.com/IvanLi-CN",
 } as const;
 
@@ -465,7 +592,7 @@ function buildFeedItem(
 		repo_full_name: PROJECT_REPO_FULL_NAME,
 		repo_visual: repoVisualFixtures.social,
 		title: `v${id}`,
-		body: "- This is a stable release\n- Includes performance improvements\n- Please update and rebuild images",
+		body: "- 稳定版本已发布\n- 包含性能与体验改进\n- 建议升级后重新同步",
 		body_truncated: false,
 		subtitle: null,
 		reason: null,
@@ -1259,6 +1386,36 @@ function buildForkItem(
 	};
 }
 
+function buildReleaseUpdateItem(
+	id: string,
+	overrides?: Partial<SocialFeedItem>,
+): SocialFeedItem {
+	return {
+		kind: "release_update",
+		ts: "2026-04-04T15:48:00+08:00",
+		id,
+		repo_full_name: PROJECT_REPO_FULL_NAME,
+		repo_visual: repoVisualFixtures.social,
+		title: "release bridge notes",
+		body: "Release updated",
+		body_truncated: false,
+		subtitle: "发布动态",
+		reason: null,
+		subject_type: "release",
+		html_url: `${PROJECT_REPO_URL}/releases/tag/release-bridge-notes`,
+		unread: null,
+		actor: {
+			login: "maintainer",
+			avatar_url: githubAvatarUrl("maintainer"),
+			html_url: "https://github.com/maintainer",
+		},
+		translated: null,
+		smart: null,
+		reactions: null,
+		...overrides,
+	};
+}
+
 const RUNTIME_PARITY_REPOS = [
 	"acme/rocket",
 	"acme/satellite",
@@ -1457,7 +1614,7 @@ function makeOwnReleaseOptInFeed(includeOwnRelease: boolean): FeedItem[] {
 			repo_full_name: "lobehub/lobe-chat",
 			repo_visual: repoVisualFixtures.avatar,
 			title: "桌面版 Stable v2.1.47",
-			body: "- external starred release\n- stays visible regardless of owner opt-in",
+			body: "- 已加入同步范围\n- 会持续显示在发布时间线中",
 			html_url: "https://github.com/lobehub/lobe-chat/releases/tag/v2.1.47",
 		}),
 		buildRepoStarItem("own-release-star", {
@@ -1480,26 +1637,107 @@ function makeOwnReleaseOptInFeed(includeOwnRelease: boolean): FeedItem[] {
 				repo_full_name: PROJECT_REPO_FULL_NAME,
 				repo_visual: repoVisualFixtures.social,
 				title: OWNER_RELEASE_OPT_IN_TITLE,
-				body: "- owner-only release\n- visible only when `我的发布` is enabled",
+				body: "- 已纳入个人同步范围\n- 会显示在你的发布时间线中",
 				html_url: `${PROJECT_REPO_URL}/releases/tag/v2.64.0`,
 				translated: {
 					lang: "zh-CN",
 					status: "ready",
-					title: "v2.64.0 · 自有仓库发布",
-					summary: "- 开启“我的发布”后进入发布流\n- 不会污染真实加星列表",
+					title: "v2.64.0 · 仓库可见性更新",
+					summary: "- 个人仓库发布已纳入阅读范围\n- 星标动态仍保持独立展示",
 				},
 				smart: {
 					lang: "zh-CN",
 					status: "ready",
-					title: "v2.64.0 · 版本变化",
+					title: "v2.64.0 · 阅读范围调整",
 					summary:
-						"- 仅 release 能见面扩展到 owner repo\n- Feed/详情/日报使用统一可见性来源",
+						"- 个人仓库发布现可直接进入阅读流\n- 详情、摘要与时间线保持一致",
 				},
 			}),
 		);
 	}
 
 	return items;
+}
+
+function makeScopedRepoFocusFeed(): FeedItem[] {
+	return [
+		buildFeedItem("focus-repo-release", {
+			ts: "2026-04-04T18:12:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_visual: repoVisualFixtures.social,
+			title: "v2.65.0 · 阅读体验更新",
+			body: "- 发布页与详情页跳转保持连贯\n- 仓库范围阅读支持稳定回跳",
+			html_url: `${PROJECT_REPO_URL}/releases/tag/v2.65.0`,
+		}),
+		buildRepoStarItem("focus-repo-star", {
+			ts: "2026-04-04T17:40:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_visual: repoVisualFixtures.social,
+			actor: {
+				login: "gaearon",
+				avatar_url: githubAvatarUrl("gaearon"),
+				html_url: "https://github.com/gaearon",
+			},
+			html_url: "https://github.com/gaearon",
+		}),
+		buildAnnouncementItem("focus-repo-announcement", {
+			ts: "2026-04-04T17:18:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_visual: repoVisualFixtures.social,
+			title: "范围阅读说明",
+		}),
+		buildReleaseUpdateItem("focus-repo-release-update", {
+			ts: "2026-04-04T16:55:00+08:00",
+			repo_full_name: PROJECT_REPO_FULL_NAME,
+			repo_visual: repoVisualFixtures.social,
+			title: "发布详情同步说明",
+		}),
+		buildForkItem("focus-repo-fork", {
+			ts: "2026-04-04T16:24:00+08:00",
+			repo_full_name: "IvanLi-CN/octo-rill-fork",
+			repo_visual: repoVisualFixtures.avatar,
+			title: "IvanLi-CN/octo-rill-fork",
+			html_url: "https://github.com/IvanLi-CN/octo-rill-fork",
+			actor: {
+				login: "octocat",
+				avatar_url: githubAvatarUrl("octocat"),
+				html_url: "https://github.com/octocat",
+			},
+		}),
+		buildFollowerItem("focus-repo-follower-ignored", {
+			ts: "2026-04-04T16:02:00+08:00",
+			actor: {
+				login: "yyx990803",
+				avatar_url: githubAvatarUrl("yyx990803"),
+				html_url: "https://github.com/yyx990803",
+			},
+			html_url: "https://github.com/yyx990803",
+		}),
+	];
+}
+
+function makeScopedOrgFocusFeed(): FeedItem[] {
+	return [
+		buildFeedItem("focus-org-release-01", {
+			ts: "2026-04-04T18:24:00+08:00",
+			repo_full_name: "acme/rocket",
+			repo_visual: repoVisualFixtures.social,
+			title: "rocket stable v3.2.1",
+			html_url: "https://github.com/acme/rocket/releases/tag/v3.2.1",
+		}),
+		buildFeedItem("focus-org-release-02", {
+			ts: "2026-04-04T17:56:00+08:00",
+			repo_full_name: "acme/satellite",
+			repo_visual: repoVisualFixtures.avatar,
+			title: "satellite canary v0.9.0",
+			html_url: "https://github.com/acme/satellite/releases/tag/v0.9.0",
+		}),
+		buildRepoStarItem("focus-org-star", {
+			ts: "2026-04-04T17:32:00+08:00",
+			repo_full_name: "acme/rocket",
+			repo_visual: repoVisualFixtures.social,
+		}),
+	];
 }
 
 function makeMobileCompactSocialFeed(): FeedItem[] {
@@ -2374,6 +2612,8 @@ function DashboardPreview(props: {
 	freshFeedKeys?: string[];
 	freshBriefKeys?: string[];
 	freshNotificationKeys?: string[];
+	scope?: DashboardScope | null;
+	includeOwnReleases?: boolean;
 }) {
 	const {
 		initialTab = "all",
@@ -2408,6 +2648,8 @@ function DashboardPreview(props: {
 		freshFeedKeys = EMPTY_STORY_FRESH_KEYS,
 		freshBriefKeys = EMPTY_STORY_FRESH_KEYS,
 		freshNotificationKeys = EMPTY_STORY_FRESH_KEYS,
+		scope = null,
+		includeOwnReleases = false,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail, {
 		smartResolveMode: releaseDetailSmartResolveMode,
@@ -2502,30 +2744,24 @@ function DashboardPreview(props: {
 	const allowReleaseItemLaneOverride = useMediaQuery("(min-width: 640px)");
 	const hasTabletSidebar = useMediaQuery("(min-width: 1024px)");
 	const hasDesktopSidebarInbox = useMediaQuery("(min-width: 1024px)");
+	const scopedMode = scope !== null;
 	const [pendingFeedTab, setPendingFeedTab] = useState<Tab | null>(
 		initialFeedTabLoading,
 	);
 	const [resolvedDeferredFeedTabs, setResolvedDeferredFeedTabs] = useState<
 		Set<Tab>
 	>(() => new Set<Tab>());
-	const renderSidebarInbox = hasDesktopSidebarInbox;
+	const renderSidebarInbox = !scopedMode && hasDesktopSidebarInbox;
 	const renderSidebar =
 		(tab === "briefs" && hasTabletSidebar) || renderSidebarInbox;
-	const dashboardContentLayoutClassName = renderSidebar
-		? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
-		: "grid gap-4 md:gap-6";
+	const dashboardContentLayoutClassName = scopedMode
+		? "grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px] lg:gap-6"
+		: renderSidebar
+			? "grid gap-4 md:grid-cols-[minmax(0,1fr)_360px] md:gap-6"
+			: "grid gap-4 md:gap-6";
 
 	const visibleItems = (mode: "all" | "releases" | "stars" | "followers") => {
-		switch (mode) {
-			case "releases":
-				return items.filter((item) => item.kind === "release");
-			case "stars":
-				return items.filter((item) => item.kind === "repo_star_received");
-			case "followers":
-				return items.filter((item) => item.kind === "follower_received");
-			default:
-				return items;
-		}
+		return filterStoryFeedItemsForTab(items, mode, scopedMode);
 	};
 
 	useEffect(() => {
@@ -2727,7 +2963,27 @@ function DashboardPreview(props: {
 				!blockingFeedError &&
 				!offlineEmpty ? (
 					<div className="bg-card/70 mb-4 rounded-xl border p-6 shadow-sm">
-						{emptyState === "auto-sync" ? (
+						{scopedMode && scope ? (
+							<>
+								<h2 className="text-base font-semibold tracking-tight">
+									当前范围暂无更新
+								</h2>
+								<p className="text-muted-foreground mt-1 text-sm leading-6">
+									最近还没有新的发布或相关动态。你可以稍后再看，或返回工作台浏览其他更新。
+								</p>
+								<div className="mt-4 flex flex-wrap gap-2">
+									<Button asChild variant="outline">
+										<InternalLink href="/" to="/">
+											返回工作台
+										</InternalLink>
+									</Button>
+									<Button type="button">
+										<RefreshCcw className="size-4" />
+										重新加载
+									</Button>
+								</div>
+							</>
+						) : emptyState === "auto-sync" ? (
 							<>
 								<h2 className="text-base font-semibold tracking-tight">
 									正在同步你的 GitHub 动态
@@ -2755,6 +3011,7 @@ function DashboardPreview(props: {
 
 				<FeedGroupedList
 					mode={mode}
+					sourceTab={mode}
 					items={filteredItems}
 					currentViewer={STORYBOOK_VIEWER}
 					briefs={storyBriefs}
@@ -2889,6 +3146,9 @@ function DashboardPreview(props: {
 						syncProgress={syncProgress}
 						onSyncAll={() => {}}
 						logoutHref="#"
+						showMineEntry={includeOwnReleases}
+						mineHref={buildDashboardScopeHref({ kind: "mine" })}
+						mineLabel={DASHBOARD_MINE_ENTRY_LABEL}
 						mobileControlBand={
 							<DashboardMobileControlBand
 								tab={tab}
@@ -2900,6 +3160,7 @@ function DashboardPreview(props: {
 									setSelectedLaneByKey({});
 								}}
 								layout="stacked"
+								tabOptions={scopedMode ? SCOPED_STORY_TAB_OPTIONS : undefined}
 							/>
 						}
 					/>
@@ -2914,7 +3175,9 @@ function DashboardPreview(props: {
 					className="gap-4 sm:gap-6"
 				>
 					<div className="hidden flex-wrap items-center justify-between gap-2 sm:flex">
-						<DashboardTabsList />
+						<DashboardTabsList
+							options={scopedMode ? SCOPED_STORY_TAB_OPTIONS : undefined}
+						/>
 						<div
 							className="flex min-h-8 items-center gap-2 self-center"
 							data-dashboard-secondary-controls
@@ -2944,6 +3207,11 @@ function DashboardPreview(props: {
 
 					<div className={dashboardContentLayoutClassName}>
 						<section className="min-w-0">
+							{scopedMode && scope ? (
+								<div className="lg:hidden">
+									<StoryScopedSummaryCard scope={scope} feedItems={items} />
+								</div>
+							) : null}
 							<TabsContent value="all" className="mt-0 min-w-0">
 								{renderFeedPanel("all")}
 							</TabsContent>
@@ -2997,7 +3265,15 @@ function DashboardPreview(props: {
 							</TabsContent>
 						</section>
 
-						{renderSidebar ? (
+						{scopedMode && scope ? (
+							<aside className="hidden space-y-4 lg:block">
+								<StoryScopedSummaryCard
+									scope={scope}
+									feedItems={items}
+									desktop
+								/>
+							</aside>
+						) : renderSidebar ? (
 							<aside className="space-y-4 sm:space-y-6">
 								{tab === "briefs" ? (
 									<BriefListCard
@@ -5888,6 +6164,193 @@ export const OwnerReleasesEvidenceAllTab: Story = {
 					"用于视觉验收：`我的发布` 开启后，owner-only release 会直接出现在 `全部` 时间线。",
 			},
 		},
+	},
+};
+
+export const ScopedFocusRepoAll: Story = {
+	name: "Evidence / Scoped Focus Repo All",
+	args: {
+		initialTab: "all",
+		feedItems: makeScopedRepoFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "repo",
+			owner: "IvanLi-CN",
+			repo: "octo-rill",
+		},
+		includeOwnReleases: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"单仓聚焦页桌面证据：只保留 `全部 / 发布`，右侧改为范围摘要，不再出现全局 Inbox。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("IvanLi-CN/octo-rill")).toBeVisible();
+		await expect(
+			canvasElement.querySelector('[data-dashboard-scope-summary="repo"]'),
+		).not.toBeNull();
+		await expect(
+			canvasElement.querySelector('[data-dashboard-sidebar-inbox="true"]'),
+		).toBeNull();
+		await expect(canvas.queryByText("yyx990803")).not.toBeInTheDocument();
+		await expect(
+			canvas.getByRole("link", { name: /IvanLi-CN\/octo-rill/ }),
+		).toHaveAttribute("href", "/focus/repo/IvanLi-CN/octo-rill");
+		await expect(canvas.getByText("1 个仓库")).toBeVisible();
+		await expect(
+			canvas.queryByText("IvanLi-CN/octo-rill-fork"),
+		).not.toBeInTheDocument();
+		await expect(canvas.queryByText("可见性")).not.toBeInTheDocument();
+	},
+};
+
+export const ScopedFocusRepoReleases: Story = {
+	name: "Evidence / Scoped Focus Repo Releases",
+	args: {
+		initialTab: "releases",
+		feedItems: makeScopedRepoFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "repo",
+			owner: "IvanLi-CN",
+			repo: "octo-rill",
+		},
+		includeOwnReleases: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"单仓聚焦页发布视图证据：repo identity 站内跳转应保留 `/releases` 子页语义。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("v2.65.0 · 阅读体验更新")).toBeVisible();
+		await expect(canvas.queryByText("范围阅读说明")).not.toBeInTheDocument();
+		await expect(
+			canvas.getByRole("link", { name: /IvanLi-CN\/octo-rill/ }),
+		).toHaveAttribute("href", "/focus/repo/IvanLi-CN/octo-rill/releases");
+	},
+};
+
+export const ScopedFocusMobileSummary: Story = {
+	name: "Evidence / Scoped Focus Mobile Summary",
+	args: {
+		initialTab: "all",
+		feedItems: makeScopedOrgFocusFeed(),
+		showFooter: false,
+		scope: {
+			kind: "org",
+			org: "acme",
+		},
+	},
+	globals: {
+		viewport: {
+			value: "dashboardMobile390",
+			isRotated: false,
+		},
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "移动端聚焦页证据：summary 卡出现在 feed 顶部，不再依赖右侧栏。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("acme")).toBeVisible();
+		await expect(
+			canvasElement.querySelector(
+				'[data-dashboard-scope-summary="org"][data-dashboard-scope-summary-layout="mobile"]',
+			),
+		).not.toBeNull();
+	},
+};
+
+export const ScopedFocusEmptyState: Story = {
+	name: "Evidence / Scoped Focus Empty State",
+	args: {
+		initialTab: "all",
+		feedItems: [],
+		showFooter: false,
+		scope: {
+			kind: "mine",
+		},
+		includeOwnReleases: false,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"合法但无命中的 scope 仍保持页面可访问，并展示 scoped empty state。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("当前范围暂无更新")).toBeVisible();
+		await expect(
+			canvas.getByRole("link", { name: "返回工作台" }),
+		).toHaveAttribute("href", "/");
+		await expect(
+			canvas.getByRole("button", { name: "重新加载" }),
+		).toBeVisible();
+	},
+};
+
+export const ScopedFocusMineMenuEntryVisible: Story = {
+	name: "Evidence / Scoped Focus Mine Entry Visible",
+	args: {
+		initialTab: "all",
+		feedItems: makeOwnReleaseOptInFeed(true),
+		showFooter: false,
+		includeOwnReleases: true,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "“我的发布”开启时，账号菜单显示“我的仓库动态”入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await userEvent.click(canvas.getByRole("button", { name: "查看账号信息" }));
+		await expect(
+			canvas.getByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
+		).toHaveAttribute("href", "/focus/mine");
+	},
+};
+
+export const ScopedFocusMineMenuEntryHidden: Story = {
+	name: "Evidence / Scoped Focus Mine Entry Hidden",
+	args: {
+		initialTab: "all",
+		feedItems: makeOwnReleaseOptInFeed(false),
+		showFooter: false,
+		includeOwnReleases: false,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story: "“我的发布”关闭时，账号菜单不显示“我的仓库动态”入口。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await userEvent.click(canvas.getByRole("button", { name: "查看账号信息" }));
+		await expect(
+			canvas.queryByRole("link", { name: DASHBOARD_MINE_ENTRY_LABEL }),
+		).not.toBeInTheDocument();
 	},
 };
 

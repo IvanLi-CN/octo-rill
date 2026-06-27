@@ -9,6 +9,7 @@ import type {
 	TranslatedItem,
 } from "@/feed/types";
 import { isReleaseFeedItem, isSocialFeedItem } from "@/feed/types";
+import type { DashboardScope } from "@/dashboard/routeState";
 import {
 	describeNetworkAwareError,
 	type NetworkErrorKind,
@@ -98,12 +99,23 @@ function mergeByKey(existing: FeedItem[], incoming: FeedItem[]) {
 function buildFeedUrl(
 	limit: number,
 	type: FeedRequestType,
+	scope?: DashboardScope | null,
 	cursor?: string | null,
 ) {
 	const params = new URLSearchParams();
 	params.set("limit", String(limit));
 	if (type !== "all") {
 		params.set("types", type);
+	}
+	if (scope) {
+		params.set("scope", scope.kind);
+		if (scope.kind === "repo") {
+			params.set("items", `${scope.owner}/${scope.repo}`);
+		} else if (scope.kind === "repos" && scope.items.length > 0) {
+			params.set("items", scope.items.join(","));
+		} else if (scope.kind === "org") {
+			params.set("org", scope.org);
+		}
 	}
 	if (cursor) {
 		params.set("cursor", cursor);
@@ -114,6 +126,7 @@ function buildFeedUrl(
 export function useFeed(
 	type: FeedRequestType = "all",
 	options?: {
+		scope?: DashboardScope | null;
 		initialData?: {
 			type: FeedRequestType;
 			items: FeedItem[];
@@ -122,6 +135,7 @@ export function useFeed(
 	},
 ) {
 	const initialData = options?.initialData;
+	const scope = options?.scope ?? null;
 	const initialStateMatches = initialData?.type === type;
 	const [dataType, setDataType] = useState<FeedRequestType>(
 		initialStateMatches ? initialData.type : type,
@@ -139,6 +153,7 @@ export function useFeed(
 
 	const reqIdRef = useRef(0);
 	const dataTypeRef = useRef(type);
+	const scopeRef = useRef(scope);
 	const isCurrentType = dataType === type;
 	const currentItems = isCurrentType ? items : [];
 	const currentNextCursor = isCurrentType ? nextCursor : null;
@@ -147,10 +162,11 @@ export function useFeed(
 	const hasMore = Boolean(currentNextCursor);
 
 	useEffect(() => {
-		if (dataTypeRef.current === type) {
+		if (dataTypeRef.current === type && scopeRef.current === scope) {
 			return;
 		}
 		dataTypeRef.current = type;
+		scopeRef.current = scope;
 		reqIdRef.current += 1;
 		setDataType(type);
 		setItems([]);
@@ -159,7 +175,7 @@ export function useFeed(
 		setLoadingMore(false);
 		setError(null);
 		setFreshKeys(new Set());
-	}, [type]);
+	}, [scope, type]);
 
 	const loadInitial = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {
@@ -172,7 +188,7 @@ export function useFeed(
 			setLoadingInitial(true);
 			setError(null);
 			try {
-				const res = await apiGet<FeedResponse>(buildFeedUrl(30, type));
+				const res = await apiGet<FeedResponse>(buildFeedUrl(30, type, scope));
 				if (reqId !== reqIdRef.current) return;
 				setDataType(type);
 				setItems((prev) => preserveReleaseViewers(prev, res.items));
@@ -200,7 +216,7 @@ export function useFeed(
 				}
 			}
 		},
-		[type],
+		[scope, type],
 	);
 
 	const loadMore = useCallback(async () => {
@@ -210,7 +226,7 @@ export function useFeed(
 		setError(null);
 		try {
 			const res = await apiGet<FeedResponse>(
-				buildFeedUrl(30, type, currentNextCursor),
+				buildFeedUrl(30, type, scope, currentNextCursor),
 			);
 			if (reqId !== reqIdRef.current) return;
 			setDataType(type);
@@ -234,7 +250,7 @@ export function useFeed(
 				setLoadingMore(false);
 			}
 		}
-	}, [currentLoadingInitial, currentNextCursor, loadingMore, type]);
+	}, [currentLoadingInitial, currentNextCursor, loadingMore, scope, type]);
 
 	const refresh = useCallback(
 		async (options?: { freshKeys?: string[]; throwOnError?: boolean }) => {

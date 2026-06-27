@@ -752,6 +752,7 @@ function AdminDashboardPreview(props: {
 					daily_boundary_local: "08:00",
 					daily_boundary_time_zone: "Asia/Shanghai",
 					daily_boundary_utc_offset_minutes: 480,
+					include_own_releases: false,
 				},
 			}}
 		/>

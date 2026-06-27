@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { FEED_LANE_OPTIONS } from "@/feed/laneOptions";
+import { buildDashboardScopeHref } from "@/dashboard/routeState";
 import {
 	isReleaseFeedItem,
 	isSocialFeedItem,
@@ -49,8 +50,10 @@ import {
 	resolveErrorDetail,
 	resolveErrorSummary,
 } from "@/lib/errorPresentation";
+import { InternalLink } from "@/lib/internalNavigation";
 import { resolveRepoVisualCandidates, type RepoVisual } from "@/lib/repoVisual";
 import { cn } from "@/lib/utils";
+import type { DashboardTab } from "@/pages/DashboardControlBand";
 
 const REACTION_ITEMS: Array<{
 	content: ReactionContent;
@@ -92,6 +95,34 @@ const REACTION_ITEMS: Array<{
 const RELEASE_TOOL_HEIGHT_CLASS = "h-9";
 const RELEASE_TOOL_BUTTON_CLASS = "h-9";
 const RELEASE_TOOL_ICON_BUTTON_CLASS = "size-8";
+
+type RepoFocusTarget = {
+	href: string;
+	to: "/focus/repo/$owner/$repo" | "/focus/repo/$owner/$repo/releases";
+	params: {
+		owner: string;
+		repo: string;
+	};
+};
+
+function buildRepoFocusTarget(
+	repoFullName: string | null | undefined,
+	sourceTab: DashboardTab | null = null,
+): RepoFocusTarget | null {
+	const [owner = "", repo = ""] = (repoFullName ?? "").split("/", 2);
+	if (!owner || !repo) return null;
+	const releases = sourceTab === "releases";
+	return {
+		href: buildDashboardScopeHref(
+			{ kind: "repo", owner, repo },
+			releases ? "releases" : "all",
+		),
+		to: releases
+			? "/focus/repo/$owner/$repo/releases"
+			: "/focus/repo/$owner/$repo",
+		params: { owner, repo },
+	};
+}
 
 function reactionAriaLabel(label: string, count: number) {
 	return count > 0 ? `${label} ${count}` : label;
@@ -438,6 +469,8 @@ function measureInlineEntityWidth(group: HTMLElement): number {
 
 function SocialEntityCard(props: {
 	href?: string | null;
+	internalTo?: string;
+	internalParams?: Record<string, string>;
 	avatar: ReactNode;
 	primary: string;
 	mono?: boolean;
@@ -447,6 +480,8 @@ function SocialEntityCard(props: {
 }) {
 	const {
 		href,
+		internalTo,
+		internalParams,
 		avatar,
 		primary,
 		mono = false,
@@ -454,15 +489,9 @@ function SocialEntityCard(props: {
 		className,
 		primaryClassName,
 	} = props;
-	return (
-		<div
-			data-social-card-segment={segment}
-			className={cn(
-				"relative z-10 flex min-w-0 items-center gap-1.5 rounded-xl border border-border/65 bg-background/78 px-2 py-2 shadow-sm",
-				"sm:gap-3 sm:rounded-2xl sm:px-3 sm:py-3",
-				className,
-			)}
-		>
+	const internalHref = href?.startsWith("/") ? href : null;
+	const content = (
+		<>
 			<div className="shrink-0">{avatar}</div>
 			<div className="min-w-0 flex-1">
 				<div className="flex min-w-0 items-center gap-0.5">
@@ -484,7 +513,7 @@ function SocialEntityCard(props: {
 							{primary}
 						</p>
 					</div>
-					{href ? (
+					{href && !internalHref ? (
 						<a
 							href={href}
 							target="_blank"
@@ -497,6 +526,31 @@ function SocialEntityCard(props: {
 					) : null}
 				</div>
 			</div>
+		</>
+	);
+	const containerClassName = cn(
+		"relative z-10 flex min-w-0 items-center gap-1.5 rounded-xl border border-border/65 bg-background/78 px-2 py-2 shadow-sm",
+		"sm:gap-3 sm:rounded-2xl sm:px-3 sm:py-3",
+		internalHref &&
+			"text-left transition-colors hover:bg-accent/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+		className,
+	);
+	if (internalHref) {
+		return (
+			<InternalLink
+				href={internalHref}
+				to={internalTo ?? internalHref}
+				params={internalParams}
+				data-social-card-segment={segment}
+				className={containerClassName}
+			>
+				{content}
+			</InternalLink>
+		);
+	}
+	return (
+		<div data-social-card-segment={segment} className={containerClassName}>
+			{content}
 		</div>
 	);
 }
@@ -572,8 +626,9 @@ function SocialActivityCard(props: {
 	item: SocialFeedItem;
 	currentViewer?: FeedViewer | null;
 	isFresh?: boolean;
+	sourceTab?: DashboardTab | null;
 }) {
-	const { item, currentViewer, isFresh = false } = props;
+	const { item, currentViewer, isFresh = false, sourceTab = null } = props;
 	const actor = item.actor;
 	const isRepoStar = item.kind === "repo_star_received";
 	const isFollower = item.kind === "follower_received";
@@ -603,6 +658,8 @@ function SocialActivityCard(props: {
 	const repoHref = item.repo_full_name
 		? `https://github.com/${item.repo_full_name}`
 		: null;
+	const repoFocusTarget = buildRepoFocusTarget(item.repo_full_name, sourceTab);
+	const repoFocusHref = repoFocusTarget?.href ?? null;
 	const actorCardHref = actorHref;
 	const targetCardHref = isRepoStar
 		? repoHref
@@ -786,46 +843,93 @@ function SocialActivityCard(props: {
 						>
 							<SocialActionChip icon={ActionIcon} title={actionTitle} />
 						</div>
-						<a
-							href={targetCardHref ?? undefined}
-							target="_blank"
-							rel="noreferrer"
-							data-social-card-segment="target"
-							className={cn(
-								"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
-								mobileTargetSegmentClass,
-							)}
-						>
-							<span
-								ref={mobileTargetGroupRef}
-								data-social-card-entity-group="target"
-								className="flex min-w-0 max-w-full items-center gap-2"
+						{repoFocusTarget ? (
+							<InternalLink
+								href={repoFocusTarget.href}
+								to={repoFocusTarget.to}
+								params={repoFocusTarget.params}
+								data-social-card-segment="target"
+								className={cn(
+									"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+									mobileTargetSegmentClass,
+								)}
 							>
-								<SocialRepoAvatar
-									key={[
-										item.repo_visual?.owner_avatar_url ?? "",
-										item.repo_visual?.open_graph_image_url ?? "",
-										item.repo_visual?.uses_custom_open_graph_image ? "1" : "0",
-										item.repo_full_name ?? "",
-									].join("|")}
-									repoVisual={item.repo_visual}
-									className="size-7 border-border/60"
-								/>
-								<p
-									data-social-card-primary="true"
-									data-social-card-primary-full={
-										item.title ?? item.repo_full_name ?? "仓库"
-									}
-									data-social-card-primary-mobile={targetMobileLabel}
-									title={item.title ?? item.repo_full_name ?? "仓库"}
-									className="min-w-0 truncate font-mono text-[10px] leading-none font-medium tracking-tight text-foreground"
+								<span
+									ref={mobileTargetGroupRef}
+									data-social-card-entity-group="target"
+									className="flex min-w-0 max-w-full items-center gap-2"
 								>
-									<span data-social-card-primary-mobile-label="true">
-										{targetMobileLabel}
-									</span>
-								</p>
-							</span>
-						</a>
+									<SocialRepoAvatar
+										key={[
+											item.repo_visual?.owner_avatar_url ?? "",
+											item.repo_visual?.open_graph_image_url ?? "",
+											item.repo_visual?.uses_custom_open_graph_image
+												? "1"
+												: "0",
+											item.repo_full_name ?? "",
+										].join("|")}
+										repoVisual={item.repo_visual}
+										className="size-7 border-border/60"
+									/>
+									<p
+										data-social-card-primary="true"
+										data-social-card-primary-full={
+											item.title ?? item.repo_full_name ?? "仓库"
+										}
+										data-social-card-primary-mobile={targetMobileLabel}
+										title={item.title ?? item.repo_full_name ?? "仓库"}
+										className="min-w-0 truncate font-mono text-[10px] leading-none font-medium tracking-tight text-foreground"
+									>
+										<span data-social-card-primary-mobile-label="true">
+											{targetMobileLabel}
+										</span>
+									</p>
+								</span>
+							</InternalLink>
+						) : (
+							<a
+								href={targetCardHref ?? undefined}
+								target="_blank"
+								rel="noreferrer"
+								data-social-card-segment="target"
+								className={cn(
+									"flex min-w-0 max-w-full transition-opacity hover:opacity-100",
+									mobileTargetSegmentClass,
+								)}
+							>
+								<span
+									ref={mobileTargetGroupRef}
+									data-social-card-entity-group="target"
+									className="flex min-w-0 max-w-full items-center gap-2"
+								>
+									<SocialRepoAvatar
+										key={[
+											item.repo_visual?.owner_avatar_url ?? "",
+											item.repo_visual?.open_graph_image_url ?? "",
+											item.repo_visual?.uses_custom_open_graph_image
+												? "1"
+												: "0",
+											item.repo_full_name ?? "",
+										].join("|")}
+										repoVisual={item.repo_visual}
+										className="size-7 border-border/60"
+									/>
+									<p
+										data-social-card-primary="true"
+										data-social-card-primary-full={
+											item.title ?? item.repo_full_name ?? "仓库"
+										}
+										data-social-card-primary-mobile={targetMobileLabel}
+										title={item.title ?? item.repo_full_name ?? "仓库"}
+										className="min-w-0 truncate font-mono text-[10px] leading-none font-medium tracking-tight text-foreground"
+									>
+										<span data-social-card-primary-mobile-label="true">
+											{targetMobileLabel}
+										</span>
+									</p>
+								</span>
+							</a>
+						)}
 					</>
 				) : (
 					<>
@@ -950,7 +1054,9 @@ function SocialActivityCard(props: {
 				/>
 				{isRepoTarget ? (
 					<SocialEntityCard
-						href={targetCardHref}
+						href={repoFocusHref ?? targetCardHref}
+						internalTo={repoFocusTarget?.to}
+						internalParams={repoFocusTarget?.params}
 						segment="target"
 						avatar={
 							<SocialRepoAvatar
@@ -989,14 +1095,16 @@ function SocialActivityCard(props: {
 function AnnouncementContentCard(props: {
 	item: SocialFeedItem;
 	isFresh?: boolean;
+	sourceTab?: DashboardTab | null;
 }) {
-	const { item, isFresh = false } = props;
+	const { item, isFresh = false, sourceTab = null } = props;
 	const title = item.title?.trim() || item.repo_full_name || "仓库公告";
 	const subtitleBits = [
 		item.subtitle || "仓库公告",
 		item.actor?.login ? `by ${item.actor.login}` : null,
 	].filter(Boolean);
 	const subtitle = subtitleBits.join(" · ");
+	const repoFocusTarget = buildRepoFocusTarget(item.repo_full_name, sourceTab);
 
 	return (
 		<Card
@@ -1010,13 +1118,30 @@ function AnnouncementContentCard(props: {
 						<div className="flex items-start gap-2">
 							<div className="min-w-0 flex-1">
 								<div className="flex flex-wrap items-center gap-2">
-									<RepoIdentity
-										repoFullName={item.repo_full_name}
-										repoVisual={item.repo_visual}
-										className="min-w-0 min-h-8"
-										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-										visualClassName="size-8"
-									/>
+									{repoFocusTarget ? (
+										<InternalLink
+											href={repoFocusTarget.href}
+											to={repoFocusTarget.to}
+											params={repoFocusTarget.params}
+											className="min-w-0"
+										>
+											<RepoIdentity
+												repoFullName={item.repo_full_name}
+												repoVisual={item.repo_visual}
+												className="min-w-0 min-h-8"
+												labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+												visualClassName="size-8"
+											/>
+										</InternalLink>
+									) : (
+										<RepoIdentity
+											repoFullName={item.repo_full_name}
+											repoVisual={item.repo_visual}
+											className="min-w-0 min-h-8"
+											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+											visualClassName="size-8"
+										/>
+									)}
 									<span className="inline-flex items-center gap-1 rounded-full border border-border/70 bg-muted/35 px-2 py-1 text-[11px] font-medium text-muted-foreground">
 										<Megaphone className="size-3.5" />
 										公告
@@ -1093,6 +1218,7 @@ export function ReleaseFeedCard(props: {
 	isReactionBusy: boolean;
 	reactionError: string | null;
 	isFresh?: boolean;
+	sourceTab?: DashboardTab | null;
 	showReactions?: boolean;
 	surface?: "card" | "article";
 	titleHref?: string | null;
@@ -1109,6 +1235,7 @@ export function ReleaseFeedCard(props: {
 		isReactionBusy,
 		reactionError,
 		isFresh = false,
+		sourceTab = null,
 		showReactions = true,
 		surface = "card",
 		titleHref = null,
@@ -1122,6 +1249,7 @@ export function ReleaseFeedCard(props: {
 		item.subject_type ? item.subject_type : null,
 	].filter(Boolean);
 	const subtitle = subtitleBits.join(" · ");
+	const repoFocusTarget = buildRepoFocusTarget(item.repo_full_name, sourceTab);
 	const reactions = showReactions ? item.reactions : null;
 	const isVersionOnly = item.smart?.status === "insufficient";
 	const isArticleSurface = surface === "article";
@@ -1155,13 +1283,30 @@ export function ReleaseFeedCard(props: {
 									</span>
 								) : null}
 
-								<RepoIdentity
-									repoFullName={item.repo_full_name}
-									repoVisual={item.repo_visual}
-									className="min-w-0 min-h-8"
-									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-									visualClassName="size-8"
-								/>
+								{repoFocusTarget ? (
+									<InternalLink
+										href={repoFocusTarget.href}
+										to={repoFocusTarget.to}
+										params={repoFocusTarget.params}
+										className="min-w-0"
+									>
+										<RepoIdentity
+											repoFullName={item.repo_full_name}
+											repoVisual={item.repo_visual}
+											className="min-w-0 min-h-8"
+											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+											visualClassName="size-8"
+										/>
+									</InternalLink>
+								) : (
+									<RepoIdentity
+										repoFullName={item.repo_full_name}
+										repoVisual={item.repo_visual}
+										className="min-w-0 min-h-8"
+										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+										visualClassName="size-8"
+									/>
+								)}
 							</div>
 
 							<CardTitle className="mt-2 text-balance text-[1.35rem] leading-tight sm:mt-2.5 sm:text-lg">
@@ -1342,19 +1487,42 @@ export function ReleaseFeedCard(props: {
 							data-public-release-action-row="true"
 						>
 							<div className="min-w-0 flex-1">
-								<RepoIdentity
-									repoFullName={item.repo_full_name}
-									repoVisual={item.repo_visual}
-									className="min-h-8 w-full min-w-0"
-									labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
-									visualClassName="size-8"
-								>
-									<span className="block truncate font-mono text-[11px] text-muted-foreground sm:text-xs">
-										{formatIsoShortLocal(item.ts)}
-										{isFresh ? <FreshContentCue className="ml-2" /> : null}
-										{subtitle ? ` · ${subtitle}` : ""}
-									</span>
-								</RepoIdentity>
+								{repoFocusTarget ? (
+									<InternalLink
+										href={repoFocusTarget.href}
+										to={repoFocusTarget.to}
+										params={repoFocusTarget.params}
+										className="min-w-0"
+									>
+										<RepoIdentity
+											repoFullName={item.repo_full_name}
+											repoVisual={item.repo_visual}
+											className="min-h-8 w-full min-w-0"
+											labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+											visualClassName="size-8"
+										>
+											<span className="block truncate font-mono text-[11px] text-muted-foreground sm:text-xs">
+												{formatIsoShortLocal(item.ts)}
+												{isFresh ? <FreshContentCue className="ml-2" /> : null}
+												{subtitle ? ` · ${subtitle}` : ""}
+											</span>
+										</RepoIdentity>
+									</InternalLink>
+								) : (
+									<RepoIdentity
+										repoFullName={item.repo_full_name}
+										repoVisual={item.repo_visual}
+										className="min-h-8 w-full min-w-0"
+										labelClassName="font-mono text-base font-medium tracking-tight text-foreground/80"
+										visualClassName="size-8"
+									>
+										<span className="block truncate font-mono text-[11px] text-muted-foreground sm:text-xs">
+											{formatIsoShortLocal(item.ts)}
+											{isFresh ? <FreshContentCue className="ml-2" /> : null}
+											{subtitle ? ` · ${subtitle}` : ""}
+										</span>
+									</RepoIdentity>
+								)}
 							</div>
 							<FeedCardLaneTabs
 								activeLane={activeLane}
@@ -1448,26 +1616,34 @@ export function FeedItemCard(props: {
 	isReactionBusy: boolean;
 	reactionError: string | null;
 	isFresh?: boolean;
+	sourceTab?: DashboardTab | null;
 	onSelectLane: (lane: FeedLane) => void;
 	onTranslateNow: () => void;
 	onSmartNow: () => void;
 	onToggleReaction: (content: ReactionContent) => void;
 }) {
-	const { item, currentViewer, isFresh = false } = props;
+	const { item, currentViewer, isFresh = false, sourceTab = null } = props;
 	let card: ReactNode = null;
 
 	if (item.kind === "announcement") {
-		card = <AnnouncementContentCard item={item} isFresh={isFresh} />;
+		card = (
+			<AnnouncementContentCard
+				item={item}
+				isFresh={isFresh}
+				sourceTab={sourceTab}
+			/>
+		);
 	} else if (isSocialFeedItem(item)) {
 		card = (
 			<SocialActivityCard
 				item={item}
 				currentViewer={currentViewer}
 				isFresh={isFresh}
+				sourceTab={sourceTab}
 			/>
 		);
 	} else if (isReleaseFeedItem(item)) {
-		card = <ReleaseFeedCard {...props} item={item} />;
+		card = <ReleaseFeedCard {...props} item={item} sourceTab={sourceTab} />;
 	} else {
 		return null;
 	}

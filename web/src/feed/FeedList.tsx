@@ -9,6 +9,7 @@ import type {
 	ReactionContent,
 } from "@/feed/types";
 import type { FeedLoadError } from "@/feed/useFeed";
+import type { DashboardTab } from "@/pages/DashboardControlBand";
 
 function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 	return `${item.kind}:${item.id}`;
@@ -17,6 +18,7 @@ function keyOf(item: Pick<FeedItem, "kind" | "id">) {
 export type FeedCardListProps = {
 	items: FeedItem[];
 	currentViewer?: FeedViewer | null;
+	sourceTab?: DashboardTab | null;
 	translationInFlightKeys: Set<string>;
 	smartInFlightKeys: Set<string>;
 	registerItemRef: (item: FeedItem) => (el: HTMLElement | null) => void;
@@ -34,6 +36,7 @@ export function FeedItems(props: FeedCardListProps) {
 	const {
 		items,
 		currentViewer,
+		sourceTab = null,
 		translationInFlightKeys,
 		smartInFlightKeys,
 		registerItemRef,
@@ -59,6 +62,7 @@ export function FeedItems(props: FeedCardListProps) {
 				<FeedItemCard
 					item={item}
 					currentViewer={currentViewer}
+					sourceTab={sourceTab}
 					activeLane={activeLane}
 					isTranslating={isTranslating}
 					isSmartGenerating={isSmartGenerating}
