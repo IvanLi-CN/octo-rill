@@ -265,18 +265,22 @@ Updated semantics:
 
 ## `GET /api/admin/jobs/realtime/{task_id}`
 
-Response changes for `task_type=sync.subscriptions` remain under `diagnostics.sync_subscriptions`.
+Response changes:
+
+- `task_type=sync.subscriptions` remains under `diagnostics.sync_subscriptions`.
+- `task_type=sync.access_refresh` now exposes `diagnostics.sync_access_refresh`, including task-log availability plus Star failure classification (`error_kind`, `error_stage`, `elapsed_ms`, `timeout_ms`, `http_status`, `error_chain` when available).
 
 Notes:
 
-- Existing admin diagnostics stay compatible while adding `social` and `notifications` sections.
+- Existing admin diagnostics stay compatible while adding `social` / `notifications` sections for `sync.subscriptions`, and Star failure diagnostics for `sync.access_refresh`.
 - When `result_json` is not available yet for a running `sync.subscriptions` task, `diagnostics.sync_subscriptions` is derived from the task's current `task.progress` events so the workflow detail can show live stage totals before completion.
-- `sync.access_refresh` currently reuses generic task detail rendering.
+- When `sync.access_refresh` fails before `star_refreshed`, the detail response should still expose the failure classification from `task.progress(stage=star_failed)` even though `result_json` is absent.
 
 ## `GET /api/admin/jobs/realtime/{task_id}/log`
 
 Behavior:
 
 - Admin only.
+- Supported for `sync.subscriptions` and `sync.access_refresh`.
 - Returns the task run log as downloadable `application/x-ndjson`.
 - `404 not_found` when the task does not exist or has no log file.

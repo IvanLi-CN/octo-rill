@@ -717,6 +717,31 @@ export type AdminSyncSubscriptionsDiagnostics = {
 		created_at: string;
 	}>;
 };
+export type AdminSyncAccessRefreshDiagnostics = {
+	log_available: boolean;
+	log_download_path: string | null;
+	star_repos: number;
+	release_repos: number;
+	releases: number;
+	social_repo_stars: number;
+	social_followers: number;
+	social_events: number;
+	notifications: number;
+	social_error: string | null;
+	notifications_error: string | null;
+	failure?: {
+		operation: string | null;
+		error_kind: string | null;
+		error_stage: string | null;
+		retryable: boolean;
+		http_status: number | null;
+		timeout_ms: number | null;
+		elapsed_ms: number | null;
+		attempts: number | null;
+		retry_limit: number | null;
+		error_chain: string | null;
+	} | null;
+};
 export type AdminTaskDiagnostics = {
 	business_outcome: AdminBusinessOutcome;
 	translate_release_batch?: AdminTranslateReleaseBatchDiagnostics | null;
@@ -725,6 +750,7 @@ export type AdminTaskDiagnostics = {
 	brief_history_recompute?: AdminBriefHistoryRecomputeDiagnostics | null;
 	brief_refresh_content?: AdminBriefRefreshContentDiagnostics | null;
 	retry_recent_failures?: AdminRetryRecentFailuresDiagnostics | null;
+	sync_access_refresh?: AdminSyncAccessRefreshDiagnostics | null;
 	sync_subscriptions?: AdminSyncSubscriptionsDiagnostics | null;
 };
 export type AdminRealtimeTaskDetailItem = AdminRealtimeTaskItem & {

@@ -247,8 +247,11 @@ function buildTaskDetailPageModel(
 			};
 		}
 		case "sync.access_refresh": {
+			const diagnostics = detail.diagnostics?.sync_access_refresh ?? null;
 			const starred = readObject(result, "starred");
 			const release = readObject(result, "release");
+			const social = readObject(result, "social");
+			const notifications = readObject(result, "notifications");
 			return {
 				pageTitle: "访问增量同步详情页",
 				pageSummary:
@@ -257,21 +260,43 @@ function buildTaskDetailPageModel(
 					field("目标用户", userId ? `#${userId}` : null),
 					field(
 						"Star 仓库数",
-						readNumber(starred, "repos") !== null
-							? `${readNumber(starred, "repos")}`
-							: null,
+						diagnostics?.star_repos !== undefined
+							? `${diagnostics.star_repos}`
+							: readNumber(starred, "repos") !== null
+								? `${readNumber(starred, "repos")}`
+								: null,
 					),
 					field(
 						"Release 仓库数",
-						readNumber(release, "repos") !== null
-							? `${readNumber(release, "repos")}`
-							: null,
+						diagnostics?.release_repos !== undefined
+							? `${diagnostics.release_repos}`
+							: readNumber(release, "repos") !== null
+								? `${readNumber(release, "repos")}`
+								: null,
 					),
 					field(
 						"共享 Release 数",
-						readNumber(release, "releases") !== null
-							? `${readNumber(release, "releases")}`
-							: null,
+						diagnostics?.releases !== undefined
+							? `${diagnostics.releases}`
+							: readNumber(release, "releases") !== null
+								? `${readNumber(release, "releases")}`
+								: null,
+					),
+					field(
+						"Social 事件",
+						diagnostics?.social_events !== undefined
+							? `${diagnostics.social_events}`
+							: readNumber(social, "events") !== null
+								? `${readNumber(social, "events")}`
+								: null,
+					),
+					field(
+						"Inbox 通知数",
+						diagnostics?.notifications !== undefined
+							? `${diagnostics.notifications}`
+							: readNumber(notifications, "notifications") !== null
+								? `${readNumber(notifications, "notifications")}`
+								: null,
 					),
 				),
 			};
@@ -802,6 +827,33 @@ function syncSubscriptionSeverityClass(severity: string) {
 	}
 }
 
+function accessRefreshFailureStageLabel(stage: string | null | undefined) {
+	switch (stage) {
+		case "dns":
+			return "DNS";
+		case "connect":
+			return "连接";
+		case "tls":
+			return "TLS";
+		case "request":
+			return "请求发送";
+		case "response":
+			return "响应体";
+		case "timeout":
+			return "超时";
+		case "decode":
+			return "解码";
+		case "http_status":
+			return "HTTP 状态";
+		case "graphql":
+			return "GraphQL";
+		case "local":
+			return "本地处理";
+		default:
+			return stage ?? "-";
+	}
+}
+
 function llmCallStatusLabel(status: string) {
 	switch (status) {
 		case "queued":
@@ -835,6 +887,7 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 	const payload = parseJsonRecord(props.detail.task.payload_json);
 	const result = parseJsonRecord(props.detail.task.result_json);
 	const diagnostics = props.detail.diagnostics ?? null;
+	const accessRefreshDiagnostics = diagnostics?.sync_access_refresh ?? null;
 	const syncDiagnostics = diagnostics?.sync_subscriptions ?? null;
 	const eventMeta = props.detail.event_meta ?? null;
 	const isEventsTruncated = eventMeta?.truncated === true;
@@ -844,6 +897,9 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 		diagnostics?.translate_release_batch?.items?.find((item) => item.item_error)
 			?.item_error ??
 		diagnostics?.brief_daily_slot?.users?.find((item) => item.error)?.error ??
+		accessRefreshDiagnostics?.failure?.error_chain ??
+		accessRefreshDiagnostics?.social_error ??
+		accessRefreshDiagnostics?.notifications_error ??
 		syncDiagnostics?.recent_events?.find((item) => item.severity === "error")
 			?.message ??
 		null;
@@ -1004,6 +1060,114 @@ export function TaskTypeDetailSection(props: TaskTypeDetailSectionProps) {
 							最后错误：{diagnostics.brief_refresh_content.last_error}
 						</p>
 					) : null}
+				</div>
+			) : null}
+			{accessRefreshDiagnostics ? (
+				<div className="grid gap-2 md:grid-cols-3">
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">Star / Release</p>
+						<p className="mt-1 text-sm font-semibold">
+							Star {accessRefreshDiagnostics.star_repos} · Release{" "}
+							{accessRefreshDiagnostics.release_repos}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							共享 Release {accessRefreshDiagnostics.releases}
+						</p>
+					</div>
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">Social / Inbox</p>
+						<p className="mt-1 text-sm font-semibold">
+							社交事件 {accessRefreshDiagnostics.social_events} · 通知{" "}
+							{accessRefreshDiagnostics.notifications}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							Repo Stars {accessRefreshDiagnostics.social_repo_stars} ·
+							Followers {accessRefreshDiagnostics.social_followers}
+						</p>
+					</div>
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">日志入口</p>
+						<p className="mt-1 text-sm font-semibold">
+							{accessRefreshDiagnostics.log_available ? "可下载" : "暂无日志"}
+						</p>
+						{accessRefreshDiagnostics.log_available &&
+						accessRefreshDiagnostics.log_download_path ? (
+							<Button
+								asChild
+								className="mt-3 w-full"
+								size="sm"
+								variant="outline"
+							>
+								<a download href={accessRefreshDiagnostics.log_download_path}>
+									下载日志
+								</a>
+							</Button>
+						) : (
+							<p className="text-muted-foreground mt-1 text-xs">
+								当前任务未提供可下载日志。
+							</p>
+						)}
+					</div>
+				</div>
+			) : null}
+			{accessRefreshDiagnostics?.failure ? (
+				<div className="grid gap-2 md:grid-cols-2">
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">Star 失败定类</p>
+						<p className="mt-1 text-sm font-semibold">
+							{accessRefreshDiagnostics.failure.operation ?? "star phase"}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							阶段{" "}
+							{accessRefreshFailureStageLabel(
+								accessRefreshDiagnostics.failure.error_stage,
+							)}{" "}
+							· 类型 {accessRefreshDiagnostics.failure.error_kind ?? "-"} ·
+							{accessRefreshDiagnostics.failure.retryable
+								? " 可重试"
+								: " 不可重试"}
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							HTTP {accessRefreshDiagnostics.failure.http_status ?? "-"} ·
+							timeout {accessRefreshDiagnostics.failure.timeout_ms ?? "-"}ms ·
+							elapsed {accessRefreshDiagnostics.failure.elapsed_ms ?? "-"}ms
+						</p>
+						<p className="text-muted-foreground mt-1 text-xs">
+							attempts {accessRefreshDiagnostics.failure.attempts ?? "-"} /{" "}
+							{accessRefreshDiagnostics.failure.retry_limit ?? "-"}
+						</p>
+					</div>
+					<div className={detailCardClass}>
+						<p className="text-muted-foreground text-[11px]">错误链</p>
+						<p className="mt-1 whitespace-pre-wrap break-all font-mono text-xs">
+							{accessRefreshDiagnostics.failure.error_chain ?? "(empty)"}
+						</p>
+					</div>
+				</div>
+			) : null}
+			{accessRefreshDiagnostics &&
+			(accessRefreshDiagnostics.social_error ||
+				accessRefreshDiagnostics.notifications_error) ? (
+				<div className={detailCardClass}>
+					<p className="text-muted-foreground text-[11px]">Best-effort 告警</p>
+					<div className="mt-2 space-y-2">
+						{accessRefreshDiagnostics.social_error ? (
+							<div className="rounded-md border border-amber-500/35 bg-amber-500/5 p-2">
+								<p className="text-xs font-medium">Social 阶段</p>
+								<p className="mt-1 text-sm">
+									{accessRefreshDiagnostics.social_error}
+								</p>
+							</div>
+						) : null}
+						{accessRefreshDiagnostics.notifications_error ? (
+							<div className="rounded-md border border-amber-500/35 bg-amber-500/5 p-2">
+								<p className="text-xs font-medium">Inbox 阶段</p>
+								<p className="mt-1 text-sm">
+									{accessRefreshDiagnostics.notifications_error}
+								</p>
+							</div>
+						) : null}
+					</div>
 				</div>
 			) : null}
 			{syncDiagnostics ? (
