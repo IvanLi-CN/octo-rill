@@ -767,7 +767,10 @@ async fn record_skipped_recent_failures_retry(
 }
 
 fn task_supports_log_file(task_type: &str) -> bool {
-    task_type == TASK_SYNC_SUBSCRIPTIONS
+    matches!(
+        task_type,
+        TASK_SYNC_SUBSCRIPTIONS | TASK_SYNC_ACCESS_REFRESH
+    )
 }
 
 fn task_log_relative_path(task_type: &str, task_id: &str, now: DateTime<Utc>) -> PathBuf {

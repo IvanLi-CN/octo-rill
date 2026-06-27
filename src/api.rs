@@ -2989,6 +2989,8 @@ pub struct AdminTaskDiagnostics {
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_recent_failures: Option<AdminRetryRecentFailuresDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    sync_access_refresh: Option<AdminSyncAccessRefreshDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sync_subscriptions: Option<AdminSyncSubscriptionsDiagnostics>,
 }
 
@@ -3169,6 +3171,36 @@ pub struct AdminSyncSubscriptionEventItem {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AdminSyncAccessRefreshFailureDiagnostic {
+    operation: Option<String>,
+    error_kind: Option<String>,
+    error_stage: Option<String>,
+    retryable: bool,
+    http_status: Option<i64>,
+    timeout_ms: Option<i64>,
+    elapsed_ms: Option<i64>,
+    attempts: Option<i64>,
+    retry_limit: Option<i64>,
+    error_chain: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminSyncAccessRefreshDiagnostics {
+    log_available: bool,
+    log_download_path: Option<String>,
+    star_repos: i64,
+    release_repos: i64,
+    releases: i64,
+    social_repo_stars: i64,
+    social_followers: i64,
+    social_events: i64,
+    notifications: i64,
+    social_error: Option<String>,
+    notifications_error: Option<String>,
+    failure: Option<AdminSyncAccessRefreshFailureDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AdminSyncSubscriptionsDiagnostics {
     trigger: Option<String>,
     schedule_key: Option<String>,
@@ -3317,7 +3349,15 @@ fn json_object_get_object<'a>(
         .and_then(serde_json::Value::as_object)
 }
 
-fn sync_subscription_log_download_path(task_id: &str) -> String {
+fn realtime_task_log_available(task: &AdminRealtimeTaskDetailItem) -> bool {
+    task.log_file_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(std::path::Path::new)
+        .is_some_and(std::path::Path::is_file)
+}
+
+fn realtime_task_log_download_path(task_id: &str) -> String {
     format!(
         "/api/admin/jobs/realtime/{}/log",
         urlencoding::encode(task_id)
@@ -4180,6 +4220,133 @@ fn map_sync_subscription_event(
     }
 }
 
+fn latest_access_refresh_failure(
+    events: &[AdminTaskEventItem],
+) -> Option<AdminSyncAccessRefreshFailureDiagnostic> {
+    let mut latest = None;
+    for event in task_events_for_diagnostics(events) {
+        if event.event_type != "task.progress" {
+            continue;
+        }
+        let payload_value = parse_json_value(Some(event.payload_json.as_str()));
+        let payload_object = payload_value
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        if json_object_get_string(payload_object, "stage").as_deref() != Some("star_failed") {
+            continue;
+        }
+        latest = Some(AdminSyncAccessRefreshFailureDiagnostic {
+            operation: json_object_get_string(payload_object, "operation"),
+            error_kind: json_object_get_string(payload_object, "error_kind"),
+            error_stage: json_object_get_string(payload_object, "error_stage"),
+            retryable: json_object_get_bool(payload_object, "retryable").unwrap_or(false),
+            http_status: json_object_get_i64(payload_object, "http_status"),
+            timeout_ms: json_object_get_i64(payload_object, "timeout_ms"),
+            elapsed_ms: json_object_get_i64(payload_object, "elapsed_ms"),
+            attempts: json_object_get_i64(payload_object, "attempts"),
+            retry_limit: json_object_get_i64(payload_object, "retry_limit"),
+            error_chain: json_object_get_string(payload_object, "error_chain"),
+        });
+    }
+    latest
+}
+
+fn build_sync_access_refresh_diagnostics(
+    task: &AdminRealtimeTaskDetailItem,
+    events: &[AdminTaskEventItem],
+) -> (AdminBusinessOutcome, AdminSyncAccessRefreshDiagnostics) {
+    let result_value = parse_json_value(task.result_json.as_deref());
+    let result_object = result_value.as_ref().and_then(serde_json::Value::as_object);
+    let starred_object = json_object_get_object(result_object, "starred");
+    let release_object = json_object_get_object(result_object, "release");
+    let social_object = json_object_get_object(result_object, "social");
+    let notifications_object = json_object_get_object(result_object, "notifications");
+    let failure = latest_access_refresh_failure(events);
+    let social_error = json_object_get_string(result_object, "social_error");
+    let notifications_error = json_object_get_string(result_object, "notifications_error");
+    let log_available = realtime_task_log_available(task);
+    let log_download_path = log_available.then(|| realtime_task_log_download_path(&task.id));
+    let diagnostics = AdminSyncAccessRefreshDiagnostics {
+        log_available,
+        log_download_path,
+        star_repos: json_object_get_i64(starred_object, "repos").unwrap_or(0),
+        release_repos: json_object_get_i64(release_object, "repos").unwrap_or(0),
+        releases: json_object_get_i64(release_object, "releases").unwrap_or(0),
+        social_repo_stars: json_object_get_i64(social_object, "repo_stars").unwrap_or(0),
+        social_followers: json_object_get_i64(social_object, "followers").unwrap_or(0),
+        social_events: json_object_get_i64(social_object, "events").unwrap_or(0),
+        notifications: json_object_get_i64(notifications_object, "notifications").unwrap_or(0),
+        social_error: social_error.clone(),
+        notifications_error: notifications_error.clone(),
+        failure,
+    };
+
+    let outcome = if task.status == jobs::STATUS_FAILED {
+        if let Some(failure) = diagnostics.failure.as_ref() {
+            let mut parts = Vec::new();
+            if let Some(operation) = failure.operation.as_deref() {
+                parts.push(format!("operation={operation}"));
+            }
+            if let Some(error_stage) = failure.error_stage.as_deref() {
+                parts.push(format!("stage={error_stage}"));
+            }
+            if let Some(error_kind) = failure.error_kind.as_deref() {
+                parts.push(format!("error_kind={error_kind}"));
+            }
+            if let Some(elapsed_ms) = failure.elapsed_ms {
+                parts.push(format!("elapsed={}ms", elapsed_ms));
+            }
+            if let Some(timeout_ms) = failure.timeout_ms {
+                parts.push(format!("timeout={}ms", timeout_ms));
+            }
+            business_outcome(
+                "failed",
+                "Star 阶段失败",
+                if parts.is_empty() {
+                    task.error_message
+                        .clone()
+                        .unwrap_or_else(|| "访问增量同步在 Star 阶段失败。".to_owned())
+                } else {
+                    format!("访问增量同步在 Star 阶段失败：{}。", parts.join(" · "))
+                },
+            )
+        } else {
+            business_outcome(
+                "failed",
+                "访问同步失败",
+                task.error_message
+                    .clone()
+                    .unwrap_or_else(|| "访问增量同步执行失败。".to_owned()),
+            )
+        }
+    } else if task.status == jobs::STATUS_CANCELED {
+        business_outcome("partial", "已取消", "访问增量同步已取消，结果可能不完整。")
+    } else if matches!(
+        task.status.as_str(),
+        jobs::STATUS_QUEUED | jobs::STATUS_RUNNING
+    ) {
+        business_outcome(
+            "unknown",
+            "处理中",
+            "访问增量同步正在执行中，结果尚未稳定。",
+        )
+    } else if social_error.is_some() || notifications_error.is_some() {
+        business_outcome(
+            "partial",
+            "部分成功",
+            "Star / Release 已完成，但 social 或 Inbox 出现 best-effort 异常。",
+        )
+    } else {
+        business_outcome(
+            "ok",
+            "业务成功",
+            "访问增量同步已完成 Star / Release / social / Inbox。",
+        )
+    };
+
+    (outcome, diagnostics)
+}
+
 fn build_sync_subscriptions_diagnostics(
     task: &AdminRealtimeTaskDetailItem,
     events: &[AdminTaskEventItem],
@@ -4247,13 +4414,8 @@ fn build_sync_subscriptions_diagnostics(
         &mut notifications,
         &mut releases_written,
     );
-    let log_available = task
-        .log_file_path
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(std::path::Path::new)
-        .is_some_and(std::path::Path::is_file);
-    let log_download_path = log_available.then(|| sync_subscription_log_download_path(&task.id));
+    let log_available = realtime_task_log_available(task);
+    let log_download_path = log_available.then(|| realtime_task_log_download_path(&task.id));
 
     let outcome = if task.status == jobs::STATUS_FAILED {
         business_outcome(
@@ -4548,6 +4710,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: None,
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: None,
             })
         }
@@ -4561,6 +4724,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: None,
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: None,
             })
         }
@@ -4574,6 +4738,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: None,
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: None,
             })
         }
@@ -4588,6 +4753,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: Some(diagnostics),
                 brief_refresh_content: None,
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: None,
             })
         }
@@ -4602,6 +4768,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: Some(diagnostics),
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: None,
             })
         }
@@ -4615,6 +4782,22 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: None,
                 retry_recent_failures: Some(diagnostics),
+                sync_access_refresh: None,
+                sync_subscriptions: None,
+            })
+        }
+        jobs::TASK_SYNC_ACCESS_REFRESH => {
+            let (business_outcome, diagnostics) =
+                build_sync_access_refresh_diagnostics(task, events);
+            Some(AdminTaskDiagnostics {
+                business_outcome,
+                translate_release_batch: None,
+                brief_daily_slot: None,
+                brief_generate: None,
+                brief_history_recompute: None,
+                brief_refresh_content: None,
+                retry_recent_failures: None,
+                sync_access_refresh: Some(diagnostics),
                 sync_subscriptions: None,
             })
         }
@@ -4629,6 +4812,7 @@ fn build_task_diagnostics(
                 brief_history_recompute: None,
                 brief_refresh_content: None,
                 retry_recent_failures: None,
+                sync_access_refresh: None,
                 sync_subscriptions: Some(diagnostics),
             })
         }
@@ -15201,6 +15385,86 @@ mod tests {
             payload_json: payload_json.to_owned(),
             created_at: format!("2026-02-27T00:00:{:02}Z", (id % 60)),
         }
+    }
+
+    #[test]
+    fn build_sync_access_refresh_diagnostics_surfaces_star_failure_details() {
+        let log_path = std::env::temp_dir().join(format!(
+            "octo-rill-access-refresh-diagnostics-{}.ndjson",
+            crate::local_id::generate_local_id()
+        ));
+        std::fs::write(&log_path, "{}\n").expect("seed access refresh log");
+        let mut task = test_task_detail_item(
+            jobs::TASK_SYNC_ACCESS_REFRESH,
+            jobs::STATUS_FAILED,
+            r#"{"user_id":"scope22222222222"}"#,
+            None,
+            Some("sync starred graphql: timed out after 30s"),
+        );
+        task.log_file_path = Some(log_path.to_string_lossy().into_owned());
+        let events = vec![test_task_event(
+            1,
+            "task.progress",
+            r#"{"stage":"star_failed","operation":"sync starred graphql","error_kind":"timeout","error_stage":"timeout","retryable":true,"timeout_ms":30000,"elapsed_ms":30004,"attempts":1,"retry_limit":3,"error_chain":"sync starred graphql: timed out after 30s"}"#,
+        )];
+
+        let (outcome, diagnostics) = super::build_sync_access_refresh_diagnostics(&task, &events);
+
+        assert_eq!(outcome.code, "failed");
+        assert!(outcome.message.contains("stage=timeout"));
+        let failure = diagnostics.failure.expect("failure diagnostics");
+        assert_eq!(failure.operation.as_deref(), Some("sync starred graphql"));
+        assert_eq!(failure.error_kind.as_deref(), Some("timeout"));
+        assert_eq!(failure.error_stage.as_deref(), Some("timeout"));
+        assert_eq!(failure.timeout_ms, Some(30_000));
+        assert_eq!(failure.elapsed_ms, Some(30_004));
+        assert_eq!(
+            diagnostics.log_download_path.as_deref(),
+            Some("/api/admin/jobs/realtime/task-test/log")
+        );
+
+        std::fs::remove_file(log_path).expect("cleanup access refresh log");
+    }
+
+    #[test]
+    fn build_sync_access_refresh_diagnostics_marks_best_effort_partial_success() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_ACCESS_REFRESH,
+            jobs::STATUS_SUCCEEDED,
+            r#"{"user_id":"scope22222222222"}"#,
+            Some(
+                r#"{"starred":{"repos":5},"release":{"repos":5,"releases":8},"social":{"repo_stars":3,"followers":2,"events":1},"social_error":"followers timeout","notifications":{"notifications":7},"notifications_error":null}"#,
+            ),
+            None,
+        );
+
+        let (outcome, diagnostics) = super::build_sync_access_refresh_diagnostics(&task, &[]);
+
+        assert_eq!(outcome.code, "partial");
+        assert_eq!(diagnostics.star_repos, 5);
+        assert_eq!(diagnostics.release_repos, 5);
+        assert_eq!(diagnostics.releases, 8);
+        assert_eq!(
+            diagnostics.social_error.as_deref(),
+            Some("followers timeout")
+        );
+    }
+
+    #[test]
+    fn build_sync_access_refresh_diagnostics_does_not_mislabel_non_star_failures() {
+        let task = test_task_detail_item(
+            jobs::TASK_SYNC_ACCESS_REFRESH,
+            jobs::STATUS_FAILED,
+            r#"{"user_id":"scope22222222222"}"#,
+            None,
+            Some("owned repo visibility refresh failed"),
+        );
+
+        let (outcome, diagnostics) = super::build_sync_access_refresh_diagnostics(&task, &[]);
+
+        assert_eq!(outcome.code, "failed");
+        assert_eq!(outcome.label, "访问同步失败");
+        assert!(diagnostics.failure.is_none());
     }
 
     async fn setup_pool() -> SqlitePool {
