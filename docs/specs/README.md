@@ -22,6 +22,7 @@
 
 | ID | Title | Lifecycle | Spec | Companion docs | Implementation |
 | --- | --- | --- | --- | --- | --- |
+| u1f6v | 认证态 Scoped Focus Feed | active | [SPEC.md](./u1f6v-authenticated-scoped-focus-feed/SPEC.md) | [IMPLEMENTATION.md](./u1f6v-authenticated-scoped-focus-feed/IMPLEMENTATION.md) / [HISTORY.md](./u1f6v-authenticated-scoped-focus-feed/HISTORY.md) | 实现中；fast-track / authenticated repo-org scoped reading surface + scope-aware route/update contract |
 | p8r3l | 公开仓库 Release 外链与 API | active | [SPEC.md](./p8r3l-public-release-endpoints/SPEC.md) | [IMPLEMENTATION.md](./p8r3l-public-release-endpoints/IMPLEMENTATION.md) / [HISTORY.md](./p8r3l-public-release-endpoints/HISTORY.md) | 实现中；fast-track / public release pages + REST API + admin registry |
 | fvh8d | Release 失败 Telegram 告警接入 | active | [SPEC.md](./fvh8d-release-failure-telegram-alerts/SPEC.md) | [IMPLEMENTATION.md](./fvh8d-release-failure-telegram-alerts/IMPLEMENTATION.md) / [HISTORY.md](./fvh8d-release-failure-telegram-alerts/HISTORY.md) | 已交付；fast-track / shared github-workflows notifier rollout / smoke test target |
 | apras | 翻译请求单条记录制重建 | active | [SPEC.md](./apras-translation-request-single-record/SPEC.md) | [IMPLEMENTATION.md](./apras-translation-request-single-record/IMPLEMENTATION.md) / [HISTORY.md](./apras-translation-request-single-record/HISTORY.md) | 已交付；PR #35; checks green; review-loop clear; single-request contract live |

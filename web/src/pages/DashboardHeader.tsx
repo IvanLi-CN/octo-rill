@@ -1,6 +1,7 @@
 import type * as React from "react";
 import {
 	ArrowUpRight,
+	Eye,
 	LogOut,
 	RefreshCcw,
 	Settings,
@@ -42,6 +43,9 @@ export type DashboardHeaderProps = {
 	onSyncAll?: () => void;
 	logoutHref?: string;
 	mobileControlBand?: React.ReactNode;
+	showMineEntry?: boolean;
+	mineHref?: string;
+	mineLabel?: string;
 };
 
 function clampUnit(value: number) {
@@ -146,6 +150,9 @@ function DashboardUserInfoCard(props: {
 	aiDisabledHint: boolean;
 	logoutHref: string;
 	showMobileAdminLink: boolean;
+	showMineEntry: boolean;
+	mineHref: string;
+	mineLabel: string;
 }) {
 	const {
 		login,
@@ -156,6 +163,9 @@ function DashboardUserInfoCard(props: {
 		aiDisabledHint,
 		logoutHref,
 		showMobileAdminLink,
+		showMineEntry,
+		mineHref,
+		mineLabel,
 	} = props;
 	const displayName = name?.trim() || login;
 	const secondaryName =
@@ -231,6 +241,22 @@ function DashboardUserInfoCard(props: {
 			) : null}
 
 			<div className="mt-4 border-t border-border/70 pt-3">
+				{showMineEntry ? (
+					<Button
+						asChild
+						variant="ghost"
+						className="mb-2 w-full justify-start px-2"
+					>
+						<InternalLink
+							href={mineHref}
+							to={mineHref}
+							data-dashboard-focus-mine-entry="true"
+						>
+							<Eye className="size-4" />
+							{mineLabel}
+						</InternalLink>
+					</Button>
+				) : null}
 				<Button asChild variant="ghost" className="w-full justify-start px-2">
 					<InternalLink
 						href="/settings"
@@ -269,6 +295,9 @@ function DashboardUserMenu(props: {
 	logoutHref: string;
 	headerProgress: number;
 	showMobileAdminLink: boolean;
+	showMineEntry: boolean;
+	mineHref: string;
+	mineLabel: string;
 }) {
 	const {
 		login,
@@ -280,6 +309,9 @@ function DashboardUserMenu(props: {
 		logoutHref,
 		headerProgress,
 		showMobileAdminLink,
+		showMineEntry,
+		mineHref,
+		mineLabel,
 	} = props;
 	const cardId = useId();
 	const wrapperRef = useRef<HTMLFieldSetElement | null>(null);
@@ -367,6 +399,9 @@ function DashboardUserMenu(props: {
 						aiDisabledHint={aiDisabledHint}
 						logoutHref={logoutHref}
 						showMobileAdminLink={showMobileAdminLink}
+						showMineEntry={showMineEntry}
+						mineHref={mineHref}
+						mineLabel={mineLabel}
 					/>
 				</div>
 			) : null}
@@ -387,6 +422,9 @@ export function DashboardHeader({
 	onSyncAll,
 	logoutHref = "/auth/logout",
 	mobileControlBand = null,
+	showMineEntry = false,
+	mineHref = "/focus/mine",
+	mineLabel = "我的仓库动态",
 }: DashboardHeaderProps) {
 	const {
 		compactHeader,
@@ -622,6 +660,9 @@ export function DashboardHeader({
 						logoutHref={logoutHref}
 						headerProgress={mobileHeaderProgress}
 						showMobileAdminLink={isAdmin}
+						showMineEntry={showMineEntry}
+						mineHref={mineHref}
+						mineLabel={mineLabel}
 					/>
 				</div>
 			</div>

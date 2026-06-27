@@ -275,7 +275,14 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		page.locator(
 			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]:visible',
 		),
-	).toHaveCount(2);
+	).toHaveCount(1);
+	await expect(
+		page
+			.locator(
+				'[data-social-card-kind="repo_star_received"] a[data-social-card-segment="target"]',
+			)
+			.first(),
+	).toHaveAttribute("href", "/focus/repo/owner/repo");
 	await expect(
 		page.locator(
 			'[data-social-card-kind="repo_star_received"][data-social-card-time-visible="true"] [data-social-card-timestamp]',
@@ -300,7 +307,14 @@ test("dashboard renders mixed social activity in all tab and filters stars/follo
 		page.locator(
 			'[data-social-card-kind="repo_star_received"] a[href^="https://github.com/"]:visible',
 		),
-	).toHaveCount(2);
+	).toHaveCount(1);
+	await expect(
+		page
+			.locator(
+				'[data-social-card-kind="repo_star_received"] a[data-social-card-segment="target"]',
+			)
+			.first(),
+	).toHaveAttribute("href", "/focus/repo/owner/repo");
 	await expect(
 		page.locator(
 			'[data-social-card-kind="repo_star_received"][data-social-card-time-visible="true"] [data-social-card-timestamp]',
@@ -475,7 +489,7 @@ test("dashboard keeps social cards inline on mobile widths without horizontal ov
 				.locator('a[data-social-card-segment="target"]'),
 		).toHaveAttribute(
 			"href",
-			"https://github.com/octo-rill/mobile-dashboard-social-activity-feed",
+			"/focus/repo/octo-rill/mobile-dashboard-social-activity-feed",
 		);
 		const repoMetrics = await starRepoMobileLabel.evaluate((node) => ({
 			clientWidth: node.clientWidth,
