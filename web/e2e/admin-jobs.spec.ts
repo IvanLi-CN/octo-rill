@@ -222,10 +222,32 @@ async function installAdminJobsMocks(
 	];
 	let llmSchedulerStatus = {
 		scheduler_enabled: true,
+		llm_models: ["gpt-4o-mini", "gpt-4.1-mini"],
+		selected_model_for_new_calls: "gpt-4.1-mini",
 		max_concurrency: 2,
 		ai_model_context_limit: null as number | null,
-		effective_model_input_limit: 32768,
+		effective_model_input_limit: 1047576,
 		effective_model_input_limit_source: "builtin_catalog",
+		model_statuses: [
+			{
+				model: "gpt-4o-mini",
+				priority: 1,
+				status: "cooldown",
+				consecutive_final_failures: 3,
+				cooldown_until: "2026-02-26T04:10:00Z",
+				effective_input_limit: 128000,
+				effective_input_limit_source: "builtin_catalog",
+			},
+			{
+				model: "gpt-4.1-mini",
+				priority: 2,
+				status: "ready",
+				consecutive_final_failures: 0,
+				cooldown_until: null,
+				effective_input_limit: 1047576,
+				effective_input_limit_source: "builtin_catalog",
+			},
+		],
 		available_slots: 1,
 		waiting_calls: 1,
 		in_flight_calls: 1,
@@ -1507,6 +1529,7 @@ async function installAdminJobsMocks(
 			const body = (req.postDataJSON() ?? {}) as {
 				max_concurrency?: number;
 				ai_model_context_limit?: number | null;
+				llm_models?: string[];
 			};
 			const maxConcurrency = Number(body.max_concurrency ?? 1);
 			const hasModelContextLimit = Object.hasOwn(
@@ -1518,13 +1541,31 @@ async function installAdminJobsMocks(
 					? Number(body.ai_model_context_limit)
 					: null
 				: llmSchedulerStatus.ai_model_context_limit;
+			const nextModels =
+				body.llm_models && body.llm_models.length > 0
+					? body.llm_models
+					: llmSchedulerStatus.llm_models;
 			llmSchedulerStatus = {
 				...llmSchedulerStatus,
+				llm_models: nextModels,
+				selected_model_for_new_calls: nextModels[0] ?? null,
 				max_concurrency: maxConcurrency,
 				ai_model_context_limit: aiModelContextLimit,
-				effective_model_input_limit: aiModelContextLimit ?? 32768,
+				effective_model_input_limit: aiModelContextLimit ?? 128000,
 				effective_model_input_limit_source:
 					aiModelContextLimit === null ? "builtin_catalog" : "admin_override",
+				model_statuses: nextModels.map((model, index) => ({
+					model,
+					priority: index + 1,
+					status: "ready",
+					consecutive_final_failures: 0,
+					cooldown_until: null,
+					effective_input_limit:
+						aiModelContextLimit ??
+						(model === "gpt-4.1-mini" ? 1047576 : 128000),
+					effective_input_limit_source:
+						aiModelContextLimit === null ? "builtin_catalog" : "admin_override",
+				})),
 				available_slots: Math.max(
 					0,
 					maxConcurrency - llmSchedulerStatus.in_flight_calls,
@@ -2331,18 +2372,27 @@ test("admin can update llm runtime settings from settings dialog", async ({
 	await expect(dialog).toBeVisible();
 	const concurrencyInput = dialog.getByLabel("最大并发数");
 	const modelInput = dialog.getByLabel("LLM 输入长度上限（tokens）");
+	const firstModelInput = dialog.getByPlaceholder("例如 gpt-4o-mini").first();
 	await expect(concurrencyInput).toHaveValue("2");
 	await expect(modelInput).toHaveValue("");
+	await expect(firstModelInput).toHaveValue("gpt-4o-mini");
 	await concurrencyInput.fill("0");
 	await dialog.getByRole("button", { name: "保存设置" }).click();
 	await expect(dialog.getByText("并发上限必须是大于 0 的整数。")).toBeVisible();
 	await concurrencyInput.fill("5");
+	await dialog.getByRole("button", { name: "新增模型" }).click();
+	const modelInputs = dialog.getByPlaceholder("例如 gpt-4o-mini");
+	await firstModelInput.fill("gpt-4.1-mini");
+	await modelInputs.nth(1).fill("gpt-4o-mini");
+	await dialog.getByRole("button", { name: "删除模型 3" }).click();
 	await modelInput.fill("65536");
 	await dialog.getByRole("button", { name: "保存设置" }).click();
 	await expect(dialog).toHaveCount(0);
 	await expect(
 		page.getByText("并发上限 5 · 可用 4 · 输入 65,536 tokens"),
 	).toBeVisible();
+	await expect(page.getByText("当前优先模型：")).toBeVisible();
+	await expect(page.getByText("1. gpt-4.1-mini")).toBeVisible();
 });
 
 test("admin refreshes llm scheduler via shared sse stream", async ({
@@ -2363,7 +2413,7 @@ test("admin refreshes llm scheduler via shared sse stream", async ({
 	await page.goto("/admin/jobs");
 	await page.getByRole("tab", { name: "LLM调度" }).click();
 	await expect(
-		page.getByText("并发上限 5 · 可用 4 · 输入 32,768 tokens"),
+		page.getByText("并发上限 5 · 可用 4 · 输入 1,047,576 tokens"),
 	).toBeVisible();
 });
 

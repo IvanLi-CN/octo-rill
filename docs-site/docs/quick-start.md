@@ -53,7 +53,7 @@ cp .env.example .env.local
 
 - `AI_API_KEY`
 - `AI_BASE_URL`
-- `AI_MODEL`
+- `AI_MODEL`（首次启动用于 seed 管理后台模型列表）
 
 变量解释见 [配置参考](/config)。
 

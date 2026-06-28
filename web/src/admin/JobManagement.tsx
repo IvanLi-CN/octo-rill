@@ -1,4 +1,12 @@
-import { ArrowLeft, CircleHelp, Settings2 } from "lucide-react";
+import {
+	ArrowDown,
+	ArrowLeft,
+	ArrowUp,
+	CircleHelp,
+	Plus,
+	Settings2,
+	Trash2,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TaskTypeDetailSection } from "@/admin/TaskTypeDetailSection";
@@ -122,6 +130,12 @@ const RETRY_RECENT_FAILURES_INTERVAL_DEFAULT = 10;
 const REPO_RELEASE_WORKER_MIN = 1;
 const REPO_RELEASE_WORKER_MAX = 32;
 const REPO_RELEASE_WORKER_MARKS = [1, 5, 10, 16, 24, 32];
+let llmModelInputIdCounter = 0;
+
+type LlmModelInputRow = {
+	id: string;
+	value: string;
+};
 
 function formatLocalHm(value: string | null | undefined) {
 	if (!value) return "-";
@@ -259,6 +273,40 @@ function formatModelInputLimitSource(source: string | null | undefined) {
 		default:
 			return source ?? "-";
 	}
+}
+
+function normalizeLlmModelsForInput(models: string[]) {
+	const normalized: string[] = [];
+	for (const model of models) {
+		const trimmed = model.trim();
+		if (!trimmed) continue;
+		if (normalized.includes(trimmed)) continue;
+		normalized.push(trimmed);
+	}
+	return normalized;
+}
+
+function llmModelsValidationError(models: string[]) {
+	const hasBlank = models.some((model) => model.trim().length === 0);
+	if (hasBlank) {
+		return "模型列表不能包含空白项。";
+	}
+	const normalized = normalizeLlmModelsForInput(models);
+	if (normalized.length === 0) {
+		return "至少需要保留一个模型。";
+	}
+	if (normalized.length !== models.length) {
+		return "模型列表不能包含重复项。";
+	}
+	return null;
+}
+
+function createLlmModelInputRow(value = ""): LlmModelInputRow {
+	llmModelInputIdCounter += 1;
+	return {
+		id: `llm-model-row-${llmModelInputIdCounter}`,
+		value,
+	};
 }
 
 function formatTranslationWorkerBoardDescription(
@@ -3417,6 +3465,9 @@ export function JobManagement({
 	const [llmMaxConcurrencyInput, setLlmMaxConcurrencyInput] = useState("");
 	const [llmModelContextLimitInput, setLlmModelContextLimitInput] =
 		useState("");
+	const [llmModelsInput, setLlmModelsInput] = useState<LlmModelInputRow[]>([
+		createLlmModelInputRow(""),
+	]);
 	const [llmSettingsSaveError, setLlmSettingsSaveError] = useState<
 		string | null
 	>(null);
@@ -4000,6 +4051,11 @@ export function JobManagement({
 				? String(llmStatus.ai_model_context_limit)
 				: "",
 		);
+		setLlmModelsInput(
+			llmStatus?.llm_models?.length
+				? llmStatus.llm_models.map((model) => createLlmModelInputRow(model))
+				: [createLlmModelInputRow("")],
+		);
 		setLlmSettingsDialogOpen(true);
 	}, [llmStatus]);
 
@@ -4020,6 +4076,13 @@ export function JobManagement({
 			);
 			return;
 		}
+		const modelValues = llmModelsInput.map((row) => row.value);
+		const modelError = llmModelsValidationError(modelValues);
+		if (modelError) {
+			setLlmSettingsSaveError(modelError);
+			return;
+		}
+		const llmModels = normalizeLlmModelsForInput(modelValues);
 
 		setLlmSettingsSaving(true);
 		setLlmSettingsSaveError(null);
@@ -4027,6 +4090,7 @@ export function JobManagement({
 			const nextStatus = await apiPatchAdminLlmRuntimeConfig({
 				max_concurrency: maxConcurrency,
 				ai_model_context_limit: aiModelContextLimit,
+				llm_models: llmModels,
 			});
 			setLlmStatus(nextStatus);
 			setLlmSettingsDialogOpen(false);
@@ -4035,7 +4099,7 @@ export function JobManagement({
 		} finally {
 			setLlmSettingsSaving(false);
 		}
-	}, [llmMaxConcurrencyInput, llmModelContextLimitInput]);
+	}, [llmMaxConcurrencyInput, llmModelContextLimitInput, llmModelsInput]);
 
 	const loadLlmCalls = useCallback(
 		async (options?: LoadOptions) => {
@@ -5434,6 +5498,54 @@ export function JobManagement({
 							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
+							{llmStatus?.model_statuses?.length ? (
+								<div className="grid gap-2 lg:grid-cols-2">
+									{llmStatus.model_statuses.map((modelStatus) => (
+										<div
+											key={modelStatus.model}
+											className="rounded-lg border bg-card/70 p-3"
+										>
+											<div className="flex items-center justify-between gap-3">
+												<div className="min-w-0">
+													<p className="truncate font-mono text-sm">
+														{modelStatus.priority}. {modelStatus.model}
+													</p>
+													<p className="text-muted-foreground mt-1 text-xs">
+														{modelStatus.status === "cooldown"
+															? `冷却至 ${formatLocalDateTime(modelStatus.cooldown_until)}`
+															: "可用"}
+													</p>
+												</div>
+												<Badge
+													variant={
+														modelStatus.status === "cooldown"
+															? "secondary"
+															: "outline"
+													}
+												>
+													{modelStatus.status === "cooldown"
+														? "冷却中"
+														: "就绪"}
+												</Badge>
+											</div>
+											<p className="text-muted-foreground mt-2 text-xs">
+												连续最终失败{" "}
+												{formatCount(modelStatus.consecutive_final_failures)} 次
+											</p>
+											<p className="text-muted-foreground mt-1 text-xs">
+												输入上限{" "}
+												{formatCount(modelStatus.effective_input_limit)}{" "}
+												tokens（
+												{formatModelInputLimitSource(
+													modelStatus.effective_input_limit_source,
+												)}
+												）
+											</p>
+										</div>
+									))}
+								</div>
+							) : null}
+
 							<div className="max-w-sm">
 								<div className="bg-card/70 rounded-lg border p-3">
 									<p className="text-muted-foreground text-xs">
@@ -5451,6 +5563,12 @@ export function JobManagement({
 										并发上限 {formatCount(llmStatus?.max_concurrency)} · 可用{" "}
 										{formatCount(llmStatus?.available_slots)} · 输入{" "}
 										{formatCount(llmStatus?.effective_model_input_limit)} tokens
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										当前优先模型：
+										<span className="ml-1 font-mono">
+											{llmStatus?.selected_model_for_new_calls ?? "-"}
+										</span>
 									</p>
 								</div>
 							</div>
@@ -6049,6 +6167,115 @@ export function JobManagement({
 									llmStatus?.effective_model_input_limit_source,
 								)}
 								）。
+							</p>
+						</div>
+						<div className="space-y-2">
+							<div className="flex items-center justify-between gap-2">
+								<Label>模型路由顺序</Label>
+								<Button
+									type="button"
+									variant="outline"
+									size="sm"
+									onClick={() =>
+										setLlmModelsInput((prev) => [
+											...prev,
+											createLlmModelInputRow(""),
+										])
+									}
+									disabled={llmSettingsSaving}
+								>
+									<Plus className="mr-1 size-4" />
+									新增模型
+								</Button>
+							</div>
+							<div className="space-y-2">
+								{llmModelsInput.map((model, index) => (
+									<div key={model.id} className="flex items-center gap-2">
+										<div className="w-6 shrink-0 text-center font-mono text-xs text-muted-foreground">
+											{index + 1}
+										</div>
+										<Input
+											value={model.value}
+											placeholder="例如 gpt-4o-mini"
+											onChange={(event) =>
+												setLlmModelsInput((prev) =>
+													prev.map((item, itemIndex) =>
+														itemIndex === index
+															? { ...item, value: event.target.value }
+															: item,
+													),
+												)
+											}
+										/>
+										<div className="flex items-center gap-1">
+											<Button
+												type="button"
+												variant="outline"
+												size="icon"
+												onClick={() =>
+													setLlmModelsInput((prev) => {
+														if (index === 0) return prev;
+														const next = [...prev];
+														[next[index - 1], next[index]] = [
+															next[index],
+															next[index - 1],
+														];
+														return next;
+													})
+												}
+												disabled={llmSettingsSaving || index === 0}
+												aria-label={`上移模型 ${index + 1}`}
+											>
+												<ArrowUp className="size-4" />
+											</Button>
+											<Button
+												type="button"
+												variant="outline"
+												size="icon"
+												onClick={() =>
+													setLlmModelsInput((prev) => {
+														if (index >= prev.length - 1) return prev;
+														const next = [...prev];
+														[next[index], next[index + 1]] = [
+															next[index + 1],
+															next[index],
+														];
+														return next;
+													})
+												}
+												disabled={
+													llmSettingsSaving ||
+													index >= llmModelsInput.length - 1
+												}
+												aria-label={`下移模型 ${index + 1}`}
+											>
+												<ArrowDown className="size-4" />
+											</Button>
+											<Button
+												type="button"
+												variant="outline"
+												size="icon"
+												onClick={() =>
+													setLlmModelsInput((prev) =>
+														prev.length === 1
+															? [createLlmModelInputRow("")]
+															: prev.filter(
+																	(_, itemIndex) => itemIndex !== index,
+																),
+													)
+												}
+												disabled={llmSettingsSaving}
+												aria-label={`删除模型 ${index + 1}`}
+											>
+												<Trash2 className="size-4" />
+											</Button>
+										</div>
+									</div>
+								))}
+							</div>
+							<p className="text-muted-foreground text-xs">
+								调度会优先使用排在前面的可用模型；单模型连续最终失败 3 次后冷却
+								10 分钟，再自动恢复尝试。
 							</p>
 						</div>
 						{llmSettingsSaveError ? (

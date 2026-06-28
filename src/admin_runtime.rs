@@ -2,6 +2,7 @@ use std::env;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
 use crate::{
@@ -13,10 +14,11 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminRuntimeSettingsSnapshot {
     pub llm_max_concurrency: usize,
     pub ai_model_context_limit: Option<u32>,
+    pub llm_models: Vec<String>,
     pub translation_general_worker_concurrency: usize,
     pub translation_dedicated_worker_concurrency: usize,
     pub repo_release_worker_concurrency: usize,
@@ -220,13 +222,82 @@ fn load_legacy_ai_model_context_limit_from_env() -> Result<Option<u32>> {
     Ok(Some(parsed))
 }
 
-async fn maybe_backfill_legacy_ai_model_context_limit(pool: &SqlitePool) -> Result<()> {
+fn load_legacy_ai_model_from_env() -> Result<Option<String>> {
+    let Some(raw) = env::var_os("AI_MODEL") else {
+        return Ok(None);
+    };
+
+    let raw = raw
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("invalid AI_MODEL (expected utf-8 string)"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_owned()))
+}
+
+pub fn normalize_llm_models(models: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for model in models {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if normalized.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    normalized
+}
+
+pub fn default_llm_models(config: &AppConfig) -> Vec<String> {
+    if let Some(model) = config
+        .ai
+        .as_ref()
+        .map(|ai| ai.model.trim().to_owned())
+        .filter(|model| !model.is_empty())
+    {
+        return vec![model];
+    }
+
+    load_legacy_ai_model_from_env()
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect()
+}
+
+fn serialize_llm_models_json(models: &[String]) -> String {
+    serde_json::to_string(models).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn parse_llm_models_json(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Array(items)) => normalize_llm_models(
+            items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect(),
+        ),
+        _ => Vec::new(),
+    }
+}
+
+async fn maybe_backfill_legacy_ai_model_context_limit(pool: &SqlitePool) -> Result<bool> {
     let Some(limit) = load_legacy_ai_model_context_limit_from_env()? else {
-        return Ok(());
+        return Ok(false);
     };
 
     let now = Utc::now().to_rfc3339();
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         UPDATE admin_runtime_settings
         SET
@@ -244,7 +315,33 @@ async fn maybe_backfill_legacy_ai_model_context_limit(pool: &SqlitePool) -> Resu
     .bind(now.as_str())
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+async fn maybe_backfill_legacy_llm_models(pool: &SqlitePool, config: &AppConfig) -> Result<bool> {
+    let models = default_llm_models(config);
+    if models.is_empty() {
+        return Ok(false);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let serialized = serialize_llm_models_json(&models);
+    let result = sqlx::query(
+        r#"
+        UPDATE admin_runtime_settings
+        SET
+          llm_models_json = ?,
+          updated_at = ?
+        WHERE
+          id = 1
+          AND TRIM(COALESCE(llm_models_json, '')) IN ('', '[]')
+        "#,
+    )
+    .bind(serialized.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn load_or_seed_runtime_settings(
@@ -252,8 +349,14 @@ pub async fn load_or_seed_runtime_settings(
     config: &AppConfig,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     if let Some(snapshot) = fetch_runtime_settings(pool).await? {
+        let mut backfilled = false;
         if snapshot.ai_model_context_limit.is_none() {
-            maybe_backfill_legacy_ai_model_context_limit(pool).await?;
+            backfilled |= maybe_backfill_legacy_ai_model_context_limit(pool).await?;
+        }
+        if snapshot.llm_models.is_empty() {
+            backfilled |= maybe_backfill_legacy_llm_models(pool, config).await?;
+        }
+        if backfilled {
             return fetch_runtime_settings(pool).await?.ok_or_else(|| {
                 anyhow::anyhow!("admin runtime settings row missing after backfill")
             });
@@ -264,6 +367,7 @@ pub async fn load_or_seed_runtime_settings(
     let snapshot = AdminRuntimeSettingsSnapshot {
         llm_max_concurrency: config.ai_max_concurrency,
         ai_model_context_limit: None,
+        llm_models: default_llm_models(config),
         translation_general_worker_concurrency: DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY,
         translation_dedicated_worker_concurrency: DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY,
         repo_release_worker_concurrency: DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY,
@@ -276,19 +380,21 @@ pub async fn load_or_seed_runtime_settings(
           llm_max_concurrency,
           ai_model_context_limit,
           ai_model_context_limit_migrated_at,
+          llm_models_json,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           repo_release_worker_concurrency,
           created_at,
           updated_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO NOTHING
         "#,
     )
     .bind(i64::try_from(snapshot.llm_max_concurrency).unwrap_or(i64::MAX))
     .bind(snapshot.ai_model_context_limit.map(i64::from))
     .bind(Option::<&str>::None)
+    .bind(serialize_llm_models_json(&snapshot.llm_models))
     .bind(i64::try_from(snapshot.translation_general_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.translation_dedicated_worker_concurrency).unwrap_or(i64::MAX))
     .bind(i64::try_from(snapshot.repo_release_worker_concurrency).unwrap_or(i64::MAX))
@@ -305,14 +411,17 @@ pub async fn update_llm_runtime_settings(
     pool: &SqlitePool,
     llm_max_concurrency: usize,
     ai_model_context_limit: Option<u32>,
+    llm_models: &[String],
 ) -> Result<AdminRuntimeSettingsSnapshot> {
     let now = Utc::now().to_rfc3339();
+    let serialized_llm_models = serialize_llm_models_json(llm_models);
     sqlx::query(
         r#"
         UPDATE admin_runtime_settings
         SET
           llm_max_concurrency = ?,
           ai_model_context_limit = ?,
+          llm_models_json = ?,
           ai_model_context_limit_migrated_at = COALESCE(ai_model_context_limit_migrated_at, ?),
           updated_at = ?
         WHERE id = 1
@@ -320,6 +429,7 @@ pub async fn update_llm_runtime_settings(
     )
     .bind(i64::try_from(llm_max_concurrency).unwrap_or(i64::MAX))
     .bind(ai_model_context_limit.map(i64::from))
+    .bind(serialized_llm_models.as_str())
     .bind(now.as_str())
     .bind(now.as_str())
     .execute(pool)
@@ -361,6 +471,13 @@ pub async fn load_ai_model_context_limit(pool: &SqlitePool) -> Result<Option<u32
         .and_then(|snapshot| snapshot.ai_model_context_limit))
 }
 
+pub async fn load_llm_models(pool: &SqlitePool) -> Result<Vec<String>> {
+    Ok(fetch_runtime_settings(pool)
+        .await?
+        .map(|snapshot| snapshot.llm_models)
+        .unwrap_or_default())
+}
+
 pub async fn sync_persisted_runtime_settings(
     state: std::sync::Arc<AppState>,
 ) -> Result<AdminRuntimeSettingsSnapshot> {
@@ -369,6 +486,10 @@ pub async fn sync_persisted_runtime_settings(
     state
         .llm_scheduler
         .set_max_concurrency(snapshot.llm_max_concurrency)
+        .await;
+    state
+        .llm_scheduler
+        .set_model_routing(snapshot.llm_models.clone())
         .await;
     state
         .translation_scheduler
@@ -390,6 +511,7 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
         SELECT
           llm_max_concurrency,
           ai_model_context_limit,
+          llm_models_json,
           translation_general_worker_concurrency,
           translation_dedicated_worker_concurrency,
           repo_release_worker_concurrency
@@ -406,6 +528,7 @@ async fn fetch_runtime_settings(pool: &SqlitePool) -> Result<Option<AdminRuntime
             .get::<Option<i64>, _>("ai_model_context_limit")
             .and_then(|value| u32::try_from(value).ok())
             .filter(|value| *value > 0),
+        llm_models: parse_llm_models_json(row.get::<String, _>("llm_models_json").as_str()),
         translation_general_worker_concurrency: usize::try_from(
             row.get::<i64, _>("translation_general_worker_concurrency"),
         )
@@ -511,9 +634,14 @@ mod tests {
             .expect("seed runtime settings");
         let state = setup_state(pool.clone(), config.clone());
 
-        update_llm_runtime_settings(&pool, 4, Some(32_768))
-            .await
-            .expect("update llm settings");
+        update_llm_runtime_settings(
+            &pool,
+            4,
+            Some(32_768),
+            &["gpt-4o-mini".to_owned(), "gpt-4.1-mini".to_owned()],
+        )
+        .await
+        .expect("update llm settings");
         update_translation_runtime_settings(&pool, 5, 2)
             .await
             .expect("update translation settings");

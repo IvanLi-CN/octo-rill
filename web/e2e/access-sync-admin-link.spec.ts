@@ -344,10 +344,23 @@ test("dashboard sync click creates the same access-refresh task visible in admin
 		if (req.method() === "GET" && pathname === "/api/admin/jobs/llm/status") {
 			return json(route, {
 				scheduler_enabled: true,
+				llm_models: ["gpt-4o-mini"],
+				selected_model_for_new_calls: "gpt-4o-mini",
 				max_concurrency: 2,
 				ai_model_context_limit: null,
-				effective_model_input_limit: 32768,
+				effective_model_input_limit: 128000,
 				effective_model_input_limit_source: "builtin_catalog",
+				model_statuses: [
+					{
+						model: "gpt-4o-mini",
+						priority: 1,
+						status: "ready",
+						consecutive_final_failures: 0,
+						cooldown_until: null,
+						effective_input_limit: 128000,
+						effective_input_limit_source: "builtin_catalog",
+					},
+				],
 				available_slots: 2,
 				waiting_calls: 0,
 				in_flight_calls: 0,
