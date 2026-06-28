@@ -5577,10 +5577,19 @@ fn parse_positive_runtime_limit(value: i64, field: &str) -> Result<u32, ApiError
 }
 
 fn parse_llm_models(models: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let nonblank_count = models
+        .iter()
+        .filter(|model| !model.trim().is_empty())
+        .count();
     let normalized = admin_runtime::normalize_llm_models(models);
     if normalized.is_empty() {
         return Err(ApiError::bad_request(
             "llm_models must contain at least one non-empty model".to_owned(),
+        ));
+    }
+    if normalized.len() != nonblank_count {
+        return Err(ApiError::bad_request(
+            "llm_models must not contain blank or duplicate models".to_owned(),
         ));
     }
     Ok(normalized)
@@ -15285,17 +15294,18 @@ mod tests {
         normalize_markdown_translation_output, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
-        parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
-        parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
-        parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
-        prepare_release_batch, preserve_chunk_edge_newlines, public_get_repo_release_detail,
-        public_list_repo_releases, refresh_admin_dashboard_rollups, refresh_feed_reactions,
-        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_feed_body, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, should_retry_public_compare_without_auth,
-        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
+        parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
+        parse_release_id_param, parse_release_smart_summary_payload,
+        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
+        parse_unique_thread_ids, prepare_release_batch, preserve_chunk_edge_newlines,
+        public_get_repo_release_detail, public_list_repo_releases, refresh_admin_dashboard_rollups,
+        refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_feed_body,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_releases_batch_for_user,
+        translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -19310,6 +19320,13 @@ mod tests {
             .collect::<Vec<_>>();
         let err =
             parse_unique_thread_ids(&raw_ids, 60).expect_err("oversized thread batch rejected");
+        assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn parse_llm_models_rejects_duplicates_after_normalization() {
+        let err = parse_llm_models(vec!["gpt-4o-mini".to_owned(), "  gpt-4o-mini  ".to_owned()])
+            .expect_err("duplicate model ids should be rejected");
         assert_eq!(err.code(), "bad_request");
     }
 
