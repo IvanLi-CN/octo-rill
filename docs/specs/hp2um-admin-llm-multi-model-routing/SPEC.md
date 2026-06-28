@@ -163,10 +163,12 @@
 
 - 多模型设置弹窗（排序 / 新增 / 删除 / 输入长度上限）
 
+PR: include
 ![LLM settings dialog](./assets/llm-settings-dialog.png)
 
 - 冷却切换状态卡（首选模型冷却，次选模型接管）
 
+PR: include
 ![LLM failover status](./assets/llm-status-failover.png)
 
 - 管理端 `LLM 调度` 多模型设置弹窗（含排序按钮）Storybook canvas。
