@@ -1440,10 +1440,32 @@ function AdminJobsPreview({
 		const llmCalls = llmCallsSeed.map((item) => ({ ...item }));
 		let llmSchedulerStatus = {
 			scheduler_enabled: true,
+			llm_models: ["gpt-4o-mini", "gpt-4.1-mini"],
+			selected_model_for_new_calls: "gpt-4.1-mini",
 			max_concurrency: 2,
 			ai_model_context_limit: null as number | null,
-			effective_model_input_limit: 32768,
+			effective_model_input_limit: 1047576,
 			effective_model_input_limit_source: "builtin_catalog",
+			model_statuses: [
+				{
+					model: "gpt-4o-mini",
+					priority: 1,
+					status: "cooldown",
+					consecutive_final_failures: 3,
+					cooldown_until: "2026-02-26T04:10:00Z",
+					effective_input_limit: 128000,
+					effective_input_limit_source: "builtin_catalog",
+				},
+				{
+					model: "gpt-4.1-mini",
+					priority: 2,
+					status: "ready",
+					consecutive_final_failures: 0,
+					cooldown_until: null,
+					effective_input_limit: 1047576,
+					effective_input_limit_source: "builtin_catalog",
+				},
+			],
 			waiting_calls: 1,
 			in_flight_calls: 1,
 			available_slots: 1,
@@ -1860,6 +1882,7 @@ function AdminJobsPreview({
 				const body = (await req.json()) as {
 					max_concurrency?: number;
 					ai_model_context_limit?: number | null;
+					llm_models?: string[];
 				};
 				const hasModelContextLimit = Object.hasOwn(
 					body,
@@ -1870,13 +1893,33 @@ function AdminJobsPreview({
 						? Number(body.ai_model_context_limit)
 						: null
 					: llmSchedulerStatus.ai_model_context_limit;
+				const nextModels =
+					body.llm_models && body.llm_models.length > 0
+						? body.llm_models
+						: llmSchedulerStatus.llm_models;
 				llmSchedulerStatus = {
 					...llmSchedulerStatus,
+					llm_models: nextModels,
+					selected_model_for_new_calls: nextModels[0] ?? null,
 					max_concurrency: Number(body.max_concurrency ?? 1),
 					ai_model_context_limit: aiModelContextLimit,
-					effective_model_input_limit: aiModelContextLimit ?? 32768,
+					effective_model_input_limit: aiModelContextLimit ?? 128000,
 					effective_model_input_limit_source:
 						aiModelContextLimit === null ? "builtin_catalog" : "admin_override",
+					model_statuses: nextModels.map((model, index) => ({
+						model,
+						priority: index + 1,
+						status: "ready",
+						consecutive_final_failures: 0,
+						cooldown_until: null,
+						effective_input_limit:
+							aiModelContextLimit ??
+							(model === "gpt-4.1-mini" ? 1047576 : 128000),
+						effective_input_limit_source:
+							aiModelContextLimit === null
+								? "builtin_catalog"
+								: "admin_override",
+					})),
 					available_slots: Math.max(
 						0,
 						Number(body.max_concurrency ?? 1) -

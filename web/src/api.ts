@@ -804,10 +804,21 @@ export type AdminScheduledSlotsResponse = {
 };
 export type AdminLlmSchedulerStatusResponse = {
 	scheduler_enabled: boolean;
+	llm_models: string[];
+	selected_model_for_new_calls: string | null;
 	max_concurrency: number;
 	ai_model_context_limit: number | null;
 	effective_model_input_limit: number;
 	effective_model_input_limit_source: string;
+	model_statuses: {
+		model: string;
+		priority: number;
+		status: string;
+		consecutive_final_failures: number;
+		cooldown_until: string | null;
+		effective_input_limit: number;
+		effective_input_limit_source: string;
+	}[];
 	available_slots: number;
 	waiting_calls: number;
 	in_flight_calls: number;
@@ -821,6 +832,7 @@ export type AdminLlmSchedulerStatusResponse = {
 export type AdminLlmRuntimeConfigUpdateRequest = {
 	max_concurrency: number;
 	ai_model_context_limit?: number | null;
+	llm_models?: string[];
 };
 export type AdminLlmCallItem = {
 	id: string;
