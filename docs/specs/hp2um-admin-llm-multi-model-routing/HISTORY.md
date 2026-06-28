@@ -1,3 +1,4 @@
 # 演进记录（管理员 LLM 多模型路由与故障切换）
 
 - 2026-06-28: 创建 follow-up spec，冻结“同 provider 多模型 + 顺序优先 + 连续 3 次最终失败后冷却 10 分钟 + 冷却到期自动恢复”的合同。
+- 2026-06-28: 完成后端 runtime model routing、管理员多模型设置 UI、预算口径收敛、状态接口扩展，以及 Storybook / Playwright / Rust 校验与视觉证据落盘。

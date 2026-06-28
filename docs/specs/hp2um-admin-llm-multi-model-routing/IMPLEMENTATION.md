@@ -1,18 +1,30 @@
 # 实现状态（管理员 LLM 多模型路由与故障切换）
 
-## Summary
+## 当前状态
 
-- 待实现；目标是在现有 admin runtime / LLM runtime 基础上补齐多模型顺序配置、模型级冷却切换、预算按实际选模收敛，以及管理台状态展示。
+- Lifecycle: active
+- Implementation: 已交付
+- Created: 2026-06-28
+- Last: 2026-06-28
+- Summary: 已交付；local implementation completed；管理员后台现已支持多模型顺序配置、模型级冷却切换、按实际选模计算输入预算，并补齐 Storybook / E2E / 视觉证据。
+- Spec: [SPEC.md](./SPEC.md)
+- History: [HISTORY.md](./HISTORY.md)
 
-## 当前覆盖
+## 文档更新（Docs to Update）
 
-- 现状仅支持单一 `AI_MODEL`。
-- `admin_runtime_settings` 仅持久化 `llm_max_concurrency` 与 `ai_model_context_limit`。
-- 管理端设置弹窗仅支持并发与输入长度上限。
+- `docs/specs/README.md`
+- `docs/specs/hp2um-admin-llm-multi-model-routing/SPEC.md`
+- `docs-site/docs/config.md`
+- `docs-site/docs/quick-start.md`
+- `.env.example`
 
-## 计划实现项
+## 计划资产（Plan assets）
 
-- [ ] M1: `admin_runtime_settings.llm_models_json` migration + seed/backfill + runtime snapshot。
-- [ ] M2: `ai.rs` 选模、冷却、预算按实际模型计算、状态接口扩展。
-- [ ] M3: 管理台多模型编辑、逐模型状态显示、Storybook 夹具更新。
-- [ ] M4: Rust / Web / Storybook / E2E 验证与视觉证据落盘。
+- Directory: `docs/specs/hp2um-admin-llm-multi-model-routing/assets/`
+
+## 实现里程碑（Milestones / Delivery checklist）
+
+- [x] M1: `admin_runtime_settings.llm_models_json` migration、启动 seed/backfill、runtime snapshot 与 live scheduler 同步。
+- [x] M2: `ai.rs` 多模型选模、连续最终失败计数、10 分钟冷却、预算按实际候选模型计算、状态接口扩展。
+- [x] M3: 管理台多模型编辑、排序/增删、逐模型状态展示、Storybook 夹具与 E2E 更新。
+- [x] M4: 完成 `cargo test`、`cargo clippy --all-targets -- -D warnings`、`web` lint/build/storybook/e2e 与视觉证据落盘。
