@@ -2319,9 +2319,16 @@ async fn create_translation_request_with_origin(
         .begin_immediate(&state.pool, "translation_request")
         .await
         .map_err(ApiError::internal)?;
-    let created =
-        insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
-            .await?;
+    let created = insert_translation_request(
+        state,
+        &mut tx,
+        user_id,
+        mode,
+        item,
+        request_origin,
+        now.as_str(),
+    )
+    .await?;
     tx.commit().await.map_err(ApiError::internal)?;
     drop(sqlite_write);
     refresh_live_batch_runtime_for_request(state, &created).await?;
@@ -2350,6 +2357,7 @@ async fn resolve_translation_results_for_user(
     for item in items {
         let canonical_item = canonicalize_translation_result_item(&mut tx, user_id, item).await?;
         let result = ensure_translation_result_for_item(
+            state,
             &mut tx,
             user_id,
             &canonical_item,
@@ -2444,8 +2452,16 @@ async fn create_translation_requests_batch_with_origin(
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         out.push(
-            insert_translation_request(&mut tx, user_id, mode, item, request_origin, now.as_str())
-                .await?,
+            insert_translation_request(
+                state,
+                &mut tx,
+                user_id,
+                mode,
+                item,
+                request_origin,
+                now.as_str(),
+            )
+            .await?,
         );
     }
     tx.commit().await.map_err(ApiError::internal)?;
@@ -2457,6 +2473,7 @@ async fn create_translation_requests_batch_with_origin(
 }
 
 async fn ensure_translation_result_for_item(
+    state: &AppState,
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
@@ -2612,13 +2629,16 @@ async fn ensure_translation_result_for_item(
     )
     .await?;
     ensure_translation_result_demand(
+        state,
         tx,
-        user_id,
-        item,
-        source_hash.as_str(),
-        request_id.as_str(),
-        retry_on_error,
-        now,
+        TranslationDemandRequestContext {
+            user_id,
+            item,
+            source_hash: source_hash.as_str(),
+            request_id: request_id.as_str(),
+            retry_on_error,
+            now,
+        },
     )
     .await
 }
@@ -2682,6 +2702,7 @@ async fn insert_translation_request_record(
 }
 
 async fn insert_translation_request(
+    state: &AppState,
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     mode: &str,
@@ -2713,7 +2734,7 @@ async fn insert_translation_request(
     }
 
     if let Some(work_item_id) =
-        create_work_item(tx, user_id, &canonical_item, &source_hash, now).await?
+        create_work_item(state, tx, user_id, &canonical_item, &source_hash, now).await?
     {
         attach_request_to_work_item(tx, request_id.as_str(), &work_item_id, "queued", now).await?;
         upsert_translation_demand_state(
@@ -2822,16 +2843,31 @@ async fn insert_translation_request(
     })
 }
 
-async fn ensure_translation_result_demand(
-    tx: &mut Transaction<'_, Sqlite>,
-    user_id: &str,
-    item: &TranslationRequestItemInput,
-    source_hash: &str,
-    request_id: &str,
+struct TranslationDemandRequestContext<'a> {
+    user_id: &'a str,
+    item: &'a TranslationRequestItemInput,
+    source_hash: &'a str,
+    request_id: &'a str,
     retry_on_error: bool,
-    now: &str,
+    now: &'a str,
+}
+
+async fn ensure_translation_result_demand(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+    context: TranslationDemandRequestContext<'_>,
 ) -> Result<TranslationResultItem, ApiError> {
-    if let Some(work_item_id) = create_work_item(tx, user_id, item, source_hash, now).await? {
+    let TranslationDemandRequestContext {
+        user_id,
+        item,
+        source_hash,
+        request_id,
+        retry_on_error,
+        now,
+    } = context;
+
+    if let Some(work_item_id) = create_work_item(state, tx, user_id, item, source_hash, now).await?
+    {
         attach_request_to_work_item(tx, request_id, &work_item_id, "queued", now).await?;
         upsert_translation_demand_state(
             tx,
@@ -3520,6 +3556,7 @@ async fn load_work_item_by_id(
 }
 
 async fn create_work_item(
+    state: &AppState,
     tx: &mut Transaction<'_, Sqlite>,
     user_id: &str,
     item: &TranslationRequestItemInput,
@@ -3527,7 +3564,7 @@ async fn create_work_item(
     now: &str,
 ) -> Result<Option<String>, ApiError> {
     let id = crate::local_id::generate_local_id();
-    let model_profile = current_model_profile();
+    let model_profile = current_model_profile(state).await;
     let token_estimate = estimate_item_tokens(item);
     let deadline_at =
         (Utc::now() + chrono::Duration::milliseconds(item.max_wait_ms.max(0))).to_rfc3339();
@@ -5488,12 +5525,17 @@ fn derive_item_source(item: &TranslationRequestItemInput) -> Option<String> {
     }
 }
 
-fn current_model_profile() -> String {
-    std::env::var("AI_MODEL")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| TRANSLATION_MODEL_PROFILE_DISABLED.to_owned())
+async fn current_model_profile(state: &AppState) -> String {
+    let profile = ai::llm_routing_profile(state).await;
+    if profile.trim().is_empty() {
+        return TRANSLATION_MODEL_PROFILE_DISABLED.to_owned();
+    }
+    profile
+}
+
+#[cfg(test)]
+fn current_model_profile_for_tests() -> String {
+    "route:gpt-test".to_owned()
 }
 
 fn uses_release_detail_translation_state(kind: &str, variant: &str) -> bool {
@@ -6265,7 +6307,7 @@ mod tests {
         .bind("batch-queued-window")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind(1_i64)
@@ -6380,7 +6422,7 @@ mod tests {
         .bind("batch-terminal-window")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind(1_i64)
@@ -6551,7 +6593,7 @@ mod tests {
         .bind("batch-detail-error")
         .bind("general:release_detail:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline")
         .bind(1_i64)
@@ -6700,7 +6742,7 @@ mod tests {
         .bind("batch-detail-missing")
         .bind("general:release_detail:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline")
         .bind(1_i64)
@@ -9452,7 +9494,7 @@ mod tests {
         )
         .bind("linked-llm-recover")
         .bind("translation.scheduler.deadline")
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind(batch.id.as_str())
         .bind(512_i64)
         .bind(1_i64)
@@ -9722,7 +9764,7 @@ mod tests {
         )
         .bind("linked-llm-startup-recover")
         .bind("translation.scheduler.deadline")
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind(batch.id.as_str())
         .bind(512_i64)
         .bind(1_i64)
@@ -9904,7 +9946,7 @@ mod tests {
         .bind("batch-runtime-refresh")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind("translation-worker-general-2")
@@ -10008,7 +10050,7 @@ mod tests {
         .bind("batch-runtime-refresh-resized")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind(worker_id.as_str())
@@ -10155,7 +10197,7 @@ mod tests {
         .bind("batch-runtime-slot-sync")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind(worker_id.as_str())
@@ -10640,7 +10682,7 @@ mod tests {
         .bind("batch-drained-slot-sync")
         .bind("general:release_summary:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline_due")
         .bind(dedicated_worker_id.as_str())
@@ -10930,7 +10972,7 @@ mod tests {
         .bind("batch-status-issues")
         .bind("general:release_detail:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline")
         .bind(1_i64)
@@ -11044,7 +11086,7 @@ mod tests {
         .bind("batch-status-fallback")
         .bind("general:release_detail:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline")
         .bind(1_i64)
@@ -11137,7 +11179,7 @@ mod tests {
         .bind("batch-status-future")
         .bind("general:release_detail:feed_body:zh-CN")
         .bind(TRANSLATION_PROTOCOL_VERSION)
-        .bind(current_model_profile())
+        .bind(current_model_profile_for_tests())
         .bind("zh-CN")
         .bind("deadline")
         .bind(1_i64)

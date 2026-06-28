@@ -158,6 +158,10 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         encryption_key: config.encryption_key.clone(),
         runtime_owner_id: crate::local_id::generate_local_id(),
     });
+    app_state
+        .llm_scheduler
+        .set_model_routing(runtime_settings.llm_models.clone())
+        .await;
 
     let addr: SocketAddr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(addr)

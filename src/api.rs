@@ -5216,12 +5216,26 @@ pub struct AdminLlmCallsResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AdminLlmModelStatusItem {
+    model: String,
+    priority: i64,
+    status: String,
+    consecutive_final_failures: i64,
+    cooldown_until: Option<String>,
+    effective_input_limit: i64,
+    effective_input_limit_source: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct AdminLlmSchedulerStatusResponse {
     scheduler_enabled: bool,
+    llm_models: Vec<String>,
+    selected_model_for_new_calls: Option<String>,
     max_concurrency: i64,
     ai_model_context_limit: Option<i64>,
     effective_model_input_limit: i64,
     effective_model_input_limit_source: String,
+    model_statuses: Vec<AdminLlmModelStatusItem>,
     available_slots: i64,
     waiting_calls: i64,
     in_flight_calls: i64,
@@ -5238,6 +5252,8 @@ pub struct AdminLlmRuntimeConfigUpdateRequest {
     max_concurrency: i64,
     #[serde(default, deserialize_with = "deserialize_optional_nullable_i64")]
     ai_model_context_limit: Option<Option<i64>>,
+    #[serde(default)]
+    llm_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5421,10 +5437,17 @@ pub async fn admin_patch_llm_runtime_config(
             .await
             .map_err(ApiError::internal)?,
     };
+    let llm_models = match req.llm_models {
+        Some(models) => parse_llm_models(models)?,
+        None => admin_runtime::load_llm_models(&state.pool)
+            .await
+            .map_err(ApiError::internal)?,
+    };
     admin_runtime::update_llm_runtime_settings(
         &state.pool,
         max_concurrency,
         ai_model_context_limit,
+        &llm_models,
     )
     .await
     .map_err(ApiError::internal)?;
@@ -5441,6 +5464,10 @@ async fn load_admin_llm_scheduler_status_response(
     state: &AppState,
 ) -> Result<AdminLlmSchedulerStatusResponse, ApiError> {
     let runtime = state.llm_scheduler.runtime_status();
+    let routing = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+        .await;
     let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
     let (calls_24h, failed_24h, avg_wait_raw, avg_duration_raw) =
         sqlx::query_as::<_, (i64, i64, Option<f64>, Option<f64>)>(
@@ -5480,18 +5507,35 @@ async fn load_admin_llm_scheduler_status_response(
     .fetch_one(&state.pool)
     .await
     .map_err(ApiError::internal)?;
-    let effective_model_input_limit = ai::resolve_model_input_limit_with_source(state).await;
+    let selected_model = ai::select_model_for_new_calls(state).await;
     let ai_model_context_limit = admin_runtime::load_ai_model_context_limit(&state.pool)
         .await
         .map_err(ApiError::internal)?
         .map(i64::from);
+    let mut model_statuses = Vec::with_capacity(routing.model_statuses.len());
+    for status in routing.model_statuses {
+        let (effective_input_limit, effective_input_limit_source) =
+            ai::resolve_model_input_limit_for_status(state, &status.model).await;
+        model_statuses.push(AdminLlmModelStatusItem {
+            model: status.model,
+            priority: status.priority,
+            status: status.status.to_owned(),
+            consecutive_final_failures: status.consecutive_final_failures,
+            cooldown_until: status.cooldown_until,
+            effective_input_limit: i64::from(effective_input_limit),
+            effective_input_limit_source: effective_input_limit_source.to_owned(),
+        });
+    }
 
     Ok(AdminLlmSchedulerStatusResponse {
         scheduler_enabled: state.config.ai.is_some(),
+        llm_models: routing.llm_models,
+        selected_model_for_new_calls: routing.selected_model_for_new_calls,
         max_concurrency: runtime.max_concurrency,
         ai_model_context_limit,
-        effective_model_input_limit: i64::from(effective_model_input_limit.0),
-        effective_model_input_limit_source: effective_model_input_limit.1.to_owned(),
+        effective_model_input_limit: i64::from(selected_model.model_input_limit),
+        effective_model_input_limit_source: selected_model.fallback_source.to_owned(),
+        model_statuses,
         available_slots: runtime.available_slots,
         waiting_calls: runtime.waiting_calls,
         in_flight_calls: runtime.in_flight_calls,
@@ -5530,6 +5574,25 @@ fn parse_positive_runtime_limit(value: i64, field: &str) -> Result<u32, ApiError
         )));
     }
     Ok(parsed)
+}
+
+fn parse_llm_models(models: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let nonblank_count = models
+        .iter()
+        .filter(|model| !model.trim().is_empty())
+        .count();
+    let normalized = admin_runtime::normalize_llm_models(models);
+    if normalized.is_empty() {
+        return Err(ApiError::bad_request(
+            "llm_models must contain at least one non-empty model".to_owned(),
+        ));
+    }
+    if normalized.len() != nonblank_count {
+        return Err(ApiError::bad_request(
+            "llm_models must not contain blank or duplicate models".to_owned(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn deserialize_optional_nullable_i64<'de, D>(
@@ -15231,17 +15294,18 @@ mod tests {
         normalize_markdown_translation_output, normalize_translation_fields,
         parse_batch_notification_translation_payload,
         parse_batch_release_detail_translation_payload, parse_batch_release_translation_payload,
-        parse_feed_types, parse_positive_admin_concurrency, parse_release_id_param,
-        parse_release_smart_summary_payload, parse_repo_full_name_from_release_url,
-        parse_translation_json, parse_unique_release_ids, parse_unique_thread_ids,
-        prepare_release_batch, preserve_chunk_edge_newlines, public_get_repo_release_detail,
-        public_list_repo_releases, refresh_admin_dashboard_rollups, refresh_feed_reactions,
-        release_cache_entry_reusable, release_detail_source_hash, release_detail_translation_ready,
-        release_excerpt, release_feed_body, release_reactions_status, require_active_user_id,
-        resolve_release_full_name, should_retry_public_compare_without_auth,
-        smart_error_is_retryable, split_markdown_chunks, sync_all, sync_notifications,
-        sync_releases, sync_starred, translate_release_detail_for_user,
-        translate_releases_batch_for_user, translate_response_from_batch_item, upsert_translation,
+        parse_feed_types, parse_llm_models, parse_positive_admin_concurrency,
+        parse_release_id_param, parse_release_smart_summary_payload,
+        parse_repo_full_name_from_release_url, parse_translation_json, parse_unique_release_ids,
+        parse_unique_thread_ids, prepare_release_batch, preserve_chunk_edge_newlines,
+        public_get_repo_release_detail, public_list_repo_releases, refresh_admin_dashboard_rollups,
+        refresh_feed_reactions, release_cache_entry_reusable, release_detail_source_hash,
+        release_detail_translation_ready, release_excerpt, release_feed_body,
+        release_reactions_status, require_active_user_id, resolve_release_full_name,
+        should_retry_public_compare_without_auth, smart_error_is_retryable, split_markdown_chunks,
+        sync_all, sync_notifications, sync_releases, sync_starred,
+        translate_release_detail_for_user, translate_releases_batch_for_user,
+        translate_response_from_batch_item, upsert_translation,
     };
     use crate::ai;
     use crate::error::ApiError;
@@ -19144,6 +19208,7 @@ mod tests {
             Json(AdminLlmRuntimeConfigUpdateRequest {
                 max_concurrency: 2,
                 ai_model_context_limit: None,
+                llm_models: None,
             }),
         )
         .await
@@ -19255,6 +19320,13 @@ mod tests {
             .collect::<Vec<_>>();
         let err =
             parse_unique_thread_ids(&raw_ids, 60).expect_err("oversized thread batch rejected");
+        assert_eq!(err.code(), "bad_request");
+    }
+
+    #[test]
+    fn parse_llm_models_rejects_duplicates_after_normalization() {
+        let err = parse_llm_models(vec!["gpt-4o-mini".to_owned(), "  gpt-4o-mini  ".to_owned()])
+            .expect_err("duplicate model ids should be rejected");
         assert_eq!(err.code(), "bad_request");
     }
 

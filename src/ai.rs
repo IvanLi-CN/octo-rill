@@ -50,6 +50,8 @@ const LLM_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5);
 const LLM_RETRY_BACKOFF_JITTER_MAX_MS: u64 = 250;
 const LLM_CALL_LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const LLM_CALL_LOG_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const LLM_MODEL_FINAL_FAILURE_THRESHOLD: u32 = 3;
+const LLM_MODEL_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const AI_RESPONSE_MISSING_CONTENT_ERROR: &str = "AI response missing content";
 
 #[derive(Debug, Default)]
@@ -94,10 +96,27 @@ pub struct LlmSchedulerRuntimeStatus {
     pub in_flight_calls: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct LlmSchedulerModelRuntimeStatus {
+    pub model: String,
+    pub priority: i64,
+    pub status: &'static str,
+    pub consecutive_final_failures: i64,
+    pub cooldown_until: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmSchedulerRoutingRuntimeStatus {
+    pub llm_models: Vec<String>,
+    pub selected_model_for_new_calls: Option<String>,
+    pub model_statuses: Vec<LlmSchedulerModelRuntimeStatus>,
+}
+
 #[derive(Debug)]
 pub struct LlmScheduler {
     max_concurrency: AtomicUsize,
     gate: Mutex<SchedulerGateState>,
+    routing: tokio::sync::RwLock<ModelRoutingState>,
     status_overrides: tokio::sync::RwLock<HashMap<String, LlmCallAdminOverride>>,
     waiting_calls: AtomicUsize,
     in_flight_calls: AtomicUsize,
@@ -112,6 +131,25 @@ struct SchedulerGateState {
 struct SchedulerQueuedWaiterState {
     notify: tokio::sync::Notify,
     state: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct ModelRoutingState {
+    ordered_models: Vec<String>,
+    health: HashMap<String, ModelRouteHealthState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelRouteHealthState {
+    consecutive_final_failures: u32,
+    cooldown_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedLlmModel {
+    pub model: String,
+    pub model_input_limit: u32,
+    pub fallback_source: &'static str,
 }
 
 impl SchedulerQueuedWaiterState {
@@ -143,6 +181,7 @@ impl LlmScheduler {
         Self {
             max_concurrency: AtomicUsize::new(max_concurrency.max(1)),
             gate: Mutex::new(SchedulerGateState::default()),
+            routing: tokio::sync::RwLock::new(ModelRoutingState::default()),
             status_overrides: tokio::sync::RwLock::new(HashMap::new()),
             waiting_calls: AtomicUsize::new(0),
             in_flight_calls: AtomicUsize::new(0),
@@ -173,6 +212,96 @@ impl LlmScheduler {
 
     pub(crate) async fn clear_admin_override(&self, call_id: &str) {
         self.status_overrides.write().await.remove(call_id);
+    }
+
+    pub async fn set_model_routing(&self, models: Vec<String>) {
+        let normalized = admin_runtime::normalize_llm_models(models);
+        let mut routing = self.routing.write().await;
+        let mut next_health = HashMap::new();
+        for model in &normalized {
+            next_health.insert(
+                model.clone(),
+                routing.health.get(model).cloned().unwrap_or_default(),
+            );
+        }
+        routing.ordered_models = normalized;
+        routing.health = next_health;
+    }
+
+    pub async fn routing_status(
+        &self,
+        fallback_model: Option<&str>,
+    ) -> LlmSchedulerRoutingRuntimeStatus {
+        let routing = self.routing.read().await;
+        let now = Utc::now();
+        let ordered_models = effective_routing_models(&routing.ordered_models, fallback_model);
+        let selected_model_for_new_calls =
+            select_model_from_routing(&ordered_models, &routing.health, now)
+                .map(|model| model.to_owned());
+        let model_statuses = ordered_models
+            .iter()
+            .enumerate()
+            .map(|(idx, model)| {
+                let health = routing.health.get(model).cloned().unwrap_or_default();
+                let cooldown_until = health
+                    .cooldown_until
+                    .filter(|cooldown_until| *cooldown_until > now)
+                    .map(|cooldown_until| cooldown_until.to_rfc3339());
+                LlmSchedulerModelRuntimeStatus {
+                    model: model.clone(),
+                    priority: i64::try_from(idx + 1).unwrap_or(i64::MAX),
+                    status: if cooldown_until.is_some() {
+                        "cooldown"
+                    } else {
+                        "ready"
+                    },
+                    consecutive_final_failures: i64::from(health.consecutive_final_failures),
+                    cooldown_until,
+                }
+            })
+            .collect();
+        LlmSchedulerRoutingRuntimeStatus {
+            llm_models: ordered_models,
+            selected_model_for_new_calls,
+            model_statuses,
+        }
+    }
+
+    pub async fn select_model_for_new_calls(&self, fallback_model: Option<&str>) -> Option<String> {
+        self.routing_status(fallback_model)
+            .await
+            .selected_model_for_new_calls
+    }
+
+    pub async fn record_model_success(&self, model: &str) {
+        let normalized = model.trim();
+        if normalized.is_empty() {
+            return;
+        }
+        let mut routing = self.routing.write().await;
+        let entry = routing
+            .health
+            .entry(normalized.to_owned())
+            .or_insert_with(ModelRouteHealthState::default);
+        entry.consecutive_final_failures = 0;
+        entry.cooldown_until = None;
+    }
+
+    pub async fn record_model_final_failure(&self, model: &str) {
+        let normalized = model.trim();
+        if normalized.is_empty() {
+            return;
+        }
+        let mut routing = self.routing.write().await;
+        let entry = routing
+            .health
+            .entry(normalized.to_owned())
+            .or_insert_with(ModelRouteHealthState::default);
+        entry.consecutive_final_failures = entry.consecutive_final_failures.saturating_add(1);
+        if entry.consecutive_final_failures >= LLM_MODEL_FINAL_FAILURE_THRESHOLD {
+            let seconds = i64::try_from(LLM_MODEL_FAILURE_COOLDOWN.as_secs()).unwrap_or(i64::MAX);
+            entry.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(seconds));
+        }
     }
 
     pub fn runtime_status(&self) -> LlmSchedulerRuntimeStatus {
@@ -258,6 +387,42 @@ impl LlmScheduler {
         }
         self.schedule_waiters_locked(&mut gate);
     }
+}
+
+fn effective_routing_models(
+    ordered_models: &[String],
+    fallback_model: Option<&str>,
+) -> Vec<String> {
+    let mut models = admin_runtime::normalize_llm_models(ordered_models.to_vec());
+    if models.is_empty()
+        && let Some(fallback_model) = fallback_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    {
+        models.push(fallback_model.to_owned());
+    }
+    models
+}
+
+fn select_model_from_routing<'a>(
+    ordered_models: &'a [String],
+    health: &HashMap<String, ModelRouteHealthState>,
+    now: DateTime<Utc>,
+) -> Option<&'a str> {
+    let mut earliest_cooled: Option<(&'a str, DateTime<Utc>)> = None;
+    for model in ordered_models {
+        let Some(cooldown_until) = health.get(model).and_then(|entry| entry.cooldown_until) else {
+            return Some(model.as_str());
+        };
+        if cooldown_until <= now {
+            return Some(model.as_str());
+        }
+        match earliest_cooled {
+            Some((_, earliest)) if earliest <= cooldown_until => {}
+            _ => earliest_cooled = Some((model.as_str(), cooldown_until)),
+        }
+    }
+    earliest_cooled.map(|(model, _)| model)
 }
 
 pub async fn with_llm_call_context<F, T>(context: LlmCallContext, fut: F) -> T
@@ -546,39 +711,12 @@ fn lookup_model_limit_in_map(map: &HashMap<String, u32>, model: &str) -> Option<
     None
 }
 
-pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'static str) {
-    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
-        return (limit.max(1), MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE);
-    }
-
-    let model = state
-        .config
-        .ai
-        .as_ref()
-        .map(|cfg| cfg.model.as_str())
-        .unwrap_or_default();
+pub(crate) fn resolve_model_input_limit_for_model(model: &str) -> (u32, &'static str) {
     if model.is_empty() {
         return (
             MODEL_LIMIT_UNKNOWN_FALLBACK,
             MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
         );
-    }
-
-    if let Err(err) = refresh_model_limits(state, false).await {
-        tracing::warn!(
-            event = "upstream.call",
-            operation = "ai.model_catalog.lazy_refresh",
-            error_kind = "refresh_failed",
-            error_chain = %observability::error_chain_summary(err.as_ref()),
-            "model catalog lazy refresh failed"
-        );
-    }
-
-    {
-        let guard = model_limit_catalog().read().await;
-        if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model) {
-            return (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG);
-        }
     }
 
     if let Some(limit) = lookup_model_limit_in_map(builtin_model_limits(), model) {
@@ -591,8 +729,112 @@ pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'
     )
 }
 
+pub(crate) async fn resolve_model_input_limit_for_status(
+    state: &AppState,
+    model: &str,
+) -> (u32, &'static str) {
+    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
+        return (limit.max(1), MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE);
+    }
+
+    if let Err(err) = refresh_model_limits(state, false).await {
+        tracing::warn!(
+            event = "upstream.call",
+            operation = "ai.model_catalog.lazy_refresh",
+            error_kind = "refresh_failed",
+            error_chain = %observability::error_chain_summary(err.as_ref()),
+            "model catalog lazy refresh failed"
+        );
+    }
+
+    let (limit, source) = {
+        let guard = model_limit_catalog().read().await;
+        if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model) {
+            (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG)
+        } else {
+            resolve_model_input_limit_for_model(model)
+        }
+    };
+    (limit, source)
+}
+
+pub async fn select_model_for_new_calls(state: &AppState) -> SelectedLlmModel {
+    if let Ok(Some(limit)) = admin_runtime::load_ai_model_context_limit(&state.pool).await {
+        let model = state
+            .llm_scheduler
+            .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+            .await
+            .or_else(|| {
+                state
+                    .config
+                    .ai
+                    .as_ref()
+                    .map(|cfg| cfg.model.trim().to_owned())
+                    .filter(|model| !model.is_empty())
+            })
+            .unwrap_or_default();
+        return SelectedLlmModel {
+            model,
+            model_input_limit: limit.max(1),
+            fallback_source: MODEL_LIMIT_RESOLUTION_ADMIN_OVERRIDE,
+        };
+    }
+
+    let model = state
+        .llm_scheduler
+        .select_model_for_new_calls(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+        .await
+        .or_else(|| {
+            state
+                .config
+                .ai
+                .as_ref()
+                .map(|cfg| cfg.model.trim().to_owned())
+                .filter(|model| !model.is_empty())
+        })
+        .unwrap_or_default();
+
+    if let Err(err) = refresh_model_limits(state, false).await {
+        tracing::warn!(
+            event = "upstream.call",
+            operation = "ai.model_catalog.lazy_refresh",
+            error_kind = "refresh_failed",
+            error_chain = %observability::error_chain_summary(err.as_ref()),
+            "model catalog lazy refresh failed"
+        );
+    }
+
+    let (model_input_limit, fallback_source) = {
+        let guard = model_limit_catalog().read().await;
+        if let Some(limit) = lookup_model_limit_in_map(&guard.synced_limits, model.as_str()) {
+            (limit.max(1), MODEL_LIMIT_RESOLUTION_SYNCED_CATALOG)
+        } else if let Some(limit) =
+            lookup_model_limit_in_map(builtin_model_limits(), model.as_str())
+        {
+            (limit.max(1), MODEL_LIMIT_RESOLUTION_BUILTIN_CATALOG)
+        } else {
+            (
+                MODEL_LIMIT_UNKNOWN_FALLBACK,
+                MODEL_LIMIT_RESOLUTION_UNKNOWN_FALLBACK,
+            )
+        }
+    };
+    SelectedLlmModel {
+        model,
+        model_input_limit,
+        fallback_source,
+    }
+}
+
+pub async fn resolve_model_input_limit_with_source(state: &AppState) -> (u32, &'static str) {
+    let selected = select_model_for_new_calls(state).await;
+    (selected.model_input_limit, selected.fallback_source)
+}
+
 pub async fn compute_input_budget_with_source(state: &AppState, max_tokens: u32) -> InputBudget {
-    let (model_limit, fallback_source) = resolve_model_input_limit_with_source(state).await;
+    let selected = select_model_for_new_calls(state).await;
+    let model_limit = selected.model_input_limit;
+    let fallback_source = selected.fallback_source;
     let output_reserve = max_tokens;
     let ratio_margin = (f64::from(model_limit) * MODEL_LIMIT_SAFETY_RATIO).ceil() as u32;
     let margin = ratio_margin.max(MODEL_LIMIT_SAFETY_MIN_TOKENS);
@@ -604,6 +846,17 @@ pub async fn compute_input_budget_with_source(state: &AppState, max_tokens: u32)
         input_budget,
         fallback_source,
     }
+}
+
+pub async fn llm_routing_profile(state: &AppState) -> String {
+    let routing = state
+        .llm_scheduler
+        .routing_status(state.config.ai.as_ref().map(|cfg| cfg.model.as_str()))
+        .await;
+    if routing.llm_models.is_empty() {
+        return "ai-disabled".to_owned();
+    }
+    format!("route:{}", routing.llm_models.join(" | "))
 }
 
 pub fn estimate_text_tokens(raw: &str) -> u32 {
@@ -2016,9 +2269,14 @@ pub async fn chat_completion(
     user: &str,
     max_tokens: u32,
 ) -> Result<String> {
-    let Some(ai) = state.config.ai.clone() else {
+    let Some(base_ai) = state.config.ai.clone() else {
         return Err(anyhow!("AI is not configured (AI_API_KEY is missing)"));
     };
+    let selected_model = select_model_for_new_calls(state).await;
+    let mut ai = base_ai;
+    if !selected_model.model.trim().is_empty() {
+        ai.model = selected_model.model.clone();
+    }
 
     let log_record = build_llm_call_log_record();
     let prompt_text = format!("system:\n{system}\n\nuser:\n{user}");
@@ -2036,7 +2294,7 @@ pub async fn chat_completion(
     let llm_call_persisted = match insert_llm_call(
         state,
         &log_record,
-        &ai.model,
+        ai.model.as_str(),
         max_tokens,
         &prompt_text,
         input_messages_json.as_deref(),
@@ -2056,6 +2314,7 @@ pub async fn chat_completion(
         }
     };
 
+    let model_for_call = ai.model.clone();
     let mut total_wait_ms = 0_i64;
     let mut started_at: Option<Instant> = None;
     let mut started_at_timestamp: Option<String> = None;
@@ -2125,6 +2384,10 @@ pub async fn chat_completion(
         let attempt_result = chat_completion_once(state, &ai, system, user, max_tokens).await;
         match attempt_result {
             Ok(output) => {
+                state
+                    .llm_scheduler
+                    .record_model_success(model_for_call.as_str())
+                    .await;
                 let duration_ms = started_at.map(|started| {
                     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                 });
@@ -2198,6 +2461,10 @@ pub async fn chat_completion(
                 let max_attempts =
                     max_llm_attempts_for_call(translation_empty_content_budget_active);
                 if !retryable || attempt >= max_attempts {
+                    state
+                        .llm_scheduler
+                        .record_model_final_failure(model_for_call.as_str())
+                        .await;
                     let duration_ms = started_at.map(|started| {
                         i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
                     });

@@ -70,11 +70,11 @@ http://127.0.0.1:58090/auth/linuxdo/callback
 
 - `AI_API_KEY`：开启 AI 能力的开关；为空时后端不会初始化 AI provider。
 - `AI_BASE_URL`：AI provider base URL。默认 `https://api.openai.com/v1/`。
-- `AI_MODEL`：模型 ID。默认 `gpt-4o-mini`。
+- `AI_MODEL`：初始模型 ID。默认 `gpt-4o-mini`。首次启动会用它 seed 管理后台的模型路由列表；后续应在管理员页面维护多个模型与顺序。
 - `AI_MAX_CONCURRENCY`：单进程内同时在途的上游 LLM 请求数。默认 `1`。
 - `AI_DAILY_AT_LOCAL`：日报窗口边界，本地时间格式 `HH:MM`。默认 `08:00`。
 
-对 OpenAI-compatible 网关，`AI_MODEL` 必须和 `/v1/models` 返回值一致；大小写通常也要一致。
+对 OpenAI-compatible 网关，`AI_MODEL` 必须和 `/v1/models` 返回值一致；大小写通常也要一致。若后台模型列表为空，运行时也会回退到这个值。
 
 ## 运行时覆盖与管理员设置
 
