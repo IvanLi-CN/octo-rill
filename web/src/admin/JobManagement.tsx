@@ -5498,33 +5498,6 @@ export function JobManagement({
 							</Button>
 						</CardHeader>
 						<CardContent className="space-y-4">
-							<div className="max-w-sm">
-								<div className="bg-card/70 rounded-lg border p-3">
-									<p className="text-muted-foreground text-xs">
-										近24h 调用 / 失败
-									</p>
-									<p className="mt-1 text-sm font-semibold">
-										{formatCount(llmStatus?.calls_24h)} /{" "}
-										{formatCount(llmStatus?.failed_24h)}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										平均等待{" "}
-										{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										并发上限 {formatCount(llmStatus?.max_concurrency)} · 可用{" "}
-										{formatCount(llmStatus?.available_slots)} · 输入{" "}
-										{formatCount(llmStatus?.effective_model_input_limit)} tokens
-									</p>
-									<p className="text-muted-foreground mt-1 text-xs">
-										当前优先模型：
-										<span className="ml-1 font-mono">
-											{llmStatus?.selected_model_for_new_calls ?? "-"}
-										</span>
-									</p>
-								</div>
-							</div>
-
 							{llmStatus?.model_statuses?.length ? (
 								<div className="grid gap-2 lg:grid-cols-2">
 									{llmStatus.model_statuses.map((modelStatus) => (
@@ -5572,6 +5545,33 @@ export function JobManagement({
 									))}
 								</div>
 							) : null}
+
+							<div className="max-w-sm">
+								<div className="bg-card/70 rounded-lg border p-3">
+									<p className="text-muted-foreground text-xs">
+										近24h 调用 / 失败
+									</p>
+									<p className="mt-1 text-sm font-semibold">
+										{formatCount(llmStatus?.calls_24h)} /{" "}
+										{formatCount(llmStatus?.failed_24h)}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										平均等待{" "}
+										{formatDurationMs(llmStatus?.avg_wait_ms_24h ?? null)}
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										并发上限 {formatCount(llmStatus?.max_concurrency)} · 可用{" "}
+										{formatCount(llmStatus?.available_slots)} · 输入{" "}
+										{formatCount(llmStatus?.effective_model_input_limit)} tokens
+									</p>
+									<p className="text-muted-foreground mt-1 text-xs">
+										当前优先模型：
+										<span className="ml-1 font-mono">
+											{llmStatus?.selected_model_for_new_calls ?? "-"}
+										</span>
+									</p>
+								</div>
+							</div>
 
 							<div className="grid gap-2 lg:grid-cols-[minmax(0,220px)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.35fr)]">
 								<FilterSelect
