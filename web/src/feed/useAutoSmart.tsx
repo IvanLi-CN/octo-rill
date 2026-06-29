@@ -89,7 +89,6 @@ function mapTranslationItemToFeedSmart(item: {
 	error_detail?: string | null;
 }): SmartItem | null {
 	const summary = item.body_md ?? item.summary_md;
-	const retrySignal = item.error_detail ?? item.error;
 	switch (item.status) {
 		case "ready":
 			return {
@@ -126,13 +125,13 @@ function mapTranslationItemToFeedSmart(item: {
 		case "error":
 			return {
 				lang: "zh-CN",
-				status: smartErrorIsRetryable(retrySignal) ? "missing" : "error",
+				status: "error",
 				title: null,
 				summary: null,
 				error_code: item.error_code ?? null,
 				error_summary: item.error_summary ?? null,
 				error_detail: item.error_detail ?? null,
-				auto_translate: smartErrorIsRetryable(retrySignal),
+				auto_translate: false,
 			};
 		default:
 			return null;
@@ -318,6 +317,7 @@ export function useAutoSmart(params: {
 	const failedRef = useRef(new Set<string>());
 	const retryCountRef = useRef(new Map<string, number>());
 	const pollErrorCountRef = useRef(new Map<string, number>());
+	const autoRetriedKeysRef = useRef(new Set<string>());
 
 	const [, forceRender] = useState(0);
 
@@ -332,10 +332,19 @@ export function useAutoSmart(params: {
 			isReleaseFeedItem(item) &&
 			((item.smart?.status === "missing" &&
 				item.smart.auto_translate !== false) ||
-				(item.smart?.status === "error" && feedSmartIsRetryable(item)) ||
 				(item.smart?.status === "ready" &&
 					item.smart.auto_translate === true)) &&
 			!failedRef.current.has(keyOf(item)),
+		[enabled],
+	);
+
+	const shouldAutoRetryLoadedError = useCallback(
+		(item: FeedItem) =>
+			enabled &&
+			isReleaseFeedItem(item) &&
+			item.smart?.status === "error" &&
+			feedSmartIsRetryable(item) &&
+			!autoRetriedKeysRef.current.has(keyOf(item)),
 		[enabled],
 	);
 
@@ -674,7 +683,12 @@ export function useAutoSmart(params: {
 	schedulePendingPollRef.current = schedulePendingPoll;
 
 	const submitCandidates = useCallback(
-		async (rawCandidates: TranslationCandidate[]) => {
+		async (
+			rawCandidates: TranslationCandidate[],
+			options?: {
+				retryOnError?: boolean;
+			},
+		) => {
 			const byKey = new Map<string, Promise<SmartResolveResponse | null>>();
 			const candidates: Array<{
 				candidate: TranslationCandidate;
@@ -724,6 +738,7 @@ export function useAutoSmart(params: {
 			bumpRender();
 
 			await resolveCandidateTasks(candidates, {
+				retryOnError: options?.retryOnError,
 				onChunkError: (chunk, error) => {
 					for (const { candidate, task } of chunk) {
 						finalizeFailure(candidate, task, error);
@@ -766,6 +781,40 @@ export function useAutoSmart(params: {
 			await submitCandidates(candidates);
 		},
 		[buildQueuedCandidate, enabled, submitCandidates],
+	);
+
+	const retryLoadedErrors = useCallback(
+		async (items: FeedItem[]) => {
+			if (!enabled || !mountedRef.current || items.length === 0) {
+				return;
+			}
+			const candidates: TranslationCandidate[] = [];
+			for (const item of items) {
+				if (!shouldAutoRetryLoadedError(item)) {
+					continue;
+				}
+				const key = keyOf(item);
+				autoRetriedKeysRef.current.add(key);
+				failedRef.current.delete(key);
+				retryCountRef.current.delete(key);
+				itemByKeyRef.current.set(key, item);
+				const requestItem = buildReleaseSmartRequestItem(item);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				candidates.push({
+					key,
+					item,
+					requestItem,
+					sourceKey,
+					top: 0,
+					bottom: 0,
+				});
+			}
+			if (candidates.length === 0) {
+				return;
+			}
+			await submitCandidates(candidates, { retryOnError: true });
+		},
+		[enabled, shouldAutoRetryLoadedError, submitCandidates],
 	);
 
 	const prepareCandidates = useCallback(() => {
@@ -994,6 +1043,18 @@ export function useAutoSmart(params: {
 	}, [enabled, schedulePendingPoll, scheduleViewportPlan]);
 
 	const inFlightKeys = new Set(requestTasksRef.current.keys());
+	const autoRetryingKeys = new Set(
+		Array.from(requestTasksRef.current.entries())
+			.filter(([, task]) => !task.rejectOnFailure)
+			.map(([key]) => key),
+	);
 
-	return { prime, register, smartNow, inFlightKeys };
+	return {
+		prime,
+		register,
+		retryLoadedErrors,
+		smartNow,
+		inFlightKeys,
+		autoRetryingKeys,
+	};
 }

@@ -85,9 +85,6 @@ function mapTranslationItemToFeedTranslated(item: {
 	error_detail?: string | null;
 }): TranslatedItem | null {
 	const translatedBody = item.body_md ?? item.summary_md;
-	const retryable = translationErrorIsRetryable(
-		item.error_detail ?? item.error,
-	);
 	switch (item.status) {
 		case "ready":
 			return {
@@ -123,13 +120,13 @@ function mapTranslationItemToFeedTranslated(item: {
 		case "error":
 			return {
 				lang: "zh-CN",
-				status: retryable ? "missing" : "error",
+				status: "error",
 				title: null,
 				summary: null,
 				error_code: item.error_code ?? null,
 				error_summary: item.error_summary ?? null,
 				error_detail: item.error_detail ?? null,
-				auto_translate: retryable,
+				auto_translate: false,
 			};
 		default:
 			return null;
@@ -313,6 +310,7 @@ export function useAutoTranslate(params: {
 	const failedRef = useRef(new Set<string>());
 	const retryCountRef = useRef(new Map<string, number>());
 	const pollErrorCountRef = useRef(new Map<string, number>());
+	const autoRetriedKeysRef = useRef(new Set<string>());
 
 	const [, forceRender] = useState(0);
 
@@ -327,11 +325,19 @@ export function useAutoTranslate(params: {
 			isReleaseFeedItem(item) &&
 			((item.translated?.status === "missing" &&
 				item.translated.auto_translate !== false) ||
-				(item.translated?.status === "error" &&
-					feedTranslationIsRetryable(item)) ||
 				(item.translated?.status === "ready" &&
 					item.translated.auto_translate === true)) &&
 			!failedRef.current.has(keyOf(item)),
+		[enabled],
+	);
+
+	const shouldAutoRetryLoadedError = useCallback(
+		(item: FeedItem) =>
+			enabled &&
+			isReleaseFeedItem(item) &&
+			item.translated?.status === "error" &&
+			feedTranslationIsRetryable(item) &&
+			!autoRetriedKeysRef.current.has(keyOf(item)),
 		[enabled],
 	);
 
@@ -642,7 +648,12 @@ export function useAutoTranslate(params: {
 	schedulePendingPollRef.current = schedulePendingPoll;
 
 	const submitCandidates = useCallback(
-		async (rawCandidates: TranslationCandidate[]) => {
+		async (
+			rawCandidates: TranslationCandidate[],
+			options?: {
+				retryOnError?: boolean;
+			},
+		) => {
 			const byKey = new Map<string, Promise<TranslateResponse | null>>();
 			const candidates: Array<{
 				candidate: TranslationCandidate;
@@ -692,6 +703,7 @@ export function useAutoTranslate(params: {
 			bumpRender();
 
 			await resolveCandidateTasks(candidates, {
+				retryOnError: options?.retryOnError,
 				onChunkError: (chunk, error) => {
 					for (const { candidate, task } of chunk) {
 						finalizeFailure(candidate, task, error);
@@ -712,6 +724,40 @@ export function useAutoTranslate(params: {
 			schedulePendingPoll,
 			retireTask,
 		],
+	);
+
+	const retryLoadedErrors = useCallback(
+		async (items: FeedItem[]) => {
+			if (!enabled || !mountedRef.current || items.length === 0) {
+				return;
+			}
+			const candidates: TranslationCandidate[] = [];
+			for (const item of items) {
+				if (!shouldAutoRetryLoadedError(item)) {
+					continue;
+				}
+				const key = keyOf(item);
+				autoRetriedKeysRef.current.add(key);
+				failedRef.current.delete(key);
+				retryCountRef.current.delete(key);
+				itemByKeyRef.current.set(key, item);
+				const requestItem = buildReleaseSummaryRequestItem(item);
+				const sourceKey = buildRequestSourceKey(requestItem);
+				candidates.push({
+					key,
+					item,
+					requestItem,
+					sourceKey,
+					top: 0,
+					bottom: 0,
+				});
+			}
+			if (candidates.length === 0) {
+				return;
+			}
+			await submitCandidates(candidates, { retryOnError: true });
+		},
+		[enabled, shouldAutoRetryLoadedError, submitCandidates],
 	);
 
 	const prepareCandidates = useCallback(() => {
@@ -950,6 +996,17 @@ export function useAutoTranslate(params: {
 	}, [enabled, schedulePendingPoll, scheduleViewportPlan]);
 
 	const inFlightKeys = new Set(requestTasksRef.current.keys());
+	const autoRetryingKeys = new Set(
+		Array.from(requestTasksRef.current.entries())
+			.filter(([, task]) => !task.rejectOnFailure)
+			.map(([key]) => key),
+	);
 
-	return { register, translateNow, inFlightKeys };
+	return {
+		register,
+		retryLoadedErrors,
+		translateNow,
+		inFlightKeys,
+		autoRetryingKeys,
+	};
 }
