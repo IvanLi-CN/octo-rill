@@ -102,6 +102,7 @@ const EMPTY_STORY_LIVE_NOTICES: StoryLiveNotices = {};
 const EMPTY_STORY_DEFERRED_TABS: Tab[] = [];
 const EMPTY_STORY_REACTION_ERRORS: Record<string, string> = {};
 const EMPTY_STORY_FRESH_KEYS: string[] = [];
+const EMPTY_STORY_BRIEF_FAILURE_DATES: string[] = [];
 const SCOPED_STORY_TAB_OPTIONS = DASHBOARD_TAB_OPTIONS.filter(
 	(option) => option.value === "all" || option.value === "releases",
 );
@@ -723,6 +724,10 @@ function makeMockFeed(): FeedItem[] {
 				"https://github.com/acme/fleet/releases/tag/fallback-lane-release",
 		}),
 	];
+}
+
+function makeHistoricalBriefErrorFocusFeed(): FeedItem[] {
+	return [makeMockFeed()[4]!];
 }
 
 function makeReactionCompactFeed(): FeedItem[] {
@@ -2639,6 +2644,8 @@ function DashboardPreview(props: {
 	freshNotificationKeys?: string[];
 	scope?: DashboardScope | null;
 	includeOwnReleases?: boolean;
+	generateBriefFailureDates?: string[];
+	initialBriefErrorSummariesByDate?: Record<string, string>;
 }) {
 	const {
 		initialTab = "all",
@@ -2675,6 +2682,8 @@ function DashboardPreview(props: {
 		freshNotificationKeys = EMPTY_STORY_FRESH_KEYS,
 		scope = null,
 		includeOwnReleases = false,
+		generateBriefFailureDates = EMPTY_STORY_BRIEF_FAILURE_DATES,
+		initialBriefErrorSummariesByDate,
 	} = props;
 	useStorybookReleaseDetailMock(releaseDetail, {
 		smartResolveMode: releaseDetailSmartResolveMode,
@@ -2682,6 +2691,9 @@ function DashboardPreview(props: {
 	const [storyBriefs, setStoryBriefs] = useState<BriefItem[]>(briefs);
 	const [storyLiveNotices, setStoryLiveNotices] =
 		useState<StoryLiveNotices>(liveNotices);
+	const [pendingFailureDates, setPendingFailureDates] = useState<Set<string>>(
+		() => new Set(generateBriefFailureDates),
+	);
 
 	useEffect(() => {
 		setStoryBriefs(briefs);
@@ -2690,6 +2702,18 @@ function DashboardPreview(props: {
 	useEffect(() => {
 		setStoryLiveNotices(liveNotices);
 	}, [liveNotices]);
+
+	useEffect(() => {
+		setPendingFailureDates((current) => {
+			if (
+				current.size === generateBriefFailureDates.length &&
+				generateBriefFailureDates.every((date) => current.has(date))
+			) {
+				return current;
+			}
+			return new Set(generateBriefFailureDates);
+		});
+	}, [generateBriefFailureDates]);
 
 	const seededReleaseTarget = useMemo(() => {
 		const locator = releaseDetail
@@ -2869,16 +2893,24 @@ function DashboardPreview(props: {
 
 	const generateBriefForDate = async (date: string) => {
 		await new Promise((resolve) => window.setTimeout(resolve, 900));
-		const nextBrief =
-			generatedBriefTemplates[date] ??
-			makeBrief({
+		if (pendingFailureDates.has(date)) {
+			setPendingFailureDates((current) => {
+				const next = new Set(current);
+				next.delete(date);
+				return next;
+			});
+			throw new Error("后台没有返回日报内容，请稍后重试。");
+		}
+		const nextBrief = makeBrief({
+			...((generatedBriefTemplates[date] ?? {
 				id: `brief-generated-${date}`,
 				date,
 				window_start: null,
 				window_end: null,
 				content_markdown: "## 项目更新\n\n- 本时间窗口内没有新的 Release。",
 				created_at: `${date}T08:00:03+08:00`,
-			});
+			}) as BriefItem),
+		});
 		setStoryBriefs((current) =>
 			[nextBrief, ...current.filter((brief) => brief.id !== nextBrief.id)].sort(
 				(a, b) =>
@@ -3104,6 +3136,9 @@ function DashboardPreview(props: {
 					}
 					onGenerateBriefForDate={
 						mode === "all" ? generateBriefForDate : undefined
+					}
+					initialBriefErrorSummariesByDate={
+						mode === "all" ? initialBriefErrorSummariesByDate : undefined
 					}
 					newContentBoundaries={(storyLiveNotices.feed ?? []).map(
 						(notice, index) => ({
@@ -3857,6 +3892,50 @@ export const EvidenceAllHistoryFallbackToReleaseCards: Story = {
 		docs: {
 			disable: true,
 		},
+	},
+};
+
+export const AllHistoryFallbackGenerateErrorAndRetry: Story = {
+	args: {
+		initialTab: "all",
+		briefs: [],
+		feedItems: makeHistoricalBriefErrorFocusFeed(),
+		initialBriefErrorSummariesByDate: {
+			"2026-04-03": "后台没有返回日报内容，请稍后重试。",
+		},
+		showFooter: false,
+	},
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"打开即见历史日组的日报展示容器错误态：错误说明与“重试日报”首屏可见，没有无关历史组噪音。",
+			},
+		},
+	},
+	play: async ({ canvasElement, step }) => {
+		const canvas = within(canvasElement);
+		await step("inline error is immediately visible", async () => {
+			await expect(await canvas.findByText("日报生成失败")).toBeVisible();
+			await expect(
+				canvas.getByText("后台没有返回日报内容，请稍后重试。"),
+			).toBeVisible();
+			await expect(
+				canvas.getByRole("button", { name: "重试日报" }),
+			).toBeVisible();
+			await expect(
+				canvas.queryByText("这份日报是降级摘要"),
+			).not.toBeInTheDocument();
+		});
+		await step("retry still succeeds in place", async () => {
+			await canvas.getByRole("button", { name: "重试日报" }).click();
+			await expect(
+				await canvas.findByText(/回补这一天的日报摘要/),
+			).toBeVisible();
+			await expect(
+				canvas.queryByText("后台没有返回日报内容，请稍后重试。"),
+			).not.toBeInTheDocument();
+		});
 	},
 };
 
