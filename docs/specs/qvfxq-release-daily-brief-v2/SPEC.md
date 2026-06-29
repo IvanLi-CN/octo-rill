@@ -89,6 +89,7 @@
 - 当窗口内没有任何 Release 时，`## 项目更新` 仍需输出“本时间窗口内没有新的 Release。”。
 - 当窗口内没有任何获星 / 关注时，`## 获星与关注` 仍需输出“本时间窗口内没有新的获星或关注动态。”。
 - 当 LLM 润色结果缺少必需章节、丢失内部 release 链接、打乱 release 顺序、把子 bullet 改成段落/硬换行文本，或产出空白内容时，必须回退到 deterministic markdown。
+- deterministic fallback 仍可作为成功摘要落库与展示；前端不得额外暴露“降级摘要”这一第四种展示状态。
 - 不对生产 brief 内容做中文比例、英文比例或字符类别硬性判定；语言倾向通过 prompt 契约、合成 fixture 测试与可控 fallback 保障。
 - legacy brief 若既没有存储窗口也无法从正文解析窗口，仍由原有 history recompute 失败语义处理，不进入内容刷新任务。
 

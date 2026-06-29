@@ -1,5 +1,6 @@
 import {
 	ArrowUpToLine,
+	RefreshCcw,
 	List,
 	LoaderCircle,
 	Newspaper,
@@ -29,6 +30,7 @@ import { isReleaseFeedItem, type FeedItem } from "@/feed/types";
 import { cn } from "@/lib/utils";
 import type { DashboardReleaseTarget } from "@/dashboard/routeState";
 import type { DashboardTab } from "@/pages/DashboardControlBand";
+import { describeUnknownError } from "@/lib/errorPresentation";
 
 type BriefLike = BriefSnapshotCandidate & {
 	date: string;
@@ -39,6 +41,22 @@ type BriefLike = BriefSnapshotCandidate & {
 	content_markdown: string;
 	created_at: string;
 };
+
+type HistoricalBriefErrorState = {
+	summary: string;
+};
+
+function toHistoricalBriefErrorMap(
+	initialBriefErrorSummariesByDate: Record<string, string>,
+) {
+	const next = new Map<string, HistoricalBriefErrorState>();
+	for (const [date, summary] of Object.entries(
+		initialBriefErrorSummariesByDate,
+	)) {
+		next.set(date, { summary });
+	}
+	return next;
+}
 
 const FEED_DAY_ACTION_SLOT_CLASS =
 	"flex w-full items-start justify-end pt-1 sm:h-8 sm:w-[152px] sm:shrink-0 sm:items-center sm:justify-end sm:pt-0";
@@ -452,16 +470,40 @@ function FeedBriefBody(props: {
 
 function HistoricalBriefPanel(props: {
 	brief: BriefLike | null;
+	errorState?: HistoricalBriefErrorState | null;
+	onRetryGenerate?: (() => void) | undefined;
+	retryBusy?: boolean;
 	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 }) {
-	const { brief, onOpenReleaseFromBrief } = props;
+	const {
+		brief,
+		errorState = null,
+		onRetryGenerate,
+		retryBusy = false,
+		onOpenReleaseFromBrief,
+	} = props;
+	const showBriefBody = !errorState;
 	return (
 		<div className={FEED_BRIEF_PANEL_CLASS}>
 			<div className="flex items-center gap-2 border-b border-dashed border-border/55 px-4 py-[10px] text-foreground/82 sm:px-6">
 				<Newspaper className="size-4" />
 				<span className="font-mono text-[13px] tracking-wide">日报摘要</span>
 			</div>
-			<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
+			<div className="space-y-3 px-4 pb-4 pt-4 sm:px-6 sm:pb-5">
+				{errorState ? (
+					<ErrorStatePanel
+						title="日报生成失败"
+						summary={errorState.summary}
+						size="compact"
+						actionLabel={onRetryGenerate ? "重试日报" : undefined}
+						onAction={onRetryGenerate}
+						loading={retryBusy}
+					/>
+				) : null}
+				{showBriefBody ? (
+					<FeedBriefBody brief={brief} onOpenRelease={onOpenReleaseFromBrief} />
+				) : null}
+			</div>
 		</div>
 	);
 }
@@ -474,6 +516,9 @@ function FeedHistoricalDayGroup(props: {
 	showDivider: boolean;
 	showBriefPanel: boolean;
 	brief: BriefLike | null;
+	errorState?: HistoricalBriefErrorState | null;
+	onRetryGenerate?: (() => void) | undefined;
+	retryBusy?: boolean;
 	onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 	items: FeedItem[];
 	feedCardProps: Omit<FeedCardListProps, "items">;
@@ -486,6 +531,9 @@ function FeedHistoricalDayGroup(props: {
 		showDivider,
 		showBriefPanel,
 		brief,
+		errorState = null,
+		onRetryGenerate,
+		retryBusy = false,
 		onOpenReleaseFromBrief,
 		items,
 		feedCardProps,
@@ -560,6 +608,9 @@ function FeedHistoricalDayGroup(props: {
 			) : null}
 			<HistoricalBriefPanel
 				brief={brief}
+				errorState={errorState}
+				onRetryGenerate={onRetryGenerate}
+				retryBusy={retryBusy}
 				onOpenReleaseFromBrief={onOpenReleaseFromBrief}
 			/>
 			{trailingItems.length > 0 ? (
@@ -587,6 +638,7 @@ export function FeedGroupedList(
 		now?: Date;
 		onOpenReleaseFromBrief?: (target: DashboardReleaseTarget) => void;
 		onGenerateBriefForDate?: (date: string) => Promise<void>;
+		initialBriefErrorSummariesByDate?: Record<string, string>;
 		newContentBoundaries?: NewContentBoundary[];
 	},
 ) {
@@ -607,6 +659,7 @@ export function FeedGroupedList(
 		now,
 		onOpenReleaseFromBrief,
 		onGenerateBriefForDate,
+		initialBriefErrorSummariesByDate = {},
 		newContentBoundaries = [],
 		...feedCardProps
 	} = props;
@@ -619,6 +672,9 @@ export function FeedGroupedList(
 	const [pendingGroupIds, setPendingGroupIds] = useState<Set<string>>(
 		() => new Set<string>(),
 	);
+	const [briefErrorsByDate, setBriefErrorsByDate] = useState<
+		Map<string, HistoricalBriefErrorState>
+	>(() => toHistoricalBriefErrorMap(initialBriefErrorSummariesByDate));
 	const [loadMoreBubbleOpen, setLoadMoreBubbleOpen] = useState(false);
 	const blockingError =
 		error?.phase === "initial" && items.length === 0 ? error : null;
@@ -679,10 +735,15 @@ export function FeedGroupedList(
 		() => new Map(briefs.map((brief) => [brief.id, brief])),
 		[briefs],
 	);
-	const briefByDate = useMemo(
-		() => new Map(briefs.map((brief) => [brief.date, brief])),
-		[briefs],
-	);
+	const briefByDate = useMemo(() => {
+		const next = new Map<string, BriefLike>();
+		for (const brief of briefs) {
+			if (!next.has(brief.date)) {
+				next.set(brief.date, brief);
+			}
+		}
+		return next;
+	}, [briefs]);
 
 	useEffect(() => {
 		setRawListGroupIds((current) => {
@@ -714,6 +775,13 @@ export function FeedGroupedList(
 				Array.from(next).every((groupId) => current.has(groupId))
 			) {
 				return current;
+			}
+			return next;
+		});
+		setBriefErrorsByDate((current) => {
+			const next = new Map(current);
+			for (const brief of briefs) {
+				next.delete(brief.date);
 			}
 			return next;
 		});
@@ -763,6 +831,7 @@ export function FeedGroupedList(
 						? briefByDate.get(group.briefDate)
 						: null) ??
 					null;
+				const briefError = briefErrorsByDate.get(group.briefDate) ?? null;
 				const hasReleases = group.releaseCount > 0;
 				const isHistoricalRawGroup =
 					mode === "all" &&
@@ -772,8 +841,11 @@ export function FeedGroupedList(
 				const pendingBrief = pendingGroupIds.has(group.id);
 				const showBriefPanel =
 					mode === "all" &&
-					group.kind === "historical" &&
-					(Boolean(brief) || pendingBrief) &&
+					!group.isCurrent &&
+					hasReleases &&
+					(group.kind === "historical" ||
+						pendingBrief ||
+						Boolean(briefError)) &&
 					!rawListGroupIds.has(group.id);
 				const showDivider = index > 0;
 				let groupAction: ReactNode = null;
@@ -832,6 +904,49 @@ export function FeedGroupedList(
 								生成日报
 							</Button>
 						);
+					} else if (briefError && onGenerateBriefForDate) {
+						groupAction = (
+							<Button
+								type="button"
+								variant="ghost"
+								size="sm"
+								className={FEED_DAY_ACTION_BUTTON_CLASS}
+								onClick={() => {
+									setBriefErrorsByDate((current) => {
+										const next = new Map(current);
+										next.delete(group.briefDate);
+										return next;
+									});
+									setPendingGroupIds((current) => {
+										const next = new Set(current);
+										next.add(group.id);
+										return next;
+									});
+									void onGenerateBriefForDate(group.briefDate).catch(
+										(error) => {
+											setPendingGroupIds((current) => {
+												const next = new Set(current);
+												next.delete(group.id);
+												return next;
+											});
+											setBriefErrorsByDate((current) => {
+												const next = new Map(current);
+												next.set(group.briefDate, {
+													summary: describeUnknownError(
+														error,
+														"日报生成失败，请稍后重试。",
+													),
+												});
+												return next;
+											});
+										},
+									);
+								}}
+							>
+								<RefreshCcw className="size-4" />
+								重试日报
+							</Button>
+						);
 					} else if (onGenerateBriefForDate) {
 						groupAction = (
 							<Button
@@ -845,13 +960,30 @@ export function FeedGroupedList(
 										next.add(group.id);
 										return next;
 									});
-									void onGenerateBriefForDate(group.briefDate).catch(() => {
-										setPendingGroupIds((current) => {
-											const next = new Set(current);
-											next.delete(group.id);
-											return next;
-										});
+									setBriefErrorsByDate((current) => {
+										const next = new Map(current);
+										next.delete(group.briefDate);
+										return next;
 									});
+									void onGenerateBriefForDate(group.briefDate).catch(
+										(error) => {
+											setPendingGroupIds((current) => {
+												const next = new Set(current);
+												next.delete(group.id);
+												return next;
+											});
+											setBriefErrorsByDate((current) => {
+												const next = new Map(current);
+												next.set(group.briefDate, {
+													summary: describeUnknownError(
+														error,
+														"日报生成失败，请稍后重试。",
+													),
+												});
+												return next;
+											});
+										},
+									);
 								}}
 							>
 								<Sparkles className="size-4" />
@@ -868,17 +1000,19 @@ export function FeedGroupedList(
 						data-feed-group-id={group.id}
 						data-feed-brief-date={group.briefDate}
 						data-feed-group-type={
-							group.kind === "historical" ? "historical" : "default"
+							group.kind === "historical" || showBriefPanel
+								? "historical"
+								: "default"
 						}
 						data-feed-group-view={
-							group.kind === "historical"
+							group.kind === "historical" || showBriefPanel
 								? showBriefPanel
 									? "brief"
 									: "raw"
 								: "default"
 						}
 					>
-						{mode === "all" && group.kind === "historical" ? (
+						{mode === "all" && showBriefPanel ? (
 							<FeedHistoricalDayGroup
 								date={group.displayDate}
 								releaseCount={group.releaseCount}
@@ -887,6 +1021,43 @@ export function FeedGroupedList(
 								showDivider={showDivider}
 								showBriefPanel={showBriefPanel}
 								brief={pendingBrief ? null : brief}
+								errorState={briefError}
+								onRetryGenerate={
+									onGenerateBriefForDate
+										? () => {
+												setBriefErrorsByDate((current) => {
+													const next = new Map(current);
+													next.delete(group.briefDate);
+													return next;
+												});
+												setPendingGroupIds((current) => {
+													const next = new Set(current);
+													next.add(group.id);
+													return next;
+												});
+												void onGenerateBriefForDate(group.briefDate).catch(
+													(error) => {
+														setPendingGroupIds((current) => {
+															const next = new Set(current);
+															next.delete(group.id);
+															return next;
+														});
+														setBriefErrorsByDate((current) => {
+															const next = new Map(current);
+															next.set(group.briefDate, {
+																summary: describeUnknownError(
+																	error,
+																	"日报生成失败，请稍后重试。",
+																),
+															});
+															return next;
+														});
+													},
+												);
+											}
+										: undefined
+								}
+								retryBusy={pendingBrief}
 								onOpenReleaseFromBrief={onOpenReleaseFromBrief}
 								items={group.items}
 								feedCardProps={{ ...feedCardProps, sourceTab }}
