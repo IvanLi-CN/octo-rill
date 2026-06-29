@@ -258,7 +258,51 @@ export type AdminSyncRuntimeConfigResponse = {
 	sync_auto_fetch_interval_minutes: number;
 	retry_recent_failures_interval_minutes: number;
 	repo_release_worker_concurrency: number;
+	repo_refresh_system_budget_per_window: number;
 	recent_sync_tasks: SyncAutoFetchTaskItem[];
+};
+export type AdminRepoGovernanceGridCell = {
+	repo_id: number;
+	age_bucket: string;
+	band_label: string;
+	urgency_score: number;
+};
+export type AdminRepoGovernanceOverviewResponse = {
+	summary: {
+		dedup_repo_count: number;
+		pressure_windows: number;
+		last_full_cycle_completed_at: string | null;
+	};
+	cycle: {
+		active_cycle_id: string | null;
+		active_cycle_started_at: string | null;
+		active_cycle_repo_count: number;
+		active_cycle_completed_count: number;
+	};
+	settings: AdminSyncRuntimeConfigResponse;
+	grid_cells: AdminRepoGovernanceGridCell[];
+};
+export type AdminRepoGovernanceListItem = {
+	repo_id: number;
+	repo_full_name: string;
+	watcher_user_count: number;
+	watcher_repo_total_sum: number;
+	cached_stargazer_count: number | null;
+	priority_rank: number;
+	target_window: number;
+	target_interval_minutes: number;
+	urgency_score: number;
+	urgency_bucket: string;
+	system_last_selected_at: string | null;
+	system_last_success_at: string | null;
+	actual_last_success_at: string | null;
+	actual_last_success_source: string | null;
+};
+export type AdminRepoGovernanceListResponse = {
+	items: AdminRepoGovernanceListItem[];
+	page: number;
+	page_size: number;
+	total: number;
 };
 export type AdminPublicReleaseRepoItem = {
 	id: string;
@@ -300,6 +344,7 @@ export type AdminSyncRuntimeConfigUpdateRequest = {
 	sync_auto_fetch_interval_minutes: number;
 	retry_recent_failures_interval_minutes?: number;
 	repo_release_worker_concurrency?: number;
+	repo_refresh_system_budget_per_window?: number;
 };
 export type DailyBriefProfilePatchRequest = {
 	daily_brief_local_time: string;
@@ -1028,6 +1073,18 @@ export async function apiPatchAdminScheduledSlot(
 export async function apiGetAdminSyncRuntimeConfig(): Promise<AdminSyncRuntimeConfigResponse> {
 	return apiGet<AdminSyncRuntimeConfigResponse>(
 		"/api/admin/jobs/sync/runtime-config",
+	);
+}
+export async function apiGetAdminRepoGovernanceOverview(): Promise<AdminRepoGovernanceOverviewResponse> {
+	return apiGet<AdminRepoGovernanceOverviewResponse>(
+		"/api/admin/repos/overview",
+	);
+}
+export async function apiGetAdminRepoGovernanceList(
+	params: URLSearchParams,
+): Promise<AdminRepoGovernanceListResponse> {
+	return apiGet<AdminRepoGovernanceListResponse>(
+		`/api/admin/repos?${params.toString()}`,
 	);
 }
 export async function apiGetAdminPublicReleaseRepos(

@@ -221,6 +221,11 @@ pub async fn serve(config: AppConfig) -> Result<()> {
         )
         .route("/admin/dashboard", get(api::admin_dashboard))
         .route(
+            "/admin/repos/overview",
+            get(api::admin_get_repo_governance_overview),
+        )
+        .route("/admin/repos", get(api::admin_list_repo_governance))
+        .route(
             "/admin/public-release-repos",
             get(api::admin_list_public_release_repos),
         )

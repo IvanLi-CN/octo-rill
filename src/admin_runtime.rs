@@ -28,6 +28,8 @@ pub const DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES: i64 = 60;
 pub const DEFAULT_RETRY_RECENT_FAILURES_INTERVAL_MINUTES: i64 = 10;
 pub const DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY: usize = 8;
 pub const MAX_REPO_RELEASE_WORKER_CONCURRENCY: usize = 32;
+pub const DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 1000;
+pub const MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW: i64 = 20_000;
 
 pub fn normalize_sync_auto_fetch_interval_minutes(value: i64) -> i64 {
     value.clamp(1, 120)
@@ -45,6 +47,10 @@ pub fn normalize_repo_release_worker_concurrency(value: i64) -> usize {
     .unwrap_or(DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY)
 }
 
+pub fn normalize_repo_refresh_system_budget_per_window(value: i64) -> i64 {
+    value.clamp(1, MAX_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW)
+}
+
 pub async fn load_repo_release_worker_concurrency(pool: &SqlitePool) -> Result<usize> {
     let concurrency = sqlx::query_scalar::<_, i64>(
         r#"
@@ -59,6 +65,22 @@ pub async fn load_repo_release_worker_concurrency(pool: &SqlitePool) -> Result<u
     .unwrap_or(i64::try_from(DEFAULT_REPO_RELEASE_WORKER_CONCURRENCY).unwrap_or(5));
 
     Ok(normalize_repo_release_worker_concurrency(concurrency))
+}
+
+pub async fn load_repo_refresh_system_budget_per_window(pool: &SqlitePool) -> Result<i64> {
+    let budget = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT repo_refresh_system_budget_per_window
+        FROM admin_runtime_settings
+        WHERE id = 1
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(DEFAULT_REPO_REFRESH_SYSTEM_BUDGET_PER_WINDOW);
+
+    Ok(normalize_repo_refresh_system_budget_per_window(budget))
 }
 
 pub async fn update_repo_release_worker_concurrency(
@@ -95,6 +117,42 @@ pub async fn update_repo_release_worker_concurrency(
     .await?;
 
     load_repo_release_worker_concurrency(pool).await
+}
+
+pub async fn update_repo_refresh_system_budget_per_window(
+    pool: &SqlitePool,
+    budget_per_window: i64,
+) -> Result<i64> {
+    let budget_per_window = normalize_repo_refresh_system_budget_per_window(budget_per_window);
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        INSERT INTO admin_runtime_settings (
+          id,
+          llm_max_concurrency,
+          translation_general_worker_concurrency,
+          translation_dedicated_worker_concurrency,
+          sync_auto_fetch_interval_minutes,
+          repo_refresh_system_budget_per_window,
+          created_at,
+          updated_at
+        )
+        VALUES (1, 1, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          repo_refresh_system_budget_per_window = excluded.repo_refresh_system_budget_per_window,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(i64::try_from(DEFAULT_TRANSLATION_GENERAL_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(i64::try_from(DEFAULT_TRANSLATION_DEDICATED_WORKER_CONCURRENCY).unwrap_or(1))
+    .bind(DEFAULT_SYNC_AUTO_FETCH_INTERVAL_MINUTES)
+    .bind(budget_per_window)
+    .bind(now.as_str())
+    .bind(now.as_str())
+    .execute(pool)
+    .await?;
+
+    load_repo_refresh_system_budget_per_window(pool).await
 }
 
 pub async fn load_sync_auto_fetch_interval_minutes(pool: &SqlitePool) -> Result<i64> {
