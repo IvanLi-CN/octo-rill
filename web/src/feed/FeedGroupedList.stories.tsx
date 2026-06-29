@@ -144,8 +144,16 @@ function FeedGroupedListPreview(props: {
 	items?: FeedItem[];
 	briefs?: FeedGroupedListProps["briefs"];
 	now?: Date;
+	onGenerateBriefForDate?: FeedGroupedListProps["onGenerateBriefForDate"];
+	initialBriefErrorSummariesByDate?: Record<string, string>;
 }) {
-	const { items = earlyMorningReleases, briefs = [], now } = props;
+	const {
+		items = earlyMorningReleases,
+		briefs = [],
+		now,
+		onGenerateBriefForDate,
+		initialBriefErrorSummariesByDate,
+	} = props;
 	const selectedLaneByKey = Object.fromEntries(
 		items.map((item) => [`${item.kind}:${item.id}`, "original"]),
 	) as Record<string, FeedLane>;
@@ -178,6 +186,8 @@ function FeedGroupedListPreview(props: {
 					selectedLaneByKey={selectedLaneByKey}
 					onLoadMore={() => {}}
 					onRetryInitial={() => {}}
+					onGenerateBriefForDate={onGenerateBriefForDate}
+					initialBriefErrorSummariesByDate={initialBriefErrorSummariesByDate}
 					onSelectLane={() => {}}
 					onTranslateNow={() => {}}
 					onSmartNow={() => {}}
@@ -250,5 +260,33 @@ export const SanitizedProductionMay8Boundary: Story = {
 		).map((element) => element.textContent?.replace(/\s+/g, " ").trim());
 		expect(labels).toContain("2026-05-07 · 1 条 Release");
 		expect(labels.some((label) => label?.startsWith("2026-05-08"))).toBe(false);
+	},
+};
+
+export const HistoricalBriefInlineErrorVisible: Story = {
+	name: "Historical Brief Inline Error Visible",
+	render: () => (
+		<FeedGroupedListPreview
+			items={earlyMorningReleases.slice(-1)}
+			briefs={[]}
+			now={new Date("2026-05-07T12:00:00+08:00")}
+			initialBriefErrorSummariesByDate={{
+				"2026-05-06": "后台没有返回日报内容，请稍后重试。",
+			}}
+			onGenerateBriefForDate={async () => {}}
+		/>
+	),
+	play: async ({ canvasElement }) => {
+		const canvas = within(canvasElement);
+		await expect(canvas.getByText("日报生成失败")).toBeVisible();
+		await expect(
+			canvas.getByText("后台没有返回日报内容，请稍后重试。"),
+		).toBeVisible();
+		await expect(
+			canvas.getByRole("button", { name: "重试日报" }),
+		).toBeVisible();
+		await expect(
+			canvas.queryByText("这份日报是降级摘要"),
+		).not.toBeInTheDocument();
 	},
 };
