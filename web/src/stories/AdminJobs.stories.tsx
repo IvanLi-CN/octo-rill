@@ -2483,6 +2483,38 @@ export const SubscriptionSyncDetail: Story = {
 	},
 };
 
+export const SubscriptionSyncBackNavigation: Story = {
+	render: () => (
+		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-1430" />
+	),
+	parameters: {
+		docs: {
+			description: {
+				story:
+					"验证订阅同步详情页的返回按钮会退回订阅同步列表，而不是只更新地址栏。",
+			},
+		},
+	},
+	play: async ({ canvasElement }) => {
+		const body = within(canvasElement.ownerDocument.body);
+		await expect(
+			await body.findByRole("heading", { name: "订阅同步工作流详情" }),
+		).toBeVisible();
+		await userEvent.click(
+			body.getByRole("button", { name: "返回订阅同步列表" }),
+		);
+		await waitFor(() =>
+			expect(canvasElement.ownerDocument.defaultView?.location.pathname).toBe(
+				"/admin/jobs/subscriptions",
+			),
+		);
+		await expect(body.getByRole("heading", { name: "订阅同步" })).toBeVisible();
+		expect(
+			body.queryByRole("heading", { name: "订阅同步工作流详情" }),
+		).not.toBeInTheDocument();
+	},
+};
+
 export const SubscriptionSyncDetailSkipped: Story = {
 	render: () => (
 		<AdminJobsPreview routeUrl="/admin/jobs/subscriptions/task-subscription-skipped" />
