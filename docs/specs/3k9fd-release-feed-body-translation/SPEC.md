@@ -31,6 +31,8 @@
   - 卡片正文读 `body`，中文视图读翻译后的正文字段。
   - 当 `body_truncated=true` 时显示“列表正文已截断显示”的提示。
   - 当自动翻译终态为不可自动重试时，不再提供“翻译”按钮重试入口。
+  - Dashboard feed 对 `translated` lane 的 retryable `error` 采用“当前页面会话内一次性自动补救”语义：首屏加载、分页追加、feed 替换和 live update 合并后都会重扫当前已加载 release items，并按 `lane:item-key` 去重，只自动补救一次。
+  - `translated` lane 进入本页自动补救后，正文区改为居中的中性等待面与轻量 loading，文案统一为“刚发现这条结果还没准备好，正在自动重试，请稍候”；本次自动补救若仍返回 `error`，则立刻恢复现有 `翻译失败` 错误块与 `重试翻译` 按钮。
 - 翻译:
   - `release_summary` / feed 变体切到正文输入（`body_markdown`）。
   - `release_summary.feed_body -> release_detail` fallback 在进入 Markdown 结构校验前，先规范化外层 fenced Markdown、包装空白与尾部换行；规范化后仍不保结构才记为失败。
@@ -46,3 +48,13 @@
 - sync 后新增 release 会自动触发后台翻译任务；再次打开列表时优先命中已预热译文。
 - 正文超过 3000 字符的 release 不进入分块翻译；后台记录明确 `error` 终态。
 - `release_summary.feed_body` 因 Markdown 结构不一致失败时，后台保留分类后的短提示与原始错误原因，不再只显示 `translation failed`。
+- Dashboard feed 当前已加载 release items 中若存在 retryable `translated.error`，首屏和分页追加后都会在本页自动补救一次；补救期间不再显示红色 `翻译失败` 大错误块。
+
+## Visual Evidence
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/TranslatedUpstreamRetrying`
+  state: `translation-auto-retry-pending`
+  evidence_note: 验证 retryable `翻译失败` 在本页自动补救期间改为居中的中性等待面，不再显示红色错误块、详情 disclosure 或手动重试按钮。
+
+  ![翻译自动补救等待态](./assets/release-translation-auto-retry-pending.png)

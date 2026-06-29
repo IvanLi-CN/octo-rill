@@ -166,6 +166,28 @@ function EmptyPanel(props: {
 	);
 }
 
+function AutoRetryPendingPanel(props: {
+	title: string;
+	description: string;
+	lane: "translated" | "smart";
+}) {
+	const { title, description, lane } = props;
+	return (
+		<div
+			className="flex min-h-[180px] flex-col items-center justify-center rounded-2xl border border-border/55 bg-muted/20 px-6 py-10 text-center"
+			data-feed-auto-retry-pending={lane}
+		>
+			<div className="mb-4 flex size-11 items-center justify-center rounded-full border border-border/60 bg-background/85 shadow-sm">
+				<RefreshCcw className="size-4 animate-spin text-foreground/70" />
+			</div>
+			<p className="text-sm font-medium text-foreground">{title}</p>
+			<p className="mt-2 max-w-[24rem] text-sm leading-6 text-muted-foreground">
+				{description}
+			</p>
+		</div>
+	);
+}
+
 function displayTitleForLane(item: ReleaseFeedItem, lane: FeedLane) {
 	const originalTitle = item.title ?? "(no title)";
 	if (lane === "translated") {
@@ -202,8 +224,9 @@ function OriginalLane(props: { item: ReleaseFeedItem }) {
 function TranslatedLane(props: {
 	item: ReleaseFeedItem;
 	onTranslateNow: () => void;
+	isAutoRetrying: boolean;
 }) {
-	const { item, onTranslateNow } = props;
+	const { item, onTranslateNow, isAutoRetrying } = props;
 
 	if (item.translated?.status === "ready" && item.translated.summary?.trim()) {
 		return <Markdown content={item.translated.summary} />;
@@ -219,6 +242,15 @@ function TranslatedLane(props: {
 	}
 
 	if (item.translated?.status === "error") {
+		if (isAutoRetrying) {
+			return (
+				<AutoRetryPendingPanel
+					title="翻译结果准备中"
+					description="刚发现这条结果还没准备好，正在自动重试，请稍候。"
+					lane="translated"
+				/>
+			);
+		}
 		return (
 			<ErrorStatePanel
 				title="翻译失败"
@@ -241,8 +273,9 @@ function SmartLane(props: {
 	item: ReleaseFeedItem;
 	onSmartNow: () => void;
 	isSmartGenerating: boolean;
+	isAutoRetrying: boolean;
 }) {
-	const { item, onSmartNow, isSmartGenerating } = props;
+	const { item, onSmartNow, isSmartGenerating, isAutoRetrying } = props;
 
 	if (item.smart?.status === "ready" && item.smart.summary?.trim()) {
 		return <Markdown content={item.smart.summary} />;
@@ -258,6 +291,15 @@ function SmartLane(props: {
 	}
 
 	if (item.smart?.status === "error") {
+		if (isAutoRetrying) {
+			return (
+				<AutoRetryPendingPanel
+					title="润色结果准备中"
+					description="刚发现这条结果还没准备好，正在自动重试，请稍候。"
+					lane="smart"
+				/>
+			);
+		}
 		return (
 			<ErrorStatePanel
 				title="润色失败"
@@ -1214,7 +1256,9 @@ export function ReleaseFeedCard(props: {
 	item: ReleaseFeedItem;
 	activeLane: FeedLane;
 	isTranslating: boolean;
+	isTranslationAutoRetrying: boolean;
 	isSmartGenerating: boolean;
+	isSmartAutoRetrying: boolean;
 	isReactionBusy: boolean;
 	reactionError: string | null;
 	isFresh?: boolean;
@@ -1231,7 +1275,9 @@ export function ReleaseFeedCard(props: {
 		item,
 		activeLane,
 		isTranslating,
+		isTranslationAutoRetrying,
 		isSmartGenerating,
+		isSmartAutoRetrying,
 		isReactionBusy,
 		reactionError,
 		isFresh = false,
@@ -1542,13 +1588,18 @@ export function ReleaseFeedCard(props: {
 							<OriginalLane item={item} />
 						</TabsContent>
 						<TabsContent value="translated" className="mt-0">
-							<TranslatedLane item={item} onTranslateNow={onTranslateNow} />
+							<TranslatedLane
+								item={item}
+								onTranslateNow={onTranslateNow}
+								isAutoRetrying={isTranslationAutoRetrying}
+							/>
 						</TabsContent>
 						<TabsContent value="smart" className="mt-0">
 							<SmartLane
 								item={item}
 								onSmartNow={onSmartNow}
 								isSmartGenerating={isSmartGenerating}
+								isAutoRetrying={isSmartAutoRetrying}
 							/>
 						</TabsContent>
 					</CardContent>
@@ -1589,13 +1640,18 @@ export function ReleaseFeedCard(props: {
 							<OriginalLane item={item} />
 						</TabsContent>
 						<TabsContent value="translated" className="mt-0">
-							<TranslatedLane item={item} onTranslateNow={onTranslateNow} />
+							<TranslatedLane
+								item={item}
+								onTranslateNow={onTranslateNow}
+								isAutoRetrying={isTranslationAutoRetrying}
+							/>
 						</TabsContent>
 						<TabsContent value="smart" className="mt-0">
 							<SmartLane
 								item={item}
 								onSmartNow={onSmartNow}
 								isSmartGenerating={isSmartGenerating}
+								isAutoRetrying={isSmartAutoRetrying}
 							/>
 						</TabsContent>
 					</CardContent>
@@ -1612,7 +1668,9 @@ export function FeedItemCard(props: {
 	currentViewer?: FeedViewer | null;
 	activeLane: FeedLane;
 	isTranslating: boolean;
+	isTranslationAutoRetrying: boolean;
 	isSmartGenerating: boolean;
+	isSmartAutoRetrying: boolean;
 	isReactionBusy: boolean;
 	reactionError: string | null;
 	isFresh?: boolean;
