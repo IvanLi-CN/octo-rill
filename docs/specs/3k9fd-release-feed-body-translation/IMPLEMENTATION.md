@@ -5,8 +5,8 @@
 - Lifecycle: superseded(#y2yf8)
 - Implementation: 重新设计（#y2yf8）
 - Created: 2026-04-03
-- Last: 2026-04-13
-- Summary: 已由 #y2yf8 接替；historical body-limit contract superseded by #y2yf8 LLM-input-budget chunk translation
+- Last: 2026-06-29
+- Summary: 已由 #y2yf8 接替；historical body-limit contract superseded by #y2yf8 LLM-input-budget chunk translation, while Dashboard feed retryable translated errors now auto-rescue once per page session and show a neutral waiting state during the rescue window
 - Spec: [SPEC.md](./SPEC.md)
 - History: [HISTORY.md](./HISTORY.md)
 - Superseded by: [../y2yf8-release-translation-input-budget-runtime/SPEC.md](../y2yf8-release-translation-input-budget-runtime/SPEC.md)

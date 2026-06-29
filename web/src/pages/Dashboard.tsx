@@ -1418,8 +1418,10 @@ export function Dashboard(props: {
 
 	const {
 		register: registerTranslate,
+		retryLoadedErrors: retryLoadedTranslations,
 		translateNow,
 		inFlightKeys: translationInFlightKeys,
+		autoRetryingKeys: translationAutoRetryingKeys,
 	} = useAutoTranslate({
 		enabled: true,
 		onTranslated: feed.applyTranslation,
@@ -1427,8 +1429,10 @@ export function Dashboard(props: {
 	const {
 		prime: primeSmart,
 		register: registerSmart,
+		retryLoadedErrors: retryLoadedSmart,
 		smartNow,
 		inFlightKeys: smartInFlightKeys,
+		autoRetryingKeys: smartAutoRetryingKeys,
 	} = useAutoSmart({
 		enabled: true,
 		onSmart: feed.applySmart,
@@ -1613,6 +1617,36 @@ export function Dashboard(props: {
 			notifyGlobalError("润色预取失败", error, "润色预取失败，请稍后重试。");
 		});
 	}, [feed.items, feed.loadingInitial, notifyGlobalError, primeSmart, tab]);
+
+	useEffect(() => {
+		if (tab !== "all" && tab !== "releases") {
+			return;
+		}
+		if (feed.loadingInitial || feed.items.length === 0) {
+			return;
+		}
+		void retryLoadedTranslations(feed.items).catch((error) => {
+			notifyGlobalError(
+				"翻译自动补救失败",
+				error,
+				"翻译自动补救失败，请稍后手动重试。",
+			);
+		});
+		void retryLoadedSmart(feed.items).catch((error) => {
+			notifyGlobalError(
+				"润色自动补救失败",
+				error,
+				"润色自动补救失败，请稍后手动重试。",
+			);
+		});
+	}, [
+		feed.items,
+		feed.loadingInitial,
+		notifyGlobalError,
+		retryLoadedSmart,
+		retryLoadedTranslations,
+		tab,
+	]);
 
 	useEffect(() => {
 		if (!accessTaskStream) return;
@@ -2533,7 +2567,9 @@ export function Dashboard(props: {
 					loadingMore={feed.loadingMore}
 					hasMore={feed.hasMore}
 					translationInFlightKeys={translationInFlightKeys}
+					translationAutoRetryingKeys={translationAutoRetryingKeys}
 					smartInFlightKeys={smartInFlightKeys}
+					smartAutoRetryingKeys={smartAutoRetryingKeys}
 					registerItemRef={registerFeedItem}
 					onLoadMore={feed.loadMore}
 					onRetryInitial={feed.loadInitial}

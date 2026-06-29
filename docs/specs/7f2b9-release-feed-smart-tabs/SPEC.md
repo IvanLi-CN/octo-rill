@@ -134,6 +134,8 @@
 - sync 新写入的 release：后台同时预热 `翻译` 与 `润色` 两条 lane；smart 预热除了本次新增 release，还要补覆盖当前 feed 最近一屏的未完成 smart 卡片，避免老数据长期停留在 missing。
 - subscription sync 的 smart 预热必须使用“本次新增 + 最近窗口”的并集；即使某个用户本轮没有新增命中的 release，也不能跳过其 recent smart preheat。
 - 若 smart cache 命中的是可重试的瞬时错误（如 `runtime_lease_expired`、`database is locked`、历史旧 token 触发的 `repo scope required; re-login via GitHub OAuth`、上游聊天通道返回的 `AI returned 403 Forbidden: Chat upstream returned 403`），前端首屏预加载与后台预热都必须把它重新视作待生成，而不是把旧错误卡片直接钉死在界面上。
+- Dashboard feed 对 `smart` lane 的 retryable `error` 采用“当前页面会话内一次性自动补救”语义：首屏加载、分页追加、feed 替换和 live update 合并后都会重扫当前已加载 release items，并按 `lane:item-key` 去重，只自动补救一次。
+- `smart` lane 进入本页自动补救后，正文区改为居中的中性等待面与轻量 loading，文案统一为“刚发现这条结果还没准备好，正在自动重试，请稍候”；本次自动补救若仍返回 `error`，则立刻恢复现有 `润色失败` 错误块与 `重试润色` 按钮。
 - 上游聊天通道 403 只在 release 翻译 / 润色链路中视为可恢复终态：feed/detail read model 可重新暴露为 `missing + auto_translate`，`retry.recent_failures` 可定时重排队；底层 AI 客户端单次调用仍快速失败，不扩大 403 的同请求重试预算。
 - 当 `translation.scheduler.*` 或 `api.translate_*` 路径中的 LLM 调用返回 `AI response missing content` 时，共享 AI 客户端必须在**同一次请求内**把总尝试上限从 4 提升到 8；其他 source 与其他错误类型继续维持 4 次总尝试，不引入后台重排队。
 - 若进程曾在 translation batch 建立后、真正执行前退出，导致遗留 `translation_batches.status=queued` 与 `translation_work_items.status=batched`，调度器下一次 tick 必须优先接手旧 batch 并继续执行，而不是让卡片长期停在 `润色中`。
@@ -163,6 +165,10 @@
 - Given smart lane 之前落过可重试的瞬时错误
   When 用户重新打开 feed 或再次触发 sync
   Then 系统会把该卡片重新纳入润色预热/预加载，而不是继续展示陈旧错误态。
+
+- Given 当前页面已加载的 release smart lane 命中了 retryable `error`
+  When Dashboard feed 完成首屏或分页合并后的自动补救扫描
+  Then 本页会自动补救该 lane 一次，并在补救期间显示中性等待面，而不是继续展示 `润色失败` 终态。
 
 - Given 翻译或润色 lane 之前落过上游聊天通道 403
   When 用户重新打开 feed/detail 或 `retry.recent_failures` 定时任务运行
@@ -305,6 +311,13 @@
   evidence_note: 验证错误态卡片点击“重试润色”后，按钮立即进入旋转 loading，并在 smart 请求进行期间保持禁用，避免重复点击。
 
   ![重试润色按钮加载中](./assets/release-smart-retry-action-loading-focused.png)
+
+- source_type: `storybook_canvas`
+  story_id_or_title: `Pages/Dashboard/SmartUpstreamRetrying`
+  state: `smart-auto-retry-pending`
+  evidence_note: 验证 retryable `润色失败` 在本页自动补救期间改为居中的中性等待面，不再显示红色错误块、详情 disclosure 或手动重试按钮。
+
+  ![润色自动补救等待态](./assets/release-smart-auto-retry-pending.png)
 
 - source_type: `storybook_canvas`
   story_id_or_title: `Pages/Dashboard/SmartInsufficient`
