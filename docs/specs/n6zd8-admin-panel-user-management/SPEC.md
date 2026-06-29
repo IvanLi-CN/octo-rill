@@ -12,7 +12,7 @@
 - 提供管理员面板一期：用户列表、搜索筛选、升降管理员、启用/禁用。
 - 增加后端权限门禁：仅管理员可调用管理接口；禁用用户不可访问受保护 API。
 - 兼容已有数据库：迁移后自动回填管理员。
-- 用户管理列表展示“项目处理仓库总数”，并切换为紧凑双层列表页。
+- 用户管理列表展示“有效关注仓库数”，并切换为紧凑双层列表页。
 
 ### Non-goals
 
@@ -47,7 +47,10 @@
 - 禁用用户访问受保护 API 返回 403 `account_disabled` 并使会话失效。
 - 用户管理支持列表、搜索筛选、升降管理员、启用/禁用。
 - `GET /api/admin/users` 的列表项必须返回 `repo_total` 与 `include_own_releases`。
-- `repo_total` 必须表示 `starred_repos ∪ owned_repo_star_baselines` 以 `repo_id` 去重后的“项目处理仓库总数”。
+- `repo_total` 必须表示当前“有效关注池”中的去重 repo 数：
+  - `starred_repos` 恒纳入；
+  - `owned_repo_star_baselines` 仅当 `include_own_releases=1` 时纳入；
+  - `is_disabled=1` 用户不计入有效关注池。
 - `/admin/users` 必须以紧凑列表页呈现 4 个双层信息列：用户、仓库、状态、时间；主/次字段都只能单行展示。
 - 保护规则：
   - 不能把系统降为 0 管理员。
@@ -75,7 +78,7 @@
 2. **管理员查看用户列表**
    - 管理员进入 Dashboard 的“管理员”Tab。
    - 可按 query/role/status 筛选，查看分页结果。
-   - 列表按“用户 / 仓库 / 状态 / 时间 / 操作”紧凑展示；仓库列主值为项目处理仓库总数，次值为“我的发布已纳入/未纳入”。
+   - 列表按“用户 / 仓库 / 状态 / 时间 / 操作”紧凑展示；仓库列主值为有效关注仓库数，次值为“我的发布已纳入/未纳入”。
 
 3. **管理员修改用户**
    - 管理员可切换目标用户的管理员状态。
@@ -142,6 +145,10 @@
   Then `repo_total` 只按唯一 `repo_id` 计数一次。
 
 - Given 管理员查看 `/admin/users`
+  When 用户关闭 `include_own_releases` 或账号已 disabled
+  Then `repo_total` 只反映有效关注池，不再被 owned baseline 或 disabled 状态虚增。
+
+- Given 管理员查看 `/admin/users`
   When 用户名、姓名或邮箱很长
   Then 双层字段保持单行截断，不换行撑高记录行。
 
@@ -170,14 +177,14 @@
 - 后端先落地身份状态模型，再提供管理接口，最后前端接入。
 - 以最小可用原则构建一期功能，避免提前引入复杂角色体系。
 - 通过数据库与服务层双重约束保障“至少一名管理员”和“至少一名有效管理员”。
-- 列表中的“项目处理仓库总数”只读取本地已同步仓库快照，不在管理员列表请求里引入新的 GitHub 在线刷新副作用。
+- 列表中的“有效关注仓库数”只读取本地已同步仓库快照，不在管理员列表请求里引入新的 GitHub 在线刷新副作用；更完整的 repo budget / 老化治理由 [#rap6f](../rap6f-repo-refresh-governance/SPEC.md) 负责。
 
 ## Visual Evidence
 
 - source_type: `storybook_canvas`
   story_id_or_title: `admin-admin-panel--evidence-compact-list`
   state: `desktop compact list`
-  evidence_note: 证明 `/admin/users` 已切换为 4 信息列 + 1 操作列的紧凑双层列表页，并展示“项目处理仓库总数 / 我的发布纳入状态”。
+  evidence_note: 证明 `/admin/users` 已切换为 4 信息列 + 1 操作列的紧凑双层列表页，并展示“有效关注仓库数 / 我的发布纳入状态”。
   PR: include
   ![管理员用户列表桌面证据](./assets/admin-users-compact-list-desktop.png)
 

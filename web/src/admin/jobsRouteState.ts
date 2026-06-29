@@ -30,6 +30,8 @@ export const ADMIN_JOBS_SCHEDULED_PATH = `${ADMIN_JOBS_BASE_PATH}/scheduled`;
 export const ADMIN_JOBS_SUBSCRIPTIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/subscriptions`;
 export const ADMIN_JOBS_LLM_PATH = `${ADMIN_JOBS_BASE_PATH}/llm`;
 export const ADMIN_JOBS_TRANSLATIONS_PATH = `${ADMIN_JOBS_BASE_PATH}/translations`;
+export const ADMIN_SUBSCRIPTION_SETTINGS_AUTO_OPEN_SESSION_KEY =
+	"admin.jobs.subscription-settings.auto-open";
 
 const ADMIN_JOBS_ROUTE_QUERY_KEYS = ["from", "view"] as const;
 const TASK_DRAWER_ROUTE_PATTERN =

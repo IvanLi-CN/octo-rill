@@ -16,6 +16,7 @@ export function AdminJobs(props: {
 		},
 	) => void;
 	taskIntervalSettingsDialogDefaultOpen?: boolean;
+	subscriptionSyncSettingsDialogDefaultOpen?: boolean;
 	syncSettingsHelpTooltipsOpen?: boolean;
 }) {
 	const {
@@ -23,6 +24,7 @@ export function AdminJobs(props: {
 		routeState,
 		onNavigateRoute,
 		taskIntervalSettingsDialogDefaultOpen,
+		subscriptionSyncSettingsDialogDefaultOpen,
 		syncSettingsHelpTooltipsOpen,
 	} = props;
 
@@ -39,6 +41,9 @@ export function AdminJobs(props: {
 				onNavigateRoute={onNavigateRoute}
 				taskIntervalSettingsDialogDefaultOpen={
 					taskIntervalSettingsDialogDefaultOpen
+				}
+				subscriptionSyncSettingsDialogDefaultOpen={
+					subscriptionSyncSettingsDialogDefaultOpen
 				}
 				syncSettingsHelpTooltipsOpen={syncSettingsHelpTooltipsOpen}
 			/>

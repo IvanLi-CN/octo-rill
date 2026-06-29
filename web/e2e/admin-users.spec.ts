@@ -160,6 +160,64 @@ async function installBaseMocks(
 			});
 		}
 
+		if (req.method() === "GET" && pathname === "/api/admin/dashboard") {
+			return json(route, {
+				generated_at: "2026-02-26T08:00:00Z",
+				time_zone: "Asia/Shanghai",
+				summary: {
+					total_users: users.length,
+					active_users_today: 0,
+					ongoing_tasks_total: 0,
+					queued_tasks: 0,
+					running_tasks: 0,
+					ongoing_by_task: {
+						translations: 0,
+						summaries: 0,
+						briefs: 0,
+					},
+				},
+				today_live: {
+					date: "2026-02-26",
+					total_users: users.length,
+					active_users: 0,
+					ongoing_tasks_total: 0,
+					queued_tasks: 0,
+					running_tasks: 0,
+				},
+				status_breakdown: {
+					queued_total: 0,
+					running_total: 0,
+					succeeded_total: 0,
+					failed_total: 0,
+					canceled_total: 0,
+					business_counts: {
+						ok: 0,
+						partial: 0,
+						failed: 0,
+						disabled: 0,
+					},
+					total: 0,
+					items: [],
+				},
+				task_share: [],
+				trend_points: [],
+				llm_health: {
+					calls_24h: 0,
+					failed_24h: 0,
+					last_failure_at: null,
+					top_failure_reasons: [],
+					top_failure_sources: [],
+				},
+				window_meta: {
+					selected_window: "7d",
+					available_windows: ["7d", "30d"],
+					window_start: "2026-02-20",
+					window_end: "2026-02-26",
+					point_count: 7,
+				},
+			});
+		}
+
 		if (pathname === "/api/admin/users") {
 			if (options.adminApiForbidden || !currentUserIsAdmin) {
 				return json(
@@ -348,14 +406,14 @@ test("admin user can manage users in admin panel", async ({ page }) => {
 	const standardUserRow = userRow(page, STANDARD_USER_ID);
 	await expect(standardUserRow).toContainText("最后活动：");
 	await expect(standardUserRow).toContainText("普通用户");
-	await expect(standardUserRow).toContainText("总数：7");
+	await expect(standardUserRow).toContainText("有效关注：7");
 	await expect(standardUserRow).toContainText("我的发布：未纳入");
 	await standardUserRow.getByRole("button", { name: "详情" }).click();
 	const profileSheet = page.getByRole("dialog", { name: "用户详情" });
 	await expect(profileSheet).toBeVisible();
 	await expect(profileSheet.getByText("UID")).toBeVisible();
 	await expect(profileSheet.getByText(STANDARD_USER_ID)).toBeVisible();
-	await expect(profileSheet).toContainText("项目处理仓库总数 7");
+	await expect(profileSheet).toContainText("有效关注仓库数 7");
 	await expect(profileSheet.getByLabel("日报时间")).toContainText("08:00");
 	await expect(profileSheet.getByLabel("IANA 时区")).toHaveValue(
 		"Asia/Shanghai",
@@ -517,7 +575,7 @@ test("admin users list keeps compact single-line rows with horizontal scroll on 
 	const tableShell = page.locator("[data-admin-users-table-shell]");
 	await expect(tableShell).toBeVisible();
 	const standardUserRow = userRow(page, STANDARD_USER_ID);
-	await expect(standardUserRow).toContainText("总数：7");
+	await expect(standardUserRow).toContainText("有效关注：7");
 	await expect(standardUserRow).toContainText("我的发布：未纳入");
 
 	const metrics = await page.evaluate((userId) => {
